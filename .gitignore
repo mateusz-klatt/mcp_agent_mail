@@ -204,6 +204,9 @@ benchmarks/results/**/*.json
 benchmarks/**/*.json
 tests/benchmarks/results/**/*.json
 data/baselines/*
+# Production bind-mount root for compose.prod.yaml: the SQLite DB, the git
+# archive (a nested repo) and attachments. Must never enter this repo's history.
+/data/
 *.sqlite3
 .env
 .pytest_out/*

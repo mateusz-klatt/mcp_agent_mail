@@ -1,0 +1,119 @@
+# Production deployment.
+#
+# Deliberately a SEPARATE file from the repo's own compose.yaml / docker-compose.yml:
+#   * compose.yaml (upstream) omits DATABASE_URL — see the note below; it loses the DB.
+#   * docker-compose.yml (upstream) points at Postgres, which this app rejects at startup
+#     (db.py:542 `_SUPPORTED_BACKENDS = frozenset({"sqlite"})`). It is dead on arrival.
+# Keeping ours separate also keeps `git merge upstream/main` conflict-free.
+#
+#   docker compose -f compose.prod.yaml up -d --build
+#
+services:
+  mcp-agent-mail:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mcp-agent-mail:local
+    container_name: mcp-agent-mail
+
+    init: true                # tini as PID1: reap zombies + forward SIGTERM
+    restart: unless-stopped
+    stop_grace_period: 30s    # let SQLite checkpoint the WAL and the git commit queue drain
+
+    # Loopback ONLY. Apache on the host is the sole ingress; the container must never
+    # be reachable from the LAN, because /health/* bypasses bearer auth (http.py:703).
+    ports:
+      - "127.0.0.1:8765:8765"
+
+    # Secrets (HTTP_BEARER_TOKEN, MAIL_UI_SESSION_SECRET) — gitignored, mode 0600.
+    env_file:
+      - .env
+
+    environment:
+      HTTP_HOST: "0.0.0.0"    # inside the container only; the port bind above confines it
+      HTTP_PORT: "8765"
+
+      # MUST stay "/api/". build_http_app always mounts a "/mcp" alias, and per #250
+      # (ec835d2) "/mcp" gets the STATEFUL app *unless* /mcp is itself the configured
+      # base — an explicit HTTP_PATH=/mcp/ would silently downgrade it to stateless.
+      # So: /api/ = stateless one-shot, /mcp = stateful (issues Mcp-Session-Id).
+      HTTP_PATH: "/api/"
+
+      STORAGE_ROOT: "/data/mailbox"
+
+      # ---------------------------------------------------------------------
+      # THE most important line in this file.
+      #
+      # The default is "sqlite+aiosqlite:///./storage.sqlite3" (config.py:434) — a
+      # RELATIVE path, resolved against the process CWD (db.py:346 `.resolve()`),
+      # and the image's WORKDIR is /app (not a volume). Leaving it unset puts the
+      # database at /app/storage.sqlite3 inside the container's writable layer, so
+      # `docker compose down && up` destroys every message, agent, thread and
+      # reservation — while the git archive under /data survives and makes the loss
+      # look like it didn't happen.
+      #
+      # Four slashes = absolute path. db.py:566's own error text suggests this value.
+      # ---------------------------------------------------------------------
+      DATABASE_URL: "sqlite+aiosqlite:////data/mailbox/storage.sqlite3"
+
+      # Auth. Without a bearer the whole server is open; with one, only OPTIONS,
+      # /health/* and /api/health stay unauthenticated (http.py:700-709).
+      HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED: "false"   # default is TRUE; behind a proxy the
+                                                      # bypass self-disables only because Apache
+                                                      # sends X-Forwarded-* (http.py:731). Do not
+                                                      # leave security resting on header hygiene.
+      HTTP_JWT_ENABLED: "false"
+
+      # RBAC defaults to enabled with default role "reader" (config.py:422-425). With
+      # JWT off, EVERY remote request gets that role, and any tools/call outside the
+      # read-only whitelist (health_check, fetch_inbox, whois, search_messages,
+      # summarize_thread) is rejected 403 — send_message included (http.py:1016-1018).
+      # A remote agent with a perfectly valid bearer would be silently read-only.
+      HTTP_RBAC_ENABLED: "true"
+      HTTP_RBAC_DEFAULT_ROLE: "writer"
+
+      # APP_ENVIRONMENT defaults to "development" (config.py:363), and CORS keys its
+      # default off that (config.py:453) — so leaving it unset turns CORS ON.
+      APP_ENVIRONMENT: "production"
+      HTTP_CORS_ENABLED: "false"
+
+      # Attachments must not be readable from arbitrary host paths.
+      ALLOW_ABSOLUTE_ATTACHMENT_PATHS: "false"
+
+      # Long-running central server: reap expired file reservations instead of
+      # letting them accumulate (defaults to off, which suits a laptop, not a daemon).
+      FILE_RESERVATIONS_CLEANUP_ENABLED: "true"
+      FILE_RESERVATIONS_CLEANUP_INTERVAL_SECONDS: "60"
+
+      # Attribution for the git archive commits.
+      GIT_AUTHOR_NAME: "agent-mail"
+      GIT_AUTHOR_EMAIL: "agent-mail@localhost"
+
+    volumes:
+      # Everything durable lives here: storage.sqlite3 (+ -wal/-shm), the git archive,
+      # attachments, and the server lock. Host dir must be owned by uid/gid 10001 —
+      # the Dockerfile's chown happens at build time and is shadowed by this mount.
+      - type: bind
+        source: ./data
+        target: /data
+
+      # Backup destination, deliberately OUTSIDE this git working tree.
+      # ./data is gitignored-and-untracked, which is exactly what `git clean -xdf`
+      # deletes — so an off-tree copy is what makes that survivable. The container
+      # writes the SQLite snapshot here directly (VACUUM INTO), because a hot WAL
+      # database cannot be safely backed up with a plain host-side `cp`.
+      # Path comes from AGENT_MAIL_BACKUP_DIR in the project's .env (gitignored):
+      # this repository is public and must not name a machine or a user.
+      # The directory must be owned by uid 10001 — the container writes to it.
+      - type: bind
+        source: ${AGENT_MAIL_BACKUP_DIR:?set AGENT_MAIL_BACKUP_DIR in .env}
+        target: /backup
+
+    security_opt:
+      - "no-new-privileges:true"
+
+    # NOTE: single process, deliberately. Stateful MCP sessions live in an in-process
+    # StreamableHTTPSessionManager (http.py:1446-1453) and agent bindings in in-process
+    # dicts (app.py:5039-5058), so a session initialised in one worker 400s in another.
+    # The image's default CMD is single-process uvicorn — correct. Do NOT switch to
+    # deploy/gunicorn.conf.py, which sets workers = cpu_count()*2+1.

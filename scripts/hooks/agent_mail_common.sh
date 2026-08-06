@@ -1,65 +1,119 @@
-# Shared configuration and MCP plumbing for the Agent Mail hooks.
-# Sourced, never executed. Every function here is written so that a failure
-# degrades to "do nothing" rather than to a broken editing session.
+# Shared plumbing for the Agent Mail hooks. Sourced, never executed.
 #
-# Config resolution order: environment, then the project's .env, then a default.
+# Designed to be installed ONCE PER MACHINE in ~/.claude/settings.json and work
+# in every repository without per-project setup. Nothing here is configured per
+# checkout: the project key is derived from the repository itself, so the same
+# repo yields the same key on Linux, WSL, native Windows and macOS.
+#
+# Optional environment overrides:
 #   AGENT_MAIL_URL          server base URL (default http://127.0.0.1:8765)
-#   AGENT_MAIL_TOKEN        bearer token (default HTTP_BEARER_TOKEN from .env)
-#   AGENT_MAIL_PROJECT_KEY  the canonical project key — MUST be byte-identical
-#                           on every host, see docs/multi-host-project-identity.md
-#   AGENT_MAIL_AGENT        this host's stable agent identity
-#   AGENT_MAIL_PROJECT_DIR  local checkout, used to find .env and to relativise paths
+#   AGENT_MAIL_TOKEN        bearer token (default: HTTP_BEARER_TOKEN from ~/.agent-mail.env)
+#   AGENT_MAIL_PROJECT_KEY  force a project key instead of deriving one
+#   AGENT_MAIL_AGENT        force an identity instead of deriving one
 #
-# Calls go to the STATELESS mount, not /mcp. A one-shot JSON-RPC POST needs no
-# initialize/notifications handshake and returns in ~40ms; the stateful mount
-# would cost three round trips per hook and leak a session per invocation.
+# Every function degrades to "do nothing" on failure. A hook that errors is a
+# hook that blocks an edit.
 
 AM_TIMEOUT="${AGENT_MAIL_HOOK_TIMEOUT:-3}"
 AM_BASE_URL="${AGENT_MAIL_URL:-http://127.0.0.1:8765}"
-AM_PROJECT_DIR="${AGENT_MAIL_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-}}"
-
-# Credentials are keyed by (project, agent) and are DURABLE, not per-session:
-# re-registering an existing identity requires the registration token that the
-# first registration returned, so losing this file means losing the identity.
 AM_STATE_DIR="${AGENT_MAIL_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-mail}"
 AM_CRED_FILE="${AM_STATE_DIR}/credentials.json"
+
+# --- payload -----------------------------------------------------------------
+# Claude Code delivers the hook invocation as JSON on stdin and closes the pipe.
+# `read -d ''` consumes to EOF and is bounded by -t, which matters because GNU
+# `timeout` does not exist on a stock macOS and `timeout 2 cat` would simply
+# fail there — a hook that silently never runs on one of the machines.
+am_read_payload() {
+    AM_PAYLOAD=""
+    [ -t 0 ] && return 0
+    IFS= read -r -d '' -t "$AM_TIMEOUT" AM_PAYLOAD 2>/dev/null || true
+    return 0
+}
+
+am_payload_field() {
+    printf '%s' "${AM_PAYLOAD:-}" | jq -r "$1 // empty" 2>/dev/null
+}
+
+# --- project identity --------------------------------------------------------
+# The key is derived from the repository's origin remote, normalised to an
+# absolute-looking "/owner/repo".
+#
+# Two constraints force exactly this shape:
+#   * ensure_project rejects anything Path().is_absolute() says no to, so a bare
+#     remote URL cannot be used;
+#   * the key must be byte-identical across hosts, so a checkout path cannot be
+#     used — /home/me/app, /Users/me/dev/app and C:\src\app are three projects
+#     with three mailboxes and no warning that they were ever meant to be one.
+#
+# The server has this same normalisation (PROJECT_IDENTITY_MODE=git-remote) but
+# resolves the repo on the SERVER, which a container does not have — so it
+# silently falls back to the checkout path. Doing it client-side is the same
+# idea placed on the side of the network that can actually see the repository.
+am_project_key() {
+    if [ -n "${AGENT_MAIL_PROJECT_KEY:-}" ]; then
+        printf '%s' "$AGENT_MAIL_PROJECT_KEY"
+        return 0
+    fi
+    local url
+    url="$(git rev-parse --is-inside-work-tree >/dev/null 2>&1 && git remote get-url origin 2>/dev/null)" || return 0
+    [ -z "$url" ] && return 0   # no remote -> stay silent rather than invent a key
+    printf '%s' "$url" \
+        | sed -E 's#^[a-zA-Z]+://[^/]+/#/#; s#^[^@]+@[^:]+:#/#; s#\.git$##; s#/+$##' \
+        | tr -d '\n'
+}
+
+# Repo root of the file being edited, so a worktree reserves paths comparable
+# with every other checkout. Relativising against a fixed project directory
+# would make a worktree outside it reserve an ABSOLUTE path that can never
+# string-match anyone else's reservation — conflict detection would silently
+# never fire in exactly the fan-out case it exists for.
+am_relpath() {
+    local p="$1" root
+    root="$(git -C "$(dirname "$p")" rev-parse --show-toplevel 2>/dev/null)" || root=""
+    [ -n "$root" ] && p="${p#"${root}"/}"
+    printf '%s' "${p#./}"
+}
+
+# --- agent identity ----------------------------------------------------------
+# Durable per (host, project). Concurrent sessions on one host share it, which
+# is safe: file_reservation_paths APPENDS to an agent's set rather than
+# replacing it, so siblings accumulate rather than erase. SessionEnd releases by
+# path (not wholesale) so one session's exit cannot drop another's holds.
+am_agent_name() {
+    if [ -n "${AGENT_MAIL_AGENT:-}" ]; then
+        printf '%s' "$AGENT_MAIL_AGENT"
+        return 0
+    fi
+    local h
+    h="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo host)"
+    h="$(printf '%s' "$h" | tr -cd '[:alnum:]._-' | cut -c1-64)"
+    [ -z "$h" ] && h="host"
+    # WSL reports the Windows machine name, so a WSL and a native-Windows CLI on
+    # one box would otherwise claim the same identity and the same mailbox.
+    if [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/version 2>/dev/null; then
+        h="${h}wsl"
+    fi
+    # The server rejects names resembling a program or model — and does it
+    # SILENTLY, substituting a random one (enforcement mode defaults to
+    # "coerce"). `_looks_like_model_name` matches on substring, so a hostname
+    # containing e.g. "opus" or "gemini-" would be coerced without a word.
+    printf '%s-1' "$h"
+}
 
 am_bearer() {
     if [ -n "${AGENT_MAIL_TOKEN:-}" ]; then
         printf '%s' "$AGENT_MAIL_TOKEN"
-        return
+        return 0
     fi
-    [ -n "$AM_PROJECT_DIR" ] && [ -r "${AM_PROJECT_DIR}/.env" ] \
-        && grep -m1 '^HTTP_BEARER_TOKEN=' "${AM_PROJECT_DIR}/.env" 2>/dev/null | cut -d= -f2-
+    [ -r "$HOME/.agent-mail.env" ] \
+        && grep -m1 '^HTTP_BEARER_TOKEN=' "$HOME/.agent-mail.env" 2>/dev/null | cut -d= -f2-
 }
 
-am_project_key() {
-    printf '%s' "${AGENT_MAIL_PROJECT_KEY:-}"
-}
-
-# Default identity is derived from the hostname so a given machine keeps the same
-# mailbox across sessions. Two constraints the server enforces silently:
-#   * the name must match [A-Za-z0-9][A-Za-z0-9._-]{0,127}, and
-#   * it must not LOOK like a program or model name — `_looks_like_program_name`
-#     rejects e.g. "claude-<host>", and the default enforcement mode is "coerce",
-#     which quietly substitutes a random name instead of raising. A host prefix
-#     with a numeric suffix avoids both traps.
-am_agent_name() {
-    if [ -n "${AGENT_MAIL_AGENT:-}" ]; then
-        printf '%s' "$AGENT_MAIL_AGENT"
-        return
-    fi
-    local h
-    h="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo host)"
-    h="$(printf '%s' "$h" | tr -cd '[:alnum:]._-' | cut -c1-100)"
-    [ -z "$h" ] && h="host"
-    printf '%s-1' "$h"
-}
-
-# One-shot MCP tool call against the stateless mount.
-# Usage: am_call <tool_name> <arguments_json>
-# Prints the tool's text payload on success, nothing on any failure. Never
-# returns non-zero in a way that could propagate out of a hook.
+# --- server calls ------------------------------------------------------------
+# The STATELESS mount: a one-shot JSON-RPC POST needs no initialize handshake
+# and returns in ~40ms, where the stateful /mcp mount would cost three round
+# trips and leak a session per hook invocation.
 am_call() {
     local tool="$1" args="$2" bearer body
     bearer="$(am_bearer)"
@@ -74,11 +128,21 @@ am_call() {
         | jq -r '.result.content[0].text // empty' 2>/dev/null
 }
 
+am_get() {
+    local path="$1" bearer
+    bearer="$(am_bearer)"
+    [ -z "$bearer" ] && return 0
+    curl -s --max-time "$AM_TIMEOUT" -G -H "Authorization: Bearer ${bearer}" \
+        "${@:2}" "${AM_BASE_URL}${path}" 2>/dev/null
+}
+
+# --- credential store --------------------------------------------------------
+# Re-registering an existing name REQUIRES the token the first registration
+# returned; the server will not reissue it. Losing this file orphans the
+# identity permanently, hence the atomic write.
 am_cred_get() {
-    local project="$1" agent="$2"
     [ -r "$AM_CRED_FILE" ] || return 0
-    jq -r --arg p "$project" --arg a "$agent" \
-        '.[$p][$a] // empty' "$AM_CRED_FILE" 2>/dev/null
+    jq -r --arg p "$1" --arg a "$2" '.[$p][$a] // empty' "$AM_CRED_FILE" 2>/dev/null
 }
 
 am_cred_put() {
@@ -87,12 +151,10 @@ am_cred_put() {
     mkdir -p "$AM_STATE_DIR" 2>/dev/null || return 0
     chmod 700 "$AM_STATE_DIR" 2>/dev/null
     tmp="${AM_CRED_FILE}.$$.tmp"
-    # Read-modify-write through a temp file plus rename: two hooks firing at once
-    # must not leave a truncated credential store, which would orphan the agent
-    # identity permanently (the token cannot be re-read from the server).
     if [ -r "$AM_CRED_FILE" ]; then
         jq --arg p "$project" --arg a "$agent" --arg t "$token" \
-            '.[$p] = ((.[$p] // {}) | .[$a] = $t)' "$AM_CRED_FILE" >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+            '.[$p] = ((.[$p] // {}) | .[$a] = $t)' "$AM_CRED_FILE" >"$tmp" 2>/dev/null \
+            || { rm -f "$tmp"; return 0; }
     else
         jq -n --arg p "$project" --arg a "$agent" --arg t "$token" \
             '{($p): {($a): $t}}' >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
@@ -101,19 +163,32 @@ am_cred_put() {
     mv -f "$tmp" "$AM_CRED_FILE" 2>/dev/null || rm -f "$tmp"
 }
 
-# Emit a Claude Code hook envelope. Plain stdout does not reach the model —
-# additionalContext is the only channel that surfaces in its system reminder.
+# --- per-session path log ----------------------------------------------------
+# Records what THIS session reserved, so SessionEnd can release exactly those
+# paths and leave a sibling session's holds alone. Keyed by session_id, so a new
+# session starts empty without anything having to reset it — which matters
+# because SessionStart re-fires on resume and compaction for a session that is
+# still very much alive.
+am_session_log() {
+    local key
+    key="$(printf '%s|%s' "$1" "${AM_SESSION_ID:-nosession}" | tr -cd '[:alnum:]._|-' | tr '|' '_')"
+    printf '%s/sessions/%s.list' "$AM_STATE_DIR" "$key"
+}
+
+am_session_log_add() {
+    local f; f="$(am_session_log "$1")"
+    mkdir -p "$(dirname "$f")" 2>/dev/null || return 0
+    printf '%s\n' "$2" >>"$f" 2>/dev/null
+    return 0
+}
+
+# --- output ------------------------------------------------------------------
+# Plain stdout from a hook does not reach the model; additionalContext is the
+# only channel that surfaces in its system reminder.
 am_emit_context() {
     local event="$1" text="$2" escaped
     [ -z "$text" ] && return 0
     if escaped="$(printf '%s' "$text" | jq -Rs . 2>/dev/null)" && [ -n "$escaped" ]; then
         printf '{"hookSpecificOutput":{"hookEventName":"%s","additionalContext":%s}}\n' "$event" "$escaped"
     fi
-}
-
-# Path as the server records it: relative to the project checkout.
-am_relpath() {
-    local p="$1"
-    [ -n "$AM_PROJECT_DIR" ] && p="${p#"${AM_PROJECT_DIR}"/}"
-    printf '%s' "${p#./}"
 }

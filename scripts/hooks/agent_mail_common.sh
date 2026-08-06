@@ -1,29 +1,73 @@
 # Shared plumbing for the Agent Mail hooks. Sourced, never executed.
 #
-# Designed to be installed ONCE PER MACHINE in ~/.claude/settings.json and work
-# in every repository without per-project setup. Nothing here is configured per
-# checkout: the project key is derived from the repository itself, so the same
-# repo yields the same key on Linux, WSL, native Windows and macOS.
+# Installed ONCE PER MACHINE in ~/.claude/settings.json and works in every
+# repository without per-project setup. Per-machine settings live in
+# ~/.agent-mail.env, NOT in the hook commands: repeating four environment
+# assignments across four commands is four places to forget one, and a forgotten
+# one is silent.
 #
-# Optional environment overrides:
-#   AGENT_MAIL_URL          server base URL (default http://127.0.0.1:8765)
-#   AGENT_MAIL_TOKEN        bearer token (default: HTTP_BEARER_TOKEN from ~/.agent-mail.env)
-#   AGENT_MAIL_PROJECT_KEY  force a project key instead of deriving one
-#   AGENT_MAIL_AGENT        force an identity instead of deriving one
+# ~/.agent-mail.env (mode 0600), all optional except the token:
+#   HTTP_BEARER_TOKEN=...                  server bearer
+#   AGENT_MAIL_URL=https://host            server base URL
+#   AGENT_MAIL_AGENT=name                  override the derived identity
+#   AGENT_MAIL_STATE_DIR=/path             override the credential/state location
 #
 # Every function degrades to "do nothing" on failure. A hook that errors is a
 # hook that blocks an edit.
 
+# Git Bash rewrites any argument that looks like a POSIX path into a Windows one
+# before handing it to a NATIVE binary — and jq.exe and curl.exe are native. A
+# project key of "/owner/repo" would arrive as "C:/Program Files/Git/owner/repo",
+# creating a phantom project that no other machine can ever join. Exported here
+# so the hook commands do not each have to remember it.
+case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*) export MSYS_NO_PATHCONV=1 ;;
+esac
+
+# Per-machine configuration. Parsed rather than sourced: this file is read on
+# every edit, and executing whatever it happens to contain is not a property
+# worth having. Environment always wins, so a hook command can still override.
+am_load_env() {
+    [ -n "${AM_ENV_LOADED:-}" ] && return 0
+    AM_ENV_LOADED=1
+    local f="${AGENT_MAIL_ENV_FILE:-$HOME/.agent-mail.env}" line k v
+    [ -r "$f" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in ''|'#'*) continue ;; esac
+        k="${line%%=*}"; v="${line#*=}"
+        case "$k" in
+            HTTP_BEARER_TOKEN|AGENT_MAIL_URL|AGENT_MAIL_AGENT|AGENT_MAIL_STATE_DIR|AGENT_MAIL_PROJECT_KEY)
+                # shellcheck disable=SC2163
+                [ -z "$(eval "printf '%s' \"\${$k:-}\"")" ] && export "$k=$v" ;;
+        esac
+    done < "$f"
+    return 0
+}
+am_load_env
+
 AM_TIMEOUT="${AGENT_MAIL_HOOK_TIMEOUT:-3}"
 AM_BASE_URL="${AGENT_MAIL_URL:-http://127.0.0.1:8765}"
-AM_STATE_DIR="${AGENT_MAIL_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-mail}"
+
+# On MSYS the credential store must be addressed the way jq.exe can open it.
+# $HOME there is "/c/Users/you", which a native binary cannot resolve — and the
+# failure is asymmetric and therefore vicious: the first write succeeds (bash
+# redirection handles the path) while every later read fails (jq gets it as an
+# argument). Registration works once, then the identity is unrecoverable.
+am_default_state_dir() {
+    local base="${XDG_STATE_HOME:-$HOME/.local/state}"
+    case "$(uname -s 2>/dev/null)" in
+        MINGW*|MSYS*|CYGWIN*)
+            command -v cygpath >/dev/null 2>&1 && base="$(cygpath -m "$base" 2>/dev/null || printf '%s' "$base")" ;;
+    esac
+    printf '%s/agent-mail' "$base"
+}
+AM_STATE_DIR="${AGENT_MAIL_STATE_DIR:-$(am_default_state_dir)}"
 AM_CRED_FILE="${AM_STATE_DIR}/credentials.json"
 
 # --- payload -----------------------------------------------------------------
-# Claude Code delivers the hook invocation as JSON on stdin and closes the pipe.
-# `read -d ''` consumes to EOF and is bounded by -t, which matters because GNU
-# `timeout` does not exist on a stock macOS and `timeout 2 cat` would simply
-# fail there — a hook that silently never runs on one of the machines.
+# Claude Code delivers the invocation as JSON on stdin and closes the pipe.
+# `read -d ''` consumes to EOF, bounded by -t: GNU `timeout` does not exist on a
+# stock macOS, where `timeout 2 cat` would simply fail and the hook never run.
 am_read_payload() {
     AM_PAYLOAD=""
     [ -t 0 ] && return 0
@@ -35,123 +79,144 @@ am_payload_field() {
     printf '%s' "${AM_PAYLOAD:-}" | jq -r "$1 // empty" 2>/dev/null
 }
 
+# --- paths -------------------------------------------------------------------
+# Claude Code does not normalise the paths a model supplies, so on Windows they
+# arrive with backslashes. Everything downstream — git, the server, string
+# comparison against another agent's reservation — expects forward slashes.
+am_norm_path() {
+    # Guarded on a drive letter: a backslash is a legal character in a POSIX
+    # filename and must survive untouched there. Only a Windows-style absolute
+    # path is rewritten.
+    case "$1" in
+        [A-Za-z]:[\\/]*) printf '%s' "${1//\\//}" ;;
+        *)                 printf '%s' "$1" ;;
+    esac
+}
+
+am_git() {
+    git -C "$1" "${@:2}" 2>/dev/null
+}
+
 # --- project identity --------------------------------------------------------
-# The key is derived from the repository's origin remote, normalised to an
-# absolute-looking "/owner/repo".
+# Derived from the repository's origin remote, normalised to "/owner/repo".
 #
-# Two constraints force exactly this shape:
-#   * ensure_project rejects anything Path().is_absolute() says no to, so a bare
-#     remote URL cannot be used;
-#   * the key must be byte-identical across hosts, so a checkout path cannot be
-#     used — /home/me/app, /Users/me/dev/app and C:\src\app are three projects
-#     with three mailboxes and no warning that they were ever meant to be one.
-#
-# The server has this same normalisation (PROJECT_IDENTITY_MODE=git-remote) but
-# resolves the repo on the SERVER, which a container does not have — so it
-# silently falls back to the checkout path. Doing it client-side is the same
-# idea placed on the side of the network that can actually see the repository.
-am_project_key() {
-    if [ -n "${AGENT_MAIL_PROJECT_KEY:-}" ]; then
-        printf '%s' "$AGENT_MAIL_PROJECT_KEY"
-        return 0
-    fi
-    local url
-    url="$(git rev-parse --is-inside-work-tree >/dev/null 2>&1 && git remote get-url origin 2>/dev/null)" || return 0
-    [ -z "$url" ] && return 0   # no remote -> stay silent rather than invent a key
-    printf '%s' "$url" \
+# ensure_project rejects any key that is not Path().is_absolute(), so a bare
+# remote URL cannot be used; and the key must be byte-identical across hosts, so
+# a checkout path cannot be used — /home/me/app, /Users/me/dev/app and C:\src\app
+# are three projects with three mailboxes and nothing saying they were meant to
+# be one.
+am_normalize_remote() {
+    printf '%s' "$1" \
         | sed -E 's#^[a-zA-Z]+://[^/]+/#/#; s#^[^@]+@[^:]+:#/#; s#\.git$##; s#/+$##' \
         | tr -d '\n'
 }
 
-# For the edit hooks the project must come from the REPOSITORY THAT OWNS THE
-# FILE, not from the session's working directory. Those differ more often than
-# it looks: a scratch file under /tmp, a note outside the tree, a file opened
-# from a second repository. Keying on the working directory files such an edit
-# under the wrong project and — with no git root to relativise against — under
-# an absolute path that can never string-match anyone else's reservation. The
-# result is a permanent phantom hold on a path nobody will ever ask about.
-# (Observed in practice: a scratchpad file under /tmp reserved into this repo's
-# project, which is what prompted splitting this out.)
-am_project_key_for_file() {
-    if [ -n "${AGENT_MAIL_PROJECT_KEY:-}" ]; then
-        printf '%s' "$AGENT_MAIL_PROJECT_KEY"
-        return 0
-    fi
-    local d url p
-    p="$1"
-    # Claude Code hands over file_path exactly as the model wrote it, and on native
-    # Windows that means backslashes. dirname then sees no separator at all, answers
-    # ".", and the edit gets keyed on the session's working directory — precisely the
-    # substitution this function exists to prevent. Guarded on a drive letter because
-    # a backslash is a legal character in a POSIX filename and must survive there.
-    case "$p" in [A-Za-z]:[\\/]*) p="${p//\\//}" ;; esac
-    d="$(dirname "$p")"
-    url="$(git -C "$d" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
-           && git -C "$d" remote get-url origin 2>/dev/null)" || return 0
+am_project_key() {
+    [ -n "${AGENT_MAIL_PROJECT_KEY:-}" ] && { printf '%s' "$AGENT_MAIL_PROJECT_KEY"; return 0; }
+    local url
+    url="$(git rev-parse --is-inside-work-tree >/dev/null 2>&1 && git remote get-url origin 2>/dev/null)" || return 0
     [ -z "$url" ] && return 0
-    printf '%s' "$url" \
-        | sed -E 's#^[a-zA-Z]+://[^/]+/#/#; s#^[^@]+@[^:]+:#/#; s#\.git$##; s#/+$##' \
-        | tr -d '\n'
+    am_normalize_remote "$url"
+}
+
+# For the edit hooks the project must come from the repository that OWNS THE
+# FILE, not the working directory. Those differ more often than it looks — a
+# scratch file under /tmp, a file opened from a second repository — and keying on
+# the working directory files the edit under the wrong project, at an absolute
+# path that can never match anyone else's reservation.
+am_project_key_for_file() {
+    [ -n "${AGENT_MAIL_PROJECT_KEY:-}" ] && { printf '%s' "$AGENT_MAIL_PROJECT_KEY"; return 0; }
+    local d url
+    d="$(dirname "$(am_norm_path "$1")")"
+    url="$(am_git "$d" rev-parse --is-inside-work-tree >/dev/null && am_git "$d" remote get-url origin)" || return 0
+    [ -z "$url" ] && return 0
+    am_normalize_remote "$url"
 }
 
 # Path relative to the git top-level of the file itself, so a worktree reserves
 # something comparable with every other checkout. Yields nothing when the file
-# lies outside a repository: reserving an absolute path is worse than not
-# reserving at all, because it looks like protection and can never match.
+# lies outside a repository: an absolute reservation looks like protection and
+# can never match.
 am_relpath() {
-    local p="$1" root
-    # Same reason as above, plus one of its own: git reports the top level with
-    # forward slashes, so a backslash path never matches the prefix, survives the
-    # "still absolute" check (it does not begin with /) and is reserved verbatim as
-    # "D:\repo\file". That looks like protection and can never match the "file" a
-    # checkout on any other machine reserves.
-    case "$p" in [A-Za-z]:[\\/]*) p="${p//\\//}" ;; esac
-    root="$(git -C "$(dirname "$p")" rev-parse --show-toplevel 2>/dev/null)" || return 0
+    local p root
+    p="$(am_norm_path "$1")"
+    root="$(am_git "$(dirname "$p")" rev-parse --show-toplevel)" || return 0
     [ -z "$root" ] && return 0
+    root="$(am_norm_path "$root")"
     p="${p#"${root}"/}"
-    case "$p" in /*) return 0 ;; esac   # still absolute -> outside that root
+    case "$p" in /*|?:/*) return 0 ;; esac   # still absolute -> outside that root
     printf '%s' "${p#./}"
 }
 
 # --- agent identity ----------------------------------------------------------
-# Durable per (host, project). Concurrent sessions on one host share it, which
-# is safe: file_reservation_paths APPENDS to an agent's set rather than
-# replacing it, so siblings accumulate rather than erase. SessionEnd releases by
-# path (not wholesale) so one session's exit cannot drop another's holds.
+# <host>-<platform>-1. The platform token comes from uname, which is the only
+# thing that separates the three cases that otherwise collide: WSL and native
+# Windows report the SAME hostname, and nothing else distinguishes a mac.
+am_platform() {
+    case "$(uname -s 2>/dev/null)" in
+        Darwin)               printf 'mac' ;;
+        MINGW*|MSYS*|CYGWIN*) printf 'win' ;;
+        Linux)
+            if [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/version 2>/dev/null; then
+                printf 'wsl'
+            else
+                printf 'linux'
+            fi ;;
+        *) printf '%s' "$(uname -s 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]' | cut -c1-8)" ;;
+    esac
+}
+
 am_agent_name() {
-    if [ -n "${AGENT_MAIL_AGENT:-}" ]; then
-        printf '%s' "$AGENT_MAIL_AGENT"
-        return 0
+    [ -n "${AGENT_MAIL_AGENT:-}" ] && { printf '%s' "$AGENT_MAIL_AGENT"; return 0; }
+    local h p
+    # macOS derives `hostname` from DHCP/reverse DNS, so a laptop that changes
+    # network changes identity — and an identity change orphans the mailbox and
+    # every reservation under the old name. LocalHostName is user-set and stays
+    # put.
+    h=""
+    if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+        # macOS keeps three independent names and `hostname` reflects none of
+        # them persistently: with HostName unset it takes kern.hostname from DHCP
+        # option 12 or reverse DNS, falling back to LocalHostName off-network.
+        # A laptop that changes network therefore changes identity — and the new
+        # name has no entry in the credential store, so autoreserve and
+        # session_end quietly start exiting 0 without doing anything. Observed:
+        # the same machine reports a LAN-derived FQDN on one network and its
+        # on-disk LocalHostName on another.
+        #
+        # HostName first because it is the one an operator can pin
+        # (`sudo scutil --set HostName <name>`), LocalHostName second because it
+        # is at least written to disk. Plain `hostname` is the last resort.
+        h="$(scutil --get HostName 2>/dev/null || true)"
+        [ -z "$h" ] && h="$(scutil --get LocalHostName 2>/dev/null || true)"
     fi
-    local h
-    h="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo host)"
-    h="$(printf '%s' "$h" | tr -cd '[:alnum:]._-' | cut -c1-64)"
+    # The `||` chain is load-bearing, not decoration: Git Bash ships GNU
+    # coreutils' hostname, which has no -s at all (that flag belongs to
+    # net-tools) and exits 1. Without the fallback there would be no name on
+    # Windows whatsoever.
+    [ -z "$h" ] && h="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo host)"
+    # Lowercased deliberately. The server treats agent names as case-insensitively
+    # unique, and $COMPUTERNAME on Windows reports HOME where `hostname` reports
+    # home — two derivations of one machine that would collide as "already in
+    # use", which in the default coerce mode is answered with a silent random
+    # rename rather than an error.
+    h="$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]._-' | cut -c1-48)"
     [ -z "$h" ] && h="host"
-    # WSL reports the Windows machine name, so a WSL and a native-Windows CLI on
-    # one box would otherwise claim the same identity and the same mailbox.
-    if [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/version 2>/dev/null; then
-        h="${h}wsl"
-    fi
-    # The server rejects names resembling a program or model — and does it
-    # SILENTLY, substituting a random one (enforcement mode defaults to
-    # "coerce"). `_looks_like_model_name` matches on substring, so a hostname
-    # containing e.g. "opus" or "gemini-" would be coerced without a word.
-    printf '%s-1' "$h"
+    p="$(am_platform)"; [ -z "$p" ] && p="unknown"
+    # The server silently replaces a name resembling a program or model with a
+    # random one — `_looks_like_model_name` matches on substring — so keep the
+    # shape boring and verify any new platform token before adding it.
+    printf '%s-%s-1' "$h" "$p"
 }
 
 am_bearer() {
-    if [ -n "${AGENT_MAIL_TOKEN:-}" ]; then
-        printf '%s' "$AGENT_MAIL_TOKEN"
-        return 0
-    fi
-    [ -r "$HOME/.agent-mail.env" ] \
-        && grep -m1 '^HTTP_BEARER_TOKEN=' "$HOME/.agent-mail.env" 2>/dev/null | cut -d= -f2-
+    printf '%s' "${AGENT_MAIL_TOKEN:-${HTTP_BEARER_TOKEN:-}}"
 }
 
 # --- server calls ------------------------------------------------------------
-# The STATELESS mount: a one-shot JSON-RPC POST needs no initialize handshake
-# and returns in ~40ms, where the stateful /mcp mount would cost three round
-# trips and leak a session per hook invocation.
+# The STATELESS mount: a one-shot JSON-RPC POST needs no initialize handshake and
+# returns in ~40ms, where the stateful /mcp mount would cost three round trips
+# and leak a session per hook invocation.
 am_call() {
     local tool="$1" args="$2" bearer body
     bearer="$(am_bearer)"
@@ -176,8 +241,8 @@ am_get() {
 
 # --- credential store --------------------------------------------------------
 # Re-registering an existing name REQUIRES the token the first registration
-# returned; the server will not reissue it. Losing this file orphans the
-# identity permanently, hence the atomic write.
+# returned; the server will not reissue it. Losing this file orphans the identity
+# permanently, hence the atomic write.
 am_cred_get() {
     [ -r "$AM_CRED_FILE" ] || return 0
     jq -r --arg p "$1" --arg a "$2" '.[$p][$a] // empty' "$AM_CRED_FILE" 2>/dev/null
@@ -202,15 +267,18 @@ am_cred_put() {
 }
 
 # --- per-session path log ----------------------------------------------------
-# Records what THIS session reserved, so SessionEnd can release exactly those
-# paths and leave a sibling session's holds alone. Keyed by session_id, so a new
-# session starts empty without anything having to reset it — which matters
-# because SessionStart re-fires on resume and compaction for a session that is
-# still very much alive.
+# Records what THIS session reserved, so SessionEnd releases exactly those paths
+# and leaves a sibling session's holds alone. Keyed by session AND project: a
+# session can edit files in more than one repository, and SessionEnd must find
+# every log it wrote — looking under only the working directory's project would
+# silently strand the rest.
+am_session_slug() {
+    printf '%s' "$1" | tr -cd '[:alnum:]._-' | cut -c1-64
+}
+
 am_session_log() {
-    local key
-    key="$(printf '%s|%s' "$1" "${AM_SESSION_ID:-nosession}" | tr -cd '[:alnum:]._|-' | tr '|' '_')"
-    printf '%s/sessions/%s.list' "$AM_STATE_DIR" "$key"
+    printf '%s/sessions/%s__%s.list' "$AM_STATE_DIR" \
+        "$(am_session_slug "${AM_SESSION_ID:-nosession}")" "$(am_session_slug "$1")"
 }
 
 am_session_log_add() {
@@ -218,6 +286,14 @@ am_session_log_add() {
     mkdir -p "$(dirname "$f")" 2>/dev/null || return 0
     printf '%s\n' "$2" >>"$f" 2>/dev/null
     return 0
+}
+
+# Every log this session wrote, across all repositories it touched.
+am_session_logs() {
+    local dir="${AM_STATE_DIR}/sessions"
+    [ -d "$dir" ] || return 0
+    find "$dir" -maxdepth 1 -type f \
+        -name "$(am_session_slug "${AM_SESSION_ID:-nosession}")__*.list" 2>/dev/null
 }
 
 # --- output ------------------------------------------------------------------

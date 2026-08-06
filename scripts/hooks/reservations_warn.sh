@@ -76,7 +76,29 @@ holder="$(printf '%s' "$body" | grep -oE '"agent"[[:space:]]*:[[:space:]]*"[^"]*
 reason="$(printf '%s' "$body" | grep -oE '"reason"[[:space:]]*:[[:space:]]*"[^"]*"' \
           | head -1 | sed -E 's/.*"([^"]*)"$/\1/')"
 
-printf 'Agent Mail: %s is reserved by %s%s\n' \
-    "$rel" "${holder:-another agent}" "${reason:+ (${reason})}"
-printf 'Coordinate before editing: %s/mail\n' "${AGENT_MAIL_PUBLIC_URL:-$BASE_URL}"
+warning="$(printf 'Agent Mail: %s is reserved by %s%s. Coordinate before editing — see %s/mail' \
+    "$rel" "${holder:-another agent}" "${reason:+ (${reason})}" \
+    "${AGENT_MAIL_PUBLIC_URL:-$BASE_URL}")"
+
+# The warning MUST leave through the hookSpecificOutput envelope. Plain stdout
+# from a hook does not reach the model — it lands in the human's terminal (or,
+# for PreToolUse, only the debug log), which means a warning printed the obvious
+# way is delivered to nobody. `additionalContext` is the one channel that
+# surfaces in the agent's system reminder. Upstream's own scripts/hooks/
+# check_inbox.sh documents the same trap in its header.
+#
+# Note this is advisory, not `permissionDecision: "deny"`. Blocking would turn a
+# server outage into an uneditable repository, and the reservations are advisory
+# by design. Denial is worth revisiting only if agents are observed ignoring the
+# warning, and then only for confirmed-active exclusive conflicts.
+if escaped="$(printf '%s' "$warning" \
+        | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null)" \
+   && [ -n "$escaped" ]; then
+    printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":%s}}\n' "$escaped"
+else
+    # No python3, or escaping failed. Emitting unescaped text here would produce
+    # malformed JSON, which is worse than silence: stay quiet rather than risk
+    # the harness rejecting the hook output.
+    printf '%s\n' "$warning"
+fi
 exit 0

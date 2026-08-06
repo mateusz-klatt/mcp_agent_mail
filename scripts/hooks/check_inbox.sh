@@ -88,9 +88,9 @@ AGENT_JSON=$(json_escape "${AGENT}")
 # args shape stays backward-compatible with servers that don't enforce it.
 if [[ -n "${REG_TOKEN}" ]]; then
   REG_TOKEN_JSON=$(json_escape "${REG_TOKEN}")
-  ARGS_JSON="{\"project_key\":${PROJECT_JSON},\"agent_name\":${AGENT_JSON},\"registration_token\":${REG_TOKEN_JSON},\"limit\":10,\"include_bodies\":false}"
+  ARGS_JSON="{\"project_key\":${PROJECT_JSON},\"agent_name\":${AGENT_JSON},\"registration_token\":${REG_TOKEN_JSON},\"limit\":10,\"include_bodies\":false,\"unread_only\":true}"
 else
-  ARGS_JSON="{\"project_key\":${PROJECT_JSON},\"agent_name\":${AGENT_JSON},\"limit\":10,\"include_bodies\":false}"
+  ARGS_JSON="{\"project_key\":${PROJECT_JSON},\"agent_name\":${AGENT_JSON},\"limit\":10,\"include_bodies\":false,\"unread_only\":true}"
 fi
 
 # Build curl command with proper auth

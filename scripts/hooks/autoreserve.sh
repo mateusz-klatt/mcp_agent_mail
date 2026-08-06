@@ -27,7 +27,8 @@ target="$(am_payload_field '.tool_input.file_path')"
 [ -z "$target" ] && target="$(am_payload_field '.tool_input.notebook_path')"
 [ -z "$target" ] && exit 0
 
-PROJECT="$(am_project_key)"
+# Project of the FILE, not of the working directory — see am_relpath.
+PROJECT="$(am_project_key_for_file "$target")"
 [ -z "$PROJECT" ] && exit 0
 AGENT="$(am_agent_name)"
 

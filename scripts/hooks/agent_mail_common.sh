@@ -63,15 +63,40 @@ am_project_key() {
         | tr -d '\n'
 }
 
-# Repo root of the file being edited, so a worktree reserves paths comparable
-# with every other checkout. Relativising against a fixed project directory
-# would make a worktree outside it reserve an ABSOLUTE path that can never
-# string-match anyone else's reservation — conflict detection would silently
-# never fire in exactly the fan-out case it exists for.
+# For the edit hooks the project must come from the REPOSITORY THAT OWNS THE
+# FILE, not from the session's working directory. Those differ more often than
+# it looks: a scratch file under /tmp, a note outside the tree, a file opened
+# from a second repository. Keying on the working directory files such an edit
+# under the wrong project and — with no git root to relativise against — under
+# an absolute path that can never string-match anyone else's reservation. The
+# result is a permanent phantom hold on a path nobody will ever ask about.
+# (Observed in practice: a scratchpad file under /tmp reserved into this repo's
+# project, which is what prompted splitting this out.)
+am_project_key_for_file() {
+    if [ -n "${AGENT_MAIL_PROJECT_KEY:-}" ]; then
+        printf '%s' "$AGENT_MAIL_PROJECT_KEY"
+        return 0
+    fi
+    local d url
+    d="$(dirname "$1")"
+    url="$(git -C "$d" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+           && git -C "$d" remote get-url origin 2>/dev/null)" || return 0
+    [ -z "$url" ] && return 0
+    printf '%s' "$url" \
+        | sed -E 's#^[a-zA-Z]+://[^/]+/#/#; s#^[^@]+@[^:]+:#/#; s#\.git$##; s#/+$##' \
+        | tr -d '\n'
+}
+
+# Path relative to the git top-level of the file itself, so a worktree reserves
+# something comparable with every other checkout. Yields nothing when the file
+# lies outside a repository: reserving an absolute path is worse than not
+# reserving at all, because it looks like protection and can never match.
 am_relpath() {
     local p="$1" root
-    root="$(git -C "$(dirname "$p")" rev-parse --show-toplevel 2>/dev/null)" || root=""
-    [ -n "$root" ] && p="${p#"${root}"/}"
+    root="$(git -C "$(dirname "$p")" rev-parse --show-toplevel 2>/dev/null)" || return 0
+    [ -z "$root" ] && return 0
+    p="${p#"${root}"/}"
+    case "$p" in /*) return 0 ;; esac   # still absolute -> outside that root
     printf '%s' "${p#./}"
 }
 

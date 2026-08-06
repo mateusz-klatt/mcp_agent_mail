@@ -2248,7 +2248,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 # for the plain-prefix style ("src/mcp_agent_mail").
                 from fnmatch import fnmatch
 
-                needle = path.lstrip("./")
+                # str.lstrip takes a SET of characters, not a prefix: ".gitignore"
+                # would become "gitignore" and ".github/workflows/ci.yml" would
+                # become "github/...". Every dot-prefixed path — .github, .claude,
+                # .beads, .env — could then never match a stored pattern, so the
+                # pre-edit warning was silently dead for exactly the files a
+                # coordination layer most wants to protect.
+                needle = path[2:] if path.startswith("./") else path.lstrip("/")
                 items = [
                     i
                     for i in items

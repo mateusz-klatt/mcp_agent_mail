@@ -52,8 +52,12 @@ am_session_log_add "$PROJECT" "$rel"
 
 # Speak only on conflict. Announcing every successful self-reservation would put
 # a line in the model's context on each edit, which is how a signal becomes noise.
+# The holder is nested: the server returns {path, holders:[{agent,…}]}
+# (app.py:11264). Reading .agent at the top level yielded null and fell back to
+# "another agent" — so in the one moment a conflict is real, the message did not
+# say who to talk to, which is the only thing it exists to convey.
 conflicts="$(printf '%s' "$resp" | jq -r \
-    '[.conflicts[]? | "\(.path_pattern // .path) held by \(.agent // .agent_name // "another agent")"] | join("; ")' 2>/dev/null)"
+    '[.conflicts[]? as $c | ($c.holders[]? // {}) | "\($c.path) held by \(.agent // "another agent")"] | unique | join("; ")' 2>/dev/null)"
 if [ -n "$conflicts" ] && [ "$conflicts" != "null" ]; then
     am_emit_context "PostToolUse" \
         "Agent Mail: you just edited a file reserved by someone else — ${conflicts}. Coordinate before continuing."

@@ -221,7 +221,17 @@ am_call() {
     local tool="$1" args="$2" bearer body
     bearer="$(am_bearer)"
     [ -z "$bearer" ] && return 0
-    body="$(jq -nc --arg t "$tool" --argjson a "$args" \
+    # -a escapes every non-ASCII character to \uXXXX. Raw UTF-8 bytes in the POST
+    # body make the stateless mount answer 500 ("Error handling POST request"),
+    # with or without charset=utf-8 on the Content-Type; the same request escaped
+    # returns 200. Escaping here covers every caller: whatever they built with
+    # `jq -c` is re-parsed by --argjson and re-emitted ASCII-only.
+    #
+    # Worth doing even though the hooks themselves only ever send file paths and
+    # agent names: the 500 arrives as an empty result below, indistinguishable
+    # from "nothing to report", so an agent sending a non-English message loses
+    # it with no error anywhere.
+    body="$(jq -nac --arg t "$tool" --argjson a "$args" \
         '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:$t,arguments:$a}}' 2>/dev/null)" || return 0
     curl -s --max-time "$AM_TIMEOUT" -X POST "${AM_BASE_URL}/api/" \
         -H "Authorization: Bearer ${bearer}" \

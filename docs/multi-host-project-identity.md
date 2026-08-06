@@ -40,22 +40,41 @@ the same filesystem namespace, as the agents.
 
 ## The fix: one canonical key, agreed out of band
 
-Every host must pass the **same literal string**. It does not need to be a path,
-and it is better if it is not one. Use the repository's remote URL — globally
-unique, identical everywhere, and self-documenting:
+Every host must pass the **same literal string**, and that string must be
+*path-shaped*: `ensure_project` rejects anything for which
+`Path(human_key).is_absolute()` is false (`app.py:5890`). A git remote URL —
+the otherwise obvious choice for a machine-independent identifier — is refused
+outright.
+
+It does not, however, have to be a path that exists. The code is explicit
+(`app.py:5889`): *"It need not exist on disk — it is an opaque project KEY, not
+a filesystem probe."* So use a **synthetic** absolute path, deliberately one
+that is not anybody's real checkout, so that nobody helpfully "corrects" it to
+their own working directory:
 
 ```
-project_key = "git@github.com:owner/repo.git"
+AGENT_MAIL_PROJECT_KEY=/owner/repo
 ```
 
-Set it once per host so no agent has to guess:
+Mirroring the `owner/repo` of the remote keeps it unique and self-explanatory
+while remaining identical on Linux, macOS and Windows. Note the check runs on
+the server, so a POSIX-style leading slash is correct even for Windows clients.
 
-```
-AGENT_MAIL_PROJECT_KEY=git@github.com:owner/repo.git
-```
+State it in the project's `CLAUDE.md` / `AGENTS.md` as well, so an agent reading
+its instructions uses it verbatim rather than substituting its own cwd.
 
-and state it in the project's `CLAUDE.md` / `AGENTS.md` so every agent uses it
-verbatim rather than substituting its own working directory.
+## Agent names have a matching trap
+
+Names are unique per project and an existing identity can only be re-registered
+by presenting the `registration_token` from its first registration — so the
+token is a durable credential worth persisting, not session state.
+
+Less obviously: a requested name that looks like a program or model name is
+**silently replaced** with a random one rather than rejected. The check is
+`_looks_like_program_name(...) or _looks_like_model_name(...)` (`app.py:3272`),
+and the default enforcement mode is `coerce`, which falls through to
+auto-generation instead of raising. `claude-<host>` therefore does not do what
+it appears to do; `<host>-1` does.
 
 ## Verifying
 

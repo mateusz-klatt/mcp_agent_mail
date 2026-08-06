@@ -111,6 +111,23 @@ class CorsSettings:
 
 
 @dataclass(slots=True, frozen=True)
+class MailUiSettings:
+    """Password login for the ``/mail`` web viewer.
+
+    Off unless ``MAIL_UI_SESSION_SECRET`` is set — an empty secret means auth is
+    unavailable, and ``enabled`` then means "refuse to serve /mail" rather than
+    "serve it to everyone". Failing closed matters here because the UI carries
+    destructive POST routes.
+    """
+
+    enabled: bool
+    session_secret: str
+    cookie_secure: bool
+    cookie_name: str
+    session_ttl_seconds: int
+
+
+@dataclass(slots=True, frozen=True)
 class LlmSettings:
     """LiteLLM-related settings and defaults."""
 
@@ -193,6 +210,7 @@ class Settings:
     database: DatabaseSettings
     storage: StorageSettings
     cors: CorsSettings
+    mail_ui: MailUiSettings
     llm: LlmSettings
     tool_filter: ToolFilterSettings
     notifications: NotificationSettings
@@ -458,6 +476,20 @@ def _build_settings() -> Settings:
         allow_headers=_csv("HTTP_CORS_ALLOW_HEADERS", default="*"),
     )
 
+    # Login for the /mail viewer. The secret is the master switch: no secret, no
+    # signed cookies, so the UI cannot be served safely and is refused outright.
+    # Default the Secure cookie flag on in production, because a session cookie
+    # that leaks over plaintext is the whole compromise.
+    _mail_ui_secret = decouple_config("MAIL_UI_SESSION_SECRET", default="").strip()
+    mail_ui_settings = MailUiSettings(
+        enabled=_b("MAIL_UI_AUTH_ENABLED", default=True),
+        session_secret=_mail_ui_secret,
+        cookie_secure=_b("MAIL_UI_COOKIE_SECURE", default=environment.lower() != "development"),
+        cookie_name=decouple_config("MAIL_UI_COOKIE_NAME", default="agent_mail_session").strip()
+        or "agent_mail_session",
+        session_ttl_seconds=_i("MAIL_UI_SESSION_TTL_SECONDS", default=14 * 24 * 3600),
+    )
+
     def _float(value: str, *, default: float, key: str) -> float:
         text = str(value or "").strip()
         # Empty/unset → legitimate fallback to default.
@@ -539,6 +571,7 @@ def _build_settings() -> Settings:
         database=database_settings,
         storage=storage_settings,
         cors=cors_settings,
+        mail_ui=mail_ui_settings,
         llm=llm_settings,
         tool_filter=tool_filter_settings,
         notifications=notification_settings,

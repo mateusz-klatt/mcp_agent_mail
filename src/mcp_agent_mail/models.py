@@ -201,6 +201,32 @@ class MessageSummary(SQLModel, table=True):
     created_ts: datetime = Field(default_factory=_utcnow_naive)
 
 
+class UiUser(SQLModel, table=True):
+    """A human login for the ``/mail`` web viewer.
+
+    Deliberately separate from :class:`Agent`: agents authenticate with a bearer
+    token or a per-agent registration token over MCP, humans authenticate with a
+    password in a browser. Conflating them would give every registered agent a
+    way into the destructive UI routes.
+
+    ``session_epoch`` is bumped whenever the password changes or the account is
+    disabled. It is embedded in the signed session cookie and compared on every
+    request, so those actions revoke live sessions immediately without a
+    server-side session table (see :mod:`mcp_agent_mail.webauth`).
+    """
+
+    __tablename__ = "ui_users"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    username: str = Field(index=True, unique=True, max_length=64)
+    password_hash: str = Field(max_length=256)
+    role: str = Field(default="viewer", max_length=16)  # admin | viewer
+    disabled: bool = Field(default=False)
+    session_epoch: int = Field(default=1)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+    last_login_ts: Optional[datetime] = Field(default=None)
+
+
 class ProjectSiblingSuggestion(SQLModel, table=True):
     """LLM-ranked sibling project suggestion (undirected pair)."""
 

@@ -39,6 +39,7 @@ from .app import (
     sweep_stale_agents,
     update_project_sibling_status,
 )
+from . import webauth
 from .config import Settings, get_settings
 from .db import ensure_schema, get_session
 from .storage import (
@@ -702,6 +703,13 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         if request.url.path.startswith("/health/") or request.url.path == "/api/health":
             return await call_next(request)
+        # MailUiAuthMiddleware sits OUTSIDE this one and has already rendered a
+        # verdict for /mail: either it authenticated a browser session (and set
+        # this flag) or it redirected to the login page. Re-checking the bearer
+        # here would 401 every logged-in human, since a browser cannot attach an
+        # Authorization header to an ordinary navigation.
+        if getattr(request.state, "mail_ui_authenticated", False):
+            return await call_next(request)
         if _localhost_bypass_allowed(
             request,
             allow_localhost=self._allow_localhost,
@@ -731,6 +739,190 @@ def _localhost_bypass_allowed(request: Request, *, allow_localhost: bool) -> boo
     return BearerAuthMiddleware._is_localhost(client_host) and not BearerAuthMiddleware._has_forwarded_headers(
         request
     )
+
+
+# Paths under the /mail prefix that must remain reachable without a session,
+# otherwise there is no way to obtain one.
+_MAIL_LOGIN_PATH = "/mail/login"
+_MAIL_LOGOUT_PATH = "/mail/logout"
+_UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+# Login brute-force throttle, keyed by client address. scrypt already caps an
+# attacker at roughly 20 guesses/second/core, but that is still ~1.7M/day against
+# a weak password, so cap it properly. In-process state is sufficient and correct
+# here precisely because this server must run as a single process anyway (stateful
+# MCP sessions live in memory too) — there is no second worker to share it with.
+_LOGIN_MAX_FAILURES = 8
+_LOGIN_WINDOW_SECONDS = 300.0
+_login_failures: dict[str, list[float]] = {}
+
+
+def _login_throttled(client: str) -> bool:
+    import time
+
+    now = time.time()
+    recent = [t for t in _login_failures.get(client, []) if now - t < _LOGIN_WINDOW_SECONDS]
+    if recent:
+        _login_failures[client] = recent
+    else:
+        _login_failures.pop(client, None)
+    return len(recent) >= _LOGIN_MAX_FAILURES
+
+
+def _login_record_failure(client: str) -> None:
+    import time
+
+    now = time.time()
+    bucket = [t for t in _login_failures.get(client, []) if now - t < _LOGIN_WINDOW_SECONDS]
+    bucket.append(now)
+    _login_failures[client] = bucket
+    # Bound the dict so a spray across forged client addresses cannot grow it
+    # without limit. Behind this deployment's proxy every client looks like
+    # 127.0.0.1 anyway, but the server is not required to run behind one.
+    if len(_login_failures) > 4096:
+        stale = [k for k, v in _login_failures.items() if not v or now - v[-1] > _LOGIN_WINDOW_SECONDS]
+        for k in stale:
+            _login_failures.pop(k, None)
+
+
+def _login_clear_failures(client: str) -> None:
+    _login_failures.pop(client, None)
+
+
+class MailUiAuthMiddleware(BaseHTTPMiddleware):
+    """Password-session auth for the ``/mail`` viewer.
+
+    Installed OUTSIDE :class:`BearerAuthMiddleware` so it renders the verdict for
+    ``/mail`` first. That ordering is the whole point: a browser cannot attach an
+    ``Authorization`` header to a normal navigation, so if the bearer middleware
+    saw these requests first every human would get a bare 401 with nowhere to log
+    in. Requests outside ``/mail`` are passed straight through untouched — the MCP
+    mounts keep their bearer-only behaviour exactly as before.
+
+    Three ways a ``/mail`` request may proceed:
+
+    1. A valid session cookie. The user row is re-read on every request, so
+       ``disabled`` and ``session_epoch`` changes take effect immediately rather
+       than whenever the cookie happens to expire.
+    2. An ``Authorization`` header. Left for the bearer middleware to validate,
+       which keeps ``curl``/CLI access to the UI's JSON routes working.
+    3. The login and logout endpoints themselves.
+
+    Anything else is redirected to the login page (for navigations) or answered
+    401 (for anything expecting JSON).
+
+    State-changing requests carry two extra requirements, because the UI exposes
+    genuinely destructive routes (delete-messages, retire-agent, archive-project,
+    overseer/send): the session must belong to an ``admin``, and the request must
+    be same-origin. Combined with the ``SameSite=Lax`` cookie, a cross-site POST
+    is blocked by the browser and again by the server.
+    """
+
+    def __init__(self, app: FastAPI, settings: Settings) -> None:
+        super().__init__(app)
+        self._settings = settings
+
+    @staticmethod
+    def _wants_html(request: Request) -> bool:
+        """Whether to answer with a redirect to the login page rather than JSON."""
+        if request.method != "GET":
+            return False
+        return "text/html" in request.headers.get("accept", "")
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
+        path = request.url.path
+        if not (path == "/mail" or path.startswith("/mail/")):
+            return await call_next(request)
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
+        cfg = self._settings.mail_ui
+        if not cfg.enabled:
+            # Auth explicitly switched off: fall through to the bearer middleware,
+            # which is then the only thing standing in front of the UI.
+            return await call_next(request)
+        if not cfg.session_secret:
+            # Fail closed. An unset secret cannot sign cookies, and serving the
+            # destructive UI unauthenticated is never the safer default.
+            return JSONResponse(
+                {"detail": "Mail UI authentication is unconfigured (MAIL_UI_SESSION_SECRET is empty)."},
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        if path in (_MAIL_LOGIN_PATH, _MAIL_LOGOUT_PATH):
+            request.state.mail_ui_authenticated = True  # let the bearer layer stand aside
+            return await call_next(request)
+
+        token = request.cookies.get(cfg.cookie_name, "")
+        user = await _load_session_user(token, settings=self._settings) if token else None
+
+        if user is None:
+            if request.headers.get("Authorization", "").startswith("Bearer "):
+                # An API client: hand it to the bearer middleware unchanged.
+                return await call_next(request)
+            if self._wants_html(request):
+                target = request.url.path
+                if request.url.query:
+                    target = f"{target}?{request.url.query}"
+                from urllib.parse import quote
+
+                return Response(
+                    status_code=status.HTTP_303_SEE_OTHER,
+                    headers={"Location": f"{_MAIL_LOGIN_PATH}?next={quote(target, safe='')}"},
+                )
+            return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
+
+        if request.method in _UNSAFE_METHODS:
+            if not webauth.same_origin(
+                request.headers.get("origin", ""),
+                request.headers.get("referer", ""),
+                request.headers.get("host", ""),
+            ):
+                return JSONResponse(
+                    {"detail": "Cross-origin request rejected"}, status_code=status.HTTP_403_FORBIDDEN
+                )
+            if user["role"] != webauth.ROLE_ADMIN:
+                return JSONResponse(
+                    {"detail": "Forbidden: this action requires the admin role"},
+                    status_code=status.HTTP_403_FORBIDDEN,
+                )
+
+        request.state.mail_ui_authenticated = True
+        request.state.mail_ui_user = user
+        return await call_next(request)
+
+
+async def _load_session_user(token: str, *, settings: Settings) -> "dict[str, Any] | None":
+    """Resolve a session cookie to a live, enabled user row, or ``None``.
+
+    Re-reads the database on every request rather than trusting the cookie's
+    contents. The signed payload carries ``session_epoch``; if the stored epoch
+    has moved on (password change, account disable) the cookie is stale and is
+    refused even though its signature is still valid and it has not expired.
+    """
+    import time
+
+    verified = webauth.verify_session(
+        token, now=time.time(), secret=settings.mail_ui.session_secret.encode("utf-8")
+    )
+    if verified is None:
+        return None
+    username, epoch = verified
+    try:
+        from sqlmodel import select
+
+        from .models import UiUser
+
+        async with get_session() as session:
+            result = await session.execute(select(UiUser).where(UiUser.username == username))
+            row = result.scalars().first()
+            if row is None or row.disabled or row.session_epoch != epoch:
+                return None
+            return {"id": row.id, "username": row.username, "role": row.role}
+    except Exception:
+        # A database hiccup must not be an authentication bypass.
+        structlog.get_logger("mail_ui").warning("mail_ui.session_lookup_failed", exc_info=True)
+        return None
 
 
 class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
@@ -1570,6 +1762,15 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             jwt_enabled=bool(getattr(settings.http, "jwt_enabled", False)),
         )
 
+    # Registered AFTER BearerAuthMiddleware, which with Starlette's add_middleware
+    # means it wraps it and therefore runs FIRST. That is required, not incidental:
+    # it must decide /mail before the bearer layer can 401 a browser that has no
+    # way to send an Authorization header. Everything outside /mail passes straight
+    # through, so the MCP mounts are unaffected.
+    if settings.mail_ui.enabled:
+        app_any3 = cast(Any, fastapi_app)
+        app_any3.add_middleware(MailUiAuthMiddleware, settings=settings)
+
     # Optional CORS
     if settings.cors.enabled:
         from typing import Any as _Any, cast as _cast  # local type-only import
@@ -1899,10 +2100,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             css_sanitizer=_css_sanitizer,
         )
 
-        async def _render(name: str, **ctx: Any) -> HTMLResponse:
+        async def _render(name: str, status_code: int = 200, **ctx: Any) -> HTMLResponse:
             tpl = env.get_template(name)
             html = await tpl.render_async(**ctx)
-            return HTMLResponse(html)
+            return HTMLResponse(html, status_code=status_code)
 
         def _parse_fts_query(
             raw: str, scope_preference: str | None = None
@@ -1965,6 +2166,98 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             settings_local = get_settings()
             payload = collect_lock_status(settings_local)
             return JSONResponse(payload)
+
+        @fastapi_app.get("/mail/api/file-reservations", response_class=JSONResponse)
+        async def mail_active_file_reservations(
+            project: str, path: str | None = None
+        ) -> JSONResponse:
+            """Active advisory file reservations, optionally narrowed to one path.
+
+            Exists because there is no read-only way to ask this question: the MCP
+            surface can create, renew, release and force-release reservations, but
+            every one of those mutates state, and the only listing is the HTML
+            viewer page. An editor hook that wants to warn "someone else has
+            reserved this file" needs a cheap, side-effect-free answer — reserving
+            a path in order to discover it was already reserved is precisely the
+            collision the feature exists to avoid.
+
+            "Active" means not released and not yet expired.
+
+            The expiry comparison is done in PYTHON, not in SQL, and that is not
+            an accident. SQLite stores these timestamps as TEXT in
+            ``YYYY-MM-DD HH:MM:SS.ffffff`` form (space separator), while the
+            datetime adapter registered in db.py binds a bound parameter as ISO
+            8601 with a ``T`` separator. A ``WHERE expires_ts > :now`` therefore
+            compares ``'... 13:11:34'`` against ``'...T12:15:00'`` as strings, and
+            since ``' '`` (0x20) sorts before ``'T'`` (0x54) the predicate is
+            ALWAYS false — the endpoint would return 200 with an empty list
+            forever and look like it worked.
+            """
+            await ensure_schema()
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            async with get_session() as session:
+                prow = (
+                    await session.execute(
+                        text("SELECT id FROM projects WHERE slug = :k OR human_key = :k"),
+                        {"k": project},
+                    )
+                ).fetchone()
+                if not prow:
+                    return JSONResponse({"detail": "Project not found"}, status_code=404)
+                rows = (
+                    await session.execute(
+                        text(
+                            "SELECT c.id, a.name, c.path_pattern, c.exclusive, c.reason, c.expires_ts "
+                            "FROM file_reservations c LEFT JOIN agents a ON a.id = c.agent_id "
+                            "WHERE c.project_id = :pid AND c.released_ts IS NULL "
+                            "ORDER BY c.created_ts DESC"
+                        ),
+                        {"pid": int(prow[0])},
+                    )
+                ).fetchall()
+
+            def _still_active(raw: Any) -> bool:
+                if isinstance(raw, datetime):
+                    return raw.replace(tzinfo=None) > now
+                try:
+                    return datetime.fromisoformat(str(raw).replace(" ", "T")) > now
+                except (TypeError, ValueError):
+                    # An unparseable expiry is reported rather than silently
+                    # dropped: a warning that turns out to be stale costs a
+                    # glance, a reservation that vanishes costs a collision.
+                    return True
+
+            items = [
+                {
+                    "id": r[0],
+                    # LEFT JOIN: a reservation can outlive its owning agent row (#161).
+                    "agent": r[1] or "<orphaned>",
+                    "path_pattern": r[2],
+                    "exclusive": bool(r[3]),
+                    "reason": r[4] or "",
+                    "expires_ts": str(r[5]),
+                }
+                for r in rows
+                if _still_active(r[5])
+            ]
+
+            if path:
+                # Reservations are glob patterns, so a literal comparison would miss
+                # the common "src/**/*.py" case. Match both directions: the queried
+                # path against the stored pattern, and the pattern against the path
+                # for the plain-prefix style ("src/mcp_agent_mail").
+                from fnmatch import fnmatch
+
+                needle = path.lstrip("./")
+                items = [
+                    i
+                    for i in items
+                    if fnmatch(needle, i["path_pattern"])
+                    or needle == i["path_pattern"]
+                    or needle.startswith(i["path_pattern"].rstrip("/*") + "/")
+                ]
+
+            return JSONResponse({"active": len(items), "reservations": items})
 
         async def _build_unified_inbox_payload(
             *, limit: int = 500, include_projects: bool = True
@@ -2115,6 +2408,141 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 logging.error("Error fetching unified inbox data", exc_info=True, extra={"error": str(exc)})
 
             return {"messages": messages, "projects": projects}
+
+        # ---------------------------------------------------------------
+        # Login / logout for the viewer. MailUiAuthMiddleware lets exactly
+        # these two paths through without a session; everything else under
+        # /mail is gated. See mcp_agent_mail.webauth for the primitives.
+        # ---------------------------------------------------------------
+
+        def _safe_next(raw: str) -> str:
+            """Only allow same-site relative redirects.
+
+            Without this, ``/mail/login?next=https://evil.example`` turns the
+            login form into an open redirect that phishes a freshly-authenticated
+            user straight off the site.
+            """
+            candidate = (raw or "").strip()
+            if not candidate.startswith("/") or candidate.startswith("//"):
+                return "/mail"
+            return candidate
+
+        @fastapi_app.get(_MAIL_LOGIN_PATH, response_class=HTMLResponse)
+        async def mail_login_form(request: Request) -> HTMLResponse:
+            cfg = settings.mail_ui
+            # Already signed in? Don't show the form again.
+            token = request.cookies.get(cfg.cookie_name, "")
+            if token and await _load_session_user(token, settings=settings):
+                return HTMLResponse(
+                    "", status_code=status.HTTP_303_SEE_OTHER,
+                    headers={"Location": _safe_next(request.query_params.get("next", "/mail"))},
+                )
+            return await _render(
+                "mail_login.html",
+                error=None,
+                next_url=_safe_next(request.query_params.get("next", "/mail")),
+            )
+
+        @fastapi_app.post(_MAIL_LOGIN_PATH)
+        async def mail_login_submit(request: Request) -> Response:
+            cfg = settings.mail_ui
+            form = await request.form()
+            username = str(form.get("username", "")).strip()
+            password = str(form.get("password", ""))
+            next_url = _safe_next(str(form.get("next", "/mail")))
+
+            # The login form is the one unauthenticated POST under /mail, so the
+            # middleware's same-origin check has not run for it. Do it here.
+            if not webauth.same_origin(
+                request.headers.get("origin", ""),
+                request.headers.get("referer", ""),
+                request.headers.get("host", ""),
+            ):
+                return JSONResponse({"detail": "Cross-origin request rejected"}, status_code=403)
+
+            client_ip = request.client.host if request.client else "-"
+            if _login_throttled(client_ip):
+                return await _render(
+                    "mail_login.html",
+                    error="Too many failed attempts. Wait a minute and try again.",
+                    next_url=next_url,
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                )
+
+            stored: str | None = None
+            row_epoch = 1
+            row_disabled = False
+            if webauth.valid_username(username):
+                from sqlmodel import select as _select
+
+                from .models import UiUser as _UiUser
+
+                async with get_session() as s_login:
+                    res = await s_login.execute(_select(_UiUser).where(_UiUser.username == username))
+                    row = res.scalars().first()
+                    if row is not None:
+                        stored, row_epoch, row_disabled = row.password_hash, row.session_epoch, row.disabled
+
+            # authenticate() runs a dummy scrypt for an unknown user, so a bad
+            # username and a bad password take the same time and cannot be told
+            # apart. A disabled account is checked after, and reports the same
+            # generic failure for the same reason.
+            if not webauth.authenticate(username, password, stored) or row_disabled:
+                _login_record_failure(client_ip)
+                structlog.get_logger("mail_ui").info(
+                    "mail_ui.login_failed", username=username[:64], client=client_ip
+                )
+                return await _render(
+                    "mail_login.html",
+                    error="Invalid username or password.",
+                    next_url=next_url,
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                )
+
+            _login_clear_failures(client_ip)
+            import time as _time
+
+            token = webauth.make_session(
+                username,
+                epoch=row_epoch,
+                now=_time.time(),
+                secret=cfg.session_secret.encode("utf-8"),
+                ttl=float(cfg.session_ttl_seconds),
+            )
+            async with get_session() as s_touch:
+                from sqlmodel import select as _select2
+
+                from .models import UiUser as _UiUser2
+
+                res2 = await s_touch.execute(_select2(_UiUser2).where(_UiUser2.username == username))
+                row2 = res2.scalars().first()
+                if row2 is not None:
+                    row2.last_login_ts = datetime.now(timezone.utc).replace(tzinfo=None)
+                    s_touch.add(row2)
+                    await s_touch.commit()
+
+            response = Response(status_code=status.HTTP_303_SEE_OTHER, headers={"Location": next_url})
+            response.set_cookie(
+                cfg.cookie_name,
+                token,
+                max_age=cfg.session_ttl_seconds,
+                httponly=True,          # JavaScript must never be able to read it
+                secure=cfg.cookie_secure,
+                samesite="lax",         # blocks the cookie on cross-site POSTs
+                path="/mail",           # never sent to the MCP mounts
+            )
+            structlog.get_logger("mail_ui").info("mail_ui.login_ok", username=username, client=client_ip)
+            return response
+
+        @fastapi_app.get(_MAIL_LOGOUT_PATH)
+        @fastapi_app.post(_MAIL_LOGOUT_PATH)
+        async def mail_logout() -> Response:
+            cfg = settings.mail_ui
+            response = Response(
+                status_code=status.HTTP_303_SEE_OTHER, headers={"Location": _MAIL_LOGIN_PATH}
+            )
+            response.delete_cookie(cfg.cookie_name, path="/mail")
+            return response
 
         @fastapi_app.get("/mail", response_class=HTMLResponse)
         async def mail_unified_inbox() -> HTMLResponse:

@@ -410,6 +410,243 @@ docs_app = typer.Typer(help="Documentation helpers for agent onboarding")
 app.add_typer(docs_app, name="docs")
 doctor_app = typer.Typer(help="Diagnose and repair mailbox health issues")
 app.add_typer(doctor_app, name="doctor")
+ui_users_app = typer.Typer(help="Manage human logins for the /mail web viewer")
+app.add_typer(ui_users_app, name="ui-users")
+
+
+async def _ui_users_load(username: str) -> Any:
+    from sqlmodel import select
+
+    from .db import ensure_schema, get_session
+    from .models import UiUser
+
+    await ensure_schema()
+    async with get_session() as session:
+        result = await session.execute(select(UiUser).where(UiUser.username == username))
+        return result.scalars().first()
+
+
+async def _ui_users_enabled_admins(exclude: str | None = None) -> int:
+    """How many enabled admins exist, optionally ignoring one username.
+
+    Used to refuse the last step that would lock every human out of the UI.
+    """
+    from sqlmodel import select
+
+    from .db import ensure_schema, get_session
+    from .models import UiUser
+    from .webauth import ROLE_ADMIN
+
+    await ensure_schema()
+    async with get_session() as session:
+        result = await session.execute(
+            select(UiUser).where(UiUser.role == ROLE_ADMIN).where(UiUser.disabled == False)  # noqa: E712
+        )
+        rows = list(result.scalars().all())
+    return sum(1 for r in rows if r.username != exclude)
+
+
+@ui_users_app.command("add")
+def ui_users_add(
+    username: str = typer.Argument(..., help="Login name"),
+    role: str = typer.Option(None, "--role", help="admin (may perform destructive actions) or viewer"),
+) -> None:
+    """Create a user, or reset an existing user's password.
+
+    Resetting a password bumps ``session_epoch``, which immediately invalidates
+    that user's existing browser sessions.
+    """
+    from .db import get_session
+    from .webauth import DEFAULT_NEW_ROLE, ROLES, hash_password, valid_username
+
+    if not valid_username(username):
+        typer.secho("Invalid username (1-64 chars, no '|' or '/', no surrounding whitespace)", fg="red")
+        raise typer.Exit(code=2)
+    if role is not None and role not in ROLES:
+        typer.secho(f"Invalid role {role!r}; use one of: {', '.join(ROLES)}", fg="red")
+        raise typer.Exit(code=2)
+
+    password = typer.prompt("Password", hide_input=True, confirmation_prompt=True)
+    if not password:
+        typer.secho("Empty password", fg="red")
+        raise typer.Exit(code=1)
+
+    async def _save() -> tuple[str, str]:
+        from .models import UiUser
+
+        existing = await _ui_users_load(username)
+        async with get_session() as session:
+            if existing is None:
+                effective = role or DEFAULT_NEW_ROLE
+                session.add(
+                    UiUser(username=username, password_hash=hash_password(password), role=effective)
+                )
+                await session.commit()
+                return "created", effective
+            # Explicit --role wins; a bare password reset preserves the current role.
+            effective = role or existing.role
+            row = await session.get(UiUser, existing.id)
+            row.password_hash = hash_password(password)
+            row.role = effective
+            row.session_epoch = row.session_epoch + 1  # revoke live sessions
+            session.add(row)
+            await session.commit()
+            return "updated", effective
+
+    action, effective = _run_async(_save())
+    typer.secho(f"{action} user {username!r} with role {effective!r}", fg="green")
+    if action == "updated":
+        typer.echo("Existing browser sessions for this user were invalidated.")
+
+
+@ui_users_app.command("list")
+def ui_users_list() -> None:
+    """List viewer logins."""
+    from sqlmodel import select
+
+    from .db import ensure_schema, get_session
+    from .models import UiUser
+
+    async def _list() -> list[Any]:
+        await ensure_schema()
+        async with get_session() as session:
+            result = await session.execute(select(UiUser).order_by(UiUser.username))
+            return list(result.scalars().all())
+
+    rows = _run_async(_list())
+    if not rows:
+        typer.echo("No viewer logins yet. Create one with: mcp-agent-mail ui-users add <name> --role admin")
+        return
+    for r in rows:
+        state = "disabled" if r.disabled else "enabled"
+        last = r.last_login_ts.isoformat(sep=" ", timespec="seconds") if r.last_login_ts else "never"
+        typer.echo(f"{r.username:<24} {r.role:<8} {state:<9} last login: {last}")
+
+
+@ui_users_app.command("role")
+def ui_users_role(
+    username: str = typer.Argument(...),
+    role: str = typer.Argument(..., help="admin or viewer"),
+) -> None:
+    """Change a user's role."""
+    from .db import get_session
+    from .models import UiUser
+    from .webauth import ROLE_ADMIN, ROLES
+
+    if role not in ROLES:
+        typer.secho(f"Invalid role {role!r}; use one of: {', '.join(ROLES)}", fg="red")
+        raise typer.Exit(code=2)
+
+    async def _set() -> str:
+        existing = await _ui_users_load(username)
+        if existing is None:
+            return "not_found"
+        if existing.role == ROLE_ADMIN and role != ROLE_ADMIN:
+            if await _ui_users_enabled_admins(exclude=username) == 0:
+                return "last_admin"
+        async with get_session() as session:
+            row = await session.get(UiUser, existing.id)
+            row.role = role
+            session.add(row)
+            await session.commit()
+        return "ok"
+
+    outcome = _run_async(_set())
+    if outcome == "not_found":
+        typer.secho(f"No such user {username!r}", fg="red")
+        raise typer.Exit(code=1)
+    if outcome == "last_admin":
+        typer.secho(
+            f"Refused: {username!r} is the only enabled admin; demoting it would lock everyone out.",
+            fg="red",
+        )
+        raise typer.Exit(code=1)
+    typer.secho(f"Set {username!r} role to {role!r}", fg="green")
+
+
+@ui_users_app.command("remove")
+def ui_users_remove(
+    username: str = typer.Argument(...),
+    yes: bool = typer.Option(False, "--yes", help="Skip the confirmation prompt"),
+) -> None:
+    """Delete a viewer login permanently."""
+    from .db import get_session
+    from .models import UiUser
+    from .webauth import ROLE_ADMIN
+
+    async def _remove() -> str:
+        existing = await _ui_users_load(username)
+        if existing is None:
+            return "not_found"
+        if existing.role == ROLE_ADMIN and not existing.disabled:
+            if await _ui_users_enabled_admins(exclude=username) == 0:
+                return "last_admin"
+        async with get_session() as session:
+            row = await session.get(UiUser, existing.id)
+            await session.delete(row)
+            await session.commit()
+        return "ok"
+
+    if not yes and not typer.confirm(f"Permanently delete viewer login {username!r}?"):
+        typer.echo("Aborted.")
+        raise typer.Exit(code=1)
+
+    outcome = _run_async(_remove())
+    if outcome == "not_found":
+        typer.secho(f"No such user {username!r}", fg="red")
+        raise typer.Exit(code=1)
+    if outcome == "last_admin":
+        typer.secho(
+            f"Refused: {username!r} is the only enabled admin (would lock everyone out).", fg="red"
+        )
+        raise typer.Exit(code=1)
+    typer.secho(f"Removed user {username!r}", fg="green")
+
+
+@ui_users_app.command("disable")
+def ui_users_disable(username: str = typer.Argument(...)) -> None:
+    """Disable an account and immediately terminate its sessions."""
+    _ui_users_set_disabled(username, True)
+
+
+@ui_users_app.command("enable")
+def ui_users_enable(username: str = typer.Argument(...)) -> None:
+    """Re-enable a disabled account."""
+    _ui_users_set_disabled(username, False)
+
+
+def _ui_users_set_disabled(username: str, disabled: bool) -> None:
+    from .db import get_session
+    from .models import UiUser
+    from .webauth import ROLE_ADMIN
+
+    async def _set() -> str:
+        existing = await _ui_users_load(username)
+        if existing is None:
+            return "not_found"
+        if disabled and existing.role == ROLE_ADMIN and not existing.disabled:
+            if await _ui_users_enabled_admins(exclude=username) == 0:
+                return "last_admin"
+        async with get_session() as session:
+            row = await session.get(UiUser, existing.id)
+            row.disabled = disabled
+            # Bump the epoch so a disable takes effect on the next request rather
+            # than whenever the cookie happens to expire.
+            row.session_epoch = row.session_epoch + 1
+            session.add(row)
+            await session.commit()
+        return "ok"
+
+    outcome = _run_async(_set())
+    if outcome == "not_found":
+        typer.secho(f"No such user {username!r}", fg="red")
+        raise typer.Exit(code=1)
+    if outcome == "last_admin":
+        typer.secho(
+            f"Refused: {username!r} is the only enabled admin (would lock everyone out).", fg="red"
+        )
+        raise typer.Exit(code=1)
+    typer.secho(f"{'Disabled' if disabled else 'Enabled'} user {username!r}", fg="green")
 
 
 def _canonical_project_path(path: Path) -> Path:

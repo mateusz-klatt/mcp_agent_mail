@@ -77,8 +77,15 @@ am_project_key_for_file() {
         printf '%s' "$AGENT_MAIL_PROJECT_KEY"
         return 0
     fi
-    local d url
-    d="$(dirname "$1")"
+    local d url p
+    p="$1"
+    # Claude Code hands over file_path exactly as the model wrote it, and on native
+    # Windows that means backslashes. dirname then sees no separator at all, answers
+    # ".", and the edit gets keyed on the session's working directory — precisely the
+    # substitution this function exists to prevent. Guarded on a drive letter because
+    # a backslash is a legal character in a POSIX filename and must survive there.
+    case "$p" in [A-Za-z]:[\\/]*) p="${p//\\//}" ;; esac
+    d="$(dirname "$p")"
     url="$(git -C "$d" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
            && git -C "$d" remote get-url origin 2>/dev/null)" || return 0
     [ -z "$url" ] && return 0
@@ -93,6 +100,12 @@ am_project_key_for_file() {
 # reserving at all, because it looks like protection and can never match.
 am_relpath() {
     local p="$1" root
+    # Same reason as above, plus one of its own: git reports the top level with
+    # forward slashes, so a backslash path never matches the prefix, survives the
+    # "still absolute" check (it does not begin with /) and is reserved verbatim as
+    # "D:\repo\file". That looks like protection and can never match the "file" a
+    # checkout on any other machine reserves.
+    case "$p" in [A-Za-z]:[\\/]*) p="${p//\\//}" ;; esac
     root="$(git -C "$(dirname "$p")" rev-parse --show-toplevel 2>/dev/null)" || return 0
     [ -z "$root" ] && return 0
     p="${p#"${root}"/}"

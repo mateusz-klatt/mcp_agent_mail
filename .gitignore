@@ -207,6 +207,17 @@ data/baselines/*
 # Production bind-mount root for compose.prod.yaml: the SQLite DB, the git
 # archive (a nested repo) and attachments. Must never enter this repo's history.
 /data/
+# Project-scoped MCP config. Deliberately absent: Claude Code reads .mcp.json
+# from the project root and it takes precedence over the user-scope entry in
+# ~/.claude.json, so upstream's template — which names the same server, points
+# at the STATELESS /api/ mount, and carries a placeholder token — silently
+# shadows a correct configuration and answers 401. Configure the server once per
+# machine instead:
+#   claude mcp add --transport http --scope user mcp-agent-mail <url>/mcp/ \
+#     --header "Authorization: Bearer <token>"
+# (A modify/delete conflict here on `git pull upstream main` is expected; keep
+# it deleted.)
+.mcp.json
 *.sqlite3
 .env
 .pytest_out/*

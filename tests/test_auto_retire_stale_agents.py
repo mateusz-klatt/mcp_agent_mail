@@ -20,6 +20,7 @@ from sqlalchemy import select as sa_select, update as sa_update
 from mcp_agent_mail.app import build_mcp_server, sweep_stale_agents
 from mcp_agent_mail.db import get_session
 from mcp_agent_mail.models import Agent, FileReservation, Project
+from tests.keys import pkey
 
 
 def _naive_utc(when: datetime | None = None) -> datetime:
@@ -33,12 +34,12 @@ def _naive_utc(when: datetime | None = None) -> datetime:
 async def test_sweep_retires_only_agents_past_threshold(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/staleagents"})
+        await client.call_tool("ensure_project", {"human_key": pkey("staleagents")})
 
         stale_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "Staleagents",
+                "project_key": pkey("Staleagents"),
                 "program": "claude-code",
                 "model": "opus-4",
                 "name": "DustyMountain",
@@ -48,7 +49,7 @@ async def test_sweep_retires_only_agents_past_threshold(isolated_env):
         active_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "Staleagents",
+                "project_key": pkey("Staleagents"),
                 "program": "claude-code",
                 "model": "opus-4",
                 "name": "BrightForest",
@@ -63,17 +64,17 @@ async def test_sweep_retires_only_agents_past_threshold(isolated_env):
         async with get_session() as session:
             stale_agent = (
                 await session.execute(
-                    Agent.__table__.select().where(Agent.name == stale_name)
+                    sa_select(Agent).where(cast(Any, Agent.name) == stale_name)
                 )
-            ).first()
+            ).scalar_one()
             assert stale_agent is not None
             stale_id = stale_agent.id
             two_days_ago = _naive_utc(
                 datetime.now(timezone.utc) - timedelta(hours=48)
             )
             await session.execute(
-                Agent.__table__.update()
-                .where(Agent.id == stale_id)
+                sa_update(Agent)
+                .where(cast(Any, Agent.id) == stale_id)
                 .values(last_active_ts=two_days_ago, retired_at=None)
             )
             await session.commit()
@@ -85,14 +86,14 @@ async def test_sweep_retires_only_agents_past_threshold(isolated_env):
         async with get_session() as session:
             stale_after = (
                 await session.execute(
-                    Agent.__table__.select().where(Agent.name == stale_name)
+                    sa_select(Agent).where(cast(Any, Agent.name) == stale_name)
                 )
-            ).first()
+            ).scalar_one()
             active_after = (
                 await session.execute(
-                    Agent.__table__.select().where(Agent.name == active_name)
+                    sa_select(Agent).where(cast(Any, Agent.name) == active_name)
                 )
-            ).first()
+            ).scalar_one()
             assert stale_after is not None
             assert active_after is not None
             assert stale_after.retired_at is not None
@@ -103,12 +104,12 @@ async def test_sweep_retires_only_agents_past_threshold(isolated_env):
 async def test_sweep_is_idempotent(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/staleidempo"})
+        await client.call_tool("ensure_project", {"human_key": pkey("staleidempo")})
 
         result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "Staleidempo",
+                "project_key": pkey("Staleidempo"),
                 "program": "claude-code",
                 "model": "opus-4",
                 "name": "QuietRiver",
@@ -121,18 +122,18 @@ async def test_sweep_is_idempotent(isolated_env):
             target_id = (
                 (
                     await session.execute(
-                        Agent.__table__.select().where(Agent.name == target_name)
+                        sa_select(Agent).where(cast(Any, Agent.name) == target_name)
                     )
                 )
-                .first()
+                .scalar_one()
                 .id
             )
             two_days_ago = _naive_utc(
                 datetime.now(timezone.utc) - timedelta(hours=48)
             )
             await session.execute(
-                Agent.__table__.update()
-                .where(Agent.id == target_id)
+                sa_update(Agent)
+                .where(cast(Any, Agent.id) == target_id)
                 .values(last_active_ts=two_days_ago, retired_at=None)
             )
             await session.commit()
@@ -149,12 +150,12 @@ async def test_sweep_threshold_floor(isolated_env):
     """Threshold values below 60s are clamped — sweep must still execute."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/stalefloor"})
+        await client.call_tool("ensure_project", {"human_key": pkey("stalefloor")})
 
         await client.call_tool(
             "register_agent",
             {
-                "project_key": "Stalefloor",
+                "project_key": pkey("Stalefloor"),
                 "program": "claude-code",
                 "model": "opus-4",
                 "name": "FuzzyCloud",
@@ -172,12 +173,12 @@ async def test_sweep_threshold_floor(isolated_env):
 async def test_on_demand_sweep_is_project_scoped_and_never_retires_caller(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/sweep/project-a"})
-        await client.call_tool("ensure_project", {"human_key": "/sweep/project-b"})
+        await client.call_tool("ensure_project", {"human_key": pkey("sweep/project-a")})
+        await client.call_tool("ensure_project", {"human_key": pkey("sweep/project-b")})
         caller = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/sweep/project-a",
+                "project_key": pkey("sweep/project-a"),
                 "program": "codex",
                 "model": "gpt-5",
                 "name": "BrightRiver",
@@ -186,7 +187,7 @@ async def test_on_demand_sweep_is_project_scoped_and_never_retires_caller(isolat
         stale_local = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/sweep/project-a",
+                "project_key": pkey("sweep/project-a"),
                 "program": "codex",
                 "model": "gpt-5",
                 "name": "QuietMountain",
@@ -195,7 +196,7 @@ async def test_on_demand_sweep_is_project_scoped_and_never_retires_caller(isolat
         stale_other = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/sweep/project-b",
+                "project_key": pkey("sweep/project-b"),
                 "program": "codex",
                 "model": "gpt-5",
                 "name": "DustyForest",
@@ -215,7 +216,7 @@ async def test_on_demand_sweep_is_project_scoped_and_never_retires_caller(isolat
         result = await client.call_tool(
             "sweep_stale_agents",
             {
-                "project_key": "/sweep/project-a",
+                "project_key": pkey("sweep/project-a"),
                 "agent_name": caller.data["name"],
                 "registration_token": caller.data["registration_token"],
                 "threshold_seconds": 0,
@@ -241,11 +242,11 @@ async def test_on_demand_sweep_is_project_scoped_and_never_retires_caller(isolat
 async def test_on_demand_sweep_skips_unexpired_reservations_by_default(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
-        project_result = await client.call_tool("ensure_project", {"human_key": "/sweep/reservations"})
+        project_result = await client.call_tool("ensure_project", {"human_key": pkey("sweep/reservations")})
         caller = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/sweep/reservations",
+                "project_key": pkey("sweep/reservations"),
                 "program": "codex",
                 "model": "gpt-5",
                 "name": "SilverLake",
@@ -254,7 +255,7 @@ async def test_on_demand_sweep_skips_unexpired_reservations_by_default(isolated_
         stale = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/sweep/reservations",
+                "project_key": pkey("sweep/reservations"),
                 "program": "codex",
                 "model": "gpt-5",
                 "name": "SilentValley",
@@ -294,7 +295,7 @@ async def test_on_demand_sweep_skips_unexpired_reservations_by_default(isolated_
         protected = await client.call_tool(
             "sweep_stale_agents",
             {
-                "project_key": "/sweep/reservations",
+                "project_key": pkey("sweep/reservations"),
                 "agent_name": caller.data["name"],
                 "registration_token": caller.data["registration_token"],
                 "threshold_seconds": 60,
@@ -305,7 +306,7 @@ async def test_on_demand_sweep_skips_unexpired_reservations_by_default(isolated_
         forced = await client.call_tool(
             "sweep_stale_agents",
             {
-                "project_key": "/sweep/reservations",
+                "project_key": pkey("sweep/reservations"),
                 "agent_name": caller.data["name"],
                 "registration_token": caller.data["registration_token"],
                 "threshold_seconds": 60,
@@ -317,7 +318,7 @@ async def test_on_demand_sweep_skips_unexpired_reservations_by_default(isolated_
         repeated = await client.call_tool(
             "sweep_stale_agents",
             {
-                "project_key": "/sweep/reservations",
+                "project_key": pkey("sweep/reservations"),
                 "agent_name": caller.data["name"],
                 "registration_token": caller.data["registration_token"],
                 "threshold_seconds": 60,

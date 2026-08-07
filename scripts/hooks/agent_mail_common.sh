@@ -259,11 +259,21 @@ am_urlencode() {
 # Callers must pass query strings pre-encoded with am_urlencode
 # (--data "k=$(am_urlencode "$v")"), NOT --data-urlencode "k=$v" — the raw
 # value would be mis-encoded on argv before curl ever sees it.
+#
+# The bearer goes in a config read from stdin, not -H in argv, because the
+# process table publishes argv to anyone who can run ps: on Linux
+# /proc/PID/cmdline is world-readable, so any other account on the host reads
+# the token live; on macOS it is owner-only, which still defeats the 0600 on
+# ~/.agent-mail.env, since a routine `ps aux` during a session pulls the
+# bearer straight into the model's context and the transcript. At two GETs
+# per edit that window is not rare. Config on stdin is also the one form that
+# crosses no argv boundary at all, so it needs no encoding defence.
 am_get() {
     local path="$1" bearer
     bearer="$(am_bearer)"
     [ -z "$bearer" ] && return 0
-    curl -s --max-time "$AM_TIMEOUT" -G -H "Authorization: Bearer ${bearer}" \
+    printf 'header = "Authorization: Bearer %s"\n' "$bearer" \
+      | curl -s --max-time "$AM_TIMEOUT" -G -K - \
         "${@:2}" "${AM_BASE_URL}${path}" 2>/dev/null
 }
 

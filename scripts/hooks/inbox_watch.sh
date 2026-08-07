@@ -79,7 +79,11 @@ bearer="$(am_bearer)"
 # name, so a slug of (project, agent) alone means a second watcher truncates the
 # first one's stream mid-read and its exit trap deletes a file the first is
 # still using.
-slug="$(printf '%s|%s|%s' "$PROJECT" "$AGENT" "$$" | tr -cd '[:alnum:]._|-' | tr '|' '_')"
+# Same mapping as inbox_check.sh — see the note there. Milder here because the
+# pid keeps concurrent watchers apart regardless, but two projects would still
+# share a directory of stream state, and "milder" is how the other three
+# instances survived this long.
+slug="$(printf '%s|%s|%s' "$PROJECT" "$AGENT" "$$" | tr '/' '_' | tr -cd '[:alnum:]._|-' | tr '|' '_' | cut -c1-96)"
 stream="${AM_STATE_DIR}/watch/${slug}.stream"
 mkdir -p "$(dirname "$stream")" 2>/dev/null || exit 0
 

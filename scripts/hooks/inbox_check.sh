@@ -48,7 +48,16 @@ AGENT="$(am_agent_name)"
 token="$(am_cred_get "$PROJECT" "$AGENT")"
 [ -z "$token" ] && exit 0   # SessionStart has not run; nothing to authenticate as
 
-slug="$(printf '%s|%s' "$PROJECT" "$AGENT" | tr -cd '[:alnum:]._|-' | tr '|' '_')"
+# Separators MAPPED, not deleted — third instance of a defect fixed twice
+# already (am_granted_name_file, then am_sync_model). `tr -cd` alone drops the
+# slashes rather than replacing them, so `/a/b` and `/ab` collapse onto one key.
+#
+# This one is the worst of the three. The other two guard a name and a cached
+# model string; these guard `.seen`, the high-water mark of what this agent has
+# already been shown. Two projects sharing it means mail from one is recorded as
+# seen by the other and never surfaces — a silently lost message, which is the
+# single failure this hook exists to prevent.
+slug="$(printf '%s|%s' "$PROJECT" "$AGENT" | tr '/' '_' | tr -cd '[:alnum:]._|-' | tr '|' '_' | cut -c1-96)"
 stamp="${AM_STATE_DIR}/inbox/${slug}.stamp"
 seen="${AM_STATE_DIR}/inbox/${slug}.seen"
 mkdir -p "$(dirname "$stamp")" 2>/dev/null || exit 0

@@ -339,6 +339,59 @@ them is the first thing they see. Which means:
 - **Say plainly when a test failed to create its own condition.** Twice today
   that admission turned what looked like a refutation into a live finding.
 
+## Some failures have no signature, and can only be prevented
+
+Every technique above assumes the failure leaves a trace somebody could look
+for. Some do not, and the mistake is to answer them with better reporting.
+
+A hook command that `cmd.exe` cannot run exits **0**. So does a hook that ran
+and had nothing to say — which is the designed behaviour of four of the five.
+The exit code is identical, and so is the output: empty. A fallback that fires
+on non-zero exit therefore cannot fire, and one that fires on empty output would
+fire constantly on healthy machines. The observable trace of the failure is
+byte-identical to the trace of its opposite.
+
+When that is true, "detect and report it" is not a cheap version of the fix; it
+is a different thing that does not work. Worse, shipping it removes the reason
+to keep looking — everyone now believes this class announces itself.
+
+Before choosing a reporting fix, ask what distinguishes the failure from the
+healthy case in the data you can actually see. If the honest answer is
+*nothing*, the only fix is to make the state unreachable: name the interpreter,
+pin the path, remove the branch. Reserve reporting for failures that have a
+signature.
+
+The generalisation is uncomfortable because it cuts against the rest of this
+document: not every problem is a measurement problem. Some are, and better
+controls find them. Others cannot be measured at all from where you stand, and
+the effort spent building an instrument is effort not spent removing the state.
+
+## Your own probe comes back as somebody else's evidence
+
+We measure against a shared server and, sometimes, a shared machine. A probe
+that pokes at a live system produces effects other people can see — and they see
+them as phenomena, not as your experiment.
+
+Today a controlled call to `cmd.exe` on a `.sh` file put a file-association
+dialog on the operator's screen. Within minutes three agents had attributed it
+to a commit shipped a few minutes earlier, marked it urgent, and pushed a fix
+whose justification cited the operator's window as field evidence. The commit
+that accused it only ever *printed* a path, and printing cannot open a dialog —
+one line of mechanism ruled it out, and nobody asked for it, because live human
+testimony feels stronger than any measurement.
+
+Two things make this hard to catch. The first is that it needs you to remember
+what you were doing two minutes ago, at the moment everyone is looking at the
+conclusion. The second is that the fix was **correct**: the bare path really
+does fail there. A right action taken for a wrong reason is the worst case,
+because the outcome vouches for the process, and nothing downstream ever
+disturbs it.
+
+Two habits help. Announce a probe that touches shared state *before* running it,
+so the effect has a name when it surfaces. And when a symptom is attributed to a
+suspect, ask the cheapest question first — **does the accused execute anything at
+all?** — before the more interesting question of how it did it.
+
 ## Where this came from
 
 Every example above is a real event, and each has a commit or a thread entry

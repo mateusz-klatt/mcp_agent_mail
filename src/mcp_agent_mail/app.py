@@ -28,7 +28,7 @@ from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from functools import wraps
 from pathlib import Path
-from typing import Any, AsyncContextManager, Callable, Optional, Protocol, cast
+from typing import Any, AsyncContextManager, Callable, Optional, Protocol, Union, cast
 from urllib.parse import parse_qsl
 import uuid
 
@@ -174,6 +174,25 @@ TOOL_CLUSTER_MAP: dict[str, str] = {}
 TOOL_METADATA: dict[str, dict[str, Any]] = {}
 
 RECENT_TOOL_USAGE: deque[tuple[datetime, str, Optional[str], Optional[str]]] = deque(maxlen=4096)
+
+# Return type for a tool that yields a list AND accepts `format`.
+#
+# `_apply_tool_output_format` replaces the return value with the TOON envelope
+# `{format, data, meta}` — an object. FastMCP derives each tool's output schema
+# from its return annotation, so a tool annotated `list[dict[str, Any]]` declares
+# `{"type": "array"}` and the envelope fails validation. The call does not degrade
+# to JSON; it errors out entirely, and the caller gets no result at all.
+#
+# That made `format="toon"` unusable on exactly the tools an agent reads most —
+# fetch_inbox, fetch_topic, fetch_summary, list_contacts — while it worked on every
+# object-returning tool, which is why it looked like it worked. Worse, the wrapper
+# also fires on `settings.toon_default_format`, so setting TOON_DEFAULT_FORMAT=toon
+# server-side would have made the mailbox unreadable for every agent at once.
+#
+# Widening the annotation keeps both shapes valid instead of silently dropping the
+# requested format: a caller asking for TOON gets TOON, a caller asking for nothing
+# still gets a list, and both satisfy the declared schema.
+ToonableList = Union[list[dict[str, Any]], dict[str, Any]]
 
 # Tools that are safe to auto-retry after transient OS-level FD exhaustion (EMFILE).
 # Keep this list conservative: do NOT include tools like send_message that can create
@@ -9378,7 +9397,7 @@ def build_mcp_server() -> FastMCP:
         agent_name: str,
         registration_token: Optional[str] = None,
         format: Optional[str] = None,
-    ) -> list[dict[str, Any]]:
+    ) -> ToonableList:
         """List contact links for an agent in a project."""
         project = await _get_project_by_identifier(project_key)
         agent = await _authenticate_agent(
@@ -9578,7 +9597,7 @@ def build_mcp_server() -> FastMCP:
         unread_only: bool = False,
         registration_token: Optional[str] = None,
         format: Optional[str] = None,
-    ) -> list[dict[str, Any]]:
+    ) -> ToonableList:
         """
         Retrieve recent messages for an agent without mutating read/ack state.
 
@@ -9688,7 +9707,7 @@ def build_mcp_server() -> FastMCP:
         unread_only: bool = False,
         registration_token: Optional[str] = None,
         format: Optional[str] = None,
-    ) -> list[dict[str, Any]]:
+    ) -> ToonableList:
         """
         Fetch all messages in a project with a given topic tag, regardless of recipient.
 
@@ -11263,7 +11282,7 @@ def build_mcp_server() -> FastMCP:
         since_hours: float = 24.0,
         limit: int = 5,
         format: Optional[str] = None,
-    ) -> list[dict[str, Any]]:
+    ) -> ToonableList:
         """Retrieve stored project-wide summaries.
 
         Parameters
@@ -12786,7 +12805,7 @@ def build_mcp_server() -> FastMCP:
             unread_only: bool = False,
             registration_token: Optional[str] = None,
             format: Optional[str] = None,
-        ) -> list[dict[str, Any]]:
+        ) -> ToonableList:
             """
             Retrieve recent messages for an agent across all projects linked to a product (non-mutating).
 
@@ -12836,7 +12855,7 @@ def build_mcp_server() -> FastMCP:
             unread_only: bool = False,
             registration_token: Optional[str] = None,
             format: Optional[str] = None,
-        ) -> list[dict[str, Any]]:
+        ) -> ToonableList:
             raise ToolExecutionError("FEATURE_DISABLED", "Product Bus is disabled. Enable WORKTREES_ENABLED to use this tool.")
 
     if settings.worktrees_enabled:
@@ -13742,7 +13761,7 @@ def build_mcp_server() -> FastMCP:
         slug: str,
         active_only: bool = True,
         format: Optional[str] = None,
-    ) -> list[dict[str, Any]]:
+    ) -> ToonableList:
         """
         List file_reservations for a project, optionally filtering to active-only.
 

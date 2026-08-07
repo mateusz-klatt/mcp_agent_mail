@@ -2750,6 +2750,76 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 projects=payload.get("projects", []),
             )
 
+        @fastapi_app.get("/mail/events")
+        async def mail_events_stream(request: Request) -> Any:
+            """Tell the open viewer when to refetch, so it stops needing F5.
+
+            Under `/mail/`, so the session cookie the viewer already holds is
+            the whole authentication story — which is also why the page can use
+            a plain `EventSource`. The agent-facing `/events` needs a
+            registration token in a header, and a browser cannot set one; that
+            endpoint authenticates *as an agent*, and a person at a keyboard is
+            not one.
+
+            Frames carry `{"kind":"changed","project":…}` and nothing else. No
+            addressee, no message id, no subject. The page reacts by refetching
+            through the ordinary viewer API, which applies exactly the
+            authorisation an F5 would — so this says *when* to look, never
+            *what* is there, and cannot become a second answer to who may see
+            what. That matters most for blind copies: a project-wide feed
+            carrying per-recipient frames would end BCC blindness for anyone
+            with a viewer session.
+            """
+            project_key = (request.query_params.get("project") or "").strip()
+            if not project_key:
+                return JSONResponse({"detail": "project is required"}, status_code=400)
+
+            await ensure_schema()
+            async with get_session() as session:
+                row = (
+                    await session.execute(
+                        text("SELECT slug FROM projects WHERE slug = :k OR human_key = :k"),
+                        {"k": project_key},
+                    )
+                ).fetchone()
+            if row is None:
+                return JSONResponse({"detail": "Project not found"}, status_code=404)
+            project_slug = str(row[0])
+
+            queue = hub.subscribe_project(project_slug)
+
+            async def stream() -> Any:
+                deadline = asyncio.get_running_loop().time() + MAX_STREAM_SECONDS
+                try:
+                    yield b": ready\n\n"
+                    while True:
+                        remaining = deadline - asyncio.get_running_loop().time()
+                        if remaining <= 0:
+                            return
+                        try:
+                            event = await asyncio.wait_for(
+                                queue.get(), timeout=min(KEEPALIVE_SECONDS, remaining)
+                            )
+                        except asyncio.TimeoutError:
+                            yield b": ping\n\n"
+                            continue
+                        # Unlike the agent stream this does NOT close after one
+                        # frame: a page stays open and would otherwise have to
+                        # reconnect after every message it displays.
+                        yield f"data: {json.dumps(event, separators=(',', ':'))}\n\n".encode()
+                finally:
+                    hub.unsubscribe_project(project_slug, queue)
+
+            return StreamingResponse(
+                stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache, no-store",
+                    "X-Accel-Buffering": "no",
+                    "Connection": "keep-alive",
+                },
+            )
+
         @fastapi_app.get("/mail/api/unified-inbox", response_class=JSONResponse)
         async def mail_unified_inbox_api(
             limit: int = 50000,
@@ -4518,6 +4588,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                 "id": message_id,
                             },
                         )
+                # The viewer too. Without this the one message type composed in
+                # the browser is the one the browser never sees arrive.
+                with contextlib.suppress(Exception):
+                    hub.publish_project(project_slug)
 
                 return JSONResponse({
                     "success": True,

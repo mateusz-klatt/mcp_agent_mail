@@ -15,6 +15,27 @@
 
 {% block header_actions %}
 <div class="flex items-center gap-3">
+  <!-- Live state. Says which of the two update paths is carrying the page, so a
+       dead stream reads as "falling back to polling" rather than as a quiet day. -->
+  <span id="live-dot" data-live="no" title="connecting…"
+        class="inline-flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400 select-none">
+    <span id="live-pip" class="w-2 h-2 rounded-full bg-slate-300 dark:bg-slate-600"></span>
+    <span class="hidden sm:inline">live</span>
+  </span>
+
+  <!-- Audio is opt-in because browsers block it until a gesture in the page,
+       and the login navigation does not count as one. Clicking here IS that
+       gesture, which is why the toggle plays the sound when switched on. -->
+  <button id="sound-toggle" type="button" data-on="no"
+          class="inline-flex items-center justify-center w-9 h-9 rounded-lg text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+          aria-label="Toggle a sound when new mail arrives" title="Sound on new mail">
+    <i id="bell-on" data-lucide="bell" class="w-4 h-4 hidden"></i>
+    <i id="bell-off" data-lucide="bell-off" class="w-4 h-4"></i>
+  </button>
+
+  <!-- Divider -->
+  <div class="w-px h-8 bg-slate-200 dark:bg-slate-700"></div>
+
   <!-- Human Overseer - Primary Action -->
   <a href="/mail/{{ project.slug }}/overseer/compose"
      class="inline-flex items-center gap-2 px-4 py-2.5 bg-amber-500 hover:bg-amber-600 dark:bg-amber-600 dark:hover:bg-amber-700 text-white font-semibold rounded-lg shadow-sm hover:shadow-md transition-all duration-200"
@@ -553,5 +574,114 @@
       }, 800);
     });
   });
+</script>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  // Live update. The page holds a session cookie, so a plain EventSource is
+  // enough — the agent-facing /events needs a token in a header, which a
+  // browser cannot set, and authenticates as an agent rather than a person.
+  //
+  // Frames carry only {kind:"changed"}. Everything shown still comes from the
+  // ordinary viewer API under the same session, so this decides WHEN to look
+  // and never what is there.
+  (function () {
+    const slug = {{ project.slug | tojson }};
+    const dot = document.getElementById('live-dot');
+    const soundKey = 'agentMailSound';
+    let refreshing = false;
+
+    const pip = document.getElementById('live-pip');
+    function setState(on, label) {
+      if (dot) { dot.dataset.live = on ? 'yes' : 'no'; dot.title = label; }
+      // Set the colour here rather than in CSS: the stylesheet is built ahead
+      // of time, so a class invented in this template would simply not exist.
+      if (pip) {
+        pip.classList.toggle('bg-emerald-500', on);
+        pip.classList.toggle('bg-slate-300', !on);
+      }
+    }
+
+    // Browsers refuse audio until a gesture inside the page, and arriving from
+    // the login form does not count — so this is opt-in and remembered.
+    function ding() {
+      if (localStorage.getItem(soundKey) !== 'on') return;
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator(), gain = ctx.createGain();
+        osc.connect(gain); gain.connect(ctx.destination);
+        osc.frequency.value = 880; osc.type = 'sine';
+        gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.25, ctx.currentTime + 0.01);
+        gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.35);
+        osc.start(); osc.stop(ctx.currentTime + 0.36);
+      } catch (e) { /* no audio device, or blocked: silence is fine */ }
+    }
+
+    function refresh() {
+      if (refreshing) return;
+      refreshing = true;
+      // Reload rather than patch the DOM: this page renders server-side, and a
+      // partial update that drifts from the server is worse than a flicker.
+      window.location.reload();
+    }
+
+    let es = null, backoff = 1000;
+    function connect() {
+      try { es = new EventSource('/mail/events?project=' + encodeURIComponent(slug)); }
+      catch (e) { setState(false, 'live updates unavailable'); return; }
+
+      es.onopen = () => { backoff = 1000; setState(true, 'live'); };
+      es.onmessage = (ev) => {
+        let payload = null;
+        try { payload = JSON.parse(ev.data); } catch (e) { return; }
+        if (payload && payload.kind === 'changed') { ding(); refresh(); }
+      };
+      es.onerror = () => {
+        // A closed stream that reports nothing looks exactly like a quiet
+        // period — say so in the indicator, and keep the poll below running so
+        // the page still updates while the stream is down.
+        setState(false, 'live updates disconnected — falling back to polling');
+        if (es) { es.close(); es = null; }
+        setTimeout(connect, backoff);
+        backoff = Math.min(backoff * 2, 60000);
+      };
+    }
+
+    // Polling fallback, always on. Without it a proxy that kills the stream
+    // leaves a dashboard that silently stops updating, which is the failure
+    // this whole layer keeps producing elsewhere.
+    let lastSeen = null;
+    async function poll() {
+      try {
+        const r = await fetch('/mail/api/unified-inbox?limit=1', { credentials: 'same-origin' });
+        if (!r.ok) return;
+        const data = await r.json();
+        const top = (data.messages && data.messages[0] && data.messages[0].id) || null;
+        if (lastSeen !== null && top !== null && top !== lastSeen) { ding(); refresh(); }
+        lastSeen = top;
+      } catch (e) { /* offline; the next tick tries again */ }
+    }
+    setInterval(poll, 30000);
+    poll();
+    connect();
+
+    const toggle = document.getElementById('sound-toggle');
+    if (toggle) {
+      const sync = () => {
+        const on = localStorage.getItem(soundKey) === 'on';
+        toggle.dataset.on = on ? 'yes' : 'no';
+        document.getElementById('bell-on')?.classList.toggle('hidden', !on);
+        document.getElementById('bell-off')?.classList.toggle('hidden', on);
+      };
+      toggle.addEventListener('click', () => {
+        localStorage.setItem(soundKey, localStorage.getItem(soundKey) === 'on' ? 'off' : 'on');
+        sync();
+        if (localStorage.getItem(soundKey) === 'on') ding();  // the gesture that unlocks audio
+      });
+      sync();
+    }
+  })();
 </script>
 {% endblock %}

@@ -5668,6 +5668,11 @@ def build_mcp_server() -> FastMCP:
             for target in to_agents + cc_agents + bcc_agents:
                 with suppress(Exception):
                     hub.publish(project.slug, target.name, {**instant_hint, "agent": target.name})
+            # And the human's browser, which watches the project rather than a
+            # mailbox. Content-free by construction, so a viewer session learns
+            # only that it should refetch — never who a blind copy went to.
+            with suppress(Exception):
+                hub.publish_project(project.slug)
 
         if notification_message_meta is not None:
             for target_name in notification_targets:

@@ -67,6 +67,7 @@ class NotificationHub:
 
     def __init__(self) -> None:
         self._subscribers: dict[tuple[str, str], set[asyncio.Queue[dict[str, Any]]]] = {}
+        self._project_subscribers: dict[str, set[asyncio.Queue[dict[str, Any]]]] = {}
 
     def subscribe(self, project: str, agent: str) -> asyncio.Queue[dict[str, Any]]:
         """Register a connection and hand back the queue it should read."""
@@ -110,6 +111,58 @@ class NotificationHub:
 
     def listener_count(self, project: str, agent: str) -> int:
         return len(self._subscribers.get(_key(project, agent), ()))
+
+    # ── project-wide watchers ────────────────────────────────────────────────
+    #
+    # A separate registry, and deliberately not the per-agent one with a
+    # wildcard. The human's browser watches a whole project, which is a
+    # different question from "mail for this agent" and must not be able to
+    # answer it: a wildcard subscriber would receive the per-agent frames
+    # verbatim, including the id and recipient of every BCC delivery, and BCC
+    # blindness would be gone for anyone holding a viewer session.
+    #
+    # What goes out here carries no addressee and no message id — see
+    # `publish_project`. It says only that something changed, which is what a
+    # page needs in order to decide to refetch, and nothing a reader could not
+    # already obtain by pressing F5 against the same session.
+
+    def subscribe_project(self, project: str) -> asyncio.Queue[dict[str, Any]]:
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
+        self._project_subscribers.setdefault(project.strip().lower(), set()).add(queue)
+        return queue
+
+    def unsubscribe_project(self, project: str, queue: asyncio.Queue[dict[str, Any]]) -> None:
+        key = project.strip().lower()
+        listeners = self._project_subscribers.get(key)
+        if listeners is None:
+            return
+        listeners.discard(queue)
+        if not listeners:
+            self._project_subscribers.pop(key, None)
+
+    def publish_project(self, project: str) -> int:
+        """Tell project watchers that something changed. Nothing else.
+
+        The frame is content-free on purpose. Carrying a message id or an
+        addressee would make this a second, weaker answer to "who may see
+        what" — a question `fetch_inbox` and the viewer's own session already
+        answer. A cache-invalidation ping cannot leak what it does not carry.
+        """
+        listeners = self._project_subscribers.get(project.strip().lower())
+        if not listeners:
+            return 0
+        event = {"kind": "changed", "project": project}
+        delivered = 0
+        for queue in tuple(listeners):
+            try:
+                queue.put_nowait(event)
+            except Exception:
+                continue
+            delivered += 1
+        return delivered
+
+    def project_listener_count(self, project: str) -> int:
+        return len(self._project_subscribers.get(project.strip().lower(), ()))
 
 
 hub = NotificationHub()

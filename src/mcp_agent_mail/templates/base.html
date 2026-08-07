@@ -2155,12 +2155,19 @@
       <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div class="flex items-center justify-between h-16">
           <!-- Logo and Brand -->
-          <div class="flex items-center gap-8">
+          <!-- Below sm the wordmark gives way to the logo tile, which is still a
+               link to /mail. Measured on a 440 px viewport (iPhone 17 Pro Max,
+               operator's UAT): this row wanted 443 px of a 408 px content box, so
+               the right-hand controls sat 35 px past the edge and the page scrolled
+               sideways. The wordmark plus its gap is 83 px of that; the two tighter
+               gaps are another 16. Breadcrumbs vary per page and a project slug is
+               longer than "Unified Inbox", so the slack is deliberate. -->
+          <div class="flex items-center gap-4 sm:gap-8">
             <a href="/mail" class="flex items-center gap-3 group">
               <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-primary-500 to-primary-700 flex items-center justify-center shadow-medium group-hover:shadow-glow transition-all duration-300">
                 <i data-lucide="mail" class="w-5 h-5 text-white"></i>
               </div>
-              <span class="text-xl font-bold bg-gradient-to-r from-primary-600 to-primary-800 dark:from-primary-400 dark:to-primary-600 bg-clip-text text-transparent">
+              <span class="hidden sm:inline text-xl font-bold bg-gradient-to-r from-primary-600 to-primary-800 dark:from-primary-400 dark:to-primary-600 bg-clip-text text-transparent">
                 Agent Mail
               </span>
             </a>
@@ -2170,7 +2177,7 @@
           </div>
 
           <!-- Right side actions -->
-          <div class="flex items-center gap-3">
+          <div class="flex items-center gap-2 sm:gap-3">
             {% block header_actions %}{% endblock %}
 
             <!-- Live state + sound. Here rather than per page, so every view

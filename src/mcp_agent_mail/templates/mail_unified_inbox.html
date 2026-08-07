@@ -110,19 +110,27 @@
            :class="isRefreshing ? 'animate-spin text-primary-500' : 'text-slate-500 dark:text-slate-400'"></i>
         <span class="hidden xl:inline">Refresh</span>
       </button>
+      <!-- Both texts step aside below sm. Measured on a 440 px viewport: this
+           group is 180 px of a 408 px bar and pushed it 88 px past the edge —
+           "Updated just now" is 49 of that and the Auto-refresh word 44. Neither
+           is load-bearing on a phone: the navbar's live pip already says whether
+           the stream is carrying the page, and the checkbox keeps its own
+           aria-label. The error line is NOT hidden with them; it is the one thing
+           here that only appears when something is wrong. -->
       <div class="flex flex-col">
-        <span class="text-xs font-medium text-slate-500 dark:text-slate-400" x-text="lastRefreshLabel"></span>
+        <span class="hidden sm:inline text-xs font-medium text-slate-500 dark:text-slate-400" x-text="lastRefreshLabel"></span>
         <template x-if="refreshError">
           <span class="text-xs text-rose-500" x-text="refreshError"></span>
         </template>
       </div>
-      <label class="flex items-center gap-2 text-xs font-medium text-slate-600 dark:text-slate-400 cursor-pointer select-none">
+      <label class="flex items-center gap-2 text-xs font-medium text-slate-600 dark:text-slate-400 cursor-pointer select-none"
+             data-tippy-content="Auto-refresh">
         <input type="checkbox"
                class="form-checkbox h-4 w-4 rounded border-slate-300 dark:border-slate-600 text-primary-600 focus:ring-primary-500"
                x-model="autoRefreshEnabled"
                @change="handleAutoRefreshToggle()"
                aria-label="Toggle automatic refresh" />
-        <span>Auto-refresh</span>
+        <span class="hidden sm:inline">Auto-refresh</span>
       </label>
     </div>
 
@@ -725,7 +733,12 @@ function unifiedInboxManager() {
     searchQuery: '',
     showFilters: false,
     sortBy: 'newest',
-    viewMode: 'split',
+    // The split preview pane is `hidden md:flex` (the <main> in the split
+    // template), so below 768 px "split" is a list with nowhere to put the
+    // message: selecting one set selectedMessage and displayed nothing. Matching
+    // the default to the same breakpoint the CSS uses is why this is matchMedia
+    // and not a guess at a phone width.
+    viewMode: window.matchMedia('(min-width: 768px)').matches ? 'split' : 'list',
     isFullscreen: false,
     autoRefreshSeconds: 45,
     autoRefreshEnabled: true,
@@ -1116,9 +1129,23 @@ function unifiedInboxManager() {
       }
     },
 
+    // True only when the split preview pane can actually render. It is
+    // `hidden md:flex`, so below md it occupies no space and shows nothing —
+    // and viewMode alone cannot tell you that, because the split button stays
+    // tappable at every width. Same query as the viewMode default above, so the
+    // two cannot drift apart from each other or from the `md:` in the markup.
+    splitPaneVisible() {
+      return window.matchMedia('(min-width: 768px)').matches;
+    },
+
     // Selection
     handleMessageClick(msg) {
-      if (this.viewMode === 'list') {
+      // Not just `viewMode === 'list'`: a phone user who taps the split-view
+      // button lands in split mode with an unrenderable pane, and every
+      // subsequent tap on a message did nothing at all — no navigation, no
+      // preview, no error. Falling back to the dedicated page keeps the click
+      // meaning "open this message" at every width.
+      if (this.viewMode === 'list' || !this.splitPaneVisible()) {
         // Navigate to dedicated message page in list view
         window.location.href = `/mail/${msg.project_slug}/message/${msg.id}`;
       } else {

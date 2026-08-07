@@ -19,11 +19,6 @@ from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.http import build_http_app
 from mcp_agent_mail.storage import ensure_archive, write_agent_profile, write_message_bundle
 
-# Every test in this module asserts what a /mail page renders, not who is allowed
-# to ask for it. Since the password gate landed those are different questions, and
-# without this the first request returns 503 and nothing below is ever reached.
-# The gate itself is covered by tests/test_mail_ui_auth.py.
-pytestmark = pytest.mark.usefixtures("open_mail_ui_gate")
 
 
 

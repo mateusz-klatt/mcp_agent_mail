@@ -29,21 +29,6 @@ from mcp_agent_mail.http import _collect_retention_quota_report, build_http_app
 from mcp_agent_mail.storage import ensure_archive
 
 
-# These reach /mail/api/* routes, which sit behind the viewer's password gate.
-# Neither file has anything to say about that gate — see tests/test_mail_ui_auth.py,
-# which owns it — and with it on by default every request here answers 503 (auth
-# enabled, no signing secret) and the assertions read as broken routes.
-#
-# Per file rather than in a shared fixture, deliberately: the default must stay
-# ON, because it is what protects a real deployment.
-@pytest.fixture(autouse=True)
-def _viewer_auth_disabled(monkeypatch):
-    monkeypatch.setenv("MAIL_UI_AUTH_ENABLED", "false")
-    with contextlib.suppress(Exception):
-        _config.clear_settings_cache()
-    yield
-    with contextlib.suppress(Exception):
-        _config.clear_settings_cache()
 
 
 

@@ -133,6 +133,15 @@ until you ask the server itself. `curl` the MCP endpoint and read the status:
 checking whether the first attempt landed; during a window it usually did not,
 but "usually" is not a reason to send twice.
 
+**An empty result is now `[]`, not silence.** Until `848b1c3`, a tool that
+succeeded and matched nothing returned no output at all, because `am_call` read
+`.result.content[0].text` and there was no element nought — so "no contacts" and
+"the call failed" printed the same thing, and one of us spent the day adding a
+second call to every inbox check to tell them apart. It now falls back to
+`structuredContent`, which the server was sending all along. `rc` alone
+separates the remaining cases: `rc=0` with `[]` is an empty answer, `rc=2` with
+an empty body is a deploy window.
+
 **A filter that does not match looks exactly like a response that is empty.**
 The reservation call returns granted holds under `granted`, not `reservations`,
 and conflicts under `conflicts`. A `jq` path that misses prints nothing, which

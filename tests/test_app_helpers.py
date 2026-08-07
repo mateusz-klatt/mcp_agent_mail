@@ -20,6 +20,8 @@ from mcp_agent_mail.app import (
     build_mcp_server,
 )
 
+from tests.keys import pkey
+
 
 def test_iso_and_parse_helpers():
     now = datetime(2025, 1, 1, tzinfo=timezone.utc)
@@ -155,7 +157,7 @@ async def test_tool_metrics_resource_populates_after_calls(isolated_env):
         # call a couple tools to increment metrics
         res = await client.call_tool("health_check", {})
         assert res.data["status"] == "ok"
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
 
         # tooling metrics resource
         metrics_blocks = await client.read_resource("resource://tooling/metrics")

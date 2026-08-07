@@ -23,6 +23,8 @@ from mcp_agent_mail.utils import (
     validate_agent_name_format,
 )
 
+from tests.keys import pkey
+
 # ============================================================================
 # Unit Tests: validate_agent_name_format()
 # ============================================================================
@@ -220,12 +222,12 @@ async def test_register_agent_auto_generates_valid_name(isolated_env):
     """register_agent should auto-generate a valid name when name is omitted."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/names"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/names")})
 
         result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/names",
+                "project_key": pkey("test/names"),
                 "program": "test-program",
                 "model": "test-model",
             },
@@ -241,12 +243,12 @@ async def test_register_agent_with_explicit_valid_name(isolated_env):
     """register_agent should accept explicit valid names."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/names"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/names")})
 
         result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/names",
+                "project_key": pkey("test/names"),
                 "program": "test-program",
                 "model": "test-model",
                 "name": "BlueMountain",
@@ -261,13 +263,13 @@ async def test_register_agent_case_insensitive_uniqueness(isolated_env):
     """Agent names should be case-insensitively unique."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/case"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/case")})
 
         # Register with one case
         result1 = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/case",
+                "project_key": pkey("test/case"),
                 "program": "test",
                 "model": "test",
                 "name": "GreenLake",
@@ -279,7 +281,7 @@ async def test_register_agent_case_insensitive_uniqueness(isolated_env):
         result2 = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/case",
+                "project_key": pkey("test/case"),
                 "program": "test-updated",
                 "model": "test-updated",
                 "name": "greenlake",
@@ -299,13 +301,13 @@ async def test_register_agent_coerces_invalid_descriptive_name(isolated_env):
     """In coerce mode (default), invalid names auto-generate valid ones."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/coerce"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/coerce")})
 
         # In coerce mode, invalid name should trigger auto-generation
         result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/coerce",
+                "project_key": pkey("test/coerce"),
                 "program": "test",
                 "model": "test",
                 "name": "BackendHarmonizer",  # Invalid descriptive name
@@ -323,12 +325,12 @@ async def test_register_agent_coerces_program_name_as_agent(isolated_env):
     """In coerce mode, program names as agent names get auto-generated."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/coerce"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/coerce")})
 
         result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/coerce",
+                "project_key": pkey("test/coerce"),
                 "program": "claude-code",
                 "model": "opus",
                 "name": "claude-code",  # Using program name as agent name
@@ -356,13 +358,13 @@ async def test_register_agent_strict_rejects_invalid_descriptive_name(isolated_e
 
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/strict"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/strict")})
 
         with pytest.raises(Exception) as exc_info:
             await client.call_tool(
                 "register_agent",
                 {
-                    "project_key": "/test/strict",
+                    "project_key": pkey("test/strict"),
                     "program": "test",
                     "model": "test",
                     "name": "BackendHarmonizer",
@@ -383,13 +385,13 @@ async def test_register_agent_strict_rejects_program_name_as_agent(isolated_env,
 
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/strict"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/strict")})
 
         with pytest.raises(Exception) as exc_info:
             await client.call_tool(
                 "register_agent",
                 {
-                    "project_key": "/test/strict",
+                    "project_key": pkey("test/strict"),
                     "program": "claude-code",
                     "model": "opus",
                     "name": "claude-code",
@@ -410,7 +412,7 @@ async def test_create_agent_identity_generates_unique_names(isolated_env):
     """create_agent_identity should generate unique valid names."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/identity"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/identity")})
 
         # Create multiple identities - all should have unique valid names
         names = set()
@@ -418,7 +420,7 @@ async def test_create_agent_identity_generates_unique_names(isolated_env):
             result = await client.call_tool(
                 "create_agent_identity",
                 {
-                    "project_key": "/test/identity",
+                    "project_key": pkey("test/identity"),
                     "program": "test",
                     "model": "test",
                 },
@@ -434,12 +436,12 @@ async def test_create_agent_identity_with_valid_hint(isolated_env):
     """create_agent_identity should accept valid name hints."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/hint"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/hint")})
 
         result = await client.call_tool(
             "create_agent_identity",
             {
-                "project_key": "/test/hint",
+                "project_key": pkey("test/hint"),
                 "program": "test",
                 "model": "test",
                 "name_hint": "SilentCave",
@@ -454,13 +456,13 @@ async def test_create_agent_identity_coerces_invalid_hint(isolated_env):
     """In coerce mode, create_agent_identity auto-generates for invalid hints."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/hint"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/hint")})
 
         # In coerce mode, invalid hint should trigger auto-generation
         result = await client.call_tool(
             "create_agent_identity",
             {
-                "project_key": "/test/hint",
+                "project_key": pkey("test/hint"),
                 "program": "test",
                 "model": "test",
                 "name_hint": "InvalidDescriptiveName",
@@ -477,11 +479,11 @@ async def test_create_agent_identity_returns_token_by_default(isolated_env):
     """Default behavior preserves existing contract (issue #154)."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/token-default"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/token-default")})
         result = await client.call_tool(
             "create_agent_identity",
             {
-                "project_key": "/test/token-default",
+                "project_key": pkey("test/token-default"),
                 "program": "test",
                 "model": "test",
             },
@@ -501,11 +503,11 @@ async def test_create_agent_identity_omits_token_when_opted_out(isolated_env):
     """`return_registration_token=False` keeps the token off the wire (issue #154)."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/token-opt-out"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/token-opt-out")})
         result = await client.call_tool(
             "create_agent_identity",
             {
-                "project_key": "/test/token-opt-out",
+                "project_key": pkey("test/token-opt-out"),
                 "program": "test",
                 "model": "test",
                 "return_registration_token": False,
@@ -533,13 +535,13 @@ async def test_create_agent_identity_strict_rejects_invalid_hint(isolated_env, m
 
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/strict-hint"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/strict-hint")})
 
         with pytest.raises(Exception) as exc_info:
             await client.call_tool(
                 "create_agent_identity",
                 {
-                    "project_key": "/test/strict-hint",
+                    "project_key": pkey("test/strict-hint"),
                     "program": "test",
                     "model": "test",
                     "name_hint": "InvalidDescriptiveName",
@@ -560,13 +562,13 @@ async def test_send_message_validates_recipient_names(isolated_env):
     """send_message should validate recipient agent names exist."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/msg"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/msg")})
 
         # Register sender
         sender_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/msg",
+                "project_key": pkey("test/msg"),
                 "program": "test",
                 "model": "test",
             },
@@ -578,7 +580,7 @@ async def test_send_message_validates_recipient_names(isolated_env):
             await client.call_tool(
                 "send_message",
                 {
-                    "project_key": "/test/msg",
+                    "project_key": pkey("test/msg"),
                     "sender_name": sender_name,
                     "to": ["SilentGlacier"],  # Valid format but doesn't exist
                     "subject": "Test",
@@ -596,13 +598,13 @@ async def test_send_message_with_valid_agents(isolated_env):
     """send_message should work with valid, registered agent names."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/valid"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/valid")})
 
         # Register sender and recipient
         sender_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/valid",
+                "project_key": pkey("test/valid"),
                 "program": "test",
                 "model": "test",
             },
@@ -612,7 +614,7 @@ async def test_send_message_with_valid_agents(isolated_env):
         recipient_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/valid",
+                "project_key": pkey("test/valid"),
                 "program": "test",
                 "model": "test",
             },
@@ -623,7 +625,7 @@ async def test_send_message_with_valid_agents(isolated_env):
         result = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/valid",
+                "project_key": pkey("test/valid"),
                 "sender_name": sender_name,
                 "to": [recipient_name],
                 "subject": "Test Message",

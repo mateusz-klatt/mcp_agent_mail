@@ -228,8 +228,10 @@ am_bearer() {
 # under the same permissions; note this does put the bearer in a second place on
 # disk, where before it lived only in ~/.agent-mail.env.
 #
-# Returns nothing if the file cannot be written, and the caller then falls back
-# to -H. A hook that cannot hide a token is still better than a hook that fails.
+# Returns nothing if the file cannot be written; am_call then swaps which of the
+# two stdin users gives way, rather than degrading to -H. A hook that cannot
+# hide a token would still be better than a hook that fails, but it turns out
+# not to be a choice we have to make.
 am_hdr_conf() {
     local f="${AM_STATE_DIR}/curl-headers.conf" want cur tmp
     want="$(printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\nheader = "Accept: application/json, text/event-stream"' "$1")"
@@ -275,11 +277,19 @@ am_call() {
             -K "$hdr" --data @- 2>/dev/null \
             | jq -r '.result.content[0].text // empty' 2>/dev/null
     else
-        printf '%s' "$body" | curl -s --max-time "$AM_TIMEOUT" -X POST "${AM_BASE_URL}/api/" \
-            -H "Authorization: Bearer ${bearer}" \
-            -H 'Content-Type: application/json' \
-            -H 'Accept: application/json, text/event-stream' \
-            --data @- 2>/dev/null \
+        # No writable state dir. Swap which of the two gives up stdin rather than
+        # putting the bearer back in argv: the body is not a secret, and -a
+        # already made it ASCII, so argv is a safe place for it and not for the
+        # token. That keeps "the bearer is never in the process table" true
+        # unconditionally instead of true-until-the-disk-fills.
+        #
+        # No new size ceiling: --argjson above already hands $args to jq through
+        # argv, so the ~32 kB limit measured on Windows binds this function
+        # either way. Hook bodies run about 270 B.
+        printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\nheader = "Accept: application/json, text/event-stream"\n' \
+            "$bearer" \
+            | curl -s --max-time "$AM_TIMEOUT" -X POST "${AM_BASE_URL}/api/" \
+                -K - --data "$body" 2>/dev/null \
             | jq -r '.result.content[0].text // empty' 2>/dev/null
     fi
 }

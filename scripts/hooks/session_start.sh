@@ -60,7 +60,7 @@ got_token="$(printf '%s' "$resp" | jq -r '.registration_token // empty' 2>/dev/n
 # this hook reads.
 if [ -z "$got_name" ]; then
     am_emit_context "SessionStart" \
-        "Agent Mail: could not read an agent name from the registration response. The server answered, but not with what register_agent returns — check MCP_AGENT_MAIL_OUTPUT_FORMAT and TOON_DEFAULT_FORMAT on the server, which replace every field with a {format, data, meta} envelope. Until this is fixed there is no coordination in this session: no reservations, no conflict warnings, no mail."
+        "Agent Mail: could not read an agent name from the registration response. The server answered, but not with what register_agent returns — check MCP_AGENT_MAIL_OUTPUT_FORMAT and TOON_DEFAULT_FORMAT on the server, which replace every field with a {format, data, meta} envelope. Until this is fixed there is no coordination in this session: no reservations, no conflict warnings, no mail. The registration itself may well have succeeded: the identity can now exist on the server while no token exists here, and fixing the setting does not undo that — re-registering the same name will then be refused for want of the token it never returned."
     exit 0
 fi
 

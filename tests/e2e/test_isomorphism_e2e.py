@@ -24,6 +24,7 @@ from mcp_agent_mail.db import ensure_schema, get_session, reset_database_state
 from mcp_agent_mail.http import build_http_app
 from mcp_agent_mail.storage import ensure_archive
 from tests.e2e.utils import assert_matches_golden, make_console, render_phase, write_log
+from tests.keys import pkey
 
 INLINE_PNG_BASE64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMA"
@@ -264,7 +265,9 @@ def _touch_bundle_files(bundle_root: Path, base: float) -> None:
 
 
 @pytest.mark.asyncio
-async def test_isomorphism_e2e_suite(isolated_env, tmp_path: Path, monkeypatch) -> None:
+async def test_isomorphism_e2e_suite(
+    isolated_env, open_mail_ui_gate, tmp_path: Path, monkeypatch
+) -> None:
     monkeypatch.setenv("WORKTREES_ENABLED", "1")
     monkeypatch.setenv("INLINE_IMAGE_MAX_BYTES", "1024")
     # The suite attaches files from pytest's absolute tmp_path, so opt into
@@ -282,8 +285,8 @@ async def test_isomorphism_e2e_suite(isolated_env, tmp_path: Path, monkeypatch) 
     server = build_mcp_server()
     async with Client(server) as client:
         render_phase(console, "setup", {"project": "alpha/beta", "agents": "register"})
-        alpha_project = _tool_data(await client.call_tool("ensure_project", {"human_key": "/alpha"}))
-        beta_project = _tool_data(await client.call_tool("ensure_project", {"human_key": "/beta"}))
+        alpha_project = _tool_data(await client.call_tool("ensure_project", {"human_key": pkey("alpha")}))
+        beta_project = _tool_data(await client.call_tool("ensure_project", {"human_key": pkey("beta")}))
         alpha_key = alpha_project["slug"]
         beta_key = beta_project["slug"]
         phases.append(
@@ -457,7 +460,7 @@ async def test_isomorphism_e2e_suite(isolated_env, tmp_path: Path, monkeypatch) 
 
         perf_project = _tool_data(
             await client.call_tool(
-                "ensure_project", {"human_key": f"/perf-phase2-{uuid.uuid4().hex[:6]}"}
+                "ensure_project", {"human_key": pkey(f"perf-phase2-{uuid.uuid4().hex[:6]}")}
             )
         )
         perf_key = perf_project["slug"]
@@ -819,8 +822,8 @@ async def test_isomorphism_e2e_suite(isolated_env, tmp_path: Path, monkeypatch) 
             }
         )
 
-        alpha_project_stable = _tool_data(await client.call_tool("ensure_project", {"human_key": "/alpha"}))
-        beta_project_stable = _tool_data(await client.call_tool("ensure_project", {"human_key": "/beta"}))
+        alpha_project_stable = _tool_data(await client.call_tool("ensure_project", {"human_key": pkey("alpha")}))
+        beta_project_stable = _tool_data(await client.call_tool("ensure_project", {"human_key": pkey("beta")}))
 
     reservation_times: dict[int, dict[str, Any]] = {
         entry["id"]: entry for entry in reservations_snapshot if isinstance(entry, dict) and entry.get("id") is not None
@@ -880,6 +883,15 @@ async def test_isomorphism_e2e_suite(isolated_env, tmp_path: Path, monkeypatch) 
         (str(database_path), "<database_path>"),
         (str(product.get("product_uid") or ""), "<product_uid>"),
         (str(phase2_project), "<phase2_project>"),
+        # Map the Windows key back onto the POSIX shape the golden was recorded
+        # in, rather than onto a placeholder. A placeholder would have been the
+        # obvious move and is wrong: pkey("alpha") *is* "/alpha" off Windows, so
+        # it would rewrite the golden's own literals and turn 0 diffs into 29 on
+        # macOS and Linux. Measured, comparing a Windows run against the
+        # committed golden: 29 of 75 differences were this substitution firing
+        # on values that already matched. Both entries are no-ops off Windows.
+        (pkey("alpha"), "/alpha"),
+        (pkey("beta"), "/beta"),
     ]
 
     result = {

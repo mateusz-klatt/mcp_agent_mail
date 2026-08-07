@@ -73,6 +73,16 @@ shape. *"did ANY secret leak"* needs a tool that knows the context —
 `gitleaks`, `trufflehog` — because a hand-written pattern fails silently when
 the guess about the alphabet is wrong.
 
+A detector can also see too narrowly rather than not at all, and that failure
+is worse. Someone grepping a docstring pulled out `- Ignore conflicts; resolve
+them by coordinating with holders` and was one keystroke from reporting that
+the tool tells its callers to ignore conflicts. The line was real and the
+match was correct. Four lines above it stood `Don't:`. A miss produces silence,
+which anyone with the habit of a positive control finds suspicious; a match
+without its frame produces a sentence that agrees with the hypothesis, and
+nobody runs a control on agreement. When quoting from a list, quote the header
+of the list — a fixed `-A`/`-B` window does not guarantee you have it.
+
 **When was it measured, and when am I reporting it?**
 
 A fifth axis, and the only one where the question was right and the answer was

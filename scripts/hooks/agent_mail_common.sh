@@ -221,13 +221,15 @@ am_call() {
     local tool="$1" args="$2" bearer body
     bearer="$(am_bearer)"
     [ -z "$bearer" ] && return 0
-    # -a escapes every non-ASCII character to \uXXXX. The server accepts UTF-8
-    # fine — the corruption is ours: the body crosses an argv boundary into
-    # native curl.exe below, and on Windows that crossing re-encodes text
-    # through the console codepage, turning valid UTF-8 into legacy-codepage
-    # bytes the server rightly refuses (the identical body sent via stdin
-    # passes). ASCII cannot be mis-encoded, so escaping makes the transport
-    # encoding irrelevant on every platform and in every console setup.
+    # Two encoding defences, on purpose. The server accepts UTF-8 fine — the
+    # corruption was ours: on Windows the argv crossing into native curl.exe
+    # re-encodes text through the console codepage, turning valid UTF-8 into
+    # legacy-codepage bytes the server rightly refuses (400). Verified
+    # byte-for-byte on the affected machine: the identical body fails as
+    # --data ARG and passes via stdin. So the body goes via stdin, which
+    # removes that boundary — and -a escapes non-ASCII to \uXXXX anyway,
+    # because ASCII cannot be mis-encoded even by a boundary nobody has
+    # found yet.
     #
     # Worth doing even though the hooks themselves only ever send file paths and
     # agent names: the refusal arrives as an empty result below, indistinguishable
@@ -235,11 +237,11 @@ am_call() {
     # it with no error anywhere.
     body="$(jq -nac --arg t "$tool" --argjson a "$args" \
         '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:$t,arguments:$a}}' 2>/dev/null)" || return 0
-    curl -s --max-time "$AM_TIMEOUT" -X POST "${AM_BASE_URL}/api/" \
+    printf '%s' "$body" | curl -s --max-time "$AM_TIMEOUT" -X POST "${AM_BASE_URL}/api/" \
         -H "Authorization: Bearer ${bearer}" \
         -H 'Content-Type: application/json' \
         -H 'Accept: application/json, text/event-stream' \
-        --data "$body" 2>/dev/null \
+        --data @- 2>/dev/null \
         | jq -r '.result.content[0].text // empty' 2>/dev/null
 }
 

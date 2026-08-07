@@ -665,6 +665,88 @@ def _jwks_candidate_keys(key_set, header: dict, algorithms: list[str]) -> list:
     return candidates
 
 
+class Utf8BodyGuardMiddleware:
+    """Answer 400, not 500, when a request body is not valid UTF-8.
+
+    The MCP SDK's POST handler raises on an undecodable body and the resulting
+    reply is `500 Error handling POST request` (mcp/server/streamable_http.py).
+    That is the wrong shape of answer twice over: it blames the server for the
+    caller's bytes, and it says nothing about what was wrong. A client that
+    encodes its body in a legacy codepage — which is what a shell on a
+    non-English Windows does unless its console page is UTF-8 — gets a generic
+    server error and no way to reach the real cause. Worse, hook clients that
+    swallow errors read it as an empty result, indistinguishable from "nothing
+    to report", so a message can be lost with no trace anywhere.
+
+    Written as plain ASGI rather than BaseHTTPMiddleware because it has to touch
+    the request body, and buffering through BaseHTTPMiddleware is exactly where
+    that class misbehaves. Only POSTs with a declared, modest Content-Length are
+    inspected: a streamed or oversized body is passed through untouched rather
+    than buffered, and non-POST traffic — including the long-lived SSE GET — is
+    never intercepted at all.
+    """
+
+    # Comfortably above any JSON-RPC call this server serves; attachments travel
+    # as paths, not bytes.
+    MAX_INSPECT_BYTES = 4 * 1024 * 1024
+
+    def __init__(self, app: Any) -> None:
+        self._app = app
+
+    def _declared_length(self, scope: Scope) -> int | None:
+        for key, value in scope.get("headers") or []:
+            if key.lower() == b"content-length":
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") != "http" or scope.get("method") != "POST":
+            await self._app(scope, receive, send)
+            return
+        length = self._declared_length(scope)
+        if length is None or length <= 0 or length > self.MAX_INSPECT_BYTES:
+            await self._app(scope, receive, send)
+            return
+
+        chunks: list[bytes] = []
+        while True:
+            message = await receive()
+            if message.get("type") == "http.disconnect":
+                await self._app(scope, receive, send)
+                return
+            chunks.append(message.get("body", b"") or b"")
+            if not message.get("more_body", False):
+                break
+        body = b"".join(chunks)
+
+        try:
+            body.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            detail = (
+                "Request body is not valid UTF-8 (invalid byte at offset "
+                f"{exc.start}). JSON must be UTF-8 encoded; a body produced in a "
+                "legacy codepage will fail here. Either send UTF-8, or escape "
+                "non-ASCII characters as \\uXXXX, which cannot be mis-encoded."
+            )
+            response = JSONResponse({"detail": detail}, status_code=status.HTTP_400_BAD_REQUEST)
+            await response(scope, receive, send)
+            return
+
+        replayed = False
+
+        async def replay() -> Any:
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return await receive()
+
+        await self._app(scope, replay, send)
+
+
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     def __init__(
         self, app: FastAPI, token: str, allow_localhost: bool = False, jwt_enabled: bool = False
@@ -1770,6 +1852,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     if settings.mail_ui.enabled:
         app_any3 = cast(Any, fastapi_app)
         app_any3.add_middleware(MailUiAuthMiddleware, settings=settings)
+
+    # Registered last, so it wraps everything and inspects the body before any
+    # layer tries to parse it. An undecodable body is a property of the request,
+    # not of who is asking, so this is answered ahead of authentication.
+    app_any4 = cast(Any, fastapi_app)
+    app_any4.add_middleware(Utf8BodyGuardMiddleware)
 
     # Optional CORS
     if settings.cors.enabled:

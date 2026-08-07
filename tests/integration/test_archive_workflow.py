@@ -1,7 +1,9 @@
 import asyncio
+import contextlib
 import os
 import shutil
 import sqlite3
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -62,7 +64,13 @@ def test_archive_save_list_restore_cycle(isolated_env):
 
     asyncio.run(_seed())
 
-    with runner.isolated_filesystem():
+    # Typer's CliRunner no longer forwards click's `isolated_filesystem`: since
+    # typer vendored its own click, its runner exposes only what Typer itself
+    # needs. The block below wants one thing from it — a throwaway working
+    # directory, because it resolves the archive directory from `Path.cwd()`.
+    # The stdlib says that directly, and stops the test depending on which
+    # click surface Typer happens to re-export.
+    with tempfile.TemporaryDirectory() as _cwd, contextlib.chdir(_cwd):
         archive_dir = Path.cwd() / cli_module.ARCHIVE_DIR_NAME
         before = set(archive_dir.glob("*.zip")) if archive_dir.exists() else set()
 

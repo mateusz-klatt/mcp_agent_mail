@@ -12,6 +12,24 @@ from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.config import get_settings
 
 
+@pytest.fixture(autouse=True)
+def _allow_absolute_attachment_paths(monkeypatch):
+    """Both tests here build their images next to the storage root, absolutely.
+
+    Same cause as test_image_processing_edge.py: ``ab670c6`` gated absolute
+    attachment paths and these predate it, so ``send_message`` refused before
+    an attachment was ever written and the failure named the manifest.
+
+    Nothing in this module asserts the refusal — that lives in
+    test_security_path_traversal.py, which this fixture deliberately does not
+    reach. Module scope rather than ``isolated_env`` for exactly that reason.
+    """
+    monkeypatch.setenv("ALLOW_ABSOLUTE_ATTACHMENT_PATHS", "true")
+    _config.clear_settings_cache()
+    yield
+    _config.clear_settings_cache()
+
+
 @pytest.mark.asyncio
 async def test_attachments_keep_originals_and_manifest(isolated_env, monkeypatch):
     monkeypatch.setenv("KEEP_ORIGINAL_IMAGES", "true")

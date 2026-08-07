@@ -5170,6 +5170,39 @@ def build_mcp_server() -> FastMCP:
             return await _get_agent_by_id(project, bound_agent_ids[0])
         return None
 
+    # Authenticating IS activity, and until now it did not count as any.
+    #
+    # last_active_ts was refreshed when an agent registered or sent a message,
+    # but not when it authenticated to file, renew or read anything — so a
+    # session that spends half an hour reserving files and never speaks looks,
+    # to the reservation sweeper, exactly like one that went away. The sweeper
+    # is forgiving (it also weighs recent mail, filesystem and git activity, and
+    # only acts when none of them is present), so this was a narrow hole rather
+    # than a daily one. It is still a field whose name promised something it did
+    # not deliver.
+    #
+    # Throttled, because the alternative is a write on every hook invocation and
+    # the hooks fire twice per edit. A minute of granularity is far below the
+    # 1800s the sweeper compares against.
+    _ACTIVITY_TOUCH_SECONDS = 60
+
+    async def _touch_agent_activity(agent: Agent) -> None:
+        if agent.id is None:
+            return
+        now = _naive_utc()
+        previous = getattr(agent, "last_active_ts", None)
+        if previous is not None and (now - previous).total_seconds() < _ACTIVITY_TOUCH_SECONDS:
+            return
+        # Never let bookkeeping fail a call that already succeeded.
+        with suppress(Exception):
+            async with get_session() as session:
+                db_agent = await session.get(Agent, agent.id)
+                if db_agent is not None:
+                    db_agent.last_active_ts = now
+                    session.add(db_agent)
+                    await session.commit()
+            agent.last_active_ts = now
+
     async def _authenticate_agent(
         ctx: Context,
         project: Project,
@@ -5182,6 +5215,7 @@ def build_mcp_server() -> FastMCP:
         agent = await _get_agent(project, agent_name)
         if _session_is_bound_to_agent(ctx, project, agent):
             _bind_session_agent(ctx, project, agent)
+            await _touch_agent_activity(agent)
             return agent
 
         stored_token = (agent.registration_token or "").strip()
@@ -5240,6 +5274,7 @@ def build_mcp_server() -> FastMCP:
             )
 
         _bind_session_agent(ctx, project, agent)
+        await _touch_agent_activity(agent)
         return agent
 
     async def _resolve_authenticated_agent(

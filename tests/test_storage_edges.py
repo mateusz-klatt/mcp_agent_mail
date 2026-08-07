@@ -1113,7 +1113,7 @@ async def test_store_image_writes_sha256_path(isolated_env):
         )
 
         # rel_path must reference the SHA256 filename
-        assert digest in rel_path, (
+        assert digest in str(rel_path), (
             f"rel_path {rel_path!r} must contain the SHA256 digest"
         )
 

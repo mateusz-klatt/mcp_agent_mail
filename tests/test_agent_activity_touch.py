@@ -37,6 +37,7 @@ async def _last_active(name: str) -> str:
                 text("SELECT last_active_ts FROM agents WHERE name = :n"), {"n": name}
             )
         ).fetchone()
+    assert row is not None
     return str(row[0])
 
 

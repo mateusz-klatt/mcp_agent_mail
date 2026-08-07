@@ -178,6 +178,7 @@ async def _bump_epoch(username: str = "operator") -> None:
 
     async with get_session() as session:
         row = (await session.execute(select(UiUser).where(UiUser.username == username))).scalars().first()
+        assert row is not None
         row.session_epoch += 1
         session.add(row)
         await session.commit()

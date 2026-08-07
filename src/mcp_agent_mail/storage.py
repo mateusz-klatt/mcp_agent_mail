@@ -2797,7 +2797,7 @@ async def get_file_content(
             if obj.size > max_size_bytes:
                 raise ValueError(f"File too large: {obj.size} bytes (max {max_size_bytes})")
 
-            stream = obj.data_stream
+            stream = cast(Any, obj.data_stream)
             try:
                 return str(stream.read().decode("utf-8", errors="replace"))
             finally:

@@ -86,6 +86,25 @@ async def test_resource_format_query_param_fastmcp(isolated_env, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_toon_fallback_on_encoder_error(isolated_env, monkeypatch):
+    """A failed encode must be invisible to the caller, not half-applied.
+
+    This used to assert the opposite: on encoder failure the caller still got the
+    envelope, with format="json" and meta.toon_error explaining why. That reads
+    like a graceful fallback and is worse than not honouring the request, because
+    the envelope moves the payload under `data` — so every caller reading fields
+    off the top level breaks, whether or not it ever looks at meta.
+
+    Measured cost of the old shape: register_agent stopped carrying
+    registration_token and name, session_start.sh exited at its name check in
+    silence, and the agent it had just created stayed on the server — leaving the
+    machine unable to register under its own name ever again, at rc=0, with
+    nothing written anywhere. TOON_BIN defaults to "tru", which is not installed
+    on an ordinary host, so that was the DEFAULT result of enabling the feature.
+
+    The diagnostic is not lost, it moved: _apply_tool_output_format logs
+    toon_encode.failed. It was addressed to someone who could not act on it —
+    an agent cannot install an encoder on the server.
+    """
     clear_settings_cache()
 
     def _fake_run(payload: str, settings):
@@ -98,6 +117,9 @@ async def test_toon_fallback_on_encoder_error(isolated_env, monkeypatch):
     async with Client(server) as client:
         result = await client.call_tool("health_check", {"format": "toon"})
         payload = result.data
-        assert payload.get("format") == "json"
-        meta = payload.get("meta") or {}
-        assert "toon_error" in meta
+        # Unwrapped: the caller gets what it would have got without asking.
+        assert "format" not in payload or payload.get("format") != "json"
+        assert "meta" not in payload
+        # And the real answer survived — health_check's own fields are reachable
+        # at the top level, which is the whole point.
+        assert payload.get("status") is not None

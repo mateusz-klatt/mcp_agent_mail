@@ -1232,6 +1232,41 @@ async def _apply_tool_output_format(
         source=decision.source,
         requested=decision.requested or "toon",
     )
+
+    # The encoder failed, so hand back exactly what the caller would have got
+    # without asking for TOON. Every failure path in _encode_payload_to_toon_sync
+    # already gives up on encoding — it returns {"format": "json", "data": payload,
+    # meta.toon_error} — but the envelope was applied anyway, which made the damage
+    # unconditional while the benefit stayed conditional.
+    #
+    # That is not cosmetic. `data` holds the payload as an object, and the caller
+    # reads fields off the top level, so wrapping moves every one of them out of
+    # reach. register_agent stops carrying `registration_token` and `name`, and
+    # session_start.sh exits at its name check without a word — while the agent it
+    # just created still exists server-side. The machine cannot register again
+    # (register_agent for an existing identity needs the token it never received)
+    # and nothing anywhere says so. It has burned its own name, permanently, at
+    # rc=0. Measured end-to-end by laptop-mac-1 against a throwaway server.
+    #
+    # TOON_BIN defaults to "tru", which is not installed on an ordinary host, so
+    # this is the DEFAULT outcome of switching the feature on — not an edge case.
+    #
+    # The diagnostic is not dropped, only moved. meta.toon_error was addressed to
+    # a caller who cannot act on it — an agent cannot install an encoder on the
+    # server — so it goes to the log, where the one person who can fix it will
+    # look. The caller gets the answer it asked a question to receive.
+    _toon_error = (
+        (formatted.get("meta") or {}).get("toon_error")
+        if isinstance(formatted, dict)
+        else None
+    )
+    if _toon_error:
+        logger.warning(
+            "toon_encode.failed",
+            extra={"tool": tool_name, "error": str(_toon_error), "source": decision.source},
+        )
+        return result
+
     if setter is not None:
         try:
             setter(formatted)

@@ -42,7 +42,12 @@ WATCH="${AGENT_MAIL_WATCH_SECONDS:-1800}"
 # spawned would not be a task the agent's runtime tracks, so that successor's
 # exit would wake nobody. What can be removed is the recall: print the command,
 # not a reminder that one exists.
-SELF_CMD="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+# `bash <path>`, not a bare path. A bare .sh is executable on Linux and macOS
+# because of the exec bit and the shebang, and on Windows it is a file with no
+# registered handler — so the operator gets "How do you want to open this file?"
+# instead of a running watcher. `bash <path>` runs everywhere, so this needs no
+# per-platform branch and puts no second copy of that knowledge in the tree.
+SELF_CMD="bash $(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 # How long to wait for `: ready` before giving up on the subscription.
 READY_WAIT="${AGENT_MAIL_WATCH_READY_SECONDS:-15}"
 

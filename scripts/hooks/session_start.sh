@@ -109,7 +109,7 @@ if [ -x "$watcher" ]; then
 
 For instant delivery instead of polling, run this ONCE in the background now — it
 exits when mail arrives, and a background task that exits wakes you:
-    $(cd "$(dirname "$watcher")" && pwd)/$(basename "$watcher")"
+    bash $(cd "$(dirname "$watcher")" && pwd)/$(basename "$watcher")"
 fi
 
 am_emit_context "SessionStart" "$summary"

@@ -87,16 +87,42 @@ if [[ -f "$SETTINGS_PATH" ]]; then
   backup_file "$SETTINGS_PATH"
 fi
 
-log_step "Installing inbox check hook"
+log_step "Installing the hook scripts"
 HOOKS_DIR="${CLAUDE_DIR}/hooks"
 mkdir -p "${HOOKS_DIR}"
-INBOX_HOOK="${HOOKS_DIR}/check_inbox.sh"
-if [[ -f "${ROOT_DIR}/scripts/hooks/check_inbox.sh" ]]; then
-  cp "${ROOT_DIR}/scripts/hooks/check_inbox.sh" "${INBOX_HOOK}"
-  chmod +x "${INBOX_HOOK}"
-  log_ok "Installed inbox check hook to ${INBOX_HOOK}"
-else
-  log_warn "Could not find check_inbox.sh hook script"
+
+# The working set, and agent_mail_common.sh which every one of them sources by
+# a path relative to its own location — so they are copied together or not at
+# all. This script used to install check_inbox.sh alone, a previous generation
+# that predates all five, and nothing here mentioned the others: a machine
+# configured by this installer got one hook where the fleet runs six.
+AGENT_MAIL_HOOKS=(
+  agent_mail_common.sh
+  session_start.sh
+  inbox_check.sh
+  reservations_warn.sh
+  autoreserve.sh
+  session_end.sh
+  inbox_watch.sh
+)
+_hooks_installed=0
+_hooks_missing=()
+for _h in "${AGENT_MAIL_HOOKS[@]}"; do
+  if [[ -f "${ROOT_DIR}/scripts/hooks/${_h}" ]]; then
+    cp "${ROOT_DIR}/scripts/hooks/${_h}" "${HOOKS_DIR}/${_h}"
+    # agent_mail_common.sh is sourced, never executed; the rest need the bit.
+    [[ "${_h}" == "agent_mail_common.sh" ]] || chmod +x "${HOOKS_DIR}/${_h}"
+    _hooks_installed=$((_hooks_installed + 1))
+  else
+    _hooks_missing+=("${_h}")
+  fi
+done
+log_ok "Installed ${_hooks_installed}/${#AGENT_MAIL_HOOKS[@]} hook scripts to ${HOOKS_DIR}"
+# Named, not counted. A missing agent_mail_common.sh makes every hook exit
+# silently at its first line, which is indistinguishable from a quiet mailbox.
+if [[ ${#_hooks_missing[@]} -gt 0 ]]; then
+  log_warn "Missing from ${ROOT_DIR}/scripts/hooks: ${_hooks_missing[*]}"
+  log_warn "Hooks that depend on them will exit without saying so."
 fi
 
 # Check server readiness and register agent BEFORE writing hooks config
@@ -202,18 +228,25 @@ if [[ -n "${_REG_TOKEN:-}" ]]; then
   env_file_put AGENT_MAIL_REGISTRATION_TOKEN "${_REG_TOKEN}" \
     || log_warn "Could not write AGENT_MAIL_REGISTRATION_TOKEN to ${ENV_FILE} — fetch_inbox will be denied."
 else
-  log_warn "No registration token available; ${INBOX_HOOK} will no-op until one is written to ${ENV_FILE}."
+  log_warn "No registration token available; the hooks will no-op until one is written to ${ENV_FILE}."
 fi
 
-# Build the inbox check command. Non-secret values only.
+# The hook commands carry NOTHING — not settings, not identity, not secrets.
 #
-# AGENT_MAIL_REGISTRATION_TOKEN is required for fetch_inbox to authenticate
-# from a PostToolUse hook (each hook fires its own curl POST and bypasses
-# any persistent MCP-session state) and now arrives from the env file above.
-# AGENT_MAIL_HOOK_FORMAT=json makes the reminder land in the agent's next-turn
-# system-reminder context — plain stdout is shown to the human in the terminal
-# but never reaches the agent.
-INBOX_CHECK_CMD="AGENT_MAIL_PROJECT='${TARGET_DIR}' AGENT_MAIL_AGENT='${_AGENT}' AGENT_MAIL_HOOK_FORMAT='json' AGENT_MAIL_INTERVAL='120' '${INBOX_HOOK}'"
+# Every value the hooks need they derive or read for themselves: the project key
+# from the repo's origin remote, the identity from the hostname, the rest from
+# ${ENV_FILE}. That is what makes one installation work in every repository on
+# the machine rather than only in this one.
+#
+# This block used to pin AGENT_MAIL_PROJECT and AGENT_MAIL_AGENT into each
+# command. Both are the wrong shape and the second is actively dangerous: a
+# pinned identity or project key follows the machine into other checkouts and
+# creates a project no other agent can join, with every hook still reporting
+# success. Deriving them costs nothing and cannot drift.
+#
+# `|| true` on every command is load-bearing, not defensive habit: a PreToolUse
+# hook that exits non-zero BLOCKS the tool call it was only meant to comment on.
+_hook_cmd() { printf '%s/%s || true' "${HOOKS_DIR}" "$1"; }
 
 # ============================================================================
 # settings.json: HOOKS ONLY (no secrets, git-IGNORED via .gitignore ".claude/")
@@ -236,40 +269,27 @@ if [[ -f "$SETTINGS_PATH" ]]; then
 fi
 
 # Build hook configs as JSON
-SESSION_START_HOOK=$(cat <<HOOKJSON
-{
-  "matcher": "",
-  "hooks": [
-    { "type": "command", "command": "cd '${_MCP_DIR}' && uv run python -m mcp_agent_mail.cli file_reservations active '${_PROJ}'" },
-    { "type": "command", "command": "cd '${_MCP_DIR}' && uv run python -m mcp_agent_mail.cli acks pending '${_PROJ}' '${_AGENT}' --limit 20" }
-  ]
-}
-HOOKJSON
-)
-PRE_TOOL_USE_HOOK=$(cat <<HOOKJSON
-{ "matcher": "Edit", "hooks": [ { "type": "command", "command": "cd '${_MCP_DIR}' && uv run python -m mcp_agent_mail.cli file_reservations soon '${_PROJ}' --minutes 10" } ] }
-HOOKJSON
-)
-POST_TOOL_USE_BASH_HOOK=$(cat <<HOOKJSON
-{ "matcher": "Bash", "hooks": [ { "type": "command", "command": "${INBOX_CHECK_CMD}" } ] }
-HOOKJSON
-)
-POST_TOOL_USE_MSG_HOOK=$(cat <<HOOKJSON
-{ "matcher": "mcp__mcp-agent-mail__send_message", "hooks": [ { "type": "command", "command": "cd '${_MCP_DIR}' && uv run python -m mcp_agent_mail.cli list-acks --project '${_PROJ}' --agent '${_AGENT}' --limit 10" } ] }
-HOOKJSON
-)
-POST_TOOL_USE_RES_HOOK=$(cat <<HOOKJSON
-{ "matcher": "mcp__mcp-agent-mail__file_reservation_paths", "hooks": [ { "type": "command", "command": "cd '${_MCP_DIR}' && uv run python -m mcp_agent_mail.cli file_reservations list '${_PROJ}'" } ] }
-HOOKJSON
-)
+# The four events, in the shape that is running on the fleet today. Matchers
+# included: PreToolUse and PostToolUse fire on file-writing tools, not on Bash —
+# a reservation warning is only useful immediately before an edit, and firing it
+# on every shell command is how a warning becomes noise nobody reads.
+SESSION_START_HOOK=$(jq -nc --arg a "$(_hook_cmd session_start.sh)" --arg b "$(_hook_cmd inbox_check.sh)" \
+  '{matcher:"",hooks:[{type:"command",command:$a},{type:"command",command:$b}]}')
+PRE_TOOL_USE_HOOK=$(jq -nc --arg a "$(_hook_cmd reservations_warn.sh)" \
+  '{matcher:"Edit|Write|NotebookEdit",hooks:[{type:"command",command:$a}]}')
+POST_TOOL_USE_HOOK=$(jq -nc --arg a "$(_hook_cmd autoreserve.sh)" --arg b "$(_hook_cmd inbox_check.sh)" \
+  '{matcher:"Edit|Write|NotebookEdit",hooks:[{type:"command",command:$a},{type:"command",command:$b}]}')
+SESSION_END_HOOK=$(jq -nc --arg a "$(_hook_cmd session_end.sh)" \
+  '{matcher:"",hooks:[{type:"command",command:$a}]}')
 
-# Merge hooks into existing config (preserves permissions, plugins, other hooks)
+# Merge hooks into existing config (preserves permissions, plugins, other hooks).
+# The last argument is the de-duplication marker: it must appear in a command
+# this script writes, or a re-run appends a second copy of every hook.
 MERGED_SETTINGS="$EXISTING_SETTINGS"
-MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "SessionStart" "$SESSION_START_HOOK" "mcp_agent_mail.cli acks pending")
-MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "PreToolUse" "$PRE_TOOL_USE_HOOK" "mcp_agent_mail.cli file_reservations soon")
-MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "PostToolUse" "$POST_TOOL_USE_BASH_HOOK" "check_inbox.sh")
-MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "PostToolUse" "$POST_TOOL_USE_MSG_HOOK" "mcp_agent_mail.cli list-acks")
-MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "PostToolUse" "$POST_TOOL_USE_RES_HOOK" "mcp_agent_mail.cli file_reservations list")
+MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "SessionStart" "$SESSION_START_HOOK" "hooks/session_start.sh")
+MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "PreToolUse" "$PRE_TOOL_USE_HOOK" "hooks/reservations_warn.sh")
+MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "PostToolUse" "$POST_TOOL_USE_HOOK" "hooks/autoreserve.sh")
+MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "SessionEnd" "$SESSION_END_HOOK" "hooks/session_end.sh")
 
 # NOTE: No mcpServers in settings.json - token goes in settings.local.json only
 # This prevents credential leaks to git

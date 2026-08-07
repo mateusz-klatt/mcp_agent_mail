@@ -430,8 +430,15 @@ json_append_hook() {
     return 1
   fi
 
-  # Check if already exists (use --arg to safely pass identifier)
-  if echo "$existing" | jq -e --arg id "$identifier" ".hooks.${hook_type}[]? | .hooks[]? | .command | contains(\$id)" >/dev/null 2>&1; then
+  # Check if already exists (use --arg to safely pass identifier).
+  #
+  # `any`, not a bare stream: `jq -e` sets its exit status from the LAST value
+  # the filter produces, so a stream of true,false answered "absent" whenever
+  # the marker matched anything other than the final command. An entry with two
+  # commands was therefore appended again on every run — and the previous
+  # markers here happened to match the last command, which is why nobody saw it.
+  if echo "$existing" | jq -e --arg id "$identifier" \
+      "any(.hooks.${hook_type}[]? | .hooks[]? | .command; contains(\$id))" >/dev/null 2>&1; then
     # Already exists, return unchanged
     echo "$existing"
     return

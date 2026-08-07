@@ -222,6 +222,27 @@ elegant of two" and stayed on the list as a viable alternative. Measured later,
 it made the bug worse. Whoever read the thread a month on would have seen two
 options and picked the simpler one.
 
+## A borrowed number arrives without its question
+
+Every axis above is about a measurement you took. There is a sixth failure that
+only happens to numbers you did not take, and it is the easiest of all to miss.
+
+Someone counted the reservations in the project and reported that five of six
+carried the generic reason `auto: edited in session` — offered as an
+observation, correctly. Two other people then used that count as evidence that
+nobody writes deliberate reasons, and built recommendations on it. The count
+was right. It measures who has *edited a file since reserving it*, which is
+nearly everyone, because editing is what reserving is for. A tool overwrote the
+deliberate reasons on first edit; the number was recording the overwrite, not
+the habit.
+
+The people who repeated it had spent that day demanding the question behind
+every number they were shown. They did not ask it of one they had adopted. A
+measurement carries its scope in the head of whoever ran it, and almost never
+in the sentence that travels: **when you use someone else's number, restate
+what it counted before you build on it** — and if you cannot, that is the
+finding.
+
 ## Who catches these
 
 Not one of the mistakes above was found by the person who made it. Every single

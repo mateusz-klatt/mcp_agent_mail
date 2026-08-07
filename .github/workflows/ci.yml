@@ -7,6 +7,55 @@ on:
     branches: [ main ]
 
 jobs:
+  sonarcloud:
+    name: SonarCloud
+    runs-on: ubuntu-latest
+    # Deliberately NOT `needs: build-and-test`. That job currently stops at the
+    # type-check gate, and a scanner chained behind it would stay silent for
+    # exactly as long as the code most needs an outside opinion. This one speaks
+    # on every push, pass or fail.
+    #
+    # It is also the only quality signal here that no agent working on this
+    # repository configures: the linter's rule set, the type checker's settings
+    # and the tests are all written by the same hands they judge.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Sonar attributes issues to commits; a shallow clone makes every line
+          # look like it was written by whoever last pushed.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        shell: bash
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Sync dependencies
+        shell: bash
+        run: uv sync --dev
+
+      - name: Tests with coverage
+        shell: bash
+        # continue-on-error, not `|| true`: the step is allowed to fail and the
+        # failure stays visible in the run. `|| true` would report success and
+        # hide which of the two happened.
+        continue-on-error: true
+        env:
+          PYTHONUTF8: "1"
+        run: uv run -m pytest -q --cov=mcp_agent_mail --cov-report=xml
+
+      - name: SonarCloud scan
+        uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
   build-and-test:
     name: Lint, Type Check, Test (${{ matrix.os }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -12,7 +13,6 @@ from typing import Any
 import httpx
 import pytest
 from fastmcp import Client
-from PIL import Image
 from rich.table import Table
 from sqlalchemy import text
 
@@ -29,6 +29,32 @@ from tests.keys import pkey
 INLINE_PNG_BASE64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMA"
     "ASsJTYQAAAAASUVORK5CYII="
+)
+
+# Frozen source bytes, not Image.new(...).save(...).
+#
+# The attachment digests these produce are recorded in the golden file, and a
+# generated PNG makes them a property of whatever Pillow/zlib the runner has
+# rather than of this codebase. Measured: the webp previews the server derives
+# are byte-identical across machines, but the PNG *sources* were not — the
+# golden held one zlib's output and every current machine produces another, so
+# eight golden differences had nothing to do with our code and could never be
+# resolved by any single regeneration.
+#
+# 4x4 solid red and 128x128 solid blue, exactly what Image.new produced here.
+SMALL_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEUlEQVR4nGP8z4AA"
+    "TEhsPBwAM9EBBzDn4UwAAAAASUVORK5CYII="
+)
+LARGE_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAIAAABMXPacAAABLklEQVR4nO3TsREA"
+    "IAwDscDk2RzGUPNawMWfz+ybOBdupwBeD8AKgBUAKwBWAKwAWAGwAmAFwAqAFQAr"
+    "AFYArABYAbACYAXACoAVACsAVgCsAFgBsAJgBcAKgBUAKwBWAKwAWAGwAmAFwAqA"
+    "FQArAFYArABYAbACYAXACoAVACsAVgCsAFgBsAJgBcAKgBUAKwBWAKwAWAGwAmAF"
+    "wAqAFQArAFYArABYAbACYAXACoAVACsAVgCsAFgBsAJgBcAKgBUAKwBWAKwAWAGw"
+    "AmAFwAqAFQArAFYArABYAbACYAXACoAVACsAVgCsAFgBsAJgBcAKgBUAKwBWAKwA"
+    "WAGwAmAFwAqAFQArAFYArABYAbACYAXACoAVACsAVgCsAFgBsAJgBcAKgBUAKwBW"
+    "gLE+EpICf7ZDMZoAAAAASUVORK5CYII="
 )
 
 
@@ -326,8 +352,8 @@ async def test_isomorphism_e2e_suite(
         render_phase(console, "messaging", {"subject": "Launch Plan", "thread": "THREAD-1"})
         small_path = tmp_path / "small.png"
         large_path = tmp_path / "large.png"
-        Image.new("RGB", (4, 4), color=(255, 0, 0)).save(small_path)
-        Image.new("RGB", (128, 128), color=(0, 128, 255)).save(large_path)
+        small_path.write_bytes(base64.b64decode(SMALL_PNG_BASE64))
+        large_path.write_bytes(base64.b64decode(LARGE_PNG_BASE64))
         body_md = "Launch kickoff\n\n![inline](data:image/png;base64,{})\n".format(INLINE_PNG_BASE64)
         send_result = _tool_data(
             await client.call_tool(

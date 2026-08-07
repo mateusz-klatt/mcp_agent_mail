@@ -93,23 +93,32 @@ are the same error wearing two faces, and both pass unchallenged for the same
 reason. What protects you is not distrusting silence — it is checking that you
 looked where the thing would have been.
 
-**When was it measured, and when am I reporting it?**
+**When was it read, and when am I acting on it?**
 
 A fifth axis, and the only one where the question was right and the answer was
 right and the statement was still false. Someone measured whether anything had
 been pushed, spent six minutes on another task, and reported the result as
 current. It had been wrong for four and a half minutes by the time it was sent.
 
-The same shape appears constantly here because most of what we look at changes
-in seconds: unread counts, reservations, session bindings, who is editing what.
-Twice in one afternoon an empty inbox was followed by a newer message in the
-same thread — once because the reader had marked it read by mistake, once
-because it arrived between two queries. Identical symptom, unrelated causes,
-and neither distinguishable from a genuinely quiet mailbox.
+This one is not really about measurements. The same person walked into two more
+instances the same afternoon, and only one involved a number: they marked
+messages read from a list fetched before the last arrivals, and they announced
+they were taking a task from a queue of free work quoted forty minutes earlier
+— the task had been finished for forty-five. Nobody would call reading a task
+list a measurement, which is exactly why nobody applies a rule about
+measurements to it. **Any read followed by an action is exposed; measuring is
+just the common case.**
 
-A measurement of fast-moving state carries an expiry. If it is not reported
-promptly, it has to be re-taken rather than quoted; and if a decision hangs on
-it, the read belongs immediately before the decision, not before the writing-up.
+Everything here moves in seconds: unread counts, reservations, session
+bindings, who is editing what, what is still unclaimed. Twice in one afternoon
+an empty inbox was followed by a newer message in the same thread — once from a
+mis-marked read, once because it arrived between two queries. Identical
+symptom, unrelated causes, neither distinguishable from a genuinely quiet
+mailbox.
+
+A read of fast-moving state carries an expiry. If it is not acted on promptly
+it has to be re-taken rather than quoted, and when a decision hangs on it the
+read belongs immediately before the decision — not before the writing-up.
 
 ## Controls
 
@@ -252,6 +261,40 @@ measurement carries its scope in the head of whoever ran it, and almost never
 in the sentence that travels: **when you use someone else's number, restate
 what it counted before you build on it** — and if you cannot, that is the
 finding.
+
+## A subsystem with a defect history is cheaper to accuse
+
+One afternoon, against one layer of this project — file reservations, which had
+attracted the most real findings and was therefore the right place to check:
+
+```
+CONFIRMED BY MEASUREMENT              NEARLY SENT, ALL FALSE
+ 1. a hook overwrites a deliberate     A. "the docstring says to ignore
+    reservation reason                    conflicts"  (a line under `Don't:`)
+ 2. the conflict payload omits that    B. "the hook writes no session log"
+    reason entirely                       (counted in the wrong directory)
+ 3. a warning about configuration      C. "the server granted two holds and
+    printed beside "granted"              reported none"  (they were first
+ 4. expires_ts cannot carry a             by thirteen minutes)
+    freshness signal                   D. "the server reported no conflict"
+                                          (their own jq dropped the field)
+```
+
+Four real, four false, one subsystem, one afternoon. Three of the false ones
+were caught in the last check before sending; one went out and had to be
+retracted.
+
+The bilance alone proves nothing — four false alarms is unremarkable if that is
+where everyone was looking. What makes it a property of the situation rather
+than of a person is the **spread of authorship**: the false reports came from
+three different people. Each new accusation against that layer fitted a pattern
+the group had just established, so it needed less evidence to be believed, and
+got less. A fourth person noticed afterwards that they had accepted three of
+those reports without verifying any, while verifying every report that touched
+their own code — not from laziness, but because the claims had stopped looking
+like hypotheses.
+
+Suspect this most where you have been most right.
 
 ## Who catches these
 

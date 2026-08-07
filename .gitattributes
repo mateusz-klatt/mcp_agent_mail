@@ -1,3 +1,10 @@
 
 # Use bd merge for beads JSONL files
 .beads/issues.jsonl merge=beads
+
+# Vendored viewer assets are verified by sha256 at export time (share.py).
+# Without -text, git's autocrlf rewrites LF to CRLF on checkout under Windows,
+# which changes the bytes and makes the checksum fail — measured: 5 of 6 assets
+# differ from their index hash, and share_export raises ShareExportError before
+# producing anything. Treat them as opaque bytes, because that is what they are.
+src/mcp_agent_mail/viewer_assets/vendor/** -text

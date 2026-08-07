@@ -53,4 +53,15 @@ while IFS= read -r log; do
 done <<EOF
 $(am_session_logs)
 EOF
+
+# Drop the derived bearer copy am_call writes for curl. It is a cache, not
+# configuration, so its lifetime should be the session's — and unlike
+# ~/.agent-mail.env, which the operator created deliberately and would think to
+# remove when decommissioning a machine, this file appears on its own and nobody
+# knows it is there.
+#
+# Safe against a concurrent session on the same host: am_hdr_conf rewrites the
+# file whenever its contents do not match the current bearer, and a missing file
+# reads as empty, so the worst case is one extra write in the other session.
+rm -f "${AM_STATE_DIR}/curl-headers.conf" 2>/dev/null
 exit 0

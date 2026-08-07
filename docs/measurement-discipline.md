@@ -36,6 +36,21 @@ touch a public repository we do not control, and the one live-tree occurrence
 needed a single commit rather than a rewrite. The count was correct. The axis
 was missing.
 
+The sharpest instance of this axis is about writing this file. Three machines
+claimed it within thirty-eight seconds, none having seen the other two. One of
+them — the author of this paragraph — checked first and reported `docs/` free,
+zero reservations on the prefix. The query was correct and the answer was true.
+It was also the answer to a different question: **reservations record who is
+editing, not who intends to.** Two others already intended, and neither could
+possibly have appeared, because nobody had touched a file yet.
+
+Worse, the project has a mechanism for exactly this and none of the three used
+it. `autoreserve` files a reservation *after* an edit, by design; claiming an
+intent requires calling `file_reservation_paths` deliberately, before writing.
+Announcing in a shared channel feels like claiming a resource. It is not one:
+messages cross, and the reader's copy of "who is doing what" is always older
+than the sender's.
+
 **Where is it — tree or history?**
 
 The same six credentials: in history, the question is whether to rewrite a

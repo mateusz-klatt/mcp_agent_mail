@@ -3,17 +3,30 @@
 {% block title %}Send Message — Human Overseer{% endblock %}
 
 {% block breadcrumbs %}
+{# Third page with this exact defect, and the one that matters most: the Reply
+   button added in b67b995 sends the operator HERE from a phone, so the page a
+   mobile reply lands on was 105 px past a 440 px viewport. Measured in the
+   operator's own session.
+
+   Same treatment as 48ad641 and a13516f — below sm only the project link
+   survives, truncated. "Projects" duplicates the logo tile, and "Human Overseer"
+   duplicates the page's own <h1>; the project link is the one item here that
+   exists nowhere else on the page.
+
+   That this is the third occurrence is the finding, not the fix: 48ad641 was
+   written against a template, not against a pattern, and each later page had to
+   be discovered by opening it. #}
 <nav class="flex items-center gap-2 text-sm">
-  <a href="/mail" class="text-slate-600 dark:text-slate-400 hover:text-primary-600 dark:hover:text-primary-400 transition-colors flex items-center gap-1">
+  <a href="/mail" class="hidden sm:flex text-slate-600 dark:text-slate-400 hover:text-primary-600 dark:hover:text-primary-400 transition-colors items-center gap-1">
     <i data-lucide="home" class="w-3.5 h-3.5"></i>
     Projects
   </a>
-  <i data-lucide="chevron-right" class="w-4 h-4 text-slate-400"></i>
-  <a href="/mail/{{ project.slug }}" class="text-slate-600 dark:text-slate-400 hover:text-primary-600 dark:hover:text-primary-400 transition-colors">
+  <i data-lucide="chevron-right" class="hidden sm:block w-4 h-4 text-slate-400"></i>
+  <a href="/mail/{{ project.slug }}" class="truncate max-w-[6rem] sm:max-w-none text-slate-600 dark:text-slate-400 hover:text-primary-600 dark:hover:text-primary-400 transition-colors">
     {{ project.human_key }}
   </a>
-  <i data-lucide="chevron-right" class="w-4 h-4 text-slate-400"></i>
-  <span class="text-slate-900 dark:text-white font-medium">Human Overseer</span>
+  <i data-lucide="chevron-right" class="hidden sm:block w-4 h-4 text-slate-400"></i>
+  <span class="hidden sm:inline text-slate-900 dark:text-white font-medium">Human Overseer</span>
 </nav>
 {% endblock %}
 

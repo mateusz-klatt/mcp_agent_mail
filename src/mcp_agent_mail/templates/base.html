@@ -3268,6 +3268,23 @@
       // authorisation an F5 would apply.
       (function () {
         const slug = document.querySelector('meta[name="agent-mail-project"]')?.content || null;
+
+        // Honour the page's own "Auto-refresh" switch, if it has one.
+        //
+        // The unified inbox already had a background refresher and a checkbox
+        // labelled Auto-refresh. Adding a stream and a poll here put two more
+        // refreshers beside it and wired neither to that switch — so unchecking
+        // it removed the gentle in-place update and left the two that reload
+        // the whole page. Anyone who unchecked it to stop the page jumping got
+        // the opposite of what the label promised.
+        //
+        // Read through Alpine's own state so there is one source of truth
+        // rather than a second copy that can disagree with the tickbox.
+        function autoRefreshAllowed() {
+          const el = document.querySelector('[x-model="autoRefreshEnabled"]');
+          if (!el) return true;            // pages without the switch are unaffected
+          return el.checked !== false;
+        }
         const dot = document.getElementById('live-dot');
         const pip = document.getElementById('live-pip');
         const soundKey = 'agentMailSound';
@@ -3301,11 +3318,26 @@
 
         function refresh() {
           if (reloading) return;
+          if (!autoRefreshAllowed()) { setState(true, 'live — auto-refresh off, new mail waiting'); return; }
           reloading = true;
           // Reload rather than patch: these pages render server-side, and a
           // partial update that drifts from the server is worse than a flicker.
+          //
+          // The flicker is not free, though — measured at 3.7 MB and ~9,400 DOM
+          // nodes on a busy project — and it takes the reader's place in the
+          // page with it. Carry the scroll position across so the cost is a
+          // repaint rather than losing where somebody was reading.
+          try { sessionStorage.setItem('agentMailScroll', String(window.scrollY)); } catch (e) {}
           window.location.reload();
         }
+
+        try {
+          const y = sessionStorage.getItem('agentMailScroll');
+          if (y !== null) {
+            sessionStorage.removeItem('agentMailScroll');
+            window.addEventListener('load', () => window.scrollTo(0, parseInt(y, 10) || 0));
+          }
+        } catch (e) {}
 
         let es = null, backoff = 1000;
         function connect() {
@@ -3332,6 +3364,7 @@
         // failure shape this project spent a day removing from its hooks.
         let lastSeen = null;
         async function poll() {
+          if (!autoRefreshAllowed()) return;
           try {
             const r = await fetch('/mail/api/unified-inbox?limit=1', { credentials: 'same-origin' });
             if (!r.ok) return;

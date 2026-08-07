@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -30,7 +31,9 @@ def _run_precommit(script_path: Path, repo_path: Path, agent_name: str) -> subpr
     env["AGENT_NAME"] = agent_name
     # WORKTREES_ENABLED=1 is required for the guard to actually run (not exit early)
     env["WORKTREES_ENABLED"] = "1"
-    return subprocess.run(["python", str(script_path)], cwd=str(repo_path), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # sys.executable, not "python" — see test_precommit_enforcement.py: the bare
+    # name does not exist on macOS or on distributions that ship only python3.
+    return subprocess.run([sys.executable, str(script_path)], cwd=str(repo_path), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
 @pytest.mark.asyncio

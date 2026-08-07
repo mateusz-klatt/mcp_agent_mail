@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -52,8 +53,10 @@ def _run_hook(hook_path: Path, cwd: Path, env: dict) -> subprocess.CompletedProc
     """Run a hook script."""
     full_env = os.environ.copy()
     full_env.update(env)
+    # sys.executable, not "python" — see test_precommit_enforcement.py: the bare
+    # name does not exist on macOS or on distributions that ship only python3.
     return subprocess.run(
-        ["python", str(hook_path)],
+        [sys.executable, str(hook_path)],
         cwd=str(cwd),
         env=full_env,
         capture_output=True,

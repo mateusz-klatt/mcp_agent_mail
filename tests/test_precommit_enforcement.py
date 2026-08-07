@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -67,8 +68,14 @@ def run_precommit_script(
     env["GIT_IDENTITY_ENABLED"] = git_identity_enabled
     env["AGENT_MAIL_BYPASS"] = bypass
     env["AGENT_MAIL_GUARD_MODE"] = guard_mode
+    # The interpreter running the suite, not a bare "python": macOS and most
+    # current Linux distributions ship python3 without that alias, so a literal
+    # "python" here fails to launch and the test reports a guard failure it
+    # never got far enough to observe. The script under test carries its own
+    # `#!/usr/bin/env python3` shebang; naming the interpreter explicitly is
+    # this helper's choice, so it is this helper's job to name a real one.
     return subprocess.run(
-        ["python", str(script_path)],
+        [sys.executable, str(script_path)],
         cwd=str(repo_path),
         env=env,
         stdout=subprocess.PIPE,

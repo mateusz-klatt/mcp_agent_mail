@@ -88,8 +88,17 @@ async def test_messaging_flow(isolated_env):
         message_file = next(iter((storage_root / "projects" / "backend" / "messages").rglob("*.md")))
         assert "Test" in message_file.read_text()
         repo = Repo(str(storage_root))
-        # Commit message is a rich panel; ensure the subject is captured
-        assert '"subject": "Test"' in str(repo.head.commit.message)
+        # The subject has to survive into the commit, and the commit is what
+        # someone reads in `git log` months later. It is no longer embedded as
+        # JSON: storage.py builds `mail: <sender> -> <recipients> | <subject>`,
+        # documented at storage.py:2152 and relied on there to derive trailers.
+        # Asserting on the header line rather than a substring anywhere keeps
+        # this failing if the subject is dropped — "Test" alone would also be
+        # satisfied by the body, which repeats the tool name and project.
+        commit_message = str(repo.head.commit.message)
+        header = commit_message.splitlines()[0]
+        assert header.startswith("mail: ")
+        assert header.endswith("| Test")
 
 
 @pytest.mark.asyncio

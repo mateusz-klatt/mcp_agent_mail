@@ -89,5 +89,28 @@ else
     [ -n "$held" ] && summary="${summary} Reserved by others right now: ${held}."
 fi
 
+# Ask for the watcher HERE, not after a wake.
+#
+# Measured across four machines: one runs the watcher, two run a polling loop,
+# one is driven entirely by a person typing "check your mail". What decides is
+# not which mechanism works — nobody reported a fault in any of them — but how
+# much each asks the agent to remember. The watcher asks for a re-arm after
+# every wake, and that request arrives at the exact moment the agent has just
+# been handed mail and wants to answer it, so it loses to the thing it
+# interrupts.
+#
+# Session start is the one moment the request competes with nothing: there is no
+# task in flight yet, and this hook is already speaking. It cannot start the
+# watcher itself — a process spawned from a hook is not a task the agent's
+# runtime tracks, so its exit would wake nobody, and the exit IS the wake.
+watcher="$(dirname "$0")/inbox_watch.sh"
+if [ -x "$watcher" ]; then
+    summary="${summary}
+
+For instant delivery instead of polling, run this ONCE in the background now — it
+exits when mail arrives, and a background task that exits wakes you:
+    $(cd "$(dirname "$watcher")" && pwd)/$(basename "$watcher")"
+fi
+
 am_emit_context "SessionStart" "$summary"
 exit 0

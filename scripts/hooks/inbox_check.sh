@@ -67,6 +67,19 @@ fi
 # interval, so an agent would be told once that the channel is down and then
 # nothing for two minutes while it stayed down.
 
+# Keep the profile's model field true while the session runs. Deliberately BELOW
+# the rate limit above, so it inherits that cadence and adds nothing to the hot
+# path: PostToolUse fires after every tool call, and reading the transcript there
+# would cost a few milliseconds every time to notice something that changes once
+# a session, if ever. Within one inbox interval is soon enough.
+#
+# This is not a refinement of what SessionStart recorded — on a fresh session the
+# model is genuinely unknowable at that moment (no assistant turn exists yet, and
+# the hook payload carries no model at all), so this is the only path by which
+# the field ever becomes true. It cannot fail the hook: am_sync_model returns 0
+# unconditionally and reaches the network only when the value actually changed.
+am_sync_model "$PROJECT" "$AGENT" "$token"
+
 # ── what has already been announced ──────────────────────────────────────────
 #
 # {floor, ids}: every id at or below `floor` is settled, and `ids` lists the

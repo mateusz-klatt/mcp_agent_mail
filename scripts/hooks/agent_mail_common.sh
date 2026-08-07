@@ -225,16 +225,24 @@ am_agent_name() {
 # a correct value. A profile field that lies is worse than one left blank,
 # because nothing downstream can tell the two apart.
 #
-# Three sources, cheapest first. The payload is checked in both shapes because
-# the hook contract is not ours: `.model` may be a bare string or an object with
-# an id, and asking for the wrong one yields empty rather than an error.
+# The transcript is the only source that carries this today. home-win-1 captured
+# a live PostToolUse payload and enumerated all twelve top-level keys — cwd,
+# duration_ms, effort, hook_event_name, permission_mode, prompt_id, session_id,
+# tool_input, tool_name, tool_response, tool_use_id, transcript_path — and none
+# of them is the model. The two payload probes below are therefore dead today,
+# and are kept only because the hook contract is not ours to fix: if `model` is
+# ever added, in either shape, this starts working with no change here. They are
+# not evidence that the payload works.
 #
-# The transcript is the fallback that actually carries this today — every
-# assistant turn records `message.model`, and reading the LAST one is what makes
-# a mid-session `/model` switch visible. It is a fallback and not the first
-# choice because a freshly-started session has no assistant turn yet: at
-# SessionStart on a new session this file is empty or absent, which is precisely
-# when only the payload can answer.
+# The consequence is worth stating plainly: at SessionStart on a FRESH session
+# there is no source at all — no payload field, and no assistant turn in the
+# transcript yet — so registration records "unknown". am_sync_model is what
+# replaces it with a real id after the first turn. That is not a refinement of
+# this function; it is the only path by which a new session ever gets a true
+# value.
+#
+# Every assistant turn records `message.model`, and reading the LAST one is what
+# makes a mid-session `/model` switch visible.
 #
 # Never returns empty: the server rejects an empty model (EMPTY_MODEL), so a
 # blank here would fail registration outright and cost the session all
@@ -247,14 +255,64 @@ am_model_id() {
     if [ -z "$m" ]; then
         tp="$(am_payload_field '.transcript_path')"
         if [ -n "$tp" ] && [ -f "$tp" ]; then
+            # The tail first, and this is not premature: transcripts reach tens
+            # of megabytes in a long session, where a full jq scan measured
+            # ~85 ms against ~3 ms for the last 200 lines. That gap does not
+            # matter once at SessionStart; it matters a great deal to
+            # am_sync_model, which runs after every tool call.
+            #
             # Last match, not first: the newest turn is the current model.
-            m="$(jq -r 'select(.message.model != null) | .message.model' \
-                 "$tp" 2>/dev/null | tail -n 1)"
+            m="$(tail -n 200 "$tp" 2>/dev/null \
+                 | jq -r 'select(.message.model != null) | .message.model' 2>/dev/null | tail -n 1)"
+            # A long run of tool results carries no assistant turn, so the tail
+            # can legitimately hold no model at all. Falling back to the whole
+            # file keeps the cheap path from turning a slow answer into a wrong
+            # one.
+            [ -z "$m" ] && m="$(jq -r 'select(.message.model != null) | .message.model' \
+                                "$tp" 2>/dev/null | tail -n 1)"
         fi
     fi
     m="$(printf '%s' "$m" | tr -cd '[:alnum:]._-' | cut -c1-128)"
     [ -z "$m" ] && m="unknown"
     printf '%s' "$m"
+}
+
+# Re-register only when the running model has actually changed.
+#
+# SessionStart alone cannot answer this: it fires once, and on a fresh session it
+# fires BEFORE the first assistant turn exists, so the value it records is the
+# best guess available at the least informative moment. A `/model` switch
+# afterwards leaves the profile confidently wrong for the rest of the session.
+#
+# The cached value is what keeps this off the network. Unchanged is the
+# overwhelmingly common case and costs one file read; the round trip happens only
+# on an actual change.
+#
+# "unknown" is skipped rather than sent. At SessionStart there is no choice —
+# the server rejects an empty model — but here a previously recorded real id
+# already exists, and replacing it with "unknown" because a tail read came up
+# short would destroy information rather than correct it.
+#
+# The cache is written only after the call succeeds, so a failed sync retries on
+# the next hook instead of recording a change that never reached the server.
+# Returns 0 always: this runs inside hooks, and bookkeeping must never fail the
+# session it is only supposed to describe.
+am_sync_model() {
+    local proj="$1" agent="$2" tok="$3" want have cache
+    want="$(am_model_id)"
+    case "$want" in ''|unknown) return 0 ;; esac
+    cache="${AM_STATE_DIR}/model/$(printf '%s|%s' "$proj" "$agent" \
+        | tr -cd '[:alnum:]._|-' | tr '|' '_')"
+    have="$(cat "$cache" 2>/dev/null || true)"
+    [ "$want" = "$have" ] && return 0
+    mkdir -p "$(dirname "$cache")" 2>/dev/null || return 0
+    if am_call register_agent "$(jq -nc --arg p "$proj" --arg n "$agent" \
+            --arg t "$tok" --arg m "$want" \
+            '{project_key:$p,name:$n,registration_token:$t,program:"claude-code",model:$m}')" \
+            >/dev/null 2>&1; then
+        printf '%s' "$want" > "$cache" 2>/dev/null || true
+    fi
+    return 0
 }
 
 am_bearer() {

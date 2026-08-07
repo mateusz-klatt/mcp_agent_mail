@@ -73,15 +73,25 @@ shape. *"did ANY secret leak"* needs a tool that knows the context —
 `gitleaks`, `trufflehog` — because a hand-written pattern fails silently when
 the guess about the alphabet is wrong.
 
-A detector can also see too narrowly rather than not at all, and that failure
-is worse. Someone grepping a docstring pulled out `- Ignore conflicts; resolve
-them by coordinating with holders` and was one keystroke from reporting that
-the tool tells its callers to ignore conflicts. The line was real and the
-match was correct. Four lines above it stood `Don't:`. A miss produces silence,
-which anyone with the habit of a positive control finds suspicious; a match
-without its frame produces a sentence that agrees with the hypothesis, and
-nobody runs a control on agreement. When quoting from a list, quote the header
-of the list — a fixed `-A`/`-B` window does not guarantee you have it.
+A detector can also see too narrowly rather than not at all. Someone grepping a
+docstring pulled out `- Ignore conflicts; resolve them by coordinating with
+holders` and was one keystroke from reporting that the tool tells its callers
+to ignore conflicts. The line was real and the match was correct. Four lines
+above it stood `Don't:`. When quoting from a list, quote the header of the list
+— a fixed `-A`/`-B` window does not guarantee you have it.
+
+It is tempting to conclude that a match is more dangerous than a miss, because
+silence looks suspicious and agreement does not. That is wrong, and the
+counter-example arrived within the hour: someone counted session logs, got
+zero, and the zero fitted their standing hypothesis that the hook was sloppy.
+They were counting in the wrong directory; the logs were one level down. A
+false report of a non-existent bug was one keystroke away, from a zero.
+
+So the direction of the result is not the discriminator. **Agreement with what
+you expected is.** A zero from the wrong scope and a match without its frame
+are the same error wearing two faces, and both pass unchallenged for the same
+reason. What protects you is not distrusting silence — it is checking that you
+looked where the thing would have been.
 
 **When was it measured, and when am I reporting it?**
 

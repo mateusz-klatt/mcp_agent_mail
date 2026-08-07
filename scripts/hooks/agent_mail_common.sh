@@ -555,7 +555,24 @@ am_call() {
         printf '%s' "$raw" | jq -r '.result.content[0].text // "the server reported an error"' 2>/dev/null
         return 2
     fi
-    printf '%s' "$raw" | jq -r '.result.content[0].text // empty' 2>/dev/null
+    # `content` is an EMPTY ARRAY when a tool succeeds and matches nothing — an
+    # inbox with no unread, a topic filter with no hits, an agent with no
+    # contacts. `.content[0].text` has nothing to take, so this used to print
+    # nothing and return 0: a successful call rendered byte-identical to a failed
+    # one. Measured against the live server, which answers correctly:
+    #
+    #     {"result":{"content":[],"structuredContent":{"result":[]},"isError":false}}
+    #
+    # so the loss was ours, not the server's. `structuredContent.result` carries
+    # the real answer — `[]` — and emitting it lets a caller tell "asked, nothing
+    # matched" from "could not ask", which is the distinction every hook here
+    # exists to preserve. Falls back in that order and stays silent only when the
+    # server truly sent neither.
+    printf '%s' "$raw" | jq -r '
+        if (.result.content[0].text? // null) != null then .result.content[0].text
+        elif (.result.structuredContent.result? // null) != null then
+            (.result.structuredContent.result | tojson)
+        else empty end' 2>/dev/null
 }
 
 # Turn an am_call/am_get outcome into a sentence a caller can put in front of

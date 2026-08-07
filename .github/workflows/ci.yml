@@ -47,6 +47,16 @@ jobs:
         # failure stays visible in the run. `|| true` would report success and
         # hide which of the two happened.
         continue-on-error: true
+        # Time-boxed, and that box is the point. The whole reason this job exists
+        # is to give an opinion nobody here controls, promptly. Measured: the
+        # first four runs all sat here and the scanner never spoke — the
+        # independent judge had been queued behind the slowest thing in the
+        # repository, which is the one place it must never be.
+        #
+        # Past the box the step is cut, the scan still runs, and Sonar analyses
+        # the code without coverage. Losing a coverage number is cheap; losing
+        # the analysis is not.
+        timeout-minutes: 20
         env:
           PYTHONUTF8: "1"
         run: uv run -m pytest -q --cov=mcp_agent_mail --cov-report=xml

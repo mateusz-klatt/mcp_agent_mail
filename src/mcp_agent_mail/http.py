@@ -1133,8 +1133,14 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
         # than ``value or default`` (which would turn 0 into ``default``).
         if value is None:
             return default
+        # cast, not isinstance: `int()` accepts str, bytes, numbers and anything
+        # implementing `__int__`/`__index__`, which the `object` annotation
+        # cannot express. An isinstance allowlist here would narrow the
+        # behaviour, not just the type — a value that converts fine today would
+        # start silently falling back to the default. The suppress below already
+        # covers everything that genuinely cannot convert.
         with contextlib.suppress(Exception):
-            return int(value)
+            return int(cast(Any, value))
         return default
 
     def _rate_limits_for(self, kind: str) -> tuple[int, int]:
@@ -2413,7 +2419,15 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     # glance, a reservation that vanishes costs a collision.
                     return True
 
-            items = [
+            # Annotated, not inferred: the value type of a dict literal is the
+            # union of ALL its values, so the lone `bool(...)` on `exclusive`
+            # below lands in the type of every other key. `path_pattern` is
+            # `str` at the source (models.py) and comes from the join's driving
+            # table, so it can never actually be a bool — but unannotated, the
+            # checker rejects `.rstrip` on it. Narrowing here rather than
+            # guarding at the use site: a `isinstance(..., str)` check there
+            # would read as defending against data that cannot occur.
+            items: list[dict[str, Any]] = [
                 {
                     "id": r[0],
                     # LEFT JOIN: a reservation can outlive its owning agent row (#161).
@@ -3287,7 +3301,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     """
                     )
                 )
-                projects_data = []
+                # Same dict-literal union as the reservations list above: without
+                # this, `sum(p["agent_count"] ...)` at the render call has no
+                # matching overload because the inferred value type includes str.
+                projects_data: list[dict[str, Any]] = []
                 for r in projects_query.fetchall():
                     proj_id = int(r[0])
                     # Get agents for this project

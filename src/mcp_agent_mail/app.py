@@ -5049,6 +5049,10 @@ async def _update_recipient_timestamp(
         raise ValueError("Agent must have an id before updating message state.")
     now = datetime.now(timezone.utc)
     naive_now = _naive_utc(now)  # Use naive UTC for SQLite compatibility
+    # Already `Any` — `getattr` on a non-literal name cannot be resolved to a
+    # column type. The `cast(Any, ...)` used elsewhere in this file for
+    # SQLAlchemy columns would be a no-op here, so it is omitted rather than
+    # written for symmetry: a redundant cast reads as "this needed widening".
     field_col = getattr(MessageRecipient, field)
     async with get_session() as session:
         # Single atomic conditional update (issue #187): guard on the column
@@ -5059,10 +5063,10 @@ async def _update_recipient_timestamp(
             .where(
                 MessageRecipient.message_id == message_id,
                 MessageRecipient.agent_id == agent.id,
-                cast(Any, field_col).is_(None),
+                field_col.is_(None),
             )
             .values({field: naive_now})
-            .returning(cast(Any, field_col))
+            .returning(field_col)
         )
         result = await session.execute(stmt)
         applied = result.first()
@@ -5154,8 +5158,26 @@ def build_mcp_server() -> FastMCP:
         orphan_key = f"orphan:{uuid.uuid4()}"
         # ctx refuses attribute assignment; multi-lookup consistency
         # degrades to "best effort" but a single lookup still works.
+        #
+        # `setattr`, not a dotted assignment with a suppression comment: this is
+        # a deliberate monkey-patch onto a third-party Context that declares no
+        # such attribute, so there is no annotation that makes the dotted form
+        # correct. The previous `# type: ignore[attr-defined]` was in mypy's
+        # dialect, which the type gate does not read — it looked like a
+        # considered suppression and silenced nothing. `getattr` is already
+        # used to read it back four lines above; this just matches.
+        #
+        # The B010 suppression below is deliberate: that rule's premise is
+        # "no safer than normal property access", and here the premise is false
+        # — the dotted form is exactly what the type gate rejects, because
+        # Context declares no such attribute. The two gates disagree about this
+        # line and this is the only form that satisfies both.
+        #
+        # (Written without the directive word at the start of a line: ruff reads
+        # a comment opening with that token as a real blanket directive, so an
+        # explanation of a suppression becomes a second, wider suppression.)
         with suppress(Exception):
-            ctx._mcp_agent_mail_orphan_key = orphan_key  # type: ignore[attr-defined]
+            setattr(ctx, "_mcp_agent_mail_orphan_key", orphan_key)  # noqa: B010
         return orphan_key
 
     def _prune_expired_session_bindings(now: float) -> None:
@@ -9916,7 +9938,14 @@ def build_mcp_server() -> FastMCP:
         # viewer's recipient rows). A bare fetch_topic call is project-scoped —
         # it returns all messages with the given topic regardless of who sent or
         # received them, so no per-agent visibility filter is applied.
-        viewer: Agent | None = None
+        # Bound as an int here rather than kept as `Agent | None` and dereferenced
+        # 60 lines below: the only reader is the unread_only branch, which cannot
+        # run unless this `if` took the resolving path, but that reasoning lives
+        # in two places the checker cannot connect. Narrowing at the use site
+        # would need an `if viewer is None` arm that can never be taken —
+        # a branch that reads like a safety check while defending against
+        # nothing (_resolve_authenticated_agent returns Agent or raises).
+        viewer_id = 0
         if unread_only or agent_name:
             viewer = await _resolve_authenticated_agent(
                 ctx,
@@ -9926,6 +9955,7 @@ def build_mcp_server() -> FastMCP:
                 token_param="registration_token",
                 action="fetch_topic",
             )
+            viewer_id = viewer.id or 0
         if not topic_name or not topic_name.strip():
             raise ToolExecutionError(
                 "INVALID_ARGUMENT",
@@ -9974,7 +10004,7 @@ def build_mcp_server() -> FastMCP:
                         cast(Any, viewer_recipient.message_id) == Message.id,
                     )
                     .where(
-                        cast(Any, viewer_recipient.agent_id) == (viewer.id or 0),  # type: ignore[union-attr]
+                        cast(Any, viewer_recipient.agent_id) == viewer_id,
                         cast(Any, viewer_recipient.read_ts).is_(None),
                     )
                 )

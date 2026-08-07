@@ -324,12 +324,27 @@ if [[ "${_OS}" == "windows" ]]; then
   fi
 fi
 
+# `bash <file>` rather than executing the path, on both branches, because the
+# execute bit is not reliable anywhere it matters. On macOS and Linux a copy can
+# arrive without it and the bare path then fails with "Permission denied"
+# (measured by laptop-mac-1). Naming the interpreter removes the dependency.
+#
+# Inside the Windows wrapper the inner `bash` is safe, which is not obvious: on
+# the PATH cmd.exe sees, `bash` is the WSL launcher, and that is exactly what
+# made `bash <file>` wrong as a top-level command here. Inside the wrapper the
+# shell is already Git Bash, so its own PATH answers — measured: `command -v
+# bash` -> /usr/bin/bash, `uname -o` -> Msys. Both forms run the hook.
+#
+# The execute bit cannot in fact be lost on Windows, for the same reason chmod
+# does nothing there: with `noacl` the mode is inferred, and a .sh stays 755
+# through `chmod 644` and `chmod -x`. So this guard is inert here and load
+# bearing elsewhere, which is the right way round.
 _hook_cmd() {
   if [[ -n "${_BASH_WRAP}" ]]; then
-    # The inner command is single-quoted for bash; the outer for cmd.exe.
-    printf '"%s" -c "'"'"'%s/%s'"'"' || true"' "${_BASH_WRAP}" "${HOOKS_DIR}" "$1"
+    # Inner command single-quoted for bash, whole thing double-quoted for cmd.exe.
+    printf '"%s" -c "bash '"'"'%s/%s'"'"' || true"' "${_BASH_WRAP}" "${HOOKS_DIR}" "$1"
   else
-    printf '%s/%s || true' "${HOOKS_DIR}" "$1"
+    printf 'bash %s/%s || true' "${HOOKS_DIR}" "$1"
   fi
 }
 

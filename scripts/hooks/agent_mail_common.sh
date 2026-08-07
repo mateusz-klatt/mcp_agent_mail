@@ -292,7 +292,13 @@ am_conf_escape() {
 am_call() {
     local tool="$1" args="$2" bearer body hdr raw
     bearer="$(am_bearer)"
-    [ -z "$bearer" ] && return 0
+    # No bearer is NOT a reason to stay quiet. Send the request without the
+    # header instead: a server that requires one answers a loud 401 (rc=2 via
+    # am_http_status), and a deployment that deliberately runs unauthenticated
+    # keeps working. Returning success with no output — as this did — made an
+    # unconfigured machine indistinguishable from a healthy quiet one, which is
+    # the failure this whole layer exists to remove.
+    :
     # Two encoding defences, on purpose. The server accepts UTF-8 fine — the
     # corruption was ours: on Windows the argv crossing into native curl.exe
     # re-encodes text through the console codepage, turning valid UTF-8 into
@@ -358,6 +364,14 @@ am_call() {
     # JSON array, fails its own type check, and exits quietly. A wrong
     # credential is currently the most silent failure of the lot.
     raw="$(printf '%s' "$raw" | sed '$d')"
+    # A JSON-RPC envelope error sits BESIDE .result, not inside it, so a check
+    # that only reads .result.isError sees `.result` absent, `// empty`, and
+    # hands the caller an empty string — a protocol failure arriving as
+    # "answered 2xx, nothing to report".
+    if printf '%s' "$raw" | jq -e 'has("error") and (.error | type) == "object"' >/dev/null 2>&1; then
+        printf '%s' "$raw" | jq -r '.error.message // "the server rejected the request"' 2>/dev/null
+        return 2
+    fi
     if printf '%s' "$raw" | jq -e '.result.isError // false' >/dev/null 2>&1; then
         # The reason goes to stdout so the caller can quote it. Server text like
         # "Invalid registration_token for agent X" is the single most actionable
@@ -407,7 +421,13 @@ am_urlencode() {
 am_get() {
     local path="$1" bearer raw
     bearer="$(am_bearer)"
-    [ -z "$bearer" ] && return 0
+    # No bearer is NOT a reason to stay quiet. Send the request without the
+    # header instead: a server that requires one answers a loud 401 (rc=2 via
+    # am_http_status), and a deployment that deliberately runs unauthenticated
+    # keeps working. Returning success with no output — as this did — made an
+    # unconfigured machine indistinguishable from a healthy quiet one, which is
+    # the failure this whole layer exists to remove.
+    :
     raw="$(printf 'header = "Authorization: Bearer %s"\n' "$bearer" \
       | curl -s --max-time "$AM_TIMEOUT" -G -K - \
         "${@:2}" "${AM_BASE_URL}${path}" --write-out '\n%{http_code}' 2>/dev/null)"

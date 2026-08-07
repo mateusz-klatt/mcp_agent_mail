@@ -218,9 +218,25 @@ fi
 # rather than skipped. Trimming drops the oldest ids and folds them into the
 # floor, which keeps this file bounded without ever stepping over an id that
 # was never shown.
-new_state="$(jq -nc --argjson st "$state" --argjson add "$announced" --argjson keep "$KEEP_IDS" '
+# Folding old ids into `floor` asserts that everything below them was already
+# shown. That assertion is only true when the inventory was EXHAUSTIVE — and it
+# is capped at INVENTORY and ordered newest-first, so with a backlog above the
+# cap the oldest unread never entered it at all and would drop below the new
+# floor permanently. Reproduced: after announcing 1000..501 then 500..451, ids
+# 450..1 become unreachable forever.
+#
+# `count_all < INVENTORY` is exactly the proof that the response was complete:
+# the server returned fewer rows than we asked for, so there is nothing else to
+# return. Only then may the low end be folded. Otherwise the set keeps growing —
+# a state file that grows during a backlog is a far smaller problem than a
+# mailbox that silently loses its oldest messages, and it shrinks again on the
+# next complete inventory.
+exhaustive=0
+[ "$count_all" -lt "$INVENTORY" ] 2>/dev/null && exhaustive=1
+new_state="$(jq -nc --argjson st "$state" --argjson add "$announced" --argjson keep "$KEEP_IDS" \
+    --argjson exhaustive "$exhaustive" '
     (($st.ids + $add) | unique | sort | reverse) as $all
-    | if ($all | length) > $keep
+    | if ($all | length) > $keep and $exhaustive == 1
         then ($all[0:$keep]) as $kept | {floor: (($kept | min) - 1), ids: $kept}
         else {floor: $st.floor, ids: $all} end' 2>/dev/null)"
 if [ -n "$new_state" ]; then

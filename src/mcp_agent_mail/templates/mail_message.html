@@ -3,16 +3,33 @@
 {% block title %}{{ message.subject }} — Agent Mail{% endblock %}
 
 {% block breadcrumbs %}
+{# Below sm only the project link survives, truncated.
+
+   Measured on a 440 px viewport: this nav alone is 577 px, which pushed the
+   whole header 566 px past the edge — worse than the unified inbox ever was,
+   and it matters more now, because the mobile fix in 326b672 made THIS the page
+   a tap on a message lands on. The page was reachable before and simply not
+   looked at.
+
+   What is dropped is chosen, not trimmed to fit: "Projects" duplicates the logo
+   tile, which links to /mail already, and the subject crumb duplicates the <h1>
+   in the page body. The project link is the only thing here that exists nowhere
+   else on the page, so it is the one that stays.
+
+   Deliberately NOT `min-w-0` on the containers: that also takes the overflow to
+   zero, and it does it by letting the whole breadcrumb collapse to 0 px wide —
+   measured. That is the same defect as a preview pane with no room to render,
+   and it reads as fixed. #}
 <nav class="flex items-center gap-2 text-sm">
-  <a href="/mail" class="text-slate-600 dark:text-slate-400 hover:text-primary-600 dark:hover:text-primary-400 transition-colors">
+  <a href="/mail" class="hidden sm:inline text-slate-600 dark:text-slate-400 hover:text-primary-600 dark:hover:text-primary-400 transition-colors">
     Projects
   </a>
-  <i data-lucide="chevron-right" class="w-4 h-4 text-slate-400"></i>
-  <a href="/mail/{{ project.slug }}" class="text-slate-600 dark:text-slate-400 hover:text-primary-600 dark:hover:text-primary-400 transition-colors">
+  <i data-lucide="chevron-right" class="hidden sm:block w-4 h-4 text-slate-400"></i>
+  <a href="/mail/{{ project.slug }}" class="truncate max-w-[6rem] sm:max-w-none text-slate-600 dark:text-slate-400 hover:text-primary-600 dark:hover:text-primary-400 transition-colors">
     {{ project.human_key }}
   </a>
-  <i data-lucide="chevron-right" class="w-4 h-4 text-slate-400"></i>
-  <span class="text-slate-900 dark:text-white font-medium truncate max-w-xs">{{ message.subject }}</span>
+  <i data-lucide="chevron-right" class="hidden sm:block w-4 h-4 text-slate-400"></i>
+  <span class="hidden sm:inline text-slate-900 dark:text-white font-medium truncate max-w-xs">{{ message.subject }}</span>
 </nav>
 {% endblock %}
 
@@ -23,15 +40,20 @@
      data-tippy-content="Reply to this message as the Human Overseer"
      aria-label="Reply">
     <i data-lucide="reply" class="w-4 h-4"></i>
-    Reply
+    {# Icon-only below sm. The breadcrumb alone did not buy enough room: this
+       page adds Reply and Forward to the six controls every page already
+       carries, and the right-hand group is 357 px of a 440 px viewport on its
+       own. aria-label on the anchor keeps the name for anyone not reading
+       pixels. #}
+    <span class="hidden sm:inline">Reply</span>
   </a>
   <button disabled
           class="px-4 py-2 text-sm font-medium text-slate-400 dark:text-slate-500 bg-slate-100 dark:bg-slate-800 rounded-lg flex items-center gap-2 opacity-60 cursor-not-allowed relative"
           data-tippy-content="Coming soon - Forward this message"
           aria-label="Forward (Coming Soon)">
     <i data-lucide="forward" class="w-4 h-4"></i>
-    Forward
-    <span class="absolute -top-1 -right-1 px-1 py-0.5 bg-amber-500 text-white text-[9px] font-bold rounded-full shadow-sm">Soon</span>
+    <span class="hidden sm:inline">Forward</span>
+    <span class="hidden sm:block absolute -top-1 -right-1 px-1 py-0.5 bg-amber-500 text-white text-[9px] font-bold rounded-full shadow-sm">Soon</span>
   </button>
 </div>
 {% endblock %}

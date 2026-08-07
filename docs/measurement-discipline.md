@@ -14,7 +14,7 @@ Each item below is a real mistake from that day, not a hypothetical. The names
 are left out because every one of the four made every one of these at least
 once.
 
-## Four axes a measurement has to declare
+## Five axes a measurement has to declare
 
 **What am I measuring — is it the thing I am asking about?**
 
@@ -73,6 +73,24 @@ shape. *"did ANY secret leak"* needs a tool that knows the context —
 `gitleaks`, `trufflehog` — because a hand-written pattern fails silently when
 the guess about the alphabet is wrong.
 
+**When was it measured, and when am I reporting it?**
+
+A fifth axis, and the only one where the question was right and the answer was
+right and the statement was still false. Someone measured whether anything had
+been pushed, spent six minutes on another task, and reported the result as
+current. It had been wrong for four and a half minutes by the time it was sent.
+
+The same shape appears constantly here because most of what we look at changes
+in seconds: unread counts, reservations, session bindings, who is editing what.
+Twice in one afternoon an empty inbox was followed by a newer message in the
+same thread — once because the reader had marked it read by mistake, once
+because it arrived between two queries. Identical symptom, unrelated causes,
+and neither distinguishable from a genuinely quiet mailbox.
+
+A measurement of fast-moving state carries an expiry. If it is not reported
+promptly, it has to be re-taken rather than quoted; and if a decision hangs on
+it, the read belongs immediately before the decision, not before the writing-up.
+
 ## Controls
 
 **Positive control — can the detector see anything?**
@@ -108,6 +126,17 @@ Two machines tried to make `mv` refuse a rename — `chmod 500` on the directory
 then a read-only target file on Windows. Both writes went through anyway, and
 both results looked like refutations of the claim under test. They were
 evidence that the test never created the state it was testing.
+
+**In a security scan, call `command grep`, not `grep`.** On one machine here
+`grep` is a shell function dispatching to `ugrep --ignore-files`, which honours
+`.gitignore`; on another it is plain GNU grep. Same command in the thread, two
+different programs, and nobody could tell from a quoted result. The wrapper is
+a good default for reading code and the wrong one for finding secrets, because
+what it skips — ignored paths, `.git`, binaries — is exactly where a leaked
+credential lands. The same split runs through git: `git grep` searches tracked
+files, `git grep --no-index` searches the working tree, and `git ls-files`
+answers about the local index and nothing else. Three questions, one habit of
+speech.
 
 **When you cannot produce the condition, shadow the call that has to fail.**
 Overriding `mv` with a shell function returning 1 exercises the branch

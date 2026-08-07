@@ -3,7 +3,7 @@
 # Deliberately a SEPARATE file from the repo's own compose.yaml / docker-compose.yml:
 #   * compose.yaml (upstream) omits DATABASE_URL — see the note below; it loses the DB.
 #   * docker-compose.yml (upstream) points at Postgres, which this app rejects at startup
-#     (db.py:542 `_SUPPORTED_BACKENDS = frozenset({"sqlite"})`). It is dead on arrival.
+#     (db.py, `_SUPPORTED_BACKENDS = frozenset({"sqlite"})`). It is dead on arrival.
 # Keeping ours separate also keeps `git merge upstream/main` conflict-free.
 #
 #   docker compose -f compose.prod.yaml up -d --build
@@ -53,7 +53,8 @@ services:
       # reservation — while the git archive under /data survives and makes the loss
       # look like it didn't happen.
       #
-      # Four slashes = absolute path. db.py:566's own error text suggests this value.
+      # Four slashes = absolute path. db.py's own "unsupported backend" error text
+      # suggests exactly this value.
       # ---------------------------------------------------------------------
       DATABASE_URL: "sqlite+aiosqlite:////data/mailbox/storage.sqlite3"
 
@@ -137,7 +138,6 @@ services:
     # adding -w/--workers to any of these commands breaks the invariant with no
     # warning and no log line.
     #
-    # Deliberately no file:line references here. The previous version of this
-    # note carried two, both of which had drifted onto unrelated code — which
-    # invites the next reader to dismiss the whole comment as stale, including
-    # the half that still holds. Symbol names survive edits; line numbers do not.
+    # Symbol names, not file:line. A line number that has drifted onto unrelated
+    # code invites the next reader to dismiss the whole note as stale, including
+    # the half that still holds.

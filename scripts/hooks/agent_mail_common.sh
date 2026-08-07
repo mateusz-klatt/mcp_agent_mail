@@ -45,7 +45,15 @@ am_load_env() {
 }
 am_load_env
 
-AM_TIMEOUT="${AGENT_MAIL_HOOK_TIMEOUT:-3}"
+# 3s was losing 2-5% of calls to nothing more than a slow round trip. The cost
+# of raising it is paid only when packets vanish without an answer — a VPN, a
+# firewall that drops instead of resetting, a dead CDN edge — because a refused
+# connection returns in ~58ms whatever this is set to. Measured: a black hole
+# costs exactly this many seconds, a dead server costs nothing.
+#
+# reservations_warn overrides it back down: it is the only PreToolUse hook, so
+# it is the only one a person waits behind before every edit.
+AM_TIMEOUT="${AGENT_MAIL_HOOK_TIMEOUT:-8}"
 AM_BASE_URL="${AGENT_MAIL_URL:-http://127.0.0.1:8765}"
 
 # On MSYS the credential store must be addressed the way jq.exe can open it.
@@ -332,7 +340,34 @@ am_call() {
     # because folding it into the body would break the parse this exists to
     # protect.
     am_http_status "$raw" || return $?
-    printf '%s' "$raw" | sed '$d' | jq -r '.result.content[0].text // empty' 2>/dev/null
+    # A refused tool call is an HTTP 200. The JSON-RPC envelope succeeded; the
+    # tool inside it did not, and says so in .result.isError. Reading only the
+    # status therefore lets an invalid registration_token through as a normal
+    # answer — the caller gets an English error sentence where it expected a
+    # JSON array, fails its own type check, and exits quietly. A wrong
+    # credential is currently the most silent failure of the lot.
+    raw="$(printf '%s' "$raw" | sed '$d')"
+    if printf '%s' "$raw" | jq -e '.result.isError // false' >/dev/null 2>&1; then
+        # The reason goes to stdout so the caller can quote it. Server text like
+        # "Invalid registration_token for agent X" is the single most actionable
+        # thing this layer ever produces, and dropping it would leave the agent
+        # knowing only that something failed.
+        printf '%s' "$raw" | jq -r '.result.content[0].text // "the server reported an error"' 2>/dev/null
+        return 2
+    fi
+    printf '%s' "$raw" | jq -r '.result.content[0].text // empty' 2>/dev/null
+}
+
+# Turn an am_call/am_get outcome into a sentence a caller can put in front of
+# the agent. Kept here so the four hooks phrase it identically: an agent that
+# sees the same wording twice learns it once.
+am_failure_reason() {
+    case "$1" in
+        1) printf 'the server did not answer' ;;
+        2) if [ -n "${2:-}" ]; then printf 'the server refused: %s' "$2"
+           else printf 'the server refused the request'; fi ;;
+        *) printf 'the call failed' ;;
+    esac
 }
 
 # Percent-encode a query value so it can cross argv into native curl.exe.

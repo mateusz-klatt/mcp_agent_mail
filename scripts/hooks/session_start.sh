@@ -39,7 +39,7 @@ rc=$?
 # looks identical to a healthy one. Say it once, at the only moment the agent
 # can act on it.
 if [ "$rc" -ne 0 ]; then
-    [ "$rc" -eq 1 ] && why="the server did not answer" || why="the server refused the registration"
+    why="$(am_failure_reason "$rc" "$resp")"
     am_emit_context "SessionStart" \
         "Agent Mail: could not register on ${PROJECT} — ${why}. For this session there is no coordination: reservations will not be filed, conflicts will not be reported, and mail will not be delivered. Nothing else will mention it again."
     exit 0

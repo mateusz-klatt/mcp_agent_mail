@@ -20,6 +20,12 @@ set -uo pipefail
 # shellcheck source=/dev/null
 . "$(dirname "$0")/agent_mail_common.sh" 2>/dev/null || exit 0
 
+# The only PreToolUse hook, and so the only one a person waits behind before
+# every single edit. Elsewhere 8s buys reliability for free; here it would be
+# eight seconds of nothing happening, per edit, whenever the network is a black
+# hole. An explicit AGENT_MAIL_HOOK_TIMEOUT still wins.
+AM_TIMEOUT="${AGENT_MAIL_HOOK_TIMEOUT:-3}"
+
 am_read_payload
 target="$(am_payload_field '.tool_input.file_path')"
 [ -z "$target" ] && target="$(am_payload_field '.tool_input.notebook_path')"
@@ -43,7 +49,7 @@ rc=$?
 # coordination layer does not merely stop — for that minute it actively asserts
 # a safety that is not there, which is worse than having no layer at all.
 if [ "$rc" -ne 0 ]; then
-    [ "$rc" -eq 1 ] && why="the server did not answer" || why="the server refused the request"
+    why="$(am_failure_reason "$rc" "$body")"
     am_emit_context "PreToolUse" \
         "Agent Mail: could not check reservations for ${rel} — ${why}. This is NOT 'no conflict': another agent may hold this file and you would not have been told. Check ${AGENT_MAIL_PUBLIC_URL:-$AM_BASE_URL}/mail before editing, or proceed knowing the guard is down."
     exit 0

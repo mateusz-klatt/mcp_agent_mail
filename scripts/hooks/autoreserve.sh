@@ -52,7 +52,7 @@ rc=$?
 # they are alone. Announce the failure even though the ordinary path stays
 # quiet, because this is the one case where quiet is a false statement.
 if [ "$rc" -ne 0 ]; then
-    [ "$rc" -eq 1 ] && why="the server did not answer" || why="the server refused the request"
+    why="$(am_failure_reason "$rc" "$resp")"
     am_emit_context "PostToolUse" \
         "Agent Mail: NO reservation was filed for ${rel} — ${why}. Nobody else will be warned that you are editing it, and you were not warned about them. Treat this file as unguarded until coordination is back."
     exit 0

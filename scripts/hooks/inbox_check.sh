@@ -62,7 +62,10 @@ if [ "$EVENT" != "SessionStart" ] && [ -f "$stamp" ]; then
     case "$then_" in ''|*[!0-9]*) then_=0 ;; esac
     [ $((now - then_)) -lt "$INTERVAL" ] && exit 0
 fi
-date +%s > "$stamp" 2>/dev/null
+# Stamped AFTER the call, not before — see the failure branch. Writing it here
+# would mean a failed check silences its own outage warning for the full
+# interval, so an agent would be told once that the channel is down and then
+# nothing for two minutes while it stayed down.
 
 # ── what has already been announced ──────────────────────────────────────────
 #
@@ -106,11 +109,17 @@ rc=$?
 # or a dropped link therefore looks exactly like a quiet morning, for as long
 # as it lasts — including to a human trying to say stop.
 if [ "$rc" -ne 0 ]; then
-    [ "$rc" -eq 1 ] && why="the server did not answer" || why="the server refused the request"
+    # Back off, but far less than the healthy interval: retry soon enough that
+    # the agent learns when the channel returns, rarely enough not to hammer a
+    # server that is already struggling.
+    now_fail=$(date +%s 2>/dev/null || echo 0)
+    printf '%s' "$(( now_fail - INTERVAL + ${AGENT_MAIL_INBOX_RETRY:-30} ))" > "$stamp" 2>/dev/null
+    why="$(am_failure_reason "$rc" "$inv")"
     am_emit_context "$EVENT" \
         "Agent Mail: could not check the inbox — ${why}. This is NOT 'no new messages': mail may be waiting, including from the human overseer. Retry before assuming the channel is quiet."
     exit 0
 fi
+date +%s > "$stamp" 2>/dev/null
 [ -z "$inv" ] && exit 0
 printf '%s' "$inv" | jq -e 'type == "array"' >/dev/null 2>&1 || exit 0
 

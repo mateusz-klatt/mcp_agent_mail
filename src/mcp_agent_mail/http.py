@@ -3109,10 +3109,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 # cards and the one alias actually set on this server appears
                 # zero times on it.
                 agents_q = await session.execute(
-                    text("SELECT id, name, program, model, retired_at, display_name FROM agents WHERE project_id = :pid ORDER BY name"),
+                    # notify_sound joins display_name here for the same reason it was added:
+                    # the column exists, a tool sets it, and this dict is the only
+                    # thing the project page ever sees. A preference nobody can
+                    # perceive is indistinguishable from one nobody set.
+                    text("SELECT id, name, program, model, retired_at, display_name, notify_sound FROM agents WHERE project_id = :pid ORDER BY name"),
                     {"pid": pid},
                 )
-                agents = [{"id": r[0], "name": r[1], "program": r[2], "model": r[3], "retired_at": str(r[4]) if r[4] else None, "display_name": r[5]} for r in agents_q.fetchall()]
+                agents = [{"id": r[0], "name": r[1], "program": r[2], "model": r[3], "retired_at": str(r[4]) if r[4] else None, "display_name": r[5], "notify_sound": r[6]} for r in agents_q.fetchall()]
                 matched_messages: list[dict] = []
                 if q and q.strip():
                     # Prefer FTS5 when available (fts_messages maintained by triggers)

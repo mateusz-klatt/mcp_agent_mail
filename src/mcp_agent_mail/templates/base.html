@@ -3307,15 +3307,43 @@
           }
         }
 
+        // The vocabulary from set_agent_notify_sound, mirrored. Synthesised here
+        // rather than fetched, and that is the whole security argument: a
+        // colleague's preference must never become a request from this browser to
+        // a host that colleague chose.
+        const TONES = {
+          chime: { hz: 880,  wave: 'sine' },
+          low:   { hz: 440,  wave: 'sine' },
+          high:  { hz: 1320, wave: 'sine' },
+          soft:  { hz: 660,  wave: 'triangle' },
+          click: { hz: 220,  wave: 'square' },
+        };
+
+        // Which agent sounds like what. Read from a JSON island the page may or
+        // may not carry — pages without it keep the single default tone, so this
+        // degrades rather than breaks. Parsed defensively: a malformed island
+        // must not take the notification down with it.
+        const AGENT_TONES = (() => {
+          try {
+            const el = document.getElementById('agent-mail-sounds');
+            return el ? (JSON.parse(el.textContent || '{}') || {}) : {};
+          } catch (e) { return {}; }
+        })();
+
         // Browsers refuse audio until a gesture inside the page, and arriving
         // from the login form does not count — hence opt-in, remembered.
-        function ding() {
+        //
+        // Takes the sender so four colleagues are distinguishable without
+        // looking. Callers that cannot know who sent it pass nothing and get the
+        // default, which is exactly what every caller did before this existed.
+        function ding(agentName) {
           if (localStorage.getItem(soundKey) !== 'on') return;
+          const tone = TONES[AGENT_TONES[agentName]] || TONES.chime;
           try {
             const ctx = new (window.AudioContext || window.webkitAudioContext)();
             const osc = ctx.createOscillator(), gain = ctx.createGain();
             osc.connect(gain); gain.connect(ctx.destination);
-            osc.frequency.value = 880; osc.type = 'sine';
+            osc.frequency.value = tone.hz; osc.type = tone.wave;
             gain.gain.setValueAtTime(0.0001, ctx.currentTime);
             gain.gain.exponentialRampToValueAtTime(0.25, ctx.currentTime + 0.01);
             gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.35);

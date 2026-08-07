@@ -55,6 +55,7 @@ from .db import (
 )
 from .guard import install_guard as install_guard_script, uninstall_guard as uninstall_guard_script
 from .llm import complete_system_user
+from .notify import hub
 from .models import (
     Agent,
     AgentLink,
@@ -5639,6 +5640,28 @@ def build_mcp_server() -> FastMCP:
                     notification_message_meta["from_project"] = sender_project.human_key
                 # Signal to/cc recipients (not bcc - blind copies shouldn't trigger visible signals).
                 notification_targets = [agent.name for agent in to_agents + cc_agents]
+            # Wake anyone holding an /events subscription. Deliberately outside
+            # the block above, and with its own recipient list, because the two
+            # differ in ways that would each cost a delivered-but-unnoticed
+            # message:
+            #   * the filesystem signal is off by default, so gating this on it
+            #     would make instant delivery silently depend on an unrelated
+            #     setting;
+            #   * it drops BCC, correctly — blindness is between recipients.
+            #     But this channel is private to one agent, so withholding the
+            #     hint would leave a BCC'd recipient as the only one who never
+            #     learns their own mail arrived.
+            # Reached only after the archive write succeeded: the block above
+            # compensates a failed archive by deleting the row, and a wake for
+            # a message that no longer exists is worse than no wake at all.
+            instant_hint = {
+                "kind": "message",
+                "project": project.slug,
+                "id": message.id,
+            }
+            for target in to_agents + cc_agents + bcc_agents:
+                with suppress(Exception):
+                    hub.publish(project.slug, target.name, {**instant_hint, "agent": target.name})
 
         if notification_message_meta is not None:
             for target_name in notification_targets:

@@ -21,7 +21,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.exc import NoResultFound
@@ -42,6 +42,7 @@ from .app import (
 from . import webauth
 from .config import Settings, get_settings
 from .db import ensure_schema, get_session
+from .notify import KEEPALIVE_SECONDS, MAX_STREAM_SECONDS, hub
 from .storage import (
     ProjectArchive,
     archive_write_lock,
@@ -1903,6 +1904,100 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         under heavy multi-agent load.
         """
         return JSONResponse({"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()})
+
+    @fastapi_app.get("/events")
+    async def events_stream(request: Request) -> Any:
+        """Wake one agent the moment something lands in its mailbox.
+
+        The inbox hook polls: always at session start, then at most once every
+        two minutes, and only while the agent is running tools. An *idle*
+        session is therefore never reached — which is exactly the case the
+        mailbox exists for, an agent waiting on an answer or a human saying
+        "stop". This closes that gap without a monitor runtime: a background
+        process that exits already re-invokes the agent, so a `curl -N` that
+        returns *is* the wake.
+
+        The stream carries one hint and then closes, deliberately. Frames are
+        thin — the woken client pulls content through `fetch_inbox`, which
+        already enforces who may read what.
+
+        Registered before the MCP mounts below; one of them claims a broad
+        prefix and would otherwise shadow this path.
+        """
+        project_key = (request.query_params.get("project") or "").strip()
+        agent_name = (request.query_params.get("agent") or "").strip()
+        token = (request.headers.get("x-agent-mail-registration-token") or "").strip()
+
+        # One reply for every failure. The bearer this endpoint sits behind is
+        # server-wide, not per project, so a caller who holds it could otherwise
+        # sweep names and learn which agents exist and when their mail arrives.
+        unauthorized = JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        if not project_key or not agent_name or not token:
+            return unauthorized
+
+        await ensure_schema()
+        async with get_session() as session:
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT p.slug, a.name, a.registration_token, a.retired_at "
+                        "FROM agents a JOIN projects p ON p.id = a.project_id "
+                        "WHERE (p.slug = :k OR p.human_key = :k) AND lower(a.name) = lower(:a)"
+                    ),
+                    {"k": project_key, "a": agent_name},
+                )
+            ).fetchone()
+
+        if row is None or not row[2] or row[3] is not None:
+            return unauthorized
+        # compare_digest, not ==, so a caller cannot narrow the token by timing.
+        if not hmac.compare_digest(str(row[2]), token):
+            return unauthorized
+        project_slug, canonical_agent = str(row[0]), str(row[1])
+
+        # Subscribe BEFORE the client catches up, not after. The client's
+        # contract is: connect, wait for `: ready`, pull the inbox, then wait.
+        # Checking first and subscribing second would drop anything that
+        # arrived in between — a lost wakeup with no trace on either side.
+        queue = hub.subscribe(project_slug, canonical_agent)
+
+        async def stream() -> Any:
+            deadline = asyncio.get_running_loop().time() + MAX_STREAM_SECONDS
+            try:
+                yield b": ready\n\n"
+                while True:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        yield b": bye\n\n"
+                        return
+                    try:
+                        event = await asyncio.wait_for(
+                            queue.get(), timeout=min(KEEPALIVE_SECONDS, remaining)
+                        )
+                    except asyncio.TimeoutError:
+                        yield b": ping\n\n"
+                        continue
+                    # No `id:` line: that would advertise Last-Event-ID replay
+                    # this stream does not have. The mailbox is the log.
+                    yield f"data: {json.dumps(event, separators=(',', ':'))}\n\n".encode()
+                    return
+            finally:
+                # Must run on client disconnect too, or the hub accumulates
+                # queues for connections that are long gone and publishes into
+                # them forever.
+                hub.unsubscribe(project_slug, canonical_agent, queue)
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-store",
+                # Tells nginx not to buffer; harmless elsewhere. Without it a
+                # buffering proxy holds the frame and the wake never arrives.
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
+        )
 
     def _oauth_metadata_disabled_response() -> JSONResponse:
         return JSONResponse({"mcp_oauth": False}, status_code=404)
@@ -4398,6 +4493,25 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         status_code=500,
                         detail=f"Failed to write message to Git archive: {git_error!s}"
                     ) from git_error
+
+                # This path builds its rows by hand rather than going through
+                # _deliver_message, so without this the one message type that
+                # most needs to arrive at once — a human telling an agent to
+                # stop — would be the only one that never wakes anybody.
+                # After the archive write, for the same reason as there: a wake
+                # pointing at a message the archive rejected is worse than none.
+                for _recipient in valid_recipients:
+                    with contextlib.suppress(Exception):
+                        hub.publish(
+                            project_slug,
+                            _recipient,
+                            {
+                                "kind": "message",
+                                "project": project_slug,
+                                "agent": _recipient,
+                                "id": message_id,
+                            },
+                        )
 
                 return JSONResponse({
                     "success": True,

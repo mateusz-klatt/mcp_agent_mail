@@ -64,6 +64,12 @@ SELF_CMD="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 READY_WAIT="${AGENT_MAIL_WATCH_READY_SECONDS:-15}"
 
 PROJECT="$(am_project_key)"
+# am_agent_name resolves the project itself when AM_PROJECT_FOR_NAME is unset,
+# which means a second `git config` and `git rev-parse` for a value this hook
+# has already computed one line above. The override exists for exactly this and
+# nothing set it. Measured by home-win-1: am_project_key costs ~122 ms per call
+# on Windows, so this is a doubled cost on every tool invocation there.
+export AM_PROJECT_FOR_NAME="$PROJECT"
 [ -z "$PROJECT" ] && exit 0
 AGENT="$(am_agent_name)"
 

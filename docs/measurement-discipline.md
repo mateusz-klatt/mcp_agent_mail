@@ -154,6 +154,14 @@ The same split runs through git: `git grep` searches tracked files, `git grep
 --no-index` searches the working tree, and `git ls-files` answers about the
 local index and nothing else. Three questions, one habit of speech.
 
+**A reference that looks checkable is a reference nobody checks.** Every
+`file.py:NNN` in one deployment file had drifted onto unrelated code — one of
+them 84 lines from the behaviour it claimed to document. A line number reads as
+evidence that somebody verified it, so the reader arrives already convinced and
+interprets whatever is there as a match. The same shape as a pattern that
+cannot match: both are silent, and both look precise. Symbol names survive
+edits and are just as greppable.
+
 **When you cannot produce the condition, shadow the call that has to fail.**
 Overriding `mv` with a shell function returning 1 exercises the branch
 deterministically on any platform. This separates two questions that get

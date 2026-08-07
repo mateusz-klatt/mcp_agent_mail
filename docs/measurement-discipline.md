@@ -77,6 +77,14 @@ had put a secret in argv.
 one shape says nothing about the others. The secret gate above was tested with
 a bearer and never with a registration token.
 
+**The control has to be built independently of the thing under test.** A
+pre-push gate searched for the literal credential values. Because a bearer read
+from a file carries no trailing newline, the file it searched held one line —
+bearer immediately followed by token — so the gate was looking for a
+concatenation that occurs nowhere. Its positive control was produced by copying
+that same file, matched trivially, and certified the blindness. A control
+derived from the subject always passes; that is what makes it worthless.
+
 ## Techniques
 
 **A condition you cannot produce is not a condition that does not exist.**
@@ -125,6 +133,28 @@ record looks the same either way.** A proposed fix was set aside as "the less
 elegant of two" and stayed on the list as a viable alternative. Measured later,
 it made the bug worse. Whoever read the thread a month on would have seen two
 options and picked the simpler one.
+
+## Who catches these
+
+Not one of the mistakes above was found by the person who made it. Every single
+one was caught by somebody else, and always by the same question: *what is that
+number actually an answer to?*
+
+That is not a remark about attentiveness. It is structural. The author of a
+measurement knows what they meant to measure, and reads the result as the
+answer to that. A reader has only the result and the method, so the gap between
+them is the first thing they see. Which means:
+
+- **A finding is not finished when it is measured. It is finished when someone
+  else has said what it excludes.** Four machines agreed three separate times
+  today on a fix that was still wrong; agreement is not verification, and a
+  proposal everybody likes is the one nobody re-checks.
+- **Report the measurement, not just the conclusion** — the call, the flags, the
+  controls. A conclusion cannot be audited; a method can. Half the corrections
+  below started with someone noticing a missing flag in a command that was
+  quoted in full.
+- **Say plainly when a test failed to create its own condition.** Twice today
+  that admission turned what looked like a refutation into a live finding.
 
 ## Where this came from
 

@@ -3363,8 +3363,38 @@
           // page with it. Carry the scroll position across so the cost is a
           // repaint rather than losing where somebody was reading.
           try { sessionStorage.setItem('agentMailScroll', String(window.scrollY)); } catch (e) {}
+          // Remember which message was newest, so the reloaded page can tell what
+          // arrived and sound the right agent's tone. The frame that woke us
+          // carries no sender — deliberately, so a project watcher cannot learn
+          // who a BCC went to — so the only honest source is what the server
+          // re-renders for this reader.
+          try {
+            const top = document.querySelector('[data-message-id]');
+            sessionStorage.setItem('agentMailTop', top ? (top.dataset.messageId || '') : '');
+            sessionStorage.setItem('agentMailPendingDing', '1');
+          } catch (e) {}
           window.location.reload();
         }
+
+        // After the reload: ding once, with the tone of whoever actually wrote.
+        // Falls back to the default when the page has no message rows to read —
+        // which is every page that is not a message list, and was the behaviour
+        // everywhere before this existed.
+        try {
+          if (sessionStorage.getItem('agentMailPendingDing') === '1') {
+            sessionStorage.removeItem('agentMailPendingDing');
+            const before = sessionStorage.getItem('agentMailTop');
+            sessionStorage.removeItem('agentMailTop');
+            window.addEventListener('load', () => {
+              const top = document.querySelector('[data-message-id]');
+              const now = top ? (top.dataset.messageId || '') : '';
+              // No rows to compare: sound the default rather than stay silent.
+              // A missed notification is worse than an unspecific one.
+              if (!top) { ding(); return; }
+              if (now !== before) ding(top.dataset.sender || undefined);
+            });
+          }
+        } catch (e) {}
 
         try {
           const y = sessionStorage.getItem('agentMailScroll');
@@ -3383,7 +3413,7 @@
           es.onmessage = (ev) => {
             let payload = null;
             try { payload = JSON.parse(ev.data); } catch (e) { return; }
-            if (payload && payload.kind === 'changed') { ding(); refresh(); }
+            if (payload && payload.kind === 'changed') { refresh(); }  // ding happens after the reload, with the sender
           };
           es.onerror = () => {
             setState(false, 'live updates disconnected — falling back to polling');
@@ -3405,7 +3435,7 @@
             if (!r.ok) return;
             const data = await r.json();
             const top = (data.messages && data.messages[0] && data.messages[0].id) || null;
-            if (lastSeen !== null && top !== null && top !== lastSeen) { ding(); refresh(); }
+            if (lastSeen !== null && top !== null && top !== lastSeen) { refresh(); }  // ding after reload
             lastSeen = top;
           } catch (e) { /* offline; the next tick tries again */ }
         }

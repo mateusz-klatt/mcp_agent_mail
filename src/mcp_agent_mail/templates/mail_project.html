@@ -17,6 +17,20 @@
 <!-- Narrows the shared live-update script in base.html to this project. Absent
      elsewhere, which makes those pages watch every project instead. -->
 <meta name="agent-mail-project" content="{{ project.slug }}" />
+
+{# Which agent sounds like what, for the chime in base.html. A JSON island rather
+   than data attributes on the cards: the notification fires on messages, and the
+   cards are a different list that may not contain the sender at all.
+
+   Emitted only when somebody has actually chosen a tone — an empty map and a
+   missing island behave identically in the reader, and not emitting it keeps the
+   page honest about whether the feature is in use. #}
+{% set sounds = agents | selectattr('notify_sound') | list %}
+{% if sounds %}
+<script type="application/json" id="agent-mail-sounds">
+{ {% for a in sounds %}{{ a.name | tojson }}: {{ a.notify_sound | tojson }}{{ "," if not loop.last }}{% endfor %} }
+</script>
+{% endif %}
 {% endblock %}
 
 {% block header_actions %}
@@ -325,6 +339,7 @@
         <div class="space-y-3">
           {% for r in results %}
             <a href="/mail/{{ project.slug }}/message/{{ r.id }}"
+               data-message-id="{{ r.id }}" data-sender="{{ r.sender }}"
                class="block group bg-slate-50 dark:bg-slate-900 hover:bg-white dark:hover:bg-slate-800 rounded-xl p-5 border-2 border-slate-200 dark:border-slate-700 hover:border-primary-400 dark:hover:border-primary-600 transition-all duration-300 shadow-sm hover:shadow-md stagger-item"
                style="animation-delay: {{ [loop.index0 * 0.05, 1.0]|min }}s;">
               <div class="flex items-start justify-between mb-3">

@@ -1,22 +1,17 @@
-{% extends "base.html" %}
+{# A PARTIAL, not a page. It declared base.html as its parent while being
+   reached only through `{% include %}` from mail_file_reservations.html, so every
+   request for that page rendered base.html twice — two <html>, two <body>, two
+   <nav>, the second nested inside the first's <main>. Measured on production:
+   818 KB of response for one page.
 
-{% block title %}File Reservations — {{ project.human_key }}{% endblock %}
+   That is also why breadcrumb and header fixes appeared not to work there: the
+   first copy was repaired and the second, further down the document, set the
+   width. A simulation hiding the first navigation changed nothing and looked
+   like the fix being wrong.
 
-{% block breadcrumbs %}
-<nav class="flex items-center gap-2 text-sm">
-  <a href="/mail" class="hidden sm:flex text-slate-600 dark:text-slate-400 hover:text-primary-600 dark:hover:text-primary-400 transition-colors">
-    Projects
-  </a>
-  <i data-lucide="chevron-right" class="hidden sm:block w-4 h-4 text-slate-400"></i>
-  <a href="/mail/{{ project.slug }}" class="truncate max-w-[6rem] sm:max-w-none text-slate-600 dark:text-slate-400 hover:text-primary-600 dark:hover:text-primary-400 transition-colors">
-    {{ project.human_key }}
-  </a>
-  <i data-lucide="chevron-right" class="hidden sm:block w-4 h-4 text-slate-400"></i>
-  <span class="text-slate-900 dark:text-white font-medium">File Reservations</span>
-</nav>
-{% endblock %}
-
-{% block content %}
+   The wrapper already declares title and breadcrumbs, and declared them
+   identically — nothing is lost by dropping them here. Do not restore that inheritance: this file is rendered nowhere as a page (zero references in any .py,
+   verified with a positive control on two templates that are). #}
 <div class="space-y-6 animate-fade-in">
   <!-- File Reservations Header -->
   <div class="bg-white dark:bg-slate-800 rounded-xl p-8 shadow-soft border border-slate-200 dark:border-slate-700">
@@ -238,4 +233,3 @@
     </div>
   {% endif %}
 </div>
-{% endblock %}

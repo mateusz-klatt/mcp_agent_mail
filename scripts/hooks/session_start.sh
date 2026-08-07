@@ -50,7 +50,7 @@ if [ "$(printf '%s' "$resp" | jq -r '.retired_at // empty' 2>/dev/null)" != "" ]
 fi
 
 summary="Agent Mail: you are ${got_name} on ${PROJECT}."
-res="$(am_get /mail/api/file-reservations --data-urlencode "project=${PROJECT}")"
+res="$(am_get /mail/api/file-reservations --data "project=$(am_urlencode "$PROJECT")")"
 held="$(printf '%s' "$res" | jq -r --arg me "$got_name" \
     '[.reservations[]? | select(.agent != $me) | "\(.path_pattern) (\(.agent))"] | join(", ")' 2>/dev/null)"
 [ -n "$held" ] && summary="${summary} Reserved by others right now: ${held}."

@@ -245,6 +245,20 @@ am_call() {
         | jq -r '.result.content[0].text // empty' 2>/dev/null
 }
 
+# Percent-encode a query value so it can cross argv into native curl.exe.
+# The same boundary that mangles am_call's body mangles --data-urlencode's
+# VALUE: Windows re-encodes argv through the ANSI codepage, so a reserved
+# path with any non-ASCII in it queries as legacy bytes, never matches, and
+# the conflict warning silently does not come. Percent-encoded output is
+# pure ASCII, which no codepage can damage. The value reaches jq via stdin,
+# never argv.
+am_urlencode() {
+    printf '%s' "$1" | jq -sRr '@uri' 2>/dev/null
+}
+
+# Callers must pass query strings pre-encoded with am_urlencode
+# (--data "k=$(am_urlencode "$v")"), NOT --data-urlencode "k=$v" — the raw
+# value would be mis-encoded on argv before curl ever sees it.
 am_get() {
     local path="$1" bearer
     bearer="$(am_bearer)"

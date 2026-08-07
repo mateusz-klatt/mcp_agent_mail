@@ -34,7 +34,7 @@ rel="$(am_relpath "$target")"
 [ -z "$rel" ] && exit 0
 
 body="$(am_get /mail/api/file-reservations \
-    --data-urlencode "project=${PROJECT}" --data-urlencode "path=${rel}")"
+    --data "project=$(am_urlencode "$PROJECT")" --data "path=$(am_urlencode "$rel")")"
 [ -z "$body" ] && exit 0
 
 # Ignore our own holds: at one path per edit, re-editing a file we already

@@ -8,12 +8,13 @@
 #
 #     ./scripts/hooks/inbox_watch.sh        (run in background)
 #
-# What it does not do: read the mailbox. The server's hint carries only an id,
-# and this script prints one line saying mail is waiting. Reading is
-# `inbox_check.sh`'s job, and it runs on SessionStart — which is exactly when
-# the agent comes back after this exits. Fetching here would duplicate that,
-# and would put the message body in a background task's output rather than in
-# the channel the agent already reads.
+# Order matters and is the whole reason this is not one curl in a command
+# substitution: subscribe, wait for `: ready`, and only THEN read the mailbox.
+# Reading first leaves a window — a message arriving after the read and before
+# the subscription exists produces no hint and wakes nobody, so it waits until
+# something else happens to arrive. Buffering curl's whole output, as this
+# script used to, cannot see `: ready` until the connection is over, which is
+# too late to catch up under its protection.
 #
 # Two secrets cross into curl here — the server bearer and this agent's
 # registration token — so both go through `-K -` on stdin. Passing either as
@@ -32,6 +33,8 @@ set -uo pipefail
 # own cap (AGENT_MAIL_EVENTS_MAX_SECONDS, 3600 by default) so the client is the
 # one that decides when to reconnect.
 WATCH="${AGENT_MAIL_WATCH_SECONDS:-1800}"
+# How long to wait for `: ready` before giving up on the subscription.
+READY_WAIT="${AGENT_MAIL_WATCH_READY_SECONDS:-15}"
 
 PROJECT="$(am_project_key)"
 [ -z "$PROJECT" ] && exit 0
@@ -45,40 +48,97 @@ token="$(am_cred_get "$PROJECT" "$AGENT")"
 bearer="$(am_bearer)"
 [ -z "$bearer" ] && exit 0
 
+# Keyed by PROCESS as well as identity. Two sessions on one host share an agent
+# name, so a slug of (project, agent) alone means a second watcher truncates the
+# first one's stream mid-read and its exit trap deletes a file the first is
+# still using.
+slug="$(printf '%s|%s|%s' "$PROJECT" "$AGENT" "$$" | tr -cd '[:alnum:]._|-' | tr '|' '_')"
+stream="${AM_STATE_DIR}/watch/${slug}.stream"
+mkdir -p "$(dirname "$stream")" 2>/dev/null || exit 0
+
+CURL_PID=""
+cleanup() {
+    [ -n "$CURL_PID" ] && kill "$CURL_PID" 2>/dev/null
+    rm -f "$stream" 2>/dev/null
+}
+trap cleanup EXIT INT TERM
+
 url="${AM_BASE_URL}/events?project=$(am_urlencode "$PROJECT")&agent=$(am_urlencode "$AGENT")"
 
-# --no-buffer, or curl holds the frame in its own output buffer and the wake
-# arrives whenever the buffer happens to flush rather than when the mail lands.
+# Streamed to a file rather than captured, so `: ready` is readable while the
+# connection is still open. --no-buffer, or curl holds the frame in its own
+# output buffer and the wake arrives whenever that happens to flush.
+: > "$stream"
 started="$(date +%s 2>/dev/null || echo 0)"
-out="$(printf 'header = "Authorization: Bearer %s"\nheader = "X-Agent-Mail-Registration-Token: %s"\nheader = "Accept: text/event-stream"\n' \
+printf 'header = "Authorization: Bearer %s"\nheader = "X-Agent-Mail-Registration-Token: %s"\nheader = "Accept: text/event-stream"\n' \
         "$bearer" "$token" \
-    | curl -sN --no-buffer --max-time "$WATCH" -K - "$url" 2>/dev/null)"
+    | curl -sN --no-buffer --max-time "$WATCH" -K - "$url" >>"$stream" 2>/dev/null &
+CURL_PID=$!
+
+# ── wait for the subscription to be live ─────────────────────────────────────
+ready=0
+ready_deadline=$(( started + READY_WAIT ))
+while :; do
+    grep -q '^: ready' "$stream" 2>/dev/null && { ready=1; break; }
+    kill -0 "$CURL_PID" 2>/dev/null || break      # curl died before subscribing
+    [ "$(date +%s 2>/dev/null || echo 0)" -ge "$ready_deadline" ] 2>/dev/null && break
+    sleep 0.2
+done
+
+if [ "$ready" -ne 1 ]; then
+    # Kill first, THEN reap. A connection that opened but never said `: ready`
+    # leaves curl alive until its own --max-time, so waiting on it here would
+    # hold this message back for the entire watch window — half an hour of
+    # silence to report that the first fifteen seconds failed.
+    kill "$CURL_PID" 2>/dev/null
+    wait "$CURL_PID" 2>/dev/null
+    CURL_PID=""
+    printf 'Agent Mail: could not subscribe for %s (no stream opened). Check the server and credentials before relying on instant delivery.\n' "$AGENT"
+    exit 0
+fi
+
+# ── catch up, under the protection of a live subscription ────────────────────
+#
+# Anything already waiting is read here. Anything arriving from now on has a
+# subscriber, so it produces a hint. Between the two there is no gap, which is
+# the entire point of doing this after `: ready` rather than before connecting.
+# DETECTION ONLY. Running inbox_check.sh here would deliver the content — and
+# in doing so mark those ids announced and stamp the rate limiter, making this
+# background task the sole carrier of a message the dedupe store now believes
+# was delivered. Lose this stdout and the mail is gone, because the SessionStart
+# check that runs when the agent wakes will skip ids it has already recorded.
+# Ask whether anything is waiting; let the established channel say what.
+pending="$(am_call fetch_inbox "$(jq -nc --arg p "$PROJECT" --arg a "$AGENT" --arg t "$token" \
+    '{project_key:$p,agent_name:$a,registration_token:$t,unread_only:true,limit:1,include_bodies:false}')")"
+if printf '%s' "$pending" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+    # Something is already waiting. Exit now rather than sitting on an open
+    # subscription: the agent has work it can do, and holding the connection
+    # would only delay what SessionStart is about to hand it anyway.
+    printf 'Agent Mail: mail is already waiting for %s. Read it, then start this watcher again in the background.\n' "$AGENT"
+    exit 0
+fi
+
+# ── wait for a hint ──────────────────────────────────────────────────────────
+wait "$CURL_PID" 2>/dev/null
+CURL_PID=""
 ended="$(date +%s 2>/dev/null || echo 0)"
 elapsed=$(( ended - started ))
+out="$(cat "$stream" 2>/dev/null)"
 
-# Distinguish the reasons for waking, because they call for different next moves
-# and the agent cannot tell them apart from an empty exit.
 if printf '%s' "$out" | grep -q '^data: '; then
     id="$(printf '%s' "$out" | sed -n 's/^data: .*"id":\([0-9]*\).*/\1/p' | head -1)"
-    printf 'Agent Mail: new mail for %s (id %s). Read it, then start this watcher again.\n' \
+    printf 'Agent Mail: new mail for %s (id %s). Read it, then start this watcher again in the background.\n' \
         "$AGENT" "${id:-?}"
-elif printf '%s' "$out" | grep -q '^: ready'; then
+elif [ "$elapsed" -lt $(( WATCH - 5 )) ] 2>/dev/null; then
     # A subscription that ends early ended because something cut it, not
-    # because nothing happened. Without this check a proxy or CDN dropping the
+    # because nothing happened. Without this a proxy or CDN dropping the
     # connection at its idle limit reports "no new mail" — a quiet period that
     # never occurred, and the exact shape of failure this layer keeps
-    # producing. The margin absorbs clock granularity and connection setup.
-    if [ "$elapsed" -lt $(( WATCH - 5 )) ] 2>/dev/null; then
-        printf 'Agent Mail: the event stream closed after %ss of a %ss window for %s — it was cut, not idle. This is NOT "no new mail": mail sent after the cut was not delivered here. Start the watcher again, and check the inbox directly if this keeps happening.\n' \
-            "$elapsed" "$WATCH" "$AGENT"
-    else
-        printf 'Agent Mail: watch window elapsed (%ss) with no new mail for %s. Start this watcher again.\n' \
-            "$elapsed" "$AGENT"
-    fi
+    # producing.
+    printf 'Agent Mail: the event stream closed after %ss of a %ss window for %s — it was cut, not idle. This is NOT "no new mail": mail sent after the cut was not delivered here. Start the watcher again, and check the inbox directly if this keeps happening.\n' \
+        "$elapsed" "$WATCH" "$AGENT"
 else
-    # Never subscribed — bad credential, server down, proxy in the way. Say so
-    # rather than reporting "no mail", which would be indistinguishable from a
-    # healthy quiet period and could hide an outage for as long as it lasts.
-    printf 'Agent Mail: could not subscribe for %s (no stream opened). Check the server and credentials before relying on instant delivery.\n' "$AGENT"
+    printf 'Agent Mail: watch window elapsed (%ss) with no new mail for %s. Start this watcher again in the background.\n' \
+        "$elapsed" "$AGENT"
 fi
 exit 0

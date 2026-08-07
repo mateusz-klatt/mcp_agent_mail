@@ -25,6 +25,28 @@ from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.config import get_settings
 
+
+@pytest.fixture(autouse=True)
+def _allow_absolute_attachment_paths(monkeypatch):
+    """Every image here is written to ``tmp_path``, so every path is absolute.
+
+    ``ab670c6`` began refusing absolute attachment paths unless this is set.
+    These tests predate that gate by two months and were never revisited, so
+    the refusal happened before any image was read: a corrupt file raised no
+    decoding error, and a body naming three images stored none. The failures
+    read as broken image handling and were the path policy every time.
+
+    Scoped to this module rather than to ``isolated_env``, which 102 test
+    files share — relaxing the default there would switch the gate off for the
+    whole suite, and the one place it is deliberately exercised would keep
+    passing with nothing behind it.
+    """
+    monkeypatch.setenv("ALLOW_ABSOLUTE_ATTACHMENT_PATHS", "true")
+    _config.clear_settings_cache()
+    yield
+    _config.clear_settings_cache()
+
+
 # =============================================================================
 # Malformed Image Tests
 # =============================================================================

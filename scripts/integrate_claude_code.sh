@@ -377,8 +377,32 @@ SESSION_START_HOOK=$(jq -nc --arg a "$(_hook_cmd session_start.sh)" --arg b "$(_
   '{matcher:"",hooks:[{type:"command",command:$a},{type:"command",command:$b}]}')
 PRE_TOOL_USE_HOOK=$(jq -nc --arg a "$(_hook_cmd reservations_warn.sh)" \
   '{matcher:"Edit|Write|NotebookEdit",hooks:[{type:"command",command:$a}]}')
-POST_TOOL_USE_HOOK=$(jq -nc --arg a "$(_hook_cmd autoreserve.sh)" --arg b "$(_hook_cmd inbox_check.sh)" \
-  '{matcher:"Edit|Write|NotebookEdit",hooks:[{type:"command",command:$a},{type:"command",command:$b}]}')
+# PostToolUse is split in two, because the two hooks under it want opposite
+# matchers.
+#
+# autoreserve.sh must stay narrow: it files a reservation for the file that was
+# just written, so firing it after a shell command would reserve nothing and
+# say so, on every command.
+#
+# inbox_check.sh must be wide, and this was measured the hard way. It is the
+# only caller of am_sync_model, which is what keeps the agent's `model` field
+# true. Under the narrow matcher an agent that never edits a file never
+# refreshes it: the SessionStart run happens before the transcript has an
+# assistant turn to read, so it records "unknown", and PostToolUse never fires
+# at all. laptop-mac-1 spent a day at maximum activity with a `model` that had
+# been wrong since morning — last_active_ts fresh to the second, model stale
+# since the fix landed. The two fields look like they answer the same question
+# and do not, so the agent that looks most alive can be the one whose model is
+# least trustworthy, which is exactly backwards for routing work by model.
+#
+# The cost of the wide matcher is bounded and was checked before widening:
+# am_sync_model sits BELOW the rate gate in inbox_check.sh, so the hook exits
+# early within the interval and syncs at most once per 120s regardless of how
+# many commands run.
+POST_TOOL_USE_HOOK=$(jq -nc --arg a "$(_hook_cmd autoreserve.sh)" \
+  '{matcher:"Edit|Write|NotebookEdit",hooks:[{type:"command",command:$a}]}')
+POST_TOOL_USE_INBOX_HOOK=$(jq -nc --arg a "$(_hook_cmd inbox_check.sh)" \
+  '{matcher:"",hooks:[{type:"command",command:$a}]}')
 SESSION_END_HOOK=$(jq -nc --arg a "$(_hook_cmd session_end.sh)" \
   '{matcher:"",hooks:[{type:"command",command:$a}]}')
 
@@ -389,6 +413,12 @@ MERGED_SETTINGS="$EXISTING_SETTINGS"
 MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "SessionStart" "$SESSION_START_HOOK" "hooks/session_start.sh")
 MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "PreToolUse" "$PRE_TOOL_USE_HOOK" "hooks/reservations_warn.sh")
 MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "PostToolUse" "$POST_TOOL_USE_HOOK" "hooks/autoreserve.sh")
+# Its own marker, so the two PostToolUse entries are tracked separately. Note
+# for anyone upgrading by re-running this: a machine configured before the split
+# already has inbox_check.sh inside the narrow entry, so this marker matches and
+# the wide entry is not added. Widening it there is a one-line edit by hand —
+# the installer will not do it for you, and will not say so either.
+MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "PostToolUse" "$POST_TOOL_USE_INBOX_HOOK" "hooks/inbox_check.sh")
 MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "SessionEnd" "$SESSION_END_HOOK" "hooks/session_end.sh")
 
 # NOTE: No mcpServers in settings.json - token goes in settings.local.json only

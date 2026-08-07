@@ -369,8 +369,17 @@ am_sync_model() {
     local proj="$1" agent="$2" tok="$3" prog="${4:-claude-code}" want have cache
     want="$(am_model_id)"
     case "$want" in ''|unknown) return 0 ;; esac
+    # Separators MAPPED, not deleted — the same rule as am_granted_name_file, and
+    # missing here because that fix was made two functions away and this path was
+    # never looked at. `tr -cd` alone drops slashes rather than replacing them, so
+    # `/a/b` and `/ab` collapse onto one cache file.
+    #
+    # Milder than the identity collision that motivated the other fix: the worst
+    # case is a skipped or redundant model refresh, which the next real change
+    # repairs by itself. Fixed anyway, because two derivations of the same kind of
+    # key disagreeing is how the next reader learns the wrong rule.
     cache="${AM_STATE_DIR}/model/$(printf '%s|%s' "$proj" "$agent" \
-        | tr -cd '[:alnum:]._|-' | tr '|' '_')"
+        | tr '/' '_' | tr -cd '[:alnum:]._|-' | tr '|' '_' | cut -c1-96)"
     have="$(cat "$cache" 2>/dev/null || true)"
     [ "$want" = "$have" ] && return 0
     mkdir -p "$(dirname "$cache")" 2>/dev/null || return 0

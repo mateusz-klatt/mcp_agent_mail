@@ -115,14 +115,50 @@ Two silences still mean something you cannot see:
   `file_reservation_paths` had set. Reserve deliberately, announce, then write
   — in that order — if you want the reason to reach anyone.
 
-## Do not run `scripts/integrate_claude_code.sh`
+## Reading what the server says back
 
-It installs only the previous-generation `check_inbox.sh` and none of the hooks
-above, so a machine set up with it has no reservations, no conflict warnings
-and no session lifecycle. Configure `~/.claude/settings.json` by hand instead.
+Four of us hit these separately in one day, and every one of them looks like
+silence rather than like a mistake.
 
-Its handling of secrets was fixed in `21c5588` — before that it wrote the
-server bearer and the agent's registration token into a mode-644 file and into
-every hook's argv, under a banner reading "no secrets". Nothing needs undoing
-if you never ran it; if you did, check `~/.claude/settings.json` for a literal
-token and rotate what you find.
+**`id` is not where it looks.** `send_message` and `reply_message` return it at
+`.deliveries[0].payload.id`; `.id` at the top level is null on a perfectly
+successful send. Filtering on `.id` and finding nothing has already caused one
+duplicate message — the sender read the empty result as "it did not go".
+
+**`rc=2` with an empty body is the server being down, not refusing you.** The
+exit-code contract says 2 means a non-2xx answer, and a deploy window produces
+exactly that with nothing in the body — indistinguishable from an auth refusal
+until you ask the server itself. `curl` the MCP endpoint and read the status:
+502 is a window, 401 is your credentials. Do not resend on `rc=2` without
+checking whether the first attempt landed; during a window it usually did not,
+but "usually" is not a reason to send twice.
+
+**A filter that does not match looks exactly like a response that is empty.**
+The reservation call returns granted holds under `granted`, not `reservations`,
+and conflicts under `conflicts`. A `jq` path that misses prints nothing, which
+reads as "no conflicts" — the one answer you must not get wrong. Print the raw
+response the first time you write a call, and only then narrow it.
+
+**Marking your own sent message read returns `read:false`.** That is correct,
+not a failure: you are not its addressee. Anything counting acknowledgements
+should not treat it as an error.
+
+## `scripts/integrate_claude_code.sh`
+
+Safe to run since `f81d779`, and it now installs the working set — the six
+hooks plus `agent_mail_common.sh` — instead of the previous-generation
+`check_inbox.sh` alone. It detects the platform, wraps hook commands in Git
+Bash on Windows (where a bare `.sh` path exits 0 without running), keeps secrets
+out of every hook command, and reports the mode it actually achieved on
+`~/.agent-mail.env` rather than asserting 0600.
+
+Two fixes worth knowing if you ran an older copy:
+
+- before `21c5588` it wrote the server bearer and the agent's registration
+  token into a mode-644 file and into every hook's argv, under a banner reading
+  "no secrets". Check `~/.claude/settings.json` for a literal token and rotate
+  what you find.
+- before `f81d779` it also ran `claude mcp add --scope project`, which writes
+  the bearer into `.mcp.json` in the target directory. `.gitignore` here forbids
+  that file, but an arbitrary project does not — on a fresh repo, `git add .`
+  stages it with the token inside.

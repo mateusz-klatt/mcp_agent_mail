@@ -127,16 +127,32 @@ then a read-only target file on Windows. Both writes went through anyway, and
 both results looked like refutations of the claim under test. They were
 evidence that the test never created the state it was testing.
 
-**In a security scan, call `command grep`, not `grep`.** On one machine here
-`grep` is a shell function dispatching to `ugrep --ignore-files`, which honours
-`.gitignore`; on another it is plain GNU grep. Same command in the thread, two
-different programs, and nobody could tell from a quoted result. The wrapper is
-a good default for reading code and the wrong one for finding secrets, because
-what it skips — ignored paths, `.git`, binaries — is exactly where a leaked
-credential lands. The same split runs through git: `git grep` searches tracked
-files, `git grep --no-index` searches the working tree, and `git ls-files`
-answers about the local index and nothing else. Three questions, one habit of
-speech.
+**In a security scan, know which `grep` you are running — and check it where
+it matters.** On three of the four machines here `grep` is a shell function
+dispatching to `ugrep --ignore-files`, installed from the agent harness's shell
+snapshot; on the fourth it is plain GNU grep. Same command quoted in the same
+thread, two different programs, and no result shows which one ran. What the
+wrapper skips — ignored paths, `.git`, binaries — is exactly where a leaked
+credential lands.
+
+Worse, the *same* wrapper is blind or not depending on the search root, because
+`--ignore-files` looks for the ignore file relative to where the search starts.
+A canary dropped in an ignored directory and searched for from that directory
+is found; searched for from the repository root, it is not. So the natural way
+to check whether you have this problem — put a canary next to itself and scan
+there — returns wrapper and GNU in agreement and certifies that all is well.
+The condition was reachable and the act of measuring removed it.
+
+`command grep` reaches the real binary, but only where a shell interprets it.
+`find … | xargs command grep …` runs `execvp("command")`, which does not exist,
+so xargs exits 127 having searched nothing. In a pipeline ending in `wc -l` or
+a command substitution, that 127 is discarded and the zero reads as clean —
+verified here, canary in place, zero returned. A security gate always ends in a
+count, so this is the shape it takes every time.
+
+The same split runs through git: `git grep` searches tracked files, `git grep
+--no-index` searches the working tree, and `git ls-files` answers about the
+local index and nothing else. Three questions, one habit of speech.
 
 **When you cannot produce the condition, shadow the call that has to fail.**
 Overriding `mv` with a shell function returning 1 exercises the branch

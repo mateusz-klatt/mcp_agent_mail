@@ -396,10 +396,13 @@ Please investigate the following:
 function overseerComposer() {
   return {
     agents: [{% for agent in agents %}{{ agent.name | tojson }}{% if not loop.last %}, {% endif %}{% endfor %}],
-    selectedRecipients: [],
-    subject: '',
+    {# Prefilled when arriving from a message's Reply link; empty otherwise. tojson
+       so a subject containing a quote or a backslash cannot break out of the
+       literal — these values come from message bodies written by anyone. #}
+    selectedRecipients: {{ (prefill.recipients if prefill else []) | tojson }},
+    subject: {{ (prefill.subject if prefill else '') | tojson }},
     body: '',
-    threadId: '',
+    threadId: {{ (prefill.thread_id if prefill else '') | tojson }},
     recipientSearch: '',
     viewMode: 'write',
     renderedPreview: '',

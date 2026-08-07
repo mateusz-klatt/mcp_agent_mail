@@ -4293,8 +4293,20 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         # ========== Human Overseer Routes ==========
 
         @fastapi_app.get("/mail/{project}/overseer/compose", response_class=HTMLResponse)
-        async def overseer_compose(project: str) -> HTMLResponse:
-            """Display Human Overseer message composer."""
+        async def overseer_compose(project: str, reply_to: int | None = None) -> HTMLResponse:
+            """Display Human Overseer message composer.
+
+            `reply_to` is a message id to answer. Everything needed to thread a
+            reply already existed — overseer_send accepts thread_id and writes it
+            straight through — but nothing carried the id from a message the
+            operator was reading to the form, so the viewer shipped Reply and
+            Forward as disabled buttons with a "Soon" badge.
+
+            An unknown or malformed id prefills nothing rather than erroring: the
+            composer is still the right page to be on, and a blank form is a
+            smaller surprise than an error page when the only thing lost is
+            convenience.
+            """
             await ensure_schema()
             async with get_session() as session:
                 # Get project
@@ -4315,10 +4327,35 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 )
                 agents = [{"name": r[0]} for r in agent_rows.fetchall()]
 
+            prefill: dict[str, Any] = {"thread_id": "", "subject": "", "recipients": []}
+            if reply_to is not None:
+                async with get_session() as session:
+                    mrow = (
+                        await session.execute(
+                            text(
+                                "SELECT m.thread_id, m.subject, a.name "
+                                "FROM messages m LEFT JOIN agents a ON a.id = m.sender_id "
+                                "WHERE m.id = :mid AND m.project_id = :pid"
+                            ),
+                            {"mid": reply_to, "pid": pid},
+                        )
+                    ).fetchone()
+                if mrow is not None:
+                    subject = str(mrow[1] or "")
+                    # Thread on the original's thread_id when it has one, else on the
+                    # message id — the same rule reply_message applies, so a reply sent
+                    # from the browser lands in the thread the agents are reading.
+                    prefill = {
+                        "thread_id": str(mrow[0] or reply_to),
+                        "subject": subject if subject.lower().startswith("re:") else f"Re: {subject}",
+                        "recipients": [str(mrow[2])] if mrow[2] else [],
+                    }
+
             return await _render(
                 "overseer_compose.html",
                 project={"slug": prow[1], "human_key": prow[2]},
-                agents=agents
+                agents=agents,
+                prefill=prefill,
             )
 
         @fastapi_app.post("/mail/{project}/overseer/send")

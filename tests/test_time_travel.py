@@ -15,6 +15,8 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import contextlib
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
@@ -30,6 +32,26 @@ from mcp_agent_mail.storage import ensure_archive, write_agent_profile, write_me
 # without this the first request returns 503 and nothing below is ever reached.
 # The gate itself is covered by tests/test_mail_ui_auth.py.
 pytestmark = pytest.mark.usefixtures("open_mail_ui_gate")
+
+
+
+# The viewer is behind a password login by default, and these tests exercise
+# what the pages RENDER, not who may see them — the login has its own coverage
+# in tests/test_http_auth.py and tests/test_mail_ui_auth*.py. Without this every
+# request here answers 401 and the assertions read as broken templates.
+#
+# Turned off per file rather than in a shared fixture, deliberately: the default
+# has to stay ON, because it is what protects a real deployment, and a fixture
+# that disabled it globally would also disable it for the tests whose whole
+# subject it is.
+@pytest.fixture(autouse=True)
+def _viewer_auth_disabled(monkeypatch):
+    monkeypatch.setenv("MAIL_UI_AUTH_ENABLED", "false")
+    with contextlib.suppress(Exception):
+        _config.clear_settings_cache()
+    yield
+    with contextlib.suppress(Exception):
+        _config.clear_settings_cache()
 
 
 

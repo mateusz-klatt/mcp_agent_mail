@@ -29,6 +29,23 @@ target="$(am_payload_field '.tool_input.file_path')"
 
 # Project of the FILE, not of the working directory — see am_relpath.
 PROJECT="$(am_project_key_for_file "$target")"
+# The identity must come from the SAME project the credential is looked up
+# under, and that is this file's project — not the session's. The reservation
+# lives where the edited file lives, so the token that files it has to be the one
+# issued there; a name resolved against the session's project produces a pair
+# that matches only by accident.
+#
+# By accident is exactly what it is today: with no remembered name yet,
+# am_agent_name falls through to derivation, which does not depend on the project
+# at all — measured, three different project keys, one name. So this is
+# preventive, not corrective: the mismatch appears at the first session restart,
+# when granted/ starts holding per-project names, and would then be a silent
+# exit rather than an error.
+#
+# Deferred earlier on the grounds that "session identity" and "file identity"
+# were both defensible. They are not: home-wsl-1 measured that one of them files
+# reservations and the other loses them.
+export AM_PROJECT_FOR_NAME="$PROJECT"
 [ -z "$PROJECT" ] && exit 0
 AGENT="$(am_agent_name)"
 

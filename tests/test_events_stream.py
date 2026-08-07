@@ -157,7 +157,7 @@ class TestEndpointAuth:
         ],
     )
     async def test_rejections_are_indistinguishable(self, isolated_env, monkeypatch, params, headers):
-        settings, app = _build(monkeypatch)
+        _, app = _build(monkeypatch)
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get(
@@ -172,7 +172,7 @@ class TestEndpointAuth:
     async def test_bearer_is_still_required(self, isolated_env, monkeypatch):
         """The route sits behind the existing bearer middleware; a valid agent
         token must not be a way around it."""
-        settings, app = _build(monkeypatch)
+        _, app = _build(monkeypatch)
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get(

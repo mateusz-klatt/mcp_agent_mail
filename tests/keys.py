@@ -32,4 +32,9 @@ def pkey(name: str) -> str:
     """
     if os.name != "nt":
         return f"/{name}"
-    return str(Path(os.environ.get("SystemDrive", "C:") + "/") / Path(name))
+    # SYSTEMDRIVE, not SystemDrive. On Windows `os.environ` upper-cases its keys,
+    # so the mixed-case lookup never matched and the "C:" default was doing all
+    # the work — invisible while C: happens to be right, wrong on a machine that
+    # boots elsewhere. The linter flagged this as style; it is a lookup that
+    # could not succeed.
+    return str(Path(os.environ.get("SYSTEMDRIVE", "C:") + "/") / Path(name))

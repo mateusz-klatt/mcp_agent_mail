@@ -26,6 +26,8 @@ from sqlalchemy import text
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import get_session
 
+from tests.keys import pkey
+
 # ============================================================================
 # Helper: Direct SQL verification
 # ============================================================================
@@ -131,11 +133,11 @@ async def test_file_reservation_create_persists_to_database(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
         # Setup
-        await client.call_tool("ensure_project", {"human_key": "/test/session/reserve"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/session/reserve")})
         agent_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/session/reserve",
+                "project_key": pkey("test/session/reserve"),
                 "program": "test",
                 "model": "test",
             },
@@ -146,7 +148,7 @@ async def test_file_reservation_create_persists_to_database(isolated_env):
         result = await client.call_tool(
             "file_reservation_paths",
             {
-                "project_key": "/test/session/reserve",
+                "project_key": pkey("test/session/reserve"),
                 "agent_name": agent_name,
                 "paths": ["src/**"],
                 "ttl_seconds": 300,
@@ -169,11 +171,11 @@ async def test_file_reservation_release_persists_to_database(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
         # Setup
-        await client.call_tool("ensure_project", {"human_key": "/test/session/release"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/session/release")})
         agent_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/session/release",
+                "project_key": pkey("test/session/release"),
                 "program": "test",
                 "model": "test",
             },
@@ -184,7 +186,7 @@ async def test_file_reservation_release_persists_to_database(isolated_env):
         create_result = await client.call_tool(
             "file_reservation_paths",
             {
-                "project_key": "/test/session/release",
+                "project_key": pkey("test/session/release"),
                 "agent_name": agent_name,
                 "paths": ["lib/**"],
                 "ttl_seconds": 300,
@@ -201,7 +203,7 @@ async def test_file_reservation_release_persists_to_database(isolated_env):
         await client.call_tool(
             "release_file_reservations",
             {
-                "project_key": "/test/session/release",
+                "project_key": pkey("test/session/release"),
                 "agent_name": agent_name,
             },
         )
@@ -218,11 +220,11 @@ async def test_file_reservation_renew_persists_to_database(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
         # Setup
-        await client.call_tool("ensure_project", {"human_key": "/test/session/renew"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/session/renew")})
         agent_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/session/renew",
+                "project_key": pkey("test/session/renew"),
                 "program": "test",
                 "model": "test",
             },
@@ -233,7 +235,7 @@ async def test_file_reservation_renew_persists_to_database(isolated_env):
         create_result = await client.call_tool(
             "file_reservation_paths",
             {
-                "project_key": "/test/session/renew",
+                "project_key": pkey("test/session/renew"),
                 "agent_name": agent_name,
                 "paths": ["api/**"],
                 "ttl_seconds": 300,
@@ -254,7 +256,7 @@ async def test_file_reservation_renew_persists_to_database(isolated_env):
         await client.call_tool(
             "renew_file_reservations",
             {
-                "project_key": "/test/session/renew",
+                "project_key": pkey("test/session/renew"),
                 "agent_name": agent_name,
                 "extend_seconds": 600,
             },
@@ -285,11 +287,11 @@ async def test_force_release_file_reservation_persists_to_database(isolated_env)
     server = build_mcp_server()
     async with Client(server) as client:
         # Setup - create project and two agents
-        await client.call_tool("ensure_project", {"human_key": "/test/session/force"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/session/force")})
         holder_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/session/force",
+                "project_key": pkey("test/session/force"),
                 "program": "test",
                 "model": "test",
             },
@@ -299,7 +301,7 @@ async def test_force_release_file_reservation_persists_to_database(isolated_env)
         releaser_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/session/force",
+                "project_key": pkey("test/session/force"),
                 "program": "test",
                 "model": "test",
             },
@@ -310,7 +312,7 @@ async def test_force_release_file_reservation_persists_to_database(isolated_env)
         create_result = await client.call_tool(
             "file_reservation_paths",
             {
-                "project_key": "/test/session/force",
+                "project_key": pkey("test/session/force"),
                 "agent_name": holder_name,
                 "paths": ["docs/**"],
                 "ttl_seconds": 60,  # Short TTL to allow force release
@@ -332,7 +334,7 @@ async def test_force_release_file_reservation_persists_to_database(isolated_env)
             await client.call_tool(
                 "force_release_file_reservation",
                 {
-                    "project_key": "/test/session/force",
+                    "project_key": pkey("test/session/force"),
                     "agent_name": releaser_name,
                     "file_reservation_id": reservation_id,
                     "notify_previous": False,
@@ -361,12 +363,12 @@ async def test_contact_request_persists_to_database(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
         # Setup
-        await client.call_tool("ensure_project", {"human_key": "/test/session/contact"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/session/contact")})
 
         agent_a_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/session/contact",
+                "project_key": pkey("test/session/contact"),
                 "program": "test",
                 "model": "test",
             },
@@ -376,7 +378,7 @@ async def test_contact_request_persists_to_database(isolated_env):
         agent_b_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/session/contact",
+                "project_key": pkey("test/session/contact"),
                 "program": "test",
                 "model": "test",
             },
@@ -387,7 +389,7 @@ async def test_contact_request_persists_to_database(isolated_env):
         result = await client.call_tool(
             "request_contact",
             {
-                "project_key": "/test/session/contact",
+                "project_key": pkey("test/session/contact"),
                 "from_agent": agent_a_name,
                 "to_agent": agent_b_name,
                 "reason": "Testing persistence",
@@ -396,7 +398,7 @@ async def test_contact_request_persists_to_database(isolated_env):
         assert result.data["status"] == "pending"
 
         # Verify via direct SQL
-        project_id = await get_project_id_by_human_key("/test/session/contact")
+        project_id = await get_project_id_by_human_key(pkey("test/session/contact"))
         assert project_id is not None, "Project should exist"
         a_id = await get_agent_id_by_name(project_id, agent_a_name)
         assert a_id is not None, "Agent A should exist"
@@ -414,12 +416,12 @@ async def test_contact_respond_persists_to_database(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
         # Setup
-        await client.call_tool("ensure_project", {"human_key": "/test/session/respond"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/session/respond")})
 
         agent_a_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/session/respond",
+                "project_key": pkey("test/session/respond"),
                 "program": "test",
                 "model": "test",
             },
@@ -429,7 +431,7 @@ async def test_contact_respond_persists_to_database(isolated_env):
         agent_b_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/session/respond",
+                "project_key": pkey("test/session/respond"),
                 "program": "test",
                 "model": "test",
             },
@@ -440,14 +442,14 @@ async def test_contact_respond_persists_to_database(isolated_env):
         await client.call_tool(
             "request_contact",
             {
-                "project_key": "/test/session/respond",
+                "project_key": pkey("test/session/respond"),
                 "from_agent": agent_a_name,
                 "to_agent": agent_b_name,
             },
         )
 
         # Get IDs for verification
-        project_id = await get_project_id_by_human_key("/test/session/respond")
+        project_id = await get_project_id_by_human_key(pkey("test/session/respond"))
         assert project_id is not None, "Project should exist"
         a_id = await get_agent_id_by_name(project_id, agent_a_name)
         assert a_id is not None, "Agent A should exist"
@@ -462,7 +464,7 @@ async def test_contact_respond_persists_to_database(isolated_env):
         await client.call_tool(
             "respond_contact",
             {
-                "project_key": "/test/session/respond",
+                "project_key": pkey("test/session/respond"),
                 "to_agent": agent_b_name,
                 "from_agent": agent_a_name,
                 "accept": True,
@@ -485,12 +487,12 @@ async def test_message_read_persists_to_database(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
         # Setup
-        await client.call_tool("ensure_project", {"human_key": "/test/session/read"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/session/read")})
 
         sender_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/session/read",
+                "project_key": pkey("test/session/read"),
                 "program": "test",
                 "model": "test",
             },
@@ -500,7 +502,7 @@ async def test_message_read_persists_to_database(isolated_env):
         receiver_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/session/read",
+                "project_key": pkey("test/session/read"),
                 "program": "test",
                 "model": "test",
             },
@@ -511,7 +513,7 @@ async def test_message_read_persists_to_database(isolated_env):
         send_result = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/session/read",
+                "project_key": pkey("test/session/read"),
                 "sender_name": sender_name,
                 "to": [receiver_name],
                 "subject": "Test Persistence",
@@ -521,7 +523,7 @@ async def test_message_read_persists_to_database(isolated_env):
         message_id = send_result.data["deliveries"][0]["payload"]["id"]
 
         # Get receiver agent ID
-        project_id = await get_project_id_by_human_key("/test/session/read")
+        project_id = await get_project_id_by_human_key(pkey("test/session/read"))
         assert project_id is not None, "Project should exist"
         receiver_id = await get_agent_id_by_name(project_id, receiver_name)
         assert receiver_id is not None, "Receiver agent should exist"
@@ -535,7 +537,7 @@ async def test_message_read_persists_to_database(isolated_env):
         await client.call_tool(
             "mark_message_read",
             {
-                "project_key": "/test/session/read",
+                "project_key": pkey("test/session/read"),
                 "agent_name": receiver_name,
                 "message_id": message_id,
             },
@@ -552,12 +554,12 @@ async def test_message_acknowledge_persists_to_database(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
         # Setup
-        await client.call_tool("ensure_project", {"human_key": "/test/session/ack"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/session/ack")})
 
         sender_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/session/ack",
+                "project_key": pkey("test/session/ack"),
                 "program": "test",
                 "model": "test",
             },
@@ -567,7 +569,7 @@ async def test_message_acknowledge_persists_to_database(isolated_env):
         receiver_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/session/ack",
+                "project_key": pkey("test/session/ack"),
                 "program": "test",
                 "model": "test",
             },
@@ -578,7 +580,7 @@ async def test_message_acknowledge_persists_to_database(isolated_env):
         send_result = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/session/ack",
+                "project_key": pkey("test/session/ack"),
                 "sender_name": sender_name,
                 "to": [receiver_name],
                 "subject": "Ack Test",
@@ -589,7 +591,7 @@ async def test_message_acknowledge_persists_to_database(isolated_env):
         message_id = send_result.data["deliveries"][0]["payload"]["id"]
 
         # Get receiver agent ID
-        project_id = await get_project_id_by_human_key("/test/session/ack")
+        project_id = await get_project_id_by_human_key(pkey("test/session/ack"))
         assert project_id is not None, "Project should exist"
         receiver_id = await get_agent_id_by_name(project_id, receiver_name)
         assert receiver_id is not None, "Receiver agent should exist"
@@ -602,7 +604,7 @@ async def test_message_acknowledge_persists_to_database(isolated_env):
         await client.call_tool(
             "acknowledge_message",
             {
-                "project_key": "/test/session/ack",
+                "project_key": pkey("test/session/ack"),
                 "agent_name": receiver_name,
                 "message_id": message_id,
             },
@@ -624,13 +626,13 @@ async def test_agent_registration_persists_to_database(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
         # Setup
-        await client.call_tool("ensure_project", {"human_key": "/test/session/agent"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/session/agent")})
 
         # Register agent
         agent_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/session/agent",
+                "project_key": pkey("test/session/agent"),
                 "program": "test-program",
                 "model": "test-model",
                 "task_description": "Test task",
@@ -639,7 +641,7 @@ async def test_agent_registration_persists_to_database(isolated_env):
         agent_name = agent_result.data["name"]
 
         # Verify via direct SQL
-        project_id = await get_project_id_by_human_key("/test/session/agent")
+        project_id = await get_project_id_by_human_key(pkey("test/session/agent"))
         assert project_id is not None, "Project should exist"
         async with get_session() as session:
             result = await session.execute(
@@ -664,13 +666,13 @@ async def test_agent_update_persists_to_database(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
         # Setup
-        await client.call_tool("ensure_project", {"human_key": "/test/session/update"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/session/update")})
 
         # Register agent
         agent_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/session/update",
+                "project_key": pkey("test/session/update"),
                 "program": "original-program",
                 "model": "original-model",
             },
@@ -681,7 +683,7 @@ async def test_agent_update_persists_to_database(isolated_env):
         await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/session/update",
+                "project_key": pkey("test/session/update"),
                 "program": "original-program",
                 "model": "original-model",
                 "name": agent_name,
@@ -690,7 +692,7 @@ async def test_agent_update_persists_to_database(isolated_env):
         )
 
         # Verify update persisted via direct SQL
-        project_id = await get_project_id_by_human_key("/test/session/update")
+        project_id = await get_project_id_by_human_key(pkey("test/session/update"))
         assert project_id is not None, "Project should exist"
         async with get_session() as session:
             result = await session.execute(

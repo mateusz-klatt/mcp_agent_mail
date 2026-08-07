@@ -22,6 +22,8 @@ from fastmcp import Client
 from mcp_agent_mail.app import _get_agent, _get_project_by_identifier, _list_outbox, build_mcp_server
 from mcp_agent_mail.db import ensure_schema, track_queries
 
+from tests.keys import pkey
+
 
 def get_field(obj: Any, field: str) -> Any:
     """Get a field from either a dict or an object with attributes."""
@@ -104,13 +106,13 @@ async def test_send_message_returns_delivery_info(isolated_env):
     """send_message should return delivery count and deliveries list."""
     server = build_mcp_server()
     async with Client(server) as client:
-        agents = await setup_project_with_agents(client, "/test/send", count=2)
+        agents = await setup_project_with_agents(client, pkey("test/send"), count=2)
         sender, receiver = agents[0], agents[1]
 
         result = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/send",
+                "project_key": pkey("test/send"),
                 "sender_name": sender,
                 "to": [receiver],
                 "subject": "Test Message",
@@ -131,13 +133,13 @@ async def test_send_message_self_send(isolated_env):
     """An agent should be able to send messages to itself."""
     server = build_mcp_server()
     async with Client(server) as client:
-        agents = await setup_project_with_agents(client, "/test/self", count=1)
+        agents = await setup_project_with_agents(client, pkey("test/self"), count=1)
         agent = agents[0]
 
         result = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/self",
+                "project_key": pkey("test/self"),
                 "sender_name": agent,
                 "to": [agent],
                 "subject": "Note to Self",
@@ -150,7 +152,7 @@ async def test_send_message_self_send(isolated_env):
         inbox = await client.call_tool(
             "fetch_inbox",
             {
-                "project_key": "/test/self",
+                "project_key": pkey("test/self"),
                 "agent_name": agent,
                 "limit": 10,
             },
@@ -165,13 +167,13 @@ async def test_send_message_message_id_returned(isolated_env):
     """send_message should return the message ID in the delivery payload."""
     server = build_mcp_server()
     async with Client(server) as client:
-        agents = await setup_project_with_agents(client, "/test/id", count=2)
+        agents = await setup_project_with_agents(client, pkey("test/id"), count=2)
         sender, receiver = agents[0], agents[1]
 
         result = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/id",
+                "project_key": pkey("test/id"),
                 "sender_name": sender,
                 "to": [receiver],
                 "subject": "ID Test",
@@ -195,14 +197,14 @@ async def test_send_message_multiple_to_recipients(isolated_env):
     """send_message should deliver to multiple recipients in 'to' field."""
     server = build_mcp_server()
     async with Client(server) as client:
-        agents = await setup_project_with_agents(client, "/test/multi", count=4)
+        agents = await setup_project_with_agents(client, pkey("test/multi"), count=4)
         sender = agents[0]
         receivers = agents[1:4]  # 3 receivers
 
         result = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/multi",
+                "project_key": pkey("test/multi"),
                 "sender_name": sender,
                 "to": receivers,
                 "subject": "Broadcast",
@@ -220,7 +222,7 @@ async def test_send_message_multiple_to_recipients(isolated_env):
         for recv in receivers:
             inbox = await client.call_tool(
                 "fetch_inbox",
-                {"project_key": "/test/multi", "agent_name": recv, "limit": 10},
+                {"project_key": pkey("test/multi"), "agent_name": recv, "limit": 10},
             )
             items = get_inbox_items(inbox)
             assert any(m.get("subject") == "Broadcast" for m in items)
@@ -230,7 +232,7 @@ async def test_send_message_multiple_to_recipients(isolated_env):
 async def test_send_message_recipient_lookup_query_count(isolated_env):
     """Sending to many recipients should not scale agent lookup queries linearly."""
     server = build_mcp_server()
-    project_key = "/test/query-count"
+    project_key = pkey("test/query-count")
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": project_key})
 
@@ -275,7 +277,7 @@ async def test_send_message_recipient_lookup_query_count(isolated_env):
 async def test_list_outbox_recipient_lookup_query_count(isolated_env):
     """Listing outbox recipients should not fetch recipients per message."""
     server = build_mcp_server()
-    project_key = "/test/outbox-query"
+    project_key = pkey("test/outbox-query")
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": project_key})
 
@@ -329,7 +331,7 @@ async def test_send_message_with_cc_recipients(isolated_env):
     """send_message should deliver to CC recipients."""
     server = build_mcp_server()
     async with Client(server) as client:
-        agents = await setup_project_with_agents(client, "/test/cc", count=4)
+        agents = await setup_project_with_agents(client, pkey("test/cc"), count=4)
         sender = agents[0]
         to_recv = agents[1]
         cc_recvs = agents[2:4]
@@ -337,7 +339,7 @@ async def test_send_message_with_cc_recipients(isolated_env):
         result = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/cc",
+                "project_key": pkey("test/cc"),
                 "sender_name": sender,
                 "to": [to_recv],
                 "cc": cc_recvs,
@@ -356,7 +358,7 @@ async def test_send_message_with_cc_recipients(isolated_env):
         for recv in [to_recv, *cc_recvs]:
             inbox = await client.call_tool(
                 "fetch_inbox",
-                {"project_key": "/test/cc", "agent_name": recv, "limit": 10},
+                {"project_key": pkey("test/cc"), "agent_name": recv, "limit": 10},
             )
             items = get_inbox_items(inbox)
             assert any(m.get("subject") == "CC Test" for m in items)
@@ -367,7 +369,7 @@ async def test_send_message_with_bcc_recipients(isolated_env):
     """send_message should deliver to BCC recipients without revealing them."""
     server = build_mcp_server()
     async with Client(server) as client:
-        agents = await setup_project_with_agents(client, "/test/bcc", count=3)
+        agents = await setup_project_with_agents(client, pkey("test/bcc"), count=3)
         sender = agents[0]
         to_recv = agents[1]
         bcc_recv = agents[2]
@@ -375,7 +377,7 @@ async def test_send_message_with_bcc_recipients(isolated_env):
         result = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/bcc",
+                "project_key": pkey("test/bcc"),
                 "sender_name": sender,
                 "to": [to_recv],
                 "bcc": [bcc_recv],
@@ -393,7 +395,7 @@ async def test_send_message_with_bcc_recipients(isolated_env):
         # BCC recipient should receive the message
         bcc_inbox = await client.call_tool(
             "fetch_inbox",
-            {"project_key": "/test/bcc", "agent_name": bcc_recv, "limit": 10},
+            {"project_key": pkey("test/bcc"), "agent_name": bcc_recv, "limit": 10},
         )
         items = get_inbox_items(bcc_inbox)
         assert any(m.get("subject") == "BCC Test" for m in items)
@@ -409,13 +411,13 @@ async def test_send_message_creates_thread_id(isolated_env):
     """First message with thread_id should create the thread."""
     server = build_mcp_server()
     async with Client(server) as client:
-        agents = await setup_project_with_agents(client, "/test/thread", count=2)
+        agents = await setup_project_with_agents(client, pkey("test/thread"), count=2)
         sender, receiver = agents[0], agents[1]
 
         result = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/thread",
+                "project_key": pkey("test/thread"),
                 "sender_name": sender,
                 "to": [receiver],
                 "subject": "Thread Start",
@@ -433,14 +435,14 @@ async def test_send_message_continues_thread(isolated_env):
     """Subsequent messages with same thread_id should continue the thread."""
     server = build_mcp_server()
     async with Client(server) as client:
-        agents = await setup_project_with_agents(client, "/test/thread2", count=2)
+        agents = await setup_project_with_agents(client, pkey("test/thread2"), count=2)
         agent_a, agent_b = agents[0], agents[1]
 
         # First message
         await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/thread2",
+                "project_key": pkey("test/thread2"),
                 "sender_name": agent_a,
                 "to": [agent_b],
                 "subject": "Thread Message 1",
@@ -453,7 +455,7 @@ async def test_send_message_continues_thread(isolated_env):
         result2 = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/thread2",
+                "project_key": pkey("test/thread2"),
                 "sender_name": agent_b,
                 "to": [agent_a],
                 "subject": "Thread Message 2",
@@ -476,14 +478,14 @@ async def test_send_message_importance_levels(isolated_env):
     """send_message should respect importance parameter."""
     server = build_mcp_server()
     async with Client(server) as client:
-        agents = await setup_project_with_agents(client, "/test/importance", count=2)
+        agents = await setup_project_with_agents(client, pkey("test/importance"), count=2)
         sender, receiver = agents[0], agents[1]
 
         for level in ["low", "normal", "high", "urgent"]:
             result = await client.call_tool(
                 "send_message",
                 {
-                    "project_key": "/test/importance",
+                    "project_key": pkey("test/importance"),
                     "sender_name": sender,
                     "to": [receiver],
                     "subject": f"Importance: {level}",
@@ -500,14 +502,14 @@ async def test_send_message_ack_required_flag(isolated_env):
     """send_message should set ack_required flag correctly."""
     server = build_mcp_server()
     async with Client(server) as client:
-        agents = await setup_project_with_agents(client, "/test/ack", count=2)
+        agents = await setup_project_with_agents(client, pkey("test/ack"), count=2)
         sender, receiver = agents[0], agents[1]
 
         # With ack_required=True
         result_ack = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/ack",
+                "project_key": pkey("test/ack"),
                 "sender_name": sender,
                 "to": [receiver],
                 "subject": "Needs Ack",
@@ -521,7 +523,7 @@ async def test_send_message_ack_required_flag(isolated_env):
         result_no_ack = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/ack",
+                "project_key": pkey("test/ack"),
                 "sender_name": sender,
                 "to": [receiver],
                 "subject": "No Ack Needed",
@@ -542,7 +544,7 @@ async def test_fetch_inbox_returns_messages(isolated_env):
     """fetch_inbox should return messages for the agent."""
     server = build_mcp_server()
     async with Client(server) as client:
-        agents = await setup_project_with_agents(client, "/test/inbox", count=2)
+        agents = await setup_project_with_agents(client, pkey("test/inbox"), count=2)
         sender, receiver = agents[0], agents[1]
 
         # Send multiple messages
@@ -550,7 +552,7 @@ async def test_fetch_inbox_returns_messages(isolated_env):
             await client.call_tool(
                 "send_message",
                 {
-                    "project_key": "/test/inbox",
+                    "project_key": pkey("test/inbox"),
                     "sender_name": sender,
                     "to": [receiver],
                     "subject": f"Message {i + 1}",
@@ -560,7 +562,7 @@ async def test_fetch_inbox_returns_messages(isolated_env):
 
         inbox = await client.call_tool(
             "fetch_inbox",
-            {"project_key": "/test/inbox", "agent_name": receiver, "limit": 10},
+            {"project_key": pkey("test/inbox"), "agent_name": receiver, "limit": 10},
         )
 
         items = get_inbox_items(inbox)
@@ -576,14 +578,14 @@ async def test_fetch_inbox_urgent_only_filter(isolated_env):
     """fetch_inbox with urgent_only should only return high/urgent messages."""
     server = build_mcp_server()
     async with Client(server) as client:
-        agents = await setup_project_with_agents(client, "/test/urgent", count=2)
+        agents = await setup_project_with_agents(client, pkey("test/urgent"), count=2)
         sender, receiver = agents[0], agents[1]
 
         # Send messages with different importance
         await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/urgent",
+                "project_key": pkey("test/urgent"),
                 "sender_name": sender,
                 "to": [receiver],
                 "subject": "Normal Message",
@@ -594,7 +596,7 @@ async def test_fetch_inbox_urgent_only_filter(isolated_env):
         await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/urgent",
+                "project_key": pkey("test/urgent"),
                 "sender_name": sender,
                 "to": [receiver],
                 "subject": "Urgent Message",
@@ -607,7 +609,7 @@ async def test_fetch_inbox_urgent_only_filter(isolated_env):
         urgent_inbox = await client.call_tool(
             "fetch_inbox",
             {
-                "project_key": "/test/urgent",
+                "project_key": pkey("test/urgent"),
                 "agent_name": receiver,
                 "urgent_only": True,
                 "limit": 10,
@@ -624,13 +626,13 @@ async def test_fetch_inbox_include_bodies(isolated_env):
     """fetch_inbox with include_bodies=True should include message bodies."""
     server = build_mcp_server()
     async with Client(server) as client:
-        agents = await setup_project_with_agents(client, "/test/bodies", count=2)
+        agents = await setup_project_with_agents(client, pkey("test/bodies"), count=2)
         sender, receiver = agents[0], agents[1]
 
         await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/bodies",
+                "project_key": pkey("test/bodies"),
                 "sender_name": sender,
                 "to": [receiver],
                 "subject": "Has Body",
@@ -642,7 +644,7 @@ async def test_fetch_inbox_include_bodies(isolated_env):
         await client.call_tool(
             "fetch_inbox",
             {
-                "project_key": "/test/bodies",
+                "project_key": pkey("test/bodies"),
                 "agent_name": receiver,
                 "include_bodies": False,
                 "limit": 10,
@@ -654,7 +656,7 @@ async def test_fetch_inbox_include_bodies(isolated_env):
         inbox_with_body = await client.call_tool(
             "fetch_inbox",
             {
-                "project_key": "/test/bodies",
+                "project_key": pkey("test/bodies"),
                 "agent_name": receiver,
                 "include_bodies": True,
                 "limit": 10,
@@ -677,14 +679,14 @@ async def test_reply_message_creates_thread_link(isolated_env):
     """reply_message should link to the original message and thread."""
     server = build_mcp_server()
     async with Client(server) as client:
-        agents = await setup_project_with_agents(client, "/test/reply", count=2)
+        agents = await setup_project_with_agents(client, pkey("test/reply"), count=2)
         agent_a, agent_b = agents[0], agents[1]
 
         # Original message
         orig = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/reply",
+                "project_key": pkey("test/reply"),
                 "sender_name": agent_a,
                 "to": [agent_b],
                 "subject": "Original",
@@ -697,7 +699,7 @@ async def test_reply_message_creates_thread_link(isolated_env):
         reply = await client.call_tool(
             "reply_message",
             {
-                "project_key": "/test/reply",
+                "project_key": pkey("test/reply"),
                 "message_id": orig_id,
                 "sender_name": agent_b,
                 "body_md": "This is my reply.",
@@ -714,13 +716,13 @@ async def test_reply_message_prefixes_subject(isolated_env):
     """reply_message should prefix subject with 'Re:'."""
     server = build_mcp_server()
     async with Client(server) as client:
-        agents = await setup_project_with_agents(client, "/test/re", count=2)
+        agents = await setup_project_with_agents(client, pkey("test/re"), count=2)
         agent_a, agent_b = agents[0], agents[1]
 
         orig = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/re",
+                "project_key": pkey("test/re"),
                 "sender_name": agent_a,
                 "to": [agent_b],
                 "subject": "Discussion",
@@ -732,7 +734,7 @@ async def test_reply_message_prefixes_subject(isolated_env):
         reply = await client.call_tool(
             "reply_message",
             {
-                "project_key": "/test/re",
+                "project_key": pkey("test/re"),
                 "message_id": orig_id,
                 "sender_name": agent_b,
                 "body_md": "Sure!",
@@ -754,13 +756,13 @@ async def test_mark_message_read_workflow(isolated_env):
     """mark_message_read should mark the message as read for the recipient."""
     server = build_mcp_server()
     async with Client(server) as client:
-        agents = await setup_project_with_agents(client, "/test/read", count=2)
+        agents = await setup_project_with_agents(client, pkey("test/read"), count=2)
         sender, receiver = agents[0], agents[1]
 
         send_result = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/read",
+                "project_key": pkey("test/read"),
                 "sender_name": sender,
                 "to": [receiver],
                 "subject": "Please Read",
@@ -773,7 +775,7 @@ async def test_mark_message_read_workflow(isolated_env):
         read_result = await client.call_tool(
             "mark_message_read",
             {
-                "project_key": "/test/read",
+                "project_key": pkey("test/read"),
                 "agent_name": receiver,
                 "message_id": msg_id,
             },
@@ -789,13 +791,13 @@ async def test_acknowledge_message_workflow(isolated_env):
     """acknowledge_message should mark the message as acknowledged."""
     server = build_mcp_server()
     async with Client(server) as client:
-        agents = await setup_project_with_agents(client, "/test/ackflow", count=2)
+        agents = await setup_project_with_agents(client, pkey("test/ackflow"), count=2)
         sender, receiver = agents[0], agents[1]
 
         send_result = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/ackflow",
+                "project_key": pkey("test/ackflow"),
                 "sender_name": sender,
                 "to": [receiver],
                 "subject": "Needs Acknowledgment",
@@ -809,7 +811,7 @@ async def test_acknowledge_message_workflow(isolated_env):
         ack_result = await client.call_tool(
             "acknowledge_message",
             {
-                "project_key": "/test/ackflow",
+                "project_key": pkey("test/ackflow"),
                 "agent_name": receiver,
                 "message_id": msg_id,
             },
@@ -826,13 +828,13 @@ async def test_read_and_ack_are_idempotent(isolated_env):
     """Multiple read/ack calls should not change timestamps."""
     server = build_mcp_server()
     async with Client(server) as client:
-        agents = await setup_project_with_agents(client, "/test/idempotent", count=2)
+        agents = await setup_project_with_agents(client, pkey("test/idempotent"), count=2)
         sender, receiver = agents[0], agents[1]
 
         send_result = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/idempotent",
+                "project_key": pkey("test/idempotent"),
                 "sender_name": sender,
                 "to": [receiver],
                 "subject": "Idempotent Test",
@@ -845,28 +847,28 @@ async def test_read_and_ack_are_idempotent(isolated_env):
         # First read
         read1 = await client.call_tool(
             "mark_message_read",
-            {"project_key": "/test/idempotent", "agent_name": receiver, "message_id": msg_id},
+            {"project_key": pkey("test/idempotent"), "agent_name": receiver, "message_id": msg_id},
         )
         read1_at = read1.data["read_at"]
 
         # Second read (should return same timestamp)
         read2 = await client.call_tool(
             "mark_message_read",
-            {"project_key": "/test/idempotent", "agent_name": receiver, "message_id": msg_id},
+            {"project_key": pkey("test/idempotent"), "agent_name": receiver, "message_id": msg_id},
         )
         assert read2.data["read_at"] == read1_at
 
         # First ack
         ack1 = await client.call_tool(
             "acknowledge_message",
-            {"project_key": "/test/idempotent", "agent_name": receiver, "message_id": msg_id},
+            {"project_key": pkey("test/idempotent"), "agent_name": receiver, "message_id": msg_id},
         )
         ack1_at = ack1.data["acknowledged_at"]
 
         # Second ack (should return same timestamp)
         ack2 = await client.call_tool(
             "acknowledge_message",
-            {"project_key": "/test/idempotent", "agent_name": receiver, "message_id": msg_id},
+            {"project_key": pkey("test/idempotent"), "agent_name": receiver, "message_id": msg_id},
         )
         assert ack2.data["acknowledged_at"] == ack1_at
 
@@ -881,14 +883,14 @@ async def test_send_message_nonexistent_recipient_fails(isolated_env):
     """send_message to a non-existent recipient should fail."""
     server = build_mcp_server()
     async with Client(server) as client:
-        agents = await setup_project_with_agents(client, "/test/error", count=1)
+        agents = await setup_project_with_agents(client, pkey("test/error"), count=1)
         existing_agent = agents[0]
 
         with pytest.raises(Exception) as exc_info:
             await client.call_tool(
                 "send_message",
                 {
-                    "project_key": "/test/error",
+                    "project_key": pkey("test/error"),
                     "sender_name": existing_agent,
                     # Use a valid adjective+noun format that doesn't exist
                     "to": ["SilentGlacier"],
@@ -906,14 +908,14 @@ async def test_send_message_nonexistent_sender_fails(isolated_env):
     """send_message from a non-existent sender should fail."""
     server = build_mcp_server()
     async with Client(server) as client:
-        agents = await setup_project_with_agents(client, "/test/error2", count=1)
+        agents = await setup_project_with_agents(client, pkey("test/error2"), count=1)
         receiver = agents[0]
 
         with pytest.raises(Exception) as exc_info:
             await client.call_tool(
                 "send_message",
                 {
-                    "project_key": "/test/error2",
+                    "project_key": pkey("test/error2"),
                     # Use a valid adjective+noun format that doesn't exist
                     "sender_name": "QuietMountain",
                     "to": [receiver],
@@ -931,14 +933,14 @@ async def test_reply_to_nonexistent_message_fails(isolated_env):
     """reply_message to a non-existent message should fail."""
     server = build_mcp_server()
     async with Client(server) as client:
-        agents = await setup_project_with_agents(client, "/test/error3", count=1)
+        agents = await setup_project_with_agents(client, pkey("test/error3"), count=1)
         agent = agents[0]
 
         with pytest.raises(Exception) as exc_info:
             await client.call_tool(
                 "reply_message",
                 {
-                    "project_key": "/test/error3",
+                    "project_key": pkey("test/error3"),
                     "message_id": 999999,  # Non-existent
                     "sender_name": agent,
                     "body_md": "Reply to nothing.",

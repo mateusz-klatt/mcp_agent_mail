@@ -21,7 +21,7 @@ Reference: mcp_agent_mail-hqk
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, cast
 from urllib.parse import quote
 
 import pytest
@@ -935,7 +935,7 @@ async def test_file_reservations_resource_surfaces_orphaned(isolated_env):
         # Delete the owning agent row out-of-band — mimics the operational
         # condition the issue describes.
         async with get_session() as session:
-            await session.execute(delete(Agent).where(Agent.name == agent_name))
+            await session.execute(delete(Agent).where(cast(Any, Agent.name) == agent_name))
             await session.commit()
 
         # Orphaned reservations are stale=True by definition, so the resource

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 import pytest
 from fastmcp import Client
 
@@ -123,12 +125,12 @@ async def test_reply_to_round_trips_through_db(isolated_env):
         # The reply edge must be PERSISTED, not reconstructed only in the payload.
         async with get_session() as session:
             stored = (
-                await session.execute(sa_select(Message).where(Message.id == reply_id))
+                await session.execute(sa_select(Message).where(cast(Any, Message.id) == reply_id))
             ).scalars().one()
             assert stored.reply_to == original_id, "reply_to was not persisted to the DB (#188)"
 
             original = (
-                await session.execute(sa_select(Message).where(Message.id == original_id))
+                await session.execute(sa_select(Message).where(cast(Any, Message.id) == original_id))
             ).scalars().one()
             assert original.reply_to is None, "top-level message must have NULL reply_to (#188)"
 

@@ -92,6 +92,15 @@
         <div class="flex items-center gap-2">
           <i data-lucide="user" class="w-4 h-4"></i>
           <span class="font-medium text-slate-900 dark:text-white">{{ message.sender }}</span>
+          {# Alias after the address, not instead of it. This is the line a person
+             actually reads to answer "who sent this", so it is also the line most
+             likely to teach them what to type into `to:` — and the alias is not
+             that. models.py keeps `name` immutable precisely so addresses survive;
+             showing only the alias here would undo it from the far end. #}
+          {% if message.sender_alias %}
+          <span class="px-1.5 py-0.5 rounded bg-primary-50 dark:bg-primary-900/30 text-primary-700 dark:text-primary-300 text-xs font-medium"
+                data-tippy-content="Display name chosen by this agent — not its address">{{ message.sender_alias }}</span>
+          {% endif %}
         </div>
         <div class="flex items-center gap-2">
           <i data-lucide="calendar" class="w-4 h-4"></i>

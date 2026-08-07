@@ -3524,6 +3524,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                 m.subject,
                                 m.body_md,
                                 s.name AS sender_name,
+                                -- The sender's chosen alias, for display beside the
+                                -- name. NOT to be confused with _sender_display_name()
+                                -- below, which builds "name@project-slug" for
+                                -- cross-project senders: two unrelated concepts whose
+                                -- names differ by an underscore. Both holzera and I
+                                -- reached for that function first when asking whether
+                                -- the viewer shows an alias, and it does not.
+                                s.display_name AS sender_display_name,
                                 s.project_id AS sender_project_id,
                                 sp.human_key AS sender_project_name,
                                 sp.slug AS sender_project_slug,
@@ -3658,6 +3666,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 "body_md": mrow["body_md"],
                 "body_html": body_html,
                 "sender": sender_display,
+                # Separate key, never folded into "sender". The template shows the
+                # alias beside the address rather than in place of it, and merging
+                # them here would take that choice away from the template and put
+                # an unaddressable string where every other page shows an
+                # addressable one.
+                "sender_alias": mrow["sender_display_name"],
                 "created": str(mrow["created_ts"]),
                 "importance": mrow["importance"],
                 "thread_id": mrow["thread_id"],

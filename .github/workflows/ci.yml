@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [ main ]
 
+# Four runs stacked in the queue this afternoon, each re-analysing a tree the
+# next one superseded. Only the newest push is worth scanning.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   sonarcloud:
     name: SonarCloud
@@ -63,6 +69,23 @@ jobs:
 
       - name: SonarCloud scan
         uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          # SONAR_HOST_URL is what was missing: without it the action assumes a
+          # self-hosted SonarQube, and four consecutive runs finished with the
+          # SonarCloud project still reporting `status: NONE`. Copied from the
+          # configuration in snapper-mcp, which has been producing analyses.
+          SONAR_HOST_URL: https://sonarcloud.io
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          # Lets Sonar annotate pull requests instead of only the dashboard.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Quality gate
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        # Reports the verdict without failing the run. The first analysis of a
+        # fork whose upstream CI has not passed since June will not meet a gate,
+        # and a red cross there would say nothing anyone can act on yet.
+        continue-on-error: true
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 

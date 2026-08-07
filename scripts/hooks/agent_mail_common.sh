@@ -246,8 +246,43 @@ am_hdr_conf() {
     printf '%s' "$f"
 }
 
+# Outcome of am_call / am_get, reported through the exit status:
+#
+#   0  the server answered 2xx; stdout is the result, and empty means empty
+#   1  no answer at all — DNS, refused, timeout, a proxy that hung up
+#   2  the server answered, with a status that is not 2xx
+#
+# Deliberately NOT a variable. Every call site is `x="$(am_call …)"`, which runs
+# the function in a subshell, so anything assigned inside is gone by the time
+# the caller looks — a status variable would read as empty at exactly the
+# moment it mattered and would be believed. The exit status is the one channel
+# that survives command substitution.
+#
+# 1 and 2 are kept apart because they call for different responses: 1 is worth
+# retrying, 2 usually means the credential or the request is wrong and retrying
+# will fail the same way.
+am_http_status() {
+    local code
+    code="$(printf '%s' "$1" | tail -n1)"
+    case "$code" in
+        2??) return 0 ;;
+        ''|*[!0-9]*|000) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+# Escape a value for a curl config file. ORDER IS LOad-BEARING: backslashes
+# first, quotes second. Reversed, the second pass doubles the backslashes the
+# first pass just introduced (`"` -> `\"` -> `\\"`), curl reads a literal
+# backslash followed by the end of the value, and the request dies as a JSON
+# parse error at the server. Measured on Linux and Windows; the failure looks
+# like a server problem and is not one.
+am_conf_escape() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
 am_call() {
-    local tool="$1" args="$2" bearer body hdr
+    local tool="$1" args="$2" bearer body hdr raw
     bearer="$(am_bearer)"
     [ -z "$bearer" ] && return 0
     # Two encoding defences, on purpose. The server accepts UTF-8 fine — the
@@ -266,32 +301,38 @@ am_call() {
     # it with no error anywhere.
     body="$(jq -nac --arg t "$tool" --argjson a "$args" \
         '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:$t,arguments:$a}}' 2>/dev/null)" || return 0
-    # The body stays on stdin. Putting it in the config instead does work, but
-    # only under a two-pass escape in the right order (backslashes, then quotes)
-    # — an invariant nobody reading the call site would know to preserve, on a
-    # path that carries arbitrary Markdown. Not escaping it at all is not a
-    # workaround for that trap; it is never entering it.
+    # The body stays on stdin whenever there is a header file to read the
+    # credentials from, which keeps it clear of both argv and config escaping.
     hdr="$(am_hdr_conf "$bearer")"
     if [ -n "$hdr" ]; then
-        printf '%s' "$body" | curl -s --max-time "$AM_TIMEOUT" -X POST "${AM_BASE_URL}/api/" \
-            -K "$hdr" --data @- 2>/dev/null \
-            | jq -r '.result.content[0].text // empty' 2>/dev/null
+        raw="$(printf '%s' "$body" | curl -s --max-time "$AM_TIMEOUT" -X POST "${AM_BASE_URL}/api/" \
+            -K "$hdr" --data @- --write-out '\n%{http_code}' 2>/dev/null)"
     else
-        # No writable state dir. Swap which of the two gives up stdin rather than
-        # putting the bearer back in argv: the body is not a secret, and -a
-        # already made it ASCII, so argv is a safe place for it and not for the
-        # token. That keeps "the bearer is never in the process table" true
-        # unconditionally instead of true-until-the-disk-fills.
+        # No writable state dir. The body cannot go to argv here: every call
+        # this module makes carries `registration_token` in its arguments, so
+        # moving the body out of stdin would take the bearer off the process
+        # table and put an agent credential on it instead — a swap, not a fix.
+        # Both therefore travel in the config on stdin.
         #
-        # No new size ceiling: --argjson above already hands $args to jq through
-        # argv, so the ~32 kB limit measured on Windows binds this function
-        # either way. Hook bodies run about 270 B.
-        printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\nheader = "Accept: application/json, text/event-stream"\n' \
-            "$bearer" \
+        # That means escaping the body for the config format, and the order in
+        # am_conf_escape is what makes it survive quotes and backslashes
+        # together. Only this branch pays that cost, and only when the state
+        # directory is unwritable.
+        raw="$(printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\nheader = "Accept: application/json, text/event-stream"\ndata = "%s"\n' \
+            "$bearer" "$(am_conf_escape "$body")" \
             | curl -s --max-time "$AM_TIMEOUT" -X POST "${AM_BASE_URL}/api/" \
-                -K - --data "$body" 2>/dev/null \
-            | jq -r '.result.content[0].text // empty' 2>/dev/null
+                -K - --write-out '\n%{http_code}' 2>/dev/null)"
     fi
+    # Separate "the server said there is nothing" from "nothing came back".
+    # Until now both arrived as an empty string, so a deploy window or a dropped
+    # link was indistinguishable from a quiet morning — and worse than quiet:
+    # autoreserve reads silence as "reservation filed" while reservations_warn
+    # reads it as "no conflict", so two agents editing one file are each assured
+    # they are alone. The status goes on its own LAST line and is cut before jq,
+    # because folding it into the body would break the parse this exists to
+    # protect.
+    am_http_status "$raw" || return $?
+    printf '%s' "$raw" | sed '$d' | jq -r '.result.content[0].text // empty' 2>/dev/null
 }
 
 # Percent-encode a query value so it can cross argv into native curl.exe.
@@ -318,12 +359,17 @@ am_urlencode() {
 # per edit that window is not rare. Config on stdin is also the one form that
 # crosses no argv boundary at all, so it needs no encoding defence.
 am_get() {
-    local path="$1" bearer
+    local path="$1" bearer raw
     bearer="$(am_bearer)"
     [ -z "$bearer" ] && return 0
-    printf 'header = "Authorization: Bearer %s"\n' "$bearer" \
+    raw="$(printf 'header = "Authorization: Bearer %s"\n' "$bearer" \
       | curl -s --max-time "$AM_TIMEOUT" -G -K - \
-        "${@:2}" "${AM_BASE_URL}${path}" 2>/dev/null
+        "${@:2}" "${AM_BASE_URL}${path}" --write-out '\n%{http_code}' 2>/dev/null)"
+    # See am_call: an unanswered request must not be reported as an empty
+    # answer. This one feeds the reservation warning, where "no rows" and "no
+    # reply" would otherwise both render as "nobody holds this file".
+    am_http_status "$raw" || return $?
+    printf '%s' "$raw" | sed '$d'
 }
 
 # --- credential store --------------------------------------------------------

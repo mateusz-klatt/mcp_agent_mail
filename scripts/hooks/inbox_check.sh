@@ -100,6 +100,17 @@ fi
 # response instead of dragging every unread body across the wire every 120s.
 inv="$(am_call fetch_inbox "$(jq -nc --arg p "$PROJECT" --arg a "$AGENT" --arg t "$token" --argjson n "$INVENTORY" \
     '{project_key:$p,agent_name:$a,registration_token:$t,unread_only:true,limit:$n,include_bodies:false}')")"
+rc=$?
+# "No new mail" and "I could not ask" are the same silence today, and this hook
+# is the only channel through which anyone reaches this agent. A deploy window
+# or a dropped link therefore looks exactly like a quiet morning, for as long
+# as it lasts — including to a human trying to say stop.
+if [ "$rc" -ne 0 ]; then
+    [ "$rc" -eq 1 ] && why="the server did not answer" || why="the server refused the request"
+    am_emit_context "$EVENT" \
+        "Agent Mail: could not check the inbox — ${why}. This is NOT 'no new messages': mail may be waiting, including from the human overseer. Retry before assuming the channel is quiet."
+    exit 0
+fi
 [ -z "$inv" ] && exit 0
 printf '%s' "$inv" | jq -e 'type == "array"' >/dev/null 2>&1 || exit 0
 

@@ -35,6 +35,19 @@ rel="$(am_relpath "$target")"
 
 body="$(am_get /mail/api/file-reservations \
     --data "project=$(am_urlencode "$PROJECT")" --data "path=$(am_urlencode "$rel")")"
+rc=$?
+# A server that did not answer is not a server that said "no conflicts", and
+# staying quiet here states the second. During a deploy window every hook goes
+# quiet at once: this one reports no conflict while autoreserve reports a hold
+# filed, so two agents editing one file each get told they are alone. The
+# coordination layer does not merely stop — for that minute it actively asserts
+# a safety that is not there, which is worse than having no layer at all.
+if [ "$rc" -ne 0 ]; then
+    [ "$rc" -eq 1 ] && why="the server did not answer" || why="the server refused the request"
+    am_emit_context "PreToolUse" \
+        "Agent Mail: could not check reservations for ${rel} — ${why}. This is NOT 'no conflict': another agent may hold this file and you would not have been told. Check ${AGENT_MAIL_PUBLIC_URL:-$AM_BASE_URL}/mail before editing, or proceed knowing the guard is down."
+    exit 0
+fi
 [ -z "$body" ] && exit 0
 
 # Ignore our own holds: at one path per edit, re-editing a file we already

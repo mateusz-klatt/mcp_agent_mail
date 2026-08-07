@@ -32,6 +32,18 @@ else
 fi
 
 resp="$(am_call register_agent "$args")"
+rc=$?
+# Registration is what every later hook authenticates with, so a session that
+# fails here has no working coordination at all — no reservations filed, no
+# conflicts seen, no mail delivered. Today that session starts in silence and
+# looks identical to a healthy one. Say it once, at the only moment the agent
+# can act on it.
+if [ "$rc" -ne 0 ]; then
+    [ "$rc" -eq 1 ] && why="the server did not answer" || why="the server refused the registration"
+    am_emit_context "SessionStart" \
+        "Agent Mail: could not register on ${PROJECT} — ${why}. For this session there is no coordination: reservations will not be filed, conflicts will not be reported, and mail will not be delivered. Nothing else will mention it again."
+    exit 0
+fi
 [ -z "$resp" ] && exit 0
 got_name="$(printf '%s' "$resp" | jq -r '.name // empty' 2>/dev/null)"
 got_token="$(printf '%s' "$resp" | jq -r '.registration_token // empty' 2>/dev/null)"
@@ -51,9 +63,16 @@ fi
 
 summary="Agent Mail: you are ${got_name} on ${PROJECT}."
 res="$(am_get /mail/api/file-reservations --data "project=$(am_urlencode "$PROJECT")")"
-held="$(printf '%s' "$res" | jq -r --arg me "$got_name" \
-    '[.reservations[]? | select(.agent != $me) | "\(.path_pattern) (\(.agent))"] | join(", ")' 2>/dev/null)"
-[ -n "$held" ] && summary="${summary} Reserved by others right now: ${held}."
+if [ $? -ne 0 ]; then
+    # Registration worked, so this is a blip rather than an outage — but an
+    # empty holdings list reads as "nobody is holding anything", which is a
+    # claim, not an absence of one.
+    summary="${summary} Could not read what others hold right now — assume nothing about who is editing what."
+else
+    held="$(printf '%s' "$res" | jq -r --arg me "$got_name" \
+        '[.reservations[]? | select(.agent != $me) | "\(.path_pattern) (\(.agent))"] | join(", ")' 2>/dev/null)"
+    [ -n "$held" ] && summary="${summary} Reserved by others right now: ${held}."
+fi
 
 am_emit_context "SessionStart" "$summary"
 exit 0

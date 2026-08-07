@@ -44,6 +44,19 @@ token="$(am_cred_get "$PROJECT" "$AGENT")"
 resp="$(am_call file_reservation_paths "$(jq -nc \
     --arg p "$PROJECT" --arg a "$AGENT" --arg t "$token" --arg path "$rel" --argjson ttl "$TTL" \
     '{project_key:$p,agent_name:$a,registration_token:$t,paths:[$path],ttl_seconds:$ttl,reason:"auto: edited in session"}')")"
+rc=$?
+# Silence here reads as "reservation filed" — the hook only speaks on conflict,
+# so saying nothing is how success looks. When the server is unreachable that
+# makes this the more dangerous half of a pair: reservations_warn reports no
+# conflict at the same moment, so two agents editing one file are each assured
+# they are alone. Announce the failure even though the ordinary path stays
+# quiet, because this is the one case where quiet is a false statement.
+if [ "$rc" -ne 0 ]; then
+    [ "$rc" -eq 1 ] && why="the server did not answer" || why="the server refused the request"
+    am_emit_context "PostToolUse" \
+        "Agent Mail: NO reservation was filed for ${rel} — ${why}. Nobody else will be warned that you are editing it, and you were not warned about them. Treat this file as unguarded until coordination is back."
+    exit 0
+fi
 [ -z "$resp" ] && exit 0
 
 # Remember it so SessionEnd can release exactly this session's paths and leave a

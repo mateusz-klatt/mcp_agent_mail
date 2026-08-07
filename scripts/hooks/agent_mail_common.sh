@@ -222,15 +222,32 @@ am_agent_name() {
     # is only a memory of one.
     # The project is resolved here rather than passed in, so that every existing
     # caller — autoreserve.sh, inbox_check.sh, session_end.sh — inherits this
-    # without being edited. They already call am_project_key themselves; this is
-    # one more read of the same git config, not a new kind of work.
-    local _proj; _proj="${AM_PROJECT_FOR_NAME:-$(am_project_key)}"
-    if [ -n "$_proj" ]; then
+    # without being edited.
+    #
+    # The directory test comes FIRST, and that ordering is the whole point. The
+    # original wrote "they already call am_project_key themselves; this is one
+    # more read of the same git config, not a new kind of work" — true, and
+    # answering the wrong question. It is a SECOND read, in a fresh subprocess,
+    # and home-win-1 measured it at 122 ms on Windows against 5 ms here. The
+    # comment justified the absence of a new KIND of work where the question was
+    # about AMOUNT.
+    #
+    # Memoising am_project_key cannot help: every caller invokes it as
+    # `$(am_project_key)`, so a cache assigned inside dies with the subshell —
+    # verified with a minimal case before writing this.
+    #
+    # What does help is not asking. This lookup only has an answer once a session
+    # has recorded a granted name, so until then the project key is bought and
+    # thrown away on every hook invocation. `[ -d ]` costs ~0.25 ms.
+    if [ -d "${AM_STATE_DIR}/granted" ]; then
+      local _proj; _proj="${AM_PROJECT_FOR_NAME:-$(am_project_key)}"
+      if [ -n "$_proj" ]; then
         local gf; gf="$(am_granted_name_file "$_proj")"
         if [ -r "$gf" ]; then
             local g; g="$(cat "$gf" 2>/dev/null)"
             [ -n "$g" ] && { printf '%s' "$g"; return 0; }
         fi
+      fi
     fi
     local h p
     # macOS derives `hostname` from DHCP/reverse DNS, so a laptop that changes

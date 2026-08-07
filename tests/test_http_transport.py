@@ -140,7 +140,9 @@ async def test_http_readiness_endpoint(isolated_env):
 
 
 @pytest.mark.asyncio
-async def test_http_lock_status_endpoint(isolated_env):
+async def test_http_lock_status_endpoint(isolated_env, open_mail_ui_gate):
+    # The only case in this file that drives a /mail route, so the gate is stood
+    # aside here and nowhere else in the module.
     server = build_mcp_server()
     settings = _config.get_settings()
     app = build_http_app(settings, server)

@@ -527,8 +527,14 @@ class TestRequestLogging:
 # =============================================================================
 
 
+@pytest.mark.usefixtures("open_mail_ui_gate")
 class TestHTTPLockScope:
-    """Regression tests for DB/archive lock ordering in HTTP routes."""
+    """Regression tests for DB/archive lock ordering in HTTP routes.
+
+    Scoped to this class rather than the module: three of its cases drive /mail
+    routes and the rest do not, so switching the gate off file-wide would relax
+    it for tests that never touch it.
+    """
 
     @pytest.mark.asyncio
     async def test_overseer_send_archives_after_db_session_closes(self, isolated_env, monkeypatch):

@@ -90,6 +90,49 @@ def event_loop():
 
 
 @pytest.fixture
+def open_mail_ui_gate(isolated_env, monkeypatch):
+    """Stand the ``/mail`` password gate aside for tests that assert view *content*.
+
+    Deliberately a named fixture rather than a line in :func:`isolated_env`, and
+    deliberately not a bearer header.
+
+    The gate refuses every ``/mail`` route with 503 when ``MAIL_UI_AUTH_ENABLED``
+    is on and no session secret is configured — which is the default, so tests
+    written before the gate existed all fail on their first request. Three ways
+    out, and only this one is honest:
+
+    - a server bearer makes the routes answer 200, because the gate hands API
+      clients to the bearer middleware untouched. The tests would pass while
+      *bypassing* the thing they appear to authenticate against.
+    - setting only the session secret moves the failure from 503 to 401. The
+      count does not change, so it reads as "no progress" when in fact the gate
+      has started working.
+    - switching the gate off says so in the configuration, where a reader can
+      see it.
+
+    Global would have been shorter and is the wrong shape: ``_build`` in
+    tests/test_mail_ui_auth.py sets ``MAIL_UI_SESSION_SECRET`` per case but does
+    not pin ``MAIL_UI_AUTH_ENABLED``, so putting this in ``isolated_env`` would
+    reach under the tests that exist to prove the gate works. Measured, running
+    that suite with the variable forced off:
+
+        4 failed, 4 passed
+
+    So it would have broken loudly rather than quietly — which is the opposite
+    of what this comment first claimed, and better news than it assumed. The
+    four that still pass are the ones that would have been hollowed out: they
+    assert the same thing whether the gate is on or off. Keeping this fixture
+    named and scoped costs nothing and removes the question.
+
+    Depends on ``isolated_env`` so it runs after it: that fixture clears the
+    settings cache, and a value set before the clear would not survive it.
+    """
+    monkeypatch.setenv("MAIL_UI_AUTH_ENABLED", "false")
+    clear_settings_cache()
+    yield
+
+
+@pytest.fixture
 def isolated_env(tmp_path, monkeypatch):
     """Provide isolated database settings for tests and reset caches."""
     db_path: Path = tmp_path / "test.sqlite3"

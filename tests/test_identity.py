@@ -60,9 +60,24 @@ def test_identity_dir_mode_preserves_symlink_project_path(tmp_path: Path, monkey
 
 
 def test_build_project_profile_dedupes_same_file_aliases(tmp_path: Path) -> None:
+    """Two candidate filenames on one inode must contribute one section.
+
+    The alias is AGENTS.md rather than readme.md. `_PROJECT_PROFILE_FILENAMES`
+    lists README.md, Readme.md and readme.md, so on a case-insensitive
+    filesystem — macOS, which is in the CI matrix — those three names already
+    denote the same file, and `alias.symlink_to(readme)` cannot even be
+    created: the path exists. The test failed there before reaching what it
+    tests.
+
+    AGENTS.md differs by more than case, so the two candidates are genuinely
+    distinct names on both kinds of filesystem while still resolving to one
+    inode, which is what `_collect_project_profile_candidates` deduplicates on
+    (st_dev, st_ino). README.md stays the surviving name because it is first
+    in that list.
+    """
     readme = tmp_path / "README.md"
     readme.write_text("# Project Profile\n", encoding="utf-8")
-    alias = tmp_path / "readme.md"
+    alias = tmp_path / "AGENTS.md"
     alias.symlink_to(readme)
 
     profile = asyncio.run(_build_project_profile(Project(slug="proj", human_key=str(tmp_path)), ["BlueLake"]))

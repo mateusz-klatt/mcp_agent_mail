@@ -1837,6 +1837,12 @@ def _agent_to_dict(agent: Agent) -> dict[str, Any]:
     }
     if getattr(agent, "retired_at", None) is not None:
         d["retired_at"] = _iso(agent.retired_at)
+    # Emitted only when set, so no consumer has to distinguish "" from absent.
+    # This function is the funnel for register_agent, whois, list_contacts, the
+    # agents resource and the archived profile, so one line here reaches every
+    # place an agent is described.
+    if getattr(agent, "display_name", None):
+        d["display_name"] = agent.display_name
     return d
 
 
@@ -9366,6 +9372,99 @@ def build_mcp_server() -> FastMCP:
                     "expires_ts": _iso(link.expires_ts) if link.expires_ts else None,
                 })
         return out
+
+    @mcp.tool(name="set_agent_display_name")
+    @_instrument_tool(
+        "set_agent_display_name",
+        cluster=CLUSTER_CONTACT,
+        capabilities={"configure"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def set_agent_display_name(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        display_name: Optional[str] = None,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Give this agent a human-readable label, shown alongside its name.
+
+        The label is for display only. It is NOT an address: `to:`, `cc:` and
+        every other recipient field still take `agent_name`, which does not
+        change. That separation is the point — a derived name that never moves
+        cannot orphan a mailbox, a credential or a reservation, and an alias
+        that cannot be addressed cannot make a mutable field load-bearing.
+
+        Authenticated by the caller's own registration token, so an agent can
+        rename itself and nobody else.
+
+        Parameters
+        ----------
+        display_name : Optional[str]
+            The label. Pass null or an empty string to clear it and go back to
+            showing the plain name.
+
+        Returns
+        -------
+        dict
+            `{agent, display_name}` — the canonical name and the label now set.
+        """
+        project = await _get_project_by_identifier(project_key)
+        agent = await _authenticate_agent(
+            ctx,
+            project,
+            agent_name,
+            registration_token,
+            token_param="registration_token",
+            action="set_agent_display_name",
+        )
+
+        label = (display_name or "").strip()
+        # Control characters would corrupt every rendering of this — a newline
+        # alone turns one line of a conflict warning into two and lets an alias
+        # forge the line that follows it.
+        label = "".join(ch for ch in label if ch.isprintable())
+        if len(label) > 128:
+            label = label[:128].rstrip()
+
+        if label:
+            async with get_session() as s:
+                clash = (
+                    await s.execute(
+                        text(
+                            "SELECT name FROM agents WHERE project_id = :pid "
+                            "AND id != :aid AND (lower(name) = lower(:label) "
+                            "OR lower(COALESCE(display_name, '')) = lower(:label)) LIMIT 1"
+                        ),
+                        {"pid": project.id, "aid": agent.id, "label": label},
+                    )
+                ).fetchone()
+            # An alias equal to another agent's NAME is the one genuinely
+            # deceptive case: readers would attribute this agent's messages and
+            # reservations to that one. Duplicate aliases are merely confusing,
+            # but rejecting both costs a single query and keeps the door open
+            # if addressing is ever revisited.
+            if clash is not None:
+                raise ToolExecutionError(
+                    error_type="INVALID_ARGUMENT",
+                    message=(
+                        f"Display name {label!r} is already taken by agent {clash[0]!r} "
+                        "in this project, as its name or its alias."
+                    ),
+                    recoverable=True,
+                    data={"argument": "display_name", "provided": label, "conflicts_with": clash[0]},
+                )
+
+        async with get_session() as s:
+            db_agent = await s.get(Agent, agent.id)
+            if db_agent is not None:
+                db_agent.display_name = label or None
+                s.add(db_agent)
+                await s.commit()
+        return {"agent": agent.name, "display_name": label or None}
 
     @mcp.tool(name="set_contact_policy")
     @_instrument_tool(

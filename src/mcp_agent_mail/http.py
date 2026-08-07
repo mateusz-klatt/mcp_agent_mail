@@ -2390,7 +2390,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 rows = (
                     await session.execute(
                         text(
-                            "SELECT c.id, a.name, c.path_pattern, c.exclusive, c.reason, c.expires_ts "
+                            "SELECT c.id, a.name, c.path_pattern, c.exclusive, c.reason, "
+                            "c.expires_ts, a.display_name "
                             "FROM file_reservations c LEFT JOIN agents a ON a.id = c.agent_id "
                             "WHERE c.project_id = :pid AND c.released_ts IS NULL "
                             "ORDER BY c.created_ts DESC"
@@ -2415,6 +2416,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     "id": r[0],
                     # LEFT JOIN: a reservation can outlive its owning agent row (#161).
                     "agent": r[1] or "<orphaned>",
+                    # Alongside the name, never instead of it: the name is what
+                    # has to be typed into `to:`, so a warning showing only the
+                    # label would teach the reader an address the server
+                    # rejects. Absent when unset rather than echoing the name.
+                    **({"display_name": r[6]} if len(r) > 6 and r[6] else {}),
                     "path_pattern": r[2],
                     "exclusive": bool(r[3]),
                     "reason": r[4] or "",

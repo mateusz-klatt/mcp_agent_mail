@@ -71,6 +71,18 @@ class Agent(SQLModel, table=True):
     contact_policy: str = Field(default="auto", max_length=16)  # open | auto | contacts_only | block_all
     registration_token: Optional[str] = Field(default=None, max_length=64, index=True)
     retired_at: Optional[datetime] = Field(default=None)
+    # A human-chosen label, shown alongside `name` and never instead of it.
+    #
+    # `name` stays the identity: it is what `to:` resolves, what conflict
+    # messages print, and what the credential store is keyed by. Letting a
+    # display label be addressable would make a mutable field load-bearing —
+    # rename once and every memorised address, thread participant and
+    # reservation points at nothing — which is the exact failure that keeping
+    # the derived name immutable was meant to prevent.
+    #
+    # Nullable, and null means "no alias": render the name unadorned rather
+    # than inventing one.
+    display_name: Optional[str] = Field(default=None, max_length=128)
 
 
 class MessageRecipient(SQLModel, table=True):

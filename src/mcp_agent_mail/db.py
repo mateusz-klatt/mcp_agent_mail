@@ -936,6 +936,9 @@ def _setup_fts(connection: Any) -> None:
         # round-trip through the DB (previously reply_to lived only in the
         # response payload and was lost on read).
         "ALTER TABLE messages ADD COLUMN reply_to INTEGER DEFAULT NULL",
+        # Display alias. Additive and nullable, so an older database keeps
+        # working and every agent simply has no alias until it sets one.
+        "ALTER TABLE agents ADD COLUMN display_name VARCHAR(128) DEFAULT NULL",
     ]:
         with suppress(Exception):  # Column already exists — safe to ignore
             connection.exec_driver_sql(migration_sql)

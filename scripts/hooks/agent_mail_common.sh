@@ -174,8 +174,64 @@ am_platform() {
     esac
 }
 
+# Remember the name the server actually granted, keyed by project.
+#
+# Only session_start.sh writes this, from register_agent's response. It is a
+# separate file from credentials.json on purpose: that one is keyed by agent
+# name, which is precisely the thing in question here.
+am_granted_name_file() {
+    # Separators are MAPPED, not deleted. `tr -cd` alone drops the slashes, and
+    # then /p/x and /px both become "px" — two projects sharing one identity
+    # file, which is a collision credentials.json does not have because jq keys
+    # it by the whole string. Caught by a control that was itself aimed at the
+    # wrong filename, which is how the naming came to be printed at all.
+    printf '%s/granted/%s' "$AM_STATE_DIR" \
+        "$(printf '%s' "$1" | tr '/' '_' | tr -cd '[:alnum:]._-' | cut -c1-96)"
+}
+
+am_granted_name_put() {
+    local f; f="$(am_granted_name_file "$1")"
+    [ -n "${2:-}" ] || return 0
+    mkdir -p "$(dirname "$f")" 2>/dev/null || return 0
+    printf '%s' "$2" > "$f" 2>/dev/null || true
+}
+
 am_agent_name() {
     [ -n "${AGENT_MAIL_AGENT:-}" ] && { printf '%s' "$AGENT_MAIL_AGENT"; return 0; }
+    # A previously granted name wins over re-deriving one.
+    #
+    # The server does not always give you the name you asked for: a name that is
+    # taken, or that matches _looks_like_model_name on a SUBSTRING, is answered
+    # in the default coerce mode with a silent random rename. Everything then
+    # came apart, and measurably so — laptop-mac-1 ran three sessions under a
+    # name containing "claude-" and got three different identities and three
+    # entries in credentials.json, because:
+    #
+    #   session_start:22   am_cred_get  … "$AGENT"      <- the DERIVED name
+    #   session_start:75   am_cred_put  … "$got_name"   <- the GRANTED name
+    #
+    # written under one key, read back under another. The next session finds no
+    # token, registers afresh, is renamed afresh, and the loop has no fixed
+    # point. autoreserve.sh and inbox_check.sh look up by the derived name too,
+    # so a renamed agent silently loses reservations, conflict warnings and mail
+    # — every one of them exiting 0.
+    #
+    # Fixed here rather than in each hook because they all call this function,
+    # so they all inherit the answer without being touched. AGENT_MAIL_AGENT
+    # still wins: an explicit override is a statement about identity, and this
+    # is only a memory of one.
+    # The project is resolved here rather than passed in, so that every existing
+    # caller — autoreserve.sh, inbox_check.sh, session_end.sh — inherits this
+    # without being edited. They already call am_project_key themselves; this is
+    # one more read of the same git config, not a new kind of work.
+    local _proj; _proj="${AM_PROJECT_FOR_NAME:-$(am_project_key)}"
+    if [ -n "$_proj" ]; then
+        local gf; gf="$(am_granted_name_file "$_proj")"
+        if [ -r "$gf" ]; then
+            local g; g="$(cat "$gf" 2>/dev/null)"
+            [ -n "$g" ] && { printf '%s' "$g"; return 0; }
+        fi
+    fi
     local h p
     # macOS derives `hostname` from DHCP/reverse DNS, so a laptop that changes
     # network changes identity — and an identity change orphans the mailbox and

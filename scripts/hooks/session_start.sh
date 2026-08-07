@@ -73,6 +73,13 @@ fi
 # a program or model is silently replaced, and recording the request would leave
 # every later call authenticating as an agent that does not exist.
 [ -n "$got_token" ] && am_cred_put "$PROJECT" "$got_name" "$got_token"
+# Remember what the server called us, so the next session looks the token up
+# under the key it was filed under. Without this, a name the server declines to
+# grant — taken, or matching _looks_like_model_name on a substring — is written
+# here under the granted name and read back under the derived one, and every
+# session registers a brand new identity. Measured by laptop-mac-1: three
+# sessions, three names, three entries in credentials.json.
+am_granted_name_put "$PROJECT" "$got_name"
 
 # An agent idle for a day is auto-retired, and re-registering does NOT clear
 # that flag — the session would look fine while every message sent to it failed.

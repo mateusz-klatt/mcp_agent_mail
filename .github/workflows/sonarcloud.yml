@@ -1,0 +1,64 @@
+name: SonarCloud
+
+# Its own workflow, not a job inside CI, and that separation is the fix for a
+# problem I created an hour ago: `concurrency: cancel-in-progress` on ci.yml
+# killed the Sonar run when the next commit landed. With four agents pushing
+# every few minutes and a job that ran the test suite, the scan was cancelled
+# every single time — measured, `7f1170c` ended as `cancelled`.
+#
+# Modelled on the operator's snapper-mcp, which has been producing analyses
+# while this one produced none.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: sonarcloud-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: SonarCloud scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Sonar attributes issues to commits; a shallow clone makes every line
+          # look like it was written by whoever last pushed.
+          fetch-depth: 0
+
+      # No test run here, deliberately, and this is a decision rather than an
+      # omission. The suite takes over an hour, and while it sat in front of the
+      # scanner the project reported `status: NONE` across five pushes. Static
+      # analysis on every commit beats coverage that never arrives.
+      #
+      # Coverage goes back in when the suite is green and quick — the properties
+      # file already points at coverage.xml and ignores it when absent.
+
+      - name: SonarCloud scan
+        uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          # The variable whose absence made four earlier runs analyse nothing:
+          # the action assumes a self-hosted SonarQube without it.
+          SONAR_HOST_URL: https://sonarcloud.io
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Quality gate
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        # Reports the verdict without failing the run. A fork whose upstream has
+        # not had a passing CI since June will not meet a gate on its first
+        # analysis, and a red cross there carries nothing anyone can act on.
+        continue-on-error: true
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

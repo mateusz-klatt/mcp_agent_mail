@@ -167,53 +167,50 @@ async def test_project_slug_generated_from_human_key(isolated_env):
 
 
 @pytest.mark.asyncio
-async def test_ensure_project_resolves_symlinks(isolated_env, tmp_path):
-    """ensure_project resolves symlinks to canonical paths.
+async def test_ensure_project_keeps_symlinked_paths_distinct(isolated_env, tmp_path):
+    """A symlink and its target are DIFFERENT projects, and that is deliberate.
 
-    This ensures that /dp/ntm and /data/projects/ntm resolve to the same
-    project when /dp is a symlink to /data/projects.
+    _ensure_project normalises with os.path.normpath, not Path.resolve(). The
+    comment on it says why: resolve() calls realpath(), which follows symlinks
+    and can collapse unrelated projects onto one database row (2b35d54, issue
+    #126). Two agents working through two different symlinks into a shared tree
+    would silently become one project, and neither would see the other's
+    reservations as conflicts.
+
+    This test used to assert the opposite — it was written for the resolve()
+    behaviour and outlived it.
     """
-
-    # Create a real directory and a symlink to it
     real_dir = tmp_path / "real_project"
     real_dir.mkdir()
     symlink_dir = tmp_path / "symlink_project"
     symlink_dir.symlink_to(real_dir)
 
-    real_path = str(real_dir.resolve())
+    real_path = str(real_dir)
     symlink_path = str(symlink_dir)
 
     server = build_mcp_server()
     async with Client(server) as client:
-        # Create project via symlink path
-        result1 = await client.call_tool(
-            "ensure_project", {"human_key": symlink_path}
-        )
+        via_symlink = await client.call_tool("ensure_project", {"human_key": symlink_path})
+        via_real = await client.call_tool("ensure_project", {"human_key": real_path})
 
-        # The stored human_key should be the resolved (canonical) path
-        assert result1.data["human_key"] == real_path, \
-            f"human_key should be resolved path {real_path}, got {result1.data['human_key']}"
+        assert via_symlink.data["human_key"] == symlink_path,             "the key is stored as given, not rewritten to the symlink target"
+        assert via_symlink.data["id"] != via_real.data["id"],             "symlink and target must stay distinct projects"
 
-        # Create project via real path - should return same project
-        result2 = await client.call_tool(
-            "ensure_project", {"human_key": real_path}
-        )
+        # Positive control. Without it, "distinct" would also pass if normalisation
+        # were absent entirely — which is a different and much worse bug.
+        noisy = str(real_dir) + "//./"
+        via_noisy = await client.call_tool("ensure_project", {"human_key": noisy})
+        assert via_noisy.data["id"] == via_real.data["id"],             "// and . must still collapse onto the same project"
 
-        # Should be the same project
-        assert result1.data["id"] == result2.data["id"], \
-            "Symlink and real path should resolve to same project"
-        assert result1.data["slug"] == result2.data["slug"], \
-            "Symlink and real path should have same slug"
-
-        # Register an agent via the symlinked project_key and ensure it lands on the canonical project
+        # An agent registered through the symlink belongs to the symlink project.
         agent_result = await client.call_tool(
             "register_agent",
             {"project_key": symlink_path, "program": "test-program", "model": "test-model"},
         )
-        project = await get_project_from_db(real_path)
-        assert project is not None, "Canonical project should exist"
+        project = await get_project_from_db(symlink_path)
+        assert project is not None, "the symlinked project exists in its own right"
         agent = await get_agent_from_db(project["id"], agent_result.data["name"])
-        assert agent is not None, "Agent registered via symlink should attach to canonical project"
+        assert agent is not None, "agent registered via symlink attaches to that project"
 
 
 # ============================================================================

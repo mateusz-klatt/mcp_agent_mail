@@ -541,9 +541,11 @@ def ui_users_role(
         existing = await _ui_users_load(username)
         if existing is None:
             return "not_found"
-        if existing.role == ROLE_ADMIN and role != ROLE_ADMIN:
-            if await _ui_users_enabled_admins(exclude=username) == 0:
-                return "last_admin"
+        if (
+            existing.role == ROLE_ADMIN and role != ROLE_ADMIN
+            and await _ui_users_enabled_admins(exclude=username) == 0
+        ):
+            return "last_admin"
         async with get_session() as session:
             row = await session.get(UiUser, existing.id)
             row.role = role
@@ -578,9 +580,11 @@ def ui_users_remove(
         existing = await _ui_users_load(username)
         if existing is None:
             return "not_found"
-        if existing.role == ROLE_ADMIN and not existing.disabled:
-            if await _ui_users_enabled_admins(exclude=username) == 0:
-                return "last_admin"
+        if (
+            existing.role == ROLE_ADMIN and not existing.disabled
+            and await _ui_users_enabled_admins(exclude=username) == 0
+        ):
+            return "last_admin"
         async with get_session() as session:
             row = await session.get(UiUser, existing.id)
             await session.delete(row)
@@ -624,9 +628,11 @@ def _ui_users_set_disabled(username: str, disabled: bool) -> None:
         existing = await _ui_users_load(username)
         if existing is None:
             return "not_found"
-        if disabled and existing.role == ROLE_ADMIN and not existing.disabled:
-            if await _ui_users_enabled_admins(exclude=username) == 0:
-                return "last_admin"
+        if (
+            disabled and existing.role == ROLE_ADMIN and not existing.disabled
+            and await _ui_users_enabled_admins(exclude=username) == 0
+        ):
+            return "last_admin"
         async with get_session() as session:
             row = await session.get(UiUser, existing.id)
             row.disabled = disabled

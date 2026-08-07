@@ -5276,7 +5276,12 @@ def build_mcp_server() -> FastMCP:
                     session.add(db_agent)
                     await session.commit()
             agent.last_active_ts = now
-        except Exception as exc:  # noqa: BLE001 - see above: swallow, but say so
+        # Broad on purpose: see the guard above. Bookkeeping must never fail a
+        # call that already succeeded — but it says so in the log rather than
+        # vanishing. This carried a `noqa: BLE001` until ruff removed it as
+        # unused (BLE is not in this project's select list); the reason it
+        # existed outlives the directive.
+        except Exception as exc:
             logger.warning(
                 "activity_touch.failed",
                 extra={"agent": getattr(agent, "name", None), "error": str(exc)},

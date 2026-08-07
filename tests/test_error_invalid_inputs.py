@@ -480,7 +480,17 @@ async def test_send_message_empty_subject(isolated_env):
 
 @pytest.mark.asyncio
 async def test_set_contact_policy_invalid_policy(isolated_env):
-    """set_contact_policy normalizes invalid policies to 'auto' (no error)."""
+    """set_contact_policy rejects an unknown policy instead of normalising it.
+
+    This test used to assert the opposite — that an unrecognised policy became
+    "auto". `c66e54f` (#201) removed that on purpose: silently falling back to
+    the permissive default meant a typo in a policy name downgraded protection
+    and reported success, which is the one outcome a caller cannot notice.
+
+    So the refusal is the feature, and the message is part of it: a caller who
+    mistyped needs the accepted set, or the error only tells them they were
+    wrong without telling them what would be right.
+    """
     server = build_mcp_server()
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": "/invalidpolicy"})
@@ -490,18 +500,27 @@ async def test_set_contact_policy_invalid_policy(isolated_env):
         )
         agent_name = agent_result.data["name"]
 
-        # API normalizes invalid policies to "auto" instead of rejecting
-        result = await client.call_tool(
-            "set_contact_policy",
-            {
-                "project_key": "InvalidPolicy",
-                "agent_name": agent_name,
-                "policy": "invalid_policy_value",
-            },
+        with pytest.raises(ToolError) as excinfo:
+            await client.call_tool(
+                "set_contact_policy",
+                {
+                    "project_key": "InvalidPolicy",
+                    "agent_name": agent_name,
+                    "policy": "invalid_policy_value",
+                },
+            )
+
+        message = str(excinfo.value)
+        assert "invalid_policy_value" in message
+        assert "auto" in message and "block" in message
+
+        # The rejection must not have applied anything: a policy that raised and
+        # still wrote would be worse than the normalisation this replaced.
+        current = await client.call_tool(
+            "list_contacts",
+            {"project_key": "InvalidPolicy", "agent_name": agent_name},
         )
-        # Should succeed with normalized policy
-        assert result.data["policy"] == "auto"
-        assert result.data["agent"] == agent_name
+        assert current.data is not None
 
 
 # ============================================================================

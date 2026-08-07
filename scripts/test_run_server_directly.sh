@@ -3,7 +3,12 @@
 
 set -euo pipefail
 
-export HTTP_BEARER_TOKEN="5dcdbc3a02da090e38ae1889ac508a582752e9e88898f769854882a4aef83693"
+# Read from the environment, never hardcoded. A literal token here is exported
+# into the shell of everyone who runs this file and into every process it spawns
+# — and this one lived in a tracked file on a public remote. Dead against our
+# server, but a credential handed to every reader all the same.
+: "${HTTP_BEARER_TOKEN:?set HTTP_BEARER_TOKEN first, e.g. from ~/.agent-mail.env}"
+export HTTP_BEARER_TOKEN
 
 echo "========================================"
 echo "Running server with direct Python call"

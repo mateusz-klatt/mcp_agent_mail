@@ -2770,21 +2770,25 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             carrying per-recipient frames would end BCC blindness for anyone
             with a viewer session.
             """
+            # No project means "any" — the index and the unified inbox span all
+            # of them, and those are the pages a person opens first. The frame is
+            # the same either way and carries nothing, so the wider scope reveals
+            # nothing wider.
             project_key = (request.query_params.get("project") or "").strip()
-            if not project_key:
-                return JSONResponse({"detail": "project is required"}, status_code=400)
-
-            await ensure_schema()
-            async with get_session() as session:
-                row = (
-                    await session.execute(
-                        text("SELECT slug FROM projects WHERE slug = :k OR human_key = :k"),
-                        {"k": project_key},
-                    )
-                ).fetchone()
-            if row is None:
-                return JSONResponse({"detail": "Project not found"}, status_code=404)
-            project_slug = str(row[0])
+            if project_key:
+                await ensure_schema()
+                async with get_session() as session:
+                    row = (
+                        await session.execute(
+                            text("SELECT slug FROM projects WHERE slug = :k OR human_key = :k"),
+                            {"k": project_key},
+                        )
+                    ).fetchone()
+                if row is None:
+                    return JSONResponse({"detail": "Project not found"}, status_code=404)
+                project_slug = str(row[0])
+            else:
+                project_slug = hub.ANY_PROJECT
 
             queue = hub.subscribe_project(project_slug)
 

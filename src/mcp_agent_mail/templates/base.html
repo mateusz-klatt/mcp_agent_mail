@@ -2173,6 +2173,23 @@
           <div class="flex items-center gap-3">
             {% block header_actions %}{% endblock %}
 
+            <!-- Live state + sound. Here rather than per page, so every view
+                 that inherits this layout updates itself; the pages that land
+                 on people are the index and the unified inbox, not only a
+                 project. Says WHICH path is carrying the page, so a dead stream
+                 reads as "polling" rather than as a quiet day. -->
+            <span id="live-dot" data-live="no" title="connecting…"
+                  class="inline-flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400 select-none">
+              <span id="live-pip" class="w-2 h-2 rounded-full bg-slate-300 dark:bg-slate-600"></span>
+              <span class="hidden sm:inline">live</span>
+            </span>
+            <button id="sound-toggle" type="button" data-on="no"
+                    class="p-2 rounded-lg hover:bg-primary-100 dark:hover:bg-primary-900/30 text-slate-500 dark:text-slate-400 transition-all duration-200"
+                    aria-label="Toggle a sound when new mail arrives" title="Sound on new mail">
+              <i id="bell-on" data-lucide="bell" class="w-4 h-4 hidden"></i>
+              <i id="bell-off" data-lucide="bell-off" class="w-4 h-4"></i>
+            </button>
+
             <!-- Help Button -->
             <button onclick="window.restartTutorial()"
                     class="p-2 rounded-lg hover:bg-primary-100 dark:hover:bg-primary-900/30 text-primary-600 dark:text-primary-400 transition-all duration-200 relative group"
@@ -3234,6 +3251,116 @@
           return dateString;
         }
       };
+    </script>
+
+    <script>
+      // Live update for every page that inherits this layout.
+      //
+      // A page holds a session cookie, so a plain EventSource is enough; the
+      // agent-facing /events needs a token in a header, which a browser cannot
+      // set, and authenticates as an agent rather than a person.
+      //
+      // Scope comes from a meta tag: a project page narrows to its own project,
+      // everything else watches all of them. Frames carry {kind:"changed"} and
+      // nothing more — no addressee, no id, no subject — so this decides WHEN
+      // to look and never what is there. Content is refetched through the
+      // ordinary viewer routes under the same session, which is exactly the
+      // authorisation an F5 would apply.
+      (function () {
+        const slug = document.querySelector('meta[name="agent-mail-project"]')?.content || null;
+        const dot = document.getElementById('live-dot');
+        const pip = document.getElementById('live-pip');
+        const soundKey = 'agentMailSound';
+        let reloading = false;
+
+        function setState(on, label) {
+          if (dot) { dot.dataset.live = on ? 'yes' : 'no'; dot.title = label; }
+          // Set the colour here rather than in CSS: a class invented in a
+          // template is not guaranteed to exist in the built stylesheet.
+          if (pip) {
+            pip.classList.toggle('bg-emerald-500', on);
+            pip.classList.toggle('bg-slate-300', !on);
+          }
+        }
+
+        // Browsers refuse audio until a gesture inside the page, and arriving
+        // from the login form does not count — hence opt-in, remembered.
+        function ding() {
+          if (localStorage.getItem(soundKey) !== 'on') return;
+          try {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const osc = ctx.createOscillator(), gain = ctx.createGain();
+            osc.connect(gain); gain.connect(ctx.destination);
+            osc.frequency.value = 880; osc.type = 'sine';
+            gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.25, ctx.currentTime + 0.01);
+            gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.35);
+            osc.start(); osc.stop(ctx.currentTime + 0.36);
+          } catch (e) { /* no device, or blocked: silence is acceptable */ }
+        }
+
+        function refresh() {
+          if (reloading) return;
+          reloading = true;
+          // Reload rather than patch: these pages render server-side, and a
+          // partial update that drifts from the server is worse than a flicker.
+          window.location.reload();
+        }
+
+        let es = null, backoff = 1000;
+        function connect() {
+          const url = '/mail/events' + (slug ? '?project=' + encodeURIComponent(slug) : '');
+          try { es = new EventSource(url); }
+          catch (e) { setState(false, 'live updates unavailable'); return; }
+          es.onopen = () => { backoff = 1000; setState(true, 'live'); };
+          es.onmessage = (ev) => {
+            let payload = null;
+            try { payload = JSON.parse(ev.data); } catch (e) { return; }
+            if (payload && payload.kind === 'changed') { ding(); refresh(); }
+          };
+          es.onerror = () => {
+            setState(false, 'live updates disconnected — falling back to polling');
+            if (es) { es.close(); es = null; }
+            setTimeout(connect, backoff);
+            backoff = Math.min(backoff * 2, 60000);
+          };
+        }
+
+        // Polling runs ALWAYS, not as a fallback engaged on error. A proxy that
+        // holds the connection open and sends nothing never fires onerror, so
+        // the stream looks alive while the page quietly stops updating — the
+        // failure shape this project spent a day removing from its hooks.
+        let lastSeen = null;
+        async function poll() {
+          try {
+            const r = await fetch('/mail/api/unified-inbox?limit=1', { credentials: 'same-origin' });
+            if (!r.ok) return;
+            const data = await r.json();
+            const top = (data.messages && data.messages[0] && data.messages[0].id) || null;
+            if (lastSeen !== null && top !== null && top !== lastSeen) { ding(); refresh(); }
+            lastSeen = top;
+          } catch (e) { /* offline; the next tick tries again */ }
+        }
+        setInterval(poll, 30000);
+        poll();
+        connect();
+
+        const toggle = document.getElementById('sound-toggle');
+        if (toggle) {
+          const sync = () => {
+            const on = localStorage.getItem(soundKey) === 'on';
+            toggle.dataset.on = on ? 'yes' : 'no';
+            document.getElementById('bell-on')?.classList.toggle('hidden', !on);
+            document.getElementById('bell-off')?.classList.toggle('hidden', on);
+          };
+          toggle.addEventListener('click', () => {
+            localStorage.setItem(soundKey, localStorage.getItem(soundKey) === 'on' ? 'off' : 'on');
+            sync();
+            if (localStorage.getItem(soundKey) === 'on') ding();  // the gesture that unlocks audio
+          });
+          sync();
+        }
+      })();
     </script>
 
     {% block scripts %}{% endblock %}

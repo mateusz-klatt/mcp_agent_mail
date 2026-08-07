@@ -140,6 +140,12 @@ class NotificationHub:
         if not listeners:
             self._project_subscribers.pop(key, None)
 
+    # Watchers of no project in particular — the index and the unified inbox,
+    # which is where a person actually lands. Kept as a reserved key rather than
+    # a second registry, so one publish reaches both scopes and neither can
+    # drift from the other.
+    ANY_PROJECT = "*"
+
     def publish_project(self, project: str) -> int:
         """Tell project watchers that something changed. Nothing else.
 
@@ -148,17 +154,15 @@ class NotificationHub:
         what" — a question `fetch_inbox` and the viewer's own session already
         answer. A cache-invalidation ping cannot leak what it does not carry.
         """
-        listeners = self._project_subscribers.get(project.strip().lower())
-        if not listeners:
-            return 0
         event = {"kind": "changed", "project": project}
         delivered = 0
-        for queue in tuple(listeners):
-            try:
-                queue.put_nowait(event)
-            except Exception:
-                continue
-            delivered += 1
+        for key in (project.strip().lower(), self.ANY_PROJECT):
+            for queue in tuple(self._project_subscribers.get(key, ())):
+                try:
+                    queue.put_nowait(event)
+                except Exception:
+                    continue
+                delivered += 1
         return delivered
 
     def project_listener_count(self, project: str) -> int:

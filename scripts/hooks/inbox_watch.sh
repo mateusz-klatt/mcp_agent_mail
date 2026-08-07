@@ -33,6 +33,16 @@ set -uo pipefail
 # own cap (AGENT_MAIL_EVENTS_MAX_SECONDS, 3600 by default) so the client is the
 # one that decides when to reconnect.
 WATCH="${AGENT_MAIL_WATCH_SECONDS:-1800}"
+# The exact command to run again, carried in every message this script prints.
+#
+# Re-arming is the whole reason instant delivery went unused: the polling loop
+# asks nothing of anybody, while this asks the agent to remember a command at
+# the precise moment it has just been handed mail and wants to act on it. It
+# cannot re-arm itself — the wake IS this process exiting, and a successor it
+# spawned would not be a task the agent's runtime tracks, so that successor's
+# exit would wake nobody. What can be removed is the recall: print the command,
+# not a reminder that one exists.
+SELF_CMD="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 # How long to wait for `: ready` before giving up on the subscription.
 READY_WAIT="${AGENT_MAIL_WATCH_READY_SECONDS:-15}"
 
@@ -114,7 +124,8 @@ if printf '%s' "$pending" | jq -e 'type == "array" and length > 0' >/dev/null 2>
     # Something is already waiting. Exit now rather than sitting on an open
     # subscription: the agent has work it can do, and holding the connection
     # would only delay what SessionStart is about to hand it anyway.
-    printf 'Agent Mail: mail is already waiting for %s. Read it, then start this watcher again in the background.\n' "$AGENT"
+    printf 'Agent Mail: mail is already waiting for %s. Read it, then re-arm instant delivery by running this in the BACKGROUND:\n    %s\n' \
+        "$AGENT" "$SELF_CMD"
     exit 0
 fi
 
@@ -127,8 +138,8 @@ out="$(cat "$stream" 2>/dev/null)"
 
 if printf '%s' "$out" | grep -q '^data: '; then
     id="$(printf '%s' "$out" | sed -n 's/^data: .*"id":\([0-9]*\).*/\1/p' | head -1)"
-    printf 'Agent Mail: new mail for %s (id %s). Read it, then start this watcher again in the background.\n' \
-        "$AGENT" "${id:-?}"
+    printf 'Agent Mail: new mail for %s (id %s). Read it, then re-arm instant delivery by running this in the BACKGROUND:\n    %s\n' \
+        "$AGENT" "${id:-?}" "$SELF_CMD"
 elif [ "$elapsed" -lt $(( WATCH - 5 )) ] 2>/dev/null; then
     # A subscription that ends early ended because something cut it, not
     # because nothing happened. Without this a proxy or CDN dropping the

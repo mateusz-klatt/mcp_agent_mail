@@ -83,6 +83,13 @@ class Agent(SQLModel, table=True):
     # Nullable, and null means "no alias": render the name unadorned rather
     # than inventing one.
     display_name: Optional[str] = Field(default=None, max_length=128)
+    # A name from a fixed vocabulary, never a frequency and never a URL. A URL
+    # would let any agent point the operator's browser at a host of its choosing
+    # — a tracking pixel with a volume control — and a raw frequency invites 1 Hz
+    # and 20 kHz, which are silence and pain rather than notification. The closed
+    # set is what makes this field safe to render without asking anything of the
+    # reader.
+    notify_sound: Optional[str] = Field(default=None, max_length=32)
 
 
 class MessageRecipient(SQLModel, table=True):

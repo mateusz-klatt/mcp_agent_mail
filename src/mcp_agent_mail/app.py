@@ -1897,6 +1897,8 @@ def _agent_to_dict(agent: Agent) -> dict[str, Any]:
     # place an agent is described.
     if getattr(agent, "display_name", None):
         d["display_name"] = agent.display_name
+    if getattr(agent, "notify_sound", None):
+        d["notify_sound"] = agent.notify_sound
     return d
 
 
@@ -9504,6 +9506,19 @@ def build_mcp_server() -> FastMCP:
                 })
         return out
 
+    # Closed vocabulary, and the values are what a browser needs to synthesise
+    # the tone locally: no file is fetched, so nothing here can become a request
+    # to a host somebody else chose. Frequencies stay inside the band a small
+    # laptop speaker actually reproduces and a person can tell apart — the point
+    # is distinguishing four colleagues, not composing.
+    NOTIFY_SOUNDS: dict[str, dict[str, Any]] = {
+        "chime": {"hz": 880, "wave": "sine"},
+        "low": {"hz": 440, "wave": "sine"},
+        "high": {"hz": 1320, "wave": "sine"},
+        "soft": {"hz": 660, "wave": "triangle"},
+        "click": {"hz": 220, "wave": "square"},
+    }
+
     @mcp.tool(name="set_agent_display_name")
     @_instrument_tool(
         "set_agent_display_name",
@@ -9596,6 +9611,86 @@ def build_mcp_server() -> FastMCP:
                 s.add(db_agent)
                 await s.commit()
         return {"agent": agent.name, "display_name": label or None}
+
+    @mcp.tool(name="set_agent_notify_sound")
+    @_instrument_tool(
+        "set_agent_notify_sound",
+        cluster=CLUSTER_CONTACT,
+        capabilities={"configure"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def set_agent_notify_sound(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        notify_sound: Optional[str] = None,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Choose the tone the mail viewer plays when this agent's message arrives.
+
+        A name from a fixed set, not a frequency and not a URL. The browser
+        synthesises the tone itself, so setting this cannot cause a request to a
+        host anyone chose, and cannot carry a 20 kHz value into somebody's
+        headphones. The same reasoning as `display_name`: a field a colleague
+        sets and a human hears has to be safe without the human vetting it.
+
+        This is a preference, not an identity. It changes nothing about
+        addressing, authorisation or delivery — a message sounds different and is
+        otherwise the same message.
+
+        Authenticated by the caller's own registration token, so an agent can
+        pick its own tone and nobody else's.
+
+        Parameters
+        ----------
+        notify_sound : Optional[str]
+            One of: chime, low, high, soft, click. Pass null or an empty string
+            to clear it and fall back to the viewer's default tone.
+
+        Returns
+        -------
+        dict
+            `{agent, notify_sound, available}` — what is set now, and the whole
+            vocabulary, so a caller never has to guess the valid values or read
+            this docstring twice.
+        """
+        project = await _get_project_by_identifier(project_key)
+        agent = await _authenticate_agent(
+            ctx,
+            project,
+            agent_name,
+            registration_token,
+            token_param="registration_token",
+            action="set_agent_notify_sound",
+        )
+
+        choice = (notify_sound or "").strip().lower()
+        if choice and choice not in NOTIFY_SOUNDS:
+            # Named explicitly rather than silently ignored: a tone that does not
+            # play is indistinguishable from a viewer with sound switched off,
+            # and the agent would have no way to tell which it was looking at.
+            raise ToolExecutionError(
+                error_type="INVALID_NOTIFY_SOUND",
+                message=(
+                    f"Unknown notify_sound {choice!r}. "
+                    f"Expected one of: {', '.join(sorted(NOTIFY_SOUNDS))}."
+                ),
+            )
+
+        async with get_session() as s:
+            db_agent = await s.get(Agent, agent.id)
+            if db_agent is not None:
+                db_agent.notify_sound = choice or None
+                s.add(db_agent)
+                await s.commit()
+        return {
+            "agent": agent.name,
+            "notify_sound": choice or None,
+            "available": sorted(NOTIFY_SOUNDS),
+        }
 
     @mcp.tool(name="set_contact_policy")
     @_instrument_tool(

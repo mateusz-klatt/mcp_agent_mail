@@ -939,6 +939,7 @@ def _setup_fts(connection: Any) -> None:
         # Display alias. Additive and nullable, so an older database keeps
         # working and every agent simply has no alias until it sets one.
         "ALTER TABLE agents ADD COLUMN display_name VARCHAR(128) DEFAULT NULL",
+        "ALTER TABLE agents ADD COLUMN notify_sound VARCHAR(32) DEFAULT NULL",
     ]:
         with suppress(Exception):  # Column already exists — safe to ignore
             connection.exec_driver_sql(migration_sql)

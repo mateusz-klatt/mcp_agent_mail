@@ -217,8 +217,35 @@ am_bearer() {
 # The STATELESS mount: a one-shot JSON-RPC POST needs no initialize handshake and
 # returns in ~40ms, where the stateful /mcp mount would cost three round trips
 # and leak a session per hook invocation.
+# The bearer as a curl config file, so it never appears in argv. am_get can
+# take the config on stdin; am_call cannot, because stdin carries the body.
+# A file is the remaining way in: curl on Windows rejects /dev/fd/N and named
+# pipes ("error encountered when reading a file"), accepting only a real file.
+#
+# Written once per session, not per call — the token does not change mid-session,
+# so this is one write, not a temp file in the critical path. It lands in
+# AM_STATE_DIR beside credentials.json, which already holds registration tokens
+# under the same permissions; note this does put the bearer in a second place on
+# disk, where before it lived only in ~/.agent-mail.env.
+#
+# Returns nothing if the file cannot be written, and the caller then falls back
+# to -H. A hook that cannot hide a token is still better than a hook that fails.
+am_hdr_conf() {
+    local f="${AM_STATE_DIR}/curl-headers.conf" want cur tmp
+    want="$(printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\nheader = "Accept: application/json, text/event-stream"' "$1")"
+    cur="$(cat "$f" 2>/dev/null)"
+    if [ "$cur" != "$want" ]; then
+        mkdir -p "$AM_STATE_DIR" 2>/dev/null || return 0
+        tmp="${f}.$$"
+        printf '%s\n' "$want" > "$tmp" 2>/dev/null || return 0
+        chmod 600 "$tmp" 2>/dev/null
+        mv -f "$tmp" "$f" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 0; }
+    fi
+    printf '%s' "$f"
+}
+
 am_call() {
-    local tool="$1" args="$2" bearer body
+    local tool="$1" args="$2" bearer body hdr
     bearer="$(am_bearer)"
     [ -z "$bearer" ] && return 0
     # Two encoding defences, on purpose. The server accepts UTF-8 fine — the
@@ -237,12 +264,24 @@ am_call() {
     # it with no error anywhere.
     body="$(jq -nac --arg t "$tool" --argjson a "$args" \
         '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:$t,arguments:$a}}' 2>/dev/null)" || return 0
-    printf '%s' "$body" | curl -s --max-time "$AM_TIMEOUT" -X POST "${AM_BASE_URL}/api/" \
-        -H "Authorization: Bearer ${bearer}" \
-        -H 'Content-Type: application/json' \
-        -H 'Accept: application/json, text/event-stream' \
-        --data @- 2>/dev/null \
-        | jq -r '.result.content[0].text // empty' 2>/dev/null
+    # The body stays on stdin. Putting it in the config instead does work, but
+    # only under a two-pass escape in the right order (backslashes, then quotes)
+    # — an invariant nobody reading the call site would know to preserve, on a
+    # path that carries arbitrary Markdown. Not escaping it at all is not a
+    # workaround for that trap; it is never entering it.
+    hdr="$(am_hdr_conf "$bearer")"
+    if [ -n "$hdr" ]; then
+        printf '%s' "$body" | curl -s --max-time "$AM_TIMEOUT" -X POST "${AM_BASE_URL}/api/" \
+            -K "$hdr" --data @- 2>/dev/null \
+            | jq -r '.result.content[0].text // empty' 2>/dev/null
+    else
+        printf '%s' "$body" | curl -s --max-time "$AM_TIMEOUT" -X POST "${AM_BASE_URL}/api/" \
+            -H "Authorization: Bearer ${bearer}" \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            --data @- 2>/dev/null \
+            | jq -r '.result.content[0].text // empty' 2>/dev/null
+    fi
 }
 
 # Percent-encode a query value so it can cross argv into native curl.exe.

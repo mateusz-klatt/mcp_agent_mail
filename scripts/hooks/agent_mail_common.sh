@@ -307,8 +307,19 @@ am_call() {
     # agent names: the refusal arrives as an empty result below, indistinguishable
     # from "nothing to report", so an agent sending a non-English message loses
     # it with no error anywhere.
-    body="$(jq -nac --arg t "$tool" --argjson a "$args" \
-        '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:$t,arguments:$a}}' 2>/dev/null)" || return 0
+    # $args arrives on stdin, not as --argjson. Arguments can carry a whole
+    # message body, and an argument is part of the command line: Windows caps
+    # an entire command line at 32767 bytes, so past that jq cannot be started
+    # and the call fails before a single byte is sent. Measured at 44 kB for
+    # ten ordinary messages, so this is not a theoretical ceiling. Reading the
+    # document from stdin removes it on every platform.
+    #
+    # The ceiling still binds wherever a CALLER builds $args with `--arg`, which
+    # is fine for hooks (their largest argument is a 43-byte token) but not for
+    # anything sending long prose.
+    body="$(printf '%s' "$args" | jq -ac --arg t "$tool" \
+        '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:$t,arguments:.}}' 2>/dev/null)" || return 0
+    [ -z "$body" ] && return 1
     # The body stays on stdin whenever there is a header file to read the
     # credentials from, which keeps it clear of both argv and config escaping.
     hdr="$(am_hdr_conf "$bearer")"

@@ -156,11 +156,23 @@ full="$(printf '%s' "$bodies" | jq -c --argjson want "$want" \
 # Whatever call 2 failed to return is named on one line rather than dropped: a
 # message the agent is never told about is the failure this hook exists to
 # prevent, and a subject line still says who to go and ask.
-rest="$(jq -nc --argjson fresh "$fresh" --argjson full "$full" --argjson n "$SUMMARY_MAX" \
-    '[$full[].id] as $shown | [$fresh[] | select(.id as $i | $shown | index($i) | not)] | .[0:$n]' 2>/dev/null)"
+#
+# Both arrays arrive on stdin, NOT through --argjson. $full holds whole message
+# bodies, and handing those to jq as an argument puts them on the command line:
+# measured at 44 kB for ten messages of ordinary length, against a hard 32 kB
+# limit for an entire command line on Windows. Past that, jq cannot be launched
+# at all — and the failure is silent in the worst way, because an empty $rest
+# becomes an empty $announced and the hook exits without a word. Mail simply
+# stops being delivered, on the busiest mailboxes first, and only on one
+# platform. jq -s slurps the stream into an array, so nothing large is ever an
+# argument and the ceiling stops existing on every platform at once.
+rest="$({ printf '%s\n' "$fresh"; printf '%s\n' "$full"; } | jq -sc --argjson n "$SUMMARY_MAX" '
+    .[0] as $fresh | .[1] as $full
+    | [$full[].id] as $shown
+    | [$fresh[] | select(.id as $i | $shown | index($i) | not)] | .[0:$n]' 2>/dev/null)"
 [ -z "$rest" ] && rest='[]'
 
-announced="$(jq -nc --argjson full "$full" --argjson rest "$rest" '[$full[].id] + [$rest[].id]' 2>/dev/null)"
+announced="$({ printf '%s\n' "$full"; printf '%s\n' "$rest"; } | jq -sc '[.[0][].id] + [.[1][].id]' 2>/dev/null)"
 [ -z "$announced" ] && exit 0
 printf '%s' "$announced" | jq -e 'length > 0' >/dev/null 2>&1 || exit 0
 

@@ -286,15 +286,36 @@ retracted.
 
 The bilance alone proves nothing — four false alarms is unremarkable if that is
 where everyone was looking. What makes it a property of the situation rather
-than of a person is the **spread of authorship**: the false reports came from
-three different people. Each new accusation against that layer fitted a pattern
-the group had just established, so it needed less evidence to be believed, and
-got less. A fourth person noticed afterwards that they had accepted three of
-those reports without verifying any, while verifying every report that touched
-their own code — not from laziness, but because the claims had stopped looking
-like hypotheses.
+than of a person is the **spread of authorship**. The four false reports came
+from three different people; a fourth then listed six over-broad claims of
+their own from the same afternoon, which makes it four out of four. Not "this
+is not one person's habit" — there was nobody it did not happen to. Each new
+accusation against that layer fitted a pattern the group had just established,
+so it needed less evidence to be believed and got less. One of them noticed
+afterwards that they had accepted three such reports unverified while checking
+every claim that touched their own code — not from laziness, but because the
+claims had stopped looking like hypotheses.
 
 Suspect this most where you have been most right.
+
+**The countermeasure, and it is not "be more careful."** Nobody here was
+careless; every one of those false reports had a measurement behind it. What
+distinguishes the ones caught from the one that went out is uniform, and it is
+worth stating as a procedure:
+
+> Send an accusation only after running a control that would have refuted it —
+> not after re-reading your evidence and finding it still convincing.
+
+Of five false alarms stopped before sending, every single one was stopped by a
+control: a call that had to succeed, a path nobody held, an invented route that
+returned the same code as the real one. Not one was stopped by reading the
+draft again. Rereading confirms; only a control can contradict.
+
+This composes with the rule two sections down about controls built from their
+own subject. A control that would refute you is worth nothing if it is made out
+of the thing it is testing — a canary placed in a directory that turns out not
+to be ignored, a positive control copied from the file under test. Both of
+those passed, and both meant nothing.
 
 ## Who catches these
 

@@ -5297,12 +5297,25 @@ def build_mcp_server() -> FastMCP:
 
         stored_token = (agent.registration_token or "").strip()
         if not stored_token:
-            # Adjacent-agent auth for legacy tokenless agents: retire_agent
-            # and hard_delete_agent can be authorized by any other authenticated
-            # agent in the same project. This unsticks cleanup of pre-token
-            # agents without requiring direct SQL surgery. All other actions
-            # continue to require the target's own token.
-            if action in ("retire_agent", "hard_delete_agent"):
+            # Adjacent-agent auth for legacy tokenless agents: a bystander in
+            # the same project may retire one, and may put it back. This
+            # unsticks cleanup of pre-token agents without direct SQL surgery.
+            # All other actions continue to require the target's own token.
+            #
+            # Scoped to the reversible pair, deliberately. hard_delete_agent
+            # used to be here, which let any participant permanently destroy
+            # another identity — and a tokenless agent is not always a stale
+            # ghost. The human operator's own identity is created without a
+            # token and there is no path to issue one afterwards: minting
+            # requires authentication, authentication requires the token. So
+            # the one identity that cannot defend itself was the one anybody
+            # could delete, with no way to recreate its mailbox or its history.
+            #
+            # unretire_agent was NOT here, which made the "reversible" half
+            # one-way in exactly the same case: retiring a tokenless agent
+            # locked it out, since putting it back demanded the token it does
+            # not have. Cleanup that cannot be undone is not cleanup.
+            if action in ("retire_agent", "unretire_agent"):
                 peer = await _resolve_session_agent_for_project(ctx, project)
                 if peer is not None and peer.id != agent.id:
                     await ctx.info(
@@ -5317,7 +5330,8 @@ def build_mcp_server() -> FastMCP:
                     f"Agent '{agent.name}' does not have a registration token, so {action} cannot be authenticated. "
                     "Re-register or mint a token locally before retrying, or run this call from an MCP session "
                     "already authenticated as another agent in the same project (adjacent-agent auth is permitted "
-                    "for retire_agent and hard_delete_agent on tokenless legacy agents)."
+                    "for retire_agent and unretire_agent on tokenless legacy agents, and deliberately not for "
+                    "hard_delete_agent, which cannot be undone)."
                 ),
                 recoverable=True,
                 data={"agent_name": agent.name, "project_key": project.human_key, "action": action},

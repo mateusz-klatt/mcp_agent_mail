@@ -508,8 +508,14 @@ def export_viewer_data(
     meta_path = viewer_data_dir / "meta.json"
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return {
-        "messages": str(messages_path.relative_to(output_dir)),
-        "meta": str(meta_path.relative_to(output_dir)),
+        # as_posix(), not str(): these land in manifest["viewer"] beside the
+        # viewer.sri keys, which are already as_posix(). Under Windows str()
+        # writes "viewer\\data\\messages.json" into a manifest whose sibling
+        # keys say "viewer/data/…" — one object describing one bundle in two
+        # separator conventions, only one of which a non-Windows reader
+        # resolves.
+        "messages": messages_path.relative_to(output_dir).as_posix(),
+        "meta": meta_path.relative_to(output_dir).as_posix(),
         "meta_info": meta,
     }
 

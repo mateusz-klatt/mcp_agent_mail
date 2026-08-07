@@ -486,6 +486,12 @@ def ui_users_add(
             # Explicit --role wins; a bare password reset preserves the current role.
             effective = role or existing.role
             row = await session.get(UiUser, existing.id)
+            if row is None:
+                # Re-read in a fresh session, so the row can be gone between the
+                # lookup and the write. Reported rather than crashed on: the
+                # caller already distinguishes outcomes, and "deleted while you
+                # were typing your password" is a true thing to say.
+                return "vanished", effective
             row.password_hash = hash_password(password)
             row.role = effective
             row.session_epoch = row.session_epoch + 1  # revoke live sessions
@@ -494,6 +500,9 @@ def ui_users_add(
             return "updated", effective
 
     action, effective = _run_async(_save())
+    if action == "vanished":
+        typer.secho(f"User {username!r} was deleted while this command ran", fg="red")
+        raise typer.Exit(code=1)
     typer.secho(f"{action} user {username!r} with role {effective!r}", fg="green")
     if action == "updated":
         typer.echo("Existing browser sessions for this user were invalidated.")
@@ -548,6 +557,10 @@ def ui_users_role(
             return "last_admin"
         async with get_session() as session:
             row = await session.get(UiUser, existing.id)
+            if row is None:
+                # Same race as above; "not_found" is what the caller already
+                # prints for a user that is not there.
+                return "not_found"
             row.role = role
             session.add(row)
             await session.commit()
@@ -635,6 +648,8 @@ def _ui_users_set_disabled(username: str, disabled: bool) -> None:
             return "last_admin"
         async with get_session() as session:
             row = await session.get(UiUser, existing.id)
+            if row is None:
+                return "not_found"
             row.disabled = disabled
             # Bump the epoch so a disable takes effect on the next request rather
             # than whenever the cookie happens to expire.

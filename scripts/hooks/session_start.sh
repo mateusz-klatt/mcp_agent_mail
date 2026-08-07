@@ -20,15 +20,20 @@ AGENT="$(am_agent_name)"
 am_call ensure_project "$(jq -nc --arg k "$PROJECT" '{human_key:$k}')" >/dev/null 2>&1
 
 token="$(am_cred_get "$PROJECT" "$AGENT")"
+# Derived, not a literal. This was hardcoded "opus-5", so every host running
+# anything else published a profile that was wrong from the first second — and
+# `whois` reported it with the same confidence as a measured value. See
+# am_model_id for where it comes from and why it never returns empty.
+MODEL="$(am_model_id)"
 if [ -n "$token" ]; then
     # `name`, not `agent_name` — the latter is an unexpected-keyword validation
     # error that am_call swallows, which once made a re-registration test pass
     # while doing nothing at all.
-    args="$(jq -nc --arg p "$PROJECT" --arg n "$AGENT" --arg t "$token" \
-        '{project_key:$p,name:$n,registration_token:$t,program:"claude-code",model:"opus-5"}')"
+    args="$(jq -nc --arg p "$PROJECT" --arg n "$AGENT" --arg t "$token" --arg m "$MODEL" \
+        '{project_key:$p,name:$n,registration_token:$t,program:"claude-code",model:$m}')"
 else
-    args="$(jq -nc --arg p "$PROJECT" --arg n "$AGENT" \
-        '{project_key:$p,name:$n,program:"claude-code",model:"opus-5"}')"
+    args="$(jq -nc --arg p "$PROJECT" --arg n "$AGENT" --arg m "$MODEL" \
+        '{project_key:$p,name:$n,program:"claude-code",model:$m}')"
 fi
 
 resp="$(am_call register_agent "$args")"

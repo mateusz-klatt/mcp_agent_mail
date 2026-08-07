@@ -217,6 +217,46 @@ am_agent_name() {
     printf '%s-%s-1' "$h" "$p"
 }
 
+# The model this session is actually running, for the agent's profile.
+#
+# This used to be the literal "opus-5" written into session_start.sh, which made
+# the field wrong on every host not running that model — not stale after a
+# switch, but wrong from the first second, and wrong with the same confidence as
+# a correct value. A profile field that lies is worse than one left blank,
+# because nothing downstream can tell the two apart.
+#
+# Three sources, cheapest first. The payload is checked in both shapes because
+# the hook contract is not ours: `.model` may be a bare string or an object with
+# an id, and asking for the wrong one yields empty rather than an error.
+#
+# The transcript is the fallback that actually carries this today — every
+# assistant turn records `message.model`, and reading the LAST one is what makes
+# a mid-session `/model` switch visible. It is a fallback and not the first
+# choice because a freshly-started session has no assistant turn yet: at
+# SessionStart on a new session this file is empty or absent, which is precisely
+# when only the payload can answer.
+#
+# Never returns empty: the server rejects an empty model (EMPTY_MODEL), so a
+# blank here would fail registration outright and cost the session all
+# coordination. "unknown" is the honest answer when there is nothing to read,
+# and it is distinguishable from a real id, which "opus-5" was not.
+am_model_id() {
+    local m tp
+    m="$(am_payload_field '(.model|strings)')"
+    [ -z "$m" ] && m="$(am_payload_field '.model.id')"
+    if [ -z "$m" ]; then
+        tp="$(am_payload_field '.transcript_path')"
+        if [ -n "$tp" ] && [ -f "$tp" ]; then
+            # Last match, not first: the newest turn is the current model.
+            m="$(jq -r 'select(.message.model != null) | .message.model' \
+                 "$tp" 2>/dev/null | tail -n 1)"
+        fi
+    fi
+    m="$(printf '%s' "$m" | tr -cd '[:alnum:]._-' | cut -c1-128)"
+    [ -z "$m" ] && m="unknown"
+    printf '%s' "$m"
+}
+
 am_bearer() {
     printf '%s' "${AGENT_MAIL_TOKEN:-${HTTP_BEARER_TOKEN:-}}"
 }

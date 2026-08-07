@@ -15,7 +15,7 @@
 # Deliberately NOT marking anything read. Read state belongs to the agent, which
 # marks it after acting (mark_message_read / acknowledge_message); marking on
 # delivery would make an unacted-on message indistinguishable from a handled one.
-# Repetition is instead avoided by remembering the highest id already announced.
+# Repetition is instead avoided by remembering which ids were already announced.
 #
 # Cannot fail: an inbox check that breaks a session is worse than a late message.
 
@@ -25,6 +25,17 @@ set -uo pipefail
 
 INTERVAL="${AGENT_MAIL_INBOX_INTERVAL:-120}"
 MAX_BODY="${AGENT_MAIL_INBOX_BODY_CHARS:-1200}"
+# How many unread messages to enumerate per check. Bodies are NOT fetched for
+# these — see the two-call split below — so this is a cheap ceiling, and it must
+# stay well above any believable backlog: anything past it is invisible to this
+# hook until the newer messages are read.
+INVENTORY="${AGENT_MAIL_INBOX_INVENTORY:-200}"
+# How many NEW messages to reproduce in full. The rest are named but not quoted.
+RENDER_FULL="${AGENT_MAIL_INBOX_RENDER_FULL:-10}"
+# How many further new messages to name on one line each.
+SUMMARY_MAX="${AGENT_MAIL_INBOX_SUMMARY_MAX:-40}"
+# Announced ids retained before the low end is folded into a floor.
+KEEP_IDS="${AGENT_MAIL_INBOX_KEEP_IDS:-500}"
 
 am_read_payload
 EVENT="$(am_payload_field '.hook_event_name')"
@@ -53,28 +64,88 @@ if [ "$EVENT" != "SessionStart" ] && [ -f "$stamp" ]; then
 fi
 date +%s > "$stamp" 2>/dev/null
 
-resp="$(am_call fetch_inbox "$(jq -nc --arg p "$PROJECT" --arg a "$AGENT" --arg t "$token" \
-    '{project_key:$p,agent_name:$a,registration_token:$t,unread_only:true,limit:10,include_bodies:true}')")"
-[ -z "$resp" ] && exit 0
-printf '%s' "$resp" | jq -e 'type == "array"' >/dev/null 2>&1 || exit 0
+# ── what has already been announced ──────────────────────────────────────────
+#
+# {floor, ids}: every id at or below `floor` is settled, and `ids` lists the
+# announced ones above it.
+#
+# A high-water mark ALONE is why this needed changing. fetch_inbox orders newest
+# first and then applies the limit (app.py, `.order_by(desc(created_ts)).limit`),
+# so with more unread than the limit the hook saw only the newest page, stored
+# the top id, and every older unread message fell below the mark for good —
+# invisible from then on even once the newer ones were read. Verified against a
+# live server: 14 unread, 10 shown, the remaining 4 never announced again.
+#
+# A bare integer is the pre-existing format. It records the highest id announced
+# and says NOTHING about the ids below it, so reading it as a floor would
+# preserve on disk the exact loss this change removes. Treat it instead as a set
+# of one: on the first check after an upgrade every still-unread message is
+# announced again, including any that were stranded. Messages that are unread
+# are by definition not yet acted on, so repeating them once is the safe
+# direction, and it happens once per agent.
+state='{"floor":0,"ids":[]}'
+if [ -r "$seen" ]; then
+    raw="$(cat "$seen" 2>/dev/null)"
+    parsed="$(printf '%s' "$raw" | jq -c '
+        if type == "number" then {floor: 0, ids: [.]}
+        elif type == "object" and (.floor | type) == "number" and (.ids | type) == "array"
+            then {floor: .floor, ids: .ids}
+        else {floor: 0, ids: []} end' 2>/dev/null)"
+    [ -n "$parsed" ] && state="$parsed"
+fi
 
-last=0
-[ -r "$seen" ] && last="$(cat "$seen" 2>/dev/null)"
-case "$last" in ''|*[!0-9]*) last=0 ;; esac
+# ── call 1: enumerate, without bodies ────────────────────────────────────────
+#
+# Split into two calls so the common case — nothing new — costs one small
+# response instead of dragging every unread body across the wire every 120s.
+inv="$(am_call fetch_inbox "$(jq -nc --arg p "$PROJECT" --arg a "$AGENT" --arg t "$token" --argjson n "$INVENTORY" \
+    '{project_key:$p,agent_name:$a,registration_token:$t,unread_only:true,limit:$n,include_bodies:false}')")"
+[ -z "$inv" ] && exit 0
+printf '%s' "$inv" | jq -e 'type == "array"' >/dev/null 2>&1 || exit 0
 
-# Fresh = arrived since the last announcement. Older unread messages are counted
-# but not repeated verbatim: a message the agent has chosen not to act on should
-# not re-enter its context in full on every check, or the channel becomes noise
-# and gets ignored — the exact failure mode of the poll this replaces.
-fresh="$(printf '%s' "$resp" | jq -c --argjson last "$last" '[.[] | select(.id > $last)]' 2>/dev/null)"
+fresh="$(printf '%s' "$inv" | jq -c --argjson st "$state" \
+    '[.[] | select(.id > $st.floor and ((.id) as $i | $st.ids | index($i) | not))]' 2>/dev/null)"
+[ -z "$fresh" ] && exit 0
 count_fresh="$(printf '%s' "$fresh" | jq 'length' 2>/dev/null || echo 0)"
-count_all="$(printf '%s' "$resp" | jq 'length' 2>/dev/null || echo 0)"
 [ "$count_fresh" -eq 0 ] 2>/dev/null && exit 0
 
-highest="$(printf '%s' "$fresh" | jq '[.[].id] | max' 2>/dev/null)"
-[ -n "$highest" ] && [ "$highest" != "null" ] && printf '%s' "$highest" > "$seen" 2>/dev/null
+# ── call 2: bodies, for the few that get quoted in full ──────────────────────
+#
+# fetch_inbox has no id filter and no offset, so ask for a prefix long enough to
+# cover the newest RENDER_FULL fresh items and then select by id. The slack
+# absorbs messages arriving between the two calls, which would otherwise push
+# the last wanted item off the end.
+cutoff="$(printf '%s' "$inv" | jq --argjson st "$state" --argjson n "$RENDER_FULL" '
+    [ to_entries[]
+      | select(.value.id > $st.floor and ((.value.id) as $i | $st.ids | index($i) | not))
+      | .key ]
+    | (.[$n - 1] // .[-1] // -1) + 1 + 10' 2>/dev/null)"
+case "$cutoff" in ''|*[!0-9]*) cutoff="$RENDER_FULL" ;; esac
 
-text="$(printf '%s' "$fresh" | jq -r --argjson maxb "$MAX_BODY" '
+want="$(printf '%s' "$fresh" | jq -c --argjson n "$RENDER_FULL" '[.[0:$n][].id]' 2>/dev/null)"
+[ -z "$want" ] && want='[]'
+
+bodies="$(am_call fetch_inbox "$(jq -nc --arg p "$PROJECT" --arg a "$AGENT" --arg t "$token" --argjson n "$cutoff" \
+    '{project_key:$p,agent_name:$a,registration_token:$t,unread_only:true,limit:$n,include_bodies:true}')")"
+printf '%s' "$bodies" | jq -e 'type == "array"' >/dev/null 2>&1 || bodies='[]'
+
+full="$(printf '%s' "$bodies" | jq -c --argjson want "$want" \
+    '[.[] | select(.id as $i | $want | index($i))]' 2>/dev/null)"
+[ -z "$full" ] && full='[]'
+
+# Whatever call 2 failed to return is named on one line rather than dropped: a
+# message the agent is never told about is the failure this hook exists to
+# prevent, and a subject line still says who to go and ask.
+rest="$(jq -nc --argjson fresh "$fresh" --argjson full "$full" --argjson n "$SUMMARY_MAX" \
+    '[$full[].id] as $shown | [$fresh[] | select(.id as $i | $shown | index($i) | not)] | .[0:$n]' 2>/dev/null)"
+[ -z "$rest" ] && rest='[]'
+
+announced="$(jq -nc --argjson full "$full" --argjson rest "$rest" '[$full[].id] + [$rest[].id]' 2>/dev/null)"
+[ -z "$announced" ] && exit 0
+printf '%s' "$announced" | jq -e 'length > 0' >/dev/null 2>&1 || exit 0
+
+# ── render ───────────────────────────────────────────────────────────────────
+text="$(printf '%s' "$full" | jq -r --argjson maxb "$MAX_BODY" '
     [ .[] |
       "── from \(.from // .sender_name // "?")"
       + (if (.importance // "normal") != "normal" then "  [\(.importance)]" else "" end)
@@ -82,15 +153,51 @@ text="$(printf '%s' "$fresh" | jq -r --argjson maxb "$MAX_BODY" '
       + "\nsubject: \(.subject // "(no subject)")\n"
       + ((.body_md // "") | if length > $maxb then .[0:$maxb] + "\n…(truncated)" else . end)
     ] | join("\n\n")' 2>/dev/null)"
-[ -z "$text" ] && exit 0
 
-header="Agent Mail: ${count_fresh} new message(s) for ${AGENT}."
-older=$((count_all - count_fresh))
-[ "$older" -gt 0 ] 2>/dev/null && header="${header} ${older} older unread not repeated here."
+listed="$(printf '%s' "$rest" | jq -r '
+    [ .[] | "  #\(.id)  \(.from // .sender_name // "?"): \(.subject // "(no subject)")"
+      + (if (.importance // "normal") != "normal" then "  [\(.importance)]" else "" end)
+      + (if (.ack_required // false) then "  [ACK REQUIRED]" else "" end)
+    ] | join("\n")' 2>/dev/null)"
+
+count_all="$(printf '%s' "$inv" | jq 'length' 2>/dev/null || echo 0)"
+total="$count_all"
+[ "$count_all" -ge "$INVENTORY" ] 2>/dev/null && total="${INVENTORY}+"
+header="Agent Mail: ${count_fresh} new message(s) for ${AGENT}; ${total} unread in total."
+
+body=""
+[ -n "$text" ] && body="${text}"
+if [ -n "$listed" ]; then
+    [ -n "$body" ] && body="${body}
+
+"
+    body="${body}Also new, not quoted here — fetch_inbox by id to read:
+${listed}"
+fi
+# Only the ids actually named above may be recorded as announced.
+beyond=$((count_fresh - $(printf '%s' "$announced" | jq 'length' 2>/dev/null || echo 0)))
+if [ "$beyond" -gt 0 ] 2>/dev/null; then
+    body="${body}
+  …and ${beyond} more new, held over to the next check."
+fi
+[ -z "$body" ] && exit 0
+
+# Record only what was named, so anything held over is announced next time
+# rather than skipped. Trimming drops the oldest ids and folds them into the
+# floor, which keeps this file bounded without ever stepping over an id that
+# was never shown.
+new_state="$(jq -nc --argjson st "$state" --argjson add "$announced" --argjson keep "$KEEP_IDS" '
+    (($st.ids + $add) | unique | sort | reverse) as $all
+    | if ($all | length) > $keep
+        then ($all[0:$keep]) as $kept | {floor: (($kept | min) - 1), ids: $kept}
+        else {floor: $st.floor, ids: $all} end' 2>/dev/null)"
+if [ -n "$new_state" ]; then
+    printf '%s' "$new_state" > "${seen}.tmp" 2>/dev/null && mv -f "${seen}.tmp" "$seen" 2>/dev/null
+fi
 
 am_emit_context "$EVENT" "${header}
 
-${text}
+${body}
 
 Reply with send_message/reply_message, and mark handled with mark_message_read (or acknowledge_message when ACK is required) — otherwise it stays unread for everyone reviewing the mailbox."
 exit 0

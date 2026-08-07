@@ -297,8 +297,20 @@ am_model_id() {
 # the next hook instead of recording a change that never reached the server.
 # Returns 0 always: this runs inside hooks, and bookkeeping must never fail the
 # session it is only supposed to describe.
+# $4 is the program, defaulting to claude-code. That default is correct today and
+# will not stay correct by itself: `session_start.sh` is copied ONLY by
+# integrate_claude_code.sh (measured — codex installs codex_notify.sh, gemini and
+# factory-droid install check_inbox.sh, and neither of those calls register_agent
+# at all), so every present caller of this really is Claude Code.
+#
+# It is a parameter rather than another literal because this function lives in
+# the file every hook sources, including the two that ship with other CLIs. The
+# first non-Claude hook to call it would otherwise assert "claude-code" about
+# itself — silently, and with a value indistinguishable from a measured one.
+# That is the same defect that made `model` wrong for a year, and putting it back
+# one line away from where it was just fixed would be hard to defend.
 am_sync_model() {
-    local proj="$1" agent="$2" tok="$3" want have cache
+    local proj="$1" agent="$2" tok="$3" prog="${4:-claude-code}" want have cache
     want="$(am_model_id)"
     case "$want" in ''|unknown) return 0 ;; esac
     cache="${AM_STATE_DIR}/model/$(printf '%s|%s' "$proj" "$agent" \
@@ -307,8 +319,8 @@ am_sync_model() {
     [ "$want" = "$have" ] && return 0
     mkdir -p "$(dirname "$cache")" 2>/dev/null || return 0
     if am_call register_agent "$(jq -nc --arg p "$proj" --arg n "$agent" \
-            --arg t "$tok" --arg m "$want" \
-            '{project_key:$p,name:$n,registration_token:$t,program:"claude-code",model:$m}')" \
+            --arg t "$tok" --arg m "$want" --arg g "$prog" \
+            '{project_key:$p,name:$n,registration_token:$t,program:$g,model:$m}')" \
             >/dev/null 2>&1; then
         printf '%s' "$want" > "$cache" 2>/dev/null || true
     fi

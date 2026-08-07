@@ -19,6 +19,7 @@ import pytest
 from fastmcp import Client
 
 from mcp_agent_mail.app import build_mcp_server
+from tests.keys import pkey
 
 logger = logging.getLogger(__name__)
 
@@ -74,12 +75,12 @@ async def test_summarize_empty_window(isolated_env):
     """No messages in window -> 'No activity' response, no LLM call."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await _setup_project_with_agents(client, "/test/sum-empty", 1)
+        await _setup_project_with_agents(client, pkey("test/sum-empty"), 1)
 
         result = await client.call_tool(
             "summarize_recent",
             {
-                "project_key": "/test/sum-empty",
+                "project_key": pkey("test/sum-empty"),
                 "since_hours": 1.0,
                 "llm_mode": False,
             },
@@ -101,14 +102,14 @@ async def test_summarize_single_thread(isolated_env):
     """Summarize a single thread with a few messages."""
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/sum-single", 2)
+        names = await _setup_project_with_agents(client, pkey("test/sum-single"), 2)
         sender, receiver = names[0], names[1]
 
         for i in range(3):
             await client.call_tool(
                 "send_message",
                 {
-                    "project_key": "/test/sum-single",
+                    "project_key": pkey("test/sum-single"),
                     "sender_name": sender,
                     "to": [receiver],
                     "subject": f"Thread msg {i}",
@@ -120,7 +121,7 @@ async def test_summarize_single_thread(isolated_env):
         result = await client.call_tool(
             "summarize_recent",
             {
-                "project_key": "/test/sum-single",
+                "project_key": pkey("test/sum-single"),
                 "since_hours": 1.0,
                 "llm_mode": False,
             },
@@ -147,14 +148,14 @@ async def test_summarize_multiple_threads(isolated_env):
     """Summarize messages across multiple threads."""
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/sum-multi", 2)
+        names = await _setup_project_with_agents(client, pkey("test/sum-multi"), 2)
         sender, receiver = names[0], names[1]
 
         # Thread T1
         await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/sum-multi",
+                "project_key": pkey("test/sum-multi"),
                 "sender_name": sender,
                 "to": [receiver],
                 "subject": "T1 msg",
@@ -166,7 +167,7 @@ async def test_summarize_multiple_threads(isolated_env):
         await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/sum-multi",
+                "project_key": pkey("test/sum-multi"),
                 "sender_name": receiver,
                 "to": [sender],
                 "subject": "T2 msg",
@@ -178,7 +179,7 @@ async def test_summarize_multiple_threads(isolated_env):
         result = await client.call_tool(
             "summarize_recent",
             {
-                "project_key": "/test/sum-multi",
+                "project_key": pkey("test/sum-multi"),
                 "since_hours": 1.0,
                 "llm_mode": False,
             },
@@ -201,12 +202,12 @@ async def test_summarize_stores_in_db(isolated_env):
     """After summarization, fetch_summary returns the stored summary."""
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/sum-store", 2)
+        names = await _setup_project_with_agents(client, pkey("test/sum-store"), 2)
 
         await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/sum-store",
+                "project_key": pkey("test/sum-store"),
                 "sender_name": names[0],
                 "to": [names[1]],
                 "subject": "Store test",
@@ -218,7 +219,7 @@ async def test_summarize_stores_in_db(isolated_env):
         sum_result = await client.call_tool(
             "summarize_recent",
             {
-                "project_key": "/test/sum-store",
+                "project_key": pkey("test/sum-store"),
                 "since_hours": 1.0,
                 "llm_mode": False,
             },
@@ -230,7 +231,7 @@ async def test_summarize_stores_in_db(isolated_env):
         fetch_result = await client.call_tool(
             "fetch_summary",
             {
-                "project_key": "/test/sum-store",
+                "project_key": pkey("test/sum-store"),
                 "since_hours": 1.0,
                 "limit": 5,
             },
@@ -251,12 +252,12 @@ async def test_summarize_idempotent(isolated_env):
     """Same time window twice returns cached summary (no duplicate)."""
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/sum-idem", 2)
+        names = await _setup_project_with_agents(client, pkey("test/sum-idem"), 2)
 
         await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/sum-idem",
+                "project_key": pkey("test/sum-idem"),
                 "sender_name": names[0],
                 "to": [names[1]],
                 "subject": "Idempotency test",
@@ -268,7 +269,7 @@ async def test_summarize_idempotent(isolated_env):
         r1 = await client.call_tool(
             "summarize_recent",
             {
-                "project_key": "/test/sum-idem",
+                "project_key": pkey("test/sum-idem"),
                 "since_hours": 1.0,
                 "llm_mode": False,
             },
@@ -281,7 +282,7 @@ async def test_summarize_idempotent(isolated_env):
         r2 = await client.call_tool(
             "summarize_recent",
             {
-                "project_key": "/test/sum-idem",
+                "project_key": pkey("test/sum-idem"),
                 "since_hours": 1.0,
                 "llm_mode": False,
             },
@@ -301,12 +302,12 @@ async def test_fetch_summary_limit(isolated_env):
     """fetch_summary with limit=1 returns at most 1 summary."""
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/sum-limit", 2)
+        names = await _setup_project_with_agents(client, pkey("test/sum-limit"), 2)
 
         await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/sum-limit",
+                "project_key": pkey("test/sum-limit"),
                 "sender_name": names[0],
                 "to": [names[1]],
                 "subject": "Limit test",
@@ -318,7 +319,7 @@ async def test_fetch_summary_limit(isolated_env):
         await client.call_tool(
             "summarize_recent",
             {
-                "project_key": "/test/sum-limit",
+                "project_key": pkey("test/sum-limit"),
                 "since_hours": 1.0,
                 "llm_mode": False,
             },
@@ -328,7 +329,7 @@ async def test_fetch_summary_limit(isolated_env):
         result = await client.call_tool(
             "fetch_summary",
             {
-                "project_key": "/test/sum-limit",
+                "project_key": pkey("test/sum-limit"),
                 "since_hours": 24.0,
                 "limit": 1,
             },
@@ -342,12 +343,12 @@ async def test_fetch_summary_empty(isolated_env):
     """fetch_summary with no summaries returns empty list."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await _setup_project_with_agents(client, "/test/sum-fetch-empty", 1)
+        await _setup_project_with_agents(client, pkey("test/sum-fetch-empty"), 1)
 
         result = await client.call_tool(
             "fetch_summary",
             {
-                "project_key": "/test/sum-fetch-empty",
+                "project_key": pkey("test/sum-fetch-empty"),
                 "since_hours": 1.0,
             },
         )
@@ -394,12 +395,12 @@ async def test_summarize_with_llm_mock(isolated_env, monkeypatch):
 
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/sum-llm", 2)
+        names = await _setup_project_with_agents(client, pkey("test/sum-llm"), 2)
 
         await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/sum-llm",
+                "project_key": pkey("test/sum-llm"),
                 "sender_name": names[0],
                 "to": [names[1]],
                 "subject": "LLM test msg",
@@ -410,7 +411,7 @@ async def test_summarize_with_llm_mock(isolated_env, monkeypatch):
         result = await client.call_tool(
             "summarize_recent",
             {
-                "project_key": "/test/sum-llm",
+                "project_key": pkey("test/sum-llm"),
                 "since_hours": 1.0,
                 "llm_mode": True,
             },

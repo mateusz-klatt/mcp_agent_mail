@@ -10,6 +10,7 @@ from fastmcp.exceptions import ToolError
 from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.utils import slugify
+from tests.keys import pkey
 
 
 @pytest.mark.asyncio
@@ -21,7 +22,7 @@ async def test_contact_blocked_and_contacts_only(isolated_env, monkeypatch):
 
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         for name in ("GreenCastle", "BlueLake"):
             await client.call_tool(
                 "register_agent",
@@ -73,7 +74,7 @@ async def test_contact_auto_allows_file_reservation_overlap(isolated_env, monkey
 
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
@@ -127,8 +128,8 @@ async def test_contact_auto_allows_file_reservation_overlap(isolated_env, monkey
 async def test_cross_project_contact_and_delivery(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
-        await client.call_tool("ensure_project", {"human_key": "/frontend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
+        await client.call_tool("ensure_project", {"human_key": pkey("frontend")})
         await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
@@ -164,7 +165,7 @@ async def test_cross_project_contact_and_delivery(isolated_env):
             },
         )
         deliveries = sent.data.get("deliveries") or []
-        assert deliveries and any(d.get("project") in {"Frontend", "/frontend"} for d in deliveries)
+        assert deliveries and any(d.get("project") in {"Frontend", pkey("frontend")} for d in deliveries)
 
         # Verify appears in Frontend inbox
         inbox_blocks = await client.read_resource("resource://inbox/BlueLake?project=Frontend&limit=10")
@@ -177,7 +178,7 @@ async def test_cross_project_contact_and_delivery(isolated_env):
 async def test_macro_contact_handshake_welcome(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
@@ -211,7 +212,7 @@ async def test_macro_contact_handshake_welcome(isolated_env):
 async def test_macro_contact_handshake_rejects_partial_welcome(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
@@ -238,7 +239,7 @@ async def test_macro_contact_handshake_rejects_partial_welcome(isolated_env):
 async def test_macro_contact_handshake_rejects_welcome_without_auto_accept(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
@@ -270,7 +271,7 @@ async def test_macro_contact_handshake_rejects_welcome_without_auto_accept(isola
 async def test_macro_contact_handshake_rejects_same_agent_same_project(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
@@ -336,7 +337,7 @@ async def test_macro_contact_handshake_cross_project_welcome(isolated_env):
 async def test_macro_contact_handshake_auto_accept_requires_target_auth(isolated_env):
     server = build_mcp_server()
     async with Client(server) as bootstrap_client:
-        await bootstrap_client.call_tool("ensure_project", {"human_key": "/backend"})
+        await bootstrap_client.call_tool("ensure_project", {"human_key": pkey("backend")})
         green = await bootstrap_client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
@@ -404,14 +405,14 @@ async def test_macro_contact_handshake_auto_accept_requires_target_auth(isolated
 async def test_macro_contact_handshake_reuses_existing_approval_without_target_auth(isolated_env):
     server = build_mcp_server()
     async with Client(server) as bootstrap_client:
-        await bootstrap_client.call_tool("ensure_project", {"human_key": "/backend-reuse-approved"})
+        await bootstrap_client.call_tool("ensure_project", {"human_key": pkey("backend-reuse-approved")})
         green = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": "/backend-reuse-approved", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {"project_key": pkey("backend-reuse-approved"), "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
         )
         blue = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": "/backend-reuse-approved", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": pkey("backend-reuse-approved"), "program": "codex", "model": "gpt-5", "name": "BlueLake"},
         )
         green_token = green.data["registration_token"]
         blue_token = blue.data["registration_token"]
@@ -419,7 +420,7 @@ async def test_macro_contact_handshake_reuses_existing_approval_without_target_a
         await bootstrap_client.call_tool(
             "request_contact",
             {
-                "project_key": "/backend-reuse-approved",
+                "project_key": pkey("backend-reuse-approved"),
                 "from_agent": "GreenCastle",
                 "to_agent": "BlueLake",
                 "registration_token": green_token,
@@ -428,7 +429,7 @@ async def test_macro_contact_handshake_reuses_existing_approval_without_target_a
         await bootstrap_client.call_tool(
             "respond_contact",
             {
-                "project_key": "/backend-reuse-approved",
+                "project_key": pkey("backend-reuse-approved"),
                 "to_agent": "BlueLake",
                 "from_agent": "GreenCastle",
                 "accept": True,
@@ -440,7 +441,7 @@ async def test_macro_contact_handshake_reuses_existing_approval_without_target_a
         res = await requester_client.call_tool(
             "macro_contact_handshake",
             {
-                "project_key": "/backend-reuse-approved",
+                "project_key": pkey("backend-reuse-approved"),
                 "requester": "GreenCastle",
                 "target": "BlueLake",
                 "auto_accept": True,
@@ -460,7 +461,7 @@ async def test_macro_contact_handshake_reuses_existing_approval_without_target_a
         inbox = await recipient_client.call_tool(
             "fetch_inbox",
             {
-                "project_key": "/backend-reuse-approved",
+                "project_key": pkey("backend-reuse-approved"),
                 "agent_name": "BlueLake",
                 "registration_token": blue_token,
                 "include_bodies": True,

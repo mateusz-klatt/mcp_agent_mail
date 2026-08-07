@@ -33,6 +33,7 @@ from sqlmodel import select
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import get_session
 from mcp_agent_mail.models import Agent, Project
+from tests.keys import pkey
 
 # ============================================================================
 # Test: Invalid project_key
@@ -80,7 +81,7 @@ async def test_register_agent_invalid_name_format(isolated_env):
     """register_agent should reject invalid agent name formats or auto-generate valid ones."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/invalidname"})
+        await client.call_tool("ensure_project", {"human_key": pkey("invalidname")})
 
         # Single word name (not adjective+noun) - API may reject or auto-generate
         # Either behavior is acceptable; we just verify no crash
@@ -112,7 +113,7 @@ async def test_send_message_nonexistent_agent(isolated_env):
     """send_message should fail for non-existent sender agent."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/nonexistentagent"})
+        await client.call_tool("ensure_project", {"human_key": pkey("nonexistentagent")})
 
         try:
             await client.call_tool(
@@ -136,7 +137,7 @@ async def test_send_message_nonexistent_recipient(isolated_env):
     """send_message should fail for non-existent recipient."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/nonexistentrecip"})
+        await client.call_tool("ensure_project", {"human_key": pkey("nonexistentrecip")})
         agent_result = await client.call_tool(
             "register_agent",
             {"project_key": "NonexistentRecip", "program": "test", "model": "test"},
@@ -171,7 +172,7 @@ async def test_placeholder_detection_your_project(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
         try:
-            result = await client.call_tool("ensure_project", {"human_key": "/YOUR_PROJECT"})
+            result = await client.call_tool("ensure_project", {"human_key": pkey("YOUR_PROJECT")})
             # If it succeeded, project was created (placeholder detection may just warn)
             # Verify we at least got a valid response
             assert result.data is not None
@@ -188,7 +189,7 @@ async def test_placeholder_detection_your_agent_name(isolated_env):
     """Should detect placeholder agent names like YOUR_AGENT_NAME - either reject or warn."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/placeholderagent"})
+        await client.call_tool("ensure_project", {"human_key": pkey("placeholderagent")})
 
         try:
             result = await client.call_tool(
@@ -225,7 +226,7 @@ async def test_send_message_empty_recipients(isolated_env):
     """
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/emptyrecip"})
+        await client.call_tool("ensure_project", {"human_key": pkey("emptyrecip")})
         agent_result = await client.call_tool(
             "register_agent",
             {"project_key": "EmptyRecip", "program": "test", "model": "test"},
@@ -252,11 +253,11 @@ async def test_hard_delete_project_rejects_legacy_tokenless_project(isolated_env
     """Legacy projects with tokenless agents should not bypass hard-delete auth."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/legacy/no-token"})
+        await client.call_tool("ensure_project", {"human_key": pkey("legacy/no-token")})
 
     async with get_session() as session:
         project = (
-            await session.execute(select(Project).where(Project.human_key == "/legacy/no-token"))
+            await session.execute(select(Project).where(Project.human_key == pkey("legacy/no-token")))
         ).scalars().one()
         session.add(
             Agent(
@@ -273,7 +274,7 @@ async def test_hard_delete_project_rejects_legacy_tokenless_project(isolated_env
         with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
                 "hard_delete_project",
-                {"project_key": "/legacy/no-token", "confirmation": "I UNDERSTAND"},
+                {"project_key": pkey("legacy/no-token"), "confirmation": "I UNDERSTAND"},
             )
         err = str(exc_info.value).lower()
         assert "registration token" in err or "authenticated" in err
@@ -283,12 +284,12 @@ async def test_hard_delete_project_rejects_legacy_tokenless_project(isolated_env
 async def test_hard_delete_project_removes_archive_tree(isolated_env, tmp_path):
     server = build_mcp_server()
     async with Client(server) as client:
-        project_result = await client.call_tool("ensure_project", {"human_key": "/deletable/project"})
+        project_result = await client.call_tool("ensure_project", {"human_key": pkey("deletable/project")})
         project_payload = project_result.data.get("project") or project_result.data
         slug = project_payload["slug"]
         agent_result = await client.call_tool(
             "register_agent",
-            {"project_key": "/deletable/project", "program": "test", "model": "test"},
+            {"project_key": pkey("deletable/project"), "program": "test", "model": "test"},
         )
         registration_token = agent_result.data["registration_token"]
 
@@ -299,7 +300,7 @@ async def test_hard_delete_project_removes_archive_tree(isolated_env, tmp_path):
         result = await client.call_tool(
             "hard_delete_project",
             {
-                "project_key": "/deletable/project",
+                "project_key": pkey("deletable/project"),
                 "confirmation": "I UNDERSTAND",
                 "registration_token": registration_token,
             },
@@ -314,12 +315,12 @@ async def test_hard_delete_project_removes_archive_tree(isolated_env, tmp_path):
 async def test_hard_delete_agent_removes_archive_tree(isolated_env, tmp_path):
     server = build_mcp_server()
     async with Client(server) as client:
-        project_result = await client.call_tool("ensure_project", {"human_key": "/deletable/agent"})
+        project_result = await client.call_tool("ensure_project", {"human_key": pkey("deletable/agent")})
         project_payload = project_result.data.get("project") or project_result.data
         slug = project_payload["slug"]
         agent_result = await client.call_tool(
             "register_agent",
-            {"project_key": "/deletable/agent", "program": "test", "model": "test"},
+            {"project_key": pkey("deletable/agent"), "program": "test", "model": "test"},
         )
         agent_name = agent_result.data["name"]
         registration_token = agent_result.data["registration_token"]
@@ -331,7 +332,7 @@ async def test_hard_delete_agent_removes_archive_tree(isolated_env, tmp_path):
         result = await client.call_tool(
             "hard_delete_agent",
             {
-                "project_key": "/deletable/agent",
+                "project_key": pkey("deletable/agent"),
                 "agent_name": agent_name,
                 "confirmation": "I UNDERSTAND",
                 "registration_token": registration_token,
@@ -352,18 +353,18 @@ async def test_hard_delete_agent_legacy_null_token_via_adjacent_agent(isolated_e
     """
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/legacy/cleanup"})
+        await client.call_tool("ensure_project", {"human_key": pkey("legacy/cleanup")})
 
         # Create two agents in the project.
         legacy_result = await client.call_tool(
             "register_agent",
-            {"project_key": "/legacy/cleanup", "program": "legacy", "model": "legacy"},
+            {"project_key": pkey("legacy/cleanup"), "program": "legacy", "model": "legacy"},
         )
         legacy_name = legacy_result.data["name"]
 
         peer_result = await client.call_tool(
             "register_agent",
-            {"project_key": "/legacy/cleanup", "program": "peer", "model": "peer"},
+            {"project_key": pkey("legacy/cleanup"), "program": "peer", "model": "peer"},
         )
         peer_token = peer_result.data["registration_token"]
 
@@ -381,7 +382,7 @@ async def test_hard_delete_agent_legacy_null_token_via_adjacent_agent(isolated_e
         await client.call_tool(
             "fetch_inbox",
             {
-                "project_key": "/legacy/cleanup",
+                "project_key": pkey("legacy/cleanup"),
                 "agent_name": peer_result.data["name"],
                 "registration_token": peer_token,
             },
@@ -391,7 +392,7 @@ async def test_hard_delete_agent_legacy_null_token_via_adjacent_agent(isolated_e
         result = await client.call_tool(
             "hard_delete_agent",
             {
-                "project_key": "/legacy/cleanup",
+                "project_key": pkey("legacy/cleanup"),
                 "agent_name": legacy_name,
                 "confirmation": "I UNDERSTAND",
             },
@@ -412,10 +413,10 @@ async def test_hard_delete_agent_null_token_without_peer_rejected(isolated_env):
 
     # Session 1: create the agent.
     async with Client(server) as setup_client:
-        await setup_client.call_tool("ensure_project", {"human_key": "/legacy/nopeer"})
+        await setup_client.call_tool("ensure_project", {"human_key": pkey("legacy/nopeer")})
         lone_result = await setup_client.call_tool(
             "register_agent",
-            {"project_key": "/legacy/nopeer", "program": "lone", "model": "lone"},
+            {"project_key": pkey("legacy/nopeer"), "program": "lone", "model": "lone"},
         )
         lone_name = lone_result.data["name"]
 
@@ -435,7 +436,7 @@ async def test_hard_delete_agent_null_token_without_peer_rejected(isolated_env):
             await attack_client.call_tool(
                 "hard_delete_agent",
                 {
-                    "project_key": "/legacy/nopeer",
+                    "project_key": pkey("legacy/nopeer"),
                     "agent_name": lone_name,
                     "confirmation": "I UNDERSTAND",
                 },
@@ -447,7 +448,7 @@ async def test_send_message_empty_subject(isolated_env):
     """send_message should handle empty subject gracefully or reject."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/emptysubject"})
+        await client.call_tool("ensure_project", {"human_key": pkey("emptysubject")})
         agent_result = await client.call_tool(
             "register_agent",
             {"project_key": "EmptySubject", "program": "test", "model": "test"},
@@ -493,7 +494,7 @@ async def test_set_contact_policy_invalid_policy(isolated_env):
     """
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/invalidpolicy"})
+        await client.call_tool("ensure_project", {"human_key": pkey("invalidpolicy")})
         agent_result = await client.call_tool(
             "register_agent",
             {"project_key": "InvalidPolicy", "program": "test", "model": "test"},
@@ -533,7 +534,7 @@ async def test_file_reservation_ttl_below_minimum(isolated_env):
     """file_reservation_paths warns but allows TTL below 60 seconds."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/ttlminimum"})
+        await client.call_tool("ensure_project", {"human_key": pkey("ttlminimum")})
         agent_result = await client.call_tool(
             "register_agent",
             {"project_key": "TtlMinimum", "program": "test", "model": "test"},
@@ -561,7 +562,7 @@ async def test_file_reservation_empty_paths(isolated_env):
     """file_reservation_paths should reject empty paths list."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/emptypaths"})
+        await client.call_tool("ensure_project", {"human_key": pkey("emptypaths")})
         agent_result = await client.call_tool(
             "register_agent",
             {"project_key": "EmptyPaths", "program": "test", "model": "test"},
@@ -588,7 +589,7 @@ async def test_file_reservation_nonexistent_agent(isolated_env):
     """file_reservation_paths should fail for non-existent agent."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/reservenoagent"})
+        await client.call_tool("ensure_project", {"human_key": pkey("reservenoagent")})
 
         try:
             await client.call_tool(
@@ -634,7 +635,7 @@ async def test_whois_nonexistent_agent(isolated_env):
     """whois should fail for non-existent agent."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/whoisnoagent"})
+        await client.call_tool("ensure_project", {"human_key": pkey("whoisnoagent")})
 
         try:
             await client.call_tool(
@@ -679,7 +680,7 @@ async def test_fetch_inbox_nonexistent_agent(isolated_env):
     """fetch_inbox should fail for non-existent agent."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/inboxnoagent"})
+        await client.call_tool("ensure_project", {"human_key": pkey("inboxnoagent")})
 
         try:
             await client.call_tool(
@@ -705,7 +706,7 @@ async def test_mark_message_read_nonexistent_message(isolated_env):
     """mark_message_read should fail for non-existent message."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/marknonemsg"})
+        await client.call_tool("ensure_project", {"human_key": pkey("marknonemsg")})
         agent_result = await client.call_tool(
             "register_agent",
             {"project_key": "MarkNoneMsg", "program": "test", "model": "test"},
@@ -732,7 +733,7 @@ async def test_acknowledge_message_nonexistent_message(isolated_env):
     """acknowledge_message should fail for non-existent message."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/acknonemsg"})
+        await client.call_tool("ensure_project", {"human_key": pkey("acknonemsg")})
         agent_result = await client.call_tool(
             "register_agent",
             {"project_key": "AckNoneMsg", "program": "test", "model": "test"},
@@ -764,7 +765,7 @@ async def test_reply_message_nonexistent_original(isolated_env):
     """reply_message should fail for non-existent original message."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/replynonemsg"})
+        await client.call_tool("ensure_project", {"human_key": pkey("replynonemsg")})
         agent_result = await client.call_tool(
             "register_agent",
             {"project_key": "ReplyNoneMsg", "program": "test", "model": "test"},
@@ -797,7 +798,7 @@ async def test_release_file_reservations_nonexistent_agent(isolated_env):
     """release_file_reservations should fail for non-existent agent."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/releasenoagent"})
+        await client.call_tool("ensure_project", {"human_key": pkey("releasenoagent")})
 
         try:
             await client.call_tool(
@@ -818,7 +819,7 @@ async def test_release_file_reservations_rejects_empty_paths(isolated_env):
     """release_file_reservations should reject an explicit empty paths filter."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/releaseemptypaths"})
+        await client.call_tool("ensure_project", {"human_key": pkey("releaseemptypaths")})
         agent_result = await client.call_tool(
             "register_agent",
             {"project_key": "ReleaseEmptyPaths", "program": "test", "model": "test"},
@@ -853,7 +854,7 @@ async def test_release_file_reservations_rejects_empty_ids(isolated_env):
     """release_file_reservations should reject an explicit empty id filter."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/releaseemptyids"})
+        await client.call_tool("ensure_project", {"human_key": pkey("releaseemptyids")})
         agent_result = await client.call_tool(
             "register_agent",
             {"project_key": "ReleaseEmptyIds", "program": "test", "model": "test"},
@@ -888,7 +889,7 @@ async def test_renew_file_reservations_nonexistent_agent(isolated_env):
     """renew_file_reservations should fail for non-existent agent."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/renewnoagent"})
+        await client.call_tool("ensure_project", {"human_key": pkey("renewnoagent")})
 
         try:
             await client.call_tool(
@@ -909,7 +910,7 @@ async def test_renew_file_reservations_rejects_empty_paths(isolated_env):
     """renew_file_reservations should reject an explicit empty paths filter."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/renewemptypaths"})
+        await client.call_tool("ensure_project", {"human_key": pkey("renewemptypaths")})
         agent_result = await client.call_tool(
             "register_agent",
             {"project_key": "RenewEmptyPaths", "program": "test", "model": "test"},
@@ -944,7 +945,7 @@ async def test_renew_file_reservations_rejects_empty_ids(isolated_env):
     """renew_file_reservations should reject an explicit empty id filter."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/renewemptyids"})
+        await client.call_tool("ensure_project", {"human_key": pkey("renewemptyids")})
         agent_result = await client.call_tool(
             "register_agent",
             {"project_key": "RenewEmptyIds", "program": "test", "model": "test"},
@@ -1008,7 +1009,7 @@ async def test_request_contact_nonexistent_agent(isolated_env):
     """request_contact should fail for non-existent from_agent."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/contactnoagent"})
+        await client.call_tool("ensure_project", {"human_key": pkey("contactnoagent")})
         agent_result = await client.call_tool(
             "register_agent",
             {"project_key": "ContactNoAgent", "program": "test", "model": "test"},
@@ -1035,7 +1036,7 @@ async def test_respond_contact_nonexistent_agent(isolated_env):
     """respond_contact should fail for non-existent to_agent."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/respondnoagent"})
+        await client.call_tool("ensure_project", {"human_key": pkey("respondnoagent")})
         agent_result = await client.call_tool(
             "register_agent",
             {"project_key": "RespondNoAgent", "program": "test", "model": "test"},

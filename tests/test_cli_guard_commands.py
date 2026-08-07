@@ -27,6 +27,7 @@ from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.models import Agent, Project
 from mcp_agent_mail.storage import ensure_archive
 from mcp_agent_mail.utils import slugify
+from tests.keys import pkey
 
 if TYPE_CHECKING:
     from mcp_agent_mail.storage import ProjectArchive
@@ -212,7 +213,7 @@ class TestGuardInstall:
 
     def test_guard_install_by_human_key(self, tmp_path: Path, isolated_env, monkeypatch):
         """Test guard install using human_key instead of slug."""
-        asyncio.run(_seed_project(slug="myslug", human_key="/my/project/path"))
+        asyncio.run(_seed_project(slug="myslug", human_key=pkey("my/project/path")))
 
         monkeypatch.setenv("WORKTREES_ENABLED", "1")
         get_settings.cache_clear()
@@ -221,7 +222,7 @@ class TestGuardInstall:
         repo_dir.mkdir(parents=True)
         _init_git_repo(repo_dir)
 
-        result = runner.invoke(app, ["guard", "install", "/my/project/path", str(repo_dir)])
+        result = runner.invoke(app, ["guard", "install", pkey("my/project/path"), str(repo_dir)])
         assert result.exit_code == 0
         assert "Installed guard" in result.output
 

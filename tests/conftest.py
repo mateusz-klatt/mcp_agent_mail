@@ -192,7 +192,15 @@ def isolated_env(tmp_path, monkeypatch):
         clear_settings_cache()
 
         if db_path.exists():
-            db_path.unlink()
+            # Windows refuses to unlink a file another handle still holds, and
+            # raises out of teardown — turning a test's own result into an
+            # error and losing it. POSIX unlinks the entry regardless, which is
+            # why this was invisible until the Windows suite got far enough to
+            # open a database at all. tmp_path is pytest's to clean up either
+            # way, so failing to remove it here costs nothing; failing loudly
+            # costs the result of the test that just ran.
+            with contextlib.suppress(PermissionError):
+                db_path.unlink()
         storage_root = tmp_path / "storage"
         if storage_root.exists():
             for path in storage_root.rglob("*"):

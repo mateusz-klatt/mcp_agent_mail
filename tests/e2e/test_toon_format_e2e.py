@@ -9,6 +9,7 @@ from mcp_agent_mail import app as app_module
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.config import clear_settings_cache
 from tests.e2e.utils import make_console, render_phase, write_log
+from tests.keys import pkey
 
 
 def _fake_completed(stdout: str, stderr: str = "", returncode: int = 0) -> subprocess.CompletedProcess[str]:
@@ -36,7 +37,7 @@ async def test_toon_format_e2e_flow(isolated_env, monkeypatch):
         steps.append(step)
         render_phase(console, "health_check", {"response_format": health.data.get("format")})
 
-        project = await client.call_tool("ensure_project", {"human_key": "/backend", "format": "toon"})
+        project = await client.call_tool("ensure_project", {"human_key": pkey("backend"), "format": "toon"})
         step = {"tool": "ensure_project", "format": "toon", "response": project.data}
         steps.append(step)
         render_phase(console, "ensure_project", {"response_format": project.data.get("format")})

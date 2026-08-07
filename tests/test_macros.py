@@ -4,6 +4,7 @@ import pytest
 from fastmcp import Client
 
 from mcp_agent_mail.app import build_mcp_server
+from tests.keys import pkey
 
 
 @pytest.mark.asyncio
@@ -13,7 +14,7 @@ async def test_macro_start_session(isolated_env):
         res = await client.call_tool(
             "macro_start_session",
             {
-                "human_key": "/backend",
+                "human_key": pkey("backend"),
                 "program": "codex",
                 "model": "gpt-5",
                 "task_description": "macro",
@@ -22,7 +23,12 @@ async def test_macro_start_session(isolated_env):
             },
         )
         data = res.data
-        assert data["project"]["slug"] == "backend"
+        # endswith, not ==: the slug is derived from the project key, and the
+        # key is absolute, so off POSIX it carries a drive letter that shows up
+        # as a "c-" prefix. The assertion is here to say "the macro returned the
+        # project I asked for", which the suffix establishes; the exact prefix is
+        # a property of the platform, not of the macro.
+        assert data["project"]["slug"].endswith("backend")
         assert data["agent"]["name"] == "BlueLake"
         assert "file_reservations" in data and "inbox" in data
 
@@ -31,7 +37,7 @@ async def test_macro_start_session(isolated_env):
 async def test_macro_prepare_thread(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
@@ -62,7 +68,7 @@ async def test_macro_prepare_thread(isolated_env):
 async def test_macro_file_reservation_cycle(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
@@ -87,7 +93,7 @@ async def test_macro_file_reservation_cycle(isolated_env):
 async def test_renew_file_reservations_extends_expiry(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},

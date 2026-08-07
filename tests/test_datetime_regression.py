@@ -37,6 +37,7 @@ from mcp_agent_mail.models import (
     ProjectSiblingSuggestion,
     _utcnow_naive,
 )
+from tests.keys import pkey
 
 # ============================================================================
 # Unit Tests: _naive_utc() helper in app.py
@@ -123,7 +124,7 @@ class TestModelDefaultsProduceNaiveDatetimes:
 
     def test_project_created_at_is_naive(self):
         """Project.created_at default should be naive."""
-        project = Project(slug="test", human_key="/test")
+        project = Project(slug="test", human_key=pkey("test"))
         assert project.created_at.tzinfo is None, "Project.created_at should be naive"
 
     def test_product_created_at_is_naive(self):
@@ -187,11 +188,11 @@ async def test_file_reservation_expiration_comparison_no_error(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
         # Setup: create project and agent (let server auto-generate name)
-        await client.call_tool("ensure_project", {"human_key": "/test/regression"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/regression")})
         agent_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/regression",
+                "project_key": pkey("test/regression"),
                 "program": "test",
                 "model": "test",
             },
@@ -202,7 +203,7 @@ async def test_file_reservation_expiration_comparison_no_error(isolated_env):
         result = await client.call_tool(
             "file_reservation_paths",
             {
-                "project_key": "/test/regression",
+                "project_key": pkey("test/regression"),
                 "agent_name": agent_name,
                 "paths": ["src/**"],
                 "ttl_seconds": 3600,
@@ -216,7 +217,7 @@ async def test_file_reservation_expiration_comparison_no_error(isolated_env):
         result = await client.call_tool(
             "file_reservation_paths",
             {
-                "project_key": "/test/regression",
+                "project_key": pkey("test/regression"),
                 "agent_name": agent_name,
                 "paths": ["other/**"],
                 "ttl_seconds": 3600,
@@ -232,11 +233,11 @@ async def test_file_reservation_release_and_renew_datetime_handling(isolated_env
     """Test that release and renew operations handle datetimes correctly."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/datetime"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/datetime")})
         agent_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/datetime",
+                "project_key": pkey("test/datetime"),
                 "program": "test",
                 "model": "test",
             },
@@ -247,7 +248,7 @@ async def test_file_reservation_release_and_renew_datetime_handling(isolated_env
         await client.call_tool(
             "file_reservation_paths",
             {
-                "project_key": "/test/datetime",
+                "project_key": pkey("test/datetime"),
                 "agent_name": agent_name,
                 "paths": ["lib/**"],
                 "ttl_seconds": 300,
@@ -259,7 +260,7 @@ async def test_file_reservation_release_and_renew_datetime_handling(isolated_env
         renew_result = await client.call_tool(
             "renew_file_reservations",
             {
-                "project_key": "/test/datetime",
+                "project_key": pkey("test/datetime"),
                 "agent_name": agent_name,
                 "extend_seconds": 600,
             },
@@ -270,7 +271,7 @@ async def test_file_reservation_release_and_renew_datetime_handling(isolated_env
         release_result = await client.call_tool(
             "release_file_reservations",
             {
-                "project_key": "/test/datetime",
+                "project_key": pkey("test/datetime"),
                 "agent_name": agent_name,
             },
         )
@@ -287,11 +288,11 @@ async def test_agent_link_expiration_comparison(isolated_env):
     """Test that agent link expiration handling works with naive datetimes."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/links"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/links")})
         agent_a_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/links",
+                "project_key": pkey("test/links"),
                 "program": "test",
                 "model": "test",
             },
@@ -301,7 +302,7 @@ async def test_agent_link_expiration_comparison(isolated_env):
         agent_b_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/links",
+                "project_key": pkey("test/links"),
                 "program": "test",
                 "model": "test",
             },
@@ -312,7 +313,7 @@ async def test_agent_link_expiration_comparison(isolated_env):
         result = await client.call_tool(
             "request_contact",
             {
-                "project_key": "/test/links",
+                "project_key": pkey("test/links"),
                 "from_agent": agent_a_name,
                 "to_agent": agent_b_name,
                 "reason": "Testing datetime handling",
@@ -325,7 +326,7 @@ async def test_agent_link_expiration_comparison(isolated_env):
         respond_result = await client.call_tool(
             "respond_contact",
             {
-                "project_key": "/test/links",
+                "project_key": pkey("test/links"),
                 "to_agent": agent_b_name,
                 "from_agent": agent_a_name,
                 "accept": True,
@@ -344,11 +345,11 @@ async def test_message_recipient_timestamp_updates(isolated_env):
     """Test that message read/ack timestamps are set correctly as naive."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/msg"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/msg")})
         sender_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/msg",
+                "project_key": pkey("test/msg"),
                 "program": "test",
                 "model": "test",
             },
@@ -358,7 +359,7 @@ async def test_message_recipient_timestamp_updates(isolated_env):
         receiver_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/msg",
+                "project_key": pkey("test/msg"),
                 "program": "test",
                 "model": "test",
             },
@@ -369,7 +370,7 @@ async def test_message_recipient_timestamp_updates(isolated_env):
         send_result = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/msg",
+                "project_key": pkey("test/msg"),
                 "sender_name": sender_name,
                 "to": [receiver_name],
                 "subject": "Datetime Test",
@@ -384,7 +385,7 @@ async def test_message_recipient_timestamp_updates(isolated_env):
         read_result = await client.call_tool(
             "mark_message_read",
             {
-                "project_key": "/test/msg",
+                "project_key": pkey("test/msg"),
                 "agent_name": receiver_name,
                 "message_id": message_id,
             },
@@ -396,7 +397,7 @@ async def test_message_recipient_timestamp_updates(isolated_env):
         ack_result = await client.call_tool(
             "acknowledge_message",
             {
-                "project_key": "/test/msg",
+                "project_key": pkey("test/msg"),
                 "agent_name": receiver_name,
                 "message_id": message_id,
             },
@@ -415,11 +416,11 @@ async def test_inbox_fetch_with_since_ts_datetime_handling(isolated_env):
     """Test that fetch_inbox with since_ts handles datetime comparisons correctly."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/inbox"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/inbox")})
         agent_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/inbox",
+                "project_key": pkey("test/inbox"),
                 "program": "test",
                 "model": "test",
             },
@@ -430,7 +431,7 @@ async def test_inbox_fetch_with_since_ts_datetime_handling(isolated_env):
         result = await client.call_tool(
             "fetch_inbox",
             {
-                "project_key": "/test/inbox",
+                "project_key": pkey("test/inbox"),
                 "agent_name": agent_name,
                 "since_ts": "2025-01-01T00:00:00Z",
                 "limit": 10,

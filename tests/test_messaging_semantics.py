@@ -10,6 +10,7 @@ from sqlalchemy import text
 
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import get_db_health_status, get_session
+from tests.keys import pkey
 
 
 async def _expire_contact_link(
@@ -59,7 +60,7 @@ async def _expire_contact_link(
 async def test_reply_message_inherits_thread_and_subject_prefix(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
@@ -96,15 +97,15 @@ async def test_reply_message_inherits_thread_and_subject_prefix(isolated_env):
 async def test_reply_message_explicit_empty_to_does_not_restore_default_recipient(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/reply-empty-to"})
+        await client.call_tool("ensure_project", {"human_key": pkey("reply-empty-to")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "/reply-empty-to", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": pkey("reply-empty-to"), "program": "codex", "model": "gpt-5", "name": "BlueLake"},
         )
         original = await client.call_tool(
             "send_message",
             {
-                "project_key": "/reply-empty-to",
+                "project_key": pkey("reply-empty-to"),
                 "sender_name": "BlueLake",
                 "to": ["BlueLake"],
                 "subject": "Plan",
@@ -117,7 +118,7 @@ async def test_reply_message_explicit_empty_to_does_not_restore_default_recipien
         reply = await client.call_tool(
             "reply_message",
             {
-                "project_key": "/reply-empty-to",
+                "project_key": pkey("reply-empty-to"),
                 "message_id": original_id,
                 "sender_name": "BlueLake",
                 "to": [],
@@ -134,7 +135,7 @@ async def test_reply_message_explicit_empty_to_does_not_restore_default_recipien
 async def test_mark_read_then_ack_updates_state(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
@@ -176,7 +177,7 @@ async def test_mark_read_then_ack_updates_state(isolated_env):
 async def test_acknowledge_idempotent_multiple_calls(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
@@ -219,10 +220,10 @@ async def test_send_message_requires_sender_token_across_sessions(isolated_env):
     """A fresh session cannot impersonate an existing sender without sender_token."""
     server = build_mcp_server()
     async with Client(server) as bootstrap_client:
-        await bootstrap_client.call_tool("ensure_project", {"human_key": "/security/spoof-send"})
+        await bootstrap_client.call_tool("ensure_project", {"human_key": pkey("security/spoof-send")})
         sender = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": "/security/spoof-send", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {"project_key": pkey("security/spoof-send"), "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
         )
         sender_token = sender.data["registration_token"]
 
@@ -231,7 +232,7 @@ async def test_send_message_requires_sender_token_across_sessions(isolated_env):
             await attacker_client.call_tool(
                 "send_message",
                 {
-                    "project_key": "/security/spoof-send",
+                    "project_key": pkey("security/spoof-send"),
                     "sender_name": "GreenCastle",
                     "to": ["GreenCastle"],
                     "subject": "Forged",
@@ -244,7 +245,7 @@ async def test_send_message_requires_sender_token_across_sessions(isolated_env):
         result = await sender_client.call_tool(
             "send_message",
                 {
-                    "project_key": "/security/spoof-send",
+                    "project_key": pkey("security/spoof-send"),
                     "sender_name": "GreenCastle",
                     "sender_token": sender_token,
                     "to": ["GreenCastle"],
@@ -261,14 +262,14 @@ async def test_send_message_auto_contact_requests_pending_approval_without_targe
     """auto_contact_if_blocked should create a pending request, not pretend to auto-approve."""
     server = build_mcp_server()
     async with Client(server) as bootstrap_client:
-        await bootstrap_client.call_tool("ensure_project", {"human_key": "/security/auto-contact-pending"})
+        await bootstrap_client.call_tool("ensure_project", {"human_key": pkey("security/auto-contact-pending")})
         green = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": "/security/auto-contact-pending", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {"project_key": pkey("security/auto-contact-pending"), "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
         )
         blue = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": "/security/auto-contact-pending", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": pkey("security/auto-contact-pending"), "program": "codex", "model": "gpt-5", "name": "BlueLake"},
         )
         green_token = green.data["registration_token"]
         blue_token = blue.data["registration_token"]
@@ -278,7 +279,7 @@ async def test_send_message_auto_contact_requests_pending_approval_without_targe
             await sender_client.call_tool(
                 "send_message",
                 {
-                    "project_key": "/security/auto-contact-pending",
+                    "project_key": pkey("security/auto-contact-pending"),
                     "sender_name": "GreenCastle",
                     "sender_token": green_token,
                     "to": ["BlueLake"],
@@ -292,7 +293,7 @@ async def test_send_message_auto_contact_requests_pending_approval_without_targe
         contacts = await sender_client.call_tool(
             "list_contacts",
             {
-                "project_key": "/security/auto-contact-pending",
+                "project_key": pkey("security/auto-contact-pending"),
                 "agent_name": "GreenCastle",
                 "registration_token": green_token,
             },
@@ -304,7 +305,7 @@ async def test_send_message_auto_contact_requests_pending_approval_without_targe
         inbox = await recipient_client.call_tool(
             "fetch_inbox",
             {
-                "project_key": "/security/auto-contact-pending",
+                "project_key": pkey("security/auto-contact-pending"),
                 "agent_name": "BlueLake",
                 "registration_token": blue_token,
                 "include_bodies": True,
@@ -319,14 +320,14 @@ async def test_send_message_explicit_false_disables_local_auto_contact(isolated_
     """Explicit false should override the server default and avoid creating contact requests."""
     server = build_mcp_server()
     async with Client(server) as bootstrap_client:
-        await bootstrap_client.call_tool("ensure_project", {"human_key": "/security/auto-contact-disabled"})
+        await bootstrap_client.call_tool("ensure_project", {"human_key": pkey("security/auto-contact-disabled")})
         green = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": "/security/auto-contact-disabled", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {"project_key": pkey("security/auto-contact-disabled"), "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
         )
         blue = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": "/security/auto-contact-disabled", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": pkey("security/auto-contact-disabled"), "program": "codex", "model": "gpt-5", "name": "BlueLake"},
         )
         green_token = green.data["registration_token"]
         blue_token = blue.data["registration_token"]
@@ -336,7 +337,7 @@ async def test_send_message_explicit_false_disables_local_auto_contact(isolated_
             await sender_client.call_tool(
                 "send_message",
                 {
-                    "project_key": "/security/auto-contact-disabled",
+                    "project_key": pkey("security/auto-contact-disabled"),
                     "sender_name": "GreenCastle",
                     "sender_token": green_token,
                     "to": ["BlueLake"],
@@ -349,7 +350,7 @@ async def test_send_message_explicit_false_disables_local_auto_contact(isolated_
         contacts = await sender_client.call_tool(
             "list_contacts",
             {
-                "project_key": "/security/auto-contact-disabled",
+                "project_key": pkey("security/auto-contact-disabled"),
                 "agent_name": "GreenCastle",
                 "registration_token": green_token,
             },
@@ -361,7 +362,7 @@ async def test_send_message_explicit_false_disables_local_auto_contact(isolated_
         inbox = await recipient_client.call_tool(
             "fetch_inbox",
             {
-                "project_key": "/security/auto-contact-disabled",
+                "project_key": pkey("security/auto-contact-disabled"),
                 "agent_name": "BlueLake",
                 "registration_token": blue_token,
                 "include_bodies": True,
@@ -376,20 +377,20 @@ async def test_send_message_auto_contact_auto_approves_when_target_is_authentica
     """Same-session authenticated agents can still use the one-step auto-approval path."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/security/auto-contact-approved"})
+        await client.call_tool("ensure_project", {"human_key": pkey("security/auto-contact-approved")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "/security/auto-contact-approved", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {"project_key": pkey("security/auto-contact-approved"), "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": "/security/auto-contact-approved", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": pkey("security/auto-contact-approved"), "program": "codex", "model": "gpt-5", "name": "BlueLake"},
         )
 
         result = await client.call_tool(
             "send_message",
             {
-                "project_key": "/security/auto-contact-approved",
+                "project_key": pkey("security/auto-contact-approved"),
                 "sender_name": "GreenCastle",
                 "to": ["BlueLake"],
                 "subject": "Auto approved",
@@ -402,7 +403,7 @@ async def test_send_message_auto_contact_auto_approves_when_target_is_authentica
         contacts = await client.call_tool(
             "list_contacts",
             {
-                "project_key": "/security/auto-contact-approved",
+                "project_key": pkey("security/auto-contact-approved"),
                 "agent_name": "GreenCastle",
             },
         )
@@ -415,15 +416,15 @@ async def test_send_message_auto_contact_requests_cross_project_approval_without
     """Cross-project auto-contact should create a pending request when only the sender is authenticated."""
     server = build_mcp_server()
     async with Client(server) as bootstrap_client:
-        await bootstrap_client.call_tool("ensure_project", {"human_key": "/security/auto-contact-xproj-backend"})
-        await bootstrap_client.call_tool("ensure_project", {"human_key": "/security/auto-contact-xproj-frontend"})
+        await bootstrap_client.call_tool("ensure_project", {"human_key": pkey("security/auto-contact-xproj-backend")})
+        await bootstrap_client.call_tool("ensure_project", {"human_key": pkey("security/auto-contact-xproj-frontend")})
         green = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": "/security/auto-contact-xproj-backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {"project_key": pkey("security/auto-contact-xproj-backend"), "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
         )
         blue = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": "/security/auto-contact-xproj-frontend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": pkey("security/auto-contact-xproj-frontend"), "program": "codex", "model": "gpt-5", "name": "BlueLake"},
         )
         green_token = green.data["registration_token"]
         blue_token = blue.data["registration_token"]
@@ -433,7 +434,7 @@ async def test_send_message_auto_contact_requests_cross_project_approval_without
             await sender_client.call_tool(
                 "send_message",
                 {
-                    "project_key": "/security/auto-contact-xproj-backend",
+                    "project_key": pkey("security/auto-contact-xproj-backend"),
                     "sender_name": "GreenCastle",
                     "sender_token": green_token,
                     "to": ["BlueLake@/security/auto-contact-xproj-frontend"],
@@ -447,7 +448,7 @@ async def test_send_message_auto_contact_requests_cross_project_approval_without
         contacts = await sender_client.call_tool(
             "list_contacts",
             {
-                "project_key": "/security/auto-contact-xproj-backend",
+                "project_key": pkey("security/auto-contact-xproj-backend"),
                 "agent_name": "GreenCastle",
                 "registration_token": green_token,
             },
@@ -459,7 +460,7 @@ async def test_send_message_auto_contact_requests_cross_project_approval_without
         inbox = await recipient_client.call_tool(
             "fetch_inbox",
             {
-                "project_key": "/security/auto-contact-xproj-frontend",
+                "project_key": pkey("security/auto-contact-xproj-frontend"),
                 "agent_name": "BlueLake",
                 "registration_token": blue_token,
                 "include_bodies": True,
@@ -474,15 +475,15 @@ async def test_send_message_explicit_false_disables_cross_project_auto_contact(i
     """Explicit false should prevent the external auto-handshake path from creating requests."""
     server = build_mcp_server()
     async with Client(server) as bootstrap_client:
-        await bootstrap_client.call_tool("ensure_project", {"human_key": "/security/auto-contact-false-backend"})
-        await bootstrap_client.call_tool("ensure_project", {"human_key": "/security/auto-contact-false-frontend"})
+        await bootstrap_client.call_tool("ensure_project", {"human_key": pkey("security/auto-contact-false-backend")})
+        await bootstrap_client.call_tool("ensure_project", {"human_key": pkey("security/auto-contact-false-frontend")})
         green = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": "/security/auto-contact-false-backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {"project_key": pkey("security/auto-contact-false-backend"), "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
         )
         blue = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": "/security/auto-contact-false-frontend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": pkey("security/auto-contact-false-frontend"), "program": "codex", "model": "gpt-5", "name": "BlueLake"},
         )
         green_token = green.data["registration_token"]
         blue_token = blue.data["registration_token"]
@@ -492,7 +493,7 @@ async def test_send_message_explicit_false_disables_cross_project_auto_contact(i
             await sender_client.call_tool(
                 "send_message",
                 {
-                    "project_key": "/security/auto-contact-false-backend",
+                    "project_key": pkey("security/auto-contact-false-backend"),
                     "sender_name": "GreenCastle",
                     "sender_token": green_token,
                     "to": ["BlueLake@/security/auto-contact-false-frontend"],
@@ -505,7 +506,7 @@ async def test_send_message_explicit_false_disables_cross_project_auto_contact(i
         contacts = await sender_client.call_tool(
             "list_contacts",
             {
-                "project_key": "/security/auto-contact-false-backend",
+                "project_key": pkey("security/auto-contact-false-backend"),
                 "agent_name": "GreenCastle",
                 "registration_token": green_token,
             },
@@ -517,7 +518,7 @@ async def test_send_message_explicit_false_disables_cross_project_auto_contact(i
         inbox = await recipient_client.call_tool(
             "fetch_inbox",
             {
-                "project_key": "/security/auto-contact-false-frontend",
+                "project_key": pkey("security/auto-contact-false-frontend"),
                 "agent_name": "BlueLake",
                 "registration_token": blue_token,
                 "include_bodies": True,
@@ -532,21 +533,21 @@ async def test_send_message_cross_project_auto_contact_preserves_recipient_kind(
     """In-session cross-project auto-approval must preserve whether the target was TO/CC/BCC."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/security/auto-contact-kind-backend"})
-        await client.call_tool("ensure_project", {"human_key": "/security/auto-contact-kind-frontend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("security/auto-contact-kind-backend")})
+        await client.call_tool("ensure_project", {"human_key": pkey("security/auto-contact-kind-frontend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "/security/auto-contact-kind-backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {"project_key": pkey("security/auto-contact-kind-backend"), "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": "/security/auto-contact-kind-frontend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": pkey("security/auto-contact-kind-frontend"), "program": "codex", "model": "gpt-5", "name": "BlueLake"},
         )
 
         result = await client.call_tool(
             "send_message",
             {
-                "project_key": "/security/auto-contact-kind-backend",
+                "project_key": pkey("security/auto-contact-kind-backend"),
                 "sender_name": "GreenCastle",
                 "to": ["GreenCastle"],
                 "bcc": ["BlueLake@/security/auto-contact-kind-frontend"],
@@ -560,7 +561,7 @@ async def test_send_message_cross_project_auto_contact_preserves_recipient_kind(
         inbox = await client.call_tool(
             "fetch_inbox",
             {
-                "project_key": "/security/auto-contact-kind-frontend",
+                "project_key": pkey("security/auto-contact-kind-frontend"),
                 "agent_name": "BlueLake",
                 "include_bodies": True,
             },
@@ -576,28 +577,28 @@ async def test_reply_message_enforces_local_contact_policy_for_new_recipient(iso
     """reply_message should not bypass local contacts_only policy for a newly added recipient."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/security/reply-contact-policy"})
+        await client.call_tool("ensure_project", {"human_key": pkey("security/reply-contact-policy")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "/security/reply-contact-policy", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {"project_key": pkey("security/reply-contact-policy"), "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": "/security/reply-contact-policy", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": pkey("security/reply-contact-policy"), "program": "codex", "model": "gpt-5", "name": "BlueLake"},
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": "/security/reply-contact-policy", "program": "codex", "model": "gpt-5", "name": "PurpleBear"},
+            {"project_key": pkey("security/reply-contact-policy"), "program": "codex", "model": "gpt-5", "name": "PurpleBear"},
         )
         await client.call_tool(
             "set_contact_policy",
-            {"project_key": "/security/reply-contact-policy", "agent_name": "PurpleBear", "policy": "contacts_only"},
+            {"project_key": pkey("security/reply-contact-policy"), "agent_name": "PurpleBear", "policy": "contacts_only"},
         )
 
         seed = await client.call_tool(
             "send_message",
             {
-                "project_key": "/security/reply-contact-policy",
+                "project_key": pkey("security/reply-contact-policy"),
                 "sender_name": "BlueLake",
                 "to": ["GreenCastle"],
                 "subject": "Seed",
@@ -610,7 +611,7 @@ async def test_reply_message_enforces_local_contact_policy_for_new_recipient(iso
             await client.call_tool(
                 "reply_message",
                 {
-                    "project_key": "/security/reply-contact-policy",
+                    "project_key": pkey("security/reply-contact-policy"),
                     "message_id": seed_id,
                     "sender_name": "GreenCastle",
                     "to": ["PurpleBear"],
@@ -778,19 +779,19 @@ async def test_reply_message_supports_agent_at_project_external_address(isolated
     """reply_message should route approved cross-project recipients addressed as Agent@project."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/security/reply-xproj-backend"})
-        await client.call_tool("ensure_project", {"human_key": "/security/reply-xproj-ops"})
+        await client.call_tool("ensure_project", {"human_key": pkey("security/reply-xproj-backend")})
+        await client.call_tool("ensure_project", {"human_key": pkey("security/reply-xproj-ops")})
         green = await client.call_tool(
             "register_agent",
-            {"project_key": "/security/reply-xproj-backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {"project_key": pkey("security/reply-xproj-backend"), "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": "/security/reply-xproj-backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": pkey("security/reply-xproj-backend"), "program": "codex", "model": "gpt-5", "name": "BlueLake"},
         )
         ops = await client.call_tool(
             "register_agent",
-            {"project_key": "/security/reply-xproj-ops", "program": "codex", "model": "gpt-5", "name": "OpsBot"},
+            {"project_key": pkey("security/reply-xproj-ops"), "program": "codex", "model": "gpt-5", "name": "OpsBot"},
         )
         green_token = green.data["registration_token"]
         ops_token = ops.data["registration_token"]
@@ -799,10 +800,10 @@ async def test_reply_message_supports_agent_at_project_external_address(isolated
         await client.call_tool(
             "macro_contact_handshake",
             {
-                "project_key": "/security/reply-xproj-backend",
+                "project_key": pkey("security/reply-xproj-backend"),
                 "requester": "GreenCastle",
                 "target": ops_name,
-                "to_project": "/security/reply-xproj-ops",
+                "to_project": pkey("security/reply-xproj-ops"),
                 "auto_accept": True,
                 "requester_registration_token": green_token,
                 "target_registration_token": ops_token,
@@ -812,7 +813,7 @@ async def test_reply_message_supports_agent_at_project_external_address(isolated
         seed = await client.call_tool(
             "send_message",
             {
-                "project_key": "/security/reply-xproj-backend",
+                "project_key": pkey("security/reply-xproj-backend"),
                 "sender_name": "BlueLake",
                 "to": ["GreenCastle"],
                 "subject": "Seed",
@@ -824,14 +825,14 @@ async def test_reply_message_supports_agent_at_project_external_address(isolated
         reply = await client.call_tool(
             "reply_message",
             {
-                "project_key": "/security/reply-xproj-backend",
+                "project_key": pkey("security/reply-xproj-backend"),
                 "message_id": seed_id,
                 "sender_name": "GreenCastle",
                 "to": [f"{ops_name}@/security/reply-xproj-ops"],
                 "body_md": "routing externally from a reply",
             },
         )
-        assert any(delivery["project"] == "/security/reply-xproj-ops" for delivery in reply.data["deliveries"])
+        assert any(delivery["project"] == pkey("security/reply-xproj-ops") for delivery in reply.data["deliveries"])
         assert get_db_health_status()["pool"]["checked_out"] == 0
 
 
@@ -1109,18 +1110,18 @@ async def test_search_and_summarize_thread_respect_recipient_visibility(isolated
     """Only senders/recipients, including BCC, can discover a private thread."""
     server = build_mcp_server()
     async with Client(server) as bootstrap_client:
-        await bootstrap_client.call_tool("ensure_project", {"human_key": "/security/private-thread"})
+        await bootstrap_client.call_tool("ensure_project", {"human_key": pkey("security/private-thread")})
         green = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": "/security/private-thread", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {"project_key": pkey("security/private-thread"), "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
         )
         blue = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": "/security/private-thread", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": pkey("security/private-thread"), "program": "codex", "model": "gpt-5", "name": "BlueLake"},
         )
         purple = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": "/security/private-thread", "program": "codex", "model": "gpt-5", "name": "PurpleBear"},
+            {"project_key": pkey("security/private-thread"), "program": "codex", "model": "gpt-5", "name": "PurpleBear"},
         )
         green_token = green.data["registration_token"]
         blue_token = blue.data["registration_token"]
@@ -1130,7 +1131,7 @@ async def test_search_and_summarize_thread_respect_recipient_visibility(isolated
         await sender_client.call_tool(
             "macro_contact_handshake",
             {
-                "project_key": "/security/private-thread",
+                "project_key": pkey("security/private-thread"),
                 "requester": "GreenCastle",
                 "target": "BlueLake",
                 "auto_accept": True,
@@ -1141,7 +1142,7 @@ async def test_search_and_summarize_thread_respect_recipient_visibility(isolated
         await sender_client.call_tool(
             "send_message",
             {
-                "project_key": "/security/private-thread",
+                "project_key": pkey("security/private-thread"),
                 "sender_name": "GreenCastle",
                 "sender_token": green_token,
                 "to": ["GreenCastle"],
@@ -1156,7 +1157,7 @@ async def test_search_and_summarize_thread_respect_recipient_visibility(isolated
         search_result = await bcc_client.call_tool(
             "search_messages",
             {
-                "project_key": "/security/private-thread",
+                "project_key": pkey("security/private-thread"),
                 "query": "ultra-secret",
                 "agent_name": "BlueLake",
                 "registration_token": blue_token,
@@ -1167,7 +1168,7 @@ async def test_search_and_summarize_thread_respect_recipient_visibility(isolated
         summary_result = await bcc_client.call_tool(
             "summarize_thread",
             {
-                "project_key": "/security/private-thread",
+                "project_key": pkey("security/private-thread"),
                 "thread_id": "SEC-THREAD-1",
                 "include_examples": True,
                 "llm_mode": False,
@@ -1182,7 +1183,7 @@ async def test_search_and_summarize_thread_respect_recipient_visibility(isolated
         search_result = await outsider_client.call_tool(
             "search_messages",
             {
-                "project_key": "/security/private-thread",
+                "project_key": pkey("security/private-thread"),
                 "query": "ultra-secret",
                 "agent_name": "PurpleBear",
                 "registration_token": purple_token,
@@ -1193,7 +1194,7 @@ async def test_search_and_summarize_thread_respect_recipient_visibility(isolated
         summary_result = await outsider_client.call_tool(
             "summarize_thread",
             {
-                "project_key": "/security/private-thread",
+                "project_key": pkey("security/private-thread"),
                 "thread_id": "SEC-THREAD-1",
                 "include_examples": True,
                 "llm_mode": False,
@@ -1216,7 +1217,7 @@ async def test_send_message_rolls_back_db_row_when_archive_write_fails(isolated_
 
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},

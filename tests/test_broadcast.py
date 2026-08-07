@@ -19,6 +19,7 @@ import pytest
 from fastmcp import Client
 
 from mcp_agent_mail.app import build_mcp_server
+from tests.keys import pkey
 
 logger = logging.getLogger(__name__)
 
@@ -84,13 +85,13 @@ async def test_broadcast_expands_to_all_agents(isolated_env):
     """broadcast=true with empty 'to' should deliver to all agents except sender."""
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/bcast", 4)
+        names = await _setup_project_with_agents(client, pkey("test/bcast"), 4)
         sender = names[0]
 
         result = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/bcast",
+                "project_key": pkey("test/bcast"),
                 "sender_name": sender,
                 "to": [],
                 "subject": "Hello everyone",
@@ -114,13 +115,13 @@ async def test_broadcast_with_explicit_recipients_errors(isolated_env):
     """broadcast=true with non-empty 'to' should raise an error."""
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/bcast-err", 2)
+        names = await _setup_project_with_agents(client, pkey("test/bcast-err"), 2)
 
         with pytest.raises(Exception, match="mutually exclusive"):
             await client.call_tool(
                 "send_message",
                 {
-                    "project_key": "/test/bcast-err",
+                    "project_key": pkey("test/bcast-err"),
                     "sender_name": names[0],
                     "to": [names[1]],
                     "subject": "Should fail",
@@ -135,13 +136,13 @@ async def test_broadcast_excludes_sender(isolated_env):
     """Sender should never appear in their own broadcast recipient list."""
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/bcast-self", 2)
+        names = await _setup_project_with_agents(client, pkey("test/bcast-self"), 2)
         sender = names[0]
 
         result = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/bcast-self",
+                "project_key": pkey("test/bcast-self"),
                 "sender_name": sender,
                 "to": [],
                 "subject": "Self-exclusion test",
@@ -159,7 +160,7 @@ async def test_broadcast_respects_block_all_policy(isolated_env):
     """Agents with contact_policy=block_all should be excluded from broadcasts."""
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/bcast-block", 3)
+        names = await _setup_project_with_agents(client, pkey("test/bcast-block"), 3)
         sender = names[0]
         blocked_agent = names[1]
 
@@ -167,7 +168,7 @@ async def test_broadcast_respects_block_all_policy(isolated_env):
         await client.call_tool(
             "set_contact_policy",
             {
-                "project_key": "/test/bcast-block",
+                "project_key": pkey("test/bcast-block"),
                 "agent_name": blocked_agent,
                 "policy": "block_all",
             },
@@ -176,7 +177,7 @@ async def test_broadcast_respects_block_all_policy(isolated_env):
         result = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/bcast-block",
+                "project_key": pkey("test/bcast-block"),
                 "sender_name": sender,
                 "to": [],
                 "subject": "Policy test",
@@ -196,14 +197,14 @@ async def test_broadcast_empty_project(isolated_env):
     """Broadcast with only sender registered should produce empty recipients."""
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/bcast-empty", 1)
+        names = await _setup_project_with_agents(client, pkey("test/bcast-empty"), 1)
         sender = names[0]
 
         # broadcast with no other agents - should not error
         result = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/bcast-empty",
+                "project_key": pkey("test/bcast-empty"),
                 "sender_name": sender,
                 "to": [],
                 "subject": "Lonely broadcast",
@@ -227,12 +228,12 @@ async def test_topic_stored_in_message(isolated_env):
     """Message with topic param should have topic field in DB and payload."""
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/topic-store", 2)
+        names = await _setup_project_with_agents(client, pkey("test/topic-store"), 2)
 
         result = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/topic-store",
+                "project_key": pkey("test/topic-store"),
                 "sender_name": names[0],
                 "to": [names[1]],
                 "subject": "Architecture discussion",
@@ -250,14 +251,14 @@ async def test_topic_filtering_inbox(isolated_env):
     """fetch_inbox with topic filter returns only matching messages."""
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/topic-filter", 2)
+        names = await _setup_project_with_agents(client, pkey("test/topic-filter"), 2)
         sender, receiver = names[0], names[1]
 
         # Send messages with different topics
         await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/topic-filter",
+                "project_key": pkey("test/topic-filter"),
                 "sender_name": sender,
                 "to": [receiver],
                 "subject": "Topic A",
@@ -268,7 +269,7 @@ async def test_topic_filtering_inbox(isolated_env):
         await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/topic-filter",
+                "project_key": pkey("test/topic-filter"),
                 "sender_name": sender,
                 "to": [receiver],
                 "subject": "Topic B",
@@ -279,7 +280,7 @@ async def test_topic_filtering_inbox(isolated_env):
         await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/topic-filter",
+                "project_key": pkey("test/topic-filter"),
                 "sender_name": sender,
                 "to": [receiver],
                 "subject": "No topic",
@@ -291,7 +292,7 @@ async def test_topic_filtering_inbox(isolated_env):
         result = await client.call_tool(
             "fetch_inbox",
             {
-                "project_key": "/test/topic-filter",
+                "project_key": pkey("test/topic-filter"),
                 "agent_name": receiver,
                 "topic": "blockers",
                 "include_bodies": True,
@@ -308,12 +309,12 @@ async def test_topic_filtering_empty(isolated_env):
     """fetch_inbox with non-existent topic returns empty list."""
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/topic-empty", 2)
+        names = await _setup_project_with_agents(client, pkey("test/topic-empty"), 2)
 
         await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/topic-empty",
+                "project_key": pkey("test/topic-empty"),
                 "sender_name": names[0],
                 "to": [names[1]],
                 "subject": "A message",
@@ -325,7 +326,7 @@ async def test_topic_filtering_empty(isolated_env):
         result = await client.call_tool(
             "fetch_inbox",
             {
-                "project_key": "/test/topic-empty",
+                "project_key": pkey("test/topic-empty"),
                 "agent_name": names[1],
                 "topic": "nonexistent",
             },
@@ -339,14 +340,14 @@ async def test_invalid_topic_rejected(isolated_env):
     """Topic with invalid characters should be rejected."""
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/topic-invalid", 2)
+        names = await _setup_project_with_agents(client, pkey("test/topic-invalid"), 2)
 
         # FastMCP may raise or return error-flagged result depending on version
         try:
             result = await client.call_tool(
                 "send_message",
                 {
-                    "project_key": "/test/topic-invalid",
+                    "project_key": pkey("test/topic-invalid"),
                     "sender_name": names[0],
                     "to": [names[1]],
                     "subject": "Bad topic",
@@ -369,12 +370,12 @@ async def test_topic_allows_dotted_bead_ids(isolated_env):
     """Dotted beads_rust hierarchical IDs (e.g. ``br-abc.1``) are valid topics (issue #165)."""
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/topic-dotted", 2)
+        names = await _setup_project_with_agents(client, pkey("test/topic-dotted"), 2)
 
         result = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/topic-dotted",
+                "project_key": pkey("test/topic-dotted"),
                 "sender_name": names[0],
                 "to": [names[1]],
                 "subject": "Child bead coordination",
@@ -396,13 +397,13 @@ async def test_topic_rejects_traversal_and_unsafe_shapes(isolated_env, bad_topic
     """Path-traversal / dotfile / leading-non-alphanumeric topics are rejected (issue #165 guard)."""
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/topic-traversal", 2)
+        names = await _setup_project_with_agents(client, pkey("test/topic-traversal"), 2)
 
         try:
             result = await client.call_tool(
                 "send_message",
                 {
-                    "project_key": "/test/topic-traversal",
+                    "project_key": pkey("test/topic-traversal"),
                     "sender_name": names[0],
                     "to": [names[1]],
                     "subject": "Bad topic",
@@ -429,13 +430,13 @@ async def test_fetch_topic_tool(isolated_env):
     """fetch_topic returns all messages with matching topic across all senders."""
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/fetch-topic", 3)
+        names = await _setup_project_with_agents(client, pkey("test/fetch-topic"), 3)
 
         # Two different senders send messages with the same topic
         await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/fetch-topic",
+                "project_key": pkey("test/fetch-topic"),
                 "sender_name": names[0],
                 "to": [names[2]],
                 "subject": "From agent 0",
@@ -446,7 +447,7 @@ async def test_fetch_topic_tool(isolated_env):
         await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/fetch-topic",
+                "project_key": pkey("test/fetch-topic"),
                 "sender_name": names[1],
                 "to": [names[2]],
                 "subject": "From agent 1",
@@ -458,7 +459,7 @@ async def test_fetch_topic_tool(isolated_env):
         await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/fetch-topic",
+                "project_key": pkey("test/fetch-topic"),
                 "sender_name": names[0],
                 "to": [names[1]],
                 "subject": "Different topic",
@@ -470,7 +471,7 @@ async def test_fetch_topic_tool(isolated_env):
         result = await client.call_tool(
             "fetch_topic",
             {
-                "project_key": "/test/fetch-topic",
+                "project_key": pkey("test/fetch-topic"),
                 "topic_name": "standup",
             },
         )
@@ -486,13 +487,13 @@ async def test_broadcast_with_topic(isolated_env):
     """Broadcast + topic: all agents receive topic-tagged message."""
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/bcast-topic", 3)
+        names = await _setup_project_with_agents(client, pkey("test/bcast-topic"), 3)
         sender = names[0]
 
         result = await client.call_tool(
             "send_message",
             {
-                "project_key": "/test/bcast-topic",
+                "project_key": pkey("test/bcast-topic"),
                 "sender_name": sender,
                 "to": [],
                 "subject": "Daily standup",
@@ -510,7 +511,7 @@ async def test_broadcast_with_topic(isolated_env):
         topic_result = await client.call_tool(
             "fetch_topic",
             {
-                "project_key": "/test/bcast-topic",
+                "project_key": pkey("test/bcast-topic"),
                 "topic_name": "standup",
             },
         )

@@ -31,6 +31,7 @@ from sqlalchemy import delete
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import get_session
 from mcp_agent_mail.models import Agent
+from tests.keys import pkey
 
 # ============================================================================
 # Helper: Parse JSON from resource blocks
@@ -61,7 +62,7 @@ async def test_project_resource_returns_project_details(isolated_env):
     """resource://project/{slug} returns project details with agents list."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/projresource"})
+        await client.call_tool("ensure_project", {"human_key": pkey("projresource")})
 
         # Register an agent (auto-generated name)
         agent_result = await client.call_tool(
@@ -92,7 +93,7 @@ async def test_project_resource_with_human_key(isolated_env):
     """resource://project/{human_key} also works with slug."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/projhk"})
+        await client.call_tool("ensure_project", {"human_key": pkey("projhk")})
 
         blocks = await client.read_resource("resource://project/projhk")
         data = parse_resource_json(blocks)
@@ -111,7 +112,7 @@ async def test_agents_resource_returns_agent_list(isolated_env):
     """resource://agents/{project} returns agent directory with metadata."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/agentsres"})
+        await client.call_tool("ensure_project", {"human_key": pkey("agentsres")})
 
         # Register multiple agents with proper adjective+noun names
         await client.call_tool(
@@ -162,7 +163,7 @@ async def test_agents_resource_shows_unread_count(isolated_env):
     """Agents resource shows correct unread message count."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/agentsunread"})
+        await client.call_tool("ensure_project", {"human_key": pkey("agentsunread")})
 
         sender_result = await client.call_tool(
             "register_agent",
@@ -211,7 +212,7 @@ async def test_inbox_resource_returns_messages(isolated_env):
     """resource://inbox/{agent}?project= returns inbox messages."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/inboxres"})
+        await client.call_tool("ensure_project", {"human_key": pkey("inboxres")})
 
         agent_result = await client.call_tool(
             "register_agent",
@@ -250,7 +251,7 @@ async def test_inbox_resource_with_limit_param(isolated_env):
     """Inbox resource respects limit query parameter."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/inboxlimit"})
+        await client.call_tool("ensure_project", {"human_key": pkey("inboxlimit")})
 
         agent_result = await client.call_tool(
             "register_agent",
@@ -285,7 +286,7 @@ async def test_inbox_resource_with_include_bodies(isolated_env):
     """Inbox resource includes bodies when include_bodies=true."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/inboxbody"})
+        await client.call_tool("ensure_project", {"human_key": pkey("inboxbody")})
 
         agent_result = await client.call_tool(
             "register_agent",
@@ -326,7 +327,7 @@ async def test_outbox_resource_returns_sent_messages(isolated_env):
     """resource://outbox/{agent}?project= returns sent messages."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/outboxres"})
+        await client.call_tool("ensure_project", {"human_key": pkey("outboxres")})
 
         sender_result = await client.call_tool(
             "register_agent",
@@ -371,7 +372,7 @@ async def test_outbox_resource_with_limit(isolated_env):
     """Outbox resource respects limit parameter."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/outboxlimit"})
+        await client.call_tool("ensure_project", {"human_key": pkey("outboxlimit")})
 
         sender_result = await client.call_tool(
             "register_agent",
@@ -417,7 +418,7 @@ async def test_thread_resource_returns_thread_messages(isolated_env):
     """resource://thread/{id}?project= returns thread messages."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/threadres"})
+        await client.call_tool("ensure_project", {"human_key": pkey("threadres")})
 
         agent_result = await client.call_tool(
             "register_agent",
@@ -467,7 +468,7 @@ async def test_thread_resource_with_message_id(isolated_env):
     """Thread resource can use message ID as seed."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/threadid"})
+        await client.call_tool("ensure_project", {"human_key": pkey("threadid")})
 
         agent_result = await client.call_tool(
             "register_agent",
@@ -505,7 +506,7 @@ async def test_thread_resource_with_include_bodies(isolated_env):
     """Thread resource includes bodies when requested."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/threadbody"})
+        await client.call_tool("ensure_project", {"human_key": pkey("threadbody")})
 
         agent_result = await client.call_tool(
             "register_agent",
@@ -540,7 +541,7 @@ async def test_thread_resource_only_returns_visible_messages(isolated_env):
     """thread resource should hide private messages from non-participants."""
     server = build_mcp_server()
     async with Client(server) as bootstrap_client:
-        await bootstrap_client.call_tool("ensure_project", {"human_key": "/threadprivate"})
+        await bootstrap_client.call_tool("ensure_project", {"human_key": pkey("threadprivate")})
         green = await bootstrap_client.call_tool(
             "register_agent",
             {"project_key": "ThreadPrivate", "program": "test", "model": "test", "name": "GreenCastle"},
@@ -607,7 +608,7 @@ async def test_message_resource_requires_project(isolated_env):
     """Message resource must require explicit project scoping."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/messagereq"})
+        await client.call_tool("ensure_project", {"human_key": pkey("messagereq")})
         agent_result = await client.call_tool(
             "register_agent",
             {"project_key": "MessageReq", "program": "test", "model": "test"},
@@ -634,7 +635,7 @@ async def test_thread_resource_requires_project(isolated_env):
     """Thread resource must require explicit project scoping."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/threadreq"})
+        await client.call_tool("ensure_project", {"human_key": pkey("threadreq")})
         agent_result = await client.call_tool(
             "register_agent",
             {"project_key": "ThreadReq", "program": "test", "model": "test"},
@@ -666,7 +667,7 @@ async def test_file_reservations_resource_returns_reservations(isolated_env):
     """resource://file_reservations/{project} returns active reservations."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/fileres"})
+        await client.call_tool("ensure_project", {"human_key": pkey("fileres")})
 
         agent_result = await client.call_tool(
             "register_agent",
@@ -710,7 +711,7 @@ async def test_file_reservations_resource_active_only(isolated_env):
     """File reservations resource with active_only=true filters released."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/fileactive"})
+        await client.call_tool("ensure_project", {"human_key": pkey("fileactive")})
 
         agent_result = await client.call_tool(
             "register_agent",
@@ -763,7 +764,7 @@ async def test_file_reservations_resource_defaults_to_active_only(isolated_env):
     """resource://file_reservations/{project} should default to active reservations only."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/filedefaultactive"})
+        await client.call_tool("ensure_project", {"human_key": pkey("filedefaultactive")})
 
         agent_result = await client.call_tool(
             "register_agent",
@@ -819,7 +820,7 @@ async def test_file_reservations_resource_includes_metadata(isolated_env):
     """File reservations resource includes stale status and timestamps."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/filemeta"})
+        await client.call_tool("ensure_project", {"human_key": pkey("filemeta")})
 
         agent_result = await client.call_tool(
             "register_agent",
@@ -896,7 +897,7 @@ async def test_agent_scoped_resources_require_project(isolated_env, uri_template
     """Agent-scoped resources must require explicit project scoping."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/project-required"})
+        await client.call_tool("ensure_project", {"human_key": pkey("project-required")})
         agent_result = await client.call_tool(
             "register_agent",
             {"project_key": "project-required", "program": "test", "model": "test"},
@@ -916,7 +917,7 @@ async def test_agent_scoped_resources_require_project(isolated_env, uri_template
 async def test_file_reservations_resource_surfaces_orphaned(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/orphan"})
+        await client.call_tool("ensure_project", {"human_key": pkey("orphan")})
         agent_result = await client.call_tool(
             "register_agent",
             {"project_key": "orphan", "program": "test", "model": "test"},

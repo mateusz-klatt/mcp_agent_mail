@@ -8,13 +8,14 @@ from sqlalchemy import text
 
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import get_session
+from tests.keys import pkey
 
 
 @pytest.mark.asyncio
 async def test_views_ack_required_and_ack_overdue_resources(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
@@ -66,7 +67,7 @@ async def test_views_ack_required_and_ack_overdue_resources(isolated_env):
 async def test_mailbox_and_mailbox_with_commits(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
@@ -95,7 +96,7 @@ async def test_mailbox_and_mailbox_with_commits(isolated_env):
 async def test_outbox_and_message_resource(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},

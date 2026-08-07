@@ -25,6 +25,7 @@ from mcp_agent_mail.storage import (
     get_file_content,
 )
 from mcp_agent_mail.utils import sanitize_agent_name, validate_agent_name_format
+from tests.keys import pkey
 
 # ============================================================================
 # Agent Name Sanitization Tests
@@ -239,11 +240,11 @@ class TestFileReservationPathTraversal:
         """File reservation warns on overly broad patterns."""
         server = build_mcp_server()
         async with Client(server) as client:
-            await client.call_tool("ensure_project", {"human_key": "/backend"})
+            await client.call_tool("ensure_project", {"human_key": pkey("backend")})
             await client.call_tool(
                 "register_agent",
                 {
-                    "project_key": "/backend",
+                    "project_key": pkey("backend"),
                     "program": "test",
                     "model": "test",
                     "name": "BlueLake",
@@ -253,7 +254,7 @@ class TestFileReservationPathTraversal:
             result = await client.call_tool(
                 "file_reservation_paths",
                 {
-                    "project_key": "/backend",
+                    "project_key": pkey("backend"),
                     "agent_name": "BlueLake",
                     "paths": ["**/*"],
                     "ttl_seconds": 3600,
@@ -267,11 +268,11 @@ class TestFileReservationPathTraversal:
         """File reservation with path traversal pattern is handled."""
         server = build_mcp_server()
         async with Client(server) as client:
-            await client.call_tool("ensure_project", {"human_key": "/backend"})
+            await client.call_tool("ensure_project", {"human_key": pkey("backend")})
             await client.call_tool(
                 "register_agent",
                 {
-                    "project_key": "/backend",
+                    "project_key": pkey("backend"),
                     "program": "test",
                     "model": "test",
                     "name": "GreenCastle",
@@ -281,7 +282,7 @@ class TestFileReservationPathTraversal:
             result = await client.call_tool(
                 "file_reservation_paths",
                 {
-                    "project_key": "/backend",
+                    "project_key": pkey("backend"),
                     "agent_name": "GreenCastle",
                     "paths": ["../../../etc/passwd"],
                     "ttl_seconds": 3600,
@@ -312,11 +313,11 @@ class TestAttachmentPathTraversal:
 
         server = build_mcp_server()
         async with Client(server) as client:
-            await client.call_tool("ensure_project", {"human_key": "/backend"})
+            await client.call_tool("ensure_project", {"human_key": pkey("backend")})
             await client.call_tool(
                 "register_agent",
                 {
-                    "project_key": "/backend",
+                    "project_key": pkey("backend"),
                     "program": "test",
                     "model": "test",
                     "name": "PurpleBear",
@@ -328,7 +329,7 @@ class TestAttachmentPathTraversal:
                 await client.call_tool(
                     "send_message",
                     {
-                        "project_key": "/backend",
+                        "project_key": pkey("backend"),
                         "sender_name": "PurpleBear",
                         "to": ["PurpleBear"],
                         "subject": "Test missing attachment",
@@ -351,11 +352,11 @@ class TestAttachmentPathTraversal:
 
         server = build_mcp_server()
         async with Client(server) as client:
-            await client.call_tool("ensure_project", {"human_key": "/backend"})
+            await client.call_tool("ensure_project", {"human_key": pkey("backend")})
             await client.call_tool(
                 "register_agent",
                 {
-                    "project_key": "/backend",
+                    "project_key": pkey("backend"),
                     "program": "test",
                     "model": "test",
                     "name": "RedStone",
@@ -366,7 +367,7 @@ class TestAttachmentPathTraversal:
             result = await client.call_tool(
                 "send_message",
                 {
-                    "project_key": "/backend",
+                    "project_key": pkey("backend"),
                     "sender_name": "RedStone",
                     "to": ["RedStone"],
                     "subject": "Test traversal in body",
@@ -393,11 +394,11 @@ class TestAttachmentPathTraversal:
 
         server = build_mcp_server()
         async with Client(server) as client:
-            await client.call_tool("ensure_project", {"human_key": "/backend"})
+            await client.call_tool("ensure_project", {"human_key": pkey("backend")})
             await client.call_tool(
                 "register_agent",
                 {
-                    "project_key": "/backend",
+                    "project_key": pkey("backend"),
                     "program": "test",
                     "model": "test",
                     "name": "BlueLake",
@@ -408,7 +409,7 @@ class TestAttachmentPathTraversal:
                 await client.call_tool(
                     "send_message",
                     {
-                        "project_key": "/backend",
+                        "project_key": pkey("backend"),
                         "sender_name": "BlueLake",
                         "to": ["BlueLake"],
                         "subject": "Absolute attachment",
@@ -486,7 +487,7 @@ class TestPathTraversalIntegration:
             # Create project with path-like human_key
             proj_result = await client.call_tool(
                 "ensure_project",
-                {"human_key": "/test/project/path"},
+                {"human_key": pkey("test/project/path")},
             )
             project_slug = proj_result.data.get("slug", "")
             assert ".." not in project_slug
@@ -496,7 +497,7 @@ class TestPathTraversalIntegration:
             await client.call_tool(
                 "register_agent",
                 {
-                    "project_key": "/test/project/path",
+                    "project_key": pkey("test/project/path"),
                     "program": "test",
                     "model": "test",
                     "name": "BlueLake",  # Valid name
@@ -507,7 +508,7 @@ class TestPathTraversalIntegration:
             msg_result = await client.call_tool(
                 "send_message",
                 {
-                    "project_key": "/test/project/path",
+                    "project_key": pkey("test/project/path"),
                     "sender_name": "BlueLake",
                     "to": ["BlueLake"],
                     "subject": "Path test",
@@ -520,7 +521,7 @@ class TestPathTraversalIntegration:
             inbox_result = await client.call_tool(
                 "fetch_inbox",
                 {
-                    "project_key": "/test/project/path",
+                    "project_key": pkey("test/project/path"),
                     "agent_name": "BlueLake",
                 },
             )

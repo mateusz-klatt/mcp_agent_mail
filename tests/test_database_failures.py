@@ -31,6 +31,7 @@ from mcp_agent_mail.db import (
     track_queries,
 )
 from mcp_agent_mail.models import Agent, Project
+from tests.keys import pkey
 
 # ============================================================================
 # Database Auto-Creation Tests
@@ -279,7 +280,7 @@ class TestTransactionRollback:
 
         # Create a project successfully first
         async with get_session() as session:
-            project = Project(slug="rollback-test", human_key="/rollback/test")
+            project = Project(slug="rollback-test", human_key=pkey("rollback/test"))
             session.add(project)
             await session.commit()
 
@@ -315,7 +316,7 @@ class TestTransactionRollback:
         await ensure_schema()
 
         async with get_session() as session:
-            project = Project(slug="explicit-rollback", human_key="/explicit/rollback")
+            project = Project(slug="explicit-rollback", human_key=pkey("explicit/rollback"))
             session.add(project)
             # Don't commit, just rollback
             await session.rollback()
@@ -344,7 +345,7 @@ class TestSessionCleanup:
 
         async with get_session() as session:
             # Create a project to verify session works
-            project = Project(slug="cleanup-test", human_key="/cleanup/test")
+            project = Project(slug="cleanup-test", human_key=pkey("cleanup/test"))
             session.add(project)
             await session.commit()
 
@@ -365,7 +366,7 @@ class TestSessionCleanup:
 
         # First create a project we can verify
         async with get_session() as session:
-            project = Project(slug="exception-test", human_key="/exception/test")
+            project = Project(slug="exception-test", human_key=pkey("exception/test"))
             session.add(project)
             await session.commit()
 
@@ -393,7 +394,7 @@ class TestSessionCleanup:
 
         # Create initial project
         async with get_session() as session:
-            project = Project(slug="concurrent-test", human_key="/concurrent/test")
+            project = Project(slug="concurrent-test", human_key=pkey("concurrent/test"))
             session.add(project)
             await session.commit()
 

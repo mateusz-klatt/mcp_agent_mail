@@ -21,6 +21,7 @@ from sqlalchemy import text
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import get_session
 from mcp_agent_mail.utils import validate_agent_name_format
+from tests.keys import pkey
 
 logger = logging.getLogger(__name__)
 
@@ -47,12 +48,12 @@ async def test_window_id_created_on_first_registration(isolated_env, monkeypatch
 
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/window"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/window")})
 
         result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/window",
+                "project_key": pkey("test/window"),
                 "program": "test-program",
                 "model": "test-model",
             },
@@ -78,12 +79,12 @@ async def test_window_id_reused_on_subsequent_registration(isolated_env, monkeyp
 
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/window"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/window")})
 
         result1 = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/window",
+                "project_key": pkey("test/window"),
                 "program": "test-program",
                 "model": "test-model",
             },
@@ -94,7 +95,7 @@ async def test_window_id_reused_on_subsequent_registration(isolated_env, monkeyp
         result2 = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/window",
+                "project_key": pkey("test/window"),
                 "program": "test-program-v2",
                 "model": "test-model-v2",
             },
@@ -196,12 +197,12 @@ async def test_window_id_without_env_var(isolated_env, monkeypatch):
 
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/window"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/window")})
 
         result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/window",
+                "project_key": pkey("test/window"),
                 "program": "test-program",
                 "model": "test-model",
             },
@@ -222,12 +223,12 @@ async def test_window_id_invalid_format(isolated_env, monkeypatch):
 
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/window"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/window")})
 
         result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/window",
+                "project_key": pkey("test/window"),
                 "program": "test-program",
                 "model": "test-model",
             },
@@ -255,12 +256,12 @@ async def test_explicit_name_takes_priority_over_window(isolated_env, monkeypatc
 
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/window"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/window")})
 
         result = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/window",
+                "project_key": pkey("test/window"),
                 "program": "test-program",
                 "model": "test-model",
                 "name": "GreenCastle",
@@ -291,11 +292,11 @@ async def test_window_display_name_unique_per_project(isolated_env, monkeypatch)
     monkeypatch.setenv("MCP_AGENT_MAIL_WINDOW_ID", uuid1)
     clear_settings_cache()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/window"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/window")})
         result1 = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/window",
+                "project_key": pkey("test/window"),
                 "program": "test",
                 "model": "test",
             },
@@ -308,7 +309,7 @@ async def test_window_display_name_unique_per_project(isolated_env, monkeypatch)
         result2 = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/window",
+                "project_key": pkey("test/window"),
                 "program": "test",
                 "model": "test",
             },
@@ -333,11 +334,11 @@ async def test_list_window_identities(isolated_env, monkeypatch):
 
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/window"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/window")})
         await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/window",
+                "project_key": pkey("test/window"),
                 "program": "test",
                 "model": "test",
             },
@@ -345,7 +346,7 @@ async def test_list_window_identities(isolated_env, monkeypatch):
 
         result = await client.call_tool(
             "list_window_identities",
-            {"project_key": "/test/window"},
+            {"project_key": pkey("test/window")},
         )
 
         assert result.data["count"] >= 1
@@ -366,11 +367,11 @@ async def test_rename_window(isolated_env, monkeypatch):
 
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/window"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/window")})
         reg = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/window",
+                "project_key": pkey("test/window"),
                 "program": "test",
                 "model": "test",
             },
@@ -380,7 +381,7 @@ async def test_rename_window(isolated_env, monkeypatch):
         result = await client.call_tool(
             "rename_window",
             {
-                "project_key": "/test/window",
+                "project_key": pkey("test/window"),
                 "window_uuid": window_uuid,
                 "new_display_name": "SilverFox",
             },
@@ -401,11 +402,11 @@ async def test_expire_window(isolated_env, monkeypatch):
 
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/window"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/window")})
         await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/window",
+                "project_key": pkey("test/window"),
                 "program": "test",
                 "model": "test",
             },
@@ -414,7 +415,7 @@ async def test_expire_window(isolated_env, monkeypatch):
         result = await client.call_tool(
             "expire_window",
             {
-                "project_key": "/test/window",
+                "project_key": pkey("test/window"),
                 "window_uuid": window_uuid,
             },
         )
@@ -424,7 +425,7 @@ async def test_expire_window(isolated_env, monkeypatch):
         # After expiry, list should not include it
         list_result = await client.call_tool(
             "list_window_identities",
-            {"project_key": "/test/window"},
+            {"project_key": pkey("test/window")},
         )
         found = [i for i in list_result.data["identities"] if i["window_uuid"] == window_uuid]
         assert len(found) == 0
@@ -446,13 +447,13 @@ async def test_multiple_agents_same_window(isolated_env, monkeypatch):
 
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/window"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/window")})
 
         # Register first agent (auto-generated name from window)
         r1 = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/window",
+                "project_key": pkey("test/window"),
                 "program": "agent-1",
                 "model": "model-1",
             },
@@ -462,7 +463,7 @@ async def test_multiple_agents_same_window(isolated_env, monkeypatch):
         r2 = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/window",
+                "project_key": pkey("test/window"),
                 "program": "agent-2",
                 "model": "model-2",
                 "name": "BlueLake",
@@ -487,11 +488,11 @@ async def test_window_persistence_across_sessions(isolated_env, monkeypatch):
 
     # First session
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/test/window"})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/window")})
         r1 = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/window",
+                "project_key": pkey("test/window"),
                 "program": "session-1",
                 "model": "test",
             },
@@ -503,7 +504,7 @@ async def test_window_persistence_across_sessions(isolated_env, monkeypatch):
         r2 = await client.call_tool(
             "register_agent",
             {
-                "project_key": "/test/window",
+                "project_key": pkey("test/window"),
                 "program": "session-2",
                 "model": "test",
             },

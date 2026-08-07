@@ -24,6 +24,7 @@ from mcp_agent_mail.app import (
 )
 from mcp_agent_mail.config import clear_settings_cache, get_settings
 from mcp_agent_mail.db import get_session
+from tests.keys import pkey
 
 
 @pytest.mark.asyncio
@@ -35,7 +36,7 @@ async def test_messaging_flow(isolated_env):
         assert health.data["status"] == "ok"
         assert health.data["environment"] == "test"
 
-        project = await client.call_tool("ensure_project", {"human_key": "/backend"})
+        project = await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         assert project.data["slug"] == "backend"
 
         agent = await client.call_tool(
@@ -106,7 +107,7 @@ async def test_file_reservation_conflicts_and_release(isolated_env):
     server = build_mcp_server()
 
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         alpha_identity = await client.call_tool(
             "create_agent_identity",
             {
@@ -232,7 +233,7 @@ async def test_build_slot_tools_offload_git_and_slot_file_io(isolated_env, monke
     server = build_mcp_server()
 
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         agent = await client.call_tool(
             "register_agent",
             {
@@ -328,7 +329,7 @@ async def test_build_slot_tools_hold_archive_lock_during_slot_io(isolated_env, m
     monkeypatch.setattr(app_module, "_archive_write_lock", tracking_archive_write_lock)
 
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         agent = await client.call_tool(
             "register_agent",
             {
@@ -380,7 +381,7 @@ async def test_build_slot_renew_missing_lease_is_noop(isolated_env, monkeypatch)
     server = build_mcp_server()
 
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         agent = await client.call_tool(
             "register_agent",
             {
@@ -422,7 +423,7 @@ async def test_build_slot_release_missing_lease_is_noop(isolated_env, monkeypatc
     server = build_mcp_server()
 
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         agent = await client.call_tool(
             "register_agent",
             {
@@ -463,7 +464,7 @@ async def test_build_slot_renew_released_lease_is_noop(isolated_env, monkeypatch
     server = build_mcp_server()
 
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         agent = await client.call_tool(
             "register_agent",
             {
@@ -515,7 +516,7 @@ async def test_build_slot_release_already_released_lease_is_noop(isolated_env, m
     server = build_mcp_server()
 
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         agent = await client.call_tool(
             "register_agent",
             {
@@ -578,7 +579,7 @@ async def test_build_slot_renew_does_not_shorten_active_lease(isolated_env, monk
     server = build_mcp_server()
 
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         agent = await client.call_tool(
             "register_agent",
             {
@@ -625,7 +626,7 @@ async def test_build_slot_reacquire_same_holder_does_not_shorten_active_lease(is
     server = build_mcp_server()
 
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         agent = await client.call_tool(
             "register_agent",
             {
@@ -695,7 +696,7 @@ async def test_build_slot_renew_and_release_honor_explicit_branch_when_repo_bran
     server = build_mcp_server()
 
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         agent = await client.call_tool(
             "register_agent",
             {
@@ -752,7 +753,7 @@ async def test_build_slot_conflicts_respect_both_requester_and_holder_exclusivit
     server = build_mcp_server()
 
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         blue = await client.call_tool(
             "register_agent",
             {
@@ -827,7 +828,7 @@ async def test_file_reservation_enforcement_blocks_message_on_overlap(isolated_e
     server = build_mcp_server()
 
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {
@@ -894,7 +895,7 @@ async def test_force_release_file_reservation_stale(isolated_env, monkeypatch):
     try:
         server = build_mcp_server()
         async with Client(server) as client:
-            await client.call_tool("ensure_project", {"human_key": "/backend"})
+            await client.call_tool("ensure_project", {"human_key": pkey("backend")})
             await client.call_tool(
                 "register_agent",
                 {
@@ -968,7 +969,7 @@ async def test_force_release_file_reservation_stale(isolated_env, monkeypatch):
 async def test_force_release_file_reservation_expired_is_noop(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         holder = await client.call_tool(
             "register_agent",
             {
@@ -1047,7 +1048,7 @@ async def test_force_release_file_reservation_reports_notification_failure(isola
     try:
         server = build_mcp_server()
         async with Client(server) as client:
-            await client.call_tool("ensure_project", {"human_key": "/backend"})
+            await client.call_tool("ensure_project", {"human_key": pkey("backend")})
             await client.call_tool(
                 "register_agent",
                 {
@@ -1144,7 +1145,7 @@ async def test_force_release_rejects_recent_activity(isolated_env, monkeypatch):
     try:
         server = build_mcp_server()
         async with Client(server) as client:
-            await client.call_tool("ensure_project", {"human_key": "/backend"})
+            await client.call_tool("ensure_project", {"human_key": pkey("backend")})
             await client.call_tool(
                 "register_agent",
                 {
@@ -1209,7 +1210,7 @@ async def test_file_reservation_integration_logging(isolated_env, monkeypatch):
     try:
         server = build_mcp_server()
         async with Client(server) as client:
-            await client.call_tool("ensure_project", {"human_key": "/backend"})
+            await client.call_tool("ensure_project", {"human_key": pkey("backend")})
             _log("Project", "Ensured project '/backend'")
 
             for name in ("BlueLake", "GreenLake"):
@@ -1281,7 +1282,7 @@ async def test_search_and_summarize(isolated_env):
     server = build_mcp_server()
 
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {
@@ -1335,7 +1336,7 @@ async def test_attachment_conversion(isolated_env, monkeypatch):
 
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {
@@ -1392,7 +1393,7 @@ async def test_attachment_conversion_offloads_absolute_path_resolution(isolated_
 
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {
@@ -1434,7 +1435,7 @@ async def test_rich_logger_does_not_throw(isolated_env, monkeypatch):
     async with Client(server) as client:
         res = await client.call_tool("health_check", {})
         assert res.data["status"] == "ok"
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {
@@ -1472,7 +1473,7 @@ async def test_server_level_attachment_policy_override(isolated_env, monkeypatch
 
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {
@@ -1510,7 +1511,7 @@ async def test_file_reservation_conflict_ttl_transition_allows_after_expiry(isol
 
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {
@@ -1582,8 +1583,8 @@ async def test_project_sibling_suggestions_backend(isolated_env, monkeypatch):
     server = build_mcp_server()
 
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/data/projects/backend_core"})
-        await client.call_tool("ensure_project", {"human_key": "/data/projects/backend_core_ui"})
+        await client.call_tool("ensure_project", {"human_key": pkey("data/projects/backend_core")})
+        await client.call_tool("ensure_project", {"human_key": pkey("data/projects/backend_core_ui")})
 
     await refresh_project_sibling_suggestions(max_pairs=5)
     data = await get_project_sibling_data()

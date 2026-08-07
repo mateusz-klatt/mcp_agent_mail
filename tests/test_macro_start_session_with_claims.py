@@ -5,6 +5,7 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
 from mcp_agent_mail.app import build_mcp_server
+from tests.keys import pkey
 
 
 @pytest.mark.asyncio
@@ -25,7 +26,7 @@ async def test_macro_start_session_with_file_reservation_paths(isolated_env):
         res = await client.call_tool(
             "macro_start_session",
             {
-                "human_key": "/test/project",
+                "human_key": pkey("test/project"),
                 "program": "claude-code",
                 "model": "sonnet-4.5",
                 "agent_name": "BlueLake",  # ← Must be adjective+noun format
@@ -42,7 +43,7 @@ async def test_macro_start_session_with_file_reservation_paths(isolated_env):
         # Verify project was created
         assert "project" in data
         assert data["project"]["slug"] == "test-project"
-        assert data["project"]["human_key"] == "/test/project"
+        assert data["project"]["human_key"] == pkey("test/project")
 
         # Verify agent was registered
         assert "agent" in data
@@ -82,7 +83,7 @@ async def test_macro_start_session_without_file_reservations_still_works(isolate
         res = await client.call_tool(
             "macro_start_session",
             {
-                "human_key": "/test/project2",
+                "human_key": pkey("test/project2"),
                 "program": "codex",
                 "model": "gpt-5",
                 "agent_name": "RedStone",  # ← Must be adjective+noun format
@@ -95,7 +96,10 @@ async def test_macro_start_session_without_file_reservations_still_works(isolate
         data = res.data
 
         # Verify basic functionality still works
-        assert data["project"]["slug"] == "test-project2"
+        # endswith: see the note in test_macros.py — the derived slug carries a
+        # drive-letter prefix off POSIX, and identity of the project is what this
+        # line is for.
+        assert data["project"]["slug"].endswith("test-project2")
         assert data["agent"]["name"] == "RedStone"
 
         # file_reservations should be empty dict when not requested (not None - function returns {"granted": [], "conflicts": []})
@@ -116,7 +120,7 @@ async def test_macro_start_session_rejects_explicit_empty_file_reservation_paths
             await client.call_tool(
                 "macro_start_session",
                 {
-                    "human_key": "/test/project-empty-claims",
+                    "human_key": pkey("test/project-empty-claims"),
                     "program": "codex",
                     "model": "gpt-5",
                     "agent_name": "BlueLake",

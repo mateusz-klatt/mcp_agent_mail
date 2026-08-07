@@ -24,6 +24,7 @@ from mcp_agent_mail.cli import app
 from mcp_agent_mail.config import get_settings
 from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.models import Agent, Message, MessageRecipient, Project
+from tests.keys import pkey
 
 runner = CliRunner()
 
@@ -37,7 +38,7 @@ async def seed_project_with_agents() -> tuple[Project, Agent, Agent]:
     """Create a project with two agents for message exchange."""
     await ensure_schema()
     async with get_session() as session:
-        project = Project(slug="mailtest", human_key="/mail/test")
+        project = Project(slug="mailtest", human_key=pkey("mail/test"))
         session.add(project)
         await session.commit()
         await session.refresh(project)

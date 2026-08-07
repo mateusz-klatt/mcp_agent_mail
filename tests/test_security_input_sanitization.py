@@ -24,6 +24,7 @@ from mcp_agent_mail.app import _quote_hyphenated_tokens, _sanitize_fts_query, bu
 from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.http import build_http_app
 from mcp_agent_mail.models import Agent, Project
+from tests.keys import pkey
 
 
 def _rpc(method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -195,7 +196,7 @@ class TestSQLInjectionPrevention:
 
         # Create a project first
         async with get_session() as session:
-            project = Project(slug="sql-test", human_key="/sql/test")
+            project = Project(slug="sql-test", human_key=pkey("sql/test"))
             session.add(project)
             await session.commit()
 
@@ -216,7 +217,7 @@ class TestSQLInjectionPrevention:
                     settings.http.path,
                     json=_rpc("tools/call", {
                         "name": "search_messages",
-                        "arguments": {"project_key": "/sql/test", "query": malicious_query},
+                        "arguments": {"project_key": pkey("sql/test"), "query": malicious_query},
                     }),
                 )
                 # Should return 200 with empty/error result, not crash the DB
@@ -232,7 +233,7 @@ class TestSQLInjectionPrevention:
         app = build_http_app(settings, server)
 
         async with get_session() as session:
-            project = Project(slug="fts-test", human_key="/fts/test")
+            project = Project(slug="fts-test", human_key=pkey("fts/test"))
             session.add(project)
             await session.commit()
 
@@ -252,7 +253,7 @@ class TestSQLInjectionPrevention:
                     settings.http.path,
                     json=_rpc("tools/call", {
                         "name": "search_messages",
-                        "arguments": {"project_key": "/fts/test", "query": query},
+                        "arguments": {"project_key": pkey("fts/test"), "query": query},
                     }),
                 )
                 # May return error but should not crash
@@ -310,7 +311,7 @@ class TestPathTraversalPrevention:
 
         # Create project and agent
         async with get_session() as session:
-            project = Project(slug="path-test", human_key="/path/test")
+            project = Project(slug="path-test", human_key=pkey("path/test"))
             session.add(project)
             await session.commit()
             await session.refresh(project)
@@ -341,7 +342,7 @@ class TestPathTraversalPrevention:
                     json=_rpc("tools/call", {
                         "name": "file_reservation_paths",
                         "arguments": {
-                            "project_key": "/path/test",
+                            "project_key": pkey("path/test"),
                             "agent_name": "TestAgent",
                             "paths": patterns,
                         },
@@ -369,7 +370,7 @@ class TestLargeInputHandling:
         app = build_http_app(settings, server)
 
         async with get_session() as session:
-            project = Project(slug="large-test", human_key="/large/test")
+            project = Project(slug="large-test", human_key=pkey("large/test"))
             session.add(project)
             await session.commit()
 
@@ -382,7 +383,7 @@ class TestLargeInputHandling:
                 settings.http.path,
                 json=_rpc("tools/call", {
                     "name": "search_messages",
-                    "arguments": {"project_key": "/large/test", "query": long_query},
+                    "arguments": {"project_key": pkey("large/test"), "query": long_query},
                 }),
             )
             # Should handle gracefully
@@ -399,7 +400,7 @@ class TestLargeInputHandling:
 
         # Create project and agent
         async with get_session() as session:
-            project = Project(slug="msg-test", human_key="/msg/test")
+            project = Project(slug="msg-test", human_key=pkey("msg/test"))
             session.add(project)
             await session.commit()
             await session.refresh(project)
@@ -422,7 +423,7 @@ class TestLargeInputHandling:
                 json=_rpc("tools/call", {
                     "name": "register_agent",
                     "arguments": {
-                        "project_key": "/msg/test",
+                        "project_key": pkey("msg/test"),
                         "program": "test",
                         "model": "test",
                         "name": "MsgAgent",
@@ -438,7 +439,7 @@ class TestLargeInputHandling:
                 json=_rpc("tools/call", {
                     "name": "send_message",
                     "arguments": {
-                        "project_key": "/msg/test",
+                        "project_key": pkey("msg/test"),
                         "sender_name": "MsgAgent",
                         "to": ["MsgAgent"],
                         "subject": "Large message test",
@@ -459,7 +460,7 @@ class TestLargeInputHandling:
         app = build_http_app(settings, server)
 
         async with get_session() as session:
-            project = Project(slug="recip-test", human_key="/recip/test")
+            project = Project(slug="recip-test", human_key=pkey("recip/test"))
             session.add(project)
             await session.commit()
             await session.refresh(project)
@@ -484,7 +485,7 @@ class TestLargeInputHandling:
                 json=_rpc("tools/call", {
                     "name": "send_message",
                     "arguments": {
-                        "project_key": "/recip/test",
+                        "project_key": pkey("recip/test"),
                         "sender_name": "RecipAgent",
                         "to": many_recipients,
                         "subject": "Many recipients test",
@@ -535,7 +536,7 @@ class TestNullByteInjection:
         app = build_http_app(settings, server)
 
         async with get_session() as session:
-            project = Project(slug="null-test", human_key="/null/test")
+            project = Project(slug="null-test", human_key=pkey("null/test"))
             session.add(project)
             await session.commit()
 
@@ -546,7 +547,7 @@ class TestNullByteInjection:
                 json=_rpc("tools/call", {
                     "name": "register_agent",
                     "arguments": {
-                        "project_key": "/null/test",
+                        "project_key": pkey("null/test"),
                         "program": "test",
                         "model": "test",
                         "name": "Test\x00Evil",
@@ -575,7 +576,7 @@ class TestUnicodeEncodingAttacks:
         app = build_http_app(settings, server)
 
         async with get_session() as session:
-            project = Project(slug="unicode-test", human_key="/unicode/test")
+            project = Project(slug="unicode-test", human_key=pkey("unicode/test"))
             session.add(project)
             await session.commit()
 
@@ -595,7 +596,7 @@ class TestUnicodeEncodingAttacks:
                     settings.http.path,
                     json=_rpc("tools/call", {
                         "name": "search_messages",
-                        "arguments": {"project_key": "/unicode/test", "query": query},
+                        "arguments": {"project_key": pkey("unicode/test"), "query": query},
                     }),
                 )
                 # Should handle without crashing
@@ -611,7 +612,7 @@ class TestUnicodeEncodingAttacks:
         app = build_http_app(settings, server)
 
         async with get_session() as session:
-            project = Project(slug="utf8-test", human_key="/utf8/test")
+            project = Project(slug="utf8-test", human_key=pkey("utf8/test"))
             session.add(project)
             await session.commit()
 
@@ -622,7 +623,7 @@ class TestUnicodeEncodingAttacks:
                 settings.http.path,
                 json=_rpc("tools/call", {
                     "name": "search_messages",
-                    "arguments": {"project_key": "/utf8/test", "query": "test\uFFFDquery"},
+                    "arguments": {"project_key": pkey("utf8/test"), "query": "test\uFFFDquery"},
                 }),
             )
             assert response.status_code == 200
@@ -646,7 +647,7 @@ class TestSpecialCharactersInIdentifiers:
         app = build_http_app(settings, server)
 
         async with get_session() as session:
-            project = Project(slug="thread-test", human_key="/thread/test")
+            project = Project(slug="thread-test", human_key=pkey("thread/test"))
             session.add(project)
             await session.commit()
             await session.refresh(project)
@@ -677,7 +678,7 @@ class TestSpecialCharactersInIdentifiers:
                     json=_rpc("tools/call", {
                         "name": "send_message",
                         "arguments": {
-                            "project_key": "/thread/test",
+                            "project_key": pkey("thread/test"),
                             "sender_name": "ThreadAgent",
                             "to": ["ThreadAgent"],
                             "subject": "Thread test",
@@ -725,7 +726,7 @@ class TestXSSPrevention:
         app = build_http_app(settings, server)
 
         async with get_session() as session:
-            project = Project(slug="xss-test", human_key="/xss/test")
+            project = Project(slug="xss-test", human_key=pkey("xss/test"))
             session.add(project)
             await session.commit()
             await session.refresh(project)
@@ -749,7 +750,7 @@ class TestXSSPrevention:
                 json=_rpc("tools/call", {
                     "name": "send_message",
                     "arguments": {
-                        "project_key": "/xss/test",
+                        "project_key": pkey("xss/test"),
                         "sender_name": "XSSAgent",
                         "to": ["XSSAgent"],
                         "subject": "XSS Test",

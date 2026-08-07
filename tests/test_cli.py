@@ -19,6 +19,7 @@ from mcp_agent_mail.config import clear_settings_cache, get_settings
 from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.models import Agent, FileReservation, Project
 from mcp_agent_mail.storage import _commit as _archive_commit, ensure_archive
+from tests.keys import pkey
 
 
 def _init_projects_adopt_repo(tmp_path: Path) -> tuple[Path, Path]:
@@ -379,8 +380,8 @@ def test_doctor_check_scopes_project_specific_findings(isolated_env):
     async def seed() -> None:
         await ensure_schema()
         async with get_session() as session:
-            backend = Project(slug="backend", human_key="/backend")
-            frontend = Project(slug="frontend", human_key="/frontend")
+            backend = Project(slug="backend", human_key=pkey("backend"))
+            frontend = Project(slug="frontend", human_key=pkey("frontend"))
             session.add(backend)
             session.add(frontend)
             await session.commit()
@@ -460,8 +461,8 @@ def test_doctor_repair_scopes_project_specific_repairs(isolated_env, monkeypatch
     async def seed() -> None:
         await ensure_schema()
         async with get_session() as session:
-            backend = Project(slug="backend", human_key="/backend")
-            frontend = Project(slug="frontend", human_key="/frontend")
+            backend = Project(slug="backend", human_key=pkey("backend"))
+            frontend = Project(slug="frontend", human_key=pkey("frontend"))
             session.add(backend)
             session.add(frontend)
             await session.commit()
@@ -705,7 +706,7 @@ def test_doctor_repair_aborts_when_backup_creation_fails(isolated_env, monkeypat
     async def seed() -> None:
         await ensure_schema()
         async with get_session() as session:
-            backend = Project(slug="backend", human_key="/backend")
+            backend = Project(slug="backend", human_key=pkey("backend"))
             session.add(backend)
             await session.commit()
             await session.refresh(backend)

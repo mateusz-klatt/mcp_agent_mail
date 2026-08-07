@@ -17,6 +17,7 @@ import pytest
 from fastmcp import Client
 
 from mcp_agent_mail.app import _is_virtual_namespace, build_mcp_server
+from tests.keys import pkey
 
 logger = logging.getLogger(__name__)
 
@@ -78,12 +79,12 @@ async def test_virtual_reservation_created(isolated_env):
     """Virtual namespace path can be reserved successfully."""
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/vns-create", 1)
+        names = await _setup_project_with_agents(client, pkey("test/vns-create"), 1)
 
         result = await client.call_tool(
             "file_reservation_paths",
             {
-                "project_key": "/test/vns-create",
+                "project_key": pkey("test/vns-create"),
                 "agent_name": names[0],
                 "paths": ["tool://playwright"],
                 "ttl_seconds": 3600,
@@ -104,12 +105,12 @@ async def test_multiple_virtual_reservations(isolated_env):
     """Multiple virtual namespace paths can be reserved at once."""
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/vns-multi", 1)
+        names = await _setup_project_with_agents(client, pkey("test/vns-multi"), 1)
 
         result = await client.call_tool(
             "file_reservation_paths",
             {
-                "project_key": "/test/vns-multi",
+                "project_key": pkey("test/vns-multi"),
                 "agent_name": names[0],
                 "paths": ["tool://playwright", "resource://gpu-0", "service://redis"],
                 "ttl_seconds": 3600,
@@ -135,13 +136,13 @@ async def test_virtual_reservation_conflict(isolated_env):
     """Two agents reserving the same virtual path shows a conflict."""
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/vns-conflict", 2)
+        names = await _setup_project_with_agents(client, pkey("test/vns-conflict"), 2)
 
         # Agent 0 reserves
         await client.call_tool(
             "file_reservation_paths",
             {
-                "project_key": "/test/vns-conflict",
+                "project_key": pkey("test/vns-conflict"),
                 "agent_name": names[0],
                 "paths": ["tool://playwright"],
                 "ttl_seconds": 3600,
@@ -153,7 +154,7 @@ async def test_virtual_reservation_conflict(isolated_env):
         result = await client.call_tool(
             "file_reservation_paths",
             {
-                "project_key": "/test/vns-conflict",
+                "project_key": pkey("test/vns-conflict"),
                 "agent_name": names[1],
                 "paths": ["tool://playwright"],
                 "ttl_seconds": 3600,
@@ -173,13 +174,13 @@ async def test_virtual_no_conflict_with_filesystem(isolated_env):
     """Virtual path and filesystem path never conflict, even with similar names."""
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/vns-no-cross", 2)
+        names = await _setup_project_with_agents(client, pkey("test/vns-no-cross"), 2)
 
         # Agent 0 reserves a filesystem path
         await client.call_tool(
             "file_reservation_paths",
             {
-                "project_key": "/test/vns-no-cross",
+                "project_key": pkey("test/vns-no-cross"),
                 "agent_name": names[0],
                 "paths": ["src/playwright.py"],
                 "ttl_seconds": 3600,
@@ -191,7 +192,7 @@ async def test_virtual_no_conflict_with_filesystem(isolated_env):
         result = await client.call_tool(
             "file_reservation_paths",
             {
-                "project_key": "/test/vns-no-cross",
+                "project_key": pkey("test/vns-no-cross"),
                 "agent_name": names[1],
                 "paths": ["tool://playwright"],
                 "ttl_seconds": 3600,
@@ -208,12 +209,12 @@ async def test_virtual_different_paths_no_conflict(isolated_env):
     """Different virtual paths don't conflict with each other."""
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/vns-diff", 2)
+        names = await _setup_project_with_agents(client, pkey("test/vns-diff"), 2)
 
         await client.call_tool(
             "file_reservation_paths",
             {
-                "project_key": "/test/vns-diff",
+                "project_key": pkey("test/vns-diff"),
                 "agent_name": names[0],
                 "paths": ["tool://playwright"],
                 "ttl_seconds": 3600,
@@ -224,7 +225,7 @@ async def test_virtual_different_paths_no_conflict(isolated_env):
         result = await client.call_tool(
             "file_reservation_paths",
             {
-                "project_key": "/test/vns-diff",
+                "project_key": pkey("test/vns-diff"),
                 "agent_name": names[1],
                 "paths": ["tool://selenium"],
                 "ttl_seconds": 3600,
@@ -246,13 +247,13 @@ async def test_virtual_reservation_release(isolated_env):
     """Virtual namespace reservations can be released normally."""
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/vns-release", 1)
+        names = await _setup_project_with_agents(client, pkey("test/vns-release"), 1)
 
         # Reserve
         await client.call_tool(
             "file_reservation_paths",
             {
-                "project_key": "/test/vns-release",
+                "project_key": pkey("test/vns-release"),
                 "agent_name": names[0],
                 "paths": ["tool://playwright"],
                 "ttl_seconds": 3600,
@@ -264,7 +265,7 @@ async def test_virtual_reservation_release(isolated_env):
         result = await client.call_tool(
             "release_file_reservations",
             {
-                "project_key": "/test/vns-release",
+                "project_key": pkey("test/vns-release"),
                 "agent_name": names[0],
                 "paths": ["tool://playwright"],
             },
@@ -283,12 +284,12 @@ async def test_mixed_fs_and_virtual_reservation(isolated_env):
     """An agent can hold both filesystem and virtual reservations."""
     server = build_mcp_server()
     async with Client(server) as client:
-        names = await _setup_project_with_agents(client, "/test/vns-mixed", 1)
+        names = await _setup_project_with_agents(client, pkey("test/vns-mixed"), 1)
 
         result = await client.call_tool(
             "file_reservation_paths",
             {
-                "project_key": "/test/vns-mixed",
+                "project_key": pkey("test/vns-mixed"),
                 "agent_name": names[0],
                 "paths": ["src/**/*.py", "tool://playwright", "resource://gpu-0"],
                 "ttl_seconds": 3600,

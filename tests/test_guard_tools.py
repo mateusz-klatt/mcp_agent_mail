@@ -8,6 +8,7 @@ from fastmcp import Client
 
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.config import clear_settings_cache
+from tests.keys import pkey
 
 
 @pytest.mark.asyncio
@@ -18,7 +19,7 @@ async def test_install_and_uninstall_precommit_guard_tools(isolated_env, tmp_pat
     server = build_mcp_server()
 
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         # Prepare an empty git repo
         repo_dir = tmp_path / "code"
         repo_dir.mkdir(parents=True, exist_ok=True)

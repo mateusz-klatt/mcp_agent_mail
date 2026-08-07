@@ -25,6 +25,7 @@ from httpx import ASGITransport, AsyncClient
 from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.http import build_http_app
+from tests.keys import pkey
 
 
 def _rpc(method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -390,7 +391,7 @@ class TestRBACEnforcement:
             response = await client.post(
                 settings.http.path,
                 headers={"Authorization": "Bearer test-token"},
-                json=_rpc("tools/call", {"name": "ensure_project", "arguments": {"human_key": "/test"}}),
+                json=_rpc("tools/call", {"name": "ensure_project", "arguments": {"human_key": pkey("test")}}),
             )
             # ensure_project is NOT read-only, should be blocked for readers
             assert response.status_code == 403

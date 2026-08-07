@@ -10,6 +10,7 @@ from httpx import ASGITransport, AsyncClient
 from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.http import build_http_app
+from tests.keys import pkey
 
 
 def _rpc(method: str, params: dict) -> dict[str, Any]:
@@ -31,7 +32,7 @@ async def test_http_ack_ttl_worker_log_mode(isolated_env, monkeypatch):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         # Create one ack-required message so worker will warn
-        await client.post(settings.http.path, json=_rpc("tools/call", {"name": "ensure_project", "arguments": {"human_key": "/backend"}}))
+        await client.post(settings.http.path, json=_rpc("tools/call", {"name": "ensure_project", "arguments": {"human_key": pkey("backend")}}))
         await client.post(settings.http.path, json=_rpc("tools/call", {"name": "register_agent", "arguments": {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"}}))
         await client.post(settings.http.path, json=_rpc("tools/call", {"name": "send_message", "arguments": {"project_key": "Backend", "sender_name": "BlueLake", "to": ["BlueLake"], "subject": "TTL", "body_md": "x", "ack_required": True}}))
 
@@ -59,7 +60,7 @@ async def test_http_ack_ttl_worker_file_reservation_escalation(isolated_env, mon
     app = build_http_app(settings, server)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        await client.post(settings.http.path, json=_rpc("tools/call", {"name": "ensure_project", "arguments": {"human_key": "/backend"}}))
+        await client.post(settings.http.path, json=_rpc("tools/call", {"name": "ensure_project", "arguments": {"human_key": pkey("backend")}}))
         await client.post(settings.http.path, json=_rpc("tools/call", {"name": "register_agent", "arguments": {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"}}))
         # Trigger ack-required to self to make overdue soon
         await client.post(settings.http.path, json=_rpc("tools/call", {"name": "send_message", "arguments": {"project_key": "Backend", "sender_name": "BlueLake", "to": ["BlueLake"], "subject": "Overdue", "body_md": "x", "ack_required": True}}))

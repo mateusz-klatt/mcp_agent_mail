@@ -27,6 +27,7 @@ from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import ensure_schema
 from mcp_agent_mail.http import _collect_retention_quota_report, build_http_app
 from mcp_agent_mail.storage import ensure_archive
+from tests.keys import pkey
 
 
 def _rpc(method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -545,7 +546,7 @@ class TestHTTPLockScope:
 
         await ensure_schema()
         async with real_get_session() as session:
-            project = Project(slug="http-overseer-lock", human_key="/tmp/http-overseer-lock")
+            project = Project(slug="http-overseer-lock", human_key=pkey("tmp/http-overseer-lock"))
             session.add(project)
             await session.commit()
             await session.refresh(project)
@@ -609,7 +610,7 @@ class TestHTTPLockScope:
 
         await ensure_schema()
         async with real_get_session() as session:
-            project = Project(slug="http-delete-lock", human_key="/tmp/http-delete-lock")
+            project = Project(slug="http-delete-lock", human_key=pkey("tmp/http-delete-lock"))
             session.add(project)
             await session.commit()
             await session.refresh(project)
@@ -704,7 +705,7 @@ class TestHTTPLockScope:
 
         await ensure_schema()
         async with real_get_session() as session:
-            project = Project(slug="http-inbox-delete-lock", human_key="/tmp/http-inbox-delete-lock")
+            project = Project(slug="http-inbox-delete-lock", human_key=pkey("tmp/http-inbox-delete-lock"))
             session.add(project)
             await session.commit()
             await session.refresh(project)
@@ -799,7 +800,7 @@ class TestHTTPLockScope:
 
         await ensure_schema()
         async with real_get_session() as session:
-            project = Project(slug="http-ack-lock", human_key="/tmp/http-ack-lock")
+            project = Project(slug="http-ack-lock", human_key=pkey("tmp/http-ack-lock"))
             session.add(project)
             await session.commit()
             await session.refresh(project)

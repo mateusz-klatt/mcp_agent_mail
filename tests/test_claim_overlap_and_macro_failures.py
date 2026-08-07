@@ -4,13 +4,14 @@ import pytest
 from fastmcp import Client
 
 from mcp_agent_mail.app import build_mcp_server
+from tests.keys import pkey
 
 
 @pytest.mark.asyncio
 async def test_file_reservation_overlap_conflict_path(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool("register_agent", {"project_key": "Backend", "program": "p", "model": "m", "name": "GreenCastle"})
         await client.call_tool("register_agent", {"project_key": "Backend", "program": "p", "model": "m", "name": "BlueLake"})
         res1 = await client.call_tool("file_reservation_paths", {"project_key": "Backend", "agent_name": "GreenCastle", "paths": ["src/**"], "exclusive": True, "ttl_seconds": 3600})
@@ -24,7 +25,7 @@ async def test_file_reservation_overlap_conflict_path(isolated_env):
 async def test_macro_contact_handshake_welcome_failure_nonfatal(isolated_env, monkeypatch):
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool("register_agent", {"project_key": "Backend", "program": "p", "model": "m", "name": "RedStone"})
         await client.call_tool("register_agent", {"project_key": "Backend", "program": "p", "model": "m", "name": "WhiteCat"})
         await client.call_tool("register_agent", {"project_key": "Backend", "program": "p", "model": "m", "name": "BlueLake"})

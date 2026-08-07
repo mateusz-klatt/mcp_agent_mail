@@ -5,6 +5,7 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
 from mcp_agent_mail.app import build_mcp_server
+from tests.keys import pkey
 
 
 @pytest.mark.asyncio
@@ -12,7 +13,7 @@ async def test_contact_policy_block_all_blocks_direct_message(isolated_env):
     server = build_mcp_server()
 
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
@@ -45,7 +46,7 @@ async def test_contacts_only_requires_approval_then_allows(isolated_env):
     server = build_mcp_server()
 
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
@@ -91,7 +92,7 @@ async def test_contact_auto_allows_recent_overlapping_file_reservations(isolated
     server = build_mcp_server()
 
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
@@ -143,8 +144,8 @@ async def test_cross_project_contact_handshake_routes_message(isolated_env):
 
     async with Client(server) as client:
         # Two projects
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
-        await client.call_tool("ensure_project", {"human_key": "/frontend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
+        await client.call_tool("ensure_project", {"human_key": pkey("frontend")})
         await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
@@ -179,4 +180,4 @@ async def test_cross_project_contact_handshake_routes_message(isolated_env):
             },
         )
         deliveries = ok.data.get("deliveries") or []
-        assert any(d.get("project") in {"Frontend", "/frontend"} for d in deliveries)
+        assert any(d.get("project") in {"Frontend", pkey("frontend")} for d in deliveries)

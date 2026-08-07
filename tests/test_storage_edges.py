@@ -33,6 +33,7 @@ from mcp_agent_mail.storage import (
     list_backups,
     restore_from_backup,
 )
+from tests.keys import pkey
 
 
 @pytest.mark.asyncio
@@ -47,7 +48,7 @@ async def test_data_uri_embed_without_conversion(isolated_env, monkeypatch):
         _config.clear_settings_cache()
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
@@ -86,7 +87,7 @@ async def test_missing_file_path_in_markdown_and_originals_toggle(isolated_env, 
     server = build_mcp_server()
     registration_token = ""
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         reg = await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
@@ -158,7 +159,7 @@ async def test_async_file_lock_recovers_stale(tmp_path, monkeypatch):
 async def test_create_and_list_diagnostic_backups(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
@@ -189,7 +190,7 @@ async def test_create_and_list_diagnostic_backups(isolated_env):
 async def test_restore_from_backup_stages_bundle_inside_storage_root(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
@@ -1220,7 +1221,7 @@ async def test_store_image_sha256_via_mcp_send_message(isolated_env, monkeypatch
 
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         reg = await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},

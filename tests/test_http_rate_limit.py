@@ -25,6 +25,7 @@ from httpx import ASGITransport, AsyncClient
 from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.http import SecurityAndRateLimitMiddleware, build_http_app
+from tests.keys import pkey
 
 
 def _rpc(method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -504,7 +505,7 @@ class TestRateLimitKeyDerivation:
             # Note: fetch_inbox may require registration, so this tests the key derivation concept
             r2 = await client.post(
                 settings.http.path,
-                json=_rpc("tools/call", {"name": "whois", "arguments": {"project_key": "/test", "agent_name": "Test"}}),
+                json=_rpc("tools/call", {"name": "whois", "arguments": {"project_key": pkey("test"), "agent_name": "Test"}}),
             )
             # Should not be 429 (different bucket), but may be 200 or other error
             assert r2.status_code != 429

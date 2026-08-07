@@ -9,13 +9,14 @@ from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.config import get_settings
 from mcp_agent_mail.db import ensure_schema, get_db_health_status, get_session
 from mcp_agent_mail.models import Agent, AgentLink, Project
+from tests.keys import pkey
 
 
 @pytest.mark.asyncio
 async def test_contact_auto_allow_same_thread(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},

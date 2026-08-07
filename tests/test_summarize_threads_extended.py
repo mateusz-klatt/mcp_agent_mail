@@ -4,6 +4,7 @@ import pytest
 from fastmcp import Client
 
 from mcp_agent_mail.app import build_mcp_server
+from tests.keys import pkey
 
 
 @pytest.mark.asyncio
@@ -15,7 +16,7 @@ async def test_summarize_threads_non_llm_mode_and_limit(isolated_env):
     """
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "x", "model": "y", "name": "BlueLake"},

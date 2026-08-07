@@ -6,6 +6,7 @@ from httpx import ASGITransport, AsyncClient
 from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.http import build_http_app
+from tests.keys import pkey
 
 
 def _rpc(method: str, params: dict) -> dict:
@@ -52,7 +53,7 @@ async def test_http_jwt_rbac_and_rate_limit(monkeypatch):
             headers=headers,
             json=_rpc(
                 "tools/call",
-                {"name": "ensure_project", "arguments": {"human_key": "/data/projects/http_rbac"}},
+                {"name": "ensure_project", "arguments": {"human_key": pkey("data/projects/http_rbac")}},
             ),
         )
         assert r.status_code == 403

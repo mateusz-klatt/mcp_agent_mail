@@ -16,6 +16,28 @@
 {% endblock %}
 
 {% block content %}
+
+{# Which agent sounds like what, for the chime in base.html — the same island the
+   project page emits, for the same reason. This page spans every project, so the
+   map is flattened across all of them: the chime is keyed by sender name, which
+   is what the message rows carry in data-sender, and a name is the addressing
+   unit anyway. Two projects using one name for different agents would collapse
+   to one tone; that ambiguity is already in `to:` and is not introduced here.
+
+   Built server-side and handed over as one mapping, rather than derived here by
+   walking `projects`: this template is rendered by two routes whose payloads do
+   not agree — /mail carries projects with no `agents` key at all, while
+   /mail/unified-inbox carries them. A filter chain over the wrong one raises
+   inside the render and takes the whole page down, which is how the first
+   version of this was caught.
+
+   Emitted only when somebody has chosen a tone, so an unused feature leaves no
+   markup behind. #}
+{% set sounds = agent_sounds | default({}, true) %}
+{% if sounds %}
+<script type="application/json" id="agent-mail-sounds">{{ sounds | tojson }}</script>
+{% endif %}
+
 <div class="flex flex-col page-transition" x-data="unifiedInboxManager()" x-init="init()">
 
   <!-- Fullscreen Backdrop -->

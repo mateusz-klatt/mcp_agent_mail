@@ -2618,7 +2618,23 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             except Exception as exc:  # pragma: no cover - defensive logging
                 logging.error("Error fetching unified inbox data", exc_info=True, extra={"error": str(exc)})
 
-            return {"messages": messages, "projects": projects}
+            # Who sounds like what, for the chime in base.html. Flattened across
+            # every project because this page spans all of them and the chime is
+            # keyed by sender name, which is what the message rows carry.
+            #
+            # Its own query rather than a column on the projects rows above:
+            # those rows are per-project and this map is per-agent, and only
+            # agents who actually chose a tone belong in it — an empty map and a
+            # missing island behave identically in the reader.
+            agent_sounds: dict[str, str] = {}
+            with contextlib.suppress(Exception):
+                async with get_session() as session:
+                    srows = await session.execute(
+                        text("SELECT name, notify_sound FROM agents WHERE notify_sound IS NOT NULL")
+                    )
+                    agent_sounds = {r[0]: r[1] for r in srows.fetchall() if r[0] and r[1]}
+
+            return {"messages": messages, "projects": projects, "agent_sounds": agent_sounds}
 
         # ---------------------------------------------------------------
         # Login / logout for the viewer. MailUiAuthMiddleware lets exactly
@@ -2764,6 +2780,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 "mail_unified_inbox.html",
                 messages=payload.get("messages", []),
                 projects=payload.get("projects", []),
+                agent_sounds=payload.get("agent_sounds", {}),
             )
 
         @fastapi_app.get("/mail/events")
@@ -3311,7 +3328,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     agents_query = await session.execute(
                         text(
                             """
-                        SELECT a.id, a.name, a.program, a.model, a.last_active_ts
+                        SELECT a.id, a.name, a.program, a.model, a.last_active_ts,
+                               a.notify_sound
                         FROM agents a
                         WHERE a.project_id = :pid
                         ORDER BY a.last_active_ts DESC, a.name ASC
@@ -3329,6 +3347,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                 "program": ar[2],
                                 "model": ar[3],
                                 "last_active": str(ar[4]) if ar[4] else None,
+                                # Carried so this page can sound the writer's own
+                                # tone. The project page has done so since the
+                                # feature landed; this is the page a watcher
+                                # actually leaves open, and without the column
+                                # every colleague rang identically here — the
+                                # feature failing exactly where it was for.
+                                "notify_sound": ar[5],
                             }
                         )
 
@@ -3432,6 +3457,15 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 total_agents=sum(p["agent_count"] for p in projects_data),
                 total_messages=len(messages),
                 filter_importance=filter_importance or "",
+                # This route does carry agents on each project row, but the map
+                # is built the same way as on /mail so the two routes cannot
+                # drift into rendering different tones for the same colleague.
+                agent_sounds={
+                    a["name"]: a["notify_sound"]
+                    for p in projects_data
+                    for a in p["agents"]
+                    if a.get("notify_sound")
+                },
             )
 
         @fastapi_app.get("/mail/{project}/inbox/{agent}", response_class=HTMLResponse)

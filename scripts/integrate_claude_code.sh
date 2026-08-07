@@ -196,13 +196,22 @@ fi
 
 log_step "Writing MCP server config and hooks (merge, not overwrite)"
 
-# Secrets go to ~/.agent-mail.env at mode 0600, never into a hook command.
+# Secrets go to ~/.agent-mail.env, never into a hook command.
 #
 # A hook command is stored verbatim in settings.json, which this script then
 # chmods to 644 — so a token written there is readable by every account on the
 # machine. The file also lives inside the repository, one .gitignore edit or one
-# `git add -f` away from a public remote. check_inbox.sh reads this env file
-# directly, so the two tokens still reach it; only their location changes.
+# `git add -f` away from a public remote. The hooks read this env file directly,
+# so the tokens still reach them; only their location changes.
+#
+# What this move does NOT do is make the file mode 0600 everywhere, which is how
+# it was originally described. Under Git Bash on NTFS the mount carries `noacl`
+# and POSIX modes are neither read nor written: `chmod 600` returns 0 and leaves
+# the mode at 644, `chmod 777` also leaves 644, and only the read-only attribute
+# survives. `umask 077` in write_atomic has nothing to express there either. On
+# that platform the secrets moved from one 644 file to another, and the file is
+# guarded by the profile directory's inherited ACL or not at all — so the mode is
+# verified below and reported rather than assumed.
 ENV_FILE="${HOME}/.agent-mail.env"
 env_file_put() {
   local key="$1" val="$2" existing=""
@@ -219,7 +228,34 @@ env_file_put() {
   chmod 600 "${ENV_FILE}" 2>/dev/null || true
 }
 
-log_step "Writing per-machine secrets to ${ENV_FILE} (mode 0600)"
+# Ask the filesystem what it actually did, not chmod what it thinks it did.
+# lib.sh already warns when `chmod` exits non-zero, and that guard is blind to
+# precisely the case that matters here: on this mount chmod SUCCEEDS and changes
+# nothing, so the only silent platform is the only unprotected one.
+report_env_file_mode() {
+  local mode
+  mode="$(stat -c %a "${ENV_FILE}" 2>/dev/null || stat -f %Lp "${ENV_FILE}" 2>/dev/null || echo '')"
+  if [[ "${mode}" == "600" ]]; then
+    log_ok "${ENV_FILE} is mode 0600."
+    return 0
+  fi
+  if [[ -z "${mode}" ]]; then
+    log_warn "Could not read the mode of ${ENV_FILE}; treat its contents as readable by others until you have checked."
+    return 0
+  fi
+  log_warn "${ENV_FILE} is mode ${mode}, not 0600 — chmod reported success and changed nothing."
+  if [[ "${_OS}" == "windows" ]]; then
+    log_warn "This is expected under Git Bash: the NTFS mount carries 'noacl', so POSIX modes are inert."
+    log_warn "What guards this file is the Windows ACL it inherits. Check it, and read the group names:"
+    log_warn "    icacls \"%USERPROFILE%\\.agent-mail.env\""
+    log_warn "Anything holding (M) on your profile can also rewrite ~/.claude/settings.json,"
+    log_warn "which names the commands every Claude Code session executes."
+  else
+    log_warn "Check the filesystem's mount options before storing a bearer token here."
+  fi
+}
+
+log_step "Writing per-machine secrets to ${ENV_FILE}"
 env_file_put HTTP_BEARER_TOKEN "${_TOKEN}" \
   || log_warn "Could not write HTTP_BEARER_TOKEN to ${ENV_FILE} — hooks will not authenticate."
 env_file_put AGENT_MAIL_URL "${_URL}" \
@@ -230,6 +266,7 @@ if [[ -n "${_REG_TOKEN:-}" ]]; then
 else
   log_warn "No registration token available; the hooks will no-op until one is written to ${ENV_FILE}."
 fi
+[[ -f "${ENV_FILE}" ]] && report_env_file_mode
 
 # The hook commands carry NOTHING — not settings, not identity, not secrets.
 #
@@ -246,7 +283,55 @@ fi
 #
 # `|| true` on every command is load-bearing, not defensive habit: a PreToolUse
 # hook that exits non-zero BLOCKS the tool call it was only meant to comment on.
-_hook_cmd() { printf '%s/%s || true' "${HOOKS_DIR}" "$1"; }
+# Three branches, not four. WSL is Linux for everything this script does —
+# POSIX $HOME, `/` separators, an ordinary filesystem — and would need its own
+# branch only to write Windows paths under /mnt/c, which this script neither
+# does nor should (measured on WSL2 by home-wsl-1). `uname -s` cannot spot WSL
+# on its own: it reports "Linux" there like any other Linux. /proc/version is
+# the reliable discriminator and does not depend on $WSL_* being exported, which
+# a hook launched by Claude Code cannot count on.
+_OS=posix _WSL=0
+case "$(uname -s 2>/dev/null || echo unknown)" in
+  MINGW*|MSYS*|CYGWIN*) _OS=windows ;;
+esac
+if [[ "${_OS}" == "posix" ]] && [[ -r /proc/version ]] && grep -qi microsoft /proc/version 2>/dev/null; then
+  _WSL=1  # informational only; the install is identical to Linux
+fi
+
+# On Windows the command has to name a bash to run the hook with, and this is
+# not a formality. Claude Code hands the string to cmd.exe, which cannot execute
+# a .sh and has no `true`. Measured with the hook script present in every case:
+#
+#   /c/.../session_start.sh || true    rc=0  "path not found", "'true' is not…"
+#   C:/.../session_start.sh            rc=0  silent — Windows opens a
+#                                            file-association dialog instead
+#   bash.exe -c "'/c/…' || true"       rc=0  the hook runs
+#
+# All three exit 0, so every one of them is reported healthy while two never
+# executed a line. `|| true` belongs INSIDE the wrapper, where it absorbs a
+# server outage without blocking the user's edit; outside it, it absorbs the
+# hook not being runnable at all.
+_BASH_WRAP=""
+if [[ "${_OS}" == "windows" ]]; then
+  for _c in "/c/Program Files/Git/bin/bash.exe" "/c/Program Files (x86)/Git/bin/bash.exe"; do
+    [[ -x "${_c}" ]] && { _BASH_WRAP="$(cygpath -m "${_c}" 2>/dev/null || printf '%s' "${_c}")"; break; }
+  done
+  if [[ -z "${_BASH_WRAP}" ]]; then
+    log_err "Windows detected but no Git for Windows bash.exe found."
+    log_err "Hook commands here exit 0 without running, so the hooks would look installed and do nothing."
+    log_err "Install Git for Windows, then re-run this script."
+    exit 1
+  fi
+fi
+
+_hook_cmd() {
+  if [[ -n "${_BASH_WRAP}" ]]; then
+    # The inner command is single-quoted for bash; the outer for cmd.exe.
+    printf '"%s" -c "'"'"'%s/%s'"'"' || true"' "${_BASH_WRAP}" "${HOOKS_DIR}" "$1"
+  else
+    printf '%s/%s || true' "${HOOKS_DIR}" "$1"
+  fi
+}
 
 # ============================================================================
 # settings.json: HOOKS ONLY (no secrets, git-IGNORED via .gitignore ".claude/")
@@ -453,13 +538,21 @@ RUN_HELPER="scripts/run_server_with_token.sh"
 write_run_helper_script "$RUN_HELPER"
 echo "Created $RUN_HELPER"
 
-# Register with Claude Code CLI at user and project scope for immediate discovery
+# Register with Claude Code CLI at USER scope only.
+#
+# The project-scope call that used to follow wrote the bearer into .mcp.json in
+# the target directory. .gitignore:210 does not merely ignore that file, it
+# forbids it and says why: Claude Code reads .mcp.json from the project root and
+# it takes precedence over the user's own configuration. This repository is
+# protected by that line; an arbitrary target directory is not — on a fresh repo
+# with a default .gitignore, `git add .` stages .mcp.json with the token in it.
+#
+# The token still reaches the CLI here, on one line, at user scope. Note that it
+# is passed as an argument either way, so it is visible in this machine's
+# process list for the duration of the call.
 if command -v claude >/dev/null 2>&1; then
-  log_step "Registering MCP server with Claude CLI"
-  # User scope
+  log_step "Registering MCP server with Claude CLI (user scope)"
   claude mcp add --transport http --scope user mcp-agent-mail "${_URL}" -H "Authorization: Bearer ${_TOKEN}" || true
-  # Project scope (run from target dir)
-  (cd "${TARGET_DIR}" && claude mcp add --transport http --scope project mcp-agent-mail "${_URL}" -H "Authorization: Bearer ${_TOKEN}") || true
 fi
 
 log_ok "==> Done."

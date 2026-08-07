@@ -29,10 +29,12 @@ from typing import Any, cast
 import pytest
 from fastmcp import Client
 from sqlalchemy import text
+from sqlmodel import select
 
 from mcp_agent_mail import app as app_module, config as _config
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import ensure_schema, get_session
+from mcp_agent_mail.models import Agent
 
 # ============================================================================
 # Helper functions
@@ -982,11 +984,45 @@ class TestRaceConditions:
             return_exceptions=True,
         )
 
-        for i, r in enumerate(results):
-            assert not isinstance(r, Exception), f"Attempt {i} failed: {r}"
+        # Exactly one attempt may create the identity. `4cf20f1` made
+        # register_agent authenticate against an existing name, so the nine
+        # that arrive second cannot claim "GreenLake" without its token —
+        # which is the point: an unauthenticated caller naming an existing
+        # agent is indistinguishable from someone taking it over.
+        #
+        # This test used to assert all ten succeeded. What it was really
+        # guarding is still guarded, and asserted below: the race must not
+        # produce two agents with one name.
+        created = [r for r in results if isinstance(r, dict)]
+        refused = [r for r in results if isinstance(r, Exception)]
+        assert len(created) == 1, f"exactly one creation, got {len(created)}"
+        assert len(refused) == num_attempts - 1
 
-        agent_ids = [r["id"] for r in results if isinstance(r, dict)]
-        assert len(set(agent_ids)) == 1, "All should get the same agent ID"
+        # Two refusals are possible and which one arrives is a matter of
+        # timing: a caller that reaches the check before the winner's token is
+        # provisioned is told the agent "does not have a registration token",
+        # and one that arrives after is told the call "requires
+        # registration_token". Both mean the same thing to the caller, so this
+        # accepts either rather than pinning whichever the machine happened to
+        # produce — the alternative is a test that passes on one box and not
+        # the next.
+        for r in refused:
+            message = str(r).lower()
+            assert "registration" in message and "token" in message, (
+                f"refused for the wrong reason: {r}"
+            )
+
+        # The winner is usable rather than a row nobody can claim: a race that
+        # left the agent tokenless would burn the name permanently, and every
+        # assertion above would still pass.
+        assert created[0].get("registration_token")
+
+        async with get_session() as session:
+            rows = (
+                await session.execute(select(Agent).where(cast(Any, Agent.name == "GreenLake")))
+            ).scalars().all()
+        assert len(rows) == 1, f"one name, one row, got {len(rows)}"
+        assert rows[0].registration_token
 
     @pytest.mark.asyncio
     async def test_simultaneous_mark_read(self, isolated_env):

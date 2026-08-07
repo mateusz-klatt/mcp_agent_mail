@@ -409,10 +409,20 @@
                 <i data-lucide="bot" class="w-7 h-7 text-white"></i>
               </div>
               <div class="flex-1 min-w-0">
+                {# The alias goes ALONGSIDE the name, never instead of it. That is
+                   not a style choice — models.py says the display label must not
+                   become addressable, because `name` is what `to:` resolves and a
+                   mutable identity orphans every memorised address. Showing only
+                   the alias would teach people to address it. #}
                 <h3 class="text-lg font-bold text-slate-900 dark:text-white truncate group-hover:text-success-600 dark:group-hover:text-success-400 transition-colors">
                   {{ a.name }}
                 </h3>
                 <div class="flex items-center gap-2 text-xs text-slate-600 dark:text-slate-400 mt-1">
+                  {% if a.display_name %}
+                  <span class="truncate px-1.5 py-0.5 rounded bg-primary-50 dark:bg-primary-900/30 text-primary-700 dark:text-primary-300 font-medium"
+                        data-tippy-content="Display name chosen by this agent — not its address">{{ a.display_name }}</span>
+                  <span class="text-slate-300 dark:text-slate-600">•</span>
+                  {% endif %}
                   <span class="truncate">{{ a.program }}</span>
                   <span class="text-slate-300 dark:text-slate-600">•</span>
                   <span class="truncate">{{ a.model }}</span>

@@ -3101,11 +3101,18 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     return await _render("error.html", message="Project not found")
                 pid = int(prow[0])
                 project_archived_at = str(prow[3]) if prow[3] else None
+                # display_name is selected because the viewer had no way to show
+                # it: the column has existed and been settable via
+                # set_agent_display_name all along, and this dict — the only
+                # source the project page gets — never carried it. Measured
+                # before changing anything: the live page renders five agent
+                # cards and the one alias actually set on this server appears
+                # zero times on it.
                 agents_q = await session.execute(
-                    text("SELECT id, name, program, model, retired_at FROM agents WHERE project_id = :pid ORDER BY name"),
+                    text("SELECT id, name, program, model, retired_at, display_name FROM agents WHERE project_id = :pid ORDER BY name"),
                     {"pid": pid},
                 )
-                agents = [{"id": r[0], "name": r[1], "program": r[2], "model": r[3], "retired_at": str(r[4]) if r[4] else None} for r in agents_q.fetchall()]
+                agents = [{"id": r[0], "name": r[1], "program": r[2], "model": r[3], "retired_at": str(r[4]) if r[4] else None, "display_name": r[5]} for r in agents_q.fetchall()]
                 matched_messages: list[dict] = []
                 if q and q.strip():
                     # Prefer FTS5 when available (fts_messages maintained by triggers)

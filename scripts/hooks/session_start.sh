@@ -47,7 +47,22 @@ fi
 [ -z "$resp" ] && exit 0
 got_name="$(printf '%s' "$resp" | jq -r '.name // empty' 2>/dev/null)"
 got_token="$(printf '%s' "$resp" | jq -r '.registration_token // empty' 2>/dev/null)"
-[ -z "$got_name" ] && exit 0
+# A response with no name in it is not an empty response — that case exited
+# above — and it is not a failure either: the status was 2xx, the envelope was
+# well formed, the tool did not refuse. The server answered something other
+# than what register_agent returns, which is what `MCP_AGENT_MAIL_OUTPUT_FORMAT`
+# or `TOON_DEFAULT_FORMAT` does: every field is replaced by {format, data,
+# meta}. Exiting quietly here leaves a machine that looks configured, registers
+# "successfully" every session, and has no coordination at all.
+#
+# The exit-code contract cannot catch this. It answers "did the server reply",
+# and here the server replied; the question is whether the reply contains what
+# this hook reads.
+if [ -z "$got_name" ]; then
+    am_emit_context "SessionStart" \
+        "Agent Mail: could not read an agent name from the registration response. The server answered, but not with what register_agent returns — check MCP_AGENT_MAIL_OUTPUT_FORMAT and TOON_DEFAULT_FORMAT on the server, which replace every field with a {format, data, meta} envelope. Until this is fixed there is no coordination in this session: no reservations, no conflict warnings, no mail."
+    exit 0
+fi
 
 # Persist the name the server GRANTED, not the one requested: a name resembling
 # a program or model is silently replaced, and recording the request would leave

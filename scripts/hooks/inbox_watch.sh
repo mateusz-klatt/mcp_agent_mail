@@ -49,18 +49,32 @@ url="${AM_BASE_URL}/events?project=$(am_urlencode "$PROJECT")&agent=$(am_urlenco
 
 # --no-buffer, or curl holds the frame in its own output buffer and the wake
 # arrives whenever the buffer happens to flush rather than when the mail lands.
+started="$(date +%s 2>/dev/null || echo 0)"
 out="$(printf 'header = "Authorization: Bearer %s"\nheader = "X-Agent-Mail-Registration-Token: %s"\nheader = "Accept: text/event-stream"\n' \
         "$bearer" "$token" \
     | curl -sN --no-buffer --max-time "$WATCH" -K - "$url" 2>/dev/null)"
+ended="$(date +%s 2>/dev/null || echo 0)"
+elapsed=$(( ended - started ))
 
-# Distinguish the two reasons for waking, because they call for different next
-# moves and the agent cannot tell them apart from an empty exit.
+# Distinguish the reasons for waking, because they call for different next moves
+# and the agent cannot tell them apart from an empty exit.
 if printf '%s' "$out" | grep -q '^data: '; then
     id="$(printf '%s' "$out" | sed -n 's/^data: .*"id":\([0-9]*\).*/\1/p' | head -1)"
     printf 'Agent Mail: new mail for %s (id %s). Read it, then start this watcher again.\n' \
         "$AGENT" "${id:-?}"
 elif printf '%s' "$out" | grep -q '^: ready'; then
-    printf 'Agent Mail: watch window elapsed with no new mail for %s. Start this watcher again.\n' "$AGENT"
+    # A subscription that ends early ended because something cut it, not
+    # because nothing happened. Without this check a proxy or CDN dropping the
+    # connection at its idle limit reports "no new mail" — a quiet period that
+    # never occurred, and the exact shape of failure this layer keeps
+    # producing. The margin absorbs clock granularity and connection setup.
+    if [ "$elapsed" -lt $(( WATCH - 5 )) ] 2>/dev/null; then
+        printf 'Agent Mail: the event stream closed after %ss of a %ss window for %s — it was cut, not idle. This is NOT "no new mail": mail sent after the cut was not delivered here. Start the watcher again, and check the inbox directly if this keeps happening.\n' \
+            "$elapsed" "$WATCH" "$AGENT"
+    else
+        printf 'Agent Mail: watch window elapsed (%ss) with no new mail for %s. Start this watcher again.\n' \
+            "$elapsed" "$AGENT"
+    fi
 else
     # Never subscribed — bad credential, server down, proxy in the way. Say so
     # rather than reporting "no mail", which would be indistinguishable from a

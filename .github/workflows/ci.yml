@@ -16,13 +16,33 @@ jobs:
   build-and-test:
     name: Lint, Type Check, Test (${{ matrix.os }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
+    # Scoped to the Windows leg by the `experimental` flag the include sets below.
+    # matrix.experimental is null on the four POSIX legs, so this is false there
+    # and they still gate merges.
+    continue-on-error: ${{ matrix.experimental == true }}
     strategy:
+      # Load-bearing: without it, the Windows leg failing cancels the four POSIX
+      # legs mid-run.
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
         # Honor the requires-python floor (3.12) advertised in pyproject.toml
         # alongside the primary 3.14 target used for Docker/release.
         python-version: ['3.12', '3.14']
+        include:
+          # One leg, not a third column. What breaks on Windows in this
+          # repository is path absoluteness, subprocess exec and case-folding —
+          # none of which differ between 3.12 and 3.14, so a second Windows job
+          # would buy a duplicate of the same failures at 45-90 minutes each.
+          #
+          # Expected red at first, and that is the point. 276 POSIX-shaped
+          # project keys remain across 47 files, and home-win-1 measured what
+          # one machine sees that the others cannot: three files converted,
+          # 54 failures to 1, none of which ubuntu or macos reports as broken.
+          # Until now that visibility depended on someone volunteering to look.
+          - os: windows-latest
+            python-version: '3.14'
+            experimental: true
 
     steps:
       - name: Checkout
@@ -34,22 +54,17 @@ jobs:
           python-version: ${{ matrix.python-version }}
           allow-prereleases: true
 
+      # Replaces a hand-rolled installer and a hand-rolled cache. The shell
+      # installer and `~/.cache/uv` are both POSIX assumptions; the action
+      # resolves both per platform.
+      #
+      # It also drops `.venv` from the cache, which the previous restore-keys
+      # prefix could repopulate from a different Python patch build.
       - name: Install uv
-        shell: bash
-        run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-          uv --version
-
-      - name: Cache uv dependencies
-        uses: actions/cache@v4
+        uses: astral-sh/setup-uv@v5
         with:
-          path: |
-            ~/.cache/uv
-            .venv
-          key: ci-uv-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('pyproject.toml', 'uv.lock') }}
-          restore-keys: |
-            ci-uv-${{ runner.os }}-py${{ matrix.python-version }}-
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
 
       - name: Sync dependencies
         shell: bash

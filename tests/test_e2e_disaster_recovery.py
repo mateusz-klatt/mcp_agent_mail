@@ -118,8 +118,18 @@ async def get_message_recipients(message_id: int) -> list[dict]:
 
 
 def delete_database_and_storage(settings) -> tuple[Path, Path]:
-    """Delete the database and storage directory, returning their paths."""
+    """Delete the database and storage directory, returning their paths.
+
+    Also drops the cached engine. Unlinking a SQLite file does not disturb a
+    connection already open on it: the handle keeps reading the unlinked inode,
+    so queries after a restore answer from the database this function believed
+    it had deleted. That reads as a successful restore whenever the archive
+    happens to hold everything the old file held — which is why restoring the
+    *latest* archive passed here while restoring an *earlier* one, the only
+    case where the two states differ, did not.
+    """
     from mcp_agent_mail.cli import resolve_sqlite_database_path
+    from mcp_agent_mail.db import reset_database_state
 
     db_path = resolve_sqlite_database_path(settings.database.url)
     storage_path = Path(settings.storage.root)
@@ -135,6 +145,8 @@ def delete_database_and_storage(settings) -> tuple[Path, Path]:
     # Delete storage directory
     if storage_path.exists():
         shutil.rmtree(storage_path)
+
+    reset_database_state()
 
     return db_path, storage_path
 
@@ -214,6 +226,11 @@ class TestDisasterRecoveryE2E:
                 },
             )
             agent1_name = agent1.data["name"]
+            # create_agent_identity hands back the token because sends need it:
+            # send_message authenticates the sender unless the MCP session is
+            # already bound to that identity, and a session binds to one. With
+            # three agents here, two of them must say who they are explicitly.
+            agent1_token = agent1.data["registration_token"]
 
             agent2 = await client.call_tool(
                 "create_agent_identity",
@@ -225,6 +242,7 @@ class TestDisasterRecoveryE2E:
                 },
             )
             agent2_name = agent2.data["name"]
+            agent2_token = agent2.data["registration_token"]
 
             agent3 = await client.call_tool(
                 "create_agent_identity",
@@ -236,6 +254,7 @@ class TestDisasterRecoveryE2E:
                 },
             )
             agent3_name = agent3.data["name"]
+            agent3_token = agent3.data["registration_token"]
 
             # Set open contact policy for all agents
             for name in [agent1_name, agent2_name, agent3_name]:
@@ -250,6 +269,7 @@ class TestDisasterRecoveryE2E:
                 {
                     "project_key": project_key,
                     "sender_name": agent1_name,
+                    "sender_token": agent1_token,
                     "to": [agent2_name, agent3_name],
                     "subject": "[DR-TEST] Initial planning message",
                     "body_md": "Starting the disaster recovery test scenario.",
@@ -265,6 +285,7 @@ class TestDisasterRecoveryE2E:
                     "project_key": project_key,
                     "message_id": thread_id,
                     "sender_name": agent2_name,
+                    "sender_token": agent2_token,
                     "body_md": "Acknowledged. Ready for testing.",
                 },
             )
@@ -275,6 +296,7 @@ class TestDisasterRecoveryE2E:
                 {
                     "project_key": project_key,
                     "agent_name": agent1_name,
+                    "registration_token": agent1_token,
                     "paths": ["src/core/**"],
                     "ttl_seconds": 7200,
                     "exclusive": True,
@@ -287,6 +309,7 @@ class TestDisasterRecoveryE2E:
                 {
                     "project_key": project_key,
                     "agent_name": agent2_name,
+                    "registration_token": agent2_token,
                     "paths": ["tests/**"],
                     "ttl_seconds": 7200,
                     "exclusive": True,
@@ -303,6 +326,7 @@ class TestDisasterRecoveryE2E:
                     {
                         "project_key": project_key,
                         "sender_name": agent3_name,
+                        "sender_token": agent3_token,
                         "to": [agent1_name],
                         "subject": f"[DR-TEST] Progress update {i + 1}",
                         "body_md": f"Progress report #{i + 1} for disaster recovery test.",
@@ -316,6 +340,7 @@ class TestDisasterRecoveryE2E:
                 {
                     "project_key": project_key,
                     "agent_name": agent2_name,
+                    "registration_token": agent2_token,
                     "message_id": thread_id,
                 },
             )
@@ -433,6 +458,7 @@ class TestDisasterRecoveryE2E:
                 {
                     "project_key": project_key,
                     "agent_name": agent2_name,
+                    "registration_token": agent2_token,
                     "include_bodies": True,
                 },
             )
@@ -626,12 +652,17 @@ class TestMultipleArchives:
                 },
             )
             agent_name = agent.data["name"]
+            # Reopened client sessions below: the session binding from
+            # create_agent_identity does not survive them, so every send says
+            # who it is explicitly.
+            agent_token = agent.data["registration_token"]
 
             await client.call_tool(
                 "send_message",
                 {
                     "project_key": project_key,
                     "sender_name": agent_name,
+                    "sender_token": agent_token,
                     "to": [agent_name],
                     "subject": "First message",
                     "body_md": "Initial state.",
@@ -642,6 +673,7 @@ class TestMultipleArchives:
                 {
                     "project_key": project_key,
                     "sender_name": agent_name,
+                    "sender_token": agent_token,
                     "to": [agent_name],
                     "subject": "Second message",
                     "body_md": "Still first archive state.",
@@ -660,6 +692,7 @@ class TestMultipleArchives:
                 {
                     "project_key": project_key,
                     "sender_name": agent_name,
+                    "sender_token": agent_token,
                     "to": [agent_name],
                     "subject": "Third message",
                     "body_md": "Second archive state.",

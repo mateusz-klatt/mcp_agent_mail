@@ -158,6 +158,28 @@ async def test_the_throttle_actually_suppresses_writes(server):
             await reserve("b.py")
             assert await _last_active("worker-1") == first
 
+            # "Unchanged" is consistent with two very different things, and this
+            # test used to stop before separating them:
+            #
+            #     throttled, as designed        value unchanged
+            #     raised, swallowed by the      value unchanged
+            #       enclosing suppress()
+            #
+            # The second is not hypothetical — it is exactly what happened with
+            # the naive/aware subtraction, and the guard now wraps the whole body,
+            # so a future error there would be even quieter. Distinguishing them
+            # needs a second measurement, not a sharper assertion on the first:
+            # age the row past the window and require a refresh. A dead function
+            # cannot produce one, so this is the positive control for the line
+            # above rather than an extra case.
+            await _backdate("worker-1", "2020-01-01 00:00:00")
+            await reserve("c.py")
+            revived = await _last_active("worker-1")
+            assert not revived.startswith("2020"), (
+                "the throttle assertion above cannot tell 'suppressed the write' "
+                f"from 'crashed and was swallowed' unless this refreshes: {revived}"
+            )
+
 
 @pytest.mark.asyncio
 async def test_an_aware_timestamp_does_not_break_authentication(server):

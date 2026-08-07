@@ -5251,7 +5251,15 @@ def build_mcp_server() -> FastMCP:
         # subtracting the two flavours is a TypeError. It surfaced as a failed
         # `send_message` — because this runs inside `_authenticate_agent`, so a
         # bookkeeping error was being reported as a rejected tool call.
-        with suppress(Exception):
+        #
+        # It logs rather than passing, and the difference is not cosmetic. Widening
+        # the guard over the comparison also made two tests in test_server.py go
+        # green *without* the fix below, because a swallowed TypeError looks
+        # exactly like a throttled call: nothing changes either way. A silent
+        # except here would have converted a visible failure into an invisible
+        # one — the field would simply stop advancing, and the sweeper that reads
+        # it would start retiring agents that are working.
+        try:
             now = _naive_utc()
             previous = getattr(agent, "last_active_ts", None)
             if previous is not None:
@@ -5266,6 +5274,11 @@ def build_mcp_server() -> FastMCP:
                     session.add(db_agent)
                     await session.commit()
             agent.last_active_ts = now
+        except Exception as exc:  # noqa: BLE001 - see above: swallow, but say so
+            logger.warning(
+                "activity_touch.failed",
+                extra={"agent": getattr(agent, "name", None), "error": str(exc)},
+            )
 
     async def _authenticate_agent(
         ctx: Context,

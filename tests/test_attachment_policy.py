@@ -8,7 +8,6 @@ from fastmcp import Client
 
 from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
-
 from tests.keys import pkey
 
 

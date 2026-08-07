@@ -15,9 +15,6 @@ from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.http import build_http_app
 
 
-
-
-
 def _rpc(method: str, params: dict) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": "1", "method": method, "params": params}
 

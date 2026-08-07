@@ -26,8 +26,7 @@ import time
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from mcp_agent_mail import config as _config
-from mcp_agent_mail import webauth
+from mcp_agent_mail import config as _config, webauth
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.http import build_http_app

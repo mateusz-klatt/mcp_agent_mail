@@ -5,10 +5,9 @@ Tests all /mail/archive/* endpoints for proper rendering and functionality.
 
 from __future__ import annotations
 
+import contextlib
 import subprocess
 from pathlib import Path
-
-import contextlib
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -18,8 +17,6 @@ from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.http import build_http_app
 from mcp_agent_mail.storage import ensure_archive, write_agent_profile, write_message_bundle
-
-
 
 
 # The viewer is behind a password login by default, and these tests exercise

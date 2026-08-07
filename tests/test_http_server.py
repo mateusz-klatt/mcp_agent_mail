@@ -29,9 +29,6 @@ from mcp_agent_mail.http import _collect_retention_quota_report, build_http_app
 from mcp_agent_mail.storage import ensure_archive
 
 
-
-
-
 def _rpc(method: str, params: dict[str, Any]) -> dict[str, Any]:
     """Create a JSON-RPC 2.0 request payload."""
     return {"jsonrpc": "2.0", "id": "1", "method": method, "params": params}

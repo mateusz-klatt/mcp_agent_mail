@@ -14,15 +14,14 @@ of thing that is only ever discovered while chasing something else.
 from __future__ import annotations
 
 import contextlib
-import json
 
 import pytest
 from fastmcp import Client
+from sqlalchemy import text
 
 from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import get_session
-from sqlalchemy import text
 
 KEY = "/test/activity"
 

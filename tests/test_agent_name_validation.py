@@ -22,7 +22,6 @@ from mcp_agent_mail.utils import (
     sanitize_agent_name,
     validate_agent_name_format,
 )
-
 from tests.keys import pkey
 
 # ============================================================================

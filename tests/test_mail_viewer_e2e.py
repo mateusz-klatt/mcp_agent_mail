@@ -17,8 +17,6 @@ from mcp_agent_mail.http import build_http_app
 from mcp_agent_mail.storage import ensure_archive, write_agent_profile
 
 
-
-
 # The viewer is behind a password login by default, and these tests exercise
 # what the pages RENDER, not who may see them — the login has its own coverage
 # in tests/test_http_auth.py and tests/test_mail_ui_auth*.py. Without this every

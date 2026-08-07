@@ -2,96 +2,156 @@
 
 Working notes for whoever picks this up. Ordered by what breaks first if ignored.
 
-## 1. Malformed request body answers 500, not 400
+## Done
 
-Reproduced: a body whose bytes are not valid UTF-8 (a legacy codepage, which is
-what Git Bash on a non-English Windows sends) makes the stateless mount answer
-`500 Error handling POST request`. Valid UTF-8 and `\uXXXX`-escaped bodies both
-answer 200 — the server decodes non-ASCII correctly, so this is not a
-non-ASCII problem, it is an *invalid encoding* problem.
+**Malformed request body answered 500, not 400.** A body whose bytes are not
+valid UTF-8 made the stateless mount answer `500 Error handling POST request`,
+which blames the server for the caller's bytes and names nothing actionable.
+`Utf8BodyGuardMiddleware` now answers 400 with the failing byte offset. Plain
+ASGI, POST-only, skips streamed and oversized bodies, so the SSE GET is
+untouched. Tests in `tests/test_http_utf8_body_guard.py`.
 
-The message comes from `mcp/server/streamable_http.py:650` (the SDK), not from
-this repo. The client-side mitigation is already in: `am_call` emits ASCII-only
-via `jq -a`, which cannot be mis-encoded.
+It paid for itself immediately: the 400-with-offset is what let the Windows
+machine isolate the real cause — the body crossing argv into native `curl.exe`,
+where the console codepage re-encodes it. Fixed separately by sending the body
+over stdin.
 
-What is still worth doing here: a small middleware that rejects an undecodable
-body with 400 and a message saying so. A 500 tells the caller "the server
-broke" when the truth is "you sent bytes I cannot read", and in `am_call` it
-surfaces as an empty result — indistinguishable from "nothing to report". That
-class of silent failure has cost more time on this project than any other.
+**Unread mail below the high-water mark was never delivered.** `fetch_inbox`
+orders newest-first and *then* applies the limit, so an agent with more unread
+than the page size saw only the newest page, stored the top id, and every older
+unread message fell below the mark permanently. Verified live: fourteen unread,
+ten announced, four never surfaced again even after the ten were read. The
+scalar mark is now `{floor, ids}`, enumeration is split from body-fetching, and
+what does not fit the render caps is named on one line or counted and held over
+rather than dropped. A bare integer on disk migrates as a set of one, so the
+first check after the change re-announces everything still unread.
 
-Also worth a regression test asserting `POST /api/` accepts a UTF-8 body.
+## 1. Instant delivery
+
+`inbox_check.sh` is polling: `SessionStart` always, then `PostToolUse` at most
+once per 120s. An *idle* session is never woken, which is precisely the case
+that matters — an agent waiting on another agent's answer, or a human saying
+"stop".
+
+Design settled (SSE, not WebSocket). WebSocket adds a proxy module and a server
+flag for no directional benefit; the channel only ever carries server→client
+hints, and SSE is already proven through this Apache/Cloudflare path with the
+15s keepalive that also defeats the CDN's ~100s idle timeout.
+
+  * **Route.** A new top-level `GET /events`, outside `/api`, `/mcp` and
+    `/mail`, registered *before* the broad MCP mounts and the optional root
+    static mount or it will be shadowed.
+  * **Auth.** Both layers. The bearer is server-wide, not project-scoped, so
+    without a second factor any bearer holder could subscribe as another agent
+    and watch their message timing, ids and BCC arrivals. Take the recipient's
+    registration token in a header — not a query parameter, which would land in
+    proxy and CDN logs. Return the same 401 for unknown project, unknown agent
+    and bad token, so the endpoint cannot be used to enumerate identities.
+  * **Frames.** Thin: `{kind, project, agent, id}`, `kind: "message"` the only
+    v1 kind. The woken agent pulls content through `fetch_inbox`; shipping
+    payloads duplicates the mailbox's authorisation model for no gain. No SSE
+    `id:` line — that would advertise `Last-Event-ID` replay this does not have.
+  * **Fan-out.** One bounded queue *per connection*, keyed `(project, agent)`.
+    A single shared queue per agent would load-balance the hint and wake only
+    one of two sessions sharing an identity.
+  * **Lifecycle.** `: ready` immediately, `: ping` every 15s, then one `data:`
+    frame and close, so `curl -N` exits — and a background process that exits
+    is already Claude Code's wake mechanism. No monitor runtime needed.
+  * **Reconnect.** No replay, no sequence number, no cursor: the mailbox is the
+    log. Order is subscribe-first, pull-second — register, send `: ready`, let
+    the client catch up through `fetch_inbox` while subscribed, then wait. That
+    closes the check-then-subscribe lost-wakeup window, and makes queue overflow
+    and disconnected periods harmless.
+
+Emit points: `_deliver_message` (covers sends, replies and the message
+`request_contact` creates) and the overseer send path, which bypasses
+`_deliver_message` and would otherwise be the one message type that never
+notifies. Publish after the archive write succeeds, not merely after DB commit.
+
+Two corrections against reusing the existing notification path: it excludes BCC
+(blindness is between recipients, not between server and recipient), and it is
+gated on `settings.notifications.enabled` plus a debounce, either of which would
+silently swallow a wake.
+
+Reservation grants are **not** an emit point. The grant path grants even when
+conflicts exist and extends existing rows on every re-reservation, so
+broadcasting it would wake everyone on routine edits, and there is no defined
+recipient. Revisit only once a client has a reservation-state pull path;
+`fetch_inbox` cannot reconcile one.
 
 ## 2. Two sessions on one host share one identity
 
-Verified: `AM_SESSION_ID` *is* assigned where it is needed (`autoreserve.sh`,
-`session_end.sh` both read `.session_id` from the payload), and the per-session
-path log is keyed correctly — a log written by session `A` is named for `A`.
-So `SessionEnd` releasing another session's paths is NOT a live defect.
+Decided: **keep the identity model as it is.** Not a session discriminator.
 
-The real gap is elsewhere: `reservations_warn.sh` filters out reservations held
-by *this agent name*, and two concurrent CLIs on one host share that name. So a
-second terminal editing a file the first one holds is told nothing. The warning
-is suppressed exactly when it would be useful.
+A session-suffixed identity (`<host>-<platform>-<hex of session_id>`) covers
+nothing actually run here — same-host different-project is already isolated end
+to end by `(project_id, name)` uniqueness — and does not cover the case that
+does collide, ultracode fan-out, because subagents share one `session_id`.
+Against that it would break the property the fleet most depends on: identity
+outliving the process, which is the only reason mail sent to an absent machine
+is picked up at its next `SessionStart`. It would also commit one agent
+directory and one archive commit per terminal, forever.
 
-Server-side, reservations belong to an agent, not a session, so this cannot be
-fully fixed client-side by filtering alone.
+The real defect is narrower and has a client-side fix.
+`reservations_warn.sh` suppresses on *"is the holder me?"* when it means
+*"did this session reserve it?"* — and the per-session path log already on disk
+answers the second question. Warn when the holder is another agent, or when it
+is our own name with no matching entry in this session's log, wording that case
+as "reserved under this host's identity by another session". `session_start.sh`
+carries the same self-filter and wants the same treatment as a separate line.
 
-Options, in increasing cost:
-  a. leave it — accept that same-host sessions do not warn each other;
-  b. include a session discriminator in the identity (`<host>-<platform>-<8 hex
-     of session_id>`), making every terminal a separate addressable agent;
-  c. keep the durable identity and add a session field server-side.
+Then, for ultracode: key the session log `<session_id>.<agent_id>` when the
+payload carries one and widen the `am_session_logs` glob to `"${slug}*__*.list"`
+so `SessionEnd`, which only ever sees `session_id`, still finds every subagent's
+log. Backward compatible. **Verify first** that `agent_id` is stable per
+subagent rather than per tool call — if it churns, the log fragments and every
+second edit warns spuriously.
 
-(b) also gives what was asked for separately: the ability to DM one specific
-terminal. Its cost is agent sprawl, bounded by the existing 24h auto-retire.
+## 3. Display names
 
-## 3. Instant delivery
+Keep the derived `<host>-<platform>-N` as the immutable key; add an alias for
+display only. `Agent.display_name` (nullable, 128) plus one line in the
+idempotent migration list in `db.py`.
 
-`inbox_check.sh` is polling, however well-behaved: `SessionStart` always, then
-`PostToolUse` at most once per 120s. A session that is *idle* is never woken,
-which is precisely the case that matters — an agent waiting on another agent's
-answer, or a human saying "stop".
+**The alias must never be accepted in `to:`.** Name resolution is not one
+function — it is a dozen `func.lower(Agent.name) == ...` sites in the hottest
+part of `app.py`, and a partial fallback makes behaviour differ per call path.
+It would also make a mutable field load-bearing, which is the exact thing
+keeping the derived key immutable was meant to prevent. And `_looks_like_model_name`
+is a substring test, so plausible aliases ("Opus Box", "Gemini-Rig") would be
+silently mangled by name validation that display-only aliases never touch.
 
-Two transports are possible and the choice is not obvious:
+Reject at set time an alias equal to any agent's key in the project or to
+another agent's alias. Render `alias (key)` everywhere, never the alias alone —
+the key is what must be typed into `to:`.
 
-  * A dedicated SSE endpoint. The transport is proven end to end on this
-    deployment (the MCP stream already survives the reverse proxy and CDN
-    unbuffered, with a 15s keepalive that also defeats the CDN's ~100s idle
-    timeout). Needs no new proxy module. Uvicorn currently starts with
-    websockets disabled, so SSE is also the smaller change.
-  * A WebSocket endpoint. Requires enabling websockets in the server start and
-    an extra proxy module, for no directional benefit — the channel only ever
-    carries server→client hints.
+Do **not** build this on `WindowIdentity`. It looks like a fit, but its uuid
+comes from the *server process's* own environment at config load, so on a shared
+remote server every caller resolves to one window identity or none. It is a
+local-stdio single-user feature.
 
-The client half already exists in Claude Code: a background process that exits
-re-invokes the agent, so `curl -N` on the stream *is* the wake mechanism. No
-separate monitor runtime is required.
+Smallest shape: model field + migration line, `_agent_to_dict` emits it (its ten
+call sites cover register, whois, contacts, the agents resource and the archive
+profile), a new `set_agent_display_name` tool authenticated by the registration
+token the agent already holds — a new tool rather than a kwarg on
+`register_agent`, which upstream changes often — and `a.display_name` added to
+the reservations endpoint's SELECT.
 
-Frames should be thin — `{kind, project, agent, id}` — with the woken agent
-pulling the real content through `fetch_inbox`. Shipping payloads on the
-channel duplicates the mailbox's authorisation model for no gain.
+Worth saying plainly: `AGENT_MAIL_AGENT` in `~/.agent-mail.env` already buys a
+human-readable name today for zero server cost. The catch is that it *is* the
+key, so changing it later orphans the mailbox, the credential and every
+reservation. The column earns its keep only for renaming after the fact, and for
+names that cannot be keys.
 
-Emit points already identified: `_deliver_message` (alongside the existing
-`emit_notification_signal` call), the reservation grant path, and separately
-the overseer send path — which bypasses `_deliver_message` and would otherwise
-be the one message type that never notifies.
+## Still open, server side
 
-## 4. Display names
-
-Identity is currently `<host>-<platform>-1`, derived and stable. The request is
-to let each participant pick a human-readable name.
-
-Keep the derived value as the immutable key and add an alias for display, so a
-rename cannot orphan a mailbox, a credential, or a reservation. The server
-already stores agent rows; an alias column plus a rename tool is the smaller
-half. The larger half is deciding where the alias is authoritative for
-addressing — accepting an alias in `to:` means aliases must be unique per
-project and reserved against collision with derived names.
+`_authenticate_agent` never refreshes `last_active_ts`, so an agent that only
+files reservations looks dead after `FILE_RESERVATION_INACTIVITY_SECONDS` and
+has its holds swept. `register_agent` does not clear `retired_at` when an
+existing agent re-registers with a valid token.
 
 ## Sequencing
 
-1 first: it is small, it is in this repo, and it converts a two-day mystery
-into a legible error. Then 2(b) or 2(a) — that decision gates 3, because the
-notification channel is per-recipient and the recipient is whatever identity
-model wins. 4 last: it is additive and touches nothing the others depend on.
+1 is the user's stated priority and its identity dependency is now resolved by
+2's decision to change nothing. The client half of 2 is a single hook file and
+can land any time. 3 is additive and touches nothing the others depend on.

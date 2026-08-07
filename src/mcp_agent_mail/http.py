@@ -28,6 +28,7 @@ from sqlalchemy.exc import NoResultFound
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.types import Receive, Scope, Send
 
+from . import webauth
 from .app import (
     _expire_stale_file_reservations,
     _format_cross_project_agent_address,
@@ -39,7 +40,6 @@ from .app import (
     sweep_stale_agents,
     update_project_sibling_status,
 )
-from . import webauth
 from .config import Settings, get_settings
 from .db import ensure_schema, get_session
 from .notify import KEEPALIVE_SECONDS, MAX_STREAM_SECONDS, hub

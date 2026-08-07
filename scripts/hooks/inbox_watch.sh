@@ -43,10 +43,17 @@ WATCH="${AGENT_MAIL_WATCH_SECONDS:-1800}"
 # exit would wake nobody. What can be removed is the recall: print the command,
 # not a reminder that one exists.
 # `bash <path>`, not a bare path. A bare .sh is executable on Linux and macOS
-# because of the exec bit and the shebang, and on Windows it is a file with no
-# registered handler — so the operator gets "How do you want to open this file?"
-# instead of a running watcher. `bash <path>` runs everywhere, so this needs no
-# per-platform branch and puts no second copy of that knowledge in the tree.
+# because of the exec bit and the shebang; on Windows it is a file with no
+# registered handler, so following the instruction opens a file-association
+# prompt rather than starting anything. `bash <path>` runs everywhere, so this
+# needs no per-platform branch and puts no second copy of that knowledge here.
+#
+# The evidence is a measurement of the bare form returning success with no
+# output on Windows — NOT the file-association prompt an operator reported
+# around the same time. That prompt came from a different experiment run
+# minutes earlier, and printing a path as text cannot open a handler; something
+# has to execute it. The commit that introduced this line claimed the prompt as
+# its own evidence, which was wrong, and the fix is right for the other reason.
 SELF_CMD="bash $(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 # How long to wait for `: ready` before giving up on the subscription.
 READY_WAIT="${AGENT_MAIL_WATCH_READY_SECONDS:-15}"

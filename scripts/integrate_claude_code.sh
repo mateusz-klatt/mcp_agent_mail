@@ -533,10 +533,22 @@ set_secure_file "$HOME_SETTINGS_PATH" || true
 
 # Create run helper script (centralized in lib.sh)
 log_step "Creating run helper script"
-mkdir -p scripts
-RUN_HELPER="scripts/run_server_with_token.sh"
+# This one writes into the SOURCE TREE, not into TARGET_DIR, and it is the only
+# thing here that does. That is correct — the helper starts the server, which
+# lives in this checkout — but it means PROJECT_DIR does not isolate a trial
+# run: the path was relative and resolved against ROOT_DIR, so a run aimed
+# somewhere else still modified a git-tracked file here, with nothing said.
+# Absolute path, backup first, and say where it went.
+mkdir -p "${ROOT_DIR}/scripts"
+RUN_HELPER="${ROOT_DIR}/scripts/run_server_with_token.sh"
+[[ -f "${RUN_HELPER}" ]] && backup_file "${RUN_HELPER}"
 write_run_helper_script "$RUN_HELPER"
-echo "Created $RUN_HELPER"
+log_ok "Wrote ${RUN_HELPER}"
+if [[ -n "${PROJECT_DIR:-}" ]]; then
+  log_warn "Note: that path is in this checkout, not in ${TARGET_DIR}."
+  log_warn "PROJECT_DIR redirects the Claude Code config, not the server helper — if you are"
+  log_warn "trialling this script, check \`git status\` in ${ROOT_DIR} afterwards."
+fi
 
 # Register with Claude Code CLI at USER scope only.
 #

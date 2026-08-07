@@ -42,19 +42,24 @@ WATCH="${AGENT_MAIL_WATCH_SECONDS:-1800}"
 # spawned would not be a task the agent's runtime tracks, so that successor's
 # exit would wake nobody. What can be removed is the recall: print the command,
 # not a reminder that one exists.
-# `bash <path>`, not a bare path. A bare .sh is executable on Linux and macOS
-# because of the exec bit and the shebang; on Windows it is a file with no
-# registered handler, so following the instruction opens a file-association
-# prompt rather than starting anything. `bash <path>` runs everywhere, so this
-# needs no per-platform branch and puts no second copy of that knowledge here.
+# A bare path, deliberately, and NOT `bash <path>`.
 #
-# The evidence is a measurement of the bare form returning success with no
-# output on Windows — NOT the file-association prompt an operator reported
-# around the same time. That prompt came from a different experiment run
-# minutes earlier, and printing a path as text cannot open a handler; something
-# has to execute it. The commit that introduced this line claimed the prompt as
-# its own evidence, which was wrong, and the fix is right for the other reason.
-SELF_CMD="bash $(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+# `bash <path>` looked like the portable choice: no per-platform branch, works
+# on Linux and macOS. It is wrong on Windows, where `bash` on the PATH is the
+# WSL launcher rather than Git Bash — so it starts a different operating system,
+# which cannot see the drive the path refers to, and answers "No such file or
+# directory". That is BYTE-IDENTICAL to what a genuinely missing hook prints,
+# so it turns a working installation into what reads as a broken one.
+#
+# A bare path is executable wherever this is meant to be run from — the exec bit
+# and shebang cover Linux, macOS and Git Bash alike. It fails only if handed to
+# cmd.exe, which is not the shell any of this is invoked from.
+#
+# The lesson is not about bash. It is that "one form for every platform" was
+# chosen to avoid duplicating platform knowledge that `am_platform` already
+# holds — and avoiding a second copy of that knowledge is not the same as being
+# allowed to ignore it.
+SELF_CMD="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 # How long to wait for `: ready` before giving up on the subscription.
 READY_WAIT="${AGENT_MAIL_WATCH_READY_SECONDS:-15}"
 

@@ -221,14 +221,16 @@ am_call() {
     local tool="$1" args="$2" bearer body
     bearer="$(am_bearer)"
     [ -z "$bearer" ] && return 0
-    # -a escapes every non-ASCII character to \uXXXX. Raw UTF-8 bytes in the POST
-    # body make the stateless mount answer 500 ("Error handling POST request"),
-    # with or without charset=utf-8 on the Content-Type; the same request escaped
-    # returns 200. Escaping here covers every caller: whatever they built with
-    # `jq -c` is re-parsed by --argjson and re-emitted ASCII-only.
+    # -a escapes every non-ASCII character to \uXXXX. The server accepts UTF-8
+    # fine — the corruption is ours: the body crosses an argv boundary into
+    # native curl.exe below, and on Windows that crossing re-encodes text
+    # through the console codepage, turning valid UTF-8 into legacy-codepage
+    # bytes the server rightly refuses (the identical body sent via stdin
+    # passes). ASCII cannot be mis-encoded, so escaping makes the transport
+    # encoding irrelevant on every platform and in every console setup.
     #
     # Worth doing even though the hooks themselves only ever send file paths and
-    # agent names: the 500 arrives as an empty result below, indistinguishable
+    # agent names: the refusal arrives as an empty result below, indistinguishable
     # from "nothing to report", so an agent sending a non-English message loses
     # it with no error anywhere.
     body="$(jq -nac --arg t "$tool" --argjson a "$args" \

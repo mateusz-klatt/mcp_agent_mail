@@ -49,6 +49,24 @@ Drop the `bash.exe` wrapper off Windows. Keep the `|| true`: a PreToolUse hook
 that exits non-zero **blocks the edit**, so a server outage would stop the user
 working.
 
+On Windows the wrapper is not a formality, and `|| true` outside it is actively
+harmful. Claude Code hands the command to `cmd.exe`, which cannot run a `.sh`
+file and does not have `true`. Measured, hook script present in every row:
+
+| command as written | exit | what the user gets |
+|---|---|---|
+| `/c/…/session_start.sh \|\| true` | **0** | "path not found", then "'true' is not recognized" |
+| `C:/…/session_start.sh` | **0** | nothing — Windows opens a *file-association dialog* |
+| `"…/bash.exe" -c "'/c/…/session_start.sh' \|\| true"` | 0 | the hook runs |
+
+Every row exits 0, so Claude Code calls all three healthy. The first two never
+executed a line of the hook. `|| true` is what converts the failure into a
+silent one: it is the right guard **inside** the wrapper, where it absorbs a
+server outage, and a mask **outside** it, where it absorbs the hook not existing
+as a runnable thing at all. The second row is the worst of the three — it is the
+only one that is completely silent, and on a desktop it can pop a GUI dialog at
+every edit.
+
 Per-machine settings go in `~/.agent-mail.env`, never in the hook commands and
 never in the repository:
 
@@ -56,6 +74,15 @@ never in the repository:
 HTTP_BEARER_TOKEN=…          # required
 AGENT_MAIL_URL=https://host  # omit on the machine running the server
 ```
+
+`chmod 600` on that file is worth attempting and worth not trusting. Under Git
+Bash on NTFS the mount carries `noacl`, so POSIX modes are neither read nor
+written: `chmod 600` returns 0 and leaves the mode at 644, `chmod 777` also
+leaves it at 644, and only the read-only attribute survives (`chmod 400` → 444).
+What actually guards the file there is the profile directory's inherited ACL —
+check it with `icacls "%USERPROFILE%\.agent-mail.env"` and read the group names,
+because anything with `(M)` on your profile can rewrite `settings.json` too, and
+that file names the commands every session executes.
 
 Claude Code re-reads `settings.json` without a session restart.
 

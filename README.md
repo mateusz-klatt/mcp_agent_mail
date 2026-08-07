@@ -2385,9 +2385,20 @@ Operations teams can follow `docs/operations_alignment_checklist.md`, which link
 
 ## Deployment quick notes
 
+> **Run exactly one worker process.** This is a correctness requirement, not a
+> capacity default. Stateful MCP sessions, the agent bindings that decide which
+> agent a session speaks as, the `/events` fan-out, and the login brute-force
+> throttle all live only in the memory of the process that created them. A
+> second worker does not share them, so each one fails *intermittently and
+> without a log line*: a session initialised in one worker is unknown in the
+> next, an `/events` client never sees a hint published elsewhere, and a throttle
+> of 8 attempts per window silently becomes 8 per window **per worker**. Adding
+> `-w`/`--workers` to any command below breaks this. Scale by running more
+> instances behind the proxy, each with its own store.
+
 - **Direct uvicorn**: `uvicorn mcp_agent_mail.http:create_app --factory --host 0.0.0.0 --port 8765`
 - **Python module**: `python -m mcp_agent_mail.http --host 0.0.0.0 --port 8765`
-- **Gunicorn**: `gunicorn -c deploy/gunicorn.conf.py mcp_agent_mail.http:create_app --factory`
+- **Gunicorn**: `gunicorn -c deploy/gunicorn.conf.py mcp_agent_mail.http:create_app --factory` — the config pins `workers = 1`; do not override it
 - **Docker**: `docker compose up --build`
 
 ### CI/CD

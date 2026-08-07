@@ -21,13 +21,15 @@ are how those decisions are observed, not the point.
 from __future__ import annotations
 
 import contextlib
+import time
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from mcp_agent_mail import config as _config
+from mcp_agent_mail import webauth
 from mcp_agent_mail.app import build_mcp_server
-from mcp_agent_mail.db import ensure_schema
+from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.http import build_http_app
 
 BEARER = "mail-ui-gate-bearer"
@@ -150,3 +152,120 @@ class TestMailUiGate:
         response = await _get(app, "/mail/login")
 
         assert response.status_code != 401
+
+
+async def _make_user(username: str = "operator", *, role: str = webauth.ROLE_ADMIN) -> int:
+    """Insert a UiUser and return its session_epoch."""
+    from mcp_agent_mail.models import UiUser
+
+    await ensure_schema()
+    async with get_session() as session:
+        user = UiUser(
+            username=username,
+            password_hash=webauth.hash_password("irrelevant-here"),
+            role=role,
+        )
+        session.add(user)
+        await session.commit()
+        await session.refresh(user)
+        return int(user.session_epoch)
+
+
+async def _bump_epoch(username: str = "operator") -> None:
+    """Do what a password change or a disable does: move the epoch on."""
+    from sqlmodel import select
+
+    from mcp_agent_mail.models import UiUser
+
+    async with get_session() as session:
+        row = (await session.execute(select(UiUser).where(UiUser.username == username))).scalars().first()
+        row.session_epoch += 1
+        session.add(row)
+        await session.commit()
+
+
+def _cookie(username: str, epoch: int) -> dict[str, str]:
+    return {
+        "agent_mail_session": webauth.make_session(
+            username, epoch=epoch, now=time.time(), secret=SECRET.encode("utf-8")
+        )
+    }
+
+
+class TestMailUiSession:
+    """The branches that need a real user, including the one that revokes them.
+
+    Written after `home-win-1` mapped this middleware and pointed out that a
+    signed cookie is not sufficient on its own: the row is re-read on every
+    request and its `session_epoch` must still match. That check is the whole
+    revocation mechanism — there is no server-side session table — so a change
+    that dropped it would leave every already-issued cookie valid until it
+    expired, and nothing would have failed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_live_session_is_let_through(self, isolated_env, monkeypatch):
+        """The positive control the rest of this class depends on.
+
+        Without it, every "refused" below is equally consistent with sessions
+        never working at all — which is the failure mode that would make the
+        revocation test pass for entirely the wrong reason.
+        """
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        epoch = await _make_user()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=_cookie("operator", epoch),
+        ) as client:
+            response = await client.get(GUARDED)
+
+        assert response.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_bumping_the_epoch_revokes_a_live_cookie(self, isolated_env, monkeypatch):
+        """A password change or a disable must kill sessions already issued.
+
+        The cookie here is the same bytes that just worked: correctly signed,
+        well inside its TTL, naming a user who still exists and is not disabled.
+        The only thing that moved is the stored epoch — which is exactly what
+        happens on the server side when someone's access is withdrawn.
+        """
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        epoch = await _make_user()
+        cookies = _cookie("operator", epoch)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test", cookies=cookies
+        ) as client:
+            before = await client.get(GUARDED)
+            await _bump_epoch()
+            after = await client.get(GUARDED)
+
+        assert before.status_code == 200
+        assert after.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_a_viewer_may_read_but_not_act(self, isolated_env, monkeypatch):
+        """Role is enforced on unsafe methods only, so both halves are pinned.
+
+        A viewer that could not read would be a different bug from a viewer that
+        could write, and only checking the refusal cannot tell them apart.
+        """
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        epoch = await _make_user("reader", role=webauth.ROLE_VIEWER)
+        cookies = _cookie("reader", epoch)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test", cookies=cookies
+        ) as client:
+            read = await client.get(GUARDED)
+            write = await client.post(
+                GUARDED,
+                headers={"Origin": "http://test", "Referer": "http://test/", "Host": "test"},
+            )
+
+        assert read.status_code == 200
+        assert write.status_code == 403
+        assert "admin" in write.json()["detail"]

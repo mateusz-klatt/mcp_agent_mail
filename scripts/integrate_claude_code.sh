@@ -170,17 +170,59 @@ fi
 
 log_step "Writing MCP server config and hooks (merge, not overwrite)"
 
-# Build the inbox check command with environment variables.
+# Secrets go to ~/.agent-mail.env at mode 0600, never into a hook command.
+#
+# A hook command is stored verbatim in settings.json, which this script then
+# chmods to 644 — so a token written there is readable by every account on the
+# machine. The file also lives inside the repository, one .gitignore edit or one
+# `git add -f` away from a public remote. check_inbox.sh reads this env file
+# directly, so the two tokens still reach it; only their location changes.
+ENV_FILE="${HOME}/.agent-mail.env"
+env_file_put() {
+  local key="$1" val="$2" existing=""
+  [[ -n "${val}" ]] || return 0
+  if [[ -f "${ENV_FILE}" ]]; then
+    existing=$(grep -v "^${key}=" "${ENV_FILE}" 2>/dev/null || true)
+  fi
+  # write_atomic creates its temp under umask 077 and returns non-zero if the
+  # write or the rename fails. A credential store that cannot say whether it
+  # stored anything leaves the caller believing a machine is configured when it
+  # is not, so the failure is propagated rather than swallowed.
+  { [[ -n "${existing}" ]] && printf '%s\n' "${existing}"; printf '%s=%s\n' "${key}" "${val}"; } \
+    | write_atomic "${ENV_FILE}" || return 1
+  chmod 600 "${ENV_FILE}" 2>/dev/null || true
+}
+
+log_step "Writing per-machine secrets to ${ENV_FILE} (mode 0600)"
+env_file_put HTTP_BEARER_TOKEN "${_TOKEN}" \
+  || log_warn "Could not write HTTP_BEARER_TOKEN to ${ENV_FILE} — hooks will not authenticate."
+env_file_put AGENT_MAIL_URL "${_URL}" \
+  || log_warn "Could not write AGENT_MAIL_URL to ${ENV_FILE} — hooks will fall back to localhost."
+if [[ -n "${_REG_TOKEN:-}" ]]; then
+  env_file_put AGENT_MAIL_REGISTRATION_TOKEN "${_REG_TOKEN}" \
+    || log_warn "Could not write AGENT_MAIL_REGISTRATION_TOKEN to ${ENV_FILE} — fetch_inbox will be denied."
+else
+  log_warn "No registration token available; ${INBOX_HOOK} will no-op until one is written to ${ENV_FILE}."
+fi
+
+# Build the inbox check command. Non-secret values only.
 #
 # AGENT_MAIL_REGISTRATION_TOKEN is required for fetch_inbox to authenticate
 # from a PostToolUse hook (each hook fires its own curl POST and bypasses
-# any persistent MCP-session state). AGENT_MAIL_HOOK_FORMAT=json makes the
-# reminder land in the agent's next-turn system-reminder context — plain
-# stdout is shown to the human in the terminal but never reaches the agent.
-INBOX_CHECK_CMD="AGENT_MAIL_PROJECT='${TARGET_DIR}' AGENT_MAIL_AGENT='${_AGENT}' AGENT_MAIL_URL='${_URL}' AGENT_MAIL_TOKEN='${_TOKEN}' AGENT_MAIL_REGISTRATION_TOKEN='${_REG_TOKEN:-}' AGENT_MAIL_HOOK_FORMAT='json' AGENT_MAIL_INTERVAL='120' '${INBOX_HOOK}'"
+# any persistent MCP-session state) and now arrives from the env file above.
+# AGENT_MAIL_HOOK_FORMAT=json makes the reminder land in the agent's next-turn
+# system-reminder context — plain stdout is shown to the human in the terminal
+# but never reaches the agent.
+INBOX_CHECK_CMD="AGENT_MAIL_PROJECT='${TARGET_DIR}' AGENT_MAIL_AGENT='${_AGENT}' AGENT_MAIL_HOOK_FORMAT='json' AGENT_MAIL_INTERVAL='120' '${INBOX_HOOK}'"
 
 # ============================================================================
-# settings.json: HOOKS ONLY (no secrets, git-tracked)
+# settings.json: HOOKS ONLY (no secrets, git-IGNORED via .gitignore ".claude/")
+# ============================================================================
+# Both halves of this line used to be false, in opposite directions: the file
+# held two tokens, and it is ignored rather than tracked. The secrets therefore
+# never reached the remote — not by design, but because the second error pointed
+# the other way. Correcting only the "git-tracked" half, which reads like
+# tidying, would have shipped both tokens on the next `git add`.
 # ============================================================================
 # Start with existing config or empty object
 EXISTING_SETTINGS="{}"
@@ -234,7 +276,9 @@ MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "PostToolUse" "$POST_TOOL_
 
 write_atomic "$SETTINGS_PATH" <<< "$MERGED_SETTINGS"
 json_validate "$SETTINGS_PATH" || log_warn "Invalid JSON in ${SETTINGS_PATH}"
-chmod 644 "$SETTINGS_PATH" 2>/dev/null || true  # Readable, no secrets
+# Readable by design: hook definitions are not secret and other tooling reads
+# them. This is now true rather than asserted — the tokens moved to $ENV_FILE.
+chmod 644 "$SETTINGS_PATH" 2>/dev/null || true
 log_ok "Merged hooks into ${SETTINGS_PATH} (existing config preserved)"
 
 # ============================================================================

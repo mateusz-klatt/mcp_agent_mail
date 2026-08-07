@@ -16,7 +16,17 @@
 #   AGENT_MAIL_PROJECT             - Project key (absolute path)
 #   AGENT_MAIL_AGENT               - Agent name
 #   AGENT_MAIL_URL                 - Server URL (default: http://127.0.0.1:8765/api/)
-#   AGENT_MAIL_TOKEN               - Principal bearer token (HTTP Authorization header)
+#
+# The two secrets below are read from ~/.agent-mail.env (mode 0600), not from
+# the hook command. A hook command is stored in settings.json, which the
+# installer chmods to 644 and which lives inside the repository — so a token
+# placed there is handed to every account on the machine and sits one
+# .gitignore edit away from a public remote.
+#
+#   AGENT_MAIL_TOKEN               - Principal bearer token (HTTP Authorization header).
+#                                    HTTP_BEARER_TOKEN is accepted under the same meaning,
+#                                    because that is the name the server and every other
+#                                    hook already use for this value.
 #   AGENT_MAIL_REGISTRATION_TOKEN  - Per-agent registration_token. Required for fetch_inbox
 #                                    when the call is made outside an authenticated MCP
 #                                    session (which is always the case for hook invocations,
@@ -35,11 +45,35 @@
 # Don't use set -e because grep returns 1 when no match
 set -uo pipefail
 
+# Per-machine configuration, secrets included. Parsed rather than sourced: this
+# runs after every Bash tool call, and executing whatever the file happens to
+# contain is not a property worth having. Environment wins, so an explicit
+# assignment in the hook command still overrides — which is what makes moving
+# the two tokens out of that command a change of location, not of behaviour.
+am_load_env() {
+  local f="${AGENT_MAIL_ENV_FILE:-$HOME/.agent-mail.env}" line k v
+  [[ -r "$f" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    k="${line%%=*}"; v="${line#*=}"
+    case "$k" in
+      AGENT_MAIL_TOKEN|HTTP_BEARER_TOKEN|AGENT_MAIL_REGISTRATION_TOKEN|AGENT_MAIL_URL|AGENT_MAIL_AGENT|AGENT_MAIL_PROJECT)
+        [[ -z "${!k:-}" ]] && export "$k=$v" ;;
+    esac
+  done < "$f"
+  return 0
+}
+am_load_env
+
 # Configuration with defaults
 PROJECT="${AGENT_MAIL_PROJECT:-}"
 AGENT="${AGENT_MAIL_AGENT:-}"
 URL="${AGENT_MAIL_URL:-http://127.0.0.1:8765/api/}"
-TOKEN="${AGENT_MAIL_TOKEN:-}"
+# Both names mean the same value. agent_mail_common.sh already falls back this
+# way; a machine whose env file says HTTP_BEARER_TOKEN — the name the server
+# itself uses — would otherwise authenticate in four hooks and silently fail in
+# this one.
+TOKEN="${AGENT_MAIL_TOKEN:-${HTTP_BEARER_TOKEN:-}}"
 REG_TOKEN="${AGENT_MAIL_REGISTRATION_TOKEN:-}"
 INTERVAL="${AGENT_MAIL_INTERVAL:-120}"
 HOOK_FORMAT="${AGENT_MAIL_HOOK_FORMAT:-text}"

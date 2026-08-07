@@ -90,8 +90,13 @@ class TestStartupBannerDatabaseReset:
         monkeypatch.setattr("mcp_agent_mail.cli.reset_database_state", mock_reset)
         monkeypatch.setattr(uvicorn_module, "run", mock_uvicorn_run)
 
-        # Run serve_http
-        serve_http()
+        # Explicit None for every parameter, not a bare serve_http(). Called
+        # outside Typer, the defaults stay `typer.Option(...)` objects rather
+        # than becoming None, and `path or settings.http.path` keeps the
+        # OptionInfo because an OptionInfo is truthy — so the configured path
+        # is never consulted and http.py fails on `.startswith`. Passing None
+        # is what Typer itself would pass when the flags are absent.
+        serve_http(host=None, port=None, path=None)
 
         # Verify the sequence
         assert banner_displayed, "Banner should be displayed"

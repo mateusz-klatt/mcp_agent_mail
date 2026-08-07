@@ -21,7 +21,6 @@ from fastmcp import Client
 
 from mcp_agent_mail.app import _get_agent, _get_project_by_identifier, _list_outbox, build_mcp_server
 from mcp_agent_mail.db import ensure_schema, track_queries
-
 from tests.keys import pkey
 
 

@@ -25,7 +25,6 @@ from sqlalchemy import text
 
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import get_session
-
 from tests.keys import pkey
 
 # ============================================================================

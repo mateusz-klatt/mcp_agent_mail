@@ -32,7 +32,6 @@ from sqlmodel import select
 from mcp_agent_mail.app import ToolExecutionError, _get_agent, _get_agents_batch, build_mcp_server
 from mcp_agent_mail.db import get_session
 from mcp_agent_mail.models import Project
-
 from tests.keys import pkey
 
 # ============================================================================

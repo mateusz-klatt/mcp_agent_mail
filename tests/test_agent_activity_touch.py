@@ -157,3 +157,58 @@ async def test_the_throttle_actually_suppresses_writes(server):
             # must be untouched — not merely close, identical.
             await reserve("b.py")
             assert await _last_active("worker-1") == first
+
+
+@pytest.mark.asyncio
+async def test_an_aware_timestamp_does_not_break_authentication(server):
+    """The shape that actually broke, and the one the tests above could not see.
+
+    `_backdate` above writes a naive string, so every assertion in this file
+    exercised naive-minus-naive and passed. The column is *declared* naive, but a
+    row written from an offset-bearing ISO string — `datetime.now(timezone.utc)
+    .isoformat()`, which is what tests/test_server.py does and what any restore
+    or import would produce — is handed back **aware**, and the throttle then
+    subtracts the two flavours: TypeError.
+
+    It surfaced two files away, as `send_message` failing with "Argument type
+    mismatch", because this runs inside `_authenticate_agent` — so a bookkeeping
+    error was reported to the caller as a rejected tool call. The axis that
+    matters here is the tzinfo flavour of the stored value, not its age.
+    """
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": KEY})
+        me = _data(
+            await client.call_tool(
+                "register_agent",
+                {"project_key": KEY, "name": "worker-1", "program": "probe", "model": "probe"},
+            )
+        )
+        token = me["registration_token"]
+
+        # Offset-bearing, and old enough that the throttle cannot short-circuit
+        # past the subtraction and hide the defect.
+        from datetime import datetime, timedelta, timezone
+
+        await _backdate(
+            "worker-1", (datetime.now(timezone.utc) - timedelta(seconds=600)).isoformat()
+        )
+
+        async with Client(server) as other:
+            await other.call_tool(
+                "file_reservation_paths",
+                {
+                    "project_key": KEY,
+                    "agent_name": "worker-1",
+                    "registration_token": token,
+                    "paths": ["src/thing.py"],
+                    "ttl_seconds": 60,
+                },
+            )
+
+        # Refreshed, not merely "did not raise": a version that swallowed the
+        # TypeError in the surrounding suppress() would also not raise, and would
+        # leave the field stale forever.
+        refreshed = await _last_active("worker-1")
+        assert (datetime.now(timezone.utc) - datetime.fromisoformat(refreshed).replace(
+            tzinfo=timezone.utc
+        )).total_seconds() < 120, f"last_active_ts not refreshed: {refreshed}"

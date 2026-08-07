@@ -5243,12 +5243,22 @@ def build_mcp_server() -> FastMCP:
     async def _touch_agent_activity(agent: Agent) -> None:
         if agent.id is None:
             return
-        now = _naive_utc()
-        previous = getattr(agent, "last_active_ts", None)
-        if previous is not None and (now - previous).total_seconds() < _ACTIVITY_TOUCH_SECONDS:
-            return
-        # Never let bookkeeping fail a call that already succeeded.
+        # Never let bookkeeping fail a call that already succeeded. The guard
+        # covers the comparison too, and that is not belt-and-braces: the
+        # comparison is the part that actually raised. `last_active_ts` is
+        # declared naive, but a row written from an offset-bearing ISO string
+        # (`datetime.now(timezone.utc).isoformat()`) is handed back *aware*, and
+        # subtracting the two flavours is a TypeError. It surfaced as a failed
+        # `send_message` — because this runs inside `_authenticate_agent`, so a
+        # bookkeeping error was being reported as a rejected tool call.
         with suppress(Exception):
+            now = _naive_utc()
+            previous = getattr(agent, "last_active_ts", None)
+            if previous is not None:
+                # The file's own idiom, and the reason it exists.
+                previous = _naive_utc(previous)
+                if (now - previous).total_seconds() < _ACTIVITY_TOUCH_SECONDS:
+                    return
             async with get_session() as session:
                 db_agent = await session.get(Agent, agent.id)
                 if db_agent is not None:

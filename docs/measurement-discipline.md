@@ -183,6 +183,16 @@ narrowing better than the last, each still incomplete. A correction is a
 hypothesis of the same rank as the claim it overturns; it only looks like a
 conclusion because it follows a demonstration of error.
 
+The clearest example is one that was not sent. A call that had been used a
+dozen times as a probe suddenly failed, and the obvious reading was that the
+probe had been worthless all along — a severe piece of self-criticism, on a day
+when self-criticism was the currency, and it would have invalidated a dozen of
+the author's own measurements and everybody else's readings that depended on
+them. Nobody would have challenged it. They measured it instead, in both
+states, and the probe turned out to discriminate correctly. Note what makes
+this hard: the retraction felt like rigour, and rigour is exactly what nobody
+audits.
+
 **False confirmation is harder to catch than false refutation.** A measurement
 that contradicts the group gets scrutinised. One that agrees is accepted. So
 when a result matches expectation, validity checks matter *more*, not less —

@@ -32,10 +32,20 @@
   </div>
 
   <!-- Gmail-style Search Header -->
-  <div class="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 px-6 py-4 flex items-center gap-4 sticky top-16 shadow-sm transition-all duration-300"
+  <!-- flex-wrap plus a floor under the search box. 326b672 took this bar's
+       overflow to zero by hiding two labels, and deliberately left the search
+       input crushed to 66 px — a box that shows none of its own placeholder.
+       The fix was rejected then because wrapping grows the bar from 83 px to
+       141 px, and the filters panel below is `sticky top-40`: measured, the
+       stuck bar would end at 205 px and the panel catches at 160, overlapping
+       by 45. That collision is now removed at its own end (see the panel), so
+       the wrap is safe.
+
+       On >= sm nothing changes: there is room, so it never wraps. -->
+  <div class="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 px-6 py-4 flex flex-wrap items-center gap-4 sticky top-16 shadow-sm transition-all duration-300"
        :class="isFullscreen ? 'z-50' : 'z-10'">
     <!-- Search Bar -->
-    <div class="flex-1 relative group">
+    <div class="flex-1 min-w-[16rem] relative group">
       <div class="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
         <i data-lucide="search" class="w-5 h-5 text-slate-400 group-focus-within:text-primary-500 transition-colors"></i>
       </div>
@@ -149,7 +159,14 @@
        x-transition:leave="transition ease-in duration-150"
        x-transition:leave-start="opacity-100 translate-y-0"
        x-transition:leave-end="opacity-0 -translate-y-2"
-       class="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 px-6 py-4 sticky top-40 transition-all duration-300"
+       {# top-56 below sm because the bar above wraps there and grows from 83 px
+          to 141 px. Stuck at top-16 it then ends at 205; top-40 catches at 160
+          and the two overlap by 45 px — measured, and only visible after
+          scrolling with the panel open, which is why the wrap was left undone
+          rather than shipped with this collision. 14rem gives 19 px of clearance
+          rather than the 3 px that 13rem measured, because the bar's height is a
+          consequence of its content and not a constant. #}
+       class="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 px-6 py-4 sticky top-56 sm:top-40 transition-all duration-300"
        :class="isFullscreen ? 'z-50' : 'z-10'">
     <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
       <!-- Project Filter -->

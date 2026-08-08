@@ -84,6 +84,54 @@ def _git_bash_path(path: str | Path) -> str:
     return normalized
 
 
+def _install_bash_command_forwarder(
+    fake_bin: Path,
+    command: str,
+    target: str | Path,
+) -> Path:
+    forwarder = fake_bin / command
+    forwarder.write_text(
+        "#!/usr/bin/env bash\n"
+        f"exec {shlex.quote(_git_bash_path(target))} \"$@\"\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    forwarder.chmod(0o700)
+    return forwarder
+
+
+def test_bash_command_forwarder_preserves_the_original_tool_location(
+    tmp_path: Path,
+) -> None:
+    tool_dir = tmp_path / "Chocolatey" / "bin"
+    fake_bin = tmp_path / "fake bin"
+    tool_dir.mkdir(parents=True)
+    fake_bin.mkdir()
+    payload = tool_dir / "jq.payload"
+    payload.write_text("original-tool-location\n", encoding="utf-8", newline="\n")
+    target = tool_dir / "jq-target"
+    target.write_text(
+        "#!/usr/bin/env bash\n"
+        'cat "$(dirname "$0")/jq.payload"\n'
+        "printf '|%s' \"$1\"\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    target.chmod(0o700)
+    forwarder = _install_bash_command_forwarder(fake_bin, "jq", target)
+
+    result = subprocess.run(
+        [BASH, _git_bash_path(forwarder), "argument with spaces"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "original-tool-location\n|argument with spaces"
+    assert not forwarder.is_symlink()
+
+
 def test_project_claude_template_is_an_inert_installer_pointer() -> None:
     """The tracked template must never recreate project-scoped MCP or hooks."""
     template_path = ROOT / ".claude" / "settings.json.template"
@@ -2024,10 +2072,10 @@ def test_auto_installer_continues_after_failure_then_exits_nonzero(
     (codex_dir / "hooks.json").write_text("not-json\n", encoding="utf-8")
     uv_path = shutil.which("uv")
     assert uv_path is not None
-    (fake_bin / "uv").symlink_to(uv_path)
+    _install_bash_command_forwarder(fake_bin, "uv", uv_path)
     jq_path = shutil.which("jq")
     assert jq_path is not None
-    (fake_bin / "jq").symlink_to(jq_path)
+    _install_bash_command_forwarder(fake_bin, "jq", jq_path)
     bash_env, bash_tmp = _install_bash_env(home, fake_bin)
     env = {
         **os.environ,

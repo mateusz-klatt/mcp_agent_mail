@@ -801,6 +801,11 @@ def test_doctor_repair_scopes_project_specific_repairs(isolated_env, monkeypatch
 
 def test_doctor_restore_creates_pre_restore_backup(tmp_path, monkeypatch):
     runner = CliRunner()
+    current_archive = tmp_path / "current-archive"
+    (current_archive / ".git").mkdir(parents=True)
+    monkeypatch.setenv("STORAGE_ROOT", str(current_archive))
+    clear_settings_cache()
+
     backup_path = tmp_path / "restore-backup"
     backup_path.mkdir()
     (backup_path / "database.sqlite3").write_text("db", encoding="utf-8")

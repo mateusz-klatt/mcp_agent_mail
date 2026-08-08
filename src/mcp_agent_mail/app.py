@@ -3332,7 +3332,10 @@ async def _generate_unique_agent_name(
 
     mode = getattr(settings, "agent_name_enforcement_mode", "coerce").lower()
     if name_hint:
-        _is_reserved = _looks_like_program_name(name_hint) or _looks_like_model_name(name_hint)
+        # A structurally valid explicit ID is an address chosen by the caller,
+        # not a natural-language display name.  Model-name substring guesses
+        # must not silently replace addresses such as host-linux-claude-1.
+        _is_reserved = _looks_like_program_name(name_hint)
         if mode == "always_auto":
             pass  # skip all caller-supplied names, fall through to auto-gen
         elif validate_explicit_agent_id(name_hint) and not _is_reserved:
@@ -3422,7 +3425,7 @@ async def _get_or_create_agent(
         desired_name = await _generate_unique_agent_name(project, settings, None)
     elif name is not None and mode != "always_auto":
         # Priority 1: Explicit name/identity provided
-        _is_reserved = _looks_like_program_name(name) or _looks_like_model_name(name)
+        _is_reserved = _looks_like_program_name(name)
         if validate_explicit_agent_id(name) and not _is_reserved:
             # Caller supplied a valid explicit identity (e.g. "alpha-one",
             # "cc-0", "worker_42") — honor it directly (#140).

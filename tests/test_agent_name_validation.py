@@ -341,6 +341,26 @@ async def test_register_agent_coerces_program_name_as_agent(isolated_env):
         assert validate_agent_name_format(agent_name), f"Auto-generated '{agent_name}' should be valid"
 
 
+@pytest.mark.asyncio
+async def test_register_agent_preserves_model_like_explicit_identity_in_coerce_mode(isolated_env):
+    """A model-name substring does not replace an explicit address."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": pkey("test/canonical-coerce")})
+
+        result = await client.call_tool(
+            "register_agent",
+            {
+                "project_key": pkey("test/canonical-coerce"),
+                "program": "claude-code",
+                "model": "claude-sonnet",
+                "name": "home-wsl-claude-1",
+            },
+        )
+
+        assert result.data["name"] == "home-wsl-claude-1"
+
+
 # ============================================================================
 # Integration Tests: Agent Registration with Invalid Names (Strict Mode)
 # ============================================================================
@@ -399,6 +419,33 @@ async def test_register_agent_strict_rejects_program_name_as_agent(isolated_env,
 
         error_msg = str(exc_info.value).lower()
         assert "program" in error_msg or "adjective" in error_msg or "invalid" in error_msg
+
+
+@pytest.mark.asyncio
+async def test_register_agent_preserves_model_like_explicit_identity_in_strict_mode(
+    isolated_env,
+    monkeypatch,
+):
+    """Strict validation also honors the caller's explicit address."""
+    monkeypatch.setenv("AGENT_NAME_ENFORCEMENT_MODE", "strict")
+    from mcp_agent_mail.config import clear_settings_cache
+
+    clear_settings_cache()
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": pkey("test/canonical-strict")})
+
+        result = await client.call_tool(
+            "register_agent",
+            {
+                "project_key": pkey("test/canonical-strict"),
+                "program": "claude-code",
+                "model": "claude-sonnet",
+                "name": "home-wsl-claude-1",
+            },
+        )
+
+        assert result.data["name"] == "home-wsl-claude-1"
 
 
 # ============================================================================

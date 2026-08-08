@@ -19,8 +19,10 @@ from mcp_agent_mail.utils import (
     ADJECTIVES,
     NOUNS,
     generate_agent_name,
+    parse_client_platform_host_agent_id,
     sanitize_agent_name,
     validate_agent_name_format,
+    validate_client_platform_host_agent_id,
 )
 from tests.keys import pkey
 
@@ -114,6 +116,50 @@ class TestValidateAgentNameFormat:
         reversed_names = ["LakeGreen", "DogBlue", "StoneRed", "BearPurple"]
         for name in reversed_names:
             assert not validate_agent_name_format(name), f"Reversed '{name}' should be invalid"
+
+
+class TestValidateClientPlatformHostAgentId:
+    """Test the stable client/platform/host/slot identity contract."""
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "claude-wsl-home-1",
+            "codex-wsl-home-1",
+            "copilot-win-home-1",
+            "gemini-linux-build-box-7-12",
+            "claude-mac-MacBook-Pro.mac-2",
+        ],
+    )
+    def test_accepts_supported_client_identities(self, name: str) -> None:
+        assert validate_client_platform_host_agent_id(name)
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "claude-wsl-home-0",
+            "codex-wsl-home-session",
+            "claude-solaris-home-1",
+            "unknown-wsl-home-1",
+            "cursor-wsl-home-1",
+            "CLAUDE-wsl-home-1",
+            "claude-WSL-home-1",
+            "claude-wsl-1",
+            "cx-wsl-home-1",
+            "claude-home-wsl-1",
+            "home-wsl-claude-1",
+            "home-wsl-codex-1",
+            "home-wsl-copilot-1",
+            "claude-code",
+        ],
+    )
+    def test_rejects_noncanonical_identities(self, name: str) -> None:
+        assert not validate_client_platform_host_agent_id(name)
+
+    def test_parser_keeps_the_entire_hyphenated_host(self) -> None:
+        assert parse_client_platform_host_agent_id(
+            "claude-mac-macbook-pro-mateusza-12"
+        ) == ("claude", "mac", "macbook-pro-mateusza", "12")
 
 
 # ============================================================================
@@ -342,8 +388,20 @@ async def test_register_agent_coerces_program_name_as_agent(isolated_env):
 
 
 @pytest.mark.asyncio
-async def test_register_agent_preserves_model_like_explicit_identity_in_coerce_mode(isolated_env):
-    """A model-name substring does not replace an explicit address."""
+@pytest.mark.parametrize(
+    "canonical_name",
+    [
+        "claude-wsl-home-1",
+        "codex-wsl-home-1",
+        "copilot-win-home-1",
+        "gemini-linux-build-box-7-2",
+    ],
+)
+async def test_register_agent_preserves_canonical_identity_in_coerce_mode(
+    isolated_env,
+    canonical_name: str,
+):
+    """Program/model-name substrings do not replace canonical addresses."""
     server = build_mcp_server()
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": pkey("test/canonical-coerce")})
@@ -354,11 +412,11 @@ async def test_register_agent_preserves_model_like_explicit_identity_in_coerce_m
                 "project_key": pkey("test/canonical-coerce"),
                 "program": "claude-code",
                 "model": "claude-sonnet",
-                "name": "home-wsl-claude-1",
+                "name": canonical_name,
             },
         )
 
-        assert result.data["name"] == "home-wsl-claude-1"
+        assert result.data["name"] == canonical_name
 
 
 # ============================================================================
@@ -422,9 +480,19 @@ async def test_register_agent_strict_rejects_program_name_as_agent(isolated_env,
 
 
 @pytest.mark.asyncio
-async def test_register_agent_preserves_model_like_explicit_identity_in_strict_mode(
+@pytest.mark.parametrize(
+    "canonical_name",
+    [
+        "claude-wsl-home-1",
+        "codex-wsl-home-1",
+        "copilot-win-home-1",
+        "gemini-linux-build-box-7-2",
+    ],
+)
+async def test_register_agent_preserves_canonical_identity_in_strict_mode(
     isolated_env,
     monkeypatch,
+    canonical_name: str,
 ):
     """Strict validation also honors the caller's explicit address."""
     monkeypatch.setenv("AGENT_NAME_ENFORCEMENT_MODE", "strict")
@@ -441,11 +509,11 @@ async def test_register_agent_preserves_model_like_explicit_identity_in_strict_m
                 "project_key": pkey("test/canonical-strict"),
                 "program": "claude-code",
                 "model": "claude-sonnet",
-                "name": "home-wsl-claude-1",
+                "name": canonical_name,
             },
         )
 
-        assert result.data["name"] == "home-wsl-claude-1"
+        assert result.data["name"] == canonical_name
 
 
 # ============================================================================

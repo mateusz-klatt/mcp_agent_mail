@@ -164,6 +164,12 @@ NOUNS: Iterable[str] = (
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _AGENT_NAME_RE = re.compile(r"[^A-Za-z0-9]+")
 _THREAD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_CLIENT_PLATFORM_HOST_AGENT_ID_RE = re.compile(
+    r"^(?:claude|codex|copilot|gemini)"
+    r"-(?:linux|wsl|win|mac|other)"
+    r"-[A-Za-z0-9][A-Za-z0-9._-]{0,95}"
+    r"-[1-9][0-9]*$",
+)
 
 # Pre-built frozenset of all valid agent names (lowercase) for O(1) validation lookup.
 # This is computed once at module load time rather than O(n*m) per validation call.
@@ -234,6 +240,45 @@ def validate_explicit_agent_id(name: str) -> bool:
     # Require at least one separator so purely-alphanumeric strings like
     # "BackendHarmonizer" still go through adjective+noun validation.
     return _EXPLICIT_ID_SEPARATOR_RE.search(name) is not None
+
+
+def parse_client_platform_host_agent_id(
+    name: str,
+) -> tuple[str, str, str, str] | None:
+    """Parse the stable ``client-os-host-slot`` identity contract.
+
+    Client and OS are closed, single lexical tokens at the start, the slot is
+    the final positive integer, and the entire middle remainder is the host.
+    Consequently host names may contain hyphens without making the identity
+    ambiguous.  A future client family may use an underscore in its one token
+    (for example ``claude_desktop``) after being added to the closed vocabulary;
+    client or OS tokens themselves must never contain hyphens.
+
+    The returned client and platform values are case-folded vocabulary values;
+    the host spelling and decimal slot are preserved.  ``None`` means the name
+    is not a canonical identity.
+    """
+    if not validate_explicit_agent_id(name):
+        return None
+    if _CLIENT_PLATFORM_HOST_AGENT_ID_RE.fullmatch(name) is None:
+        return None
+    client, platform, host_and_slot = name.split("-", 2)
+    host, slot = host_and_slot.rsplit("-", 1)
+    return client.casefold(), platform.casefold(), host, slot
+
+
+def validate_client_platform_host_agent_id(name: str) -> bool:
+    """Return whether *name* follows the stable client/OS/host contract.
+
+    Integrators use ``<client>-<os>-<host>-<slot>`` so several coding
+    clients on one machine have separate mailboxes and reservations while each
+    client keeps the same identity across process restarts.  Client and platform
+    are deliberately closed vocabularies; the slot is a positive integer chosen
+    by the operator rather than an automatically allocated session number.  The
+    client token is the program family (for example ``claude`` or ``codex``),
+    while host/platform distinguish native Windows, WSL, Linux and macOS use.
+    """
+    return parse_client_platform_host_agent_id(name) is not None
 
 
 def sanitize_agent_name(value: str) -> Optional[str]:

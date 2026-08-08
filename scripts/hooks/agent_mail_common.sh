@@ -1,16 +1,21 @@
 # Shared plumbing for the Agent Mail hooks. Sourced, never executed.
 #
-# Installed ONCE PER MACHINE in ~/.claude/settings.json and works in every
-# repository without per-project setup. Per-machine settings live in
-# ~/.agent-mail.env, NOT in the hook commands: repeating four environment
+# Installed once per machine in ~/.claude/settings.json and available only in
+# repositories that carry an explicit opt-in marker or already have private
+# Agent Mail state. Per-machine settings live in ~/.agent-mail.env, NOT in the
+# hook commands: repeating four environment
 # assignments across four commands is four places to forget one, and a forgotten
 # one is silent.
 #
 # ~/.agent-mail.env (mode 0600), all optional except the token:
 #   HTTP_BEARER_TOKEN=...                  server bearer
-#   AGENT_MAIL_URL=https://host            server base URL
-#   AGENT_MAIL_AGENT=name                  override the derived identity
-#   AGENT_MAIL_STATE_DIR=/path             override the credential/state location
+#   AGENT_MAIL_URL=https://host/mcp/       streamable-HTTP MCP endpoint
+#   AGENT_MAIL_STATE_DIR=/path             shared credential/state location
+#
+# Client, slot, project, agent name and registration token are intentionally not
+# accepted from this cross-client file.  A client-specific hook supplies its
+# own client/slot; project and agent are derived at runtime; registration tokens
+# live in credentials.json.
 #
 # Every function degrades to "do nothing" on failure. A hook that errors is a
 # hook that blocks an edit.
@@ -24,19 +29,62 @@ case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*|CYGWIN*) export MSYS_NO_PATHCONV=1 ;;
 esac
 
+# A global hook can inherit a user path in either native Windows form
+# (D:\Profiles\...) or the path dialect of the shell that launches it.  Keep
+# one canonical form for the current execution substrate before Bash, jq and
+# curl touch the same file.  In Git Bash the native jq/curl executables need a
+# mixed Windows path; in WSL the Linux tools need /mnt/<drive>/....  A Windows
+# path on a host that cannot translate it is a configuration error, never a
+# relative filename in the repository currently being edited.
+am_normalize_runtime_user_path() {
+    local target="$1" system
+    # Validate the caller-supplied dialect before asking cygpath to translate it.
+    # `cygpath -m relative` helpfully anchors the value under $PWD, which would
+    # turn a bad state setting into a seemingly absolute path inside whichever
+    # repository happened to trigger the global hook.
+    case "$target" in
+        /*|[A-Za-z]:\\*|[A-Za-z]:/*) ;;
+        *) return 1 ;;
+    esac
+    system="$(uname -s 2>/dev/null || printf unknown)"
+    case "$system" in
+        MINGW*|MSYS*|CYGWIN*)
+            command -v cygpath >/dev/null 2>&1 || return 1
+            cygpath -m "$target" 2>/dev/null
+            return $? ;;
+    esac
+    case "$target" in
+        [A-Za-z]:[\\/]*)
+            command -v wslpath >/dev/null 2>&1 || return 1
+            wslpath -u "$target" 2>/dev/null
+            return $? ;;
+        *) printf '%s' "$target" ;;
+    esac
+}
+
+AM_PATH_CONFIGURATION_VALID=1
+
 # Per-machine configuration. Parsed rather than sourced: this file is read on
 # every edit, and executing whatever it happens to contain is not a property
 # worth having. Environment always wins, so a hook command can still override.
 am_load_env() {
     [ -n "${AM_ENV_LOADED:-}" ] && return 0
     AM_ENV_LOADED=1
-    local f="${AGENT_MAIL_ENV_FILE:-$HOME/.agent-mail.env}" line k v
+    local configured_f="${AGENT_MAIL_ENV_FILE:-$HOME/.agent-mail.env}" f line k v
+    if ! f="$(am_normalize_runtime_user_path "$configured_f")"; then
+        AM_PATH_CONFIGURATION_VALID=0
+        return 0
+    fi
+    case "$f" in
+        /*|[A-Za-z]:/*) ;;
+        *) AM_PATH_CONFIGURATION_VALID=0; return 0 ;;
+    esac
     [ -r "$f" ] || return 0
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in ''|'#'*) continue ;; esac
         k="${line%%=*}"; v="${line#*=}"
         case "$k" in
-            HTTP_BEARER_TOKEN|AGENT_MAIL_URL|AGENT_MAIL_AGENT|AGENT_MAIL_STATE_DIR|AGENT_MAIL_PROJECT_KEY)
+            HTTP_BEARER_TOKEN|AGENT_MAIL_URL|AGENT_MAIL_STATE_DIR)
                 # shellcheck disable=SC2163
                 [ -z "$(eval "printf '%s' \"\${$k:-}\"")" ] && export "$k=$v" ;;
         esac
@@ -54,7 +102,16 @@ am_load_env
 # reservations_warn overrides it back down: it is the only PreToolUse hook, so
 # it is the only one a person waits behind before every edit.
 AM_TIMEOUT="${AGENT_MAIL_HOOK_TIMEOUT:-8}"
-AM_BASE_URL="${AGENT_MAIL_URL:-http://127.0.0.1:8765}"
+am_server_base_url() {
+    local url="${AGENT_MAIL_URL:-http://127.0.0.1:8765}"
+    url="${url%/}"
+    case "$url" in
+        */mcp) url="${url%/mcp}" ;;
+        */api) url="${url%/api}" ;;
+    esac
+    printf '%s' "${url%/}"
+}
+AM_BASE_URL="$(am_server_base_url)"
 
 # On MSYS the credential store must be addressed the way jq.exe can open it.
 # $HOME there is "/c/Users/you", which a native binary cannot resolve — and the
@@ -63,13 +120,20 @@ AM_BASE_URL="${AGENT_MAIL_URL:-http://127.0.0.1:8765}"
 # argument). Registration works once, then the identity is unrecoverable.
 am_default_state_dir() {
     local base="${XDG_STATE_HOME:-$HOME/.local/state}"
-    case "$(uname -s 2>/dev/null)" in
-        MINGW*|MSYS*|CYGWIN*)
-            command -v cygpath >/dev/null 2>&1 && base="$(cygpath -m "$base" 2>/dev/null || printf '%s' "$base")" ;;
-    esac
     printf '%s/agent-mail' "$base"
 }
-AM_STATE_DIR="${AGENT_MAIL_STATE_DIR:-$(am_default_state_dir)}"
+_am_configured_state_dir="${AGENT_MAIL_STATE_DIR:-$(am_default_state_dir)}"
+if ! AM_STATE_DIR="$(am_normalize_runtime_user_path "$_am_configured_state_dir")"; then
+    AM_PATH_CONFIGURATION_VALID=0
+    AM_STATE_DIR="/dev/null/agent-mail-invalid-state-dir"
+fi
+case "$AM_STATE_DIR" in
+    /*|[A-Za-z]:/*) ;;
+    *)
+        AM_PATH_CONFIGURATION_VALID=0
+        AM_STATE_DIR="/dev/null/agent-mail-invalid-state-dir" ;;
+esac
+unset _am_configured_state_dir
 AM_CRED_FILE="${AM_STATE_DIR}/credentials.json"
 
 # --- payload -----------------------------------------------------------------
@@ -101,6 +165,40 @@ am_norm_path() {
     esac
 }
 
+# Portable, bounded state-file component.  The readable prefix helps operators
+# inspect state by hand; the digest preserves the full input so truncation and
+# separator mapping cannot make two projects/sessions share a file.
+am_sha256() {
+    local digest
+    if command -v sha256sum >/dev/null 2>&1; then
+        digest="$(sha256sum 2>/dev/null | awk '{print $1}')"
+    elif command -v shasum >/dev/null 2>&1; then
+        digest="$(shasum -a 256 2>/dev/null | awk '{print $1}')"
+    elif command -v openssl >/dev/null 2>&1; then
+        digest="$(openssl dgst -sha256 2>/dev/null | sed 's/^.*= //')"
+    else
+        # A different hash would make the shell hooks and Python migration CLI
+        # address different state files.  Fail closed when no SHA-256 provider
+        # exists instead of silently falling back to Git's repository hash.
+        return 1
+    fi
+    case "$digest" in ''|*[!0-9A-Fa-f]*) return 1 ;; esac
+    [ "${#digest}" -eq 64 ] || return 1
+    printf '%s' "$(printf '%s' "$digest" | tr '[:upper:]' '[:lower:]' | cut -c1-32)"
+}
+
+am_state_component() {
+    local raw="$1" prefix digest
+    prefix="$(printf '%s' "$raw" \
+        | LC_ALL=C tr -cs 'A-Za-z0-9._ -' '_' \
+        | tr ' ' '_' \
+        | cut -c1-47)"
+    prefix="${prefix%_}"
+    [ -n "$prefix" ] || prefix="state"
+    digest="$(printf '%s' "$raw" | am_sha256)" || return 1
+    printf '%s-%s' "$prefix" "$digest"
+}
+
 am_git() {
     git -C "$1" "${@:2}" 2>/dev/null
 }
@@ -120,7 +218,9 @@ am_normalize_remote() {
 }
 
 am_project_key() {
-    [ -n "${AGENT_MAIL_PROJECT_KEY:-}" ] && { printf '%s' "$AGENT_MAIL_PROJECT_KEY"; return 0; }
+    # A global client can inherit stale shell variables.  Project identity is
+    # therefore always derived from the repository being opened; direct/API
+    # callers that need an override must pass it outside this hook runtime.
     local url
     url="$(git rev-parse --is-inside-work-tree >/dev/null 2>&1 && git remote get-url origin 2>/dev/null)" || return 0
     [ -z "$url" ] && return 0
@@ -133,7 +233,8 @@ am_project_key() {
 # the working directory files the edit under the wrong project, at an absolute
 # path that can never match anyone else's reservation.
 am_project_key_for_file() {
-    [ -n "${AGENT_MAIL_PROJECT_KEY:-}" ] && { printf '%s' "$AGENT_MAIL_PROJECT_KEY"; return 0; }
+    # Likewise, an edit is owned by the file's repository, never by an ambient
+    # project override inherited from the process that launched the client.
     local d url
     d="$(dirname "$(am_norm_path "$1")")"
     url="$(am_git "$d" rev-parse --is-inside-work-tree >/dev/null && am_git "$d" remote get-url origin)" || return 0
@@ -157,9 +258,10 @@ am_relpath() {
 }
 
 # --- agent identity ----------------------------------------------------------
-# <host>-<platform>-1. The platform token comes from uname, which is the only
-# thing that separates the three cases that otherwise collide: WSL and native
-# Windows report the SAME hostname, and nothing else distinguishes a mac.
+# Canonical names are <client>-<platform>-<host>-<slot>.  The platform token
+# comes from uname, which is the only thing that separates the three cases that
+# otherwise collide: WSL and native Windows report the SAME hostname, and
+# nothing else distinguishes a mac.
 am_platform() {
     case "$(uname -s 2>/dev/null)" in
         Darwin)               printf 'mac' ;;
@@ -170,42 +272,325 @@ am_platform() {
             else
                 printf 'linux'
             fi ;;
-        *) printf '%s' "$(uname -s 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]' | cut -c1-8)" ;;
+        *) printf 'other' ;;
     esac
 }
 
-# Remember the name the server actually granted, keyed by project.
+am_client() {
+    local client="${1:-}"
+    case "$client" in
+        claude) printf 'claude' ;;
+        codex) printf 'codex' ;;
+        copilot) printf 'copilot' ;;
+        gemini) printf 'gemini' ;;
+        *)
+            printf 'Unsupported Agent Mail client: %s\n' "$client" >&2
+            return 1 ;;
+    esac
+}
+
+# Short cc/cx/cp client segments were briefly used while the stable identity
+# contract was being designed.  They are read only for a fail-closed migration
+# check; canonical names and new state always use the program-family name.
+am_transitional_client_alias() {
+    case "$(am_client "${1:-}")" in
+        claude) printf 'cc' ;;
+        codex) printf 'cx' ;;
+        copilot) printf 'cp' ;;
+        *) return 1 ;;
+    esac
+}
+
+am_slot() {
+    local slot="${1:-1}"
+    case "$slot" in
+        ''|0|0*|*[!0-9]*)
+            printf 'Agent Mail slot must be a positive integer: %s\n' "$slot" >&2
+            return 1 ;;
+        *) printf '%s' "$slot" ;;
+    esac
+}
+
+# Stable machine/platform prefix shared by the legacy and client-scoped name
+# formats.  Keeping one implementation is important during migration: a
+# one-character disagreement would make the legacy detector miss the identity
+# it is meant to protect.
+am_hostname() {
+    local h=""
+    if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+        h="$(scutil --get HostName 2>/dev/null || true)"
+        [ -z "$h" ] && h="$(scutil --get LocalHostName 2>/dev/null || true)"
+    fi
+    [ -z "$h" ] && h="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo host)"
+    h="$(printf '%s' "$h" \
+        | LC_ALL=C tr '[:upper:]' '[:lower:]' \
+        | LC_ALL=C tr -cd '[:alnum:]._-' \
+        | LC_ALL=C sed 's/^[^[:alnum:]]*//; s/[^[:alnum:]]*$//' \
+        | cut -c1-48)"
+    [ -z "$h" ] && h="host"
+    printf '%s' "$h"
+}
+
+am_machine_stem() {
+    local p
+    p="$(am_platform)"; [ -z "$p" ] && p="unknown"
+    printf '%s-%s' "$(am_hostname)" "$p"
+}
+
+am_legacy_agent_name() {
+    local slot; slot="$(am_slot "${1:-1}")" || return 1
+    printf '%s-%s' "$(am_machine_stem)" "$slot"
+}
+
+# Remember the name the server actually granted, keyed by project, client, and
+# stable client slot.
 #
 # Only session_start.sh writes this, from register_agent's response. It is a
 # separate file from credentials.json on purpose: that one is keyed by agent
 # name, which is precisely the thing in question here.
 am_granted_name_file() {
-    # Separators are MAPPED, not deleted. `tr -cd` alone drops the slashes, and
-    # then /p/x and /px both become "px" — two projects sharing one identity
-    # file, which is a collision credentials.json does not have because jq keys
-    # it by the whole string. Caught by a control that was itself aimed at the
-    # wrong filename, which is how the naming came to be printed at all.
+    local client slot project_component
+    client="$(am_client "${2:-}")" || return 1
+    slot="$(am_slot "${3:-1}")" || return 1
+    project_component="$(am_state_component "$1")" || return 1
+    printf '%s/granted/%s--%s-%s' "$AM_STATE_DIR" \
+        "$project_component" \
+        "$client" "$slot"
+}
+
+# Read-only filename used by the immediately previous installer generation.
+# New writes always use the hashed form above.
+am_previous_granted_name_file() {
+    local client slot
+    client="$(am_client "${2:-}")" || return 1
+    slot="$(am_slot "${3:-1}")" || return 1
+    printf '%s/granted/%s--%s-%s' "$AM_STATE_DIR" \
+        "$(printf '%s' "$1" | tr '/' '_' | tr -cd '[:alnum:]._-' | cut -c1-96)" \
+        "$client" "$slot"
+}
+
+am_transitional_granted_name_file() {
+    local alias slot project_component
+    alias="$(am_transitional_client_alias "${2:-}")" || return 1
+    slot="$(am_slot "${3:-1}")" || return 1
+    project_component="$(am_state_component "$1")" || return 1
+    printf '%s/granted/%s--%s-%s' "$AM_STATE_DIR" \
+        "$project_component" \
+        "$alias" "$slot"
+}
+
+am_previous_transitional_granted_name_file() {
+    local alias slot
+    alias="$(am_transitional_client_alias "${2:-}")" || return 1
+    slot="$(am_slot "${3:-1}")" || return 1
+    printf '%s/granted/%s--%s-%s' "$AM_STATE_DIR" \
+        "$(printf '%s' "$1" | tr '/' '_' | tr -cd '[:alnum:]._-' | cut -c1-96)" \
+        "$alias" "$slot"
+}
+
+am_granted_name_put() {
+    local f lock_dir tmp rc=1
+    f="$(am_granted_name_file "$1" "${3:-}" "${4:-1}")" || return 1
+    [ -n "${2:-}" ] || return 0
+    mkdir -p "$(dirname "$f")" 2>/dev/null || return 1
+    lock_dir="${f}.lock"
+    am_lock_acquire "$lock_dir" || return 1
+    tmp="${f}.${BASHPID:-$$}.tmp"
+    if printf '%s' "$2" > "$tmp" 2>/dev/null; then
+        chmod 600 "$tmp" 2>/dev/null || true
+        mv -f "$tmp" "$f" 2>/dev/null && rc=0
+    fi
+    [ "$rc" -eq 0 ] || rm -f "$tmp" 2>/dev/null || true
+    am_lock_release "$lock_dir"
+    return "$rc"
+}
+
+# The previous hook generation keyed one granted-name file only by project and
+# derived identities as <host>-<platform>-<slot>.  Returning the old filename is
+# read-only: migration must be an explicit operator action after the server-side
+# Agent row has been renamed in place.
+am_legacy_granted_name_file() {
     printf '%s/granted/%s' "$AM_STATE_DIR" \
         "$(printf '%s' "$1" | tr '/' '_' | tr -cd '[:alnum:]._-' | cut -c1-96)"
 }
 
-am_granted_name_put() {
-    local f; f="$(am_granted_name_file "$1")"
-    [ -n "${2:-}" ] || return 0
-    mkdir -p "$(dirname "$f")" 2>/dev/null || return 0
-    printf '%s' "$2" > "$f" 2>/dev/null || true
+# A user-level hook is present in every repository the client opens, but Agent
+# Mail is not.  Treat a repository as active only when local private state
+# already proves it was onboarded, or the repository carries an explicit
+# opt-in marker.  This gate is deliberately local-only: asking the server
+# whether a project exists would itself leak every arbitrary checkout into the
+# global hook's network traffic and could reintroduce implicit registration.
+am_project_has_local_state() {
+    local project="$1" client slot granted previous_granted
+    local transitional_granted previous_transitional_granted legacy_granted
+    client="$(am_client "${2:-}")" || return 1
+    slot="$(am_slot "${3:-1}")" || return 1
+
+    if [ -r "$AM_CRED_FILE" ] && jq -e --arg project "$project" '
+        type == "object"
+        and ((.[$project]? // null) | type == "object")
+        and any(.[$project][]?; type == "string" and length > 0)
+    ' "$AM_CRED_FILE" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # A granted-name file can survive an interrupted credential write.  Check
+    # the exact current client/slot file and the one legacy project-only shape;
+    # do not glob the lossy filename encoding and risk activating a colliding
+    # project.
+    granted="$(am_granted_name_file "$project" "$client" "$slot")" || return 1
+    [ -s "$granted" ] && return 0
+    previous_granted="$(am_previous_granted_name_file "$project" "$client" "$slot")" || return 1
+    [ -s "$previous_granted" ] && return 0
+    transitional_granted="$(am_transitional_granted_name_file "$project" "$client" "$slot" 2>/dev/null || true)"
+    [ -n "$transitional_granted" ] && [ -s "$transitional_granted" ] && return 0
+    previous_transitional_granted="$(am_previous_transitional_granted_name_file "$project" "$client" "$slot" 2>/dev/null || true)"
+    [ -n "$previous_transitional_granted" ] && [ -s "$previous_transitional_granted" ] && return 0
+    legacy_granted="$(am_legacy_granted_name_file "$project")"
+    [ -s "$legacy_granted" ] && return 0
+    return 1
+}
+
+am_repository_opted_in() {
+    local hint="${1:-.}" root marker discovery
+    root="$(git -C "$hint" rev-parse --show-toplevel 2>/dev/null)" || return 1
+    [ -n "$root" ] || return 1
+
+    marker="${root}/.agent-mail-project-id"
+    # The committed identity marker is meaningful only when it contains an id.
+    [ -r "$marker" ] && grep -Eq '[^[:space:]]' "$marker" 2>/dev/null && return 0
+
+    discovery="${root}/.agent-mail.yaml"
+    # Discovery YAML is an opt-in only when it declares the documented project
+    # identity field.  Mere presence of an empty or unrelated YAML file must not
+    # turn on a global hook.
+    [ -r "$discovery" ] && awk '
+        /^project_uid[[:space:]]*:/ {
+            value = $0
+            sub(/^project_uid[[:space:]]*:[[:space:]]*/, "", value)
+            sub(/[[:space:]]+#.*/, "", value)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+            lowered = tolower(value)
+            if (value != "" && value != "\"\"" && value != "\047\047" &&
+                value != "|" && value != ">" && value != "~" && lowered != "null") {
+                found = 1
+            }
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$discovery" 2>/dev/null && return 0
+    return 1
+}
+
+am_project_is_active() {
+    local project="$1" client="${2:-}" slot="${3:-1}" hint="${4:-.}"
+    [ "${AM_PATH_CONFIGURATION_VALID:-0}" = "1" ] || return 1
+    [ -n "$project" ] || return 1
+    am_project_has_local_state "$project" "$client" "$slot" && return 0
+    am_repository_opted_in "$hint"
+}
+
+am_project_activation_message() {
+    local project="$1"
+    if [ "${AM_PATH_CONFIGURATION_VALID:-0}" != "1" ]; then
+        printf '%s' \
+            "Agent Mail is disabled because AGENT_MAIL_ENV_FILE or AGENT_MAIL_STATE_DIR is not an absolute path usable by this execution environment. No Agent Mail network request was made and no Agent was registered. Use a POSIX absolute path under Linux/macOS/WSL or a Windows absolute path under Git Bash/WSL."
+        return 0
+    fi
+    printf '%s' \
+        "Agent Mail is not activated for ${project}. No Agent Mail network request was made and no Agent was registered. Explicitly onboard this repository first, or add a non-empty .agent-mail-project-id (or .agent-mail.yaml with project_uid) at its Git root. The global hook will not create projects or identities merely because a client opened a repository."
+}
+
+# Print "old<TAB>new" and return 0 when registering the client-scoped name could
+# fork an existing legacy identity.  Return 1 when local state contains no such
+# evidence or already contains a usable credential for the resolved new name.
+# No network call and no state mutation happen here.
+am_identity_migration_pair() {
+    local project="$1" client slot stem new resolved gf previous_gf
+    local short_client short_gf previous_short_gf old_gf candidate_file
+    local legacy_name old_order_name short_order_name old=""
+    client="$(am_client "${2:-}")" || return 1
+    slot="$(am_slot "${3:-1}")" || return 1
+    stem="$(am_machine_stem)"
+    new="${client}-$(am_platform)-$(am_hostname)-${slot}"
+    legacy_name="${stem}-${slot}"
+    old_order_name="${stem}-${client}-${slot}"
+    short_client="$(am_transitional_client_alias "$client" 2>/dev/null || true)"
+    short_order_name="${stem}-${short_client}-${slot}"
+
+    # A token under the final name proves that the server and local credential
+    # cutover already completed.  A remembered OLD value without that token is
+    # handled below and remains fail-closed.
+    [ -n "$(am_cred_get "$project" "$new")" ] && return 1
+
+    gf="$(am_granted_name_file "$project" "$client" "$slot")" || return 1
+    previous_gf="$(am_previous_granted_name_file "$project" "$client" "$slot")" || return 1
+    short_gf="$(am_transitional_granted_name_file "$project" "$client" "$slot" 2>/dev/null || true)"
+    previous_short_gf="$(am_previous_transitional_granted_name_file "$project" "$client" "$slot" 2>/dev/null || true)"
+
+    # Exact project/client/slot state may contain any of the three predecessor
+    # formats, or a random adjective+noun granted by an older server.  An entry
+    # for another numeric slot is ignored rather than reassigned to this slot.
+    set -- "$gf" "$previous_gf"
+    [ -n "$short_gf" ] && set -- "$@" "$short_gf"
+    [ -n "$previous_short_gf" ] && set -- "$@" "$previous_short_gf"
+    for candidate_file in "$@"; do
+        [ -r "$candidate_file" ] || continue
+        resolved="$(tr -d '\r\n' < "$candidate_file" 2>/dev/null)"
+        [ -n "$resolved" ] || continue
+        [ "$resolved" = "$new" ] && continue
+        case "$resolved" in
+            "$legacy_name"|"$old_order_name"|"$short_order_name") old="$resolved" ;;
+            "${stem}-"[1-9]* )
+                case "${resolved#${stem}-}" in *[!0-9]*) old="$resolved" ;; esac ;;
+            "${stem}-${client}-"[1-9]*|"${stem}-${short_client}-"[1-9]*)
+                # The exact current-slot forms matched above.  Do not let an
+                # old slot 2 marker migrate slot 1.
+                ;;
+            *) old="$resolved" ;;
+        esac
+        [ -n "$old" ] && break
+    done
+
+    old_gf="$(am_legacy_granted_name_file "$project")"
+    if [ -z "$old" ] && [ -r "$old_gf" ]; then
+        resolved="$(tr -d '\r\n' < "$old_gf" 2>/dev/null)"
+        case "$resolved" in
+            "$legacy_name"|"$old_order_name"|"$short_order_name") old="$resolved" ;;
+            "${stem}-"[1-9]* )
+                case "${resolved#${stem}-}" in *[!0-9]*) old="$resolved" ;; esac ;;
+            ?*) old="$resolved" ;;
+        esac
+    fi
+    if [ -z "$old" ] && [ -r "$AM_CRED_FILE" ]; then
+        for resolved in "$legacy_name" "$old_order_name" "$short_order_name"; do
+            [ -n "$(am_cred_get "$project" "$resolved")" ] && { old="$resolved"; break; }
+        done
+    fi
+    [ -n "$old" ] || return 1
+    [ "$old" != "$new" ] || return 1
+    printf '%s\t%s' "$old" "$new"
+    return 0
+}
+
+am_identity_migration_message() {
+    local old="$1" new="$2"
+    printf '%s' \
+        "Agent Mail: MIGRATION IN PROGRESS — registration is suspended (${old} -> ${new}). This session has NO Agent Mail identity: mail will not be delivered, reservations will not be filed, and conflict warnings are unavailable. No Agent Mail network request was made and no new Agent was registered. Safe order: (1) rename the existing server Agent row in place from ${old} to ${new}, preserving Agent.id and its registration_token; (2) migrate the local credentials.json key and the client/slot granted-name entry to ${new}; (3) restart this client. Do not register ${new} before steps 1 and 2, and do not copy the token to a second identity."
 }
 
 am_agent_name() {
-    [ -n "${AGENT_MAIL_AGENT:-}" ] && { printf '%s' "$AGENT_MAIL_AGENT"; return 0; }
-    # A previously granted name wins over re-deriving one.
+    local client slot canonical
+    client="$(am_client "${1:-}")" || return 1
+    slot="$(am_slot "${2:-1}")" || return 1
+    canonical="${client}-$(am_platform)-$(am_hostname)-${slot}"
+    # A usable canonical credential wins first; otherwise a previously granted
+    # name wins over re-deriving one.
     #
-    # The server does not always give you the name you asked for: a name that is
-    # taken, or that matches _looks_like_model_name on a SUBSTRING, is answered
-    # in the default coerce mode with a silent random rename. Everything then
-    # came apart, and measurably so — laptop-mac-1 ran three sessions under a
-    # name containing "claude-" and got three different identities and three
-    # entries in credentials.json, because:
+    # The server does not always give you the name you asked for.  Collisions
+    # and older server policy can return a random name; before hotfix b43c156,
+    # the model-name heuristic also coerced valid explicit IDs containing a
+    # model substring.  Everything then came apart, and measurably so — one host
+    # ran three sessions and got three identities and three credentials entries:
     #
     #   session_start:22   am_cred_get  … "$AGENT"      <- the DERIVED name
     #   session_start:75   am_cred_put  … "$got_name"   <- the GRANTED name
@@ -217,9 +602,9 @@ am_agent_name() {
     # — every one of them exiting 0.
     #
     # Fixed here rather than in each hook because they all call this function,
-    # so they all inherit the answer without being touched. AGENT_MAIL_AGENT
-    # still wins: an explicit override is a statement about identity, and this
-    # is only a memory of one.
+    # so they all inherit the answer without being touched.  Canonical address
+    # identity is deliberately not overridable; personality belongs in the
+    # server-side display/preferred name instead.
     # The project is resolved here rather than passed in, so that every existing
     # caller — autoreserve.sh, inbox_check.sh, session_end.sh — inherits this
     # without being edited.
@@ -239,55 +624,38 @@ am_agent_name() {
     # What does help is not asking. This lookup only has an answer once a session
     # has recorded a granted name, so until then the project key is bought and
     # thrown away on every hook invocation. `[ -d ]` costs ~0.25 ms.
-    if [ -d "${AM_STATE_DIR}/granted" ]; then
+    if [ -r "$AM_CRED_FILE" ] || [ -d "${AM_STATE_DIR}/granted" ]; then
       local _proj; _proj="${AM_PROJECT_FOR_NAME:-$(am_project_key)}"
       if [ -n "$_proj" ]; then
-        local gf; gf="$(am_granted_name_file "$_proj")"
+        # A credential under the canonical address proves that the server-side
+        # cutover completed.  It must beat any stale predecessor marker left by
+        # an interrupted local migration; otherwise SessionStart resolves OLD,
+        # misses the canonical token and can recreate the retired identity.
+        if [ -n "$(am_cred_get "$_proj" "$canonical")" ]; then
+            printf '%s' "$canonical"
+            return 0
+        fi
+        [ -d "${AM_STATE_DIR}/granted" ] || { printf '%s' "$canonical"; return 0; }
+        local gf; gf="$(am_granted_name_file "$_proj" "$client" "$slot")"
+        if [ ! -r "$gf" ]; then
+            local previous_gf
+            previous_gf="$(am_previous_granted_name_file "$_proj" "$client" "$slot")"
+            [ -r "$previous_gf" ] && gf="$previous_gf"
+        fi
         if [ -r "$gf" ]; then
-            local g; g="$(cat "$gf" 2>/dev/null)"
+            local g stem; g="$(cat "$gf" 2>/dev/null)"; stem="$(am_machine_stem)"
+            case "$g" in
+                "${stem}-"[1-9]* )
+                    case "${g#${stem}-}" in
+                        *[!0-9]*) ;;
+                        *) [ "$g" = "${stem}-${slot}" ] || g="" ;;
+                    esac ;;
+            esac
             [ -n "$g" ] && { printf '%s' "$g"; return 0; }
         fi
       fi
     fi
-    local h p
-    # macOS derives `hostname` from DHCP/reverse DNS, so a laptop that changes
-    # network changes identity — and an identity change orphans the mailbox and
-    # every reservation under the old name. LocalHostName is user-set and stays
-    # put.
-    h=""
-    if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
-        # macOS keeps three independent names and `hostname` reflects none of
-        # them persistently: with HostName unset it takes kern.hostname from DHCP
-        # option 12 or reverse DNS, falling back to LocalHostName off-network.
-        # A laptop that changes network therefore changes identity — and the new
-        # name has no entry in the credential store, so autoreserve and
-        # session_end quietly start exiting 0 without doing anything. Observed:
-        # the same machine reports a LAN-derived FQDN on one network and its
-        # on-disk LocalHostName on another.
-        #
-        # HostName first because it is the one an operator can pin
-        # (`sudo scutil --set HostName <name>`), LocalHostName second because it
-        # is at least written to disk. Plain `hostname` is the last resort.
-        h="$(scutil --get HostName 2>/dev/null || true)"
-        [ -z "$h" ] && h="$(scutil --get LocalHostName 2>/dev/null || true)"
-    fi
-    # The `||` chain is load-bearing, not decoration: Git Bash ships GNU
-    # coreutils' hostname, which has no -s at all (that flag belongs to
-    # net-tools) and exits 1. Without the fallback there would be no name on
-    # Windows whatsoever.
-    [ -z "$h" ] && h="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo host)"
-    # Lowercased deliberately. The server treats agent names as case-insensitively
-    # unique, and $COMPUTERNAME on Windows reports HOME where `hostname` reports
-    # home — two derivations of one machine that would collide as "already in
-    # use", which in the default coerce mode is answered with a silent random
-    # rename rather than an error.
-    h="$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]._-' | cut -c1-48)"
-    [ -z "$h" ] && h="host"
-    p="$(am_platform)"; [ -z "$p" ] && p="unknown"
-    # The server silently replaces a name resembling a program or model with a
-    # random one — `_looks_like_model_name` matches on substring — so keep the
-    # shape boring and verify any new platform token before adding it.
-    printf '%s-%s-1' "$h" "$p"
+    printf '%s' "$canonical"
 }
 
 # The model this session is actually running, for the agent's profile.
@@ -395,14 +763,14 @@ am_sync_model() {
     # case is a skipped or redundant model refresh, which the next real change
     # repairs by itself. Fixed anyway, because two derivations of the same kind of
     # key disagreeing is how the next reader learns the wrong rule.
-    cache="${AM_STATE_DIR}/model/$(printf '%s|%s' "$proj" "$agent" \
-        | tr '/' '_' | tr -cd '[:alnum:]._|-' | tr '|' '_' | cut -c1-96)"
+    cache="${AM_STATE_DIR}/model/$(am_state_component "${proj}|${agent}")" || return 0
     have="$(cat "$cache" 2>/dev/null || true)"
     [ "$want" = "$have" ] && return 0
     mkdir -p "$(dirname "$cache")" 2>/dev/null || return 0
-    if am_call register_agent "$(jq -nc --arg p "$proj" --arg n "$agent" \
-            --arg t "$tok" --arg m "$want" --arg g "$prog" \
-            '{project_key:$p,name:$n,registration_token:$t,program:$g,model:$m}')" \
+    if am_call register_agent "$(AGENT_MAIL_JQ_REGISTRATION_TOKEN="$tok" \
+            jq -nc --arg p "$proj" --arg n "$agent" \
+            --arg m "$want" --arg g "$prog" \
+            '{project_key:$p,name:$n,registration_token:env.AGENT_MAIL_JQ_REGISTRATION_TOKEN,program:$g,model:$m}')" \
             >/dev/null 2>&1; then
         printf '%s' "$want" > "$cache" 2>/dev/null || true
     fi
@@ -483,6 +851,7 @@ am_conf_escape() {
 
 am_call() {
     local tool="$1" args="$2" bearer body hdr raw
+    [ "${AM_PATH_CONFIGURATION_VALID:-0}" = "1" ] || return 1
     bearer="$(am_bearer)"
     # No bearer is NOT a reason to stay quiet. Send the request without the
     # header instead: a server that requires one answers a loud 401 (rc=2 via
@@ -629,6 +998,7 @@ am_urlencode() {
 # crosses no argv boundary at all, so it needs no encoding defence.
 am_get() {
     local path="$1" bearer raw
+    [ "${AM_PATH_CONFIGURATION_VALID:-0}" = "1" ] || return 1
     bearer="$(am_bearer)"
     # No bearer is NOT a reason to stay quiet. Send the request without the
     # header instead: a server that requires one answers a loud 401 (rc=2 via
@@ -656,22 +1026,74 @@ am_cred_get() {
     jq -r --arg p "$1" --arg a "$2" '.[$p][$a] // empty' "$AM_CRED_FILE" 2>/dev/null
 }
 
-am_cred_put() {
-    local project="$1" agent="$2" token="$3" tmp
-    [ -z "$token" ] && return 0
-    mkdir -p "$AM_STATE_DIR" 2>/dev/null || return 0
-    chmod 700 "$AM_STATE_DIR" 2>/dev/null
-    tmp="${AM_CRED_FILE}.$$.tmp"
-    if [ -r "$AM_CRED_FILE" ]; then
-        jq --arg p "$project" --arg a "$agent" --arg t "$token" \
-            '.[$p] = ((.[$p] // {}) | .[$a] = $t)' "$AM_CRED_FILE" >"$tmp" 2>/dev/null \
-            || { rm -f "$tmp"; return 0; }
-    else
-        jq -n --arg p "$project" --arg a "$agent" --arg t "$token" \
-            '{($p): {($a): $t}}' >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+am_lock_acquire() {
+    local lock_dir="$1" owner tries=0
+    mkdir -p "$(dirname "$lock_dir")" 2>/dev/null || return 1
+    while ! mkdir "$lock_dir" 2>/dev/null; do
+        # Recover only a lock whose recorded owner no longer exists.  An empty
+        # lock can be the tiny window between mkdir and writing pid, so wait.
+        if [ -r "$lock_dir/pid" ]; then
+            owner="$(tr -cd '0-9' < "$lock_dir/pid" 2>/dev/null)"
+            if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+                rm -f "$lock_dir/pid" 2>/dev/null || true
+                rmdir "$lock_dir" 2>/dev/null || true
+                continue
+            fi
+        fi
+        tries=$((tries + 1))
+        [ "$tries" -lt 200 ] || return 1
+        sleep 0.05
+    done
+    if ! printf '%s' "$$" > "$lock_dir/pid" 2>/dev/null; then
+        rmdir "$lock_dir" 2>/dev/null || true
+        return 1
     fi
-    chmod 600 "$tmp" 2>/dev/null
-    mv -f "$tmp" "$AM_CRED_FILE" 2>/dev/null || rm -f "$tmp"
+    return 0
+}
+
+am_lock_release() {
+    local lock_dir="$1"
+    rm -f "$lock_dir/pid" 2>/dev/null || true
+    rmdir "$lock_dir" 2>/dev/null || true
+}
+
+am_cred_put() {
+    local project="$1" agent="$2" token="$3" tmp lock_dir rc=1
+    [ -z "$token" ] && return 0
+    mkdir -p "$AM_STATE_DIR" 2>/dev/null || return 1
+    chmod 700 "$AM_STATE_DIR" 2>/dev/null
+    lock_dir="${AM_CRED_FILE}.lock"
+    if ! am_lock_acquire "$lock_dir"; then
+        printf 'Agent Mail could not lock credential store: %s\n' "$AM_CRED_FILE" >&2
+        return 1
+    fi
+    tmp="${AM_CRED_FILE}.${BASHPID:-$$}.tmp"
+    if [ -r "$AM_CRED_FILE" ]; then
+        if ! jq -e 'type == "object"' "$AM_CRED_FILE" >/dev/null 2>&1; then
+            printf 'Agent Mail credential store is invalid JSON; refusing to overwrite: %s\n' "$AM_CRED_FILE" >&2
+        elif AGENT_MAIL_JQ_REGISTRATION_TOKEN="$token" \
+            jq --arg p "$project" --arg a "$agent" \
+            '.[$p] = ((.[$p] // {}) | .[$a] = env.AGENT_MAIL_JQ_REGISTRATION_TOKEN)' \
+            "$AM_CRED_FILE" >"$tmp" 2>/dev/null; then
+            rc=0
+        fi
+    else
+        if AGENT_MAIL_JQ_REGISTRATION_TOKEN="$token" \
+            jq -n --arg p "$project" --arg a "$agent" \
+            '{($p): {($a): env.AGENT_MAIL_JQ_REGISTRATION_TOKEN}}' \
+            >"$tmp" 2>/dev/null; then
+            rc=0
+        fi
+    fi
+    if [ "$rc" -eq 0 ]; then
+        chmod 600 "$tmp" 2>/dev/null
+        if ! mv -f "$tmp" "$AM_CRED_FILE" 2>/dev/null; then
+            rc=1
+        fi
+    fi
+    [ "$rc" -eq 0 ] || rm -f "$tmp" 2>/dev/null || true
+    am_lock_release "$lock_dir"
+    return "$rc"
 }
 
 # --- per-session path log ----------------------------------------------------
@@ -681,6 +1103,10 @@ am_cred_put() {
 # every log it wrote — looking under only the working directory's project would
 # silently strand the rest.
 am_session_slug() {
+    am_state_component "$1"
+}
+
+am_legacy_session_slug() {
     printf '%s' "$1" | tr -cd '[:alnum:]._-' | cut -c1-64
 }
 
@@ -690,18 +1116,61 @@ am_session_log() {
 }
 
 am_session_log_add() {
-    local f; f="$(am_session_log "$1")"
+    local f lock_dir header rc=1; f="$(am_session_log "$1")" || return 1
     mkdir -p "$(dirname "$f")" 2>/dev/null || return 0
-    printf '%s\n' "$2" >>"$f" 2>/dev/null
-    return 0
+    lock_dir="${f}.lock"
+    am_lock_acquire "$lock_dir" || return 1
+    if [ ! -s "$f" ]; then
+        header="$(jq -nc --arg project "$1" '{project:$project}')" || header=""
+        [ -n "$header" ] && printf '%s\n' "$header" >"$f" 2>/dev/null || true
+    fi
+    if [ -s "$f" ] && printf '%s\n' "$2" >>"$f" 2>/dev/null; then
+        rc=0
+    fi
+    am_lock_release "$lock_dir"
+    return "$rc"
+}
+
+am_session_project() {
+    local log="$1" project slug matches count
+    project="$(head -n 1 "$log" 2>/dev/null | jq -r '.project // empty' 2>/dev/null)"
+    if [ -n "$project" ]; then
+        printf '%s' "$project"
+        return 0
+    fi
+
+    # Read-only transition for logs written by the previous lossy filename
+    # format.  Resolve only an unambiguous credential key; never guess with
+    # head -1 and release reservations in the wrong project.
+    slug="${log##*__}"; slug="${slug%.list}"
+    [ -n "$slug" ] || return 1
+    matches="$(jq -r --arg s "$slug" \
+        'keys[] | select((. | gsub("[^A-Za-z0-9._-]"; "")) == $s)' \
+        "$AM_CRED_FILE" 2>/dev/null)"
+    count="$(printf '%s\n' "$matches" | awk 'NF {n++} END {print n+0}')"
+    [ "$count" -eq 1 ] || return 1
+    printf '%s' "$matches"
+}
+
+am_session_paths() {
+    local log="$1"
+    if head -n 1 "$log" 2>/dev/null | jq -e \
+        'type == "object" and (.project | type) == "string"' >/dev/null 2>&1; then
+        tail -n +2 "$log" 2>/dev/null
+    else
+        cat "$log" 2>/dev/null
+    fi | sort -u | jq -Rsc 'split("\n") | map(select(length > 0))' 2>/dev/null
 }
 
 # Every log this session wrote, across all repositories it touched.
 am_session_logs() {
-    local dir="${AM_STATE_DIR}/sessions"
+    local dir="${AM_STATE_DIR}/sessions" current legacy f
     [ -d "$dir" ] || return 0
-    find "$dir" -maxdepth 1 -type f \
-        -name "$(am_session_slug "${AM_SESSION_ID:-nosession}")__*.list" 2>/dev/null
+    current="$(am_session_slug "${AM_SESSION_ID:-nosession}")" || return 1
+    legacy="$(am_legacy_session_slug "${AM_SESSION_ID:-nosession}")"
+    for f in "$dir/${current}__"*.list "$dir/${legacy}__"*.list; do
+        [ -f "$f" ] && printf '%s\n' "$f"
+    done
 }
 
 # --- output ------------------------------------------------------------------

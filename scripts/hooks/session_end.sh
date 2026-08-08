@@ -19,8 +19,6 @@ set -uo pipefail
 am_read_payload
 AM_SESSION_ID="$(am_payload_field '.session_id')"
 
-AGENT="$(am_agent_name)"
-
 # Release across EVERY repository this session touched, not just the one its
 # working directory happens to sit in. autoreserve keys each log by the project
 # of the edited FILE, so a session that edited a second repository wrote a log
@@ -30,26 +28,33 @@ AGENT="$(am_agent_name)"
 found=0
 while IFS= read -r log; do
     [ -r "$log" ] || continue
-    # Recover the project from the log's own name: "<session>__<project>.list".
-    slug="${log##*__}"; slug="${slug%.list}"
-    [ -z "$slug" ] && continue
-    paths="$(sort -u "$log" 2>/dev/null | jq -Rsc 'split("\n") | map(select(length>0))' 2>/dev/null)"
-    [ -z "$paths" ] || [ "$paths" = "[]" ] && { rm -f "$log" 2>/dev/null; continue; }
+    paths="$(am_session_paths "$log")"
+    [ -n "$paths" ] && [ "$paths" != "[]" ] || { printf '' > "$log" 2>/dev/null || true; continue; }
 
-    # The slug is sanitised, so recover the real key from the credential store
-    # by matching on it rather than trying to reverse the sanitisation.
-    project="$(jq -r --arg s "$slug" 'keys[] | select((. | gsub("[^A-Za-z0-9._-]";"")) == $s)' \
-        "$AM_CRED_FILE" 2>/dev/null | head -1)"
-    [ -z "$project" ] && { rm -f "$log" 2>/dev/null; continue; }
+    # New logs carry the exact project key in a JSON header.  Legacy logs are
+    # accepted only when their old lossy slug resolves to exactly one key.
+    project="$(am_session_project "$log")" || continue
+    [ -n "$project" ] || continue
+    export AM_PROJECT_FOR_NAME="$project"
+    if am_identity_migration_pair "$project" claude "${AGENT_MAIL_CLAUDE_SLOT:-1}" >/dev/null; then
+        continue
+    fi
+    agent="$(am_agent_name claude "${AGENT_MAIL_CLAUDE_SLOT:-1}")" || continue
+    token="$(am_cred_get "$project" "$agent")"
+    [ -n "$token" ] || continue
 
-    token="$(am_cred_get "$project" "$AGENT")"
-    [ -z "$token" ] && { rm -f "$log" 2>/dev/null; continue; }
-
-    am_call release_file_reservations "$(jq -nc \
-        --arg p "$project" --arg a "$AGENT" --arg t "$token" --argjson paths "$paths" \
-        '{project_key:$p,agent_name:$a,registration_token:$t,paths:$paths}')" >/dev/null 2>&1
-    rm -f "$log" 2>/dev/null
-    found=$((found+1))
+    response="$(am_call release_file_reservations "$(
+        AGENT_MAIL_JQ_REGISTRATION_TOKEN="$token" \
+        jq -nc --arg p "$project" --arg a "$agent" --argjson paths "$paths" \
+        '{project_key:$p,agent_name:$a,registration_token:env.AGENT_MAIL_JQ_REGISTRATION_TOKEN,paths:$paths}'
+    )")"
+    if [ $? -eq 0 ]; then
+        # Keep an empty state file rather than deleting evidence after a failed
+        # release.  am_session_log_add recreates its exact project header before
+        # the next path is appended.
+        printf '' > "$log" 2>/dev/null || true
+        found=$((found+1))
+    fi
 done <<EOF
 $(am_session_logs)
 EOF

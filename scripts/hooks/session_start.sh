@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# SessionStart: establish this host's Agent Mail identity for whatever repository
-# the session opened in, and report what other agents are currently holding.
+# SessionStart: establish this host's Agent Mail identity for an explicitly
+# activated repository, and report what other agents are currently holding.
 #
-# No per-repository setup: the project key comes from the repo's origin remote.
-# A directory that is not a git repo, or has no origin, produces nothing at all
-# rather than a guessed key that would quietly create a phantom project.
+# The project key comes from the repo's origin remote. A directory that is not a
+# git repo, has no origin, or has neither an opt-in marker nor existing private
+# state produces no network traffic rather than quietly creating a project.
 #
 # Cannot fail — a SessionStart hook that errors is a session that does not start.
 
@@ -21,7 +21,30 @@ PROJECT="$(am_project_key)"
 # on Windows, so this is a doubled cost on every tool invocation there.
 export AM_PROJECT_FOR_NAME="$PROJECT"
 [ -z "$PROJECT" ] && exit 0
-AGENT="$(am_agent_name)"
+
+# Global hooks see every repository Claude opens.  Opt-in or existing local
+# project state is required before migration checks and, crucially, before the
+# first ensure_project/register_agent request.
+if ! am_project_is_active "$PROJECT" claude "${AGENT_MAIL_CLAUDE_SLOT:-1}" .; then
+    am_emit_context "SessionStart" "$(am_project_activation_message "$PROJECT")"
+    exit 0
+fi
+
+# History, contacts and reservations follow Agent.id, not the display name.
+# Registering the new client-scoped name while local state still proves that a
+# legacy <host>-<platform>-<slot> identity exists would create a second Agent
+# row and strand that history.  Stop before ensure_project as well as before
+# register_agent: the migration path must be entirely network-free until an
+# operator has renamed the existing row in place.
+if migration_pair="$(am_identity_migration_pair "$PROJECT" claude "${AGENT_MAIL_CLAUDE_SLOT:-1}")"; then
+    legacy_agent="${migration_pair%%$'\t'*}"
+    client_agent="${migration_pair#*$'\t'}"
+    am_emit_context "SessionStart" \
+        "$(am_identity_migration_message "$legacy_agent" "$client_agent")"
+    exit 0
+fi
+
+AGENT="$(am_agent_name claude "${AGENT_MAIL_CLAUDE_SLOT:-1}")" || exit 0
 
 am_call ensure_project "$(jq -nc --arg k "$PROJECT" '{human_key:$k}')" >/dev/null 2>&1
 
@@ -35,8 +58,9 @@ if [ -n "$token" ]; then
     # `name`, not `agent_name` — the latter is an unexpected-keyword validation
     # error that am_call swallows, which once made a re-registration test pass
     # while doing nothing at all.
-    args="$(jq -nc --arg p "$PROJECT" --arg n "$AGENT" --arg t "$token" --arg m "$MODEL" \
-        '{project_key:$p,name:$n,registration_token:$t,program:"claude-code",model:$m}')"
+    args="$(AGENT_MAIL_JQ_REGISTRATION_TOKEN="$token" \
+        jq -nc --arg p "$PROJECT" --arg n "$AGENT" --arg m "$MODEL" \
+        '{project_key:$p,name:$n,registration_token:env.AGENT_MAIL_JQ_REGISTRATION_TOKEN,program:"claude-code",model:$m}')"
 else
     args="$(jq -nc --arg p "$PROJECT" --arg n "$AGENT" --arg m "$MODEL" \
         '{project_key:$p,name:$n,program:"claude-code",model:$m}')"
@@ -74,24 +98,40 @@ if [ -z "$got_name" ]; then
         "Agent Mail: could not read an agent name from the registration response. The server answered, but not with what register_agent returns — check MCP_AGENT_MAIL_OUTPUT_FORMAT and TOON_DEFAULT_FORMAT on the server, which replace every field with a {format, data, meta} envelope. Until this is fixed there is no coordination in this session: no reservations, no conflict warnings, no mail. The registration itself may well have succeeded: the identity can now exist on the server while no token exists here, and fixing the setting does not undo that — re-registering the same name will then be refused for want of the token it never returned."
     exit 0
 fi
+if [ -z "$token" ] && [ -z "$got_token" ]; then
+    am_emit_context "SessionStart" \
+        "Agent Mail: fresh registration returned the agent name ${got_name}, but no registration token. No local identity state was written and this session is not healthy: reservations, conflict warnings and authenticated mail cannot work. Stop this client and inspect the server response/configuration before starting another session; retrying blindly could fork the identity."
+    exit 0
+fi
 
-# Persist the name the server GRANTED, not the one requested: a name resembling
-# a program or model is silently replaced, and recording the request would leave
-# every later call authenticating as an agent that does not exist.
-[ -n "$got_token" ] && am_cred_put "$PROJECT" "$got_name" "$got_token"
+# Persist the name the server GRANTED, not merely the one requested.  Collisions
+# and server policy can still return a different identity, and recording only
+# the request would leave later calls authenticating as an agent that does not
+# exist.
 # Remember what the server called us, so the next session looks the token up
 # under the key it was filed under. Without this, a name the server declines to
-# grant — taken, or matching _looks_like_model_name on a substring — is written
-# here under the granted name and read back under the derived one, and every
+# grant is written here under the granted name and read back under the derived
+# one, and every
 # session registers a brand new identity. Measured by laptop-mac-1: three
 # sessions, three names, three entries in credentials.json.
-am_granted_name_put "$PROJECT" "$got_name"
+if ! am_granted_name_put "$PROJECT" "$got_name" claude "${AGENT_MAIL_CLAUDE_SLOT:-1}"; then
+    am_emit_context "SessionStart" \
+        "Agent Mail registered ${got_name}, but the granted-name state could not be saved safely. Stop this client and repair the private Agent Mail state before restarting; otherwise a later session could derive a different identity."
+    exit 0
+fi
+if [ -n "$got_token" ] && ! am_cred_put "$PROJECT" "$got_name" "$got_token"; then
+    am_emit_context "SessionStart" \
+        "Agent Mail registered ${got_name}, but its registration token could not be saved safely. Stop this client before another session starts; credentials.json was left unchanged rather than overwritten. The granted-name marker was retained so a restart fails closed instead of creating another identity."
+    exit 0
+fi
 
 # An agent idle for a day is auto-retired, and re-registering does NOT clear
 # that flag — the session would look fine while every message sent to it failed.
 if [ "$(printf '%s' "$resp" | jq -r '.retired_at // empty' 2>/dev/null)" != "" ]; then
-    am_call unretire_agent "$(jq -nc --arg p "$PROJECT" --arg n "$got_name" --arg t "${got_token:-$token}" \
-        '{project_key:$p,agent_name:$n,registration_token:$t}')" >/dev/null 2>&1
+    am_call unretire_agent "$(AGENT_MAIL_JQ_REGISTRATION_TOKEN="${got_token:-$token}" \
+        jq -nc --arg p "$PROJECT" --arg n "$got_name" \
+        '{project_key:$p,agent_name:$n,registration_token:env.AGENT_MAIL_JQ_REGISTRATION_TOKEN}')" \
+        >/dev/null 2>&1
 fi
 
 summary="Agent Mail: you are ${got_name} on ${PROJECT}."

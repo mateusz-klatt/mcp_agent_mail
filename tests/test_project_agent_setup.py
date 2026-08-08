@@ -29,9 +29,15 @@ from fastmcp.exceptions import ToolError
 from sqlalchemy import text
 from sqlmodel import select
 
-from mcp_agent_mail.app import ToolExecutionError, _get_agent, _get_agents_batch, build_mcp_server
-from mcp_agent_mail.db import get_session
-from mcp_agent_mail.models import Project
+from mcp_agent_mail.app import (
+    ToolExecutionError,
+    _ensure_agent_registration_token,
+    _get_agent,
+    _get_agents_batch,
+    build_mcp_server,
+)
+from mcp_agent_mail.db import ensure_schema, get_session
+from mcp_agent_mail.models import Agent, Project
 from tests.keys import pkey
 
 # ============================================================================
@@ -351,6 +357,54 @@ async def test_register_agent_existing_identity_requires_token_across_sessions(i
         )
     assert updated.data["name"] == "BlueLake"
     assert updated.data["task_description"] == "Updated by owner"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_registration_token_initialization_returns_database_winner(isolated_env):
+    """Simultaneous session starts must never receive competing tokens."""
+    await ensure_schema()
+    async with get_session() as session:
+        project = Project(
+            slug="token-cas-project",
+            human_key=pkey("test/setup/token-cas"),
+        )
+        session.add(project)
+        await session.commit()
+        await session.refresh(project)
+        assert project.id is not None
+        agent = Agent(
+            project_id=project.id,
+            name="token-cas-agent",
+            program="codex",
+            model="test",
+            registration_token=None,
+        )
+        session.add(agent)
+        await session.commit()
+        await session.refresh(agent)
+        assert agent.id is not None
+
+    start = asyncio.Event()
+
+    async def initialize() -> str:
+        await start.wait()
+        _db_agent, token = await _ensure_agent_registration_token(agent)
+        return token
+
+    contenders = [asyncio.create_task(initialize()) for _ in range(16)]
+    await asyncio.sleep(0)
+    start.set()
+    returned_tokens = await asyncio.gather(*contenders)
+
+    assert len(set(returned_tokens)) == 1
+    repeated_tokens = await asyncio.gather(
+        *(_ensure_agent_registration_token(agent) for _ in range(8))
+    )
+    assert {token for _db_agent, token in repeated_tokens} == {returned_tokens[0]}
+    async with get_session() as session:
+        persisted = await session.get(Agent, agent.id)
+    assert persisted is not None
+    assert persisted.registration_token == returned_tokens[0]
 
 
 @pytest.mark.asyncio

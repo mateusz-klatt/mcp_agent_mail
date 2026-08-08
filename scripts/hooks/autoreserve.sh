@@ -47,7 +47,9 @@ PROJECT="$(am_project_key_for_file "$target")"
 # reservations and the other loses them.
 export AM_PROJECT_FOR_NAME="$PROJECT"
 [ -z "$PROJECT" ] && exit 0
-AGENT="$(am_agent_name)"
+am_project_is_active "$PROJECT" claude "${AGENT_MAIL_CLAUDE_SLOT:-1}" \
+    "$(dirname "$(am_norm_path "$target")")" || exit 0
+AGENT="$(am_agent_name claude "${AGENT_MAIL_CLAUDE_SLOT:-1}")"
 
 rel="$(am_relpath "$target")"
 [ -z "$rel" ] && exit 0
@@ -58,9 +60,9 @@ token="$(am_cred_get "$PROJECT" "$AGENT")"
 # the same name; leave identity establishment to SessionStart.
 [ -z "$token" ] && exit 0
 
-resp="$(am_call file_reservation_paths "$(jq -nc \
-    --arg p "$PROJECT" --arg a "$AGENT" --arg t "$token" --arg path "$rel" --argjson ttl "$TTL" \
-    '{project_key:$p,agent_name:$a,registration_token:$t,paths:[$path],ttl_seconds:$ttl,reason:"auto: edited in session"}')")"
+resp="$(am_call file_reservation_paths "$(AGENT_MAIL_JQ_REGISTRATION_TOKEN="$token" \
+    jq -nc --arg p "$PROJECT" --arg a "$AGENT" --arg path "$rel" --argjson ttl "$TTL" \
+    '{project_key:$p,agent_name:$a,registration_token:env.AGENT_MAIL_JQ_REGISTRATION_TOKEN,paths:[$path],ttl_seconds:$ttl,reason:"auto: edited in session"}')")"
 rc=$?
 # Silence here reads as "reservation filed" — the hook only speaks on conflict,
 # so saying nothing is how success looks. When the server is unreachable that

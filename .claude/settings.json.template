@@ -1,34 +1,9 @@
 {
-  "_SETUP_INSTRUCTIONS": [
-    "Copy this file to settings.json and replace placeholders:",
-    "  YOUR_PROJECT_PATH -> Absolute path to your project",
-    "  YOUR_AGENT_NAME   -> Your agent name (e.g., 'BlueMountain')",
-    "  YOUR_BEARER_TOKEN -> Token for HTTP auth (or 'dev-token' for local dev)",
-    "Then delete this _SETUP_INSTRUCTIONS block."
-  ],
-  "mcpServers": {
-    "mcp-agent-mail": {
-      "type": "http",
-      "url": "http://127.0.0.1:8765/mcp/",
-      "headers": { "Authorization": "Bearer YOUR_BEARER_TOKEN" }
-    }
-  },
-  "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "",
-        "hooks": [
-          { "type": "command", "command": "uv run python -m mcp_agent_mail.cli file_reservations active YOUR_PROJECT_PATH" },
-          { "type": "command", "command": "uv run python -m mcp_agent_mail.cli acks pending YOUR_PROJECT_PATH YOUR_AGENT_NAME --limit 20" }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      { "matcher": "Edit", "hooks": [ { "type": "command", "command": "uv run python -m mcp_agent_mail.cli file_reservations soon YOUR_PROJECT_PATH --minutes 10" } ] }
-    ],
-    "PostToolUse": [
-      { "matcher": "mcp__mcp-agent-mail__send_message", "hooks": [ { "type": "command", "command": "uv run python -m mcp_agent_mail.cli list-acks --project YOUR_PROJECT_PATH --agent YOUR_AGENT_NAME --limit 10" } ] },
-      { "matcher": "mcp__mcp-agent-mail__file_reservation_paths", "hooks": [ { "type": "command", "command": "uv run python -m mcp_agent_mail.cli file_reservations list YOUR_PROJECT_PATH" } ] }
-    ]
-  }
+  "_DEPRECATED_TEMPLATE": [
+    "Do not copy this file to .claude/settings.json.",
+    "MCP Agent Mail configuration and hooks are installed at user scope.",
+    "From this repository, run: bash scripts/integrate_claude_code.sh",
+    "Provide the MCP URL and bearer through the installer environment or ~/.agent-mail.env.",
+    "The installer merges its managed entries into ~/.claude/settings.json and ~/.claude.json while preserving unrelated user configuration."
+  ]
 }

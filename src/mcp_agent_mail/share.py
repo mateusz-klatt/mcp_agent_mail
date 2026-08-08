@@ -55,6 +55,7 @@ INLINE_ATTACHMENT_THRESHOLD = 64 * 1024  # 64 KiB
 DETACH_ATTACHMENT_THRESHOLD = 25 * 1024 * 1024  # 25 MiB
 DEFAULT_CHUNK_THRESHOLD = 20 * 1024 * 1024  # 20 MiB
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MiB
+_SHA256_LOWER_HEX_PATTERN = re.compile(r"[0-9a-f]{64}")
 INDEX_REDIRECT_HTML = """<!doctype html>
 <html lang="en">
 
@@ -1558,8 +1559,14 @@ def bundle_attachments(
     """Materialize attachment assets referenced by the snapshot into the bundle."""
 
     storage_root = storage_root.resolve()
-    attachments_dir = output_dir / "attachments"
+    output_root = output_dir.expanduser().resolve()
+    attachments_dir = (output_root / "attachments").resolve()
+    if not attachments_dir.is_relative_to(output_root):
+        raise ShareExportError("Attachment directory must stay within the bundle output directory")
     attachments_dir.mkdir(parents=True, exist_ok=True)
+    attachments_dir = attachments_dir.resolve()
+    if not attachments_dir.is_relative_to(output_root):
+        raise ShareExportError("Attachment directory must stay within the bundle output directory")
     bundles: dict[str, Path] = {}
     manifest_items: list[dict[str, Any]] = []
     inline_count = 0
@@ -1603,7 +1610,17 @@ def bundle_attachments(
                     continue
                 source_path = Path(original_path)
                 if not source_path.is_absolute():
-                    source_path = (storage_root / original_path).resolve()
+                    source_path = storage_root / source_path
+                try:
+                    source_path = source_path.resolve()
+                except (OSError, RuntimeError) as exc:
+                    raise ShareExportError(
+                        "Attachment source path could not be resolved safely"
+                    ) from exc
+                if not source_path.is_relative_to(storage_root):
+                    raise ShareExportError(
+                        "Attachment source path must stay within the configured storage directory"
+                    )
                 if not source_path.is_file():
                     missing_count += 1
                     manifest_items.append(
@@ -1629,6 +1646,10 @@ def bundle_attachments(
                 data = source_path.read_bytes()
                 size = len(data)
                 sha256 = hashlib.sha256(data).hexdigest()
+                if _SHA256_LOWER_HEX_PATTERN.fullmatch(sha256) is None:
+                    raise ShareExportError(
+                        "Attachment SHA-256 digest must be exactly 64 lowercase hexadecimal characters"
+                    )
                 ext = source_path.suffix or ".bin"
                 media_record = {
                     "message_id": int(row["id"]),
@@ -1676,7 +1697,11 @@ def bundle_attachments(
                 rel_path = bundles.get(sha256)
                 if rel_path is None:
                     rel_path = Path("attachments") / sha256[:2] / f"{sha256}{ext}"
-                    dest_path = output_dir / rel_path
+                    dest_path = (output_root / rel_path).resolve()
+                    if not dest_path.is_relative_to(output_root) or not dest_path.is_relative_to(attachments_dir):
+                        raise ShareExportError(
+                            "Attachment bundle path must stay within the bundle output directory"
+                        )
                     dest_path.parent.mkdir(parents=True, exist_ok=True)
                     if not dest_path.exists():
                         dest_path.write_bytes(data)
@@ -1824,6 +1849,14 @@ def build_bundle_assets(
     )
 
 
+def _is_runtime_viewer_artifact(relative_path: Path) -> bool:
+    """Return whether an asset is generated Python bytecode, not source data."""
+    return "__pycache__" in relative_path.parts or relative_path.suffix.lower() in {
+        ".pyc",
+        ".pyo",
+    }
+
+
 def copy_viewer_assets(output_dir: Path) -> None:
     """Copy viewer assets into the export output directory.
 
@@ -1842,8 +1875,12 @@ def copy_viewer_assets(output_dir: Path) -> None:
         # tampered/stale vendored asset in the source tree was copied into the
         # export (and later SRI-hashed) without ever being checked.
         _verify_viewer_vendor_assets(source_tree)
-        for src_path in sorted(p for p in source_tree.rglob("*") if p.is_file()):
+        for src_path in sorted(source_tree.rglob("*")):
+            if not src_path.is_file():
+                continue
             rel = src_path.relative_to(source_tree)
+            if _is_runtime_viewer_artifact(rel):
+                continue
             dest = viewer_root / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(src_path.read_bytes())
@@ -1857,6 +1894,8 @@ def copy_viewer_assets(output_dir: Path) -> None:
     def _walk(node: Any, relative: Path) -> None:
         for child in node.iterdir():
             child_relative = relative / child.name
+            if _is_runtime_viewer_artifact(child_relative):
+                continue
             if child.is_dir():
                 _walk(child, child_relative)
             else:

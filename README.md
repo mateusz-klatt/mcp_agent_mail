@@ -117,7 +117,7 @@ uv run python -m mcp_agent_mail.cli config set-port 9000
 
 ### If you want to do it yourself
 
-Clone the repo, set up and install with uv in a python 3.14 venv (install uv if you don't have it already), and then run `scripts/automatically_detect_all_installed_coding_agents_and_install_mcp_agent_mail_in_all.sh`. This will automatically set things up for your various installed coding agent tools and start the MCP server on port 8765. If you want to run the MCP server again in the future, simply run `scripts/run_server_with_token.sh`:
+Clone the repo, set up and install with uv in a Python 3.14 venv, then provide the MCP endpoint and bearer explicitly before running the user-level client installer. The client installer configures Claude Code, Codex CLI, GitHub Copilot CLI and VS Code/Copilot; it does not create repository config, generate credentials, or start a server:
 
 Install uv (if you don't have it already):
 
@@ -136,11 +136,15 @@ uv venv -p 3.14
 source .venv/bin/activate
 uv sync
 
-# Detect installed coding agents, integrate, and start the MCP server on port 8765
+# Configure installed clients at user scope. The same values can instead live
+# in ~/.agent-mail.env as AGENT_MAIL_URL and HTTP_BEARER_TOKEN.
+export INTEGRATION_MCP_URL="https://hermes.example/mcp/"
+export INTEGRATION_BEARER_TOKEN="replace-with-the-server-bearer"
 scripts/automatically_detect_all_installed_coding_agents_and_install_mcp_agent_mail_in_all.sh
 
-# Later, to run the MCP server again with the same token
-scripts/run_server_with_token.sh
+# Running a local server is a separate operator action.
+HTTP_BEARER_TOKEN="$INTEGRATION_BEARER_TOKEN" \
+  uv run python -m mcp_agent_mail.cli serve-http
 
 # Now, simply launch Codex-CLI or Claude Code or other agent tools in other consoles; they should have the mail tool available. See below for a ready-made chunk of text you can add to the end of your existing AGENTS.md or CLAUDE.md files to help your agents better utilize the new tools.
 
@@ -164,10 +168,10 @@ Why it's useful
 
 How to use effectively
 1) Same repository
-   - Register an identity: call `ensure_project`, then `register_agent` using this repo's absolute path as `project_key`.
+   - Register an identity: call `ensure_project`, then `register_agent` with the same canonical project key on every host. For a GitHub-style origin, normalize `git@github.com:owner/repo.git` (or its HTTPS form) to the synthetic absolute key `/owner/repo`. Never substitute the local checkout path.
    - Reserve files before you edit: `file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true)` to signal intent and avoid conflict.
    - Communicate with threads: use `send_message(..., thread_id="FEAT-123")`; check inbox with `fetch_inbox` and acknowledge with `acknowledge_message`.
-   - Read fast: `resource://inbox/{Agent}?project=<abs-path>&limit=20&agent_token=<registration_token>` or `resource://thread/{id}?project=<abs-path>&agent=<Agent>&agent_token=<registration_token>&include_bodies=true` unless the current MCP session already authenticated as that agent.
+   - Read fast: `resource://inbox/{Agent}?project=<url-encoded-canonical-key>&limit=20&agent_token=<registration_token>` or `resource://thread/{id}?project=<url-encoded-canonical-key>&agent=<Agent>&agent_token=<registration_token>&include_bodies=true` unless the current MCP session already authenticated as that agent.
    - Tip: set `AGENT_NAME` in your environment so the pre-commit guard can block commits that conflict with others' active exclusive file reservations.
 
 2) Across different repos in one project (e.g., Next.js frontend + FastAPI backend)
@@ -978,11 +982,11 @@ The project selector supports flexible selection syntax:
 
 ```
 Available Projects:
-#  Slug                Path
-1  backend-abc123      /abs/path/backend
-2  frontend-xyz789     /abs/path/frontend
-3  infra-def456        /abs/path/infra
-4  scripts-ghi789      /abs/path/scripts
+#  Slug                Project key
+1  backend-abc123      /owner/backend
+2  frontend-xyz789     /owner/frontend
+3  infra-def456        /owner/infra
+4  scripts-ghi789      /owner/scripts
 
 Select projects to export (e.g., 'all', '1,3,5', or '1-3'):
 ```
@@ -1592,7 +1596,7 @@ Messages are GitHub-Flavored Markdown with JSON frontmatter (fenced by `---json`
 {
   "id": 1234,
   "thread_id": "TKT-123",
-  "project": "/abs/path/backend",
+  "project": "/owner/backend",
   "project_slug": "backend-abc123",
   "from": "GreenCastle",
   "to": ["BlueLake"],
@@ -1758,9 +1762,9 @@ When two repos represent the same underlying project (e.g., `frontend` and `back
 
 2) Keep separate `project_key`s and establish explicit contact:
    - In `backend`, agent `GreenCastle` calls:
-     - `request_contact(project_key="/abs/path/backend", from_agent="GreenCastle", to_agent="BlueLake", reason="API contract changes", registration_token="<GreenCastle token>")`
+     - `request_contact(project_key="/owner/backend", from_agent="GreenCastle", to_agent="BlueLake", reason="API contract changes", registration_token="<GreenCastle token>")`
    - In `frontend`, `BlueLake` calls:
-     - `respond_contact(project_key="/abs/path/backend", to_agent="BlueLake", from_agent="GreenCastle", accept=true, registration_token="<BlueLake token>")`
+     - `respond_contact(project_key="/owner/backend", to_agent="BlueLake", from_agent="GreenCastle", accept=true, registration_token="<BlueLake token>")`
    - After approval, messages can be exchanged; in default `auto` policy the server allows follow-up threads/reservation-based coordination without re-requesting.
 
 Important: You can also create reciprocal links or set `open` policy for trusted pairs. The consent layer is on by default (CONTACT_ENFORCEMENT_ENABLED=true) but is designed to be non-blocking in obvious collaboration contexts.
@@ -1776,7 +1780,7 @@ Example (conceptual) resource read:
 ```json
 {
   "method": "resources/read",
-  "params": {"uri": "resource://inbox/BlueLake?project=/abs/path/backend&limit=20&agent_token=<registration_token>"}
+  "params": {"uri": "resource://inbox/BlueLake?project=%2Fowner%2Fbackend&limit=20&agent_token=<registration_token>"}
 }
 ```
 
@@ -1955,7 +1959,7 @@ Install the guard into a code repo (conceptual tool call):
   "params": {
     "name": "install_precommit_guard",
     "arguments": {
-      "project_key": "/abs/path/backend",
+      "project_key": "/owner/backend",
       "code_repo_path": "/abs/path/backend"
     }
   }
@@ -2250,8 +2254,8 @@ This section has been removed to keep the README focused. Client code samples be
 - Why are agent names adjective+noun?
   - Memorable identities reduce confusion in inboxes, commit logs, and UI. The scheme yields low collision risk while staying human-friendly (vs GUIDs) and predictable for directory listings.
 
-- Why is `project_key` an absolute path?
-  - Using the workspace's absolute path creates a stable, collision-resistant project identity across shells and agents. Slugs are derived deterministically from it, avoiding accidental forks of the same project.
+- Why is `project_key` path-shaped?
+  - The server validates it with absolute-path syntax, but treats it as an opaque identity rather than a filesystem probe. Multi-host clients must therefore use one synthetic absolute key such as `/owner/repo`, normally derived from the normalized Git origin. A checkout path such as `/home/alice/repo`, `/Users/bob/repo`, or `C:\src\repo` would create three unrelated mail projects.
 
 - Why WebP attachments and optional inlining?
   - WebP provides compact, high-quality images. Small images can be inlined for readability; larger ones are stored as attachments. You can keep originals when needed (`KEEP_ORIGINAL_IMAGES=true`).
@@ -2512,10 +2516,10 @@ uv run python -m mcp_agent_mail.cli share update ./bundle
 uv run python -m mcp_agent_mail.cli config set-port 9000
 
 # Install guard into a repo
-uv run python -m mcp_agent_mail.cli guard install /abs/path/backend /abs/path/backend
+uv run python -m mcp_agent_mail.cli guard install /owner/backend /abs/path/backend
 
 # List pending acknowledgements for an agent
-uv run python -m mcp_agent_mail.cli acks pending /abs/path/backend BlueLake --limit 10
+uv run python -m mcp_agent_mail.cli acks pending /owner/backend BlueLake --limit 10
 
 # Run mailbox health diagnostics
 uv run python -m mcp_agent_mail.cli doctor check
@@ -2538,7 +2542,22 @@ uv run python -m mcp_agent_mail.cli clear-and-reset-everything --force
 
 ## Client integrations
 
-Use the automated installer to wire up supported tools automatically (e.g., Claude Code, Cline, Windsurf, OpenCode). Run `scripts/automatically_detect_all_installed_coding_agents_and_install_mcp_agent_mail_in_all.sh` or the one-liner in the Quickstart above.
+Use the automated installer to wire Claude Code, Codex CLI, GitHub Copilot CLI
+and VS Code/Copilot at user scope. Set `INTEGRATION_MCP_URL` (or
+`AGENT_MAIL_URL`) and
+`INTEGRATION_BEARER_TOKEN` (or `HTTP_BEARER_TOKEN`) first, then run
+`scripts/automatically_detect_all_installed_coding_agents_and_install_mcp_agent_mail_in_all.sh`.
+Missing credentials are an error; the installer never invents a token or writes
+one to the repository's `.env`.
+
+This global-only path currently covers Claude Code, Codex CLI, GitHub Copilot
+CLI and GitHub Copilot in VS Code. It requires Bash, `jq`, `git` and `curl`;
+the Codex integrator additionally requires `uv` with this project's Python 3.14
+environment. On Windows, install Git for Windows and run the installer from Git
+Bash, then verify `jq --version`, `curl --version` and (for Codex)
+`uv --version` there. Git Bash does not
+guarantee that `jq` is present. The installers stop immediately when a required
+command is missing instead of leaving a configuration that can only fail later.
 
 ### Tool-specific integration scripts
 
@@ -2546,25 +2565,55 @@ For manual integration or customization, dedicated scripts are available:
 
 | Tool | Script | What it configures |
 |------|--------|-------------------|
-| Claude Code | `scripts/integrate_claude_code.sh` | `.claude/settings.json`, hooks, MCP server |
-| Codex CLI | `scripts/integrate_codex_cli.sh` | `~/.codex/config.toml`, MCP server, notify handler |
+| Claude Code | `scripts/integrate_claude_code.sh` | `~/.claude/settings.json`, `~/.claude/hooks/mcp-agent-mail`, user MCP in `~/.claude.json` |
+| Codex CLI | `scripts/integrate_codex_cli.sh` | `${CODEX_HOME:-~/.codex}/config.toml`, `${CODEX_HOME:-~/.codex}/hooks.json`, global lifecycle scripts |
+| GitHub Copilot CLI + VS Code | `scripts/integrate_github_copilot.sh` | `${COPILOT_HOME:-~/.copilot}/mcp-config.json`, user hook JSON/runtime, and VS Code's user `mcp.json` |
 | Gemini CLI | `scripts/integrate_gemini_cli.sh` | `~/.gemini/settings.json`, MCP server, hooks |
 | Factory Droid | `scripts/integrate_factory_droid.sh` | `~/.factory/settings.json`, MCP server, hooks |
 
-Each script:
-- Detects the MCP server endpoint from your settings
-- Generates or reuses a bearer token for authentication
-- Configures the MCP server connection
-- Installs hooks/notify handlers for inbox reminders
-- Bootstraps your project and agent identity on the server
+On native Windows, the Copilot installer resolves the Git Bash executable that
+is running it, so per-user and custom Git for Windows installations are valid.
+When installing a Windows-shared `COPILOT_HOME` from WSL with Git for Windows in
+a custom location, set the install-time-only `AGENT_MAIL_GIT_BASH_PATH` to the
+absolute Windows or `/mnt/<drive>` path of `bash.exe`.
+
+The Claude, Codex, and Copilot scripts:
+
+- use an explicit endpoint and existing bearer token
+- configure an authenticated MCP server only in the user's client profile
+- never create `.claude`, `.codex`, `.vscode`, `.mcp.json` or helper files in a project
+- keep `~/.agent-mail.env` limited to URL, bearer and optional state directory
+- pass the client slot in the client-specific hook wrapper; project and agent
+  identity are derived when a session or notification actually runs
+
+Claude, Codex and Copilot CLI `SessionStart` hooks never register merely because a global
+client opened a repository. Before any network request, they require either
+existing local credentials/granted-name state for the exact project or an
+explicit repository opt-in: a non-empty `.agent-mail-project-id`, or an
+`.agent-mail.yaml` containing `project_uid:`. This keeps unrelated checkouts out
+of the server. Per-project/per-agent registration tokens are stored in the
+private Agent Mail `credentials.json`, not in the shared environment file.
+
+Before enabling the new `<client>-<os>-<host>-<slot>` name for an existing
+installation, migrate a legacy `<host>-<os>-<slot>` identity without
+creating a second Agent row. The safe sequence is: rename the existing server
+row in place while preserving `Agent.id` and its registration token, migrate the
+local credential and granted-name keys, then restart the client. When local
+credentials or the old granted-name file prove that migration is still needed,
+both SessionStart implementations stop before any network request and print the
+old and new names. They never copy a token or call `register_agent` on the new
+name automatically.
 
 ### Automatic inbox reminders
 
-Agents often get absorbed in their work and forget to check their mail. The integration scripts install lightweight hooks that periodically remind agents when they have unread messages.
+Agents often get absorbed in their work and forget to check their mail. The
+integration scripts install lightweight lifecycle hooks that remind agents at
+safe event boundaries.
 
 **How it works:**
 
-- A rate-limited hook script (`scripts/hooks/check_inbox.sh`) runs after certain tool invocations
+- Claude uses its file-edit and session hooks; Codex and Copilot CLI check at
+  `SessionStart` and at a rate-limited `Stop`
 - It checks the inbox via a fast curl call (avoids Python import overhead)
 - If there are unread messages, it outputs a brief reminder
 - Rate limited to at most once per 2 minutes to avoid noise
@@ -2588,11 +2637,34 @@ The hook is configured as a `PostToolUse` hook that fires after `Bash` or `shell
 
 **Codex CLI:**
 
-Uses the top-level `notify` configuration in `config.toml` (must appear before any `[section]` headers) to fire on `agent-turn-complete` events:
+Uses the canonical user-level `${CODEX_HOME:-~/.codex}/hooks.json`. The installer
+preserves foreign handlers and removes only its own legacy top-level `notify`
+command from `config.toml`:
 
-```toml
-notify = ["/path/to/.codex/hooks/notify_wrapper.sh"]
+```json
+{
+  "hooks": {
+    "SessionStart": [{"matcher": "startup|resume|clear|compact", "hooks": [
+      {"type": "command", "command": "bash ~/.codex/hooks/mcp-agent-mail/hook_wrapper.sh session-start"}
+    ]}],
+    "Stop": [{"hooks": [
+      {"type": "command", "command": "bash ~/.codex/hooks/mcp-agent-mail/hook_wrapper.sh stop"}
+    ]}],
+    "SessionEnd": [{"matcher": "other", "hooks": [
+      {"type": "command", "command": "bash ~/.codex/hooks/mcp-agent-mail/hook_wrapper.sh session-end", "timeout": 3}
+    ]}]
+  }
+}
 ```
+
+Every handler also has a `commandWindows` that starts a concrete Git for Windows
+`bash.exe`; it never selects the WSL `bash` launcher. `Stop` always returns valid
+JSON and only continues the turn for a newly observed high/urgent message.
+Repeated messages become a UI warning, not a continuation loop. After installing
+or changing these user hooks, open `/hooks` in Codex and trust their exact
+definitions. Codex hooks are event-boundary checks, not realtime delivery; run
+the SSE watcher explicitly in the background when immediate wake-up is needed.
+See the current [Codex hooks reference](https://learn.chatgpt.com/docs/hooks).
 
 **Additional hooks (Claude Code only):**
 
@@ -2605,15 +2677,20 @@ notify = ["/path/to/.codex/hooks/notify_wrapper.sh"]
 
 ### Environment variables for hooks
 
-The inbox check hooks accept these environment variables (set automatically by the integration scripts):
+The global hooks read this shared machine configuration from
+`~/.agent-mail.env`:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `AGENT_MAIL_PROJECT` | Project key (absolute path) | *required* |
-| `AGENT_MAIL_AGENT` | Agent name | *required* |
-| `AGENT_MAIL_URL` | Server URL | `http://127.0.0.1:8765/mcp/` |
-| `AGENT_MAIL_TOKEN` | Bearer token | *none* |
-| `AGENT_MAIL_INTERVAL` | Seconds between checks | `120` |
+| `AGENT_MAIL_URL` | Streamable-HTTP MCP endpoint; hooks derive the same host's stateless `/api/` endpoint | `http://127.0.0.1:8765/mcp/` |
+| `HTTP_BEARER_TOKEN` | Principal server bearer | *required for authenticated servers* |
+| `AGENT_MAIL_STATE_DIR` | Private credentials/rate-limit state | `$XDG_STATE_HOME/agent-mail` |
+
+Client, slot, project, agent name and registration token are intentionally not
+loaded from this shared file. `AGENT_MAIL_CLAUDE_SLOT`,
+`AGENT_MAIL_CODEX_SLOT`, and `AGENT_MAIL_COPILOT_SLOT` are set only by their
+respective global hook commands;
+all default to `1`.
 
 ---
 

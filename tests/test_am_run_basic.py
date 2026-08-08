@@ -20,6 +20,7 @@ from mcp_agent_mail.app import _resolve_project_identity
 from mcp_agent_mail.cli import (
     _build_slot_renew_interval_seconds,
     _effective_build_slot_ttl_seconds,
+    _safe_build_path_component,
     am_run,
     app,
 )
@@ -28,6 +29,17 @@ from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.models import Agent, Project
 
 runner = CliRunner()
+
+
+@pytest.mark.parametrize("value", ["CON", "CON.txt", "NUL.txt", "LPT1.log", "x" * 400])
+def test_safe_build_path_component_is_portable_and_bounded(value: str) -> None:
+    component = _safe_build_path_component(value)
+
+    assert len(component.encode("utf-8")) <= 80
+    assert component != value
+    assert component == _safe_build_path_component(value)
+    assert component.partition(".")[0].upper() not in {"CON", "NUL", "LPT1"}
+    assert component.rsplit("-", 1)[-1] == hashlib.sha256(value.encode()).hexdigest()[:32]
 
 
 def test_am_run_creates_lease_when_enabled(tmp_path: Path, monkeypatch) -> None:
@@ -65,6 +77,161 @@ def test_am_run_creates_lease_when_enabled(tmp_path: Path, monkeypatch) -> None:
             found = True
             break
     assert found, "Expected a lease JSON file to be created for am-run"
+
+
+def test_am_run_contains_dotdot_slot_lease_under_build_slots(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
+    monkeypatch.setenv("WORKTREES_ENABLED", "1")
+    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "warn")
+    get_settings.cache_clear()
+    monkeypatch.setattr(
+        "httpx.Client.post",
+        lambda *args, **kwargs: (_ for _ in ()).throw(httpx.ConnectError("server unavailable")),
+    )
+
+    class _CompletedProcess:
+        returncode = 0
+
+    monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: _CompletedProcess())
+
+    project_path = tmp_path / "project"
+    project_path.mkdir()
+    am_run(
+        slot="..",
+        cmd=["unused"],
+        project_path=project_path,
+        agent="TestAgent",
+        ttl_seconds=120,
+        shared=False,
+    )
+
+    identity = _resolve_project_identity(str(project_path))
+    project_archive = Path(get_settings().storage.root).expanduser().resolve() / "projects" / identity["slug"]
+    build_slots_root = (project_archive / "build_slots").resolve()
+    lease_files = list(build_slots_root.rglob("*.json"))
+
+    assert len(lease_files) == 1
+    assert lease_files[0].resolve().is_relative_to(build_slots_root)
+    assert lease_files[0].parent.name.startswith("unknown-")
+    assert list(project_archive.glob("*.json")) == []
+
+
+def test_am_run_contains_malicious_agent_branch_artifacts_and_lease(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    storage_root = tmp_path / "archive"
+    monkeypatch.setenv("STORAGE_ROOT", str(storage_root))
+    monkeypatch.setenv("WORKTREES_ENABLED", "1")
+    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "warn")
+    get_settings.cache_clear()
+    monkeypatch.setattr(
+        "httpx.Client.post",
+        lambda *args, **kwargs: (_ for _ in ()).throw(httpx.ConnectError("server unavailable")),
+    )
+
+    identity = {
+        "slug": "safe-project",
+        "project_uid": "project-uid",
+        "branch": "../../outside-branch\\..\\escaped",
+    }
+    monkeypatch.setattr("mcp_agent_mail.app._resolve_project_identity", lambda _path: identity)
+    artifact_paths: list[Path] = []
+
+    class _CompletedProcess:
+        returncode = 0
+
+    def fake_run(*args, **kwargs):
+        child_env = cast(dict[str, str], kwargs["env"])
+        artifact_path = Path(child_env["ARTIFACT_DIR"])
+        artifact_paths.append(artifact_path)
+        artifact_path.mkdir(parents=True, exist_ok=True)
+        (artifact_path / "child-output.txt").write_text("ok", encoding="utf-8")
+        return _CompletedProcess()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    project_path = tmp_path / "project"
+    project_path.mkdir()
+    am_run(
+        slot="safe-slot",
+        cmd=["unused"],
+        project_path=project_path,
+        agent="../outside-agent\\..\\escaped",
+        ttl_seconds=120,
+        shared=False,
+    )
+
+    project_archive = (storage_root / "projects" / identity["slug"]).resolve()
+    artifacts_root = (project_archive / "artifacts").resolve()
+    build_slots_root = (project_archive / "build_slots").resolve()
+    lease_files = list(build_slots_root.rglob("*.json"))
+    written_markers = list(tmp_path.rglob("child-output.txt"))
+
+    assert len(artifact_paths) == 1
+    assert artifact_paths[0].resolve().is_relative_to(artifacts_root)
+    assert written_markers == [artifact_paths[0] / "child-output.txt"]
+    assert written_markers[0].resolve().is_relative_to(project_archive)
+    assert len(lease_files) == 1
+    assert lease_files[0].resolve().is_relative_to(build_slots_root)
+
+
+def test_am_run_disambiguates_sanitized_branch_components(tmp_path: Path, monkeypatch) -> None:
+    storage_root = tmp_path / "archive"
+    monkeypatch.setenv("STORAGE_ROOT", str(storage_root))
+    monkeypatch.setenv("WORKTREES_ENABLED", "1")
+    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "warn")
+    get_settings.cache_clear()
+    monkeypatch.setattr(
+        "httpx.Client.post",
+        lambda *args, **kwargs: (_ for _ in ()).throw(httpx.ConnectError("server unavailable")),
+    )
+
+    branch = "feature/foo"
+
+    def identity_for_branch(_path: str) -> dict[str, str]:
+        return {
+            "slug": "safe-project",
+            "project_uid": "project-uid",
+            "branch": branch,
+        }
+
+    monkeypatch.setattr("mcp_agent_mail.app._resolve_project_identity", identity_for_branch)
+    artifact_paths: list[Path] = []
+
+    class _CompletedProcess:
+        returncode = 0
+
+    def fake_run(*args, **kwargs):
+        child_env = cast(dict[str, str], kwargs["env"])
+        artifact_paths.append(Path(child_env["ARTIFACT_DIR"]))
+        return _CompletedProcess()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    project_path = tmp_path / "project"
+    project_path.mkdir()
+
+    for branch_value in ("feature/foo", "feature_foo"):
+        branch = branch_value
+        am_run(
+            slot="safe-slot",
+            cmd=["unused"],
+            project_path=project_path,
+            agent="TestAgent",
+            ttl_seconds=120,
+            shared=False,
+        )
+
+    project_archive = (storage_root / "projects" / "safe-project").resolve()
+    lease_files = list((project_archive / "build_slots" / "safe-slot").glob("*.json"))
+
+    assert len(artifact_paths) == 2
+    assert artifact_paths[0] != artifact_paths[1]
+    assert artifact_paths[0].name.startswith("feature_foo-")
+    assert artifact_paths[1].name == "feature_foo"
+    assert all(path.resolve().is_relative_to(project_archive) for path in artifact_paths)
+    assert len(lease_files) == 2
+    assert len({path.name for path in lease_files}) == 2
 
 
 class _StaticJsonResponse:

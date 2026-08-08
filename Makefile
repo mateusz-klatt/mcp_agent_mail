@@ -1,4 +1,4 @@
-.PHONY: serve-http migrate lint lint-fix typecheck test smoke check \
+.PHONY: serve-http migrate lint lint-fix typecheck test smoke check check-all \
 	guard-install guard-uninstall claims
 
 PY=uv run
@@ -19,8 +19,8 @@ migrate:
 # type gate held and pytest never ran once in CI, while four machines were
 # running pytest locally and reporting numbers CI could not have produced.
 #
-# What this CANNOT reproduce: CI runs a matrix (three operating systems, several
-# Python versions) and `uv sync --dev` first. A green `make check` says "the
+# What this CANNOT reproduce: CI runs a three-operating-system matrix and
+# `uv sync --dev` first. A green `make check-all` says "the
 # gate passes here", not "the build is green" — `ty` in particular returns
 # different counts on different hosts, because diagnostics like the missing
 # `resource` module on Windows are properties of the machine running the
@@ -45,7 +45,7 @@ lint-fix:
 # ASYNC240 behind --preview, a newer one has it stable, and that difference
 # alone accounted for one machine reporting 78 errors against another's 22.
 typecheck:
-	uvx ty check
+	uvx ty check --python-version 3.14 --python-platform all
 
 test:
 	$(PY) -m pytest -q
@@ -54,6 +54,11 @@ smoke:
 	$(CLI) am-run ci-slot -- echo "ok"
 
 check: lint typecheck test smoke
+
+# Canonical local quality gate. Keep `check` as a compatibility spelling for
+# existing contributors, while instructions and automation can converge on one
+# explicit full-gate name.
+check-all: check
 
 guard-install:
 	$(CLI) guard install $(PROJECT) $(REPO)

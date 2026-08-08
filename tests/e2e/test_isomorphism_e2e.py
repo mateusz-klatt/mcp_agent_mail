@@ -16,7 +16,7 @@ from fastmcp import Client
 from rich.table import Table
 from sqlalchemy import text
 
-from mcp_agent_mail import share
+from mcp_agent_mail import app as app_module, share
 from mcp_agent_mail.app import ToolExecutionError, _compile_pathspec, _patterns_overlap, build_mcp_server
 from mcp_agent_mail.cli import _collect_preview_status
 from mcp_agent_mail.config import clear_settings_cache, get_settings
@@ -625,6 +625,19 @@ async def test_isomorphism_e2e_suite(
         base_time = datetime(2025, 1, 1, 0, 0, 0)
         await _stabilize_timestamps(base_time)
 
+        # Authenticated reads below intentionally count as agent activity. Freeze
+        # the application's UTC helper while collecting the golden snapshot so
+        # those reads cannot replace the stabilized ``last_active_ts`` values
+        # with wall-clock time (which also changes stale-agent scrub metadata and
+        # the signed bundle). Calls that pass an explicit datetime retain their
+        # normal conversion semantics.
+        original_naive_utc = app_module._naive_utc
+
+        def _golden_naive_utc(dt: datetime | None = None) -> datetime:
+            return original_naive_utc(base_time if dt is None else dt)
+
+        monkeypatch.setattr(app_module, "_naive_utc", _golden_naive_utc)
+
         whois = _tool_data(
             await client.call_tool(
                 "whois",
@@ -781,6 +794,10 @@ async def test_isomorphism_e2e_suite(
                 if isinstance(link, dict) and isinstance(link.get("product"), dict):
                     link["product"]["product_uid"] = product_resource.get("product_uid")
 
+        # Bundle scrubbing should continue to use the real clock; only the
+        # authenticated snapshot reads above need the deterministic activity
+        # timestamp.
+        monkeypatch.setattr(app_module, "_naive_utc", original_naive_utc)
         settings = get_settings()
         database_path = share.resolve_sqlite_database_path(settings.database.url)
         bundle_root = tmp_path / "bundle"

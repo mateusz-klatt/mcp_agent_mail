@@ -61,11 +61,15 @@ GitHub-Flavored Markdown with threading, importance levels (`low`, `normal`, `hi
 
 ## Essential Workflow
 
+Use one canonical `project_key` on every host. For a Git origin such as
+`git@github.com:owner/repo.git`, the key is the synthetic absolute path
+`/owner/repo`. It is an opaque server identity, not the local checkout path.
+
 ### 1. Start Session (One-Call Bootstrap)
 
 ```
 macro_start_session(
-  human_key="/abs/path/to/project",
+  human_key="/owner/repo",
   program="claude-code",
   model="opus-4.5",
   task_description="Implementing auth module"
@@ -80,7 +84,7 @@ This single call: ensures project exists, registers your identity, optionally re
 
 ```
 file_reservation_paths(
-  project_key="/abs/path/to/project",
+  project_key="/owner/repo",
   agent_name="GreenCastle",
   paths=["src/auth/**/*.ts", "src/middleware/auth.ts"],
   ttl_seconds=3600,
@@ -97,7 +101,7 @@ Conflicts are reported but reservations are still granted. Check conflicts and c
 
 ```
 send_message(
-  project_key="/abs/path/to/project",
+  project_key="/owner/repo",
   sender_name="GreenCastle",
   to=["BlueLake"],
   subject="[bd-123] Starting auth refactor",
@@ -112,7 +116,7 @@ send_message(
 
 ```
 fetch_inbox(
-  project_key="/abs/path/to/project",
+  project_key="/owner/repo",
   agent_name="GreenCastle",
   limit=20,
   urgent_only=false,
@@ -122,14 +126,14 @@ fetch_inbox(
 
 Or use resources for fast reads:
 ```
-resource://inbox/GreenCastle?project=/abs/path&limit=20&include_bodies=true
+resource://inbox/GreenCastle?project=%2Fowner%2Frepo&limit=20&include_bodies=true
 ```
 
 ### 5. Release Reservations When Done
 
 ```
 release_file_reservations(
-  project_key="/abs/path/to/project",
+  project_key="/owner/repo",
   agent_name="GreenCastle"
 )
 ```
@@ -189,16 +193,16 @@ Both repos use the same `project_key`. Agents coordinate automatically.
 ```
 # Backend agent requests contact with frontend agent
 request_contact(
-  project_key="/abs/path/backend",
+  project_key="/owner/backend",
   from_agent="GreenCastle",
   to_agent="BlueLake",
-  to_project="/abs/path/frontend",
+  to_project="/owner/frontend",
   reason="API contract coordination"
 )
 
 # Frontend agent accepts
 respond_contact(
-  project_key="/abs/path/frontend",
+  project_key="/owner/frontend",
   to_agent="BlueLake",
   from_agent="GreenCastle",
   accept=true
@@ -211,7 +215,7 @@ Install the guard to block commits that conflict with others' exclusive reservat
 
 ```
 install_precommit_guard(
-  project_key="/abs/path/to/project",
+  project_key="/owner/repo",
   code_repo_path="/abs/path/to/project"
 )
 ```

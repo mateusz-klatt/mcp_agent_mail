@@ -1,12 +1,13 @@
 # The Claude Code hooks
 
-Five hooks plus a watcher, installed once per machine, working in every
-repository without per-project setup. They are what makes the mailbox reach an
-agent that is busy, and the reservations reach an agent about to edit a file
-somebody else is already in.
+Five hooks plus a watcher, installed once per machine, working in repositories
+that explicitly opt in or already have private Agent Mail state. They are what
+makes the mailbox reach an agent that is busy, and the reservations reach an
+agent about to edit a file somebody else is already in.
 
-Nothing here is installed by `scripts/integrate_claude_code.sh` — see the last
-section before you consider running it.
+`scripts/integrate_claude_code.sh` installs this set once under
+`~/.claude/hooks/mcp-agent-mail` and merges the hook entries into the user-level
+`~/.claude/settings.json`. It does not create a project's `.claude` directory.
 
 ## What each one does
 
@@ -29,13 +30,20 @@ of a message the dedupe store already believes was delivered.
 
 ## Installing
 
+The integrator requires Bash, `jq`, `git`, and `curl`. Codex additionally uses
+`uv` to update its TOML without a lossy shell parser. On Windows, use Git for
+Windows Bash and install `jq` explicitly if `jq --version` is unavailable;
+Git Bash itself does not guarantee it. Verify `curl --version` and, for Codex,
+`uv --version` in that same shell before installing. The generated Codex
+`commandWindows` also points directly to Git for Windows `bash.exe`.
+
 User scope, once per machine, in `~/.claude/settings.json`:
 
 ```json
 {"hooks": {
   "SessionStart": [{"matcher": "", "hooks": [
-    {"type": "command", "command": "\"C:/Program Files/Git/bin/bash.exe\" -c \"'/path/to/repo/scripts/hooks/session_start.sh' || true\""},
-    {"type": "command", "command": "\"C:/Program Files/Git/bin/bash.exe\" -c \"'/path/to/repo/scripts/hooks/inbox_check.sh' || true\""}]}],
+    {"type": "command", "command": "\"C:/Program Files/Git/bin/bash.exe\" -c \"'/c/Users/you/.claude/hooks/mcp-agent-mail/session_start.sh' || true\""},
+    {"type": "command", "command": "\"C:/Program Files/Git/bin/bash.exe\" -c \"'/c/Users/you/.claude/hooks/mcp-agent-mail/inbox_check.sh' || true\""}]}],
   "PreToolUse": [{"matcher": "Edit|Write|NotebookEdit", "hooks": [
     {"type": "command", "command": "…/reservations_warn.sh || true"}]}],
   "PostToolUse": [{"matcher": "Edit|Write|NotebookEdit", "hooks": [
@@ -72,8 +80,15 @@ never in the repository:
 
 ```
 HTTP_BEARER_TOKEN=…          # required
-AGENT_MAIL_URL=https://host  # omit on the machine running the server
+AGENT_MAIL_URL=https://host/mcp/
+AGENT_MAIL_STATE_DIR=/optional/private/state/path
 ```
+
+That shared file is deliberately limited to the endpoint, principal bearer and
+optional state directory. Client, slot, project, agent name and registration
+token do not belong there. The installer removes those legacy identity keys,
+preserves comments and unrelated operator settings, and writes a private backup
+under the Agent Mail state directory before an atomic merge.
 
 `chmod 600` on that file is worth attempting and worth not trusting. Under Git
 Bash on NTFS the mount carries `noacl`, so POSIX modes are neither read nor
@@ -154,20 +169,129 @@ should not treat it as an error.
 
 ## `scripts/integrate_claude_code.sh`
 
-Safe to run since `f81d779`, and it now installs the working set — the six
-hooks plus `agent_mail_common.sh` — instead of the previous-generation
-`check_inbox.sh` alone. It detects the platform, wraps hook commands in Git
-Bash on Windows (where a bare `.sh` path exits 0 without running), keeps secrets
-out of every hook command, and reports the mode it actually achieved on
-`~/.agent-mail.env` rather than asserting 0600.
+The integrator is user-scope only:
 
-Two fixes worth knowing if you ran an older copy:
+- hook scripts: `~/.claude/hooks/mcp-agent-mail`
+- hook definitions: `~/.claude/settings.json`
+- authenticated MCP server: Claude user scope in `~/.claude.json`, preferably
+  written through `claude mcp add --scope user`
 
-- before `21c5588` it wrote the server bearer and the agent's registration
-  token into a mode-644 file and into every hook's argv, under a banner reading
-  "no secrets". Check `~/.claude/settings.json` for a literal token and rotate
-  what you find.
-- before `f81d779` it also ran `claude mcp add --scope project`, which writes
-  the bearer into `.mcp.json` in the target directory. `.gitignore` here forbids
-  that file, but an arbitrary project does not — on a fresh repo, `git add .`
-  stages it with the token inside.
+Re-running it migrates old managed commands that point into a project's
+`.claude/hooks` directory, then installs one canonical global set. It filters
+individual managed commands, so an unrelated command in the same hook group is
+preserved. No project `.mcp.json`, `.claude/settings.local.json`, ignore rule or
+server-launch helper is created.
+
+`SessionStart` derives the repository and the Claude client slot, then applies a
+local activation gate before any server request. Existing credentials or a
+current/legacy granted-name file activate a known project. A new project must
+carry a non-empty `.agent-mail-project-id` or an `.agent-mail.yaml` declaring
+`project_uid:`. Only then does the hook register the agent and store its
+per-agent registration token in the private `credentials.json` state store. The
+registration token is never copied into `~/.agent-mail.env`.
+
+## Codex lifecycle integration
+
+`scripts/integrate_codex_cli.sh` respects an explicit `CODEX_HOME` and otherwise
+uses `~/.codex`. It installs:
+
+- the authenticated MCP server in `${CODEX_HOME:-~/.codex}/config.toml`
+- the runtime and wrapper in `${CODEX_HOME:-~/.codex}/hooks/mcp-agent-mail`
+- `SessionStart`, `Stop`, and `SessionEnd` in
+  `${CODEX_HOME:-~/.codex}/hooks.json`
+
+The JSON merge removes only prior Agent Mail handlers and preserves unrelated
+handlers, including a foreign command in the same matcher group. The TOML merge
+likewise removes only the old Agent Mail top-level `notify`; an unrelated
+`notify` command survives. Codex requires the exact hash of non-managed command
+hooks to be reviewed, so open `/hooks` after installation or after any hook
+update and trust the displayed user-level definitions.
+The wire formats and trust behavior follow the current
+[Codex hooks reference](https://learn.chatgpt.com/docs/hooks).
+
+`SessionStart` establishes the repository-scoped identity only after the same
+local activation gate and contributes the unread count as developer context.
+An unactivated repository makes no Agent Mail request and creates no project or
+Agent row. `Stop` checks unread mail no more than once
+per 120 seconds, always emits valid JSON, and creates a continuation only for
+message ids that are both newly observed and high/urgent. A repeated urgent
+message or ordinary unread mail is a UI `systemMessage`, avoiding continuation
+loops. `SessionEnd` has the documented three-second ceiling and only releases
+paths recorded for that exact session; because the Codex integration does not
+install autoreserve, it is normally a local no-op and never performs a wholesale
+release for the shared slot identity.
+
+Every hook has a POSIX Bash command and a `commandWindows` beginning with a
+concrete Git for Windows `bash.exe`. When `CODEX_HOME` is shared from WSL under
+`/mnt/<drive>`, the installer translates the wrapper path back to Windows. This
+keeps the Windows desktop out of the WSL launcher while allowing the wrapper,
+once inside Git Bash, to invoke ordinary `bash`.
+
+Codex currently exposes lifecycle hooks, not Claude-style managed monitor
+processes. The integration therefore does not auto-spawn a daemon. For immediate
+mail delivery, start `inbox_watch.sh` explicitly as a background task; otherwise
+delivery occurs at the next lifecycle boundary.
+
+## GitHub Copilot CLI lifecycle integration
+
+`scripts/integrate_github_copilot.sh` configures both Copilot CLI and VS Code at
+user scope. It respects `COPILOT_HOME` and otherwise writes:
+
+- the authenticated remote server to `~/.copilot/mcp-config.json`
+- the managed user hook file to `~/.copilot/hooks/mcp-agent-mail.json`
+- the runtime and wrapper below `~/.copilot/hooks/mcp-agent-mail/`
+- the same authenticated server to VS Code's platform-specific user `mcp.json`
+
+The Copilot MCP entry uses the native `mcpServers` schema, HTTP transport and
+`tools: ["*"]`. The hook file uses schema version 1 and the PascalCase
+`SessionStart`, `Stop` and `SessionEnd` events, which select Copilot's
+VS Code-compatible snake_case payload. Every entry supplies `bash`,
+`powershell` and `timeoutSec`; the Windows command invokes a concrete Git for
+Windows `bash.exe`. Native Git Bash installs use the current Bash executable,
+including per-user and custom installations. For a custom Git for Windows path
+when installing a Windows-shared profile from WSL, set the install-time-only
+`AGENT_MAIL_GIT_BASH_PATH` to an absolute Windows or `/mnt/<drive>` path. The
+installer preserves foreign servers, top-level fields, hook events and handlers,
+and replaces only its own wrapper commands when run again.
+
+The wrapper supplies the closed `copilot` client token and the selected
+`AGENT_MAIL_COPILOT_SLOT` (default `1`). `SessionStart` uses the same local
+activation and legacy-migration gates as Codex before any network request, then
+injects identity and unread counts through Copilot's direct `additionalContext`
+output. `Stop` checks at most once per 120 seconds and returns `decision: block`
+only for newly observed high/urgent message ids. Ordinary unread mail never
+forces another turn. `SessionEnd` releases only session-recorded paths and is
+normally a local no-op because this integration does not install autoreserve.
+
+Copilot CLI loads user hook files only at startup, so restart the CLI after
+installing or changing them. There is deliberately no automatically spawned
+watcher or daemon. The contracts are documented in GitHub's
+[hooks guide](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/use-hooks),
+[hooks reference](https://docs.github.com/en/copilot/reference/hooks-reference),
+and [CLI command reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference).
+
+## Identity migration is fail-closed
+
+Messages, contacts, and reservations follow the server's `Agent.id`. Creating a
+new `<client>-<os>-<host>-<slot>` row before migrating an existing
+`<host>-<os>-<slot>` identity would leave the old history attached to the
+old row.
+
+Claude, Codex, and Copilot CLI SessionStart inspect the private credential store
+and the legacy project-only granted-name entry before any network call. If that
+state proves a legacy identity exists and the client-scoped credential is not
+already usable, the hook prints the exact old and new names and stops. It does
+not call `ensure_project`, register a second Agent, copy a token, or rewrite
+either local state file.
+
+The operator sequence is deliberately manual:
+
+1. Rename the existing server Agent row in place, preserving `Agent.id` and its
+   registration token.
+2. Move the corresponding key in private `credentials.json` and write the
+   client/slot-specific granted-name entry.
+3. Restart the client and let SessionStart use the migrated identity.
+
+Only evidence produced by the old integrations is treated as legacy: the old
+project-only granted-name file or a credential key matching the locally derived
+`<host>-<os>-<positive-slot>` form. The hook does not guess remote state.

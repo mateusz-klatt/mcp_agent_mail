@@ -63,18 +63,25 @@ the server, so a POSIX-style leading slash is correct even for Windows clients.
 State it in the project's `CLAUDE.md` / `AGENTS.md` as well, so an agent reading
 its instructions uses it verbatim rather than substituting its own cwd.
 
-## Agent names have a matching trap
+## Agent address identity
 
 Names are unique per project and an existing identity can only be re-registered
 by presenting the `registration_token` from its first registration — so the
 token is a durable credential worth persisting, not session state.
 
-Less obviously: a requested name that looks like a program or model name is
-**silently replaced** with a random one rather than rejected. The check is
-`_looks_like_program_name(...) or _looks_like_model_name(...)` (`app.py:3272`),
-and the default enforcement mode is `coerce`, which falls through to
-auto-generation instead of raising. `claude-<host>` therefore does not do what
-it appears to do; `<host>-1` does.
+The global integrations derive one canonical address in the form
+`<client>-<os>-<host>-<slot>`, for example `codex-wsl-home-1`. `client` is one
+of `claude`, `codex`, `copilot`, or `gemini`; `os` describes the execution
+substrate (`linux`, `wsl`, `win`, `mac`, or `other`); the final slot is a
+positive integer without a leading zero. The hostname is the whole middle
+portion and may itself contain hyphens.
+
+Canonical addresses are validated before the older program/model-name
+heuristics, so their client token is not coerced into a random adjective+noun.
+An exact program name such as `claude-code` is still not an address. Existing
+legacy identities must be renamed in place with the offline migration command,
+preserving `Agent.id` and the registration token; registering the canonical
+name as a second row would strand the old inbox and reservations.
 
 ## Verifying
 

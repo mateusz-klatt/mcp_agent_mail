@@ -51,7 +51,9 @@ PROJECT="$(am_project_key_for_file "$target")"
 # reservations and the other loses them.
 export AM_PROJECT_FOR_NAME="$PROJECT"
 [ -z "$PROJECT" ] && exit 0
-SELF="$(am_agent_name)"
+am_project_is_active "$PROJECT" claude "${AGENT_MAIL_CLAUDE_SLOT:-1}" \
+    "$(dirname "$(am_norm_path "$target")")" || exit 0
+SELF="$(am_agent_name claude "${AGENT_MAIL_CLAUDE_SLOT:-1}")"
 
 rel="$(am_relpath "$target")"
 [ -z "$rel" ] && exit 0

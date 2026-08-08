@@ -49,7 +49,8 @@ PROJECT="$(am_project_key)"
 # on Windows, so this is a doubled cost on every tool invocation there.
 export AM_PROJECT_FOR_NAME="$PROJECT"
 [ -z "$PROJECT" ] && exit 0
-AGENT="$(am_agent_name)"
+am_project_is_active "$PROJECT" claude "${AGENT_MAIL_CLAUDE_SLOT:-1}" . || exit 0
+AGENT="$(am_agent_name claude "${AGENT_MAIL_CLAUDE_SLOT:-1}")"
 
 token="$(am_cred_get "$PROJECT" "$AGENT")"
 [ -z "$token" ] && exit 0   # SessionStart has not run; nothing to authenticate as
@@ -63,7 +64,7 @@ token="$(am_cred_get "$PROJECT" "$AGENT")"
 # already been shown. Two projects sharing it means mail from one is recorded as
 # seen by the other and never surfaces — a silently lost message, which is the
 # single failure this hook exists to prevent.
-slug="$(printf '%s|%s' "$PROJECT" "$AGENT" | tr '/' '_' | tr -cd '[:alnum:]._|-' | tr '|' '_' | cut -c1-96)"
+slug="$(am_state_component "${PROJECT}|${AGENT}")" || exit 0
 stamp="${AM_STATE_DIR}/inbox/${slug}.stamp"
 seen="${AM_STATE_DIR}/inbox/${slug}.seen"
 mkdir -p "$(dirname "$stamp")" 2>/dev/null || exit 0
@@ -129,8 +130,9 @@ fi
 #
 # Split into two calls so the common case — nothing new — costs one small
 # response instead of dragging every unread body across the wire every 120s.
-inv="$(am_call fetch_inbox "$(jq -nc --arg p "$PROJECT" --arg a "$AGENT" --arg t "$token" --argjson n "$INVENTORY" \
-    '{project_key:$p,agent_name:$a,registration_token:$t,unread_only:true,limit:$n,include_bodies:false}')")"
+inv="$(am_call fetch_inbox "$(AGENT_MAIL_JQ_REGISTRATION_TOKEN="$token" \
+    jq -nc --arg p "$PROJECT" --arg a "$AGENT" --argjson n "$INVENTORY" \
+    '{project_key:$p,agent_name:$a,registration_token:env.AGENT_MAIL_JQ_REGISTRATION_TOKEN,unread_only:true,limit:$n,include_bodies:false}')")"
 rc=$?
 # "No new mail" and "I could not ask" are the same silence today, and this hook
 # is the only channel through which anyone reaches this agent. A deploy window
@@ -173,8 +175,9 @@ case "$cutoff" in ''|*[!0-9]*) cutoff="$RENDER_FULL" ;; esac
 want="$(printf '%s' "$fresh" | jq -c --argjson n "$RENDER_FULL" '[.[0:$n][].id]' 2>/dev/null)"
 [ -z "$want" ] && want='[]'
 
-bodies="$(am_call fetch_inbox "$(jq -nc --arg p "$PROJECT" --arg a "$AGENT" --arg t "$token" --argjson n "$cutoff" \
-    '{project_key:$p,agent_name:$a,registration_token:$t,unread_only:true,limit:$n,include_bodies:true}')")"
+bodies="$(am_call fetch_inbox "$(AGENT_MAIL_JQ_REGISTRATION_TOKEN="$token" \
+    jq -nc --arg p "$PROJECT" --arg a "$AGENT" --argjson n "$cutoff" \
+    '{project_key:$p,agent_name:$a,registration_token:env.AGENT_MAIL_JQ_REGISTRATION_TOKEN,unread_only:true,limit:$n,include_bodies:true}')")"
 printf '%s' "$bodies" | jq -e 'type == "array"' >/dev/null 2>&1 || bodies='[]'
 
 full="$(printf '%s' "$bodies" | jq -c --argjson want "$want" \

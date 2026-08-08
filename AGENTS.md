@@ -84,10 +84,10 @@ Why it's useful
 
 How to use effectively
 1) Same repository
-   - Register an identity: call `ensure_project`, then `register_agent` using this repo's absolute path as `project_key`.
+   - Register an identity: call `ensure_project`, then `register_agent` with the same canonical project key on every host. Normalize the Git origin to a synthetic absolute key (`git@github.com:owner/repo.git` → `/owner/repo`); never use the local checkout path.
    - Reserve files before you edit: `file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true)` to signal intent and avoid conflict.
    - Communicate with threads: use `send_message(..., thread_id="FEAT-123")`; check inbox with `fetch_inbox` and acknowledge with `acknowledge_message`.
-   - Read fast: `resource://inbox/{Agent}?project=<abs-path>&limit=20` or `resource://thread/{id}?project=<abs-path>&include_bodies=true`.
+   - Read fast: `resource://inbox/{Agent}?project=<url-encoded-canonical-key>&limit=20` or `resource://thread/{id}?project=<url-encoded-canonical-key>&include_bodies=true`.
    - Tip: set `AGENT_NAME` in your environment so the pre-commit guard can block commits that conflict with others' active exclusive file reservations.
    - Tip: worktree mode (opt-in): set `WORKTREES_ENABLED=1`, and during trials set `AGENT_MAIL_GUARD_MODE=warn`. Check hooks with `mcp-agent-mail guard status .` and identity with `mcp-agent-mail mail status .`.
 

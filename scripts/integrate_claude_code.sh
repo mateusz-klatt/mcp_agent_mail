@@ -13,89 +13,86 @@ fi
 init_colors
 setup_traps
 parse_common_flags "$@"
-require_cmd uv
+# This installer handles bearer-bearing config writes. Disable xtrace whether
+# it came from --debug or an external `bash -x`; otherwise later environment
+# assignments would copy the bearer into stderr and shell transcripts.
+case "$-" in
+  *x*)
+    set +x
+    log_warn "Command tracing is disabled while the integration handles credentials."
+    ;;
+esac
 require_cmd curl
 require_cmd jq  # Required for safe JSON merging (avoids quote injection vulnerabilities)
+require_cmd git
 
-log_step "Claude Code Integration (HTTP MCP + Hooks)"
+_normalize_claude_shared_path() {
+  local target="$1"
+  case "$target" in
+    [a-zA-Z]:\\*|[a-zA-Z]:/*)
+      case "$(uname -s 2>/dev/null || printf unknown)" in
+        MINGW*|MSYS*|CYGWIN*)
+          command -v cygpath >/dev/null 2>&1 || {
+            log_err "cygpath is required to normalize the Windows shared env path: ${target}" >&2
+            return 1
+          }
+          cygpath -u "$target" 2>/dev/null || {
+            log_err "Could not normalize the Windows shared env path: ${target}" >&2
+            return 1
+          } ;;
+        *)
+          command -v wslpath >/dev/null 2>&1 || {
+            log_err "wslpath is required to normalize the Windows shared env path: ${target}" >&2
+            return 1
+          }
+          wslpath -u "$target" 2>/dev/null || {
+            log_err "Could not normalize the Windows shared env path: ${target}" >&2
+            return 1
+          } ;;
+      esac ;;
+    *) printf '%s\n' "$target" ;;
+  esac
+}
+
+SHARED_ENV_FILE="$(_normalize_claude_shared_path \
+  "${AGENT_MAIL_ENV_FILE:-${HOME}/.agent-mail.env}")" || exit 1
+case "$SHARED_ENV_FILE" in
+  /*) ;;
+  *)
+    log_err "Shared Agent Mail env target must be an absolute path: ${SHARED_ENV_FILE}"
+    exit 1 ;;
+esac
+AGENT_MAIL_ENV_FILE="$SHARED_ENV_FILE"
+
+log_step "Claude Code Integration (user scope)"
 echo
-echo "This script will:"
-echo "  1) Detect your server endpoint (host/port/path) from settings."
-echo "  2) Create/update a project-local .claude/settings.json with MCP server config and safe hooks (auto-backup existing)."
-echo "  3) Auto-generate a bearer token if missing and embed it in the client config."
-echo "  4) Create scripts/run_server_with_token.sh that exports the token and starts the server."
+echo "This installs MCP Agent Mail once for the current user:"
+echo "  - hooks: ~/.claude/hooks/mcp-agent-mail"
+echo "  - hook settings: ~/.claude/settings.json"
+echo "  - MCP server: Claude user scope (~/.claude.json)"
+echo "No repository configuration or server credential is created."
 echo
-TARGET_DIR="${PROJECT_DIR:-}"
-if [[ -z "${TARGET_DIR}" ]]; then TARGET_DIR="${ROOT_DIR}"; fi
 if ! confirm "Proceed?"; then log_warn "Aborted."; exit 1; fi
 
-cd "$ROOT_DIR"
-
-log_step "Resolving HTTP endpoint from settings"
-eval "$(uv run python - <<'PY'
-from mcp_agent_mail.config import get_settings
-s = get_settings()
-print(f"export _HTTP_HOST='{s.http.host}'")
-print(f"export _HTTP_PORT='{s.http.port}'")
-print(f"export _HTTP_PATH='{s.http.path}'")
-PY
-)"
-
-# Validate Python eval output (Bug 15)
-if [[ -z "${_HTTP_HOST}" || -z "${_HTTP_PORT}" || -z "${_HTTP_PATH}" ]]; then
-  log_err "Failed to detect HTTP endpoint from settings (Python eval failed)"
+_URL="$(resolve_integration_mcp_url)" || {
+  log_err "Missing MCP endpoint. Set INTEGRATION_MCP_URL or AGENT_MAIL_URL (for example https://hermes.example/mcp/)."
   exit 1
-fi
+}
+_TOKEN="$(resolve_global_integration_bearer_token)" || {
+  log_err "Missing bearer token. Set INTEGRATION_BEARER_TOKEN or HTTP_BEARER_TOKEN."
+  exit 1
+}
+log_ok "Using MCP endpoint: ${_URL}"
 
-_URL="http://${_HTTP_HOST}:${_HTTP_PORT}${_HTTP_PATH}"
-log_ok "Detected MCP HTTP endpoint: ${_URL}"
-
-# Determine or generate bearer token via shared resolver
-# (INTEGRATION_BEARER_TOKEN > HTTP_BEARER_TOKEN > MCP_AGENT_MAIL_TOKEN >
-#  systemd LoadCredential > .env > MCP_AGENT_MAIL_ENV_FILE > user config > legacy run helper)
-_TOKEN="$(resolve_integration_bearer_token "${ROOT_DIR}")"
-if [[ -z "${_TOKEN}" ]]; then
-  _TOKEN="$(generate_bearer_token)"
-  log_ok "Generated bearer token."
-fi
-
-_MORPH_ENABLED_TOOLS=$(default_morph_enabled_tools)
-_MORPH_API_KEY=$(resolve_morph_api_key)
-if [[ -n "${_MORPH_API_KEY}" ]]; then
-  log_ok "Morph MCP will be configured in grep-only mode."
-else
-  log_warn "Morph API key not found; skipping morph-mcp setup."
-fi
-
-log_step "Preparing project-local .claude/settings.json"
-CLAUDE_DIR="${TARGET_DIR}/.claude"
+log_step "Preparing user-level Claude settings"
+CLAUDE_DIR="${HOME}/.claude"
 SETTINGS_PATH="${CLAUDE_DIR}/settings.json"
-mkdir -p "$CLAUDE_DIR"
+CLAUDE_USER_JSON="${HOME}/.claude.json"
+HOOKS_DIR="${CLAUDE_DIR}/hooks/mcp-agent-mail"
 
-# Derive project name from TARGET_DIR (Bug 14 fix - was hardcoded to "backend")
-_PROJ_DISPLAY=$(basename "$TARGET_DIR")
-# Store full path for CLI commands (Bug 48 fix - hooks need absolute path, not basename)
-_PROJ="${TARGET_DIR}"
-# Store MCP Agent Mail installation directory for hook commands (Bug 48 fix - hooks run from user's project dir)
-_MCP_DIR="${ROOT_DIR}"
-# Note: We'll set _AGENT after registering with the server (it auto-generates adjective+noun names)
-_AGENT=""
-log_ok "Using project: ${_PROJ_DISPLAY} (${_PROJ})"
-
-# Backup existing file if it exists (Bug 5 fix - backup BEFORE creating empty file)
-if [[ -f "$SETTINGS_PATH" ]]; then
-  backup_file "$SETTINGS_PATH"
-fi
-
-log_step "Installing the hook scripts"
-HOOKS_DIR="${CLAUDE_DIR}/hooks"
-mkdir -p "${HOOKS_DIR}"
-
-# The working set, and agent_mail_common.sh which every one of them sources by
-# a path relative to its own location — so they are copied together or not at
-# all. This script used to install check_inbox.sh alone, a previous generation
-# that predates all five, and nothing here mentioned the others: a machine
-# configured by this installer got one hook where the fleet runs six.
+# Preflight every input before creating a directory, backup, or partial hook
+# installation.  A dry run and a refused merge must leave HOME byte-for-byte
+# untouched.
 AGENT_MAIL_HOOKS=(
   agent_mail_common.sh
   session_start.sh
@@ -105,175 +102,74 @@ AGENT_MAIL_HOOKS=(
   session_end.sh
   inbox_watch.sh
 )
-_hooks_installed=0
 _hooks_missing=()
 for _h in "${AGENT_MAIL_HOOKS[@]}"; do
-  if [[ -f "${ROOT_DIR}/scripts/hooks/${_h}" ]]; then
-    cp "${ROOT_DIR}/scripts/hooks/${_h}" "${HOOKS_DIR}/${_h}"
-    # agent_mail_common.sh is sourced, never executed; the rest need the bit.
-    [[ "${_h}" == "agent_mail_common.sh" ]] || chmod +x "${HOOKS_DIR}/${_h}"
-    _hooks_installed=$((_hooks_installed + 1))
-  else
+  if [[ ! -f "${ROOT_DIR}/scripts/hooks/${_h}" ]]; then
     _hooks_missing+=("${_h}")
+  elif ! bash -n "${ROOT_DIR}/scripts/hooks/${_h}"; then
+    log_err "Required hook script has invalid shell syntax: ${_h}"
+    log_err "No user configuration was changed."
+    exit 1
   fi
 done
-log_ok "Installed ${_hooks_installed}/${#AGENT_MAIL_HOOKS[@]} hook scripts to ${HOOKS_DIR}"
-# Named, not counted. A missing agent_mail_common.sh makes every hook exit
-# silently at its first line, which is indistinguishable from a quiet mailbox.
 if [[ ${#_hooks_missing[@]} -gt 0 ]]; then
-  log_warn "Missing from ${ROOT_DIR}/scripts/hooks: ${_hooks_missing[*]}"
-  log_warn "Hooks that depend on them will exit without saying so."
+  log_err "Missing required hook scripts: ${_hooks_missing[*]}"
+  log_err "No user configuration was changed."
+  exit 1
 fi
 
-# Check server readiness and register agent BEFORE writing hooks config
-# This ensures we get the auto-generated agent name (adjective+noun format)
-log_step "Checking server and registering agent"
-_SERVER_AVAILABLE=0
-if readiness_poll "${_HTTP_HOST}" "${_HTTP_PORT}" "/health/readiness" 3 0.5; then
-  _SERVER_AVAILABLE=1
-  log_ok "Server is reachable."
-else
-  log_warn "Server not reachable. Hooks will be configured without agent name."
-  log_warn "Agent will need to call register_agent at session start."
-fi
-
-if [[ ${_SERVER_AVAILABLE} -eq 1 ]]; then
-  _AUTH_ARGS=()
-  if [[ -n "${_TOKEN}" ]]; then _AUTH_ARGS+=("-H" "Authorization: Bearer ${_TOKEN}"); fi
-
-  # Escape the project path for JSON
-  _HUMAN_KEY_ESCAPED=$(json_escape_string "${TARGET_DIR}") || { log_err "Failed to escape project path"; exit 1; }
-
-  # ensure_project
-  if curl -fsS --connect-timeout 2 --max-time 5 --retry 0 -H "Content-Type: application/json" "${_AUTH_ARGS[@]}" \
-      -d "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"tools/call\",\"params\":{\"name\":\"ensure_project\",\"arguments\":{\"human_key\":${_HUMAN_KEY_ESCAPED}}}}" \
-      "${_URL}" >/dev/null 2>&1; then
-    log_ok "Ensured project on server"
-  else
-    log_warn "Failed to ensure project"
-  fi
-
-  # register_agent — pass explicit identity from AGENT_NAME if set, otherwise auto-generate
-  _REQUESTED_AGENT=$(requested_agent_name_override)
-  if [[ -n "${_REQUESTED_AGENT}" ]]; then
-    log_ok "Requesting explicit agent identity: ${_REQUESTED_AGENT}"
-  fi
-  _REGISTER_ARGS=$(build_register_agent_arguments_json "${_HUMAN_KEY_ESCAPED}" "claude-code" "claude-sonnet" "setup" "${_REQUESTED_AGENT}") || {
-    log_err "Failed to build register_agent arguments"
+EXISTING_SETTINGS="{}"
+EXISTING_CLAUDE_USER="{}"
+if [[ -f "$SETTINGS_PATH" ]]; then
+  if ! jq -e '
+      def valid_handler:
+        type == "object" and
+        ((has("command") | not) or (.command | type == "string"));
+      def valid_group:
+        type == "object" and
+        (.hooks | type == "array") and
+        all(.hooks[]; valid_handler);
+      type == "object" and
+      ((has("hooks") | not) or (.hooks | type == "object")) and
+      (if has("hooks") then
+        all(.hooks[]; type == "array" and all(.[]; valid_group))
+      else true end)
+    ' "$SETTINGS_PATH" >/dev/null 2>&1; then
+    log_err "Existing ${SETTINGS_PATH} has an invalid nested hook shape; refusing to overwrite it."
     exit 1
-  }
-  _REGISTER_RESPONSE=$(curl -sS --connect-timeout 2 --max-time 5 --retry 0 -H "Content-Type: application/json" "${_AUTH_ARGS[@]}" \
-      -d "{\"jsonrpc\":\"2.0\",\"id\":\"2\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{${_REGISTER_ARGS}}}}" \
-      "${_URL}" 2>/dev/null || echo "")
-
-  _REG_TOKEN=""
-  if [[ -n "${_REGISTER_RESPONSE}" ]]; then
-    _AGENT=$(extract_registered_agent_name "${_REGISTER_RESPONSE}")
-    _REG_TOKEN=$(extract_registered_registration_token "${_REGISTER_RESPONSE}")
-    if [[ -n "${_AGENT}" ]]; then
-      log_ok "Registered agent: ${_AGENT}"
-      persist_agent_identity_file "${ROOT_DIR}" "${_AGENT}" "${TARGET_DIR}"
-    else
-      log_warn "Could not parse agent name from response"
-    fi
-    if [[ -z "${_REG_TOKEN}" ]]; then
-      log_warn "Could not parse registration_token from register_agent response."
-      log_warn "The PostToolUse(Bash) inbox-check hook will silently no-op until this is set."
-      log_warn "Re-run this integrator after confirming the server returns 'registration_token' in register_agent."
-    fi
-  else
-    log_warn "Failed to register agent"
   fi
+  EXISTING_SETTINGS="$(cat "$SETTINGS_PATH")"
+fi
+if [[ -f "$CLAUDE_USER_JSON" ]]; then
+  if ! jq -e '
+      type == "object" and
+      ((has("mcpServers") | not) or (.mcpServers | type == "object"))
+    ' "$CLAUDE_USER_JSON" >/dev/null 2>&1; then
+    log_err "Existing ${CLAUDE_USER_JSON} has an invalid mcpServers shape; refusing to overwrite it."
+    exit 1
+  fi
+  EXISTING_CLAUDE_USER="$(cat "$CLAUDE_USER_JSON")"
 fi
 
-# If we still don't have an agent name, use placeholder that hooks will detect
+# Client/platform/host/slot identity is stable across restarts and distinct from
+# every other coding client on the same machine.
+_CLAUDE_SLOT="$(integration_slot "${AGENT_MAIL_CLAUDE_SLOT:-1}")"
+_AGENT="$(integration_agent_name claude "${_CLAUDE_SLOT}")"
+log_ok "Claude identity template: ${_AGENT}"
+
 if [[ -z "${_AGENT}" ]]; then
-  _AGENT="YOUR_AGENT_NAME"
-  log_warn "No agent name available (server not running). Using placeholder '${_AGENT}'."
-  log_warn "Hooks with placeholder values will silently skip execution."
-  log_warn "After starting the server, reconfigure with: ./scripts/integrate_claude_code.sh"
+  log_err "Could not derive a stable Claude agent identity."
+  exit 1
 fi
 
-log_step "Writing MCP server config and hooks (merge, not overwrite)"
-
-# Secrets go to ~/.agent-mail.env, never into a hook command.
-#
-# A hook command is stored verbatim in settings.json, which this script then
-# chmods to 644 — so a token written there is readable by every account on the
-# machine. The file also lives inside the repository, one .gitignore edit or one
-# `git add -f` away from a public remote. The hooks read this env file directly,
-# so the tokens still reach them; only their location changes.
-#
-# What this move does NOT do is make the file mode 0600 everywhere, which is how
-# it was originally described. Under Git Bash on NTFS the mount carries `noacl`
-# and POSIX modes are neither read nor written: `chmod 600` returns 0 and leaves
-# the mode at 644, `chmod 777` also leaves 644, and only the read-only attribute
-# survives. `umask 077` in write_atomic has nothing to express there either. On
-# that platform the secrets moved from one 644 file to another, and the file is
-# guarded by the profile directory's inherited ACL or not at all — so the mode is
-# verified below and reported rather than assumed.
-ENV_FILE="${HOME}/.agent-mail.env"
-env_file_put() {
-  local key="$1" val="$2" existing=""
-  [[ -n "${val}" ]] || return 0
-  if [[ -f "${ENV_FILE}" ]]; then
-    existing=$(grep -v "^${key}=" "${ENV_FILE}" 2>/dev/null || true)
-  fi
-  # write_atomic creates its temp under umask 077 and returns non-zero if the
-  # write or the rename fails. A credential store that cannot say whether it
-  # stored anything leaves the caller believing a machine is configured when it
-  # is not, so the failure is propagated rather than swallowed.
-  { [[ -n "${existing}" ]] && printf '%s\n' "${existing}"; printf '%s=%s\n' "${key}" "${val}"; } \
-    | write_atomic "${ENV_FILE}" || return 1
-  chmod 600 "${ENV_FILE}" 2>/dev/null || true
-}
-
-# Ask the filesystem what it actually did, not chmod what it thinks it did.
-# lib.sh already warns when `chmod` exits non-zero, and that guard is blind to
-# precisely the case that matters here: on this mount chmod SUCCEEDS and changes
-# nothing, so the only silent platform is the only unprotected one.
-report_env_file_mode() {
-  local mode
-  mode="$(stat -c %a "${ENV_FILE}" 2>/dev/null || stat -f %Lp "${ENV_FILE}" 2>/dev/null || echo '')"
-  if [[ "${mode}" == "600" ]]; then
-    log_ok "${ENV_FILE} is mode 0600."
-    return 0
-  fi
-  if [[ -z "${mode}" ]]; then
-    log_warn "Could not read the mode of ${ENV_FILE}; treat its contents as readable by others until you have checked."
-    return 0
-  fi
-  log_warn "${ENV_FILE} is mode ${mode}, not 0600 — chmod reported success and changed nothing."
-  if [[ "${_OS}" == "windows" ]]; then
-    log_warn "This is expected under Git Bash: the NTFS mount carries 'noacl', so POSIX modes are inert."
-    log_warn "What guards this file is the Windows ACL it inherits. Check it, and read the group names:"
-    log_warn "    icacls \"%USERPROFILE%\\.agent-mail.env\""
-    log_warn "Anything holding (M) on your profile can also rewrite ~/.claude/settings.json,"
-    log_warn "which names the commands every Claude Code session executes."
-  else
-    log_warn "Check the filesystem's mount options before storing a bearer token here."
-  fi
-}
-
-log_step "Writing per-machine secrets to ${ENV_FILE}"
-env_file_put HTTP_BEARER_TOKEN "${_TOKEN}" \
-  || log_warn "Could not write HTTP_BEARER_TOKEN to ${ENV_FILE} — hooks will not authenticate."
-env_file_put AGENT_MAIL_URL "${_URL}" \
-  || log_warn "Could not write AGENT_MAIL_URL to ${ENV_FILE} — hooks will fall back to localhost."
-if [[ -n "${_REG_TOKEN:-}" ]]; then
-  env_file_put AGENT_MAIL_REGISTRATION_TOKEN "${_REG_TOKEN}" \
-    || log_warn "Could not write AGENT_MAIL_REGISTRATION_TOKEN to ${ENV_FILE} — fetch_inbox will be denied."
-else
-  log_warn "No registration token available; the hooks will no-op until one is written to ${ENV_FILE}."
-fi
-[[ -f "${ENV_FILE}" ]] && report_env_file_mode
-
-# The hook commands carry NOTHING — not settings, not identity, not secrets.
+# The hook commands carry only the Claude-specific slot, never shared settings
+# or secrets. The client itself is a literal argument at each hook call site.
 #
 # Every value the hooks need they derive or read for themselves: the project key
 # from the repo's origin remote, the identity from the hostname, the rest from
-# ${ENV_FILE}. That is what makes one installation work in every repository on
-# the machine rather than only in this one.
+# ${ENV_FILE}. That lets one installation serve every explicitly activated
+# repository on the machine rather than binding it to the directory from which
+# the installer happened to run.
 #
 # This block used to pin AGENT_MAIL_PROJECT and AGENT_MAIL_AGENT into each
 # command. Both are the wrong shape and the second is actively dangerous: a
@@ -313,13 +209,46 @@ fi
 # hook not being runnable at all.
 _BASH_WRAP=""
 if [[ "${_OS}" == "windows" ]]; then
-  for _c in "/c/Program Files/Git/bin/bash.exe" "/c/Program Files (x86)/Git/bin/bash.exe"; do
-    [[ -x "${_c}" ]] && { _BASH_WRAP="$(cygpath -m "${_c}" 2>/dev/null || printf '%s' "${_c}")"; break; }
-  done
+  command -v cygpath >/dev/null 2>&1 || {
+    log_err "Windows detected but cygpath is unavailable."
+    exit 1
+  }
+  if [[ -n "${AGENT_MAIL_GIT_BASH_PATH:-}" ]]; then
+    case "$AGENT_MAIL_GIT_BASH_PATH" in
+      [a-zA-Z]:\\*|[a-zA-Z]:/*)
+        _c="$(cygpath -u "$AGENT_MAIL_GIT_BASH_PATH" 2>/dev/null)" || {
+          log_err "Could not normalize AGENT_MAIL_GIT_BASH_PATH."
+          exit 1
+        } ;;
+      /*) _c="$AGENT_MAIL_GIT_BASH_PATH" ;;
+      *)
+        log_err "AGENT_MAIL_GIT_BASH_PATH must be an absolute Windows or Git Bash path."
+        exit 1 ;;
+    esac
+    if [[ ! -x "$_c" ]]; then
+      log_err "AGENT_MAIL_GIT_BASH_PATH is not an executable Git Bash: ${AGENT_MAIL_GIT_BASH_PATH}"
+      exit 1
+    fi
+    _BASH_WRAP="$(cygpath -m "$_c" 2>/dev/null)" || {
+      log_err "Could not translate AGENT_MAIL_GIT_BASH_PATH for Windows."
+      exit 1
+    }
+  else
+    _current_bash="$(command -v bash 2>/dev/null || true)"
+    for _c in "$_current_bash" "/c/Program Files/Git/bin/bash.exe" "/c/Program Files (x86)/Git/bin/bash.exe"; do
+      if [[ -n "$_c" && -x "$_c" ]]; then
+        _BASH_WRAP="$(cygpath -m "$_c" 2>/dev/null)" || {
+          log_err "Could not translate Git Bash for Windows."
+          exit 1
+        }
+        break
+      fi
+    done
+  fi
   if [[ -z "${_BASH_WRAP}" ]]; then
     log_err "Windows detected but no Git for Windows bash.exe found."
     log_err "Hook commands here exit 0 without running, so the hooks would look installed and do nothing."
-    log_err "Install Git for Windows, then re-run this script."
+    log_err "Install Git for Windows or set AGENT_MAIL_GIT_BASH_PATH, then re-run this script."
     exit 1
   fi
 fi
@@ -339,34 +268,55 @@ fi
 # does nothing there: with `noacl` the mode is inferred, and a .sh stays 755
 # through `chmod 644` and `chmod -x`. So this guard is inert here and load
 # bearing elsewhere, which is the right way round.
+_shell_single_quote() {
+  local value="$1"
+  value="${value//\'/\'\\\'\'}"
+  printf "'%s'" "$value"
+}
+
 _hook_cmd() {
+  local hook_path="${HOOKS_DIR}/$1" hook_path_q
+  hook_path_q="$(_shell_single_quote "$hook_path")"
   if [[ -n "${_BASH_WRAP}" ]]; then
     # Inner command single-quoted for bash, whole thing double-quoted for cmd.exe.
-    printf '"%s" -c "bash '"'"'%s/%s'"'"' || true"' "${_BASH_WRAP}" "${HOOKS_DIR}" "$1"
+    printf '"%s" -c "AGENT_MAIL_CLAUDE_SLOT=%s bash %s || true"' \
+      "${_BASH_WRAP}" "${_CLAUDE_SLOT}" "$hook_path_q"
   else
-    printf 'bash %s/%s || true' "${HOOKS_DIR}" "$1"
+    printf 'AGENT_MAIL_CLAUDE_SLOT=%s bash %s || true' \
+      "${_CLAUDE_SLOT}" "$hook_path_q"
   fi
 }
 
-# ============================================================================
-# settings.json: HOOKS ONLY (no secrets, git-IGNORED via .gitignore ".claude/")
-# ============================================================================
-# Both halves of this line used to be false, in opposite directions: the file
-# held two tokens, and it is ignored rather than tracked. The secrets therefore
-# never reached the remote — not by design, but because the second error pointed
-# the other way. Correcting only the "git-tracked" half, which reads like
-# tidying, would have shipped both tokens on the next `git add`.
-# ============================================================================
-# Start with existing config or empty object
-EXISTING_SETTINGS="{}"
-if [[ -f "$SETTINGS_PATH" ]]; then
-  EXISTING_SETTINGS=$(cat "$SETTINGS_PATH" 2>/dev/null || echo "{}")
-  # Validate JSON (jq is required, so use it directly)
-  if ! echo "$EXISTING_SETTINGS" | jq empty 2>/dev/null; then
-    log_warn "Existing settings.json has invalid JSON, starting fresh"
-    EXISTING_SETTINGS="{}"
-  fi
-fi
+# User settings contain hook definitions only.  MCP credentials are installed
+# separately at Claude's user MCP scope.  EXISTING_SETTINGS was validated in
+# the no-mutation preflight above.
+
+# Migrate only hook commands previously managed by this installer.  Filter at
+# the inner command level so an operator's custom command sharing the same hook
+# group survives.  This removes both the old project-local .claude/hooks paths
+# and the current user-level marker before the canonical set is appended below.
+EXISTING_SETTINGS="$(printf '%s' "$EXISTING_SETTINGS" | jq '
+  def agent_mail_command:
+    ((.command? // "") | ascii_downcase | gsub("\\\\"; "/")) as $command |
+    ($command | contains("mcp-agent-mail/")) and
+    ($command | test(
+      "(?:session_start|inbox_check|reservations_warn|autoreserve|session_end)[.]sh"
+    ));
+  if (.hooks | type) == "object" then
+    .hooks |= with_entries(
+      if (.value | type) == "array" then
+        .value |= map(
+          if (.hooks | type) == "array" then
+            .hooks |= map(select(agent_mail_command | not))
+          else . end
+        ) | .value |= map(select((.hooks | type) != "array" or (.hooks | length) > 0))
+      else . end
+    )
+  else . end
+')" || {
+  log_err "Could not clean managed hooks in ${SETTINGS_PATH}; no user configuration was changed."
+  exit 1
+}
 
 # Build hook configs as JSON
 # The four events, in the shape that is running on the fleet today. Matchers
@@ -410,213 +360,103 @@ SESSION_END_HOOK=$(jq -nc --arg a "$(_hook_cmd session_end.sh)" \
 # The last argument is the de-duplication marker: it must appear in a command
 # this script writes, or a re-run appends a second copy of every hook.
 MERGED_SETTINGS="$EXISTING_SETTINGS"
-MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "SessionStart" "$SESSION_START_HOOK" "hooks/session_start.sh")
-MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "PreToolUse" "$PRE_TOOL_USE_HOOK" "hooks/reservations_warn.sh")
-MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "PostToolUse" "$POST_TOOL_USE_HOOK" "hooks/autoreserve.sh")
-# Its own marker, so the two PostToolUse entries are tracked separately. Note
-# for anyone upgrading by re-running this: a machine configured before the split
-# already has inbox_check.sh inside the narrow entry, so this marker matches and
-# the wide entry is not added. Widening it there is a one-line edit by hand —
-# the installer will not do it for you, and will not say so either.
-MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "PostToolUse" "$POST_TOOL_USE_INBOX_HOOK" "hooks/inbox_check.sh")
-MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "SessionEnd" "$SESSION_END_HOOK" "hooks/session_end.sh")
+MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "SessionStart" "$SESSION_START_HOOK" "mcp-agent-mail/session_start.sh")
+MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "PreToolUse" "$PRE_TOOL_USE_HOOK" "mcp-agent-mail/reservations_warn.sh")
+MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "PostToolUse" "$POST_TOOL_USE_HOOK" "mcp-agent-mail/autoreserve.sh")
+# Its own marker keeps the two PostToolUse entries distinct.  The managed-hook
+# migration above removes earlier Agent Mail commands before these canonical
+# entries are appended, so re-running also widens a previously narrow inbox
+# check without duplicating or disturbing foreign commands.
+MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "PostToolUse" "$POST_TOOL_USE_INBOX_HOOK" "mcp-agent-mail/inbox_check.sh")
+MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "SessionEnd" "$SESSION_END_HOOK" "mcp-agent-mail/session_end.sh")
 
-# NOTE: No mcpServers in settings.json - token goes in settings.local.json only
-# This prevents credential leaks to git
+if ! printf '%s' "$MERGED_SETTINGS" | jq -e '
+    def valid_handler:
+      type == "object" and
+      ((has("command") | not) or (.command | type == "string"));
+    def valid_group:
+      type == "object" and
+      (.hooks | type == "array") and
+      all(.hooks[]; valid_handler);
+    type == "object" and
+    (.hooks | type == "object") and
+    all(.hooks[]; type == "array" and all(.[]; valid_group))
+  ' >/dev/null; then
+  log_err "Generated invalid nested hook JSON for ${SETTINGS_PATH}; no user configuration was changed."
+  exit 1
+fi
 
-write_atomic "$SETTINGS_PATH" <<< "$MERGED_SETTINGS"
-json_validate "$SETTINGS_PATH" || log_warn "Invalid JSON in ${SETTINGS_PATH}"
-# Readable by design: hook definitions are not secret and other tooling reads
-# them. This is now true rather than asserted — the tokens moved to $ENV_FILE.
-chmod 644 "$SETTINGS_PATH" 2>/dev/null || true
+# Claude officially stores user-scoped MCP servers in ~/.claude.json.  The
+# bearer is passed to jq through its environment: unlike /dev/fd/3 this works
+# with native jq.exe in Git Bash, and unlike --arg it never appears in argv.
+MERGED_CLAUDE_USER="$(
+  AGENT_MAIL_INSTALL_URL="${_URL}" \
+  AGENT_MAIL_INSTALL_AUTHORIZATION="Bearer ${_TOKEN}" \
+  jq '
+    .mcpServers = (.mcpServers // {}) |
+    .mcpServers["mcp-agent-mail"] = {
+      type:"http",
+      url:env.AGENT_MAIL_INSTALL_URL,
+      headers:{Authorization:env.AGENT_MAIL_INSTALL_AUTHORIZATION}
+    }
+  ' <<<"$EXISTING_CLAUDE_USER"
+)" || {
+  log_err "Could not merge ${CLAUDE_USER_JSON}; no user configuration was changed."
+  exit 1
+}
+if ! printf '%s' "$MERGED_CLAUDE_USER" | jq -e '
+    type == "object" and
+    (.mcpServers | type == "object") and
+    (.mcpServers["mcp-agent-mail"] | type == "object")
+  ' >/dev/null; then
+  log_err "Generated invalid MCP JSON for ${CLAUDE_USER_JSON}; no user configuration was changed."
+  exit 1
+fi
+
+# All input validation and output construction above are read-only.  A dry run
+# exits before backup creation, directory creation, chmod, or config writes.
+if [[ "$DRY_RUN" == "1" ]]; then
+  _print "[dry-run] write shared Agent Mail URL/bearer"
+  _print "[dry-run] install Claude hooks under ${HOOKS_DIR}"
+  _print "[dry-run] merge Claude hooks into ${SETTINGS_PATH}"
+  _print "[dry-run] merge Claude MCP into ${CLAUDE_USER_JSON}"
+  _print "[dry-run] no files or directories were changed"
+  exit 0
+fi
+
+for _config in "$SETTINGS_PATH" "$CLAUDE_USER_JSON"; do
+  backup_user_file "$_config" || exit 1
+done
+
+log_step "Writing shared server settings"
+write_shared_agent_mail_env "${_URL}" "${_TOKEN}" || {
+  log_err "Could not write ${SHARED_ENV_FILE}"
+  exit 1
+}
+
+log_step "Installing the hook scripts"
+_hooks_installed=0
+for _h in "${AGENT_MAIL_HOOKS[@]}"; do
+  write_atomic "${HOOKS_DIR}/${_h}" < "${ROOT_DIR}/scripts/hooks/${_h}"
+  if [[ "${_h}" == "agent_mail_common.sh" ]]; then
+    set_secure_file "${HOOKS_DIR}/${_h}" || exit 1
+  else
+    set_secure_exec "${HOOKS_DIR}/${_h}" || exit 1
+  fi
+  _hooks_installed=$((_hooks_installed + 1))
+done
+log_ok "Installed ${_hooks_installed}/${#AGENT_MAIL_HOOKS[@]} hook scripts to ${HOOKS_DIR}"
+
+write_atomic "$SETTINGS_PATH" <<<"$MERGED_SETTINGS"
+set_secure_file "$SETTINGS_PATH" || true
 log_ok "Merged hooks into ${SETTINGS_PATH} (existing config preserved)"
 
-# ============================================================================
-# settings.local.json: MCP SERVER + TOKEN (secrets, NOT git-tracked)
-# ============================================================================
-LOCAL_SETTINGS_PATH="${CLAUDE_DIR}/settings.local.json"
-if [[ -f "$LOCAL_SETTINGS_PATH" ]]; then
-  backup_file "$LOCAL_SETTINGS_PATH"
-fi
+log_step "Registering MCP server in Claude user config"
+write_atomic "$CLAUDE_USER_JSON" <<<"$MERGED_CLAUDE_USER"
+set_secure_file "$CLAUDE_USER_JSON" || true
 
-EXISTING_LOCAL="{}"
-if [[ -f "$LOCAL_SETTINGS_PATH" ]]; then
-  EXISTING_LOCAL=$(cat "$LOCAL_SETTINGS_PATH" 2>/dev/null || echo "{}")
-  # Validate JSON (jq is required, so use it directly)
-  if ! echo "$EXISTING_LOCAL" | jq empty 2>/dev/null; then
-    log_warn "Existing settings.local.json has invalid JSON, starting fresh"
-    EXISTING_LOCAL="{}"
-  fi
-fi
-
-# MCP server config WITH bearer token
-MCP_SERVER_CONFIG=$(cat <<MCPJSON
-{
-  "type": "http",
-  "url": "${_URL}",
-  "headers": {
-    "Authorization": "Bearer ${_TOKEN}"
-  }
-}
-MCPJSON
-)
-
-# Merge MCP server into existing config (preserves other servers)
-MERGED_LOCAL=$(json_merge_mcp_server "$EXISTING_LOCAL" "mcp-agent-mail" "$MCP_SERVER_CONFIG")
-if [[ -n "${_MORPH_API_KEY}" ]]; then
-  MORPH_SERVER_CONFIG=$(cat <<MCPJSON
-{
-  "command": "npx",
-  "args": ["-y", "@morphllm/morphmcp"],
-  "env": {
-    "ENABLED_TOOLS": "${_MORPH_ENABLED_TOOLS}",
-    "MORPH_API_KEY": "${_MORPH_API_KEY}"
-  }
-}
-MCPJSON
-)
-  MERGED_LOCAL=$(json_merge_mcp_server "$MERGED_LOCAL" "morph-mcp" "$MORPH_SERVER_CONFIG")
-fi
-
-write_atomic "$LOCAL_SETTINGS_PATH" <<< "$MERGED_LOCAL"
-json_validate "$LOCAL_SETTINGS_PATH" || log_warn "Invalid JSON in ${LOCAL_SETTINGS_PATH}"
-set_secure_file "$LOCAL_SETTINGS_PATH" || true  # 600 - contains secrets
-log_ok "Merged MCP server into ${LOCAL_SETTINGS_PATH} (token secured)"
-
-# Ensure settings.local.json is in .gitignore (prevent credential leak)
-ensure_gitignore_entry "${TARGET_DIR}/.gitignore" ".claude/settings.local.json"
-
-# Update global user-level ~/.claude/settings.json to ensure CLI picks up MCP (non-destructive merge)
-HOME_CLAUDE_DIR="${HOME}/.claude"
-mkdir -p "$HOME_CLAUDE_DIR"
-HOME_SETTINGS_PATH="${HOME_CLAUDE_DIR}/settings.json"
-
-# Bug 5 fix: Backup BEFORE creating empty file, and only if file exists
-if [[ -f "$HOME_SETTINGS_PATH" ]]; then
-  backup_file "$HOME_SETTINGS_PATH"
-else
-  # Create minimal starting point
-  umask 077  # Bug 1 fix: secure permissions
-  echo '{ "mcpServers": {} }' > "$HOME_SETTINGS_PATH"
-fi
-
-# Bug 3, 9 fix: Proper temp file handling and error checking
-if command -v jq >/dev/null 2>&1; then
-  TMP_MERGE="${HOME_SETTINGS_PATH}.tmp.$$.$(date +%s)"
-  trap 'rm -f "$TMP_MERGE" 2>/dev/null' EXIT INT TERM
-
-  umask 077  # Bug 1 fix: secure permissions for temp file
-  if jq --arg url "${_URL}" \
-      --arg token "${_TOKEN}" \
-      --arg morph_key "${_MORPH_API_KEY}" \
-      --arg morph_enabled "${_MORPH_ENABLED_TOOLS}" \
-      '.mcpServers = (.mcpServers // {}) |
-       .mcpServers["mcp-agent-mail"] = {"type":"http","url":$url,"headers":{"Authorization": ("Bearer " + $token)}} |
-       (if $morph_key != "" then
-          .mcpServers["morph-mcp"] = {
-            "command": "npx",
-            "args": ["-y", "@morphllm/morphmcp"],
-            "env": {
-              "MORPH_API_KEY": $morph_key,
-              "ENABLED_TOOLS": $morph_enabled
-            }
-          }
-        else . end)' \
-      "$HOME_SETTINGS_PATH" > "$TMP_MERGE"; then
-    # Bug 3 fix: Check mv separately
-    if mv "$TMP_MERGE" "$HOME_SETTINGS_PATH"; then
-      log_ok "Updated ${HOME_SETTINGS_PATH} with jq merge"
-    else
-      log_err "Failed to move merged settings to ${HOME_SETTINGS_PATH}"
-      rm -f "$TMP_MERGE" 2>/dev/null
-      trap - EXIT INT TERM
-      exit 1
-    fi
-  else
-    log_err "jq merge failed for ${HOME_SETTINGS_PATH}"
-    rm -f "$TMP_MERGE" 2>/dev/null
-    trap - EXIT INT TERM
-    exit 1
-  fi
-  trap - EXIT INT TERM
-else
-  # No jq available - only create new file if it doesn't exist (to avoid overwriting)
-  if [[ -f "$HOME_SETTINGS_PATH" ]] && [[ $(cat "$HOME_SETTINGS_PATH" 2>/dev/null) != '{ "mcpServers": {} }' ]]; then
-    log_warn "jq not found; cannot safely merge MCP config into existing ${HOME_SETTINGS_PATH}"
-    log_warn "Please install jq or manually add mcp-agent-mail server configuration"
-  else
-    # File is empty/minimal or doesn't exist - safe to write
-    write_atomic "$HOME_SETTINGS_PATH" <<JSON
-{
-  "mcpServers": {
-    "mcp-agent-mail": {
-      "type": "http",
-      "url": "${_URL}",
-      "headers": {${AUTH_HEADER_LINE}}
-    }$(if [[ -n "${_MORPH_API_KEY}" ]]; then cat <<JSONFRAG
-,
-    "morph-mcp": {
-      "command": "npx",
-      "args": ["-y", "@morphllm/morphmcp"],
-      "env": {
-        "MORPH_API_KEY": "${_MORPH_API_KEY}",
-        "ENABLED_TOOLS": "${_MORPH_ENABLED_TOOLS}"
-      }
-    }
-JSONFRAG
-fi)
-  }
-}
-JSON
-    log_ok "Created ${HOME_SETTINGS_PATH} with MCP config"
-  fi
-fi
-
-# Bug 1 fix: Ensure secure permissions
-# Bug #5 fix: set_secure_file logs its own warning, no need to duplicate
-set_secure_file "$HOME_SETTINGS_PATH" || true
-
-# Create run helper script (centralized in lib.sh)
-log_step "Creating run helper script"
-# This one writes into the SOURCE TREE, not into TARGET_DIR, and it is the only
-# thing here that does. That is correct — the helper starts the server, which
-# lives in this checkout — but it means PROJECT_DIR does not isolate a trial
-# run: the path was relative and resolved against ROOT_DIR, so a run aimed
-# somewhere else still modified a git-tracked file here, with nothing said.
-# Absolute path, backup first, and say where it went.
-mkdir -p "${ROOT_DIR}/scripts"
-RUN_HELPER="${ROOT_DIR}/scripts/run_server_with_token.sh"
-[[ -f "${RUN_HELPER}" ]] && backup_file "${RUN_HELPER}"
-write_run_helper_script "$RUN_HELPER"
-log_ok "Wrote ${RUN_HELPER}"
-if [[ -n "${PROJECT_DIR:-}" ]]; then
-  log_warn "Note: that path is in this checkout, not in ${TARGET_DIR}."
-  log_warn "PROJECT_DIR redirects the Claude Code config, not the server helper — if you are"
-  log_warn "trialling this script, check \`git status\` in ${ROOT_DIR} afterwards."
-fi
-
-# Register with Claude Code CLI at USER scope only.
-#
-# The project-scope call that used to follow wrote the bearer into .mcp.json in
-# the target directory. .gitignore:210 does not merely ignore that file, it
-# forbids it and says why: Claude Code reads .mcp.json from the project root and
-# it takes precedence over the user's own configuration. This repository is
-# protected by that line; an arbitrary target directory is not — on a fresh repo
-# with a default .gitignore, `git add .` stages .mcp.json with the token in it.
-#
-# The token still reaches the CLI here, on one line, at user scope. Note that it
-# is passed as an argument either way, so it is visible in this machine's
-# process list for the duration of the call.
-if command -v claude >/dev/null 2>&1; then
-  log_step "Registering MCP server with Claude CLI (user scope)"
-  claude mcp add --transport http --scope user mcp-agent-mail "${_URL}" -H "Authorization: Bearer ${_TOKEN}" || true
-fi
-
-log_ok "==> Done."
-if [[ -n "${_AGENT}" ]]; then
-  _print "Your agent name is: ${_AGENT}"
-fi
-_print "Open your project in Claude Code; it should auto-detect the project-level .claude/settings.json."
-if [[ ${_SERVER_AVAILABLE} -eq 0 ]]; then
-  _print "Remember to start the server: uv run python -m mcp_agent_mail.cli serve-http"
-fi
+log_ok "==> Claude Code user integration complete."
+_print "Hook settings: ${SETTINGS_PATH}"
+_print "Hook scripts: ${HOOKS_DIR}"
+_print "MCP server: user scope in ${CLAUDE_USER_JSON}"
+_print "SessionStart will register ${_AGENT} only in an explicitly activated project and keep its token in credentials.json."

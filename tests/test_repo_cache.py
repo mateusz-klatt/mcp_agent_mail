@@ -8,11 +8,22 @@ Reference: mcp_agent_mail-jto (Bug: File handle exhaustion)
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import threading
 import time
+from pathlib import Path
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
+import pytest
+from git import Repo
+
+from mcp_agent_mail import storage as storage_module
+from mcp_agent_mail.config import get_settings
 from mcp_agent_mail.storage import (
+    _ensure_repo,
+    _GlobalAsyncCapacityLimiter,
     _LRURepoCache,
     clear_repo_cache,
     get_repo_cache_stats,
@@ -282,6 +293,212 @@ class TestLRURepoCacheOpportunisticCleanup:
 
 class TestModuleLevelFunctions:
     """Test module-level cache functions."""
+
+    def test_ensure_repo_cache_hit_refreshes_lru_order(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The production fast path must protect a recently used repo from eviction."""
+        cache = _LRURepoCache(maxsize=2)
+        monkeypatch.setattr(storage_module, "_REPO_CACHE", cache)
+        first_root = tmp_path / "first"
+        second_root = tmp_path / "second"
+        third_root = tmp_path / "third"
+        first_repo = MagicMock(spec=Repo)
+        second_repo = MagicMock(spec=Repo)
+        third_repo = MagicMock(spec=Repo)
+        first_key = str(first_root.resolve())
+        second_key = str(second_root.resolve())
+        third_key = str(third_root.resolve())
+        cache.put(first_key, first_repo)
+        cache.put(second_key, second_repo)
+
+        try:
+            resolved = asyncio.run(_ensure_repo(first_root, get_settings()))
+            cache.put(third_key, third_repo)
+
+            assert resolved is first_repo
+            assert first_key in cache
+            assert second_key not in cache
+            assert third_key in cache
+            assert cache._order == [first_key, third_key]
+        finally:
+            cache.clear()
+
+    def test_repo_single_flight_spans_concurrent_event_loops(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Two loop threads must open and cache a repository exactly once."""
+        repo_root = tmp_path / "shared-repo"
+        repo_root.mkdir()
+        initialized = Repo.init(repo_root)
+        initialized.close()
+        clear_repo_cache()
+
+        real_repo = storage_module.Repo
+        constructor_started = threading.Event()
+        second_constructor_started = threading.Event()
+        release_constructor = threading.Event()
+        constructor_guard = threading.Lock()
+        worker_barrier = threading.Barrier(2)
+        constructor_calls = 0
+
+        def slow_repo(path: str) -> Repo:
+            nonlocal constructor_calls
+            with constructor_guard:
+                constructor_calls += 1
+                if constructor_calls > 1:
+                    second_constructor_started.set()
+            constructor_started.set()
+            if not release_constructor.wait(timeout=5):
+                raise TimeoutError("test did not release the repository constructor")
+            return real_repo(path)
+
+        monkeypatch.setattr(storage_module, "Repo", slow_repo)
+        settings = get_settings()
+
+        def open_on_private_loop() -> Repo:
+            worker_barrier.wait(timeout=5)
+            return asyncio.run(_ensure_repo(repo_root, settings))
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                try:
+                    results = [executor.submit(open_on_private_loop) for _ in range(2)]
+                    assert constructor_started.wait(timeout=5)
+                    assert not second_constructor_started.wait(timeout=0.25)
+                    release_constructor.set()
+                    first, second = (future.result(timeout=10) for future in results)
+                finally:
+                    release_constructor.set()
+
+            assert constructor_calls == 1
+            assert first is second
+            assert get_repo_cache_stats()["cached"] == 1
+        finally:
+            release_constructor.set()
+            clear_repo_cache()
+
+    def test_global_capacity_limiter_spans_event_loops(self) -> None:
+        """Capacity one must serialize holders running on different loops."""
+        limiter = _GlobalAsyncCapacityLimiter(1)
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_entered = threading.Event()
+
+        async def hold_first() -> None:
+            async with limiter.slot():
+                first_entered.set()
+                await asyncio.to_thread(release_first.wait)
+
+        async def enter_second() -> None:
+            async with limiter.slot():
+                second_entered.set()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            try:
+                first = executor.submit(asyncio.run, hold_first())
+                assert first_entered.wait(timeout=5)
+                second = executor.submit(asyncio.run, enter_second())
+                assert not second_entered.wait(timeout=0.1)
+                release_first.set()
+                first.result(timeout=5)
+                second.result(timeout=5)
+            finally:
+                release_first.set()
+
+        assert second_entered.is_set()
+
+    def test_global_capacity_limiter_cancelled_waiter_does_not_leak(self) -> None:
+        """Cancelling a blocked acquire must leave the full capacity available."""
+
+        async def exercise() -> None:
+            limiter = _GlobalAsyncCapacityLimiter(1)
+            await limiter.acquire()
+            blocked = asyncio.create_task(limiter.acquire())
+            await asyncio.sleep(0.05)
+            blocked.cancel()
+
+            with pytest.raises(asyncio.CancelledError):
+                await blocked
+
+            # The original holder still owns the sole permit. Cancellation of
+            # the queued waiter must not manufacture another one.
+            assert limiter._available == 0
+            limiter.release()
+            assert limiter._available == 1
+            await asyncio.wait_for(limiter.acquire(), timeout=1)
+            limiter.release()
+
+        asyncio.run(exercise())
+
+    def test_global_capacity_limiter_cancellation_after_grant_returns_permit(self) -> None:
+        """A granted permit must be returned if cancellation wins before resume."""
+
+        async def exercise() -> None:
+            limiter = _GlobalAsyncCapacityLimiter(1)
+            await limiter.acquire()
+            blocked = asyncio.create_task(limiter.acquire())
+            await asyncio.sleep(0)
+
+            limiter.release()
+            blocked.cancel()
+
+            with pytest.raises(asyncio.CancelledError):
+                await blocked
+
+            await asyncio.wait_for(limiter.acquire(), timeout=1)
+            limiter.release()
+
+        asyncio.run(exercise())
+
+    def test_global_capacity_limiter_many_waiters_and_cancellations(self) -> None:
+        """Cancelled entries must not stall a larger cross-loop-style queue."""
+
+        async def exercise() -> None:
+            limiter = _GlobalAsyncCapacityLimiter(2)
+            await limiter.acquire()
+            await limiter.acquire()
+            acquired: list[int] = []
+
+            async def contender(index: int) -> None:
+                await limiter.acquire()
+                try:
+                    acquired.append(index)
+                    await asyncio.sleep(0)
+                finally:
+                    limiter.release()
+
+            tasks = [asyncio.create_task(contender(index)) for index in range(12)]
+            cancelled = {1, 3, 6, 10}
+            await asyncio.sleep(0)
+            for index in cancelled:
+                tasks[index].cancel()
+            await asyncio.sleep(0)
+
+            limiter.release()
+            limiter.release()
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            assert set(acquired) == set(range(12)) - cancelled
+            assert all(isinstance(results[index], asyncio.CancelledError) for index in cancelled)
+
+            # Every permit is back after the queue drains.
+            await asyncio.wait_for(limiter.acquire(), timeout=1)
+            await asyncio.wait_for(limiter.acquire(), timeout=1)
+            blocked = asyncio.create_task(limiter.acquire())
+            await asyncio.sleep(0)
+            assert not blocked.done()
+            blocked.cancel()
+            limiter.release()
+            limiter.release()
+            with pytest.raises(asyncio.CancelledError):
+                await blocked
+
+        asyncio.run(exercise())
 
     def test_clear_repo_cache_returns_count(self):
         """clear_repo_cache should return count of closed repos."""

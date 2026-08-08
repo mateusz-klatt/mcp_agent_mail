@@ -261,6 +261,62 @@ def test_detect_hosting_hints_sort_order(monkeypatch, tmp_path: Path) -> None:
     ]
 
 
+@pytest.mark.parametrize("source_mode", ["live", "package"])
+def test_copy_viewer_assets_excludes_python_runtime_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    source_mode: str,
+) -> None:
+    """Neither live nor packaged asset traversal may export Python bytecode."""
+    package_dir = tmp_path / "live-package"
+    synthetic_assets = (
+        package_dir / "viewer_assets"
+        if source_mode == "live"
+        else tmp_path / "synthetic-assets"
+    )
+    asset_contents = {
+        "index.html": "viewer",
+        "helpers.py": "# package marker",
+        "scripts/app.js": "console.log('viewer')",
+        "orphan.pyc": "compiled",
+        "orphan.PYO": "optimized",
+        "__pycache__/helpers.cpython-314.pyc": "cached",
+        "scripts/__pycache__/app.cpython-314.pyc": "nested cache",
+    }
+    for relative, contents in asset_contents.items():
+        asset_path = synthetic_assets / relative
+        asset_path.parent.mkdir(parents=True, exist_ok=True)
+        asset_path.write_text(contents, encoding="utf-8")
+
+    monkeypatch.setattr(
+        share,
+        "_verify_viewer_vendor_assets",
+        lambda *_args, **_kwargs: None,
+    )
+    if source_mode == "live":
+        monkeypatch.setattr(share, "__file__", str(package_dir / "share.py"))
+    else:
+        monkeypatch.setattr(
+            share,
+            "__file__",
+            str(tmp_path / "installed-package" / "share.py"),
+        )
+        monkeypatch.setattr(share.resources, "files", lambda _package: synthetic_assets)
+
+    output_dir = tmp_path / "bundle"
+    share.copy_viewer_assets(output_dir)
+
+    viewer_root = output_dir / "viewer"
+    exported = {
+        path.relative_to(viewer_root).as_posix()
+        for path in viewer_root.rglob("*")
+        if path.is_file()
+    }
+    assert exported == {"helpers.py", "index.html", "scripts/app.js"}
+    assert not (viewer_root / "__pycache__").exists()
+    assert not (viewer_root / "scripts" / "__pycache__").exists()
+
+
 def test_detect_hosting_hints_uses_output_dir_repo_when_cwd_elsewhere(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -739,6 +795,190 @@ def test_bundle_attachments_handles_modes(tmp_path: Path) -> None:
     assert len(items) == 4
     modes = {item["mode"] for item in items}
     assert modes == {"inline", "file", "external", "missing"}
+
+
+def test_bundle_attachments_rejects_noncanonical_sha256_before_writing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    snapshot = _build_snapshot(tmp_path)
+    storage_root = tmp_path / "storage"
+    source_path = storage_root / "attachments" / "raw" / "payload.bin"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_bytes(b"attachment data")
+
+    conn = sqlite3.connect(snapshot)
+    try:
+        conn.execute(
+            "UPDATE messages SET attachments = ? WHERE id = 1",
+            (
+                json.dumps(
+                    [
+                        {
+                            "type": "file",
+                            "path": str(source_path.relative_to(storage_root)),
+                            "media_type": "application/octet-stream",
+                        }
+                    ]
+                ),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    malicious_digest = "../escaped-attachment"
+    monkeypatch.setattr(
+        share.hashlib,
+        "sha256",
+        lambda _data: SimpleNamespace(hexdigest=lambda: malicious_digest),
+    )
+    output_dir = tmp_path / "bundle"
+
+    with pytest.raises(ShareExportError, match="64 lowercase hexadecimal"):
+        bundle_attachments(
+            snapshot,
+            output_dir,
+            storage_root=storage_root,
+            inline_threshold=0,
+            detach_threshold=1024,
+        )
+
+    assert list(tmp_path.glob("escaped-attachment*")) == []
+    assert list((output_dir / "attachments").rglob("*")) == []
+
+
+def test_bundle_attachments_rejects_attachment_symlink_outside_output(tmp_path: Path) -> None:
+    snapshot = _build_snapshot(tmp_path)
+    storage_root = tmp_path / "storage"
+    output_dir = tmp_path / "bundle"
+    outside_dir = tmp_path / "outside"
+    output_dir.mkdir()
+    outside_dir.mkdir()
+    try:
+        (output_dir / "attachments").symlink_to(outside_dir, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("Directory symlinks are unavailable on this platform")
+
+    with pytest.raises(ShareExportError, match="stay within the bundle output directory"):
+        bundle_attachments(
+            snapshot,
+            output_dir,
+            storage_root=storage_root,
+        )
+
+    assert list(outside_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize("source_kind", ["absolute", "parent-traversal"])
+def test_bundle_attachments_rejects_source_outside_storage(
+    source_kind: str,
+    tmp_path: Path,
+) -> None:
+    snapshot = _build_snapshot(tmp_path)
+    storage_root = tmp_path / "storage" / "root"
+    storage_root.mkdir(parents=True)
+    outside_source = tmp_path / "outside-secret.txt"
+    secret = b"must never enter the share bundle"
+    outside_source.write_bytes(secret)
+    source_value = (
+        str(outside_source.resolve())
+        if source_kind == "absolute"
+        else "../../outside-secret.txt"
+    )
+
+    conn = sqlite3.connect(snapshot)
+    try:
+        conn.execute(
+            "UPDATE messages SET attachments = ? WHERE id = 1",
+            (
+                json.dumps(
+                    [
+                        {
+                            "type": "file",
+                            "path": source_value,
+                            "media_type": "text/plain",
+                        }
+                    ]
+                ),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    output_dir = tmp_path / f"bundle-{source_kind}"
+    with pytest.raises(
+        ShareExportError,
+        match="source path must stay within the configured storage directory",
+    ) as exc_info:
+        bundle_attachments(
+            snapshot,
+            output_dir,
+            storage_root=storage_root,
+            inline_threshold=0,
+            detach_threshold=1024,
+        )
+
+    assert str(outside_source) not in str(exc_info.value)
+    assert not any(
+        path.is_file() and path.read_bytes() == secret
+        for path in output_dir.rglob("*")
+    )
+
+
+def test_bundle_attachments_rejects_source_symlink_outside_storage(tmp_path: Path) -> None:
+    snapshot = _build_snapshot(tmp_path)
+    storage_root = tmp_path / "storage"
+    source_dir = storage_root / "attachments" / "raw"
+    source_dir.mkdir(parents=True)
+    outside_source = tmp_path / "outside-secret.txt"
+    secret = b"must never be followed through a symlink"
+    outside_source.write_bytes(secret)
+    source_link = source_dir / "linked-secret.txt"
+    try:
+        source_link.symlink_to(outside_source)
+    except (NotImplementedError, OSError):
+        pytest.skip("File symlinks are unavailable on this platform")
+
+    conn = sqlite3.connect(snapshot)
+    try:
+        conn.execute(
+            "UPDATE messages SET attachments = ? WHERE id = 1",
+            (
+                json.dumps(
+                    [
+                        {
+                            "type": "file",
+                            "path": str(source_link.relative_to(storage_root)),
+                            "media_type": "text/plain",
+                        }
+                    ]
+                ),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    output_dir = tmp_path / "bundle-source-symlink"
+    with pytest.raises(
+        ShareExportError,
+        match="source path must stay within the configured storage directory",
+    ) as exc_info:
+        bundle_attachments(
+            snapshot,
+            output_dir,
+            storage_root=storage_root,
+            inline_threshold=0,
+            detach_threshold=1024,
+        )
+
+    assert str(outside_source) not in str(exc_info.value)
+    assert not any(
+        path.is_file() and path.read_bytes() == secret
+        for path in output_dir.rglob("*")
+    )
 
 
 def test_summarize_snapshot(tmp_path: Path) -> None:

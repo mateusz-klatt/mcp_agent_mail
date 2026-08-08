@@ -6,57 +6,34 @@ on:
   pull_request:
     branches: [ main ]
 
-# Cancel only on pull requests. On main this was actively harmful and I measured
-# it: of the last twelve runs, eight were cancelled, three failed, none finished.
-# With four agents pushing every few minutes and a job that takes longer than
-# that, `cancel-in-progress` on a branch means no result is ever observed — the
-# pipeline cannot be green because it is never allowed to end.
-#
-# `github.run_id` is unique per run, so pushes to main share no group and each
-# one survives. Pull requests keep the old behaviour, where superseding really is
-# what you want.
+# Keep the whole main workflow, including its reusable Sonar job, serial per
+# ref.  With cancellation disabled, the running commit is allowed to finish and
+# GitHub retains the most recently queued pending run.  This prevents two branch
+# analyses from racing while avoiding the former cancel-on-every-push starvation;
+# the Sonar freshness check still rejects any queued commit that is no longer
+# HEAD. Pull requests cancel a superseded run because only their latest head matters.
 concurrency:
-  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build-and-test:
     name: Lint, Type Check, Test (${{ matrix.os }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
-    # Scoped to the Windows leg by the `experimental` flag the include sets below.
-    # matrix.experimental is null on the four POSIX legs, so this is false there
-    # and they still gate merges.
-    continue-on-error: ${{ matrix.experimental == true }}
+    timeout-minutes: 30
     strategy:
-      # Load-bearing: without it, the Windows leg failing cancels the four POSIX
-      # legs mid-run.
+      # Let every platform report its result even when one leg fails.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        # Honor the requires-python floor (3.12) advertised in pyproject.toml
-        # alongside the primary 3.14 target used for Docker/release.
-        python-version: ['3.12', '3.14']
-        include:
-          # One leg, not a third column. What breaks on Windows in this
-          # repository is path absoluteness, subprocess exec and case-folding —
-          # none of which differ between 3.12 and 3.14, so a second Windows job
-          # would buy a duplicate of the same failures at 45-90 minutes each.
-          #
-          # Expected red at first, and that is the point. 276 POSIX-shaped
-          # project keys remain across 47 files, and home-win-1 measured what
-          # one machine sees that the others cannot: three files converted,
-          # 54 failures to 1, none of which ubuntu or macos reports as broken.
-          # Until now that visibility depended on someone volunteering to look.
-          - os: windows-latest
-            python-version: '3.14'
-            experimental: true
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ['3.14']
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: ${{ matrix.python-version }}
           allow-prereleases: true
@@ -68,7 +45,7 @@ jobs:
       # It also drops `.venv` from the cache, which the previous restore-keys
       # prefix could repopulate from a different Python patch build.
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -86,14 +63,25 @@ jobs:
       - name: Type check
         shell: bash
         run: |
-          uvx ty check
+          uvx ty check --python-version 3.14 --python-platform all
 
-      - name: Run tests
+      - name: Run full unit test suite
         shell: bash
         env:
           PYTHONUTF8: "1"
         run: |
-          uv run -m pytest -q
+          uv run -m pytest -q --cov-report=xml:coverage.xml
+
+      # Freeze the full-suite report before the benchmark pytest invocations
+      # below replace the active coverage data with their selected tests.
+      - name: Upload unit-test coverage
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-${{ github.sha }}
+          path: coverage.xml
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Smoke test am-run (Ubuntu only)
         if: matrix.os == 'ubuntu-latest'
@@ -121,7 +109,7 @@ jobs:
 
       - name: Upload regression report artifact
         if: matrix.os == 'ubuntu-latest' && always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: regression-reports-py${{ matrix.python-version }}
           path: tests/benchmarks/regression_reports/
@@ -130,9 +118,24 @@ jobs:
 
       - name: Upload benchmark results artifact
         if: matrix.os == 'ubuntu-latest' && always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: benchmark-results-py${{ matrix.python-version }}
           path: tests/benchmarks/results/
           if-no-files-found: ignore
           retention-days: 30
+
+  sonar:
+    name: SonarCloud
+    needs: build-and-test
+    if: >-
+      ${{
+        needs.build-and-test.result == 'success' &&
+        (
+          github.event_name == 'push' ||
+          github.event.pull_request.head.repo.full_name == github.repository
+        )
+      }}
+    uses: ./.github/workflows/sonarcloud.yml
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

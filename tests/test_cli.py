@@ -21,6 +21,35 @@ from mcp_agent_mail.models import Agent, FileReservation, Project
 from mcp_agent_mail.storage import _commit as _archive_commit, ensure_archive
 from tests.keys import pkey
 
+LIB_SH = Path(__file__).resolve().parents[1] / "scripts" / "lib.sh"
+
+
+def _seed_cli_agent_state(
+    state_dir: Path,
+    *,
+    project: str,
+    old_name: str,
+    registration_token: str,
+) -> None:
+    granted_dir = state_dir / "granted"
+    granted_dir.mkdir(parents=True)
+    (state_dir / "credentials.json").write_text(
+        json.dumps({project: {old_name: registration_token}}) + "\n",
+        encoding="utf-8",
+    )
+    legacy_granted = granted_dir / cli_module._agent_state_previous_component(project)
+    legacy_granted.write_text(old_name, encoding="utf-8")
+
+
+def _path_tree(root: Path) -> tuple[tuple[str, ...], dict[str, bytes]]:
+    paths = tuple(sorted(path.relative_to(root).as_posix() for path in root.rglob("*")))
+    contents = {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+    return paths, contents
+
 
 def _init_projects_adopt_repo(tmp_path: Path) -> tuple[Path, Path]:
     repo_root = tmp_path / "adopt-repo"
@@ -108,6 +137,206 @@ def test_cli_typecheck(monkeypatch):
     result = runner.invoke(app, ["typecheck"])
     assert result.exit_code == 0
     assert captured == [["uvx", "ty", "check"]]
+
+
+def test_shared_env_writer_rejects_non_absolute_state_without_mutation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    env_file = tmp_path / ".agent-mail.env"
+    original = "FOREIGN_SETTING=preserved\nHTTP_BEARER_TOKEN=old-secret\n"
+    env_file.write_text(original, encoding="utf-8")
+    monkeypatch.setenv("AGENT_MAIL_ENV_FILE", str(env_file))
+    monkeypatch.setenv("AGENT_MAIL_URL", "https://mail.example/mcp/")
+    monkeypatch.setenv("HTTP_BEARER_TOKEN", "writer-regression-secret")
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setenv("AGENT_MAIL_TEST_LIB", str(LIB_SH))
+    shell = r"""
+. "$AGENT_MAIL_TEST_LIB"
+init_colors
+wslpath() { printf '%s\n' "$1"; }
+write_shared_agent_mail_env "$AGENT_MAIL_URL" "$HTTP_BEARER_TOKEN"
+"""
+
+    for state_dir in ("relative/state", r"D:\Profiles\agent-mail-state"):
+        monkeypatch.setenv("AGENT_MAIL_STATE_DIR", state_dir)
+        result = subprocess.run(
+            ["bash", "-c", shell],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert "absolute path" in result.stderr
+        assert "writer-regression-secret" not in result.stdout + result.stderr
+        assert env_file.read_text(encoding="utf-8") == original
+        assert _path_tree(tmp_path) == (
+            (".agent-mail.env",),
+            {".agent-mail.env": original.encode()},
+        )
+
+
+def test_shared_env_writer_translates_windows_state_before_persisting(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    env_file = tmp_path / ".agent-mail.env"
+    env_file.write_text("FOREIGN_SETTING=preserved\n", encoding="utf-8")
+    normalized_state = tmp_path / "private-state"
+    monkeypatch.setenv("AGENT_MAIL_ENV_FILE", str(env_file))
+    monkeypatch.setenv("AGENT_MAIL_STATE_DIR", r"D:\Profiles\agent-mail-state")
+    monkeypatch.setenv("AGENT_MAIL_URL", "https://mail.example/mcp/")
+    monkeypatch.setenv("HTTP_BEARER_TOKEN", "translated-writer-secret")
+    monkeypatch.setenv("AGENT_MAIL_TEST_NORMALIZED_STATE", str(normalized_state))
+    monkeypatch.setenv("AGENT_MAIL_TEST_LIB", str(LIB_SH))
+    monkeypatch.setenv("NO_COLOR", "1")
+    shell = r"""
+. "$AGENT_MAIL_TEST_LIB"
+init_colors
+wslpath() { printf '%s\n' "$AGENT_MAIL_TEST_NORMALIZED_STATE"; }
+write_shared_agent_mail_env "$AGENT_MAIL_URL" "$HTTP_BEARER_TOKEN"
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", shell],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    persisted = env_file.read_text(encoding="utf-8")
+    assert "FOREIGN_SETTING=preserved\n" in persisted
+    assert f"AGENT_MAIL_STATE_DIR={normalized_state}\n" in persisted
+    assert "D:\\Profiles" not in persisted
+    assert "translated-writer-secret" not in result.stdout + result.stderr
+    assert list((normalized_state / "backups").glob("*.bak"))
+
+
+def test_migrate_agent_state_uses_global_hook_env_not_repo_env(
+    isolated_env,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = pkey("cli-state/global")
+    old_name = "home-wsl-1"
+    new_name = "codex-wsl-home-1"
+    registration_token = "global-state-registration-secret"
+    state_dir = tmp_path / "custom-global-state"
+    _seed_cli_agent_state(
+        state_dir,
+        project=project,
+        old_name=old_name,
+        registration_token=registration_token,
+    )
+    global_env = tmp_path / "home" / ".agent-mail.env"
+    global_env.parent.mkdir()
+    global_env.write_text(
+        f"AGENT_MAIL_STATE_DIR={state_dir}\n",
+        encoding="utf-8",
+    )
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / ".env").write_text(
+        f"AGENT_MAIL_STATE_DIR={tmp_path / 'wrong-repo-state'}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(checkout)
+    monkeypatch.setenv("HOME", str(global_env.parent))
+    monkeypatch.delenv("AGENT_MAIL_STATE_DIR", raising=False)
+    monkeypatch.delenv("AGENT_MAIL_ENV_FILE", raising=False)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "migrate-agent-state",
+            project,
+            old_name,
+            new_name,
+            "--client",
+            "codex",
+            "--slot",
+            "1",
+        ],
+        terminal_width=240,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "credential_state=pending" in result.output
+    assert registration_token not in result.output
+    assert not (tmp_path / "wrong-repo-state").exists()
+
+
+def test_migrate_agent_state_rejects_relative_global_state_before_mutation(
+    isolated_env,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = pkey("cli-state/relative")
+    old_name = "home-wsl-1"
+    new_name = "codex-wsl-home-1"
+    registration_token = "relative-state-registration-secret"
+    explicit_state = tmp_path / "explicit-state"
+    _seed_cli_agent_state(
+        explicit_state,
+        project=project,
+        old_name=old_name,
+        registration_token=registration_token,
+    )
+    global_env = tmp_path / ".agent-mail.env"
+    global_env.write_text(
+        "AGENT_MAIL_STATE_DIR=relative-state\n",
+        encoding="utf-8",
+    )
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    monkeypatch.chdir(checkout)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("AGENT_MAIL_STATE_DIR", raising=False)
+    monkeypatch.delenv("AGENT_MAIL_ENV_FILE", raising=False)
+    before = _path_tree(tmp_path)
+
+    rejected = CliRunner().invoke(
+        app,
+        [
+            "migrate-agent-state",
+            project,
+            old_name,
+            new_name,
+            "--client",
+            "codex",
+            "--slot",
+            "1",
+            "--apply",
+            "--confirm",
+            f"{old_name}=>{new_name}",
+        ],
+    )
+
+    assert rejected.exit_code != 0
+    assert "AGENT_MAIL_STATE_DIR must be an absolute path" in rejected.output
+    assert registration_token not in rejected.output
+    assert _path_tree(tmp_path) == before
+    assert not (checkout / "relative-state").exists()
+
+    explicit = CliRunner().invoke(
+        app,
+        [
+            "migrate-agent-state",
+            project,
+            old_name,
+            new_name,
+            "--client",
+            "codex",
+            "--slot",
+            "1",
+            "--state-dir",
+            str(explicit_state),
+        ],
+    )
+    assert explicit.exit_code == 0, explicit.output
+    assert registration_token not in explicit.output
 
 
 def test_projects_adopt_apply_moves_archive_state_and_keeps_archive_git_clean(isolated_env, tmp_path):

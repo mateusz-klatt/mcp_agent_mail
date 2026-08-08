@@ -71,7 +71,8 @@ PROJECT="$(am_project_key)"
 # on Windows, so this is a doubled cost on every tool invocation there.
 export AM_PROJECT_FOR_NAME="$PROJECT"
 [ -z "$PROJECT" ] && exit 0
-AGENT="$(am_agent_name)"
+am_project_is_active "$PROJECT" claude "${AGENT_MAIL_CLAUDE_SLOT:-1}" . || exit 0
+AGENT="$(am_agent_name claude "${AGENT_MAIL_CLAUDE_SLOT:-1}")"
 
 token="$(am_cred_get "$PROJECT" "$AGENT")"
 # No credential means SessionStart never ran, so there is no identity to
@@ -89,7 +90,7 @@ bearer="$(am_bearer)"
 # pid keeps concurrent watchers apart regardless, but two projects would still
 # share a directory of stream state, and "milder" is how the other three
 # instances survived this long.
-slug="$(printf '%s|%s|%s' "$PROJECT" "$AGENT" "$$" | tr '/' '_' | tr -cd '[:alnum:]._|-' | tr '|' '_' | cut -c1-96)"
+slug="$(am_state_component "${PROJECT}|${AGENT}|$$")" || exit 0
 stream="${AM_STATE_DIR}/watch/${slug}.stream"
 mkdir -p "$(dirname "$stream")" 2>/dev/null || exit 0
 
@@ -145,8 +146,9 @@ fi
 # was delivered. Lose this stdout and the mail is gone, because the SessionStart
 # check that runs when the agent wakes will skip ids it has already recorded.
 # Ask whether anything is waiting; let the established channel say what.
-pending="$(am_call fetch_inbox "$(jq -nc --arg p "$PROJECT" --arg a "$AGENT" --arg t "$token" \
-    '{project_key:$p,agent_name:$a,registration_token:$t,unread_only:true,limit:1,include_bodies:false}')")"
+pending="$(am_call fetch_inbox "$(AGENT_MAIL_JQ_REGISTRATION_TOKEN="$token" \
+    jq -nc --arg p "$PROJECT" --arg a "$AGENT" \
+    '{project_key:$p,agent_name:$a,registration_token:env.AGENT_MAIL_JQ_REGISTRATION_TOKEN,unread_only:true,limit:1,include_bodies:false}')")"
 if printf '%s' "$pending" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
     # Something is already waiting. Exit now rather than sitting on an open
     # subscription: the agent has work it can do, and holding the connection

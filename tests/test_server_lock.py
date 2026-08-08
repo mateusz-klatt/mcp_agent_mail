@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any
 
+import pytest
 from filelock import FileLock
 from typer.testing import CliRunner
 
 from mcp_agent_mail.cli import _SERVER_LOCK_FILENAME, _acquire_server_lock, app
+
+
+def _assert_lock_is_available(lock_path: Path) -> None:
+    """Prove that no prior command frame still owns the OS-level lock."""
+    probe = FileLock(str(lock_path))
+    try:
+        probe.acquire(timeout=0)
+    finally:
+        probe.release()
 
 
 def test_acquire_server_lock_creates_lockfile(isolated_env, tmp_path, monkeypatch):
@@ -48,8 +59,6 @@ def test_acquire_server_lock_blocks_second_acquisition(isolated_env, tmp_path, m
     pid_path.write_text("99999", encoding="utf-8")
     try:
         # Second acquisition should fail with SystemExit(1)
-        import pytest
-
         with pytest.raises(SystemExit) as exc_info:
             _acquire_server_lock()
         assert exc_info.value.code == 1
@@ -76,6 +85,26 @@ def test_serve_http_acquires_lock(isolated_env, tmp_path, monkeypatch):
     monkeypatch.setattr("uvicorn.run", fake_uvicorn_run)
     result = runner.invoke(app, ["serve-http"])
     assert result.exit_code == 0
+    _assert_lock_is_available(storage_root / _SERVER_LOCK_FILENAME)
+
+
+def test_serve_http_releases_lock_when_server_raises(isolated_env, tmp_path, monkeypatch):
+    """serve-http releases server.lock when startup/runtime exits with an error."""
+    storage_root = tmp_path / "http_lock_error"
+    monkeypatch.setenv("STORAGE_ROOT", str(storage_root))
+    from mcp_agent_mail.config import clear_settings_cache
+
+    clear_settings_cache()
+
+    def fake_uvicorn_run(app: Any, **kwargs: Any) -> None:
+        raise RuntimeError("simulated HTTP server failure")
+
+    monkeypatch.setattr("uvicorn.run", fake_uvicorn_run)
+    result = CliRunner().invoke(app, ["serve-http"])
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, RuntimeError)
+    _assert_lock_is_available(storage_root / _SERVER_LOCK_FILENAME)
 
 
 def test_serve_http_fails_when_locked(isolated_env, tmp_path, monkeypatch):
@@ -119,6 +148,28 @@ def test_serve_stdio_acquires_lock(isolated_env, tmp_path, monkeypatch):
     monkeypatch.setattr(FastMCP, "run", fake_run)
     result = runner.invoke(app, ["serve-stdio"])
     assert result.exit_code == 0
+    _assert_lock_is_available(storage_root / _SERVER_LOCK_FILENAME)
+
+
+def test_serve_stdio_releases_lock_when_server_raises(isolated_env, tmp_path, monkeypatch):
+    """serve-stdio releases server.lock when the transport raises."""
+    storage_root = tmp_path / "stdio_lock_error"
+    monkeypatch.setenv("STORAGE_ROOT", str(storage_root))
+    from mcp_agent_mail.config import clear_settings_cache
+
+    clear_settings_cache()
+
+    from fastmcp import FastMCP
+
+    def fake_run(self: Any, transport: str = "stdio", **kwargs: Any) -> None:
+        raise RuntimeError("simulated stdio server failure")
+
+    monkeypatch.setattr(FastMCP, "run", fake_run)
+    result = CliRunner().invoke(app, ["serve-stdio"])
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, RuntimeError)
+    _assert_lock_is_available(storage_root / _SERVER_LOCK_FILENAME)
 
 
 def test_serve_stdio_fails_when_locked(isolated_env, tmp_path, monkeypatch):
@@ -176,8 +227,6 @@ def test_error_message_includes_pid(isolated_env, tmp_path, monkeypatch, capsys)
     pid_path = storage_root / "server.pid"
     pid_path.write_text("42", encoding="utf-8")
     try:
-        import pytest
-
         with pytest.raises(SystemExit):
             _acquire_server_lock()
         captured = capsys.readouterr()

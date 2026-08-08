@@ -11,6 +11,7 @@ import importlib
 import json
 import logging
 import re
+import threading
 from collections.abc import MutableMapping
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -569,7 +570,7 @@ def _configure_logging(settings: Settings) -> None:
                     record.levelno = logging.INFO
                     record.levelname = "INFO"
 
-            return True
+            return bool(super().filter(record))
 
     # Apply filter to FastMCP's tool_manager logger
     fastmcp_logger = logging.getLogger("fastmcp.tools.tool_manager")
@@ -583,7 +584,20 @@ def _configure_logging(settings: Settings) -> None:
 # (#212). Keyed by JWKS URL; entries expire after _JWKS_CACHE_TTL_SECONDS.
 _JWKS_CACHE_TTL_SECONDS = 300.0
 _jwks_cache: dict[str, tuple[float, Any]] = {}
-_jwks_cache_lock = asyncio.Lock()
+_jwks_cache_lock = threading.Lock()
+
+
+def clear_jwks_cache() -> None:
+    """Clear cached JWKS documents.
+
+    The cache is process-wide, so tests that reuse a URL with different key
+    material must reset it just like the settings, database, and repo caches.
+    A thread lock is sufficient here because every cache operation is
+    synchronous and brief; unlike ``asyncio.Lock`` it is not tied to the event
+    loop that happened to make the first request.
+    """
+    with _jwks_cache_lock:
+        _jwks_cache.clear()
 
 
 async def _fetch_jwks(jwks_url: str, *, force: bool = False):
@@ -599,7 +613,7 @@ async def _fetch_jwks(jwks_url: str, *, force: bool = False):
     JsonWebKey = jose_mod.JsonWebKey
 
     now = monotonic()
-    async with _jwks_cache_lock:
+    with _jwks_cache_lock:
         cached = _jwks_cache.get(jwks_url)
         if cached is not None and not force and (now - cached[0]) < _JWKS_CACHE_TTL_SECONDS:
             return cached[1]
@@ -612,11 +626,11 @@ async def _fetch_jwks(jwks_url: str, *, force: bool = False):
         key_set = JsonWebKey.import_key_set(jwks)
     except Exception:
         # Fall back to any cached (possibly stale) key set on fetch failure.
-        async with _jwks_cache_lock:
+        with _jwks_cache_lock:
             cached = _jwks_cache.get(jwks_url)
         return cached[1] if cached is not None else None
 
-    async with _jwks_cache_lock:
+    with _jwks_cache_lock:
         _jwks_cache[jwks_url] = (monotonic(), key_set)
     return key_set
 

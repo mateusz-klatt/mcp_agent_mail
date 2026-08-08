@@ -1,6 +1,5 @@
 import asyncio
 import contextlib
-import gc
 from pathlib import Path
 
 import psutil
@@ -8,6 +7,7 @@ import pytest
 
 from mcp_agent_mail.config import clear_settings_cache
 from mcp_agent_mail.db import reset_database_state
+from mcp_agent_mail.http import clear_jwks_cache
 from mcp_agent_mail.storage import clear_repo_cache
 
 # CPU overload threshold - skip benchmark tests if ALL cores are at this level
@@ -148,47 +148,19 @@ def isolated_env(tmp_path, monkeypatch):
     monkeypatch.setenv("INLINE_IMAGE_MAX_BYTES", "128")
     clear_settings_cache()
     reset_database_state()
-    # Clear repo cache before test to ensure isolation
+    # Clear process-wide caches before the test so reused URLs/paths cannot
+    # inherit resources created by an earlier test.
     clear_repo_cache()
+    clear_jwks_cache()
     try:
         yield
     finally:
-        # Close all cached Repo objects first (prevents file handle leaks)
+        # Every process-wide resource has an explicit close/reset operation.
+        # Do not scan the entire GC heap: besides being expensive, that used to
+        # close objects still owned by unrelated fixtures.
         clear_repo_cache()
-        # Dispose database engine/pool state before forcing GC so SQLAlchemy
-        # returns pooled connections cleanly instead of warning during finalizers.
         reset_database_state()
-
-        # Suppress ResourceWarnings during cleanup since Python 3.14 warns about resources
-        # being cleaned up by GC, which is exactly what we want
-        import warnings
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=ResourceWarning)
-            try:
-                import time
-
-                from git import Repo
-
-                # Multiple GC passes to ensure full cleanup of any non-cached repos
-                for _ in range(2):
-                    gc.collect()
-                    # Close any Repo instances that might still be open
-                    for obj in gc.get_objects():
-                        if isinstance(obj, Repo):
-                            with contextlib.suppress(Exception):
-                                obj.close()
-
-                # Give subprocesses time to terminate
-                time.sleep(0.05)
-
-                # Final GC pass
-                gc.collect()
-            except Exception:
-                pass
-
-            # Force another GC to clean up any remaining references
-            gc.collect()
-
+        clear_jwks_cache()
         clear_settings_cache()
 
         if db_path.exists():
@@ -214,14 +186,19 @@ def isolated_env(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _global_resource_cleanup():
-    """Best-effort global cleanup to avoid FD leaks under low ulimit.
+def _global_resource_cleanup(request: pytest.FixtureRequest):
+    """Explicitly close global resources for tests without ``isolated_env``.
 
     Some tests don't opt into `isolated_env` but still touch the global engine/repo cache.
     With RLIMIT_NOFILE=256 (common on macOS), a small amount of leakage can cascade into
     EMFILE failures later in the suite.
     """
     yield
+
+    # isolated_env already closes these resources before removing its temporary
+    # files. Avoid doing the same teardown twice for the majority of the suite.
+    if "isolated_env" in request.fixturenames:
+        return
 
     # Close cached repo handles first.
     with contextlib.suppress(Exception):
@@ -234,12 +211,5 @@ def _global_resource_cleanup():
     with contextlib.suppress(Exception):
         clear_settings_cache()
 
-    # Extra safety: close any Repo objects that escaped caching.
     with contextlib.suppress(Exception):
-        from git import Repo
-
-        gc.collect()
-        for obj in gc.get_objects():
-            if isinstance(obj, Repo):
-                with contextlib.suppress(Exception):
-                    obj.close()
+        clear_jwks_cache()

@@ -1,24 +1,18 @@
 name: SonarCloud
 
-# Its own workflow, not a job inside CI, and that separation is the fix for a
-# problem I created an hour ago: `concurrency: cancel-in-progress` on ci.yml
-# killed the Sonar run when the next commit landed. With four agents pushing
-# every few minutes and a job that ran the test suite, the scan was cancelled
-# every single time — measured, `7f1170c` ended as `cancelled`.
-#
-# Modelled on the operator's snapper-mcp, which has been producing analyses
-# while this one produced none.
-
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-  workflow_dispatch:
+  workflow_call:
+    secrets:
+      SONAR_TOKEN:
+        required: true
 
 concurrency:
-  group: sonarcloud-${{ github.ref }}
-  cancel-in-progress: true
+  # The caller serializes the complete CI workflow per ref.  Keep this reusable
+  # workflow exact-SHA scoped as defense in depth for any future caller, and use
+  # the freshness check below to reject a commit that stopped being HEAD while
+  # its tests were running.
+  group: sonarcloud-${{ github.repository }}-${{ github.sha }}
+  cancel-in-progress: false
 
 jobs:
   scan:
@@ -30,35 +24,60 @@ jobs:
       pull-requests: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          ref: ${{ github.sha }}
           # Sonar attributes issues to commits; a shallow clone makes every line
           # look like it was written by whoever last pushed.
           fetch-depth: 0
 
-      # No test run here, deliberately, and this is a decision rather than an
-      # omission. The suite takes over an hour, and while it sat in front of the
-      # scanner the project reported `status: NONE` across five pushes. Static
-      # analysis on every commit beats coverage that never arrives.
-      #
-      # Coverage goes back in when the suite is green and quick — the properties
-      # file already points at coverage.xml and ignores it when absent.
+      # Matrix runs on main are deliberately not cancelled. Before analysing,
+      # reject an older run that completed after a newer commit reached the ref.
+      - name: Check that this commit is still current
+        id: freshness
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          REMOTE_REF: ${{ github.event_name == 'pull_request' && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
+        run: |
+          set -euo pipefail
+          current_sha="$(git ls-remote origin "$REMOTE_REF" | awk 'NR == 1 { print $1 }')"
+          if [[ -z "$current_sha" ]]; then
+            echo "::error::Unable to resolve $REMOTE_REF on origin"
+            exit 1
+          fi
+          if [[ "$current_sha" == "$EXPECTED_SHA" ]]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping stale SonarCloud analysis for $EXPECTED_SHA; $REMOTE_REF is now $current_sha"
+          fi
+
+      - name: Download exact unit-test coverage
+        if: steps.freshness.outputs.current == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: coverage-${{ github.sha }}
+
+      - name: Verify coverage report
+        if: steps.freshness.outputs.current == 'true'
+        shell: bash
+        run: test -s coverage.xml
 
       - name: SonarCloud scan
-        uses: SonarSource/sonarqube-scan-action@v6
+        if: steps.freshness.outputs.current == 'true'
+        uses: SonarSource/sonarqube-scan-action@fd88b7d7ccbaefd23d8f36f73b59db7a3d246602 # v6.0.0
         env:
-          # The variable whose absence made four earlier runs analyse nothing:
-          # the action assumes a self-hosted SonarQube without it.
           SONAR_HOST_URL: https://sonarcloud.io
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Quality gate
-        uses: SonarSource/sonarqube-quality-gate-action@v1
+        if: steps.freshness.outputs.current == 'true'
+        uses: SonarSource/sonarqube-quality-gate-action@7a5fffe8e523c40e0c740b6bc2712ab503e52efa # v1.2.1
         timeout-minutes: 5
-        # Reports the verdict without failing the run. A fork whose upstream has
-        # not had a passing CI since June will not meet a gate on its first
-        # analysis, and a red cross there carries nothing anyone can act on.
-        continue-on-error: true
+        with:
+          pollingTimeoutSec: 300
         env:
+          SONAR_HOST_URL: https://sonarcloud.io
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

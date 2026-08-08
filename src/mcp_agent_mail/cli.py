@@ -8,6 +8,7 @@ import hashlib
 import importlib.metadata as importlib_metadata
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -17,19 +18,21 @@ import threading
 import time
 import warnings
 import webbrowser
-from contextlib import nullcontext, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
-from typing import Annotated, Any, Iterable, List, Optional, Sequence, cast
+from typing import Annotated, Any, Iterable, Iterator, List, Optional, Sequence, cast
 from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile
 
 import click
 import httpx
 import typer
 import uvicorn
+from decouple import Config as DecoupleConfig, RepositoryEmpty, RepositoryEnv
 from filelock import BaseFileLock, FileLock, Timeout as LockTimeout
+from git import Repo
 from rich.console import Console
 from rich.table import Table
 from sqlalchemy import (
@@ -94,8 +97,20 @@ from .share import (
     sign_manifest,
     summarize_snapshot,
 )
-from .storage import archive_write_lock, ensure_archive
-from .utils import slugify
+from .storage import (
+    ProjectArchive,
+    archive_write_lock,
+    ensure_archive,
+    inspect_agent_archive_rename,
+    migrate_agent_archive,
+)
+from .utils import (
+    parse_client_platform_host_agent_id,
+    slugify,
+    validate_agent_name_format,
+    validate_client_platform_host_agent_id,
+    validate_explicit_agent_id,
+)
 
 # Suppress annoying bleach CSS sanitizer warning from dependencies
 warnings.filterwarnings("ignore", category=UserWarning, module="bleach")
@@ -1467,37 +1482,39 @@ def serve_http(
     settings = get_settings()
 
     # Enforce single-server ownership of the storage root (issue #123)
-    _server_lock = _acquire_server_lock(settings)
+    server_lock = _acquire_server_lock(settings)
+    try:
+        resolved_host = host or settings.http.host
+        resolved_port = port or settings.http.port
+        resolved_path = path or settings.http.path
+        effective_settings = replace(
+            settings,
+            http=replace(settings.http, host=resolved_host, port=resolved_port, path=resolved_path),
+        )
 
-    resolved_host = host or settings.http.host
-    resolved_port = port or settings.http.port
-    resolved_path = path or settings.http.path
-    effective_settings = replace(
-        settings,
-        http=replace(settings.http, host=resolved_host, port=resolved_port, path=resolved_path),
-    )
+        # Display awesome startup banner with database stats
+        from . import rich_logger
+        rich_logger.display_startup_banner(effective_settings, resolved_host, resolved_port, resolved_path)
 
-    # Display awesome startup banner with database stats
-    from . import rich_logger
-    rich_logger.display_startup_banner(effective_settings, resolved_host, resolved_port, resolved_path)
+        # Reset database state after startup banner to prevent connection leak.
+        # The banner's _get_database_stats() uses _run_async() which creates connections
+        # on a temporary event loop. When uvicorn starts with its own loop, those
+        # connections become orphaned and cause SQLAlchemy GC warnings. Resetting
+        # here ensures fresh connections are created on the main event loop.
+        reset_database_state()
 
-    # Reset database state after startup banner to prevent connection leak.
-    # The banner's _get_database_stats() uses _run_async() which creates connections
-    # on a temporary event loop. When uvicorn starts with its own loop, those
-    # connections become orphaned and cause SQLAlchemy GC warnings. Resetting
-    # here ensures fresh connections are created on the main event loop.
-    reset_database_state()
-
-    server = build_mcp_server()
-    app = build_http_app(effective_settings, server)
-    # Disable WebSockets: HTTP-only MCP transport. Stay compatible with tests that
-    # monkeypatch uvicorn.run without the 'ws' parameter.
-    import inspect as _inspect
-    _sig = _inspect.signature(uvicorn.run)
-    _kwargs: dict[str, Any] = {"host": resolved_host, "port": resolved_port, "log_level": "info"}
-    if "ws" in _sig.parameters:
-        _kwargs["ws"] = "none"
-    uvicorn.run(app, **_kwargs)
+        server = build_mcp_server()
+        app = build_http_app(effective_settings, server)
+        # Disable WebSockets: HTTP-only MCP transport. Stay compatible with tests that
+        # monkeypatch uvicorn.run without the 'ws' parameter.
+        import inspect as _inspect
+        _sig = _inspect.signature(uvicorn.run)
+        _kwargs: dict[str, Any] = {"host": resolved_host, "port": resolved_port, "log_level": "info"}
+        if "ws" in _sig.parameters:
+            _kwargs["ws"] = "none"
+        uvicorn.run(app, **_kwargs)
+    finally:
+        server_lock.release()
 
 
 @app.command("serve-stdio")
@@ -1521,22 +1538,24 @@ def serve_stdio() -> None:
     clear_settings_cache()
 
     # Enforce single-server ownership of the storage root (issue #123)
-    _server_lock = _acquire_server_lock()
+    server_lock = _acquire_server_lock()
+    try:
+        # Redirect all logging to stderr to avoid corrupting stdio transport
+        for handler in logging.root.handlers[:]:
+            logging.root.removeHandler(handler)
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            stream=sys.stderr,
+        )
 
-    # Redirect all logging to stderr to avoid corrupting stdio transport
-    for handler in logging.root.handlers[:]:
-        logging.root.removeHandler(handler)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        stream=sys.stderr,
-    )
+        # Print startup message to stderr (stdout is reserved for MCP protocol)
+        print("MCP Agent Mail - Starting stdio transport...", file=sys.stderr)
 
-    # Print startup message to stderr (stdout is reserved for MCP protocol)
-    print("MCP Agent Mail - Starting stdio transport...", file=sys.stderr)
-
-    server = build_mcp_server()
-    server.run(transport="stdio")
+        server = build_mcp_server()
+        server.run(transport="stdio")
+    finally:
+        server_lock.release()
 
 
 def _run_command(command: list[str]) -> None:
@@ -1544,6 +1563,921 @@ def _run_command(command: list[str]) -> None:
     result = subprocess.run(command, check=False)
     if result.returncode != 0:
         raise typer.Exit(code=result.returncode)
+
+
+def _identity_migration_server_lock(settings: Any, *, apply: bool) -> BaseFileLock | None:
+    """Hold the server lock for an offline migration or report a dry-run warning."""
+    storage_root = Path(settings.storage.root).expanduser().resolve()
+    if not apply:
+        console.print(
+            "[yellow]server_state=not lock-verified; dry-run intentionally acquires no locks "
+            "and performs no writes. --apply will require the exclusive server lock.[/]"
+        )
+        return None
+    if not storage_root.is_dir():
+        raise click.ClickException(
+            f"Storage root does not exist; refusing to create it during migration: {storage_root}"
+        )
+    lock = FileLock(str(storage_root / _SERVER_LOCK_FILENAME))
+    try:
+        lock.acquire(timeout=0)
+    except LockTimeout as exc:
+        raise click.ClickException(
+            "rename-agent is offline-only: the Agent Mail server and every writer must be "
+            "operator-stopped before --apply. The storage server.lock is currently held."
+        ) from exc
+    return lock
+
+
+_IDENTITY_PLATFORMS = frozenset({"linux", "wsl", "win", "mac", "other"})
+_IDENTITY_CLIENT_ALIASES = {
+    "claude": "claude",
+    "cc": "claude",
+    "codex": "codex",
+    "cx": "codex",
+    "copilot": "copilot",
+    "cp": "copilot",
+    "gemini": "gemini",
+}
+
+
+def _positive_identity_slot(value: str) -> bool:
+    return bool(
+        value.isascii()
+        and value.isdigit()
+        and not value.startswith("0")
+    )
+
+
+def _legacy_identity_candidates(
+    name: str,
+) -> list[tuple[str, str, str, str | None]]:
+    """Parse supported legacy/order/token shapes for an existing persisted OLD."""
+    if not validate_explicit_agent_id(name):
+        return []
+    candidates: list[tuple[str, str, str, str | None]] = []
+
+    legacy_parts = name.rsplit("-", 2)
+    if len(legacy_parts) == 3:
+        host, platform, slot = legacy_parts
+        if (
+            host
+            and platform.casefold() in _IDENTITY_PLATFORMS
+            and _positive_identity_slot(slot)
+        ):
+            candidates.append((host, platform.casefold(), slot, None))
+
+    old_order_parts = name.rsplit("-", 3)
+    if len(old_order_parts) == 4:
+        host, platform, client, slot = old_order_parts
+        canonical_client = _IDENTITY_CLIENT_ALIASES.get(client.casefold())
+        if (
+            host
+            and canonical_client is not None
+            and platform.casefold() in _IDENTITY_PLATFORMS
+            and _positive_identity_slot(slot)
+        ):
+            candidates.append(
+                (host, platform.casefold(), slot, canonical_client)
+            )
+
+    return candidates
+
+
+def _validate_migratable_source_agent_name(name: str) -> bool:
+    """Allow only evidenced legacy/transitional or server-generated identities."""
+    return validate_agent_name_format(name) or bool(_legacy_identity_candidates(name))
+
+
+def _validate_identity_rename_pair(old_name: str, new_name: str) -> bool:
+    """Require OLD and NEW to represent the same machine/environment/slot."""
+    target = parse_client_platform_host_agent_id(new_name)
+    if target is None:
+        return False
+    if validate_agent_name_format(old_name):
+        # A server-coerced adjective+noun has no structural host metadata; the
+        # DB id, persisted token and matching archive profile are its evidence.
+        return True
+    target_client, target_platform, target_host, target_slot = target
+    return any(
+        host.casefold() == target_host.casefold()
+        and platform == target_platform
+        and slot == target_slot
+        and (client is None or client == target_client)
+        for host, platform, slot, client in _legacy_identity_candidates(old_name)
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _RenameAgentRow:
+    id: int
+    name: str
+    registration_token: str | None
+
+
+def _read_agent_rename_database_state(
+    settings: Any,
+    project_identifier: str,
+    old_name: str,
+    new_name: str,
+) -> tuple[Project, list[_RenameAgentRow]]:
+    """Read the existing SQLite state without schema setup or writable PRAGMAs."""
+    backend = make_url(settings.database.url).get_backend_name()
+    if not backend.startswith("sqlite"):
+        raise ValueError(
+            f"rename-agent supports SQLite only in this application build (got '{backend}')"
+        )
+    database_path = resolve_sqlite_database_path(settings.database.url)
+    if not database_path.is_file():
+        raise ValueError(
+            f"Database does not exist; dry-run will not create it: {database_path}"
+        )
+    wal_path, _shm_path = get_sqlite_sidecar_paths(database_path)
+    try:
+        wal_size = wal_path.stat().st_size if wal_path.is_file() else 0
+    except OSError as exc:
+        raise ValueError(
+            "Unable to verify the SQLite WAL before the read-only dry-run"
+        ) from exc
+    if wal_size:
+        raise ValueError(
+            "Read-only dry-run requires a cleanly checkpointed SQLite database. "
+            "The WAL is non-empty; keep every writer stopped and checkpoint it "
+            "with an operator-reviewed SQLite backup procedure before retrying."
+        )
+    raw_identifier = project_identifier.strip()
+    canonical_identifier = _canonicalize_project_identifier(raw_identifier)
+    project_slug = slugify(canonical_identifier)
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            f"{database_path.as_uri()}?mode=ro&immutable=1",
+            uri=True,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        project_row = connection.execute(
+            """
+            SELECT id, slug, human_key
+            FROM projects
+            WHERE slug = ? OR human_key = ? OR human_key = ?
+            LIMIT 1
+            """,
+            (project_slug, canonical_identifier, raw_identifier),
+        ).fetchone()
+        if project_row is None:
+            raise ValueError(f"Project '{raw_identifier}' not found")
+        agent_rows = connection.execute(
+            """
+            SELECT id, name, registration_token
+            FROM agents
+            WHERE project_id = ? AND lower(name) IN (lower(?), lower(?))
+            """,
+            (int(project_row["id"]), old_name, new_name),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise ValueError(
+            "Read-only dry-run requires an existing, readable Agent Mail schema"
+        ) from exc
+    finally:
+        if connection is not None:
+            connection.close()
+
+    project = Project(
+        id=int(project_row["id"]),
+        slug=str(project_row["slug"]),
+        human_key=str(project_row["human_key"]),
+    )
+    rows = [
+        _RenameAgentRow(
+            id=int(row["id"]),
+            name=str(row["name"]),
+            registration_token=(
+                str(row["registration_token"])
+                if row["registration_token"] is not None
+                else None
+            ),
+        )
+        for row in agent_rows
+    ]
+    return project, rows
+
+
+def _open_existing_project_archive(
+    settings: Any,
+    project_slug: str,
+) -> ProjectArchive:
+    """Open an existing archive without creating a directory, repo or commit."""
+    storage_root = Path(settings.storage.root).expanduser().resolve()
+    project_root = storage_root / "projects" / project_slug
+    if not storage_root.is_dir() or not (storage_root / ".git").is_dir():
+        raise ValueError(
+            f"Git archive does not exist; migration will not create it: {storage_root}"
+        )
+    if not project_root.is_dir():
+        raise ValueError(
+            f"Project archive does not exist; migration will not create it: {project_root}"
+        )
+    repo = Repo(str(storage_root))
+    return ProjectArchive(
+        settings=settings,
+        slug=project_slug,
+        root=project_root,
+        repo=repo,
+        lock_path=project_root / ".archive.lock",
+        repo_root=storage_root,
+    )
+
+
+async def _agent_rename_preflight(
+    project_identifier: str,
+    old_name: str,
+    new_name: str,
+    *,
+    apply: bool,
+) -> dict[str, Any]:
+    """Resolve the DB and archive state without exposing registration secrets."""
+    settings = get_settings()
+    if apply:
+        project = await _get_project_record(project_identifier)
+    else:
+        project, readonly_rows = await asyncio.to_thread(
+            _read_agent_rename_database_state,
+            settings,
+            project_identifier,
+            old_name,
+            new_name,
+        )
+    if project.id is None:
+        raise ValueError("Project must have an id")
+    if apply:
+        await ensure_schema()
+        async with get_session() as session:
+            db_agents = (
+                await session.execute(
+                    select(Agent).where(
+                        cast(ColumnElement[bool], Agent.project_id == project.id),
+                        func.lower(Agent.name).in_([old_name.lower(), new_name.lower()]),
+                    )
+                )
+            ).scalars().all()
+        rows = [
+            _RenameAgentRow(
+                id=cast(int, db_agent.id),
+                name=db_agent.name,
+                registration_token=db_agent.registration_token,
+            )
+            for db_agent in db_agents
+            if db_agent.id is not None
+        ]
+    else:
+        rows = readonly_rows
+
+    source = next((agent for agent in rows if agent.name.casefold() == old_name.casefold()), None)
+    target = next((agent for agent in rows if agent.name.casefold() == new_name.casefold()), None)
+    if source is not None and target is not None and source.id != target.id:
+        raise ValueError(
+            f"Target collision: project already contains agent '{target.name}' "
+            f"with Agent.id={target.id}"
+        )
+    if source is None and target is None:
+        raise ValueError(
+            f"Agent '{old_name}' was not found and no resumable target '{new_name}' exists"
+        )
+
+    agent = source or target
+    assert agent is not None
+    if not str(agent.registration_token or "").strip():
+        raise ValueError(
+            f"Agent '{agent.name}' has no persisted registration token; refusing to orphan its identity"
+        )
+
+    archive = await asyncio.to_thread(
+        _open_existing_project_archive,
+        settings,
+        project.slug,
+    )
+    try:
+        archive_state = await inspect_agent_archive_rename(
+            archive,
+            old_name,
+            new_name,
+            agent.id,
+        )
+    except BaseException:
+        with suppress(Exception):
+            archive.repo.close()
+        raise
+    resolved_old_name = str(archive_state["old_directory"])
+    return {
+        "project": project,
+        "archive": archive,
+        "agent_id": agent.id,
+        "old_name": resolved_old_name,
+        "new_name": new_name,
+        "database_state": "pending" if source is not None else "already_applied",
+        "archive_state": archive_state["state"],
+        "registration_token": "persisted (value withheld)",
+    }
+
+
+async def _apply_agent_rename_database(
+    project_id: int,
+    agent_id: int,
+    old_name: str,
+    new_name: str,
+) -> dict[str, Any]:
+    """Rename one Agent row in place and update only matching window labels."""
+    await ensure_schema()
+    async with get_session() as session:
+        agent = await session.get(Agent, agent_id)
+        if agent is None or agent.project_id != project_id:
+            raise ValueError(f"Agent.id={agent_id} no longer belongs to the requested project")
+        persisted_token = str(agent.registration_token or "").strip()
+        if not persisted_token:
+            raise ValueError("Agent lost its persisted registration token during migration")
+
+        if agent.name.casefold() == new_name.casefold():
+            database_state = "already_applied"
+        elif agent.name.casefold() == old_name.casefold():
+            collision = (
+                await session.execute(
+                    select(Agent.id).where(
+                        cast(ColumnElement[bool], Agent.project_id == project_id),
+                        func.lower(Agent.name) == new_name.lower(),
+                        cast(ColumnElement[bool], Agent.id != agent_id),
+                    )
+                )
+            ).scalar_one_or_none()
+            if collision is not None:
+                raise ValueError(
+                    f"Target collision appeared during migration: Agent.id={collision} owns '{new_name}'"
+                )
+            agent.name = new_name
+            session.add(agent)
+            database_state = "applied"
+        else:
+            raise ValueError(
+                f"Agent.id={agent_id} is now named '{agent.name}', not '{old_name}' or '{new_name}'"
+            )
+
+        windows = (
+            await session.execute(
+                select(WindowIdentity).where(
+                    cast(ColumnElement[bool], WindowIdentity.project_id == project_id),
+                    func.lower(WindowIdentity.display_name) == old_name.lower(),
+                )
+            )
+        ).scalars().all()
+        for identity in windows:
+            identity.display_name = new_name
+            session.add(identity)
+        await session.commit()
+        await session.refresh(agent)
+        if agent.id != agent_id or agent.name.casefold() != new_name.casefold():
+            raise RuntimeError("Agent identity verification failed after database commit")
+        if str(agent.registration_token or "").strip() != persisted_token:
+            raise RuntimeError("Agent registration token changed during database commit")
+        return {
+            "state": database_state,
+            "agent_id": agent_id,
+            "window_identities_updated": len(windows),
+            "id_preserved": True,
+            "registration_token_preserved": True,
+        }
+
+
+@app.command("rename-agent")
+def rename_agent(
+    project: Annotated[str, typer.Argument(..., help="Project slug or human key")],
+    old_name: Annotated[str, typer.Argument(..., help="Existing legacy Agent.name")],
+    new_name: Annotated[str, typer.Argument(..., help="Canonical client-os-host-slot name")],
+    apply: Annotated[bool, typer.Option("--apply", help="Apply the offline migration.")] = False,
+    confirm: Annotated[
+        str | None,
+        typer.Option("--confirm", help="Required with --apply; exact value OLD=>NEW."),
+    ] = None,
+) -> None:
+    """Rename one existing Agent in place without forking its identity or history.
+
+    The command is local and offline: it never calls MCP or the web UI. Stop the
+    server, watchers and every archive writer, take database/archive backups,
+    run the default dry-run, then repeat with ``--apply --confirm OLD=>NEW``.
+    """
+    if not _validate_migratable_source_agent_name(old_name):
+        raise click.ClickException(
+            "rename-agent only migrates evidenced host-os-slot, deployed "
+            "host-os-client-slot identities (including explicit short-token state), "
+            "or server-generated adjective+noun identities; older "
+            "pre-platform identities require a separate operator-reviewed migration"
+        )
+    if old_name.casefold() == new_name.casefold():
+        raise click.ClickException("Case-only identity renames are forbidden")
+    if not validate_client_platform_host_agent_id(new_name):
+        raise click.ClickException(
+            "The target is not a canonical client-os-host-slot identity"
+        )
+    if not _validate_identity_rename_pair(old_name, new_name):
+        raise click.ClickException(
+            "OLD and NEW must preserve the same host, OS and slot; only the "
+            "canonical client segment/order may change"
+        )
+    expected_confirmation = f"{old_name}=>{new_name}"
+    if apply and confirm != expected_confirmation:
+        raise click.ClickException(
+            f"--apply requires exact --confirm {expected_confirmation}"
+        )
+
+    settings = get_settings()
+    backend = make_url(settings.database.url).get_backend_name()
+    if not backend.startswith("sqlite"):
+        raise click.ClickException(
+            f"rename-agent supports SQLite only in this application build (got '{backend}')"
+        )
+    server_lock = _identity_migration_server_lock(settings, apply=apply)
+    preflight: dict[str, Any] | None = None
+    try:
+        try:
+            preflight_coro = _agent_rename_preflight(
+                project,
+                old_name,
+                new_name,
+                apply=apply,
+            )
+            preflight = (
+                _run_async(preflight_coro)
+                if apply
+                else asyncio.run(preflight_coro)
+            )
+        except Exception as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        project_record = cast(Project, preflight["project"])
+        console.print(
+            f"[bold]{'APPLY PLAN' if apply else 'DRY RUN'}: rename-agent[/]"
+        )
+        console.print(f"project={project_record.human_key}")
+        console.print(f"old_name={preflight['old_name']}")
+        console.print(f"new_name={preflight['new_name']}")
+        console.print(f"agent_id={preflight['agent_id']}")
+        console.print(f"database_state={preflight['database_state']}")
+        console.print(f"archive_state={preflight['archive_state']}")
+        console.print(f"registration_token={preflight['registration_token']}")
+        if server_lock is not None:
+            console.print("server_state=operator-stopped (exclusive storage lock verified)")
+        console.print("local_state=run migrate-agent-state on each client host after this rename")
+        if not apply:
+            console.print(
+                f"[yellow]No mutation performed. Back up both stores, then use --apply "
+                f"--confirm {expected_confirmation} while all writers remain stopped.[/]"
+            )
+            return
+
+        renamed_at = datetime.now(timezone.utc).isoformat()
+        archive = preflight["archive"]
+        if project_record.id is None:
+            raise click.ClickException("Project lost its id during migration")
+        try:
+            archive_result = _run_async(
+                migrate_agent_archive(
+                    archive,
+                    str(preflight["old_name"]),
+                    new_name,
+                    int(preflight["agent_id"]),
+                    renamed_at,
+                )
+            )
+            database_result = _run_async(
+                _apply_agent_rename_database(
+                    project_record.id,
+                    int(preflight["agent_id"]),
+                    str(preflight["old_name"]),
+                    new_name,
+                )
+            )
+        except Exception as exc:
+            raise click.ClickException(
+                f"Identity migration stopped safely and is resumable with the same command: {exc}"
+            ) from exc
+
+        console.print("[green]APPLIED: identity renamed in place.[/]")
+        console.print(f"archive_state={archive_result['state']}")
+        console.print(f"database_{database_result['state']}")
+        console.print(
+            "preserved=id, registration_token, messages, reads, acknowledgements, "
+            "contacts, and reservations"
+        )
+        console.print(
+            f"window_identities_updated={database_result['window_identities_updated']}"
+        )
+        console.print(
+            f"reservation_records_updated={archive_result['reservation_records_updated']}"
+        )
+        console.print("next=run migrate-agent-state on each stopped client host before restart")
+    finally:
+        if server_lock is not None:
+            server_lock.release()
+        if preflight is not None:
+            archive = cast(ProjectArchive, preflight["archive"])
+            with suppress(Exception):
+                archive.repo.close()
+
+
+def _agent_state_previous_component(project: str) -> str:
+    """Return the lossy component used by previous hook generations."""
+    mapped = project.replace("/", "_")
+    return "".join(char for char in mapped if char.isascii() and (char.isalnum() or char in "._-"))[:96]
+
+
+def _agent_state_component(value: str) -> str:
+    """Mirror ``am_state_component``: readable prefix plus collision-proof hash."""
+    translated = re.sub(r"[^A-Za-z0-9._ -]", "_", value)
+    squeezed = re.sub(r"_+", "_", translated)
+    prefix = squeezed.replace(" ", "_")[:47]
+    if prefix.endswith("_"):
+        prefix = prefix[:-1]
+    prefix = prefix or "state"
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+    return f"{prefix}-{digest}"
+
+
+_TRANSITIONAL_CLIENT_ALIASES = {
+    "claude": "cc",
+    "codex": "cx",
+    "copilot": "cp",
+}
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+@contextmanager
+def _portable_agent_state_lock(
+    target_path: Path,
+    *,
+    timeout_seconds: float = 10.0,
+) -> Iterator[None]:
+    """Interoperate with the hooks' portable ``mkdir + pid`` lock protocol."""
+    lock_dir = Path(f"{target_path}.lock")
+    pid_path = lock_dir / "pid"
+    lock_dir.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            lock_dir.mkdir()
+            break
+        except FileExistsError:
+            owner = 0
+            with suppress(OSError, ValueError):
+                owner = int(pid_path.read_text(encoding="utf-8").strip())
+            if owner and not _pid_is_alive(owner):
+                with suppress(OSError):
+                    if pid_path.read_text(encoding="utf-8").strip() == str(owner):
+                        pid_path.unlink()
+                        lock_dir.rmdir()
+                        continue
+            if time.monotonic() >= deadline:
+                raise click.ClickException(
+                    f"Timed out waiting for Agent Mail state lock: {lock_dir}"
+                ) from None
+            time.sleep(0.05)
+    try:
+        pid_path.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        with suppress(OSError):
+            lock_dir.rmdir()
+        raise
+    try:
+        yield
+    finally:
+        with suppress(OSError):
+            if pid_path.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                pid_path.unlink()
+                lock_dir.rmdir()
+
+
+def _agent_state_backup(path: Path, state_dir: Path) -> Path:
+    backup_dir = state_dir / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    with suppress(OSError):
+        state_dir.chmod(0o700)
+        backup_dir.chmod(0o700)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    target = backup_dir / f"{path.name}.{timestamp}.bak"
+    shutil.copy2(path, target)
+    with suppress(OSError):
+        target.chmod(0o600)
+    return target
+
+
+def _atomic_private_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        with suppress(OSError):
+            temporary.chmod(0o600)
+        temporary.replace(path)
+    finally:
+        with suppress(OSError):
+            temporary.unlink()
+
+
+def _migrate_agent_state_files(
+    *,
+    project: str,
+    old_name: str,
+    new_name: str,
+    client: str,
+    slot: int,
+    resolved_state: Path,
+    apply: bool,
+) -> None:
+    """Validate and optionally migrate state while the caller holds apply locks."""
+    credential_path = resolved_state / "credentials.json"
+    if not credential_path.is_file():
+        raise click.ClickException(f"Credential store does not exist: {credential_path}")
+    try:
+        credentials = json.loads(credential_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise click.ClickException("Credential store is unreadable or invalid JSON") from exc
+    if not isinstance(credentials, dict) or not isinstance(credentials.get(project), dict):
+        raise click.ClickException("Credential store has no object for the exact project key")
+    project_credentials = cast(dict[str, Any], credentials[project])
+    old_token = project_credentials.get(old_name)
+    new_token = project_credentials.get(new_name)
+    if old_token and new_token:
+        raise click.ClickException(
+            "Both old and new credential keys exist; refusing to copy a token between identities"
+        )
+    if old_token is not None and (
+        not isinstance(old_token, str) or not old_token.strip()
+    ):
+        raise click.ClickException("Legacy credential is empty or invalid")
+    if new_token is not None and (
+        not isinstance(new_token, str) or not new_token.strip()
+    ):
+        raise click.ClickException("Target credential is empty or invalid")
+    if old_token is None and new_token is None:
+        raise click.ClickException("Neither the old nor target credential key exists")
+
+    current_component = _agent_state_component(project)
+    previous_component = _agent_state_previous_component(project)
+    granted_dir = resolved_state / "granted"
+    client_token = client.casefold()
+    canonical_granted = granted_dir / f"{current_component}--{client_token}-{slot}"
+    previous_granted = granted_dir / f"{previous_component}--{client_token}-{slot}"
+    transitional_client = _TRANSITIONAL_CLIENT_ALIASES.get(client_token)
+    transitional_granted = (
+        granted_dir / f"{current_component}--{transitional_client}-{slot}"
+        if transitional_client is not None
+        else None
+    )
+    previous_transitional_granted = (
+        granted_dir / f"{previous_component}--{transitional_client}-{slot}"
+        if transitional_client is not None
+        else None
+    )
+    legacy_granted = granted_dir / previous_component
+    lossy_paths = [previous_granted, legacy_granted]
+    if previous_transitional_granted is not None:
+        lossy_paths.append(previous_transitional_granted)
+    colliding_projects = [
+        key
+        for key in credentials
+        if isinstance(key, str)
+        and key != project
+        and _agent_state_previous_component(key) == previous_component
+    ]
+    if colliding_projects and any(path.exists() for path in lossy_paths):
+        raise click.ClickException(
+            "Legacy granted-name path is ambiguous for colliding project keys; "
+            "resolve it manually before migrating either identity"
+        )
+    granted_candidates = list(
+        dict.fromkeys(
+            path
+            for path in (
+                canonical_granted,
+                previous_granted,
+                transitional_granted,
+                previous_transitional_granted,
+                legacy_granted,
+            )
+            if path is not None
+        )
+    )
+    try:
+        granted_values = {
+            path: path.read_text(encoding="utf-8").strip()
+            for path in granted_candidates
+            if path.is_file()
+        }
+    except OSError as exc:
+        raise click.ClickException("A granted-name file is unreadable") from exc
+    for path, granted_value in granted_values.items():
+        if granted_value not in {old_name, new_name}:
+            raise click.ClickException(
+                f"Granted-name file belongs to a different identity: {path}"
+            )
+    obsolete_granted = [
+        path for path in granted_candidates if path != canonical_granted
+    ]
+    credential_state = "pending" if old_token is not None else "already_migrated"
+    granted_state = (
+        "already_migrated"
+        if granted_values.get(canonical_granted) == new_name
+        and not any(path.exists() for path in obsolete_granted)
+        else "pending"
+    )
+    overall_state = (
+        "already_migrated"
+        if credential_state == granted_state == "already_migrated"
+        else "pending"
+    )
+    console.print(f"[bold]{'APPLY PLAN' if apply else 'DRY RUN'}: migrate-agent-state[/]")
+    console.print(f"project={project}")
+    console.print(f"old_name={old_name}")
+    console.print(f"new_name={new_name}")
+    console.print(f"credential_state={credential_state}")
+    console.print(f"granted_state={granted_state}")
+    console.print(f"state={overall_state}")
+    console.print(f"credential_store={credential_path}")
+    console.print("registration_token=value withheld")
+    console.print(
+        "precondition=server Agent row was already renamed in place; no network request made"
+    )
+    if not apply or overall_state == "already_migrated":
+        return
+
+    try:
+        _agent_state_backup(credential_path, resolved_state)
+        for path in granted_values:
+            _agent_state_backup(path, resolved_state)
+
+        # Publish canonical state first. If the process stops before the token
+        # key swap, hooks fail closed because NEW still has no local token; the
+        # same command safely completes the remaining phases.
+        _atomic_private_text(canonical_granted, new_name)
+        for obsolete_path in obsolete_granted:
+            if obsolete_path.is_file():
+                obsolete_path.unlink()
+
+        if old_token is not None:
+            project_credentials.pop(old_name)
+            project_credentials[new_name] = old_token
+            credentials[project] = project_credentials
+            _atomic_private_text(
+                credential_path,
+                json.dumps(credentials, indent=2, sort_keys=True) + "\n",
+            )
+    except Exception as exc:
+        raise click.ClickException(
+            f"Local migration stopped; private backups were retained and retry is safe: {exc}"
+        ) from exc
+    console.print("[green]APPLIED: local credential key and granted name migrated.[/]")
+    console.print("registration_token=value preserved and withheld")
+
+
+def _resolve_absolute_client_path(value: str | Path, *, setting: str) -> Path:
+    """Resolve a user-level client path without accepting CWD-relative state."""
+    try:
+        candidate = Path(value).expanduser()
+    except RuntimeError as exc:
+        raise click.ClickException(f"{setting} is not a valid user path") from exc
+    if not candidate.is_absolute():
+        raise click.ClickException(f"{setting} must be an absolute path")
+    return candidate.resolve()
+
+
+def _global_agent_mail_env_path() -> Path:
+    """Locate the user-level hook configuration without consulting repo state."""
+    ambient_config = DecoupleConfig(RepositoryEmpty())
+    configured_path = str(
+        ambient_config(
+            "AGENT_MAIL_ENV_FILE",
+            default=str(Path.home() / ".agent-mail.env"),
+        )
+        or ""
+    ).strip()
+    return _resolve_absolute_client_path(
+        configured_path,
+        setting="AGENT_MAIL_ENV_FILE",
+    )
+
+
+def _configured_agent_state_directory() -> Path:
+    """Resolve private client state from the same global env used by hooks."""
+    global_env_path = _global_agent_mail_env_path()
+    try:
+        repository = RepositoryEnv(str(global_env_path))
+    except FileNotFoundError:
+        repository = RepositoryEmpty()
+    decouple_config = DecoupleConfig(repository)
+    configured_state = str(
+        decouple_config("AGENT_MAIL_STATE_DIR", default="") or ""
+    ).strip()
+    if configured_state:
+        return _resolve_absolute_client_path(
+            configured_state,
+            setting="AGENT_MAIL_STATE_DIR",
+        )
+    ambient_config = DecoupleConfig(RepositoryEmpty())
+    state_home = str(
+        ambient_config(
+            "XDG_STATE_HOME",
+            default=str(Path.home() / ".local" / "state"),
+        )
+    ).strip()
+    return _resolve_absolute_client_path(
+        Path(state_home) / "agent-mail",
+        setting="XDG_STATE_HOME",
+    )
+
+
+@app.command("migrate-agent-state")
+def migrate_agent_state(
+    project: Annotated[str, typer.Argument(..., help="Exact project key in credentials.json")],
+    old_name: Annotated[str, typer.Argument(..., help="Legacy credential key")],
+    new_name: Annotated[str, typer.Argument(..., help="Renamed server identity")],
+    client: Annotated[str, typer.Option("--client", help="Canonical client token, e.g. codex")],
+    slot: Annotated[int, typer.Option("--slot", min=1, help="Stable positive client slot")],
+    state_dir: Annotated[
+        Path | None,
+        typer.Option("--state-dir", help="Agent Mail private state directory"),
+    ] = None,
+    apply: Annotated[bool, typer.Option("--apply", help="Apply the local state move.")] = False,
+    confirm: Annotated[
+        str | None,
+        typer.Option("--confirm", help="Required with --apply; exact value OLD=>NEW."),
+    ] = None,
+) -> None:
+    """Atomically move one local credential key after the server-side rename."""
+    if not _validate_migratable_source_agent_name(old_name):
+        raise click.ClickException(
+            "migrate-agent-state does not handle arbitrary older pre-platform identities"
+        )
+    if not validate_client_platform_host_agent_id(new_name):
+        raise click.ClickException("The target identity is not canonical")
+    if not _validate_identity_rename_pair(old_name, new_name):
+        raise click.ClickException(
+            "OLD and NEW do not preserve the same host, OS and slot"
+        )
+    canonical_parts = parse_client_platform_host_agent_id(new_name)
+    assert canonical_parts is not None
+    expected_client, _expected_platform, _expected_host, expected_slot = canonical_parts
+    if expected_client != client.casefold() or expected_slot != str(slot):
+        raise click.ClickException("--client/--slot do not match the target identity")
+    expected_confirmation = f"{old_name}=>{new_name}"
+    if apply and confirm != expected_confirmation:
+        raise click.ClickException(
+            f"--apply requires exact --confirm {expected_confirmation}"
+        )
+
+    resolved_state = (
+        _resolve_absolute_client_path(state_dir, setting="--state-dir")
+        if state_dir is not None
+        else _configured_agent_state_directory()
+    )
+    credential_path = resolved_state / "credentials.json"
+    current_component = _agent_state_component(project)
+    canonical_granted = (
+        resolved_state
+        / "granted"
+        / f"{current_component}--{client.casefold()}-{slot}"
+    )
+    lock_context = (
+        _portable_agent_state_lock(credential_path)
+        if apply
+        else nullcontext()
+    )
+    with lock_context:
+        granted_lock_context = (
+            _portable_agent_state_lock(canonical_granted)
+            if apply
+            else nullcontext()
+        )
+        with granted_lock_context:
+            _migrate_agent_state_files(
+                project=project,
+                old_name=old_name,
+                new_name=new_name,
+                client=client,
+                slot=slot,
+                resolved_state=resolved_state,
+                apply=apply,
+            )
 
 
 @app.command("lint")
@@ -4148,10 +5082,21 @@ def amctl_env(
             if repo is not None:
                 with suppress(Exception):
                     repo.close()
-    # Compute cache key and artifact dir
+    # Compute cache key and artifact dir using the same collision-resistant
+    # components exported by am-run.
     settings = get_settings()
     cache_key = f"am-cache-{project_uid}-{agent_name}-{branch}"
-    artifact_dir = Path(settings.storage.root).expanduser().resolve() / "projects" / slug / "artifacts" / agent_name / branch
+    archive_root = Path(settings.storage.root).expanduser().resolve() / "projects" / slug
+    artifacts_root = _resolved_build_path_within(
+        archive_root,
+        archive_root / "artifacts",
+        label="artifacts",
+    )
+    artifact_dir = _resolved_build_path_within(
+        artifacts_root,
+        artifacts_root / _safe_build_path_component(agent_name) / _safe_build_path_component(branch or "unknown"),
+        label="artifact",
+    )
     # Print as KEY=VALUE lines
     typer.echo(f"SLUG={slug}")
     typer.echo(f"PROJECT_UID={project_uid}")
@@ -4159,6 +5104,66 @@ def amctl_env(
     typer.echo(f"AGENT={agent_name}")
     typer.echo(f"CACHE_KEY={cache_key}")
     typer.echo(f"ARTIFACT_DIR={artifact_dir}")
+
+
+_BUILD_PATH_COMPONENT_MAX_BYTES = 80
+_BUILD_PATH_COMPONENT_HASH_LENGTH = 32
+_WINDOWS_RESERVED_COMPONENT_STEMS = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{index}" for index in range(1, 10)}
+    | {f"LPT{index}" for index in range(1, 10)}
+)
+
+
+def _truncate_utf8_component(value: str, max_bytes: int) -> str:
+    """Truncate on a character boundary to a portable component byte budget."""
+    result: list[str] = []
+    used = 0
+    for char in value:
+        encoded_size = len(char.encode("utf-8", errors="surrogatepass"))
+        if used + encoded_size > max_bytes:
+            break
+        result.append(char)
+        used += encoded_size
+    return "".join(result)
+
+
+def _safe_build_path_component(value: str) -> str:
+    """Return a readable, portable component without lossy-name collisions."""
+    original = value
+    unsafe_chars = frozenset('/\\:*?"<>|')
+    sanitized = "".join(
+        "_" if char in unsafe_chars or char.isspace() or ord(char) < 32 else char
+        for char in original.strip()
+    ).rstrip(" .")
+    if sanitized in {"", ".", ".."}:
+        sanitized = "unknown"
+
+    reserved_on_windows = sanitized.partition(".")[0].upper() in _WINDOWS_RESERVED_COMPONENT_STEMS
+    if reserved_on_windows:
+        # A suffix does not make names such as ``CON.txt`` portable on Windows:
+        # the device-name rule is applied to the stem before the first dot.
+        sanitized = f"safe-{sanitized}"
+
+    encoded = sanitized.encode("utf-8", errors="surrogatepass")
+    transformed = sanitized != original or reserved_on_windows or len(encoded) > _BUILD_PATH_COMPONENT_MAX_BYTES
+    if not transformed:
+        return sanitized
+
+    digest = hashlib.sha256(original.encode("utf-8", errors="surrogatepass")).hexdigest()
+    suffix = f"-{digest[:_BUILD_PATH_COMPONENT_HASH_LENGTH]}"
+    prefix_budget = _BUILD_PATH_COMPONENT_MAX_BYTES - len(suffix)
+    prefix = _truncate_utf8_component(sanitized, prefix_budget).rstrip(" ._-") or "value"
+    return f"{prefix}{suffix}"
+
+
+def _resolved_build_path_within(root: Path, candidate: Path, *, label: str) -> Path:
+    """Resolve a build path and reject symlink or traversal escapes."""
+    resolved_root = root.resolve()
+    resolved_candidate = candidate.resolve()
+    if not resolved_candidate.is_relative_to(resolved_root):
+        raise click.ClickException(f"Unsafe {label} path escaped the project archive")
+    return resolved_candidate
 
 
 def _effective_build_slot_ttl_seconds(ttl_seconds: int) -> int:
@@ -4226,17 +5231,21 @@ def am_run(
     effective_ttl_seconds = _effective_build_slot_ttl_seconds(ttl_seconds)
     renew_interval_seconds = _build_slot_renew_interval_seconds(ttl_seconds)
     archive = _run_async(ensure_archive(settings, slug))
+    archive_root = archive.root.resolve()
 
-    def _safe_component(value: str) -> str:
-        s = value.strip()
-        for ch in ("/", "\\\\", ":", "*", "?", "\"", "<", ">", "|", " "):
-            s = s.replace(ch, "_")
-        return s or "unknown"
+    build_slots_path = archive_root / "build_slots"
 
     async def _ensure_slot_paths() -> Path:
-        slot_dir = archive.root / "build_slots" / _safe_component(slot)
+        build_slots_root = _resolved_build_path_within(archive_root, build_slots_path, label="build slots")
+        await asyncio.to_thread(build_slots_root.mkdir, parents=True, exist_ok=True)
+        build_slots_root = _resolved_build_path_within(archive_root, build_slots_path, label="build slots")
+        slot_dir = _resolved_build_path_within(
+            build_slots_root,
+            build_slots_root / _safe_build_path_component(slot),
+            label="build slot",
+        )
         await asyncio.to_thread(slot_dir.mkdir, parents=True, exist_ok=True)
-        return slot_dir
+        return _resolved_build_path_within(build_slots_root, slot_dir, label="build slot")
 
     def _is_active_lease(data: dict[str, Any], now: datetime) -> bool:
         if data.get("released_ts"):
@@ -4268,8 +5277,14 @@ def am_run(
         return results
 
     def _lease_path(slot_dir: Path) -> Path:
-        holder = _safe_component(f"{agent_name}__{branch or 'unknown'}")
-        return slot_dir / f"{holder}.json"
+        build_slots_root = _resolved_build_path_within(archive_root, build_slots_path, label="build slots")
+        resolved_slot_dir = _resolved_build_path_within(build_slots_root, slot_dir, label="build slot")
+        holder = _safe_build_path_component(f"{agent_name}__{branch or 'unknown'}")
+        return _resolved_build_path_within(
+            resolved_slot_dir,
+            resolved_slot_dir / f"{holder}.json",
+            label="build-slot lease",
+        )
 
     def _write_local_release(path: Path) -> None:
         now = datetime.now(timezone.utc)
@@ -4328,7 +5343,14 @@ def am_run(
             await asyncio.to_thread(_write_local_release, path)
 
     lease_path: Optional[Path] = None
-    artifact_dir = Path(settings.storage.root).expanduser().resolve() / "projects" / slug / "artifacts" / agent_name / branch
+    artifacts_root = _resolved_build_path_within(archive_root, archive_root / "artifacts", label="artifacts")
+    artifact_dir = _resolved_build_path_within(
+        artifacts_root,
+        artifacts_root
+        / _safe_build_path_component(agent_name)
+        / _safe_build_path_component(branch or "unknown"),
+        label="artifact",
+    )
     env = os.environ.copy()
     env.update({
         "AM_SLOT": slot,

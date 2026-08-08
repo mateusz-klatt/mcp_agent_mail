@@ -99,6 +99,190 @@ _env_file_value() {
   printf '%s\n' "$raw"
 }
 
+# Resolve the streamable-HTTP MCP endpoint used by coding clients.  Client
+# installers deliberately do not inspect the repository's .env: a checkout can
+# describe the server process running there, but it cannot describe which
+# server a user-level client on this machine should connect to.
+#
+# Precedence:
+#   1. INTEGRATION_MCP_URL (already a complete MCP endpoint)
+#   2. AGENT_MAIL_URL (complete endpoint or server base URL)
+#   3. AGENT_MAIL_URL from ~/.agent-mail.env
+resolve_integration_mcp_url() {
+  local url="${INTEGRATION_MCP_URL:-}" env_file
+  if [[ -z "$url" ]]; then
+    url="${AGENT_MAIL_URL:-}"
+  fi
+  if [[ -z "$url" ]]; then
+    env_file="${AGENT_MAIL_ENV_FILE:-${HOME}/.agent-mail.env}"
+    url="$(_env_file_value "$env_file" AGENT_MAIL_URL 2>/dev/null || true)"
+  fi
+  [[ -n "$url" ]] || return 1
+  case "$url" in
+    http://*|https://*) ;;
+    *) log_err "Agent Mail MCP URL must start with http:// or https://: ${url}"; return 1 ;;
+  esac
+  case "$url" in
+    *$'\n'*|*$'\r'*) log_err "Agent Mail MCP URL must be a single line"; return 1 ;;
+  esac
+
+  # INTEGRATION_MCP_URL is explicitly the final endpoint and is never changed.
+  if [[ -n "${INTEGRATION_MCP_URL:-}" ]]; then
+    printf '%s\n' "$url"
+    return 0
+  fi
+  case "$url" in
+    */mcp|*/mcp/) printf '%s/\n' "${url%/}" ;;
+    */api/) printf '%s/mcp/\n' "${url%/api/}" ;;
+    */api) printf '%s/mcp/\n' "${url%/api}" ;;
+    *) printf '%s/mcp/\n' "${url%/}" ;;
+  esac
+}
+
+# Strict bearer resolver for user-level client installations.  Unlike the
+# legacy resolver below, it never reads a repository .env, a server credential
+# file, or a generated run helper.
+resolve_global_integration_bearer_token() {
+  local token env_file
+  for token in "${INTEGRATION_BEARER_TOKEN:-}" "${HTTP_BEARER_TOKEN:-}"; do
+    if [[ -n "$token" ]]; then
+      case "$token" in *$'\n'*|*$'\r'*) log_err "Bearer token must be a single line"; return 1 ;; esac
+      printf '%s\n' "$token"
+      return 0
+    fi
+  done
+  env_file="${AGENT_MAIL_ENV_FILE:-${HOME}/.agent-mail.env}"
+  token="$(_env_file_value "$env_file" HTTP_BEARER_TOKEN 2>/dev/null || true)"
+  [[ -n "$token" ]] || return 1
+  case "$token" in *$'\n'*|*$'\r'*) log_err "Bearer token must be a single line"; return 1 ;; esac
+  printf '%s\n' "$token"
+}
+
+# Normalize a private Agent Mail state directory into the path dialect used by
+# the current Bash process.  A native Windows path is never allowed to fall
+# through as a relative POSIX filename: that would create artifacts such as
+# ``D:\Profiles\...`` in whichever repository happened to be current.
+normalize_agent_mail_state_dir() {
+  local target="$1" normalized system
+  case "$target" in
+    *$'\n'*|*$'\r'*)
+      log_err "Agent Mail state directory must be a single-line path." >&2
+      return 1 ;;
+  esac
+  case "$target" in
+    [a-zA-Z]:\\*|[a-zA-Z]:/*)
+      system="$(uname -s 2>/dev/null || printf unknown)"
+      case "$system" in
+        MINGW*|MSYS*|CYGWIN*)
+          command -v cygpath >/dev/null 2>&1 || {
+            log_err "cygpath is required to normalize the Agent Mail state directory." >&2
+            return 1
+          }
+          normalized="$(cygpath -u "$target" 2>/dev/null)" || {
+            log_err "Could not normalize the Agent Mail state directory." >&2
+            return 1
+          } ;;
+        *)
+          command -v wslpath >/dev/null 2>&1 || {
+            log_err "wslpath is required to normalize the Agent Mail state directory." >&2
+            return 1
+          }
+          normalized="$(wslpath -u "$target" 2>/dev/null)" || {
+            log_err "Could not normalize the Agent Mail state directory." >&2
+            return 1
+          } ;;
+      esac ;;
+    *) normalized="$target" ;;
+  esac
+  case "$normalized" in
+    *$'\n'*|*$'\r'*)
+      log_err "Normalized Agent Mail state directory must be a single-line path." >&2
+      return 1 ;;
+  esac
+  case "$normalized" in
+    /*) ;;
+    *)
+      log_err "Agent Mail state directory must be an absolute path." >&2
+      return 1 ;;
+  esac
+  printf '%s\n' "$normalized"
+}
+
+# Keep the shared hook environment intentionally small.  Client, slot, project,
+# agent name and per-agent registration tokens belong to a client wrapper or to
+# credentials.json, never to this cross-client file.
+write_shared_agent_mail_env() {
+  local url="$1" token="$2" env_file state existing_state line stripped key merged current
+  env_file="${AGENT_MAIL_ENV_FILE:-${HOME}/.agent-mail.env}"
+  state="${AGENT_MAIL_STATE_DIR:-}"
+  existing_state="$(_env_file_value "$env_file" AGENT_MAIL_STATE_DIR 2>/dev/null || true)"
+  [[ -n "$state" ]] || state="$existing_state"
+  case "$url$token$state" in
+    *$'\n'*|*$'\r'*) log_err "Shared Agent Mail settings must be single-line values"; return 1 ;;
+  esac
+  if [[ -n "$state" ]]; then
+    state="$(normalize_agent_mail_state_dir "$state")" || return 1
+  fi
+  local DRY_RUN="${DRY_RUN:-0}"
+  merged="$({
+    if [[ -f "$env_file" ]]; then
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        stripped="${line#${line%%[![:space:]]*}}"
+        stripped="${stripped#export }"
+        key="${stripped%%=*}"
+        case "$key" in
+          AGENT_MAIL_URL|HTTP_BEARER_TOKEN|AGENT_MAIL_STATE_DIR|AGENT_MAIL_AGENT|AGENT_MAIL_PROJECT|AGENT_MAIL_PROJECT_KEY|AGENT_MAIL_CLIENT|AGENT_MAIL_SLOT|AGENT_MAIL_REGISTRATION_TOKEN|AGENT_MAIL_TOKEN|AGENT_MAIL_*_SLOT)
+            continue ;;
+        esac
+        printf '%s\n' "$line"
+      done < "$env_file"
+    fi
+    printf 'AGENT_MAIL_URL=%s\n' "$url"
+    printf 'HTTP_BEARER_TOKEN=%s\n' "$token"
+    [[ -n "$state" ]] && printf 'AGENT_MAIL_STATE_DIR=%s\n' "$state"
+  })"
+  current="$(cat "$env_file" 2>/dev/null || true)"
+  if [[ "$current" == "$merged" ]]; then
+    return 0
+  fi
+  if [[ -f "$env_file" ]]; then
+    if [[ -n "$state" ]]; then
+      AGENT_MAIL_STATE_DIR="$state" backup_user_file "$env_file"
+    else
+      backup_user_file "$env_file"
+    fi
+  fi
+  printf '%s\n' "$merged" | write_atomic "$env_file"
+  [[ "$DRY_RUN" == "1" ]] || chmod 600 "$env_file" 2>/dev/null || true
+}
+
+# VS Code stores user MCP servers beside user settings, not below a workspace.
+# The explicit overrides also make the path testable and support portable or
+# custom --user-data-dir installations.
+integration_vscode_user_mcp_path() {
+  if [[ -n "${VSCODE_MCP_CONFIG_PATH:-}" ]]; then
+    printf '%s\n' "$VSCODE_MCP_CONFIG_PATH"
+    return 0
+  fi
+  if [[ -n "${VSCODE_USER_DATA_DIR:-}" ]]; then
+    printf '%s/User/mcp.json\n' "${VSCODE_USER_DATA_DIR%/}"
+    return 0
+  fi
+  case "$(uname -s 2>/dev/null)" in
+    Darwin)
+      printf '%s/Library/Application Support/Code/User/mcp.json\n' "$HOME" ;;
+    MINGW*|MSYS*|CYGWIN*)
+      local appdata="${APPDATA:-}"
+      [[ -n "$appdata" ]] || { log_err "APPDATA is required to locate VS Code user configuration"; return 1; }
+      if command -v cygpath >/dev/null 2>&1; then
+        appdata="$(cygpath -u "$appdata" 2>/dev/null || printf '%s' "$appdata")"
+      fi
+      printf '%s/Code/User/mcp.json\n' "${appdata%/}" ;;
+    *)
+      printf '%s/Code/User/mcp.json\n' "${XDG_CONFIG_HOME:-${HOME}/.config}" ;;
+  esac
+}
+
 # Resolve the active integration bearer token via a layered cascade.
 # Order (first non-empty wins):
 #   1. INTEGRATION_BEARER_TOKEN  (orchestrator-supplied session override)
@@ -246,18 +430,18 @@ SH
 # Atomic write: read content from stdin and atomically move to target
 write_atomic() {
   local target="$1"; shift || true
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    _print "[dry-run] write ${target}"
+    cat >/dev/null # consume stdin
+    return 0
+  fi
+
   local dir; dir=$(dirname "$target")
 
   # Create directory with error checking
   if ! mkdir -p "$dir"; then
     echo "ERROR: Failed to create directory ${dir}" >&2
     return 1
-  fi
-
-  if [[ "${DRY_RUN}" == "1" ]]; then
-    _print "[dry-run] write ${target}"
-    cat >/dev/null # consume stdin
-    return 0
   fi
 
   local tmp
@@ -547,6 +731,40 @@ run_cmd() {
     return 0
   fi
   "$@"
+}
+
+# Back up user-profile configuration without writing into the current
+# repository.  These files can contain bearer tokens, so both directory and
+# copy are private.  Backups are timestamped and never pruned automatically.
+backup_user_file() {
+  local file="$1" state_dir backup_dir rel safe stamp target counter
+  [[ -f "$file" ]] || return 0
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    _print "[dry-run] backup ${file}"
+    return 0
+  fi
+  state_dir="${AGENT_MAIL_STATE_DIR:-${XDG_STATE_HOME:-${HOME}/.local/state}/agent-mail}"
+  state_dir="$(normalize_agent_mail_state_dir "$state_dir")" || return 1
+  backup_dir="${state_dir}/backups"
+  mkdir -p "$backup_dir" || return 1
+  chmod 700 "$state_dir" "$backup_dir" 2>/dev/null || true
+  rel="$file"
+  [[ -n "${HOME:-}" && "$file" == "${HOME}/"* ]] && rel="${file#${HOME}/}"
+  safe="$(printf '%s' "$rel" | tr '/\\ ' '___' | tr -cd '[:alnum:]_.-' | cut -c1-160)"
+  [[ -n "$safe" ]] || safe="config"
+  # BSD date (macOS) does not implement GNU's %N and prints it literally.
+  # PID plus a collision counter keeps repeated and concurrent installs from
+  # overwriting an earlier backup on every supported platform.
+  stamp="$(date +%Y%m%d_%H%M%S 2>/dev/null || date +%s)"
+  target="${backup_dir}/${safe}.${stamp}.$$.bak"
+  counter=0
+  while [[ -e "$target" ]]; do
+    counter=$((counter + 1))
+    target="${backup_dir}/${safe}.${stamp}.$$.${counter}.bak"
+  done
+  cp "$file" "$target" || return 1
+  chmod 600 "$target" 2>/dev/null || true
+  _print "Backed up ${file} to ${target}"
 }
 
 # Backup a file to backup_config_files/ with timestamp before .bak extension
@@ -892,6 +1110,85 @@ kill_port_processes() {
 # Explicit identity helpers (#140)
 # ---------------------------------------------------------------------------
 
+integration_project_key() {
+  local target_dir="$1" remote=""
+  if [[ -n "${AGENT_MAIL_PROJECT_KEY:-}" ]]; then
+    printf '%s' "${AGENT_MAIL_PROJECT_KEY}"
+    return 0
+  fi
+  remote=$(git -C "$target_dir" remote get-url origin 2>/dev/null) || remote=""
+  if [[ -n "$remote" ]]; then
+    printf '%s' "$remote" \
+      | sed -E 's#^[a-zA-Z]+://[^/]+/#/#; s#^[^@]+@[^:]+:#/#; s#\.git$##; s#/+$##' \
+      | tr -d '\n'
+    return 0
+  fi
+  log_err "Cannot derive a shared Agent Mail project key: '${target_dir}' has no origin remote"
+  return 1
+}
+
+integration_platform() {
+  case "$(uname -s 2>/dev/null)" in
+    Darwin) printf 'mac' ;;
+    MINGW*|MSYS*|CYGWIN*) printf 'win' ;;
+    Linux)
+      if [[ -n "${WSL_DISTRO_NAME:-}" ]] || grep -qi microsoft /proc/version 2>/dev/null; then
+        printf 'wsl'
+      else
+        printf 'linux'
+      fi ;;
+    *) printf 'other' ;;
+  esac
+}
+
+integration_client() {
+  local client="$1"
+  case "$client" in
+    claude) printf 'claude' ;;
+    codex) printf 'codex' ;;
+    copilot) printf 'copilot' ;;
+    gemini) printf 'gemini' ;;
+    *)
+      log_err "Unsupported agent client token: ${client}"
+      return 1 ;;
+  esac
+}
+
+integration_slot() {
+  local slot="${1:-1}"
+  case "$slot" in
+    ''|0|0*|*[!0-9]*)
+      log_err "Agent Mail slot must be a positive integer, got '${slot}'"
+      return 1 ;;
+    *) printf '%s' "$slot" ;;
+  esac
+}
+
+integration_hostname() {
+  local host=""
+  if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+    host=$(scutil --get HostName 2>/dev/null || true)
+    [[ -n "$host" ]] || host=$(scutil --get LocalHostName 2>/dev/null || true)
+  fi
+  [[ -n "$host" ]] || host=$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf 'host')
+  host=$(printf '%s' "$host" \
+    | LC_ALL=C tr '[:upper:]' '[:lower:]' \
+    | LC_ALL=C tr -cd '[:alnum:]._-' \
+    | LC_ALL=C sed 's/^[^[:alnum:]]*//; s/[^[:alnum:]]*$//' \
+    | cut -c1-48)
+  [[ -n "$host" ]] || host="host"
+  printf '%s' "$host"
+}
+
+integration_agent_name() {
+  local client slot host platform
+  client=$(integration_client "$1") || return 1
+  slot=$(integration_slot "${2:-1}") || return 1
+  host=$(integration_hostname)
+  platform=$(integration_platform)
+  printf '%s-%s-%s-%s' "$client" "$platform" "$host" "$slot"
+}
+
 # Return the caller-requested agent name override, if set.
 # Agents can export AGENT_NAME=alpha-one before bootstrapping to claim
 # a stable identity across relaunches.
@@ -973,4 +1270,3 @@ persist_agent_identity_file() {
   mkdir -p "$identity_dir" 2>/dev/null || true
   echo "$agent_name" > "${identity_dir}/identity"
 }
-

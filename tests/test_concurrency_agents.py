@@ -955,8 +955,9 @@ class TestRaceConditions:
         assert len(set(project_ids)) == 1, "All should get same project ID"
 
     @pytest.mark.asyncio
-    async def test_simultaneous_agent_registration_same_name(self, isolated_env):
-        """Multiple clients try to register the same agent name - idempotent."""
+    @pytest.mark.parametrize("entrypoint", ["register_agent", "macro_start_session"])
+    async def test_simultaneous_agent_registration_same_name(self, isolated_env, entrypoint):
+        """Only one token-returning entrypoint may claim a new explicit name."""
         await ensure_schema()
         project_key = f"/test/concurrent/agent-register/{random_id()}"
         num_attempts = 10
@@ -965,22 +966,30 @@ class TestRaceConditions:
         async with Client(server) as bootstrap:
             await bootstrap.call_tool("ensure_project", {"human_key": project_key})
 
-        async def register_agent_same_name():
+        async def register_agent_same_name(idx: int):
             async with Client(server) as client:
+                arguments = {
+                    "program": f"test-{idx}",
+                    "model": "test",
+                    "task_description": f"simultaneous registration {idx}",
+                }
+                if entrypoint == "register_agent":
+                    arguments.update({"project_key": project_key, "name": "GreenLake"})
+                else:
+                    arguments.update({"human_key": project_key, "agent_name": "GreenLake"})
                 result = await client.call_tool(
-                    "register_agent",
-                    {
-                        "project_key": project_key,
-                        "program": "test",
-                        "model": "test",
-                        "name": "GreenLake",
-                        "task_description": "simultaneous registration",
-                    },
+                    entrypoint,
+                    arguments,
                 )
-                return result.data
+                if entrypoint == "register_agent":
+                    return result.data
+                return {
+                    **result.data["agent"],
+                    "registration_token": result.data["registration_token"],
+                }
 
         results = await asyncio.gather(
-            *[register_agent_same_name() for _ in range(num_attempts)],
+            *[register_agent_same_name(idx) for idx in range(num_attempts)],
             return_exceptions=True,
         )
 
@@ -1023,6 +1032,9 @@ class TestRaceConditions:
             ).scalars().all()
         assert len(rows) == 1, f"one name, one row, got {len(rows)}"
         assert rows[0].registration_token
+        assert rows[0].registration_token == created[0]["registration_token"]
+        assert rows[0].program == created[0]["program"]
+        assert rows[0].task_description == created[0]["task_description"]
 
     @pytest.mark.asyncio
     async def test_simultaneous_mark_read(self, isolated_env):

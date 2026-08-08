@@ -13,467 +13,602 @@ fi
 init_colors
 setup_traps
 parse_common_flags "$@"
+# Disable xtrace whether it came from --debug or an external `bash -x`; later
+# environment assignments carry the principal bearer and must never be logged.
+case "$-" in
+  *x*)
+    set +x
+    log_warn "Command tracing is disabled while the integration handles credentials."
+    ;;
+esac
 require_cmd uv
+require_cmd jq
 require_cmd curl
+require_cmd git
 
-log_step "OpenAI Codex CLI Integration (one-stop MCP config)"
+_normalize_codex_user_path() {
+  local target="$1"
+  case "$target" in
+    [a-zA-Z]:\\*|[a-zA-Z]:/*)
+      case "$(uname -s 2>/dev/null || printf unknown)" in
+        MINGW*|MSYS*|CYGWIN*)
+          command -v cygpath >/dev/null 2>&1 || {
+            log_err "cygpath is required to normalize the Windows user path: ${target}" >&2
+            return 1
+          }
+          cygpath -u "$target" 2>/dev/null || {
+            log_err "Could not normalize the Windows user path: ${target}" >&2
+            return 1
+          } ;;
+        *)
+          command -v wslpath >/dev/null 2>&1 || {
+            log_err "wslpath is required to normalize the Windows user path: ${target}" >&2
+            return 1
+          }
+          wslpath -u "$target" 2>/dev/null || {
+            log_err "Could not normalize the Windows user path: ${target}" >&2
+            return 1
+          } ;;
+      esac ;;
+    *) printf '%s\n' "$target" ;;
+  esac
+}
+
+CODEX_DIR="$(_normalize_codex_user_path "${CODEX_HOME:-${HOME}/.codex}")" || exit 1
+SHARED_ENV_FILE="$(_normalize_codex_user_path \
+  "${AGENT_MAIL_ENV_FILE:-${HOME}/.agent-mail.env}")" || exit 1
+AGENT_MAIL_ENV_FILE="$SHARED_ENV_FILE"
+HOOKS_DIR="${CODEX_DIR}/hooks/mcp-agent-mail"
+HOOK_RUNTIME="${HOOKS_DIR}/agent_mail_hook.sh"
+HOOK_WRAPPER="${HOOKS_DIR}/hook_wrapper.sh"
+USER_HOOKS="${CODEX_DIR}/hooks.json"
+USER_TOML="${CODEX_DIR}/config.toml"
+
+for _user_target in "$CODEX_DIR" "$SHARED_ENV_FILE"; do
+  case "$_user_target" in
+    /*) ;;
+    *)
+      log_err "User integration target must be an absolute path: ${_user_target}"
+      exit 1 ;;
+  esac
+done
+
+log_step "OpenAI Codex CLI Integration (user scope)"
 echo
-echo "This script will:"
-echo "  1) Detect your MCP HTTP endpoint from settings."
-echo "  2) Auto-generate a bearer token if missing and embed it."
-echo "  3) Generate a project-local codex.mcp.json (auto-backup existing)."
-echo "  4) Create scripts/run_server_with_token.sh to start the server with the token."
+echo "This installs MCP Agent Mail once for the current user:"
+echo "  - lifecycle scripts: ${CODEX_DIR}/hooks/mcp-agent-mail"
+echo "  - lifecycle config: ${CODEX_DIR}/hooks.json"
+echo "  - authenticated MCP server: ${CODEX_DIR}/config.toml"
+echo "No repository configuration or server credential is created."
 echo
-TARGET_DIR="${PROJECT_DIR:-}"
-if [[ -z "${TARGET_DIR}" ]]; then TARGET_DIR="${ROOT_DIR}"; fi
+_CODEX_SLOT="$(integration_slot "${AGENT_MAIL_CODEX_SLOT:-1}")"
+_AGENT="$(integration_agent_name codex "${_CODEX_SLOT}")"
 if ! confirm "Proceed?"; then log_warn "Aborted."; exit 1; fi
 
-cd "$ROOT_DIR"
+_URL="$(resolve_integration_mcp_url)" || {
+  log_err "Missing MCP endpoint. Set INTEGRATION_MCP_URL or AGENT_MAIL_URL (for example https://hermes.example/mcp/)."
+  exit 1
+}
+_TOKEN="$(resolve_global_integration_bearer_token)" || {
+  log_err "Missing bearer token. Set INTEGRATION_BEARER_TOKEN or HTTP_BEARER_TOKEN."
+  exit 1
+}
+log_ok "Using MCP endpoint: ${_URL}"
+log_ok "Codex identity template: ${_AGENT}"
 
-log_step "Resolving HTTP endpoint from settings"
-eval "$(uv run python - <<'PY'
-import shlex
-from mcp_agent_mail.config import get_settings
-s = get_settings()
-print(f"export _HTTP_HOST={shlex.quote(str(s.http.host))}")
-print(f"export _HTTP_PORT={shlex.quote(str(s.http.port))}")
-print(f"export _HTTP_PATH={shlex.quote(str(s.http.path))}")
-print(f"export _HTTP_BEARER_TOKEN={shlex.quote(str(s.http.bearer_token or ''))}")
-PY
+# Validate all source and destination inputs before the first write.  This is
+# what makes both --dry-run and a refused merge genuinely side-effect free.
+for _source in \
+  "${ROOT_DIR}/scripts/hooks/codex_notify.sh" \
+  "${ROOT_DIR}/scripts/hooks/agent_mail_common.sh"; do
+  if [[ ! -f "${_source}" ]]; then
+    log_err "Missing required hook script: ${_source}"
+    exit 1
+  fi
+  if ! bash -n "${_source}"; then
+    log_err "Required hook script has invalid shell syntax: ${_source}"
+    log_err "No user configuration was changed."
+    exit 1
+  fi
+done
+EXISTING_HOOKS='{}'
+if [[ -f "$USER_HOOKS" ]]; then
+  if ! jq -e '
+      def valid_handler:
+        type == "object" and
+        ((has("command") | not) or (.command | type == "string")) and
+        ((has("commandWindows") | not) or (.commandWindows | type == "string")) and
+        ((has("command_windows") | not) or (.command_windows | type == "string"));
+      def valid_group:
+        type == "object" and
+        (.hooks | type == "array") and
+        all(.hooks[]; valid_handler);
+      type == "object" and
+      ((has("hooks") | not) or (.hooks | type == "object")) and
+      (if has("hooks") then
+        all(.hooks[]; type == "array" and all(.[]; valid_group))
+      else true end)
+    ' "$USER_HOOKS" >/dev/null 2>&1; then
+    log_err "Existing ${USER_HOOKS} has an invalid nested hook shape; refusing to overwrite it."
+    exit 1
+  fi
+  EXISTING_HOOKS="$(cat "$USER_HOOKS")"
+fi
+
+printf -v _HOOK_RUNTIME_Q '%q' "$HOOK_RUNTIME"
+CODEX_WRAPPER_CONTENT="$(cat <<SH
+#!/usr/bin/env bash
+export AGENT_MAIL_CODEX_SLOT='${_CODEX_SLOT}'
+export AGENT_MAIL_HOOK_CLIENT='codex'
+export AGENT_MAIL_HOOK_SLOT='${_CODEX_SLOT}'
+export AGENT_MAIL_INTERVAL='120'
+case "\${1:-}" in
+  session-end) export AGENT_MAIL_HOOK_TIMEOUT='2' ;;
+  *) export AGENT_MAIL_HOOK_TIMEOUT='6' ;;
+esac
+exec bash ${_HOOK_RUNTIME_Q} "\$@"
+SH
 )"
-
-# Validate Python eval output (Bug 15)
-if [[ -z "${_HTTP_HOST}" || -z "${_HTTP_PORT}" || -z "${_HTTP_PATH}" ]]; then
-  log_err "Failed to detect HTTP endpoint from settings (Python eval failed)"
+if ! bash -n <<<"$CODEX_WRAPPER_CONTENT"; then
+  log_err "Generated invalid Codex hook wrapper; no user configuration was changed."
   exit 1
 fi
 
-_URL="http://${_HTTP_HOST}:${_HTTP_PORT}${_HTTP_PATH}"
-log_ok "Detected MCP HTTP endpoint: ${_URL}"
-
-_TOKEN_GENERATED=0
-_TOKEN="$(resolve_integration_bearer_token "${ROOT_DIR}")"
-if [[ -z "${_TOKEN}" ]]; then
-  _TOKEN="$(generate_bearer_token)"
-  _TOKEN_GENERATED=1
-  log_ok "Generated bearer token."
-fi
-if [[ "${_TOKEN_GENERATED}" == "1" ]]; then
-  # Keep local integrations consistent by persisting the generated token to .env.
-  # This ensures scripts/run_server_with_token.sh and Codex configs use the same token.
-  if update_env_var "HTTP_BEARER_TOKEN" "${_TOKEN}"; then
-    log_ok "Saved bearer token to .env"
-  else
-    log_warn "Failed to save bearer token to .env (continuing)"
-  fi
-fi
-
-_MORPH_ENABLED_TOOLS=$(default_morph_enabled_tools)
-_MORPH_API_KEY=$(resolve_morph_api_key)
-if [[ -n "${_MORPH_API_KEY}" ]]; then
-  log_ok "Morph MCP will be configured in grep-only mode."
-else
-  log_warn "Morph API key not found; skipping morph-mcp setup."
-fi
-
-OUT_JSON="${TARGET_DIR}/codex.mcp.json"
-backup_file "$OUT_JSON"
-log_step "Writing ${OUT_JSON}"
-if [[ -n "${_TOKEN}" ]]; then
-  AUTH_HEADER_LINE="        \"Authorization\": \"Bearer ${_TOKEN}\""
-else
-  AUTH_HEADER_LINE=''
-fi
-MORPH_MCP_JSON=""
-if [[ -n "${_MORPH_API_KEY}" ]]; then
-  MORPH_MCP_JSON=$(cat <<JSONFRAG
-,
-    "morph-mcp": {
-      "command": "npx",
-      "args": ["-y", "@morphllm/morphmcp"],
-      "env": {
-        "ENABLED_TOOLS": "${_MORPH_ENABLED_TOOLS}",
-        "MORPH_API_KEY": "${_MORPH_API_KEY}"
-      }
-    }
-JSONFRAG
-)
-fi
-write_atomic "$OUT_JSON" <<JSON
-{
-  "mcpServers": {
-    "mcp-agent-mail": {
-      "type": "http",
-      "url": "${_URL}",
-      "headers": {${AUTH_HEADER_LINE}}
-    }${MORPH_MCP_JSON}
-  }
+printf -v _HOOK_WRAPPER_Q '%q' "$HOOK_WRAPPER"
+_posix_hook_command() {
+  printf 'bash %s %s' "$_HOOK_WRAPPER_Q" "$1"
 }
-JSON
-json_validate "$OUT_JSON" || true
-set_secure_file "$OUT_JSON"
 
-log_step "Creating run helper script (centralized in lib.sh)"
-mkdir -p scripts
-RUN_HELPER="scripts/run_server_with_token.sh"
-write_run_helper_script "$RUN_HELPER"
-
-log_step "Checking server and registering agent"
-_AGENT=""
-_SERVER_AVAILABLE=0
-if readiness_poll "${_HTTP_HOST}" "${_HTTP_PORT}" "/health/readiness" 3 0.5; then
-  _SERVER_AVAILABLE=1
-  log_ok "Server is reachable."
-
-  _AUTH_ARGS=()
-  if [[ -n "${_TOKEN}" ]]; then _AUTH_ARGS+=("-H" "Authorization: Bearer ${_TOKEN}"); fi
-
-  # Escape the project path for JSON
-  _HUMAN_KEY_ESCAPED=$(json_escape_string "${TARGET_DIR}") || { log_err "Failed to escape project path"; exit 1; }
-
-  # ensure_project
-  if curl -fsS --connect-timeout 2 --max-time 5 --retry 0 -H "Content-Type: application/json" "${_AUTH_ARGS[@]}" \
-      -d "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"tools/call\",\"params\":{\"name\":\"ensure_project\",\"arguments\":{\"human_key\":${_HUMAN_KEY_ESCAPED}}}}" \
-      "${_URL}" >/dev/null 2>&1; then
-    log_ok "Ensured project on server"
-  else
-    log_warn "Failed to ensure project"
+# commandWindows is explicit even when the file is generated on a POSIX host,
+# so a synced user config has a canonical Windows runner.  On Windows itself,
+# resolve the actual Git for Windows installation and the actual hook path.
+_WINDOWS_BASH='C:\Program Files\Git\bin\bash.exe'
+_WINDOWS_WRAPPER='%USERPROFILE%\.codex\hooks\mcp-agent-mail\hook_wrapper.sh'
+# A Windows Codex desktop can share CODEX_HOME with this installer through a
+# /mnt/<drive> WSL path.  commandWindows must point back to that exact profile,
+# not assume it lives below the WSL user's unrelated HOME.
+if [[ "$HOOK_WRAPPER" == /mnt/[a-zA-Z]/* ]]; then
+  if ! command -v wslpath >/dev/null 2>&1; then
+    log_err "CODEX_HOME is on a Windows drive, but wslpath is unavailable."
+    exit 1
   fi
-
-  # register_agent - DON'T pass a name, let server auto-generate adjective+noun name
-  # Capture response to extract the generated name
-  _REGISTER_RESPONSE=$(curl -sS --connect-timeout 2 --max-time 5 --retry 0 -H "Content-Type: application/json" "${_AUTH_ARGS[@]}" \
-      -d "{\"jsonrpc\":\"2.0\",\"id\":\"2\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":${_HUMAN_KEY_ESCAPED},\"program\":\"codex-cli\",\"model\":\"gpt-5-codex\",\"task_description\":\"setup\"}}}" \
-      "${_URL}" 2>/dev/null || echo "")
-
-  _REG_TOKEN=""
-  if [[ -n "${_REGISTER_RESPONSE}" ]]; then
-    # Extract agent name + registration_token from JSON response using jq or Python
-    if command -v jq >/dev/null 2>&1; then
-      _AGENT=$(echo "${_REGISTER_RESPONSE}" | jq -r '.result.content[0].text // empty' 2>/dev/null | jq -r '.name // empty' 2>/dev/null || echo "")
-      _REG_TOKEN=$(echo "${_REGISTER_RESPONSE}" | jq -r '.result.content[0].text // empty' 2>/dev/null | jq -r '.registration_token // empty' 2>/dev/null || echo "")
-    else
-      _AGENT=$(echo "${_REGISTER_RESPONSE}" | uv run python -c 'import sys,json; r=json.load(sys.stdin); c=r.get("result",{}).get("content",[]); print(json.loads(c[0]["text"])["name"] if c else "")' 2>/dev/null || echo "")
-      _REG_TOKEN=$(echo "${_REGISTER_RESPONSE}" | uv run python -c 'import sys,json; r=json.load(sys.stdin); c=r.get("result",{}).get("content",[]); print(json.loads(c[0]["text"]).get("registration_token","") if c else "")' 2>/dev/null || echo "")
+  _WINDOWS_BASH=''
+  if [[ -n "${AGENT_MAIL_GIT_BASH_PATH:-}" ]]; then
+    case "$AGENT_MAIL_GIT_BASH_PATH" in
+      [a-zA-Z]:\\*|[a-zA-Z]:/*)
+        _candidate="$(wslpath -u "$AGENT_MAIL_GIT_BASH_PATH" 2>/dev/null)" || {
+          log_err "Could not normalize AGENT_MAIL_GIT_BASH_PATH."
+          exit 1
+        } ;;
+      /*) _candidate="$AGENT_MAIL_GIT_BASH_PATH" ;;
+      *)
+        log_err "AGENT_MAIL_GIT_BASH_PATH must be an absolute Windows or WSL path."
+        exit 1 ;;
+    esac
+    if [[ ! -x "$_candidate" ]]; then
+      log_err "AGENT_MAIL_GIT_BASH_PATH is not an executable Git Bash: ${AGENT_MAIL_GIT_BASH_PATH}"
+      exit 1
     fi
-    if [[ -n "${_AGENT}" ]]; then
-      log_ok "Registered agent: ${_AGENT}"
-    else
-      log_warn "Could not parse agent name from response"
-    fi
-    if [[ -z "${_REG_TOKEN}" ]]; then
-      log_warn "Could not parse registration_token from register_agent response."
-      log_warn "The notify hook will silently no-op until this is set (fetch_inbox auth)."
-    fi
+    _WINDOWS_BASH="$(wslpath -w "$_candidate" 2>/dev/null)" || {
+      log_err "Could not translate AGENT_MAIL_GIT_BASH_PATH for Windows."
+      exit 1
+    }
   else
-    log_warn "Failed to register agent"
+    for _candidate in "/mnt/c/Program Files/Git/bin/bash.exe" "/mnt/c/Program Files (x86)/Git/bin/bash.exe"; do
+      if [[ -x "$_candidate" ]]; then
+        _WINDOWS_BASH="$(wslpath -w "$_candidate" 2>/dev/null)" || {
+          log_err "Could not translate Git Bash for Windows."
+          exit 1
+        }
+        break
+      fi
+    done
   fi
-else
-  _rc=1; log_warn "Server not reachable. Start with: uv run python -m mcp_agent_mail.cli serve-http"
-  log_warn "Hooks will be configured without agent name. Agent will need to call register_agent at session start."
+  if [[ -z "$_WINDOWS_BASH" ]]; then
+    log_err "CODEX_HOME is shared with Windows, but Git for Windows bash.exe was not found."
+    log_err "For a per-user, non-C: or custom install, set AGENT_MAIL_GIT_BASH_PATH explicitly."
+    exit 1
+  fi
+  _WINDOWS_WRAPPER="$(wslpath -w "$HOOK_WRAPPER" 2>/dev/null)" || {
+    log_err "Could not translate the Codex hook wrapper path for Windows."
+    exit 1
+  }
 fi
-
-# If we still don't have an agent name, warn the user
-_PROJ_DISPLAY=$(basename "$TARGET_DIR")
-if [[ -z "${_AGENT}" ]]; then
-  _AGENT="YOUR_AGENT_NAME"
-  log_warn "No agent name available (server not running). Using placeholder '${_AGENT}'."
-  log_warn "Hooks with placeholder values will silently skip execution."
-  log_warn "After starting the server, reconfigure integration."
-fi
-
-echo
-log_step "Installing notify handler for inbox reminders"
-HOOKS_DIR="${TARGET_DIR}/.codex/hooks"
-mkdir -p "${HOOKS_DIR}"
-NOTIFY_HOOK="${HOOKS_DIR}/notify_inbox.sh"
-if [[ -f "${ROOT_DIR}/scripts/hooks/codex_notify.sh" ]]; then
-  cp "${ROOT_DIR}/scripts/hooks/codex_notify.sh" "${NOTIFY_HOOK}"
-  chmod +x "${NOTIFY_HOOK}"
-  log_ok "Installed notify handler to ${NOTIFY_HOOK}"
-else
-  log_warn "Could not find codex_notify.sh script"
-fi
-
-# Build the notify command with environment variables wrapper.
-# AGENT_MAIL_REGISTRATION_TOKEN is required for fetch_inbox to authenticate
-# from a notify invocation (each fires its own curl POST and bypasses any
-# persistent MCP-session state).
-NOTIFY_WRAPPER="${HOOKS_DIR}/notify_wrapper.sh"
-write_atomic "$NOTIFY_WRAPPER" <<SH
-#!/usr/bin/env bash
-export AGENT_MAIL_PROJECT='${TARGET_DIR}'
-export AGENT_MAIL_AGENT='${_AGENT}'
-export AGENT_MAIL_URL='${_URL}'
-export AGENT_MAIL_TOKEN='${_TOKEN}'
-export AGENT_MAIL_REGISTRATION_TOKEN='${_REG_TOKEN:-}'
-export AGENT_MAIL_INTERVAL='120'
-exec '${NOTIFY_HOOK}' "\$@"
-SH
-chmod +x "$NOTIFY_WRAPPER"
-
-log_step "Registering MCP server in Codex CLI config"
-# Update user-level ~/.codex/config.toml
-CODEX_DIR="${HOME}/.codex"
-mkdir -p "$CODEX_DIR"
-USER_TOML="${CODEX_DIR}/config.toml"
-backup_file "$USER_TOML"
-
-# Add notify configuration FIRST (top-level keys must come before sections in TOML)
-# We need to prepend it if it doesn't exist, to ensure it's at the top level
-if ! grep -q "^notify = " "$USER_TOML" 2>/dev/null; then
-  # Create temp file with notify at top, then append existing content
-  _TEMP_TOML=$(mktemp)
-  {
-    echo "# Notify hook for agent inbox reminders (fires on agent-turn-complete)"
-    echo "notify = [\"${NOTIFY_WRAPPER}\"]"
-    echo ""
-    if [[ -f "$USER_TOML" ]]; then
-      cat "$USER_TOML"
+case "$(uname -s 2>/dev/null || printf unknown)" in
+  MINGW*|MSYS*|CYGWIN*)
+    command -v cygpath >/dev/null 2>&1 || {
+      log_err "Windows detected but cygpath is unavailable."
+      exit 1
+    }
+    _WINDOWS_BASH=''
+    if [[ -n "${AGENT_MAIL_GIT_BASH_PATH:-}" ]]; then
+      case "$AGENT_MAIL_GIT_BASH_PATH" in
+        [a-zA-Z]:\\*|[a-zA-Z]:/*)
+          _candidate="$(cygpath -u "$AGENT_MAIL_GIT_BASH_PATH" 2>/dev/null)" || {
+            log_err "Could not normalize AGENT_MAIL_GIT_BASH_PATH."
+            exit 1
+          } ;;
+        /*) _candidate="$AGENT_MAIL_GIT_BASH_PATH" ;;
+        *)
+          log_err "AGENT_MAIL_GIT_BASH_PATH must be an absolute Windows or Git Bash path."
+          exit 1 ;;
+      esac
+      if [[ ! -x "$_candidate" ]]; then
+        log_err "AGENT_MAIL_GIT_BASH_PATH is not an executable Git Bash: ${AGENT_MAIL_GIT_BASH_PATH}"
+        exit 1
+      fi
+      _WINDOWS_BASH="$(cygpath -w "$_candidate" 2>/dev/null)" || {
+        log_err "Could not translate AGENT_MAIL_GIT_BASH_PATH for Windows."
+        exit 1
+      }
+    else
+      _current_bash="$(command -v bash 2>/dev/null || true)"
+      for _candidate in "$_current_bash" "/c/Program Files/Git/bin/bash.exe" "/c/Program Files (x86)/Git/bin/bash.exe"; do
+        if [[ -n "$_candidate" && -x "$_candidate" ]]; then
+          _WINDOWS_BASH="$(cygpath -w "$_candidate" 2>/dev/null)" || {
+            log_err "Could not translate Git Bash for Windows."
+            exit 1
+          }
+          break
+        fi
+      done
     fi
-  } > "$_TEMP_TOML"
-  mv "$_TEMP_TOML" "$USER_TOML"
-  log_ok "Added notify configuration to ${USER_TOML}"
-else
-  log_warn "notify already configured in ${USER_TOML}, skipping"
+    if [[ -z "$_WINDOWS_BASH" ]]; then
+      log_err "Windows detected but Git for Windows bash.exe was not found."
+      log_err "For a per-user or custom install, set AGENT_MAIL_GIT_BASH_PATH explicitly."
+      exit 1
+    fi
+    _WINDOWS_WRAPPER="$(cygpath -w "$HOOK_WRAPPER" 2>/dev/null)" || {
+      log_err "Could not translate the Codex hook wrapper path for Windows."
+      exit 1
+    }
+    ;;
+esac
+_windows_hook_command() {
+  printf '"%s" "%s" %s' "$_WINDOWS_BASH" "$_WINDOWS_WRAPPER" "$1"
+}
+
+SESSION_START_GROUP="$(jq -nc \
+  --arg command "$(_posix_hook_command session-start)" \
+  --arg command_windows "$(_windows_hook_command session-start)" \
+  '{matcher:"startup|resume|clear|compact",hooks:[{
+    type:"command",command:$command,commandWindows:$command_windows,
+    timeout:20,statusMessage:"Connecting Agent Mail",additionalContextLimit:2500
+  }]}')"
+STOP_GROUP="$(jq -nc \
+  --arg command "$(_posix_hook_command stop)" \
+  --arg command_windows "$(_windows_hook_command stop)" \
+  '{hooks:[{
+    type:"command",command:$command,commandWindows:$command_windows,
+    timeout:20,statusMessage:"Checking Agent Mail inbox"
+  }]}')"
+SESSION_END_GROUP="$(jq -nc \
+  --arg command "$(_posix_hook_command session-end)" \
+  --arg command_windows "$(_windows_hook_command session-end)" \
+  '{matcher:"other",hooks:[{
+    type:"command",command:$command,commandWindows:$command_windows,
+    timeout:3,statusMessage:"Closing Agent Mail session"
+  }]}')"
+
+# Remove only commands managed by this integration, then append one canonical
+# group for each lifecycle event.  Foreign handlers in the same matcher group
+# survive, and re-running the installer cannot duplicate the managed set.
+MERGED_HOOKS="$(printf '%s' "$EXISTING_HOOKS" | jq \
+  --argjson session_start "$SESSION_START_GROUP" \
+  --argjson stop "$STOP_GROUP" \
+  --argjson session_end "$SESSION_END_GROUP" '
+  def agent_mail_handler:
+    (((.command? // "") + "\n" + (.commandWindows? // .command_windows? // ""))
+      | ascii_downcase | gsub("\\\\"; "/")) as $command
+    | ($command | contains("mcp-agent-mail/")) and
+      ($command | test("(codex_notify|notify_wrapper|notify_inbox|hook_wrapper|agent_mail_hook)[.]sh"));
+  def clean_groups:
+    map(
+      if (.hooks | type) == "array" then
+        .hooks |= map(select(agent_mail_handler | not))
+      else . end
+    )
+    | map(select((.hooks | type) != "array" or (.hooks | length) > 0));
+  if type != "object" then error("hooks.json root must be an object") else . end
+  | if has("hooks") and (.hooks | type) != "object" then
+      error("hooks must be an object")
+    else .hooks = (.hooks // {}) end
+  | .hooks |= with_entries(
+      if (.value | type) == "array" then .value |= clean_groups else . end
+    )
+  | .hooks.SessionStart = ((.hooks.SessionStart // []) + [$session_start])
+  | .hooks.Stop = ((.hooks.Stop // []) + [$stop])
+  | .hooks.SessionEnd = ((.hooks.SessionEnd // []) + [$session_end])
+  | if has("description") then . else
+      .description = "User-level MCP Agent Mail lifecycle hooks"
+    end
+')" || {
+  log_err "Could not merge ${USER_HOOKS}; existing hooks were left unchanged."
+  exit 1
+}
+if ! printf '%s' "$MERGED_HOOKS" | jq -e '
+    def valid_handler:
+      type == "object" and
+      ((has("command") | not) or (.command | type == "string")) and
+      ((has("commandWindows") | not) or (.commandWindows | type == "string")) and
+      ((has("command_windows") | not) or (.command_windows | type == "string"));
+    def valid_group:
+      type == "object" and
+      (.hooks | type == "array") and
+      all(.hooks[]; valid_handler);
+    type == "object" and
+    (.hooks | type == "object") and
+    all(.hooks[]; type == "array" and all(.[]; valid_group))
+  ' >/dev/null; then
+  log_err "Generated invalid nested hook JSON for ${USER_HOOKS}; no user configuration was changed."
+  exit 1
 fi
 
-# Ensure MCP server section exists and points at the detected endpoint (idempotent).
-# Always upsert the MCP URL in-place.
-# Rationale: older installs wrote /mcp/ but the server defaults to /api/. Re-running this installer
-# should fix stale URLs automatically without requiring users to edit config by hand.
-_UPDATED_USER_TOML="$(uv run python - "$USER_TOML" "$_URL" "$_MORPH_API_KEY" "$_MORPH_ENABLED_TOOLS" <<'PY'
+# Parse and re-emit TOML semantically rather than using table-header regexes.
+# This accepts valid spaced/quoted/dotted headers, inline mcp_servers tables and
+# nested http_headers tables.  Foreign values survive the round trip; only the
+# managed URL, Authorization header, legacy auth keys and managed notify entry
+# are changed.  uv is pinned to this repository and an isolated Python 3.14, so
+# a caller's pyproject, environment and lockfile are never discovered or synced.
+_UV_PYTHON=(
+  uv run --directory "$ROOT_DIR" --project "$ROOT_DIR"
+  --isolated --no-cache --no-sync --no-env-file --python 3.14 python
+)
+if ! UPDATED_USER_TOML="$(
+  AGENT_MAIL_INSTALL_URL="$_URL" \
+  AGENT_MAIL_INSTALL_AUTHORIZATION="Bearer $_TOKEN" \
+  "${_UV_PYTHON[@]}" - "$USER_TOML" 2>/dev/null <<'PY'
+from __future__ import annotations
+
+import datetime as dt
+import json
+import math
+import os
 import re
 import sys
+import tomllib
 from pathlib import Path
+from typing import Any
 
 path = Path(sys.argv[1])
-url = sys.argv[2]
-morph_key = sys.argv[3]
-morph_enabled = sys.argv[4]
+url = os.environ.get("AGENT_MAIL_INSTALL_URL", "")
+authorization = os.environ.get("AGENT_MAIL_INSTALL_AUTHORIZATION", "")
+if not url or not authorization:
+    raise SystemExit("missing managed MCP settings")
 
 try:
     text = path.read_text(encoding="utf-8")
 except FileNotFoundError:
     text = ""
-except Exception:
-    text = path.read_text(encoding="utf-8", errors="replace")
+data = tomllib.loads(text)
+if not isinstance(data, dict):
+    raise SystemExit("TOML root must be a table")
 
-lines = text.splitlines(keepends=True)
-
-agent_header_re = re.compile(
-    r'^\s*\[mcp_servers(?:\.mcp_agent_mail|\."mcp_agent_mail"|\.\'mcp_agent_mail\'|\.mcp-agent-mail|\."mcp-agent-mail"|\.\'mcp-agent-mail\')\]\s*(?:#.*)?$'
-)
-morph_env_header_re = re.compile(
-    r'^\s*\[mcp_servers(?:\.morph-mcp|\."morph-mcp"|\.\'morph-mcp\'|\.morph_mcp|\."morph_mcp"|\.\'morph_mcp\')\.env\]\s*(?:#.*)?$'
-)
-morph_header_re = re.compile(
-    r'^\s*\[mcp_servers(?:\.morph-mcp|\."morph-mcp"|\.\'morph-mcp\'|\.morph_mcp|\."morph_mcp"|\.\'morph_mcp\')\]\s*(?:#.*)?$'
-)
-table_header_re = re.compile(r"^\s*\[.*\]\s*(?:#.*)?$")
-url_line_re = re.compile(
-    r'^(?P<indent>\s*)url\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s#]+)(?P<comment>\s*#.*)?\s*$'
-)
-command_line_re = re.compile(
-    r'^(?P<indent>\s*)command\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s#]+)(?P<comment>\s*#.*)?\s*$'
-)
-args_line_re = re.compile(
-    r'^(?P<indent>\s*)args\s*=\s*\[[^\]]*\](?P<comment>\s*#.*)?\s*$'
-)
-enabled_line_re = re.compile(
-    r'^(?P<indent>\s*)ENABLED_TOOLS\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s#]+)(?P<comment>\s*#.*)?\s*$'
-)
-key_line_re = re.compile(
-    r'^(?P<indent>\s*)MORPH_API_KEY\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s#]+)(?P<comment>\s*#.*)?\s*$'
+managed_hook_names = (
+    "codex_notify.sh",
+    "notify_wrapper.sh",
+    "notify_inbox.sh",
+    "hook_wrapper.sh",
+    "agent_mail_hook.sh",
 )
 
-out: list[str] = []
-mode: str | None = None
-agent_found = False
-morph_found = False
-morph_env_found = False
-url_written = False
-command_written = False
-args_written = False
-enabled_written = False
-key_written = False
+
+def managed_notify(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.lower().replace("\\", "/")
+    return "mcp-agent-mail/" in normalized and any(
+        name in normalized for name in managed_hook_names
+    )
 
 
-def emit_url(indent: str = "", comment: str = "") -> None:
-    out.append(f'{indent}url = "{url}"{comment}\n')
+notify = data.get("notify")
+if isinstance(notify, list):
+    kept_notify = [value for value in notify if not managed_notify(value)]
+    if kept_notify:
+        data["notify"] = kept_notify
+    else:
+        data.pop("notify", None)
+elif managed_notify(notify):
+    data.pop("notify", None)
+
+servers = data.get("mcp_servers")
+if servers is None:
+    servers = {}
+elif not isinstance(servers, dict):
+    raise SystemExit("mcp_servers must be a table")
+else:
+    servers = dict(servers)
+
+managed_keys = [
+    key for key in ("mcp_agent_mail", "mcp-agent-mail") if key in servers
+]
+if len(managed_keys) > 1:
+    raise SystemExit("multiple managed MCP server aliases")
+managed_key = managed_keys[0] if managed_keys else "mcp_agent_mail"
+managed = servers.get(managed_key, {})
+if not isinstance(managed, dict):
+    raise SystemExit("managed MCP server must be a table")
+managed = dict(managed)
+
+headers = managed.get("http_headers", {})
+if not isinstance(headers, dict):
+    raise SystemExit("managed http_headers must be a table")
+headers = dict(headers)
+headers["Authorization"] = authorization
+managed["url"] = url
+managed["http_headers"] = headers
+managed.pop("bearer_token_env_var", None)
+managed.pop("env_http_headers", None)
+servers[managed_key] = managed
+data["mcp_servers"] = servers
+
+bare_key_re = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
-def emit_command(indent: str = "", comment: str = "") -> None:
-    out.append(f'{indent}command = "npx"{comment}\n')
+def format_key(key: str) -> str:
+    if bare_key_re.fullmatch(key):
+        return key
+    return json.dumps(key, ensure_ascii=False)
 
 
-def emit_args(indent: str = "", comment: str = "") -> None:
-    out.append(f'{indent}args = ["-y", "@morphllm/morphmcp"]{comment}\n')
+def format_path(parts: tuple[str, ...]) -> str:
+    return ".".join(format_key(part) for part in parts)
 
 
-def emit_enabled(indent: str = "", comment: str = "") -> None:
-    out.append(f'{indent}ENABLED_TOOLS = "{morph_enabled}"{comment}\n')
+def is_array_of_tables(value: object) -> bool:
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(item, dict) for item in value)
+    )
 
 
-def emit_key(indent: str = "", comment: str = "") -> None:
-    out.append(f'{indent}MORPH_API_KEY = "{morph_key}"{comment}\n')
+def format_value(value: Any) -> str:
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "nan"
+        if math.isinf(value):
+            return "-inf" if value < 0 else "inf"
+        return repr(value)
+    if isinstance(value, dt.datetime | dt.date | dt.time):
+        return value.isoformat()
+    if isinstance(value, list):
+        return "[" + ", ".join(format_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        entries = ", ".join(
+            f"{format_key(str(key))} = {format_value(item)}"
+            for key, item in value.items()
+        )
+        return "{ " + entries + " }"
+    raise TypeError(f"unsupported TOML value type: {type(value).__name__}")
 
 
-def flush_section() -> None:
-    global mode
-
-    if mode == "agent" and not url_written:
-        emit_url()
-    elif mode == "morph" and morph_key:
-        if not command_written:
-            emit_command()
-        if not args_written:
-            emit_args()
-    elif mode == "morph_env" and morph_key:
-        if not enabled_written:
-            emit_enabled()
-        if not key_written:
-            emit_key()
-
-    mode = None
+output: list[str] = []
 
 
-for line in lines:
-    if mode and table_header_re.match(line):
-        flush_section()
+def blank_line() -> None:
+    if output and output[-1] != "":
+        output.append("")
 
-    if morph_env_header_re.match(line):
-        mode = "morph_env"
-        morph_env_found = True
-        enabled_written = False
-        key_written = False
-        out.append(line if line.endswith("\n") else line + "\n")
-        continue
 
-    if morph_header_re.match(line):
-        mode = "morph"
-        morph_found = True
-        command_written = False
-        args_written = False
-        out.append(line if line.endswith("\n") else line + "\n")
-        continue
+def split_items(table: dict[str, Any]) -> tuple[
+    list[tuple[str, Any]],
+    list[tuple[str, dict[str, Any]]],
+    list[tuple[str, list[dict[str, Any]]]],
+]:
+    scalar_items: list[tuple[str, Any]] = []
+    child_tables: list[tuple[str, dict[str, Any]]] = []
+    array_tables: list[tuple[str, list[dict[str, Any]]]] = []
+    for key, value in table.items():
+        if isinstance(value, dict):
+            child_tables.append((key, value))
+        elif is_array_of_tables(value):
+            array_tables.append((key, value))
+        else:
+            scalar_items.append((key, value))
+    return scalar_items, child_tables, array_tables
 
-    if agent_header_re.match(line):
-        mode = "agent"
-        agent_found = True
-        url_written = False
-        out.append(line if line.endswith("\n") else line + "\n")
-        continue
 
-    if mode == "agent":
-        m = url_line_re.match(line.rstrip("\r\n"))
-        if m:
-            emit_url(indent=m.group("indent") or "", comment=m.group("comment") or "")
-            url_written = True
-            continue
+def emit_table(table: dict[str, Any], path_parts: tuple[str, ...]) -> None:
+    scalar_items, child_tables, array_tables = split_items(table)
+    blank_line()
+    output.append(f"[{format_path(path_parts)}]")
+    output.extend(
+        f"{format_key(key)} = {format_value(value)}"
+        for key, value in scalar_items
+    )
+    for key, child in child_tables:
+        emit_table(child, (*path_parts, key))
+    for key, items in array_tables:
+        emit_array_table(items, (*path_parts, key))
 
-    if mode == "morph":
-        m = command_line_re.match(line.rstrip("\r\n"))
-        if m:
-            emit_command(indent=m.group("indent") or "", comment=m.group("comment") or "")
-            command_written = True
-            continue
 
-        m = args_line_re.match(line.rstrip("\r\n"))
-        if m:
-            emit_args(indent=m.group("indent") or "", comment=m.group("comment") or "")
-            args_written = True
-            continue
+def emit_array_table(
+    items: list[dict[str, Any]], path_parts: tuple[str, ...]
+) -> None:
+    for item in items:
+        scalar_items, child_tables, array_tables = split_items(item)
+        blank_line()
+        output.append(f"[[{format_path(path_parts)}]]")
+        output.extend(
+            f"{format_key(key)} = {format_value(value)}"
+            for key, value in scalar_items
+        )
+        for key, child in child_tables:
+            emit_table(child, (*path_parts, key))
+        for key, nested_items in array_tables:
+            emit_array_table(nested_items, (*path_parts, key))
 
-    if mode == "morph_env":
-        m = enabled_line_re.match(line.rstrip("\r\n"))
-        if m:
-            emit_enabled(indent=m.group("indent") or "", comment=m.group("comment") or "")
-            enabled_written = True
-            continue
 
-        m = key_line_re.match(line.rstrip("\r\n"))
-        if m:
-            emit_key(indent=m.group("indent") or "", comment=m.group("comment") or "")
-            key_written = True
-            continue
+root_scalars, root_tables, root_array_tables = split_items(data)
+output.extend(
+    f"{format_key(key)} = {format_value(value)}"
+    for key, value in root_scalars
+)
+for key, table in root_tables:
+    emit_table(table, (key,))
+for key, items in root_array_tables:
+    emit_array_table(items, (key,))
 
-    out.append(line if line.endswith("\n") else line + "\n")
-
-if mode:
-    flush_section()
-
-if not agent_found:
-    if out and out[-1].strip():
-        out.append("\n")
-    out.append("# MCP servers configuration (mcp-agent-mail)\n")
-    out.append("[mcp_servers.mcp_agent_mail]\n")
-    emit_url()
-
-if morph_key and not morph_found:
-    if out and out[-1].strip():
-        out.append("\n")
-    out.append("# Morph MCP configuration (grep-only to avoid edit-file billing)\n")
-    out.append("[mcp_servers.morph-mcp]\n")
-    emit_command()
-    emit_args()
-
-if morph_key and not morph_env_found:
-    if out and out[-1].strip():
-        out.append("\n")
-    out.append("[mcp_servers.morph-mcp.env]\n")
-    emit_enabled()
-    emit_key()
-
-sys.stdout.write("".join(out))
+updated = "\n".join(output).rstrip() + "\n"
+round_trip = tomllib.loads(updated)
+round_trip_server = round_trip["mcp_servers"][managed_key]
+if round_trip_server["url"] != url:
+    raise SystemExit("managed URL did not round-trip")
+if round_trip_server["http_headers"]["Authorization"] != authorization:
+    raise SystemExit("managed Authorization did not round-trip")
+sys.stdout.write(updated)
 PY
-)"
-
-# Write atomically so partially-written configs never happen.
-write_atomic "$USER_TOML" <<<"$_UPDATED_USER_TOML"
-
-# Also write project-local .codex/config.toml for portability
-LOCAL_CODEX_DIR="${TARGET_DIR}/.codex"
-mkdir -p "$LOCAL_CODEX_DIR"
-LOCAL_TOML="${LOCAL_CODEX_DIR}/config.toml"
-
-# Backup before writing
-if [[ -f "$LOCAL_TOML" ]]; then
-  backup_file "$LOCAL_TOML"
+)"; then
+  log_err "Existing ${USER_TOML} is invalid or could not be merged; no user configuration was changed."
+  exit 1
 fi
 
-# IMPORTANT: In TOML, top-level keys must come BEFORE any [section] headers
-# The notify key must be at the very top, before [mcp_servers.mcp_agent_mail]
-write_atomic "$LOCAL_TOML" <<TOML
-# Project-local Codex configuration
-# NOTE: Top-level keys must appear BEFORE any [section] headers in TOML
-
-# Notify hook for agent inbox reminders (fires on agent-turn-complete)
-notify = ["${NOTIFY_WRAPPER}"]
-
-# MCP servers configuration
-[mcp_servers.mcp_agent_mail]
-url = "${_URL}"
-# headers can be added if needed; localhost allowed without Authorization
-$(if [[ -n "${_MORPH_API_KEY}" ]]; then cat <<TOMLFRAG
-
-[mcp_servers.morph-mcp]
-command = "npx"
-args = ["-y", "@morphllm/morphmcp"]
-
-[mcp_servers.morph-mcp.env]
-ENABLED_TOOLS = "${_MORPH_ENABLED_TOOLS}"
-MORPH_API_KEY = "${_MORPH_API_KEY}"
-TOMLFRAG
-fi)
-TOML
-set_secure_file "$LOCAL_TOML" || true
-
-log_ok "==> Done."
-if [[ -n "${_AGENT}" ]]; then
-  _print "Your agent name is: ${_AGENT}"
+# Every prospective output has now been parsed or syntax-checked in memory.
+# A dry run stops before backups, mkdir, chmod, or any file publication.
+if [[ "$DRY_RUN" == "1" ]]; then
+  _print "[dry-run] write shared Agent Mail URL/bearer"
+  _print "[dry-run] install Codex lifecycle scripts under ${HOOKS_DIR}"
+  _print "[dry-run] merge Codex hooks into ${USER_HOOKS}"
+  _print "[dry-run] merge Codex MCP into ${USER_TOML}"
+  _print "[dry-run] no files or directories were changed"
+  exit 0
 fi
-_print "Codex CLI should now be configured to use MCP Agent Mail."
-if [[ ${_SERVER_AVAILABLE} -eq 0 ]]; then
-  _print "Remember to start the server: uv run python -m mcp_agent_mail.cli serve-http"
-fi
+
+for _config in "$USER_HOOKS" "$USER_TOML"; do
+  backup_user_file "$_config" || exit 1
+done
+
+log_step "Writing shared server settings"
+write_shared_agent_mail_env "${_URL}" "${_TOKEN}" || {
+  log_err "Could not write ${SHARED_ENV_FILE}"
+  exit 1
+}
+
+log_step "Installing Codex lifecycle scripts"
+write_atomic "$HOOK_RUNTIME" < "${ROOT_DIR}/scripts/hooks/codex_notify.sh"
+set_secure_exec "$HOOK_RUNTIME" || exit 1
+write_atomic "${HOOKS_DIR}/agent_mail_common.sh" \
+  < "${ROOT_DIR}/scripts/hooks/agent_mail_common.sh"
+set_secure_file "${HOOKS_DIR}/agent_mail_common.sh" || exit 1
+write_atomic "$HOOK_WRAPPER" <<<"$CODEX_WRAPPER_CONTENT"
+set_secure_exec "$HOOK_WRAPPER" || exit 1
+
+write_atomic "$USER_HOOKS" <<<"$MERGED_HOOKS"
+set_secure_file "$USER_HOOKS" || true
+write_atomic "$USER_TOML" <<<"$UPDATED_USER_TOML"
+set_secure_file "$USER_TOML" || true
+
+log_ok "==> Codex user integration complete."
+_print "Codex config: ${USER_TOML}"
+_print "Codex hooks: ${USER_HOOKS}"
+_print "Lifecycle scripts: ${HOOKS_DIR}"
+_print "Identity template: ${_AGENT}; registration is activation-gated and migration-safe."
+_print "Open /hooks in Codex and trust the new or changed user hook definitions before use."

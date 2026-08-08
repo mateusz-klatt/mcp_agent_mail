@@ -28,25 +28,36 @@ import sys
 import threading as _threading
 import time
 import weakref
+from collections import deque
 from collections.abc import Mapping
+from concurrent.futures import Future as ConcurrentFuture
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator, Iterable, Sequence, TypeVar, cast
 
 from filelock import SoftFileLock, Timeout
 from git import Actor, Repo
+from git.exc import GitCommandError
 from git.objects.tree import Tree
 from PIL import Image
 
 from .config import Settings
 from .db import get_sqlite_pre_restore_path, get_sqlite_sidecar_paths
-from .utils import validate_thread_id_format
+from .utils import (
+    validate_agent_name_format,
+    validate_client_platform_host_agent_id,
+    validate_explicit_agent_id,
+    validate_thread_id_format,
+)
 
 _logger = logging.getLogger(__name__)
 _IMAGE_PATTERN = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<path>[^)]+)\)")
 _SUBJECT_SLUG_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+IDENTITY_RENAMES_FILENAME = "identity_renames.json"
+IDENTITY_TOMBSTONES_DIRNAME = "identity_tombstones"
+_IDENTITY_RENAME_SCHEMA_VERSION = 1
 
 
 def _sanitize_backup_reason(reason: str) -> str:
@@ -558,64 +569,68 @@ class _LRURepoCache:
         self._order: list[str] = []  # LRU order: oldest first
         self._evicted: list[tuple[Repo, float]] = []  # (repo, eviction_timestamp) pairs
         self._cleanup_counter: int = 0  # Track operations for periodic cleanup
+        self._guard = _threading.RLock()
 
     def peek(self, key: str) -> Repo | None:
         """Check if key exists and return value WITHOUT updating LRU order.
 
-        Safe to call without holding the external lock for a fast-path check.
+        The cache's process-wide re-entrant lock protects this fast-path read.
         """
-        return self._cache.get(key)
+        with self._guard:
+            return self._cache.get(key)
 
     def get(self, key: str) -> Repo | None:
         """Get a repo from cache, updating LRU order.
 
-        Should only be called while holding the external lock.
-        Also performs opportunistic cleanup of evicted repos.
+        Also performs opportunistic cleanup of evicted repos while holding the
+        cache's process-wide lock.
         """
-        if key in self._cache:
-            # Move to end (most recently used)
-            with contextlib.suppress(ValueError):
-                self._order.remove(key)
-            self._order.append(key)
-            # Opportunistically try to clean up evicted repos every 4th access
-            self._cleanup_counter += 1
-            if self._cleanup_counter >= 4:
-                self._cleanup_counter = 0
-                self._cleanup_evicted()
-            return self._cache[key]
-        return None
+        with self._guard:
+            if key in self._cache:
+                # Move to end (most recently used)
+                with contextlib.suppress(ValueError):
+                    self._order.remove(key)
+                self._order.append(key)
+                # Opportunistically try to clean up evicted repos every 4th access
+                self._cleanup_counter += 1
+                if self._cleanup_counter >= 4:
+                    self._cleanup_counter = 0
+                    self._cleanup_evicted()
+                return self._cache[key]
+            return None
 
     def put(self, key: str, repo: Repo) -> None:
         """Add a repo to cache, evicting oldest if at capacity.
 
-        Should only be called while holding the external lock.
-        Evicted repos are added to a pending list for later cleanup.
+        Evicted repos are added to a pending list for later cleanup. The cache's
+        process-wide lock serializes mutations from independent event loops.
 
         Note: If the key already exists, only the LRU order is updated;
         the cached repo value is NOT replaced. This is intentional since
         the cache is only used by _ensure_repo which checks existence first.
         """
-        if key in self._cache:
-            # Already exists, just update LRU order
-            with contextlib.suppress(ValueError):
-                self._order.remove(key)
+        with self._guard:
+            if key in self._cache:
+                # Already exists, just update LRU order
+                with contextlib.suppress(ValueError):
+                    self._order.remove(key)
+                self._order.append(key)
+                return
+
+            # Evict oldest entries if at capacity
+            while len(self._cache) >= self._maxsize and self._order:
+                oldest_key = self._order.pop(0)
+                old_repo = self._cache.pop(oldest_key, None)
+                if old_repo is not None:
+                    # Don't close immediately - repo may still be in use by another coroutine
+                    # Record eviction time for time-based cleanup
+                    self._evicted.append((old_repo, time.monotonic()))
+
+            self._cache[key] = repo
             self._order.append(key)
-            return
 
-        # Evict oldest entries if at capacity
-        while len(self._cache) >= self._maxsize and self._order:
-            oldest_key = self._order.pop(0)
-            old_repo = self._cache.pop(oldest_key, None)
-            if old_repo is not None:
-                # Don't close immediately - repo may still be in use by another coroutine
-                # Record eviction time for time-based cleanup
-                self._evicted.append((old_repo, time.monotonic()))
-
-        self._cache[key] = repo
-        self._order.append(key)
-
-        # Opportunistically try to close evicted repos that are no longer referenced
-        self._cleanup_evicted()
+            # Opportunistically try to close evicted repos that are no longer referenced
+            self._cleanup_evicted()
 
     def _cleanup_evicted(self, *, force: bool = False) -> int:
         """Close evicted repos whose grace period has expired.
@@ -632,95 +647,149 @@ class _LRURepoCache:
 
         Returns count of repos closed. Logs warning if evicted list grows large.
         """
-        still_pending: list[tuple[Repo, float]] = []
-        closed = 0
-        now = time.monotonic()
-        for repo, evicted_at in self._evicted:
-            age = now - evicted_at
-            if force or age >= self.EVICTION_GRACE_SECONDS:
-                with contextlib.suppress(Exception):
-                    repo.close()
-                    closed += 1
-            else:
-                still_pending.append((repo, evicted_at))
-        self._evicted = still_pending
-        # Warn if evicted list is growing large (potential file handle pressure)
-        if len(still_pending) > self._maxsize:
-            _logger.warning(
-                "repo_cache.evicted_backlog",
-                extra={"evicted_count": len(still_pending), "maxsize": self._maxsize},
-            )
-        return closed
+        with self._guard:
+            still_pending: list[tuple[Repo, float]] = []
+            closed = 0
+            now = time.monotonic()
+            for repo, evicted_at in self._evicted:
+                age = now - evicted_at
+                if force or age >= self.EVICTION_GRACE_SECONDS:
+                    with contextlib.suppress(Exception):
+                        repo.close()
+                        closed += 1
+                else:
+                    still_pending.append((repo, evicted_at))
+            self._evicted = still_pending
+            # Warn if evicted list is growing large (potential file handle pressure)
+            if len(still_pending) > self._maxsize:
+                _logger.warning(
+                    "repo_cache.evicted_backlog",
+                    extra={"evicted_count": len(still_pending), "maxsize": self._maxsize},
+                )
+            return closed
 
     @property
     def evicted_count(self) -> int:
         """Number of evicted repos waiting to be closed."""
-        return len(self._evicted)
+        with self._guard:
+            return len(self._evicted)
 
     @property
     def stats(self) -> dict[str, int]:
         """Return cache statistics for monitoring."""
-        return {
-            "cached": len(self._cache),
-            "evicted": len(self._evicted),
-            "maxsize": self._maxsize,
-        }
+        with self._guard:
+            return {
+                "cached": len(self._cache),
+                "evicted": len(self._evicted),
+                "maxsize": self._maxsize,
+            }
 
     def __contains__(self, key: str) -> bool:
-        return key in self._cache
+        with self._guard:
+            return key in self._cache
 
     def __len__(self) -> int:
-        return len(self._cache)
+        with self._guard:
+            return len(self._cache)
 
     def clear(self) -> int:
         """Close all cached and evicted repos and clear the cache. Returns count closed."""
-        count = 0
-        # Close cached repos
-        for repo in self._cache.values():
-            with contextlib.suppress(Exception):
-                repo.close()
-                count += 1
-        self._cache.clear()
-        self._order.clear()
-        # Also close any evicted repos still in pending list
-        for repo, _evicted_at in self._evicted:
-            with contextlib.suppress(Exception):
-                repo.close()
-                count += 1
-        self._evicted.clear()
-        return count
+        with self._guard:
+            count = 0
+            # Close cached repos
+            for repo in self._cache.values():
+                with contextlib.suppress(Exception):
+                    repo.close()
+                    count += 1
+            self._cache.clear()
+            self._order.clear()
+            # Also close any evicted repos still in pending list
+            for repo, _evicted_at in self._evicted:
+                with contextlib.suppress(Exception):
+                    repo.close()
+                    count += 1
+            self._evicted.clear()
+            return count
 
     def values(self) -> list[Repo]:
         """Return list of cached repos (for iteration)."""
-        return list(self._cache.values())
+        with self._guard:
+            return list(self._cache.values())
 
 
 # LRU cache for Repo objects with automatic cleanup
 # Limits to 16 concurrent repos to prevent file handle exhaustion under heavy load
 # Increased from 8 to handle multi-project scenarios better (GitHub issue #59)
 _REPO_CACHE: _LRURepoCache = _LRURepoCache()  # Uses default maxsize=16
-_REPO_CACHE_LOCK: asyncio.Lock | None = None
 
-# Semaphore to limit concurrent repo operations (prevents FD exhaustion under high concurrency)
-# This acts as a second line of defense beyond the LRU cache
-_REPO_SEMAPHORE: asyncio.Semaphore | None = None
-_REPO_SEMAPHORE_LIMIT: int = 32  # Max concurrent repo operations
+_REPO_OPERATION_LIMIT: int = 32  # Max concurrent repository initializations
 
 
-def _get_repo_cache_lock() -> asyncio.Lock:
-    """Get or create the repo cache lock (must be called from async context)."""
-    global _REPO_CACHE_LOCK
-    if _REPO_CACHE_LOCK is None:
-        _REPO_CACHE_LOCK = asyncio.Lock()
-    return _REPO_CACHE_LOCK
+class _GlobalAsyncCapacityLimiter:
+    """Apply one process-wide capacity limit across independent event loops.
+
+    ``asyncio.Semaphore`` cannot coordinate loops running in different threads.
+    Thread-safe futures make cancellation and permit assignment an atomic race:
+    a cancelled waiter is skipped, while a waiter already granted a permit
+    returns it before propagating cancellation.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        if capacity < 1:
+            raise ValueError("capacity must be at least 1")
+        self._capacity = capacity
+        self._available = capacity
+        self._guard = _threading.Lock()
+        self._waiters: deque[ConcurrentFuture[None]] = deque()
+
+    async def acquire(self) -> None:
+        with self._guard:
+            if self._available:
+                self._available -= 1
+                return
+            waiter: ConcurrentFuture[None] = ConcurrentFuture()
+            self._waiters.append(waiter)
+
+        wrapped = asyncio.wrap_future(waiter)
+        try:
+            await asyncio.shield(wrapped)
+        except BaseException:
+            # ``cancel`` wins only while the future is still pending. If
+            # release() already marked it running, this waiter owns the permit
+            # and must return it before propagating cancellation.
+            if not waiter.cancel():
+                self.release()
+            raise
+
+    def release(self) -> None:
+        while True:
+            with self._guard:
+                waiter = self._waiters.popleft() if self._waiters else None
+                if waiter is None:
+                    if self._available >= self._capacity:
+                        raise ValueError("capacity released too many times")
+                    self._available += 1
+                    return
+
+            # Atomically claim a pending waiter. A cancelled future returns
+            # False and is discarded without consuming the released permit.
+            if waiter.set_running_or_notify_cancel():
+                waiter.set_result(None)
+                return
+
+    @asynccontextmanager
+    async def slot(self) -> AsyncIterator[None]:
+        await self.acquire()
+        try:
+            yield
+        finally:
+            self.release()
 
 
-def _get_repo_semaphore() -> asyncio.Semaphore:
-    """Get or create the repo semaphore (must be called from async context)."""
-    global _REPO_SEMAPHORE
-    if _REPO_SEMAPHORE is None:
-        _REPO_SEMAPHORE = asyncio.Semaphore(_REPO_SEMAPHORE_LIMIT)
-    return _REPO_SEMAPHORE
+_REPO_CAPACITY_LIMITER = _GlobalAsyncCapacityLimiter(_REPO_OPERATION_LIMIT)
+_REPO_SINGLE_FLIGHTS: dict[str, ConcurrentFuture[Repo]] = {}
+_REPO_CREATION_TASKS: set[asyncio.Task[Repo]] = set()
+_REPO_SINGLE_FLIGHT_GUARD = _threading.Lock()
 
 
 def get_fd_usage() -> tuple[int, int]:
@@ -729,16 +798,24 @@ def get_fd_usage() -> tuple[int, int]:
     Returns (current_count, max_limit) tuple.
     On platforms where this isn't available, returns (-1, -1).
     """
+    if sys.platform == "win32":
+        return (-1, -1)
+
     try:
         import resource
-        soft_limit, _hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+
+        getrlimit = getattr(resource, "getrlimit", None)
+        rlimit_nofile = getattr(resource, "RLIMIT_NOFILE", None)
+        if not callable(getrlimit) or rlimit_nofile is None:
+            return (-1, -1)
+        soft_limit, _hard_limit = getrlimit(rlimit_nofile)
         # Count open file descriptors by checking /proc/self/fd (Linux) or /dev/fd (macOS)
         fd_dir = Path("/dev/fd") if sys.platform == "darwin" else Path("/proc/self/fd")
         if fd_dir.exists():
             current = len(list(fd_dir.iterdir()))
-            return (current, soft_limit)
-        return (-1, soft_limit)
-    except (ImportError, OSError, AttributeError):
+            return (current, int(soft_limit))
+        return (-1, int(soft_limit))
+    except (ImportError, OSError, AttributeError, TypeError, ValueError):
         return (-1, -1)
 
 
@@ -1436,62 +1513,856 @@ async def ensure_archive(settings: Settings, slug: str) -> ProjectArchive:
     )
 
 
+async def _open_repo_cancellation_safe(factory: Any, *args: Any) -> Repo:
+    """Open a GitPython repo without losing the handle to late thread completion."""
+    worker = asyncio.create_task(asyncio.to_thread(factory, *args))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        repo: Repo | None = None
+        with contextlib.suppress(BaseException):
+            repo = await worker
+        if repo is not None:
+            with contextlib.suppress(Exception):
+                repo.close()
+        raise
+
+
+async def _create_repo_for_cache(root: Path, settings: Settings, cache_key: str) -> Repo:
+    """Create and fully initialize one cached repository under global capacity."""
+    async with _REPO_CAPACITY_LIMITER.slot():
+        cached = _REPO_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        proactive_fd_cleanup(threshold=100)
+        repo: Repo | None = None
+        cached_repo = False
+        try:
+            git_dir = root / ".git"
+            if await _to_thread(git_dir.exists):
+                repo = await _open_repo_cancellation_safe(Repo, str(root))
+            else:
+                repo = await _open_repo_cancellation_safe(Repo.init, str(root))
+
+                try:
+                    def _configure_repo() -> None:
+                        with repo.config_writer() as cw:
+                            cw.set_value("commit", "gpgsign", "false")
+
+                    await _to_thread(_configure_repo)
+                except Exception:
+                    pass
+                attributes_path = root / ".gitattributes"
+                if not await _to_thread(attributes_path.exists):
+                    await _write_text(attributes_path, "*.json text\n*.md text\n")
+                await _commit(repo, settings, "chore: initialize archive", [".gitattributes"])
+
+            _REPO_CACHE.put(cache_key, repo)
+            cached_repo = True
+            return repo
+        finally:
+            if repo is not None and not cached_repo:
+                with contextlib.suppress(Exception):
+                    repo.close()
+
+
+def _complete_repo_single_flight(
+    cache_key: str,
+    flight: ConcurrentFuture[Repo],
+    task: asyncio.Task[Repo],
+) -> None:
+    """Publish one loop-owned creation task to waiters on every event loop."""
+    try:
+        repo = task.result()
+    except asyncio.CancelledError:
+        error: BaseException = RuntimeError(f"Repository initialization was cancelled for {cache_key}")
+    except BaseException as exc:
+        error = exc
+    else:
+        error = None
+
+    if not flight.done():
+        if error is None:
+            flight.set_result(repo)
+        else:
+            flight.set_exception(error)
+
+    with _REPO_SINGLE_FLIGHT_GUARD:
+        _REPO_CREATION_TASKS.discard(task)
+        if _REPO_SINGLE_FLIGHTS.get(cache_key) is flight:
+            _REPO_SINGLE_FLIGHTS.pop(cache_key, None)
+
+
+def _get_or_start_repo_single_flight(
+    root: Path,
+    settings: Settings,
+    cache_key: str,
+) -> ConcurrentFuture[Repo]:
+    """Return the process-wide in-flight creation for ``cache_key``."""
+    with _REPO_SINGLE_FLIGHT_GUARD:
+        existing = _REPO_SINGLE_FLIGHTS.get(cache_key)
+        if existing is not None:
+            return existing
+
+        flight: ConcurrentFuture[Repo] = ConcurrentFuture()
+        task = asyncio.create_task(
+            _create_repo_for_cache(root, settings, cache_key),
+            name=f"repo-create:{cache_key}",
+        )
+        _REPO_SINGLE_FLIGHTS[cache_key] = flight
+        _REPO_CREATION_TASKS.add(task)
+        task.add_done_callback(
+            lambda completed, key=cache_key, shared=flight: _complete_repo_single_flight(
+                key,
+                shared,
+                completed,
+            )
+        )
+        return flight
+
+
 async def _ensure_repo(root: Path, settings: Settings) -> Repo:
     """Get or create a Repo for the given root, with caching to prevent file handle leaks.
 
     This function implements multiple layers of protection against file descriptor exhaustion:
     1. LRU cache limits total cached repos
-    2. Semaphore limits concurrent repo operations
+    2. A process-wide capacity limiter bounds concurrent repo initialization
     3. Proactive cleanup runs before creating new repos when FD headroom is low
     """
     cache_key = str(await _to_thread(_resolve_path, root))
 
-    # Fast path: check cache without lock using peek() which doesn't modify LRU order
-    cached = _REPO_CACHE.peek(cache_key)
+    # Fast path: the LRU owns a process-wide thread lock, so this remains safe
+    # when independent application loops run in separate threads.  A real hit
+    # must also refresh recency; using peek() here made production access order
+    # FIFO even though the cache's direct get() API behaved as an LRU.
+    cached = _REPO_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
-    # Acquire semaphore to limit concurrent repo operations
-    semaphore = _get_repo_semaphore()
-    async with semaphore:
-        # Slow path: acquire lock and check/create
-        async with _get_repo_cache_lock():
-            # Double-check after acquiring lock, use get() to update LRU order
-            cached = _REPO_CACHE.get(cache_key)
-            if cached is not None:
-                return cached
+    flight = _get_or_start_repo_single_flight(root, settings, cache_key)
+    return await asyncio.shield(asyncio.wrap_future(flight))
 
-            # Proactive cleanup: ensure we have headroom before creating a new repo
-            # This prevents hitting EMFILE by cleaning up before it's too late
-            proactive_fd_cleanup(threshold=100)
 
-            git_dir = root / ".git"
-            if git_dir.exists():
-                repo = Repo(str(root))
-                _REPO_CACHE.put(cache_key, repo)
-                return repo
+def _read_identity_rename_document_sync(project_root: Path) -> dict[str, object]:
+    """Read and validate the current identity-rename ledger."""
+    ledger_path = project_root / IDENTITY_RENAMES_FILENAME
+    if not ledger_path.exists():
+        return {"version": _IDENTITY_RENAME_SCHEMA_VERSION, "renames": []}
+    try:
+        payload = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Identity rename ledger is unreadable: {ledger_path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"Identity rename ledger must contain an object: {ledger_path}")
+    if payload.get("version") != _IDENTITY_RENAME_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported identity rename ledger version in {ledger_path}: "
+            f"{payload.get('version')!r}"
+        )
+    renames = payload.get("renames")
+    if not isinstance(renames, list) or not all(isinstance(item, dict) for item in renames):
+        raise ValueError(f"Identity rename ledger has an invalid renames list: {ledger_path}")
+    return cast(dict[str, object], payload)
 
-            # Initialize new repo and put in cache while holding the lock.
-            # Keep the returned Repo instance to avoid leaking an extra Repo handle.
-            repo = await _to_thread(Repo.init, str(root))
-            _REPO_CACHE.put(cache_key, repo)
-            # Flag that this is a newly created repo needing initialization
-            needs_init = True
 
-        # Configure the repo outside the lock (idempotent operations)
-        if needs_init:
-            try:
-                def _configure_repo() -> None:
-                    with repo.config_writer() as cw:
-                        cw.set_value("commit", "gpgsign", "false")
-                await _to_thread(_configure_repo)
-            except Exception:
-                pass
-            attributes_path = root / ".gitattributes"
-            if not attributes_path.exists():
-                await _write_text(attributes_path, "*.json text\n*.md text\n")
-            await _commit(repo, settings, "chore: initialize archive", [".gitattributes"])
-        return repo
+def _identity_rename_entries_sync(project_root: Path) -> list[dict[str, object]]:
+    document = _read_identity_rename_document_sync(project_root)
+    return [cast(dict[str, object], item) for item in cast(list[object], document["renames"])]
+
+
+def _identity_rename_tombstone_sync(
+    project_root: Path,
+    agent_name: str,
+) -> dict[str, object] | None:
+    """Resolve an old identity case-insensitively without trusting a filename alone."""
+    tombstone_root = project_root / IDENTITY_TOMBSTONES_DIRNAME
+    if not tombstone_root.is_dir():
+        return None
+    candidates = sorted(tombstone_root.glob("*.json"), key=lambda path: path.name.casefold())
+    for path in candidates:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Identity tombstone is unreadable: {path}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError(f"Identity tombstone must contain an object: {path}")
+        old_name = payload.get("old_name")
+        new_name = payload.get("new_name")
+        agent_id = payload.get("agent_id")
+        if not isinstance(old_name, str) or not isinstance(new_name, str) or not isinstance(agent_id, int):
+            raise ValueError(f"Identity tombstone is invalid: {path}")
+        if old_name.casefold() == agent_name.casefold():
+            return cast(dict[str, object], payload)
+    return None
+
+
+async def get_identity_rename_tombstone(
+    archive: ProjectArchive,
+    agent_name: str,
+) -> dict[str, object] | None:
+    """Return fail-closed rename evidence from the tombstone and/or ledger."""
+
+    def _guard_record() -> dict[str, object] | None:
+        tombstone = _identity_rename_tombstone_sync(archive.root, agent_name)
+        ledger_matches = [
+            entry
+            for entry in _identity_rename_entries_sync(archive.root)
+            if isinstance(entry.get("old_name"), str)
+            and cast(str, entry["old_name"]).casefold() == agent_name.casefold()
+        ]
+        if len(ledger_matches) > 1:
+            raise ValueError(
+                f"Identity rename ledger contains duplicate entries for '{agent_name}'"
+            )
+        ledger_entry = ledger_matches[0] if ledger_matches else None
+        if tombstone is not None and ledger_entry is not None:
+            tombstone_new = tombstone.get("new_name")
+            ledger_new = ledger_entry.get("new_name")
+            if (
+                not isinstance(tombstone_new, str)
+                or not isinstance(ledger_new, str)
+                or tombstone_new.casefold() != ledger_new.casefold()
+                or tombstone.get("agent_id") != ledger_entry.get("agent_id")
+            ):
+                raise ValueError(
+                    f"Identity rename ledger and tombstone disagree for '{agent_name}'"
+                )
+        return tombstone or ledger_entry
+
+    return await _to_thread(_guard_record)
+
+
+def _resolve_historical_identity_sync(
+    project_root: Path,
+    agent_name: str,
+    target_time: datetime,
+) -> str:
+    """Walk rename history backwards for a snapshot predating a rename."""
+    entries = _identity_rename_entries_sync(project_root)
+
+    def renamed_at(entry: dict[str, object]) -> datetime:
+        value = entry.get("renamed_at")
+        if not isinstance(value, str):
+            raise ValueError("Identity rename ledger entry is missing renamed_at")
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    resolved = agent_name
+    for entry in sorted(entries, key=renamed_at, reverse=True):
+        old_name = entry.get("old_name")
+        new_name = entry.get("new_name")
+        if not isinstance(old_name, str) or not isinstance(new_name, str):
+            raise ValueError("Identity rename ledger entry has invalid names")
+        if resolved.casefold() == new_name.casefold() and target_time < renamed_at(entry):
+            resolved = old_name
+    return resolved
+
+
+def _is_ephemeral_archive_path(path_value: str) -> bool:
+    """Return whether an untracked path is a known runtime-only artifact."""
+    normalized = path_value.replace("\\", "/")
+    path = PurePosixPath(normalized)
+    name = path.name
+    if normalized in {
+        "server.lock",
+        "server.pid",
+        ".commit.lock",
+        ".commit.lock.owner.json",
+    }:
+        return True
+    parts = path.parts
+    if len(parts) == 3 and parts[0] == "projects" and name in {
+        ".archive.lock",
+        ".archive.lock.owner.json",
+        ".commit.lock",
+        ".commit.lock.owner.json",
+    }:
+        return True
+    if (
+        len(parts) == 5
+        and parts[0] == "projects"
+        and parts[2:4] == ("messages", "threads")
+        and (
+            name.endswith(".md.lock")
+            or name.endswith(".md.lock.owner.json")
+        )
+    ):
+        return True
+    return bool(re.fullmatch(r"\..+\.\d+\.\d+\.tmp", name))
+
+
+def _archive_dirty_paths_sync(archive: ProjectArchive) -> list[str]:
+    """List meaningful staged, tracked and untracked archive changes."""
+    paths: set[str] = set()
+    # ``GIT_OPTIONAL_LOCKS=0`` prevents read-only dry-runs from refreshing and
+    # rewriting the index merely because file stat data changed. Disabling
+    # rename detection makes both sides of a directory move visible during
+    # interrupted-migration recovery.
+    with archive.repo.git.custom_environment(GIT_OPTIONAL_LOCKS="0"):
+        unstaged_output = archive.repo.git.diff_files(
+            "--name-only",
+            "--no-renames",
+            "-z",
+        )
+        staged_output = archive.repo.git.diff_index(
+            "--cached",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            "HEAD",
+        )
+        untracked_output = archive.repo.git.ls_files(
+            "--others",
+            "--exclude-standard",
+            "-z",
+        )
+    # A staged artifact is never ephemeral. In particular, silently excluding
+    # an unrelated staged ``*.lock`` would let the dedicated rename commit
+    # absorb an operator's existing index.
+    paths.update(value for value in staged_output.split("\0") if value)
+    for value in unstaged_output.split("\0"):
+        if not value:
+            continue
+        entry = archive.repo.index.entries.get((value, 0))
+        full_path = archive.repo_root / PurePosixPath(value)
+        if entry is None or not os.path.lexists(full_path):
+            paths.add(value)
+            continue
+        try:
+            with archive.repo.git.custom_environment(GIT_OPTIONAL_LOCKS="0"):
+                worktree_sha = archive.repo.git.hash_object(
+                    f"--path={value}",
+                    "--",
+                    value,
+                ).strip()
+        except GitCommandError:
+            paths.add(value)
+            continue
+        expected_executable = bool(entry.mode & 0o111)
+        actual_executable = bool(full_path.stat().st_mode & 0o111)
+        if worktree_sha != entry.binsha.hex() or (
+            full_path.is_file()
+            and expected_executable != actual_executable
+        ):
+            paths.add(value)
+    for value in untracked_output.split("\0"):
+        if not value:
+            continue
+        if not _is_ephemeral_archive_path(value):
+            paths.add(value)
+    return sorted(paths)
+
+
+async def get_archive_dirty_paths(archive: ProjectArchive) -> list[str]:
+    """Return archive changes that would make an isolated rename commit unsafe."""
+    return await _to_thread(_archive_dirty_paths_sync, archive)
+
+
+def _find_agent_directory_sync(archive: ProjectArchive, name: str) -> Path | None:
+    agents_root = archive.root / "agents"
+    if not agents_root.is_dir():
+        return None
+    matches = [
+        path
+        for path in agents_root.iterdir()
+        if path.is_dir() and path.name.casefold() == name.casefold()
+    ]
+    if len(matches) > 1:
+        raise ValueError(f"Archive contains multiple case-insensitive agent directories for '{name}'")
+    return matches[0] if matches else None
+
+
+def _profile_agent_id_sync(profile_path: Path) -> int:
+    try:
+        payload = json.loads(profile_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Agent profile is unreadable: {profile_path}") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("id"), int):
+        raise ValueError(f"Agent profile does not contain a stable integer id: {profile_path}")
+    return cast(int, payload["id"])
+
+
+def _normalize_identity_rename_boundary(value: str) -> str:
+    """Return the second-resolution UTC timestamp shared with the Git commit."""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("Identity rename boundary must be an ISO 8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _reservation_path_belongs_to_agent_at_head_sync(
+    archive: ProjectArchive,
+    relative_path: str,
+    agent_id: int,
+) -> bool:
+    """Verify that one dirty reservation path belonged to the migrating id at HEAD."""
+    try:
+        raw = archive.repo.git.show(f"HEAD:{relative_path}")
+        payload = json.loads(raw)
+    except (GitCommandError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    recorded_id = payload.get("agent_id")
+    if isinstance(recorded_id, bool):
+        return False
+    try:
+        return int(cast(Any, recorded_id)) == agent_id
+    except (TypeError, ValueError):
+        return False
+
+
+def _validate_partial_identity_rename_paths_sync(
+    archive: ProjectArchive,
+    dirty_paths: Sequence[str],
+    old_name: str,
+    new_name: str,
+    agent_id: int,
+) -> None:
+    """Accept only the exact dirty paths an interrupted rename can produce."""
+    old_prefix = (
+        (archive.root / "agents" / old_name)
+        .relative_to(archive.repo_root)
+        .as_posix()
+    )
+    new_prefix = (
+        (archive.root / "agents" / new_name)
+        .relative_to(archive.repo_root)
+        .as_posix()
+    )
+    ledger_path = (
+        (archive.root / IDENTITY_RENAMES_FILENAME)
+        .relative_to(archive.repo_root)
+        .as_posix()
+    )
+    tombstone_path = (
+        (archive.root / IDENTITY_TOMBSTONES_DIRNAME / f"{old_name}.json")
+        .relative_to(archive.repo_root)
+        .as_posix()
+    )
+    reservation_prefix = (
+        (archive.root / "file_reservations")
+        .relative_to(archive.repo_root)
+        .as_posix()
+        + "/"
+    )
+
+    unexpected: list[str] = []
+    for path in dirty_paths:
+        if (
+            path in (old_prefix, new_prefix) or path.startswith(f"{old_prefix}/") or path.startswith(f"{new_prefix}/") or path in {ledger_path, tombstone_path}
+        ):
+            continue
+        if (
+            path.startswith(reservation_prefix)
+            and path.endswith(".json")
+            and _reservation_path_belongs_to_agent_at_head_sync(
+                archive,
+                path,
+                agent_id,
+            )
+        ):
+            continue
+        unexpected.append(path)
+
+    if unexpected:
+        preview = ", ".join(unexpected[:5])
+        suffix = f" (+{len(unexpected) - 5} more)" if len(unexpected) > 5 else ""
+        raise ValueError(
+            "Interrupted identity rename cannot resume while unrelated archive changes exist: "
+            f"{preview}{suffix}"
+        )
+
+
+def _matching_rename_entry_sync(
+    archive: ProjectArchive,
+    old_name: str,
+    new_name: str,
+) -> dict[str, object] | None:
+    matches = [
+        entry
+        for entry in _identity_rename_entries_sync(archive.root)
+        if isinstance(entry.get("old_name"), str)
+        and isinstance(entry.get("new_name"), str)
+        and cast(str, entry["old_name"]).casefold() == old_name.casefold()
+    ]
+    if len(matches) > 1:
+        raise ValueError(f"Identity rename ledger contains duplicate entries for '{old_name}'")
+    if not matches:
+        return None
+    entry = matches[0]
+    recorded_new_name = cast(str, entry["new_name"])
+    if recorded_new_name.casefold() != new_name.casefold():
+        raise ValueError(
+            f"Identity '{old_name}' is permanently tombstoned as renamed to "
+            f"'{recorded_new_name}', not '{new_name}'"
+        )
+    return entry
+
+
+def _matching_agent_reservation_paths_sync(
+    archive: ProjectArchive,
+    agent_id: int,
+) -> list[Path]:
+    """Validate every current reservation artifact before any rename mutation."""
+    matching: list[Path] = []
+    reservations_root = archive.root / "file_reservations"
+    if not reservations_root.is_dir():
+        return matching
+    for reservation_path in sorted(
+        reservations_root.glob("*.json"),
+        key=lambda path: path.name,
+    ):
+        try:
+            reservation = json.loads(reservation_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"File reservation artifact is unreadable: {reservation_path}"
+            ) from exc
+        if not isinstance(reservation, dict):
+            raise ValueError(
+                f"File reservation artifact must contain an object: {reservation_path}"
+            )
+        reservation_agent_id = reservation.get("agent_id")
+        if isinstance(reservation_agent_id, bool):
+            continue
+        try:
+            matches_agent = int(cast(Any, reservation_agent_id)) == agent_id
+        except (TypeError, ValueError):
+            matches_agent = False
+        if matches_agent:
+            matching.append(reservation_path)
+    return matching
+
+
+def _inspect_agent_archive_rename_sync(
+    archive: ProjectArchive,
+    old_name: str,
+    new_name: str,
+    agent_id: int,
+) -> dict[str, object]:
+    if not (
+        validate_explicit_agent_id(old_name)
+        or validate_agent_name_format(old_name)
+    ):
+        raise ValueError("Legacy agent name is not a safe persisted identity")
+    if not validate_client_platform_host_agent_id(new_name):
+        raise ValueError("Target agent name is not a canonical client-os-host-slot identity")
+
+    old_dir = _find_agent_directory_sync(archive, old_name)
+    new_dir = _find_agent_directory_sync(archive, new_name)
+    ledger_entry = _matching_rename_entry_sync(archive, old_name, new_name)
+    tombstone = _identity_rename_tombstone_sync(archive.root, old_name)
+    dirty_paths = _archive_dirty_paths_sync(archive)
+
+    if old_dir is not None and new_dir is not None and old_dir != new_dir:
+        raise ValueError(
+            f"Archive target collision: both '{old_dir.name}' and '{new_dir.name}' exist"
+        )
+    if old_dir is not None:
+        if dirty_paths:
+            preview = ", ".join(dirty_paths[:5])
+            suffix = f" (+{len(dirty_paths) - 5} more)" if len(dirty_paths) > 5 else ""
+            raise ValueError(
+                "The Git archive must be clean before identity migration. "
+                f"Commit or otherwise resolve: {preview}{suffix}"
+            )
+        profile_id = _profile_agent_id_sync(old_dir / "profile.json")
+        if profile_id != agent_id:
+            raise ValueError(
+                "Target collision or DB-ahead mismatch: legacy archive profile id "
+                f"{profile_id} does not match database Agent.id {agent_id}"
+            )
+        if ledger_entry is not None or tombstone is not None:
+            raise ValueError(
+                f"Identity '{old_name}' has a ledger/tombstone but its legacy archive directory still exists"
+            )
+        _matching_agent_reservation_paths_sync(archive, agent_id)
+        return {
+            "state": "pending",
+            "old_directory": old_dir.name,
+            "new_directory": new_name,
+            "agent_id": agent_id,
+        }
+
+    if new_dir is not None:
+        _matching_agent_reservation_paths_sync(archive, agent_id)
+        profile_id = _profile_agent_id_sync(new_dir / "profile.json")
+        if profile_id != agent_id:
+            raise ValueError(
+                f"Archive rename evidence for '{old_name}' does not match database Agent.id {agent_id}"
+            )
+        if ledger_entry is not None and ledger_entry.get("agent_id") != agent_id:
+            raise ValueError(
+                f"Identity rename ledger for '{old_name}' does not match database Agent.id {agent_id}"
+            )
+        if tombstone is not None and tombstone.get("agent_id") != agent_id:
+            raise ValueError(
+                f"Identity tombstone for '{old_name}' does not match database Agent.id {agent_id}"
+            )
+        if dirty_paths:
+            _validate_partial_identity_rename_paths_sync(
+                archive,
+                dirty_paths,
+                old_name,
+                new_name,
+                agent_id,
+            )
+            return {
+                "state": "in_progress",
+                "old_directory": old_name,
+                "new_directory": new_dir.name,
+                "agent_id": agent_id,
+            }
+        if ledger_entry is None or tombstone is None:
+            raise ValueError(
+                f"Archive target collision: '{new_dir.name}' exists without a matching rename ledger and tombstone"
+            )
+        return {
+            "state": "already_applied",
+            "old_directory": old_name,
+            "new_directory": new_dir.name,
+            "agent_id": agent_id,
+        }
+
+    if dirty_paths:
+        preview = ", ".join(dirty_paths[:5])
+        suffix = f" (+{len(dirty_paths) - 5} more)" if len(dirty_paths) > 5 else ""
+        raise ValueError(
+            "The Git archive is dirty and contains neither the legacy nor target identity: "
+            f"{preview}{suffix}"
+        )
+    raise ValueError(
+        f"Legacy archive directory 'agents/{old_name}' does not exist, and no completed "
+        f"rename to 'agents/{new_name}' can be verified"
+    )
+
+
+async def inspect_agent_archive_rename(
+    archive: ProjectArchive,
+    old_name: str,
+    new_name: str,
+    agent_id: int,
+) -> dict[str, object]:
+    """Preflight the filesystem/Git half of an identity rename without mutation."""
+    return await _to_thread(
+        _inspect_agent_archive_rename_sync,
+        archive,
+        old_name,
+        new_name,
+        agent_id,
+    )
+
+
+def _write_json_atomic_sync(path: Path, payload: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(dict(payload), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+    finally:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+
+
+def _apply_agent_archive_rename_sync(
+    archive: ProjectArchive,
+    old_name: str,
+    new_name: str,
+    agent_id: int,
+    renamed_at: str,
+) -> dict[str, object]:
+    inspection = _inspect_agent_archive_rename_sync(archive, old_name, new_name, agent_id)
+    if inspection["state"] == "already_applied":
+        return {
+            **inspection,
+            "archive_changed": False,
+            "reservation_records_updated": 0,
+            "commit_sha": archive.repo.head.commit.hexsha,
+        }
+
+    old_dir = _find_agent_directory_sync(archive, old_name)
+    if inspection["state"] == "pending":
+        if old_dir is None:
+            raise ValueError(f"Legacy archive directory disappeared during preflight: {old_name}")
+        target_dir = old_dir.parent / new_name
+        old_directory_name = old_dir.name
+        old_dir.replace(target_dir)
+    else:
+        target_dir = _find_agent_directory_sync(archive, new_name)
+        if target_dir is None:
+            raise ValueError(f"Interrupted target directory disappeared during recovery: {new_name}")
+        old_directory_name = str(inspection["old_directory"])
+
+    profile_path = target_dir / "profile.json"
+    try:
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Agent profile is unreadable: {profile_path}") from exc
+    if not isinstance(profile, dict):
+        raise ValueError(f"Agent profile must contain an object: {profile_path}")
+    if profile.get("id") != agent_id:
+        raise ValueError(
+            f"Agent profile id does not match database Agent.id {agent_id}: {profile_path}"
+        )
+    profile["name"] = new_name
+    window_display_name = profile.get("window_display_name")
+    if isinstance(window_display_name, str) and window_display_name.casefold() == old_name.casefold():
+        profile["window_display_name"] = new_name
+    _write_json_atomic_sync(profile_path, cast(dict[str, object], profile))
+
+    matching_reservations = _matching_agent_reservation_paths_sync(
+        archive,
+        agent_id,
+    )
+    for reservation_path in matching_reservations:
+        reservation = json.loads(reservation_path.read_text(encoding="utf-8"))
+        assert isinstance(reservation, dict)
+        if reservation.get("agent") != new_name:
+            reservation["agent"] = new_name
+            _write_json_atomic_sync(
+                reservation_path,
+                cast(dict[str, object], reservation),
+            )
+
+    existing_entry = _matching_rename_entry_sync(archive, old_name, new_name)
+    existing_tombstone = _identity_rename_tombstone_sync(archive.root, old_name)
+    boundary_source: object = renamed_at
+    if existing_entry is not None:
+        boundary_source = existing_entry.get("renamed_at")
+    elif existing_tombstone is not None:
+        boundary_source = existing_tombstone.get("renamed_at")
+    if not isinstance(boundary_source, str):
+        raise ValueError("Identity rename evidence is missing its timestamp boundary")
+    boundary = _normalize_identity_rename_boundary(boundary_source)
+    if existing_entry is None and existing_tombstone is None:
+        parent_boundary = archive.repo.head.commit.authored_datetime.astimezone(
+            timezone.utc
+        ).replace(microsecond=0)
+        requested_boundary = datetime.fromisoformat(boundary)
+        if requested_boundary <= parent_boundary:
+            boundary = (parent_boundary + timedelta(seconds=1)).isoformat()
+    if existing_entry is not None and existing_tombstone is not None:
+        tombstone_boundary = existing_tombstone.get("renamed_at")
+        if not isinstance(tombstone_boundary, str) or (
+            _normalize_identity_rename_boundary(tombstone_boundary) != boundary
+        ):
+            raise ValueError("Identity rename ledger and tombstone have different boundaries")
+
+    entry: dict[str, object] = {
+        "agent_id": agent_id,
+        "old_name": old_name,
+        "new_name": new_name,
+        "renamed_at": boundary,
+    }
+    ledger = _read_identity_rename_document_sync(archive.root)
+    ledger_entries = [
+        cast(dict[str, object], item)
+        for item in cast(list[object], ledger["renames"])
+    ]
+    ledger_path = archive.root / IDENTITY_RENAMES_FILENAME
+    if existing_entry is None:
+        ledger_entries.append(entry)
+        ledger["renames"] = ledger_entries
+        _write_json_atomic_sync(ledger_path, ledger)
+
+    tombstone_path = archive.root / IDENTITY_TOMBSTONES_DIRNAME / f"{old_name}.json"
+    if existing_tombstone is None:
+        _write_json_atomic_sync(
+            tombstone_path,
+            {
+                **entry,
+                "error_type": "IDENTITY_RENAMED",
+            },
+        )
+
+    # Stage the already-validated project subtree as one unit. On a retry after
+    # the first ``git add``, the deleted OLD path is absent from both the work
+    # tree and index, so naming that exact path again makes Git reject the
+    # pathspec. The project directory remains present and correctly stages the
+    # deletion on both the first attempt and every recovery attempt. The clean
+    # guard above rejects every unrelated staged/tracked/untracked project path.
+    relative_project_root = archive.root.relative_to(archive.repo_root).as_posix()
+    with archive.repo.git.custom_environment(GIT_OPTIONAL_LOCKS="0"):
+        untracked_output = archive.repo.git.ls_files(
+            "--others",
+            "--exclude-standard",
+            "-z",
+        )
+    ephemeral_exclusions = sorted(
+        value
+        for value in untracked_output.split("\0")
+        if value
+        and (
+            value == relative_project_root
+            or value.startswith(f"{relative_project_root}/")
+        )
+        and _is_ephemeral_archive_path(value)
+    )
+    archive.repo.git.add(
+        "--all",
+        "--",
+        relative_project_root,
+        *(f":(exclude){value}" for value in ephemeral_exclusions),
+    )
+    if not archive.repo.is_dirty(index=True, working_tree=True):
+        raise RuntimeError("Identity rename produced no staged archive changes")
+    actor = Actor(
+        archive.settings.storage.git_author_name,
+        archive.settings.storage.git_author_email,
+    )
+    boundary_datetime = datetime.fromisoformat(boundary)
+    git_boundary = f"{int(boundary_datetime.timestamp())} +0000"
+    commit = archive.repo.index.commit(
+        f"identity: rename {old_name} to {new_name}",
+        author=actor,
+        committer=actor,
+        author_date=git_boundary,
+        commit_date=git_boundary,
+    )
+    dirty_after = _archive_dirty_paths_sync(archive)
+    if dirty_after:
+        raise RuntimeError(
+            "Identity rename commit left the archive dirty: " + ", ".join(dirty_after[:5])
+        )
+    return {
+        "state": "applied",
+        "archive_changed": True,
+        "reservation_records_updated": len(matching_reservations),
+        "commit_sha": commit.hexsha,
+        "renamed_at": boundary,
+        "agent_id": agent_id,
+        "old_directory": old_directory_name,
+        "new_directory": new_name,
+    }
+
+
+async def migrate_agent_archive(
+    archive: ProjectArchive,
+    old_name: str,
+    new_name: str,
+    agent_id: int,
+    renamed_at: str,
+) -> dict[str, object]:
+    """Move current identity artifacts and record one permanent audit commit."""
+    async with archive_write_lock(archive, timeout_seconds=1.0):
+        return await _to_thread(
+            _apply_agent_archive_rename_sync,
+            archive,
+            old_name,
+            new_name,
+            agent_id,
+            renamed_at,
+        )
 
 
 async def write_agent_profile(archive: ProjectArchive, agent: Mapping[str, object]) -> None:
@@ -2090,9 +2961,9 @@ def _try_clean_stale_git_lock(repo_root: Path, max_age_seconds: float = 300.0) -
     Only removes locks older than max_age_seconds to avoid removing active locks.
     """
     lock_path = repo_root / ".git" / "index.lock"
-    if not lock_path.exists():
-        return False
     try:
+        if not lock_path.exists():
+            return False
         mtime = lock_path.stat().st_mtime
         age = time.time() - mtime
         if age > max_age_seconds:
@@ -3027,24 +3898,43 @@ async def get_historical_inbox_snapshot(
                 "error": f"Invalid timestamp format: {e}"
             }
 
-        # Get agent inbox directory at that commit
-        inbox_path = f"projects/{archive.slug}/agents/{agent_name}/inbox"
+        resolved_agent_name = _resolve_historical_identity_sync(
+            archive.root,
+            agent_name,
+            target_time.astimezone(timezone.utc),
+        )
+
+        # Resolve the current address back through the immutable rename ledger
+        # before traversing a commit that predates the move. Historical message
+        # files and frontmatter intentionally remain untouched.
+        inbox_path = f"projects/{archive.slug}/agents/{resolved_agent_name}/inbox"
 
         # Find commit closest to (but not after) target timestamp
         closest_commit = None
+
+        def commit_contains_inbox(commit: Any) -> bool:
+            """Ignore a rename commit that only deleted the historical path."""
+            try:
+                candidate_tree = commit.tree
+                for part in inbox_path.split("/"):
+                    candidate_tree = candidate_tree / part
+                return True
+            except (KeyError, AttributeError):
+                return False
+
         try:
             commit_iter = archive.repo.iter_commits(max_count=10000, paths=[inbox_path])
         except Exception:
             commit_iter = archive.repo.iter_commits(max_count=10000)
         for commit in commit_iter:
-            if commit.authored_date <= target_timestamp:
+            if commit.authored_date <= target_timestamp and commit_contains_inbox(commit):
                 closest_commit = commit
                 break
 
         if not closest_commit:
             # Fall back to full history when the inbox path has never been touched
             for commit in archive.repo.iter_commits(max_count=10000):
-                if commit.authored_date <= target_timestamp:
+                if commit.authored_date <= target_timestamp and commit_contains_inbox(commit):
                     closest_commit = commit
                     break
 
@@ -3055,6 +3945,7 @@ async def get_historical_inbox_snapshot(
                 "snapshot_time": None,
                 "commit_sha": None,
                 "requested_time": timestamp,
+                "resolved_agent_name": resolved_agent_name,
                 "note": "No commits found before this timestamp"
             }
 
@@ -3165,6 +4056,7 @@ async def get_historical_inbox_snapshot(
             "snapshot_time": closest_commit.authored_datetime.isoformat(),
             "commit_sha": closest_commit.hexsha,
             "requested_time": timestamp,
+            "resolved_agent_name": resolved_agent_name,
         }
 
     result: dict[str, Any] = await _to_thread(_get_snapshot)

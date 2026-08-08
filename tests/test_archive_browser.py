@@ -573,9 +573,12 @@ async def test_archive_commit_xss_in_sha(isolated_env):
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        xss = "<script>alert('xss')</script>"
+        # Keep the payload in one path segment so this exercises the commit
+        # route, rather than falling through to the platform's static-file path
+        # parser because of the slash in a closing ``</script>`` tag.
+        xss = "<img src=x onerror=alert('xss')>"
         resp = await client.get(f"/mail/archive/commit/{xss}")
         # Should not execute script
         assert resp.status_code in (200, 400, 404)
         # Regardless of status, should never reflect raw script tag
-        assert "<script>alert('xss')</script>" not in resp.text
+        assert xss not in resp.text

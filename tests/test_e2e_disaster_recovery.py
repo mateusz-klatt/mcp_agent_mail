@@ -134,6 +134,8 @@ def delete_database_and_storage(settings) -> tuple[Path, Path]:
     db_path = resolve_sqlite_database_path(settings.database.url)
     storage_path = Path(settings.storage.root)
 
+    reset_database_state()
+
     # Delete database files
     if db_path.exists():
         db_path.unlink()
@@ -145,8 +147,6 @@ def delete_database_and_storage(settings) -> tuple[Path, Path]:
     # Delete storage directory
     if storage_path.exists():
         shutil.rmtree(storage_path)
-
-    reset_database_state()
 
     return db_path, storage_path
 

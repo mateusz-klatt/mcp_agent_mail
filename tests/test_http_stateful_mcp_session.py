@@ -40,7 +40,7 @@ def _tools_call_payload(name: str) -> dict:
 
 
 @pytest.fixture()
-def http_app(monkeypatch):
+def http_app(isolated_env, monkeypatch):
     monkeypatch.setenv("HTTP_BEARER_TOKEN", "token250")
     monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "false")
     # The default deployment shape: base '/api' (stateless), '/mcp' compat
@@ -113,7 +113,7 @@ async def test_api_mount_stays_stateless_for_one_shot_clients(http_app):
 
 
 @pytest.mark.asyncio
-async def test_explicit_mcp_base_keeps_legacy_stateless_semantics(monkeypatch):
+async def test_explicit_mcp_base_keeps_legacy_stateless_semantics(isolated_env, monkeypatch):
     """An operator who explicitly configures HTTP_PATH=/mcp/ has promised
     existing clients handshake-free semantics there — the #250 change must not
     alter the configured base's behavior."""

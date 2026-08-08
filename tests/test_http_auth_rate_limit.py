@@ -14,7 +14,7 @@ def _rpc(method: str, params: dict) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_http_jwt_rbac_and_rate_limit(monkeypatch):
+async def test_http_jwt_rbac_and_rate_limit(isolated_env, monkeypatch):
     # Configure bearer auth and RBAC
     monkeypatch.setenv("HTTP_BEARER_TOKEN", "token123")
     monkeypatch.setenv("HTTP_RBAC_ENABLED", "true")
@@ -63,4 +63,3 @@ async def test_http_jwt_rbac_and_rate_limit(monkeypatch):
         assert r1.status_code == 200
         r2 = await client.post(settings.http.path, headers=headers, json=_rpc("tools/call", {"name": "health_check", "arguments": {}}))
         assert r2.status_code == 429
-

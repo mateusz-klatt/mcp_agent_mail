@@ -1540,19 +1540,24 @@ async def _create_repo_for_cache(root: Path, settings: Settings, cache_key: str)
         cached_repo = False
         try:
             git_dir = root / ".git"
+            initialized = False
             if await _to_thread(git_dir.exists):
                 repo = await _open_repo_cancellation_safe(Repo, str(root))
             else:
                 repo = await _open_repo_cancellation_safe(Repo.init, str(root))
+                initialized = True
 
-                try:
-                    def _configure_repo() -> None:
-                        with repo.config_writer() as cw:
-                            cw.set_value("commit", "gpgsign", "false")
+            try:
+                def _configure_repo() -> None:
+                    with repo.config_writer() as cw:
+                        cw.set_value("commit", "gpgsign", "false")
+                        cw.set_value("core", "autocrlf", "false")
 
-                    await _to_thread(_configure_repo)
-                except Exception:
-                    pass
+                await _to_thread(_configure_repo)
+            except Exception:
+                pass
+
+            if initialized:
                 attributes_path = root / ".gitattributes"
                 if not await _to_thread(attributes_path.exists):
                     await _write_text(attributes_path, "*.json text\n*.md text\n")
@@ -2879,7 +2884,7 @@ async def _save_webp(img: Image.Image, path: Path) -> None:
 
 async def _write_text(path: Path, content: str) -> None:
     await _to_thread(path.parent.mkdir, parents=True, exist_ok=True)
-    await _to_thread(path.write_text, content, encoding="utf-8")
+    await _to_thread(path.write_text, content, encoding="utf-8", newline="\n")
 
 
 async def _write_json(path: Path, payload: dict[str, object]) -> None:
@@ -2983,6 +2988,25 @@ class GitIndexLockError(Exception):
         self.attempts = attempts
 
 
+def _normalize_archive_text_line_endings(repo_root: Path, rel_paths: Sequence[str]) -> None:
+    """Keep GitPython's raw index writes aligned with archive text attributes."""
+    for rel_path in rel_paths:
+        relative = PurePosixPath(rel_path)
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or relative.suffix not in {".json", ".md"}
+        ):
+            continue
+        full_path = repo_root / relative
+        if full_path.is_symlink() or not full_path.is_file():
+            continue
+        content = full_path.read_bytes()
+        normalized = content.replace(b"\r\n", b"\n")
+        if normalized != content:
+            full_path.write_bytes(normalized)
+
+
 async def _commit_direct(
     repo_root: Path,
     settings: Settings,
@@ -3014,6 +3038,7 @@ async def _commit_direct(
     attempt_repo = repo  # May diverge from `repo` during EMFILE recovery
 
     def _perform_commit(target_repo: Repo) -> None:
+        _normalize_archive_text_line_endings(repo_root, rel_paths)
         target_repo.index.add(rel_paths)
         if target_repo.is_dirty(index=True, working_tree=True):
             # Append commit trailers with Agent and optional Thread if present in message text

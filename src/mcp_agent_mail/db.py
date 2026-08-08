@@ -32,6 +32,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Final, TypeVar, cast
 
+import anyio
 from sqlalchemy.exc import OperationalError, TimeoutError as SATimeoutError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlmodel import SQLModel
@@ -598,6 +599,35 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
     return _session_factory
 
 
+async def await_database_cleanup_task(task: asyncio.Task[T]) -> T:
+    """Finish one database cleanup task, then propagate caller cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    current_task = asyncio.current_task()
+    while not task.done():
+        try:
+            if cancellation is None:
+                await asyncio.shield(task)
+            else:
+                with anyio.CancelScope(shield=True):
+                    await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            if current_task is None or current_task.cancelling() == 0:
+                raise
+            if cancellation is None:
+                cancellation = exc
+            while current_task.cancelling():
+                current_task.uncancel()
+    result = task.result()
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
+async def _close_session(session: AsyncSession) -> None:
+    """Close one session completely while preserving caller cancellation."""
+    await await_database_cleanup_task(asyncio.create_task(session.close()))
+
+
 @asynccontextmanager
 async def get_session(*, check_circuit_breaker: bool = False) -> AsyncIterator[AsyncSession]:
     """Provide an async database session with guaranteed cleanup.
@@ -629,14 +659,7 @@ async def get_session(*, check_circuit_breaker: bool = False) -> AsyncIterator[A
     try:
         yield session
     finally:
-        # Ensure session close completes even under cancellation (anyio cancel scopes
-        # will raise asyncio.CancelledError which is BaseException in Python 3.14).
-        try:
-            await asyncio.shield(session.close())
-        except BaseException:
-            with suppress(BaseException):
-                await session.close()
-            raise
+        await _close_session(session)
 
 
 @asynccontextmanager
@@ -682,12 +705,7 @@ async def get_immediate_session(*, check_circuit_breaker: bool = False) -> Async
             await session.rollback()
         raise
     finally:
-        try:
-            await asyncio.shield(session.close())
-        except BaseException:
-            with suppress(BaseException):
-                await session.close()
-            raise
+        await _close_session(session)
 
 
 def get_db_health_status() -> dict[str, Any]:

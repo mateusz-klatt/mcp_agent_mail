@@ -1,5 +1,7 @@
 import asyncio
 import json
+import os
+import shutil
 import sqlite3
 import subprocess
 import time
@@ -22,6 +24,17 @@ from mcp_agent_mail.storage import _commit as _archive_commit, ensure_archive
 from tests.keys import pkey
 
 LIB_SH = Path(__file__).resolve().parents[1] / "scripts" / "lib.sh"
+BASH = shutil.which("bash") or "bash"
+
+
+def _git_bash_path(path: str | Path) -> str:
+    value = str(path)
+    if os.name != "nt":
+        return value
+    normalized = value.replace("\\", "/")
+    if len(normalized) >= 2 and normalized[1] == ":":
+        return f"/{normalized[0].lower()}{normalized[2:]}"
+    return normalized
 
 
 def _seed_cli_agent_state(
@@ -60,6 +73,7 @@ def _init_projects_adopt_repo(tmp_path: Path) -> tuple[Path, Path]:
     subprocess.run(["git", "init"], cwd=str(repo_root), check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo_root), check=True)
     subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo_root), check=True)
+    subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=str(repo_root), check=True)
     (repo_root / "README.md").write_text("seed\n", encoding="utf-8")
     subprocess.run(["git", "add", "README.md"], cwd=str(repo_root), check=True)
     subprocess.run(
@@ -145,15 +159,17 @@ def test_shared_env_writer_rejects_non_absolute_state_without_mutation(
 ) -> None:
     env_file = tmp_path / ".agent-mail.env"
     original = "FOREIGN_SETTING=preserved\nHTTP_BEARER_TOKEN=old-secret\n"
-    env_file.write_text(original, encoding="utf-8")
+    env_file.write_text(original, encoding="utf-8", newline="\n")
+    original_bytes = env_file.read_bytes()
     monkeypatch.setenv("AGENT_MAIL_ENV_FILE", str(env_file))
     monkeypatch.setenv("AGENT_MAIL_URL", "https://mail.example/mcp/")
     monkeypatch.setenv("HTTP_BEARER_TOKEN", "writer-regression-secret")
     monkeypatch.setenv("NO_COLOR", "1")
-    monkeypatch.setenv("AGENT_MAIL_TEST_LIB", str(LIB_SH))
+    monkeypatch.setenv("AGENT_MAIL_TEST_LIB", _git_bash_path(LIB_SH))
     shell = r"""
 . "$AGENT_MAIL_TEST_LIB"
 init_colors
+cygpath() { printf '%s\n' "$1"; }
 wslpath() { printf '%s\n' "$1"; }
 write_shared_agent_mail_env "$AGENT_MAIL_URL" "$HTTP_BEARER_TOKEN"
 """
@@ -161,7 +177,7 @@ write_shared_agent_mail_env "$AGENT_MAIL_URL" "$HTTP_BEARER_TOKEN"
     for state_dir in ("relative/state", r"D:\Profiles\agent-mail-state"):
         monkeypatch.setenv("AGENT_MAIL_STATE_DIR", state_dir)
         result = subprocess.run(
-            ["bash", "-c", shell],
+            [BASH, "--noprofile", "--norc", "-c", shell],
             capture_output=True,
             text=True,
             check=False,
@@ -173,7 +189,7 @@ write_shared_agent_mail_env "$AGENT_MAIL_URL" "$HTTP_BEARER_TOKEN"
         assert env_file.read_text(encoding="utf-8") == original
         assert _path_tree(tmp_path) == (
             (".agent-mail.env",),
-            {".agent-mail.env": original.encode()},
+            {".agent-mail.env": original_bytes},
         )
 
 
@@ -182,24 +198,26 @@ def test_shared_env_writer_translates_windows_state_before_persisting(
     monkeypatch,
 ) -> None:
     env_file = tmp_path / ".agent-mail.env"
-    env_file.write_text("FOREIGN_SETTING=preserved\n", encoding="utf-8")
+    env_file.write_text("FOREIGN_SETTING=preserved\n", encoding="utf-8", newline="\n")
     normalized_state = tmp_path / "private-state"
+    normalized_state_for_shell = _git_bash_path(normalized_state)
     monkeypatch.setenv("AGENT_MAIL_ENV_FILE", str(env_file))
     monkeypatch.setenv("AGENT_MAIL_STATE_DIR", r"D:\Profiles\agent-mail-state")
     monkeypatch.setenv("AGENT_MAIL_URL", "https://mail.example/mcp/")
     monkeypatch.setenv("HTTP_BEARER_TOKEN", "translated-writer-secret")
-    monkeypatch.setenv("AGENT_MAIL_TEST_NORMALIZED_STATE", str(normalized_state))
-    monkeypatch.setenv("AGENT_MAIL_TEST_LIB", str(LIB_SH))
+    monkeypatch.setenv("AGENT_MAIL_TEST_NORMALIZED_STATE", normalized_state_for_shell)
+    monkeypatch.setenv("AGENT_MAIL_TEST_LIB", _git_bash_path(LIB_SH))
     monkeypatch.setenv("NO_COLOR", "1")
     shell = r"""
 . "$AGENT_MAIL_TEST_LIB"
 init_colors
+cygpath() { printf '%s\n' "$AGENT_MAIL_TEST_NORMALIZED_STATE"; }
 wslpath() { printf '%s\n' "$AGENT_MAIL_TEST_NORMALIZED_STATE"; }
 write_shared_agent_mail_env "$AGENT_MAIL_URL" "$HTTP_BEARER_TOKEN"
 """
 
     result = subprocess.run(
-        ["bash", "-c", shell],
+        [BASH, "--noprofile", "--norc", "-c", shell],
         capture_output=True,
         text=True,
         check=False,
@@ -208,7 +226,7 @@ write_shared_agent_mail_env "$AGENT_MAIL_URL" "$HTTP_BEARER_TOKEN"
     assert result.returncode == 0, result.stderr
     persisted = env_file.read_text(encoding="utf-8")
     assert "FOREIGN_SETTING=preserved\n" in persisted
-    assert f"AGENT_MAIL_STATE_DIR={normalized_state}\n" in persisted
+    assert f"AGENT_MAIL_STATE_DIR={normalized_state_for_shell}\n" in persisted
     assert "D:\\Profiles" not in persisted
     assert "translated-writer-secret" not in result.stdout + result.stderr
     assert list((normalized_state / "backups").glob("*.bak"))
@@ -244,6 +262,7 @@ def test_migrate_agent_state_uses_global_hook_env_not_repo_env(
     )
     monkeypatch.chdir(checkout)
     monkeypatch.setenv("HOME", str(global_env.parent))
+    monkeypatch.setenv("USERPROFILE", str(global_env.parent))
     monkeypatch.delenv("AGENT_MAIL_STATE_DIR", raising=False)
     monkeypatch.delenv("AGENT_MAIL_ENV_FILE", raising=False)
 
@@ -293,6 +312,7 @@ def test_migrate_agent_state_rejects_relative_global_state_before_mutation(
     checkout.mkdir()
     monkeypatch.chdir(checkout)
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.delenv("AGENT_MAIL_STATE_DIR", raising=False)
     monkeypatch.delenv("AGENT_MAIL_ENV_FILE", raising=False)
     before = _path_tree(tmp_path)

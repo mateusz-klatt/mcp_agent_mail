@@ -6,10 +6,51 @@ instead of using the MCP tools.
 """
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
+
+
+def _bash_executable() -> str:
+    discovered = shutil.which("bash")
+    if os.name != "nt":
+        return discovered or "bash"
+    git = shutil.which("git")
+    if git:
+        git_root = Path(git).resolve().parent.parent
+        for candidate in (
+            git_root / "bin" / "bash.exe",
+            git_root / "usr" / "bin" / "bash.exe",
+        ):
+            if candidate.is_file():
+                return str(candidate)
+    return discovered or "bash"
+
+
+BASH = _bash_executable()
+
+
+def _git_bash_path(path: Path) -> str:
+    value = str(path)
+    if os.name != "nt":
+        return value
+    normalized = value.replace("\\", "/")
+    if len(normalized) >= 2 and normalized[1] == ":":
+        return f"/{normalized[0].lower()}{normalized[2:]}"
+    return normalized
+
+
+def _run_stub(script: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [BASH, _git_bash_path(script), *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
 
 
 @pytest.fixture
@@ -33,18 +74,14 @@ MSG
 exit 1
 '''
     stub_path = tmp_path / "mcp-agent-mail"
-    stub_path.write_text(stub_content)
+    stub_path.write_text(stub_content, encoding="utf-8", newline="\n")
     stub_path.chmod(0o755)
     return stub_path
 
 
 def test_cli_stub_prints_not_cli_message(cli_stub_script: Path):
     """Test that the CLI stub prints a message explaining it's not a CLI tool."""
-    result = subprocess.run(
-        [str(cli_stub_script)],
-        capture_output=True,
-        text=True,
-    )
+    result = _run_stub(cli_stub_script)
 
     assert result.returncode == 1, "CLI stub should exit with code 1"
     output = result.stdout
@@ -57,11 +94,7 @@ def test_cli_stub_prints_not_cli_message(cli_stub_script: Path):
 
 def test_cli_stub_mentions_correct_tools(cli_stub_script: Path):
     """Test that the CLI stub mentions the correct MCP tool names."""
-    result = subprocess.run(
-        [str(cli_stub_script)],
-        capture_output=True,
-        text=True,
-    )
+    result = _run_stub(cli_stub_script)
 
     output = result.stdout
 
@@ -82,11 +115,7 @@ def test_cli_stub_ignores_arguments(cli_stub_script: Path):
     ]
 
     for args in test_cases:
-        result = subprocess.run(
-            [str(cli_stub_script), *args],
-            capture_output=True,
-            text=True,
-        )
+        result = _run_stub(cli_stub_script, *args)
 
         # Should always exit 1 regardless of arguments
         assert result.returncode == 1
@@ -100,14 +129,14 @@ class TestInstallScriptCliStub:
     def test_install_function_exists(self):
         """Verify the install_cli_stub function exists in install.sh."""
         install_script = Path(__file__).parent.parent / "scripts" / "install.sh"
-        content = install_script.read_text()
+        content = install_script.read_text(encoding="utf-8")
 
         assert "install_cli_stub()" in content, "install_cli_stub function should exist"
 
     def test_install_creates_variants(self):
         """Verify install script creates variant symlinks."""
         install_script = Path(__file__).parent.parent / "scripts" / "install.sh"
-        content = install_script.read_text()
+        content = install_script.read_text(encoding="utf-8")
 
         # Should create symlinks for common variants
         expected_variants = ["mcp_agent_mail", "mcpagentmail", "agentmail", "agent-mail"]
@@ -117,6 +146,6 @@ class TestInstallScriptCliStub:
     def test_stub_mentions_github_repo(self):
         """Verify the stub script mentions the GitHub repo for documentation."""
         install_script = Path(__file__).parent.parent / "scripts" / "install.sh"
-        content = install_script.read_text()
+        content = install_script.read_text(encoding="utf-8")
 
         assert "github.com" in content.lower() and "mcp_agent_mail" in content

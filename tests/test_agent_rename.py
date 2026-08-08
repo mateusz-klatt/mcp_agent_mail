@@ -334,6 +334,43 @@ def _seed(**kwargs: Any) -> SeededRename:
     return seeded
 
 
+@pytest.mark.asyncio
+async def test_archive_commit_is_clean_with_windows_crlf_and_global_autocrlf(
+    isolated_env,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    global_git_config = tmp_path / "global.gitconfig"
+    global_git_config.write_text("[core]\n\tautocrlf = true\n", encoding="utf-8", newline="\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_git_config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+    archive = await ensure_archive(get_settings(), "windows-eol-project")
+    profile_path = archive.root / "agents" / OLD_NAME / "profile.json"
+    message_path = archive.root / "agents" / OLD_NAME / "inbox" / "message.md"
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    message_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_path.write_bytes(b'{"name": "home-wsl-1"}\r\n')
+    message_path.write_bytes(b"# Windows checkout\r\n\r\nBody\r\n")
+    rel_paths = [
+        profile_path.relative_to(archive.repo_root).as_posix(),
+        message_path.relative_to(archive.repo_root).as_posix(),
+    ]
+
+    await _commit(
+        archive.repo,
+        archive.settings,
+        "test: commit Windows line endings",
+        rel_paths,
+        use_queue=False,
+    )
+
+    assert _git(archive.repo_root, "config", "--local", "--get", "core.autocrlf") == "false"
+    assert profile_path.read_bytes() == b'{"name": "home-wsl-1"}\n'
+    assert message_path.read_bytes() == b"# Windows checkout\n\nBody\n"
+    assert _meaningful_git_status(archive.repo_root) == []
+
+
 def test_rename_agent_defaults_to_dry_run_without_mutation(isolated_env) -> None:
     seeded = _seed()
     runner = CliRunner()

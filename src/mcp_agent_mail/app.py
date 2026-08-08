@@ -42,6 +42,7 @@ from sqlalchemy.orm import aliased
 from . import rich_logger
 from .config import Settings, get_settings
 from .db import (
+    await_database_cleanup_task,
     dispose_engine_blocking,
     ensure_schema,
     get_engine,
@@ -839,15 +840,13 @@ def _lifespan_factory(settings: Settings) -> Callable[[FastMCP], AsyncContextMan
             cancelled: BaseException | None = None
             with suppress(Exception):
                 engine = get_engine()
+                dispose_task = asyncio.create_task(
+                    asyncio.to_thread(dispose_engine_blocking, engine)
+                )
                 try:
-                    await asyncio.shield(asyncio.to_thread(dispose_engine_blocking, engine))
+                    await await_database_cleanup_task(dispose_task)
                 except asyncio.CancelledError as exc:
                     cancelled = exc
-                    with suppress(BaseException):
-                        dispose_engine_blocking(engine)
-                except Exception:
-                    with suppress(BaseException):
-                        dispose_engine_blocking(engine)
             with suppress(BaseException):
                 clear_repo_cache()
             if cancelled is not None:

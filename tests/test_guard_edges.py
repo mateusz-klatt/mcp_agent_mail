@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
 from asyncio.subprocess import PIPE
 from pathlib import Path
 
@@ -9,6 +11,35 @@ import pytest
 from mcp_agent_mail.config import get_settings
 from mcp_agent_mail.guard import install_guard, install_prepush_guard, render_precommit_script, uninstall_guard
 from mcp_agent_mail.storage import ensure_archive
+
+
+def _bash_executable() -> str:
+    discovered = shutil.which("bash")
+    if os.name != "nt":
+        return discovered or "bash"
+    git = shutil.which("git")
+    if git:
+        git_root = Path(git).resolve().parent.parent
+        for candidate in (
+            git_root / "bin" / "bash.exe",
+            git_root / "usr" / "bin" / "bash.exe",
+        ):
+            if candidate.is_file():
+                return str(candidate)
+    return discovered or "bash"
+
+
+BASH = _bash_executable()
+
+
+def _git_bash_path(path: Path) -> str:
+    value = str(path)
+    if os.name != "nt":
+        return value
+    normalized = value.replace("\\", "/")
+    if len(normalized) >= 2 and normalized[1] == ":":
+        return f"/{normalized[0].lower()}{normalized[2:]}"
+    return normalized
 
 
 @pytest.mark.asyncio
@@ -47,9 +78,14 @@ async def test_guard_render_and_conflict_message(isolated_env, tmp_path: Path):
     hook_path = await install_guard(settings, "backend", repo_dir)
     assert hook_path.exists()
     # WORKTREES_ENABLED=1 is required for the guard to actually run (not exit early)
-    env = {"AGENT_NAME": "Blue", "WORKTREES_ENABLED": "1"}
+    env = os.environ.copy()
+    env.update(AGENT_NAME="Blue", WORKTREES_ENABLED="1")
     proc_hook = await asyncio.create_subprocess_exec(
-        str(hook_path),
+        BASH,
+        "-c",
+        'exec "$1"',
+        "mcp-agent-mail-hook",
+        _git_bash_path(hook_path),
         cwd=str(repo_dir),
         env=env,
         stdout=PIPE,
@@ -92,4 +128,3 @@ async def test_uninstall_guard_removes_agent_mail_windows_shims(isolated_env, tm
     assert not (hooks_dir / "pre-push").exists()
     assert not (hooks_dir / "pre-push.cmd").exists()
     assert not (hooks_dir / "pre-push.ps1").exists()
-

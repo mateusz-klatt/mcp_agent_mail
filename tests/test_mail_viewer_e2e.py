@@ -725,12 +725,12 @@ async def test_mail_xss_in_project_name(isolated_env):
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        xss_payload = "<script>alert('xss')</script>"
+        xss_payload = "<img src=x onerror=alert('xss')>"
         resp = await client.get(f"/mail/{xss_payload}")
         # Should handle gracefully without executing script
         assert resp.status_code in (200, 404)
         # Regardless of status, should never reflect raw script tag
-        assert "<script>alert('xss')</script>" not in resp.text
+        assert xss_payload not in resp.text
 
 
 # =============================================================================

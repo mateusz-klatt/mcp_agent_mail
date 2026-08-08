@@ -1,4 +1,3 @@
-import asyncio
 import contextlib
 from pathlib import Path
 
@@ -41,52 +40,6 @@ def skip_if_cpu_overloaded() -> None:
             f"Skipping benchmark: system under extreme CPU load "
             f"(all {cores} cores at {CPU_OVERLOAD_THRESHOLD}%+ utilization)"
         )
-
-
-@pytest.fixture(scope="function")
-def event_loop():
-    """Create a new event loop for each test function.
-
-    This fixture ensures proper event loop cleanup on all platforms,
-    particularly macOS where the default event loop policy can cause
-    'Event loop is closed' errors if not handled properly.
-
-    The fixture:
-    1. Creates a fresh event loop for each test
-    2. Properly shuts down async generators
-    3. Cancels any pending tasks
-    4. Closes the loop cleanly
-
-    Note: In Python 3.14+, event loop policy management is deprecated.
-    asyncio.new_event_loop() creates the appropriate loop type automatically.
-    """
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    yield loop
-
-    # Proper cleanup sequence
-    try:
-        # Cancel all pending tasks
-        pending = asyncio.all_tasks(loop)
-        for task in pending:
-            task.cancel()
-
-        # Allow cancelled tasks to complete
-        if pending:
-            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-
-        # Shutdown async generators (Python 3.6+)
-        loop.run_until_complete(loop.shutdown_asyncgens())
-
-        # Shutdown default executor (Python 3.9+)
-        if hasattr(loop, "shutdown_default_executor"):
-            loop.run_until_complete(loop.shutdown_default_executor())
-    except Exception:
-        pass  # Ignore cleanup errors
-    finally:
-        asyncio.set_event_loop(None)
-        loop.close()
 
 
 @pytest.fixture
@@ -132,6 +85,18 @@ def open_mail_ui_gate(isolated_env, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def deterministic_git_environment(monkeypatch):
+    """Keep test commits independent of the developer's global Git config."""
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "test-agent")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "test@example.com")
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "test-agent")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "test@example.com")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "commit.gpgsign")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "false")
+
+
 @pytest.fixture
 def isolated_env(tmp_path, monkeypatch):
     """Provide isolated database settings for tests and reset caches."""
@@ -143,8 +108,6 @@ def isolated_env(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_ENVIRONMENT", "test")
     storage_root = tmp_path / "storage"
     monkeypatch.setenv("STORAGE_ROOT", str(storage_root))
-    monkeypatch.setenv("GIT_AUTHOR_NAME", "test-agent")
-    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "test@example.com")
     monkeypatch.setenv("INLINE_IMAGE_MAX_BYTES", "128")
     clear_settings_cache()
     reset_database_state()
@@ -159,7 +122,6 @@ def isolated_env(tmp_path, monkeypatch):
         # Do not scan the entire GC heap: besides being expensive, that used to
         # close objects still owned by unrelated fixtures.
         clear_repo_cache()
-        reset_database_state()
         clear_jwks_cache()
         clear_settings_cache()
 
@@ -175,41 +137,37 @@ def isolated_env(tmp_path, monkeypatch):
                 db_path.unlink()
         storage_root = tmp_path / "storage"
         if storage_root.exists():
-            for path in storage_root.rglob("*"):
-                if path.is_file():
-                    path.unlink()
-            for path in sorted(storage_root.rglob("*"), reverse=True):
-                if path.is_dir():
-                    path.rmdir()
-            if storage_root.exists():
-                storage_root.rmdir()
+            # Git object files can be read-only on Windows. This eager cleanup is
+            # only an optimization; ``tmp_path`` owns eventual removal, so a
+            # platform-level refusal must not replace the test's actual result.
+            with contextlib.suppress(OSError):
+                for path in storage_root.rglob("*"):
+                    if path.is_file():
+                        path.unlink()
+                for path in sorted(storage_root.rglob("*"), reverse=True):
+                    if path.is_dir():
+                        path.rmdir()
+                if storage_root.exists():
+                    storage_root.rmdir()
 
 
-@pytest.fixture(autouse=True)
-def _global_resource_cleanup(request: pytest.FixtureRequest):
-    """Explicitly close global resources for tests without ``isolated_env``.
-
-    Some tests don't opt into `isolated_env` but still touch the global engine/repo cache.
-    With RLIMIT_NOFILE=256 (common on macOS), a small amount of leakage can cascade into
-    EMFILE failures later in the suite.
-    """
-    yield
-
-    # isolated_env already closes these resources before removing its temporary
-    # files. Avoid doing the same teardown twice for the majority of the suite.
-    if "isolated_env" in request.fixturenames:
-        return
-
-    # Close cached repo handles first.
+def _clear_process_resources() -> None:
+    """Release cached repositories, database pools, and configuration state."""
     with contextlib.suppress(Exception):
         clear_repo_cache()
-
-    # Dispose engine/pool state across tests.
     with contextlib.suppress(Exception):
         reset_database_state()
-
     with contextlib.suppress(Exception):
         clear_settings_cache()
-
     with contextlib.suppress(Exception):
         clear_jwks_cache()
+
+
+def pytest_runtest_setup() -> None:
+    """Release resources left by the fully torn-down preceding test."""
+    _clear_process_resources()
+
+
+def pytest_sessionfinish() -> None:
+    """Release resources after the final test and its asyncio runner finish."""
+    _clear_process_resources()

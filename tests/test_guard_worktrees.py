@@ -578,8 +578,9 @@ async def test_chain_runner_executes_plugins(isolated_env, tmp_path: Path):
     plugin.write_text(
         f"#!/usr/bin/env python3\n"
         f"from pathlib import Path\n"
-        f"Path('{marker_file}').write_text('ran')\n",
+        f"Path({str(marker_file)!r}).write_text('ran', encoding='utf-8')\n",
         encoding="utf-8",
+        newline="\n",
     )
     plugin.chmod(0o755)
 
@@ -592,4 +593,4 @@ async def test_chain_runner_executes_plugins(isolated_env, tmp_path: Path):
 
     # Plugin should have run
     assert marker_file.exists()
-    assert marker_file.read_text() == "ran"
+    assert marker_file.read_text(encoding="utf-8") == "ran"

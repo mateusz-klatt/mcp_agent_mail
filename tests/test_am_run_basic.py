@@ -29,6 +29,7 @@ from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.models import Agent, Project
 
 runner = CliRunner()
+pytestmark = pytest.mark.usefixtures("isolated_env")
 
 
 @pytest.mark.parametrize("value", ["CON", "CON.txt", "NUL.txt", "LPT1.log", "x" * 400])

@@ -8,7 +8,7 @@ import shlex
 import shutil
 import subprocess
 import tomllib
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
@@ -401,9 +401,28 @@ def test_hook_derives_stateless_base_from_streamable_mcp_url(tmp_path: Path) -> 
     assert result.stdout == "https://hermes.example"
 
 
+def _install_bash_env(home: Path, fake_bin: Path) -> tuple[str, str]:
+    home.mkdir(parents=True, exist_ok=True)
+    bash_tmp = home / ".agent-mail-test-tmp"
+    bash_tmp.mkdir(exist_ok=True)
+    bash_tmp_path = _git_bash_path(bash_tmp)
+    bash_env = home / ".agent-mail-test-bash-env"
+    bash_env.write_text(
+        f"export PATH={shlex.quote(_git_bash_path(fake_bin))}:\"$PATH\"\n"
+        f"export TMPDIR={shlex.quote(bash_tmp_path)}\n"
+        f"export TEMP={shlex.quote(bash_tmp_path)}\n"
+        f"export TMP={shlex.quote(bash_tmp_path)}\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    return _git_bash_path(bash_env), str(bash_tmp)
+
+
 def _integration_env(home: Path, fake_bin: Path) -> dict[str, str]:
+    bash_env, bash_tmp = _install_bash_env(home, fake_bin)
     return {
         "HOME": _git_bash_path(home),
+        "BASH_ENV": bash_env,
         "CODEX_HOME": _git_bash_path(home / ".codex"),
         "COPILOT_HOME": _git_bash_path(home / ".copilot"),
         "XDG_STATE_HOME": _git_bash_path(home / ".state"),
@@ -420,9 +439,9 @@ def _integration_env(home: Path, fake_bin: Path) -> dict[str, str]:
                 ),
             ]
         ),
-        "TMPDIR": _git_bash_path(home.parent),
-        "TEMP": _git_bash_path(home.parent),
-        "TMP": _git_bash_path(home.parent),
+        "TMPDIR": bash_tmp,
+        "TEMP": bash_tmp,
+        "TMP": bash_tmp,
     }
 
 
@@ -446,9 +465,11 @@ def _hook_env(home: Path, state: Path, fake_bin: Path) -> dict[str, str]:
         encoding="utf-8",
         newline="\n",
     )
+    bash_env, bash_tmp = _install_bash_env(home, fake_bin)
     return {
         **os.environ,
         "HOME": _git_bash_path(home),
+        "BASH_ENV": bash_env,
         "AGENT_MAIL_STATE_DIR": _git_bash_path(state),
         "AGENT_MAIL_ENV_FILE": _git_bash_path(env_file),
         "AGENT_MAIL_AGENT": "",
@@ -463,9 +484,9 @@ def _hook_env(home: Path, state: Path, fake_bin: Path) -> dict[str, str]:
                 ),
             ]
         ),
-        "TMPDIR": _git_bash_path(home.parent),
-        "TEMP": _git_bash_path(home.parent),
-        "TMP": _git_bash_path(home.parent),
+        "TMPDIR": bash_tmp,
+        "TEMP": bash_tmp,
+        "TMP": bash_tmp,
     }
 
 
@@ -882,9 +903,13 @@ def test_codex_and_copilot_integrators_write_only_temp_user_config(
         assert len(managed) == 1
         assert managed[0]["command"].endswith(event_arg)
         assert "commandWindows" in managed[0]
-        assert managed[0]["commandWindows"].startswith(
-            '"C:\\Program Files\\Git\\bin\\bash.exe"'
-        )
+        windows_argv = shlex.split(managed[0]["commandWindows"], posix=False)
+        bash_executable = windows_argv[0].strip('"')
+        assert PureWindowsPath(bash_executable).name.casefold() == "bash.exe"
+        assert PureWindowsPath(windows_argv[1].strip('"')).name == "hook_wrapper.sh"
+        assert windows_argv[2] == event_arg
+        if os.name == "nt":
+            assert Path(bash_executable).is_file()
     assert merged_hooks["hooks"]["SessionEnd"][-1]["hooks"][0]["timeout"] == 3
 
     wrapper = codex_dir / "hooks" / "mcp-agent-mail" / "hook_wrapper.sh"
@@ -1019,7 +1044,14 @@ def test_codex_and_copilot_integrators_write_only_temp_user_config(
     assert {handler["timeoutSec"] for handler in managed_copilot_handlers} == {3, 20}
     for handler in managed_copilot_handlers:
         assert "powershell" in handler
-        assert "C:\\Program Files\\Git\\bin\\bash.exe" in handler["powershell"]
+        if os.name == "nt":
+            powershell_argv = shlex.split(handler["powershell"])
+            assert powershell_argv[0] == "&"
+            assert PureWindowsPath(powershell_argv[1]).name.casefold() == "bash.exe"
+            assert PureWindowsPath(powershell_argv[2]).name == "hook_wrapper.sh"
+        else:
+            assert "bash.exe" in handler["powershell"]
+            assert "hook_wrapper.sh" in handler["powershell"]
         assert "??" not in handler["powershell"]
 
     copilot_wrapper = copilot_dir / "hooks" / "mcp-agent-mail" / "hook_wrapper.sh"
@@ -1105,12 +1137,12 @@ def test_claude_and_codex_integrators_reject_invalid_nested_config_before_writes
     target = home / relative_path
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(invalid_contents, encoding="utf-8")
-    before = _tree_snapshot(tmp_path)
     env = {
         **os.environ,
         **_integration_env(home, fake_bin),
         "CODEX_HOME": _git_bash_path(home / "codex-profile"),
     }
+    before = _tree_snapshot(tmp_path)
 
     result = subprocess.run(
         [
@@ -1166,12 +1198,12 @@ def test_claude_and_codex_integrator_dry_run_has_zero_filesystem_mutations(
             '[mcp_servers.claude-delegator]\ncommand = "keep"\n',
             encoding="utf-8",
         )
-    before = _tree_snapshot(tmp_path)
     env = {
         **os.environ,
         **_integration_env(home, fake_bin),
         "CODEX_HOME": _git_bash_path(codex_dir),
     }
+    before = _tree_snapshot(tmp_path)
 
     result = subprocess.run(
         [
@@ -1365,10 +1397,16 @@ def test_claude_posix_hook_commands_quote_spaces_and_apostrophes(
     ]
     assert len(managed_commands) == 6
     for command in managed_commands:
-        parsed = shlex.split(command.removesuffix(" || true"))
+        if os.name == "nt":
+            outer = shlex.split(command)
+            assert Path(outer[0]).name.casefold() == "bash.exe"
+            assert outer[1] == "-c"
+            parsed = shlex.split(outer[2].removesuffix(" || true"))
+        else:
+            parsed = shlex.split(command.removesuffix(" || true"))
         assert parsed[0] == "AGENT_MAIL_CLAUDE_SLOT=1"
         assert parsed[1] == "bash"
-        assert Path(parsed[2]).is_relative_to(home / ".claude" / "hooks")
+        assert parsed[2].startswith(_git_bash_path(home / ".claude" / "hooks"))
 
 
 @pytest.mark.parametrize("client", ["claude", "codex"])
@@ -1573,12 +1611,12 @@ def test_copilot_integrator_dry_run_has_zero_filesystem_mutations(
         ),
         encoding="utf-8",
     )
-    before = _tree_snapshot(tmp_path)
     env = {
         **os.environ,
         **_integration_env(home, fake_bin),
         "COPILOT_HOME": _git_bash_path(copilot_dir),
     }
+    before = _tree_snapshot(tmp_path)
 
     result = subprocess.run(
         [
@@ -1618,12 +1656,12 @@ def test_copilot_integrator_rejects_invalid_user_json_before_any_write(
     invalid_config.write_text("not-json\n", encoding="utf-8")
     shared_env = home / ".agent-mail.env"
     shared_env.write_text("UNRELATED_SETTING=keep\n", encoding="utf-8")
-    before = _tree_snapshot(tmp_path)
     env = {
         **os.environ,
         **_integration_env(home, fake_bin),
         "COPILOT_HOME": _git_bash_path(copilot_dir),
     }
+    before = _tree_snapshot(tmp_path)
 
     result = subprocess.run(
         [
@@ -1944,9 +1982,14 @@ def test_auto_installer_continues_after_failure_then_exits_nonzero(
     uv_path = shutil.which("uv")
     assert uv_path is not None
     (fake_bin / "uv").symlink_to(uv_path)
+    jq_path = shutil.which("jq")
+    assert jq_path is not None
+    (fake_bin / "jq").symlink_to(jq_path)
+    bash_env, bash_tmp = _install_bash_env(home, fake_bin)
     env = {
         **os.environ,
         "HOME": _git_bash_path(home),
+        "BASH_ENV": bash_env,
         "CODEX_HOME": _git_bash_path(codex_dir),
         "XDG_STATE_HOME": _git_bash_path(home / ".state"),
         "XDG_CONFIG_HOME": _git_bash_path(home / ".config"),
@@ -1956,9 +1999,9 @@ def test_auto_installer_continues_after_failure_then_exits_nonzero(
         # Exclude real Claude/Codex binaries while retaining ordinary POSIX
         # tools. The explicit CODEX_HOME above still detects Codex.
         "PATH": f"{_git_bash_path(fake_bin)}:/usr/bin:/bin",
-        "TMPDIR": _git_bash_path(home.parent),
-        "TEMP": _git_bash_path(home.parent),
-        "TMP": _git_bash_path(home.parent),
+        "TMPDIR": bash_tmp,
+        "TEMP": bash_tmp,
+        "TMP": bash_tmp,
     }
 
     result = subprocess.run(
@@ -2405,6 +2448,7 @@ def test_windows_user_paths_are_normalized_for_mocked_git_bash(tmp_path: Path) -
         "AGENT_MAIL_URL=https://hermes.example/mcp/\n"
         "HTTP_BEARER_TOKEN=git-bash-bearer\n",
         encoding="utf-8",
+        newline="\n",
     )
     result = _bash(
         f"""
@@ -2439,6 +2483,7 @@ def test_windows_user_paths_are_normalized_for_mocked_wsl(tmp_path: Path) -> Non
         "AGENT_MAIL_URL=https://hermes.example/mcp/\n"
         "HTTP_BEARER_TOKEN=wsl-bearer\n",
         encoding="utf-8",
+        newline="\n",
     )
     result = _bash(
         f"""
@@ -2457,7 +2502,8 @@ def test_windows_user_paths_are_normalized_for_mocked_wsl(tmp_path: Path) -> Non
         source {shlex.quote(_git_bash_path(HOOK_COMMON))}
         printf '%s\n' "$AM_PATH_CONFIGURATION_VALID" "$AM_STATE_DIR" "$HTTP_BEARER_TOKEN"
         am_cred_put /owner/repo codex-wsl-build-box-1 registration-token
-        """
+        """,
+        env={"MSYS_NO_PATHCONV": "1"},
     )
 
     assert result.returncode == 0, result.stderr

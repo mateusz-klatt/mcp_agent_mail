@@ -16,7 +16,12 @@ class _DummyArchive:
 
 
 def _git(cwd: Path, *args: str) -> str:
-    cp = subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True)
+    cp = subprocess.run(
+        ["git", "-c", "commit.gpgsign=false", "-C", str(cwd), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     return cp.stdout.strip()
 
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timezone
 
 import pytest
@@ -38,17 +37,14 @@ async def test_renew_file_reservations_extends_expiry_and_updates_artifact(isola
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
         )
-        # Create a short TTL file reservation
+        # Create an active file reservation
         res = await client.call_tool(
             "file_reservation_paths",
-            {"project_key": "Backend", "agent_name": "GreenCastle", "paths": ["docs/*.md"], "ttl_seconds": 2, "exclusive": True},
+            {"project_key": "Backend", "agent_name": "GreenCastle", "paths": ["docs/*.md"], "ttl_seconds": 3600, "exclusive": True},
         )
         reservation = (res.data.get("granted") or [])[0]
         before = reservation.get("expires_ts")
         assert before
-
-        # Sleep briefly to ensure timestamp change
-        await asyncio.sleep(0.6)
 
         # Renew by +60 seconds
         ren = await client.call_tool(
@@ -79,5 +75,4 @@ async def test_renew_file_reservations_extends_expiry_and_updates_artifact(isola
             return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc)
 
         assert _parse(data["expires_ts"]) >= _parse(after)
-
 

@@ -27,7 +27,25 @@ INTEGRATORS = {
     "codex": ROOT / "scripts" / "integrate_codex_cli.sh",
     "copilot": ROOT / "scripts" / "integrate_github_copilot.sh",
 }
-BASH = shutil.which("bash") or "bash"
+
+
+def _bash_executable() -> str:
+    discovered = shutil.which("bash")
+    if os.name != "nt":
+        return discovered or "bash"
+    git = shutil.which("git")
+    if git:
+        git_root = Path(git).resolve().parent.parent
+        for candidate in (
+            git_root / "bin" / "bash.exe",
+            git_root / "usr" / "bin" / "bash.exe",
+        ):
+            if candidate.is_file():
+                return str(candidate)
+    return discovered or "bash"
+
+
+BASH = _bash_executable()
 
 
 def _git_bash_path(path: str | Path) -> str:

@@ -1510,6 +1510,80 @@ def test_agent_state_component_exactly_mirrors_shell_squeeze_order() -> None:
     assert cli_module._agent_state_component(value) == f"a_b__c-{digest}"
 
 
+@pytest.mark.parametrize(
+    ("exit_code", "open_winerror", "query_error", "expected"),
+    [
+        pytest.param(259, None, False, True, id="running"),
+        pytest.param(0, None, False, False, id="exited"),
+        pytest.param(None, 87, False, False, id="missing"),
+        pytest.param(None, 5, False, True, id="open-denied"),
+        pytest.param(None, None, True, True, id="query-error"),
+    ],
+)
+def test_pid_is_alive_uses_non_signalling_windows_process_query(
+    exit_code: int | None,
+    open_winerror: int | None,
+    query_error: bool,
+    expected: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pid = 4242
+    handle = 31337
+    open_calls: list[tuple[int, bool, int]] = []
+    query_calls: list[int] = []
+    close_calls: list[int] = []
+    kill_calls: list[tuple[int, int]] = []
+
+    class FakeWinAPI:
+        STILL_ACTIVE = 259
+
+        def OpenProcess(
+            self,
+            desired_access: int,
+            inherit_handle: bool,
+            process_id: int,
+        ) -> int:
+            open_calls.append((desired_access, inherit_handle, process_id))
+            if open_winerror is not None:
+                error = OSError(f"OpenProcess failed with {open_winerror}")
+                cast(Any, error).winerror = open_winerror
+                raise error
+            return handle
+
+        def GetExitCodeProcess(self, process_handle: int) -> int:
+            query_calls.append(process_handle)
+            if query_error:
+                raise OSError("GetExitCodeProcess failed")
+            assert exit_code is not None
+            return exit_code
+
+        def CloseHandle(self, process_handle: int) -> None:
+            close_calls.append(process_handle)
+
+    fake_winapi = FakeWinAPI()
+
+    def fake_import_module(name: str) -> Any:
+        assert name == "_winapi"
+        return fake_winapi
+
+    def record_kill(process_id: int, signal_number: int) -> None:
+        kill_calls.append((process_id, signal_number))
+
+    monkeypatch.setattr(cli_module.os, "name", "nt")
+    monkeypatch.setattr(cli_module.os, "kill", record_kill)
+    monkeypatch.setattr(cli_module.importlib, "import_module", fake_import_module)
+
+    assert cli_module._pid_is_alive(pid) is expected
+    assert open_calls == [(0x1000, False, pid)]
+    assert kill_calls == []
+    if open_winerror is not None:
+        assert query_calls == []
+        assert close_calls == []
+    else:
+        assert query_calls == [handle]
+        assert close_calls == [handle]
+
+
 def test_migrate_agent_state_interoperable_lock_preserves_concurrent_insert(
     isolated_env,
     tmp_path: Path,

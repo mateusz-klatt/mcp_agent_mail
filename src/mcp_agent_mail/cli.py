@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import hashlib
+import importlib
 import importlib.metadata as importlib_metadata
 import json
 import os
@@ -2111,6 +2112,28 @@ _TRANSITIONAL_CLIENT_ALIASES = {
 def _pid_is_alive(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        winapi = cast(Any, importlib.import_module("_winapi"))
+        process_query_limited_information = 0x1000
+        try:
+            handle = winapi.OpenProcess(
+                process_query_limited_information,
+                False,
+                pid,
+            )
+        except OSError as exc:
+            # OpenProcess reports ERROR_INVALID_PARAMETER for a PID that no
+            # longer exists. Other failures (notably access denied) cannot
+            # prove that the process is dead, so preserve its lock.
+            return getattr(exc, "winerror", None) != 87
+        try:
+            try:
+                return winapi.GetExitCodeProcess(handle) == winapi.STILL_ACTIVE
+            except OSError:
+                # A failed status query is likewise not evidence of death.
+                return True
+        finally:
+            winapi.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

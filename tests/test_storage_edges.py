@@ -860,6 +860,10 @@ async def test_commit_queue_batch_ignores_cancelled_waiter(isolated_env, monkeyp
 # ============================================================================
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows does not permit unlinking an open file",
+)
 def test_cleanup_leaked_lockfile_fds_closes_deleted_lock_fd() -> None:
     """A still-open fd pointing at an unlinked ``.lock`` file must be closed.
 
@@ -910,6 +914,10 @@ def test_cleanup_leaked_lockfile_fds_skips_live_lock_fds(tmp_path: Path) -> None
             lock_path.unlink()
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows does not permit unlinking an open file",
+)
 def test_cleanup_leaked_lockfile_fds_ignores_non_lock_deleted_fds() -> None:
     """A deleted-but-open fd that is NOT a ``.lock`` file must be left alone."""
     fd, path = tempfile.mkstemp(suffix=".txt")

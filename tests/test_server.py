@@ -24,6 +24,7 @@ from mcp_agent_mail.app import (
 )
 from mcp_agent_mail.config import clear_settings_cache, get_settings
 from mcp_agent_mail.db import get_session
+from mcp_agent_mail.models import FileReservation
 from tests.keys import pkey
 
 
@@ -1042,8 +1043,8 @@ async def test_force_release_file_reservation_expired_is_noop(isolated_env):
 
 @pytest.mark.asyncio
 async def test_force_release_file_reservation_reports_notification_failure(isolated_env, monkeypatch):
-    monkeypatch.setenv("FILE_RESERVATION_INACTIVITY_SECONDS", "5")
-    monkeypatch.setenv("FILE_RESERVATION_ACTIVITY_GRACE_SECONDS", "1")
+    monkeypatch.setenv("FILE_RESERVATION_INACTIVITY_SECONDS", "3600")
+    monkeypatch.setenv("FILE_RESERVATION_ACTIVITY_GRACE_SECONDS", "120")
     clear_settings_cache()
     try:
         server = build_mcp_server()
@@ -1102,7 +1103,7 @@ async def test_force_release_file_reservation_reports_notification_failure(isola
             async with get_session() as session:
                 project_row = await session.execute(text("SELECT id FROM projects WHERE slug = :slug"), {"slug": "backend"})
                 project_id = project_row.scalar_one()
-                stale_cutoff = (datetime.now(timezone.utc) - timedelta(seconds=300)).isoformat()
+                stale_cutoff = (datetime.now(timezone.utc) - timedelta(seconds=7200)).isoformat()
                 await session.execute(
                     text(
                         "UPDATE agents SET last_active_ts = :ts WHERE project_id = :pid AND lower(name) = :name"
@@ -1530,14 +1531,14 @@ async def test_file_reservation_conflict_ttl_transition_allows_after_expiry(isol
                 "name": "BlueLake",
             },
         )
-        # Beta reserves Alpha inbox surface, short TTL
+        # Beta reserves Alpha inbox surface.
         reservation = await client.call_tool(
             "file_reservation_paths",
             {
                 "project_key": "Backend",
                     "agent_name": "BlueLake",
                     "paths": ["agents/GreenCastle/inbox/*/*/*.md"],
-                "ttl_seconds": 1,
+                "ttl_seconds": 3600,
                 "exclusive": True,
             },
         )
@@ -1560,9 +1561,16 @@ async def test_file_reservation_conflict_ttl_transition_allows_after_expiry(isol
         assert isinstance(payload, dict)
         assert payload.get("type") == "FILE_RESERVATION_CONFLICT" or payload.get("error", {}).get("type") == "FILE_RESERVATION_CONFLICT"
 
-        # Wait for TTL to expire and retry
-        import asyncio as _asyncio
-        await _asyncio.sleep(1.2)
+        reservation_id = reservation.data["granted"][0]["id"]
+        async with get_session() as session:
+            expired = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=60)
+            reservation_row = await session.get(FileReservation, reservation_id)
+            assert reservation_row is not None
+            reservation_row.expires_ts = expired
+            session.add(reservation_row)
+            await session.commit()
+
+        # Retry after the persisted TTL has elapsed.
         resp2 = await client.call_tool(
             "send_message",
             {
@@ -1574,7 +1582,8 @@ async def test_file_reservation_conflict_ttl_transition_allows_after_expiry(isol
             },
         )
         deliveries = resp2.data.get("deliveries") or []
-        assert deliveries and deliveries[0]["payload"]["subject"] == "AllowedAfterTTL"
+        assert deliveries, resp2.data
+        assert deliveries[0]["payload"]["subject"] == "AllowedAfterTTL"
 
 
 @pytest.mark.asyncio

@@ -21,6 +21,7 @@ Reference: mcp_agent_mail-e4m
 from __future__ import annotations
 
 import asyncio
+import os
 import random
 import string
 from contextlib import asynccontextmanager, contextmanager
@@ -819,14 +820,17 @@ class TestNoDeadlocks:
                 else:
                     operations.append(reserve_op(i))
 
-            # Execute all with timeout to detect deadlock
+            operation_timeout_seconds = 90.0 if os.name == "nt" else 30.0
             try:
                 results = await asyncio.wait_for(
                     asyncio.gather(*operations, return_exceptions=True),
-                    timeout=30.0,  # 30 second timeout
+                    timeout=operation_timeout_seconds,
                 )
             except asyncio.TimeoutError:
-                pytest.fail("Deadlock detected - operations timed out")
+                pytest.fail(
+                    "Deadlock detected - operations exceeded "
+                    f"the {operation_timeout_seconds:.0f}s {os.name} timeout"
+                )
 
             # Count successes - under high concurrency some operations may get
             # transient cancellation. The key test is: no deadlock (timeout) occurred

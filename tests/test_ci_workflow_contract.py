@@ -11,10 +11,11 @@ USES_LINE = re.compile(
 )
 IMMUTABLE_ACTION_REF = re.compile(r"[0-9a-f]{40}")
 VERSION_COMMENT = re.compile(r"v\d+(?:\.\d+){1,2}")
-BOUNDED_JOBS = {
-    "ci.yml": ("build-and-test", 120),
-    "sonarcloud.yml": ("scan", 15),
-}
+BOUNDED_JOBS = (
+    ("ci.yml", "build-and-test", 120),
+    ("ci.yml", "portability", 180),
+    ("sonarcloud.yml", "scan", 15),
+)
 
 
 def _read_workflow(path: Path) -> str:
@@ -86,7 +87,7 @@ def test_external_actions_use_immutable_commits() -> None:
 
 
 def test_long_running_jobs_have_finite_timeouts() -> None:
-    for workflow_name, (job_name, expected_timeout) in BOUNDED_JOBS.items():
+    for workflow_name, job_name, expected_timeout in BOUNDED_JOBS:
         workflow = _read_workflow(WORKFLOWS_DIR / workflow_name)
         block = _job_block(workflow, job_name)
         timeouts = [
@@ -98,6 +99,40 @@ def test_long_running_jobs_have_finite_timeouts() -> None:
             f"{workflow_name} job {job_name!r} must have one finite "
             f"timeout-minutes value of {expected_timeout}"
         )
+
+
+def test_sonar_uses_ubuntu_gate_while_portability_remains_required() -> None:
+    workflow = _read_workflow(WORKFLOWS_DIR / "ci.yml")
+    ubuntu = _job_block(workflow, "build-and-test")
+    portability = _job_block(workflow, "portability")
+    sonar = _job_block(workflow, "sonar")
+
+    visible_check_name = "    name: Lint, Type Check, Test (${{ matrix.os }}, py${{ matrix.python-version }})"
+    assert visible_check_name in ubuntu
+    assert visible_check_name in portability
+    assert "        os: [ubuntu-latest]" in ubuntu
+    assert "        os: [macos-latest, windows-latest]" in portability
+    assert "      fail-fast: false" in portability
+    assert not any(line.startswith("    continue-on-error:") for line in portability)
+
+    common_commands = (
+        "uv sync --dev",
+        "uv run ruff check",
+        "uvx ty check --python-version 3.14 --python-platform all",
+    )
+    for command in common_commands:
+        assert any(line.strip() == command for line in ubuntu)
+        assert any(line.strip() == command for line in portability)
+
+    assert any(line.strip() == "uv run -m pytest -q --cov-report=xml:coverage.xml" for line in ubuntu)
+    assert any(line.strip() == "uv run -m pytest -q --no-cov" for line in portability)
+    assert not any("--cov-report" in line for line in portability)
+    assert any("tests/benchmarks/bench_*.py" in line for line in ubuntu)
+    assert "          name: coverage-${{ github.sha }}" in ubuntu
+    assert not any("coverage-${{ github.sha }}" in line for line in portability)
+    assert "    needs: build-and-test" in sonar
+    assert not any("portability" in line for line in sonar)
+    assert "        needs.build-and-test.result == 'success' &&" in sonar
 
 
 def test_reusable_sonar_caller_grants_requested_permissions() -> None:

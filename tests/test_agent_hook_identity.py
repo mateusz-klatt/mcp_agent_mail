@@ -35,17 +35,42 @@ def _bash_executable() -> str:
         return discovered or "bash"
     git = shutil.which("git")
     if git:
-        git_root = Path(git).resolve().parent.parent
-        for candidate in (
-            git_root / "bin" / "bash.exe",
-            git_root / "usr" / "bin" / "bash.exe",
-        ):
-            if candidate.is_file():
-                return str(candidate)
+        for git_root in Path(git).resolve().parents:
+            for candidate in (
+                git_root / "bin" / "bash.exe",
+                git_root / "usr" / "bin" / "bash.exe",
+            ):
+                if candidate.is_file():
+                    return str(candidate)
     return discovered or "bash"
 
 
 BASH = _bash_executable()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Git layout")
+def test_bash_executable_finds_git_root_above_mingw64(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    git_root = tmp_path / "Git"
+    git = git_root / "mingw64" / "bin" / "git.exe"
+    bash = git_root / "bin" / "bash.exe"
+    git.parent.mkdir(parents=True)
+    bash.parent.mkdir(parents=True)
+    git.write_bytes(b"")
+    bash.write_bytes(b"")
+
+    def fake_which(executable: str) -> str | None:
+        if executable == "git":
+            return str(git)
+        if executable == "bash":
+            return str(tmp_path / "Windows" / "System32" / "bash.exe")
+        return None
+
+    monkeypatch.setattr(shutil, "which", fake_which)
+
+    assert _bash_executable() == str(bash)
 
 
 def _git_bash_path(path: str | Path) -> str:

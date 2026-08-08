@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from click import unstyle
 from fastmcp import Client
 from git.index.base import IndexFile
 from sqlalchemy import func, select as _sa_select, text
@@ -382,9 +383,9 @@ def test_rename_agent_defaults_to_dry_run_without_mutation(isolated_env) -> None
     result = runner.invoke(app, ["rename-agent", PROJECT_KEY, OLD_NAME, NEW_NAME])
 
     assert result.exit_code == 0, result.output
-    assert "DRY RUN" in result.output
-    assert "not lock-verified" in result.output
-    assert REGISTRATION_TOKEN not in result.output
+    assert "DRY RUN" in unstyle(result.output)
+    assert "not lock-verified" in unstyle(result.output)
+    assert REGISTRATION_TOKEN not in unstyle(result.output)
     assert _git(seeded.repo_root, "rev-parse", "HEAD") == seeded.seed_commit
     assert (seeded.archive_root / "agents" / OLD_NAME / "profile.json").is_file()
     assert not (seeded.archive_root / "agents" / NEW_NAME).exists()
@@ -414,7 +415,7 @@ def test_rename_agent_dry_run_never_creates_missing_database_or_archive(isolated
     )
 
     assert result.exit_code != 0
-    assert "will not create" in result.output
+    assert "will not create" in unstyle(result.output)
     assert not database_path.exists()
     assert not storage_root.exists()
     assert _tree_contents(storage_root.parent) == before_parent
@@ -446,8 +447,8 @@ def test_rename_agent_dry_run_rejects_nonempty_wal_without_mutation(
         )
 
         assert result.exit_code != 0
-        assert "WAL" in result.output
-        assert "non-empty" in result.output
+        assert "WAL" in unstyle(result.output)
+        assert "non-empty" in unstyle(result.output)
         assert _tree_contents(seeded.repo_root.parent) == before
         assert _git(seeded.repo_root, "rev-parse", "HEAD") == seeded.seed_commit
     finally:
@@ -477,10 +478,12 @@ def test_rename_agent_apply_preserves_ids_token_relations_and_git_history(isolat
     )
 
     assert result.exit_code == 0, result.output
-    assert "APPLIED" in result.output
-    assert "preserved" in result.output
-    assert REGISTRATION_TOKEN not in result.output
-    assert hashlib.sha256(REGISTRATION_TOKEN.encode()).hexdigest() not in result.output
+    assert "APPLIED" in unstyle(result.output)
+    assert "preserved" in unstyle(result.output)
+    assert REGISTRATION_TOKEN not in unstyle(result.output)
+    assert hashlib.sha256(REGISTRATION_TOKEN.encode()).hexdigest() not in unstyle(
+        result.output
+    )
 
     async def verify_database() -> dict[str, Any]:
         async with get_session() as session:
@@ -704,7 +707,7 @@ def test_rename_agent_is_scoped_when_two_projects_share_the_old_name(
     )
 
     assert result.exit_code == 0, result.output
-    assert other_token not in result.output
+    assert other_token not in unstyle(result.output)
 
     async def project_names_and_tokens() -> tuple[tuple[str, str | None], tuple[str, str | None]]:
         async with get_session() as session:
@@ -927,7 +930,7 @@ def test_rename_agent_rejects_case_invalid_target_and_collision(
     result = CliRunner().invoke(app, ["rename-agent", PROJECT_KEY, old_name, new_name])
 
     assert result.exit_code != 0
-    assert expected in result.output.lower()
+    assert expected in unstyle(result.output).lower()
     assert _git(seeded.repo_root, "rev-parse", "HEAD") == seeded.seed_commit
 
 
@@ -940,7 +943,7 @@ def test_rename_agent_leaves_pre_platform_identity_out_of_scope(isolated_env) ->
     )
 
     assert result.exit_code != 0
-    assert "pre-platform" in result.output
+    assert "pre-platform" in unstyle(result.output)
     assert _git(seeded.repo_root, "rev-parse", "HEAD") == seeded.seed_commit
 
 
@@ -960,8 +963,8 @@ def test_rename_agent_accepts_evidenced_transitional_and_server_coerced_sources(
     )
 
     assert result.exit_code == 0, result.output
-    assert "DRY RUN" in result.output
-    assert f"agent_id={seeded.agent_id}" in result.output
+    assert "DRY RUN" in unstyle(result.output)
+    assert f"agent_id={seeded.agent_id}" in unstyle(result.output)
 
 
 def test_shared_identity_parser_preserves_a_hyphenated_host() -> None:
@@ -982,7 +985,7 @@ def test_rename_agent_accepts_hyphenated_legacy_host(isolated_env) -> None:
     )
 
     assert result.exit_code == 0, result.output
-    assert f"agent_id={seeded.agent_id}" in result.output
+    assert f"agent_id={seeded.agent_id}" in unstyle(result.output)
 
 
 @pytest.mark.parametrize(
@@ -1005,7 +1008,7 @@ def test_rename_agent_rejects_structural_identity_drift(
     )
 
     assert result.exit_code != 0
-    assert "same host, OS and slot" in result.output
+    assert "same host, OS and slot" in unstyle(result.output)
     assert _git(seeded.repo_root, "rev-parse", "HEAD") == seeded.seed_commit
 
 
@@ -1274,7 +1277,7 @@ def test_malformed_reservation_blocks_before_archive_mutation(
     )
 
     assert result.exit_code != 0
-    assert "reservation artifact is unreadable" in result.output
+    assert "reservation artifact is unreadable" in unstyle(result.output)
     assert _git(seeded.repo_root, "rev-parse", "HEAD") == before_head
     assert (seeded.archive_root / "agents" / OLD_NAME).is_dir()
     assert not (seeded.archive_root / "agents" / NEW_NAME).exists()
@@ -1309,7 +1312,7 @@ def test_staged_unrelated_lock_blocks_dedicated_rename_commit(isolated_env) -> N
     )
 
     assert result.exit_code != 0
-    assert "clean" in result.output.lower()
+    assert "clean" in unstyle(result.output).lower()
     assert _git(seeded.repo_root, "rev-parse", "HEAD") == seeded.seed_commit
     assert relative_path in _git(
         seeded.repo_root,
@@ -1345,7 +1348,7 @@ def test_rename_agent_recovers_db_ahead_when_profile_proves_same_agent(isolated_
     )
 
     assert result.exit_code == 0, result.output
-    assert "database_already_applied" in result.output
+    assert "database_already_applied" in unstyle(result.output)
     assert not (seeded.archive_root / "agents" / OLD_NAME).exists()
     assert (seeded.archive_root / "agents" / NEW_NAME / "profile.json").is_file()
     assert _meaningful_git_status(seeded.repo_root) == []
@@ -1499,8 +1502,8 @@ def test_migrate_agent_state_rejects_ambiguous_lossy_project_component(
     )
 
     assert result.exit_code != 0
-    assert "ambiguous" in result.output
-    assert REGISTRATION_TOKEN not in result.output
+    assert "ambiguous" in unstyle(result.output)
+    assert REGISTRATION_TOKEN not in unstyle(result.output)
     assert _tree_contents(state_dir) == before
 
 
@@ -1661,8 +1664,8 @@ def test_migrate_agent_state_interoperable_lock_preserves_concurrent_insert(
     assert migration_results
     migration_result = migration_results[0]
     assert migration_result.exit_code == 0, migration_result.output
-    assert REGISTRATION_TOKEN not in migration_result.output
-    assert "foreign-secret" not in migration_result.output
+    assert REGISTRATION_TOKEN not in unstyle(migration_result.output)
+    assert "foreign-secret" not in unstyle(migration_result.output)
     credentials = json.loads(credential_path.read_text(encoding="utf-8"))
     assert OLD_NAME not in credentials[PROJECT_KEY]
     assert credentials[PROJECT_KEY][NEW_NAME] == REGISTRATION_TOKEN
@@ -1684,7 +1687,7 @@ def test_rename_agent_requires_exact_confirmation_and_stopped_server(isolated_en
         ],
     )
     assert wrong_confirmation.exit_code != 0
-    assert f"{OLD_NAME}=>{NEW_NAME}" in wrong_confirmation.output
+    assert f"{OLD_NAME}=>{NEW_NAME}" in unstyle(wrong_confirmation.output)
 
     from filelock import FileLock
 
@@ -1706,7 +1709,7 @@ def test_rename_agent_requires_exact_confirmation_and_stopped_server(isolated_en
     finally:
         lock.release()
     assert active_server.exit_code != 0
-    assert "operator-stopped" in active_server.output
+    assert "operator-stopped" in unstyle(active_server.output)
 
 
 def test_rename_agent_requires_persisted_token_and_clean_archive(isolated_env) -> None:
@@ -1724,7 +1727,7 @@ def test_rename_agent_requires_persisted_token_and_clean_archive(isolated_env) -
     reset_database_state()
     missing_token = CliRunner().invoke(app, ["rename-agent", PROJECT_KEY, OLD_NAME, NEW_NAME])
     assert missing_token.exit_code != 0
-    assert "persisted registration token" in missing_token.output.lower()
+    assert "persisted registration token" in unstyle(missing_token.output).lower()
 
     async def restore_token() -> None:
         async with get_session() as session:
@@ -1740,7 +1743,7 @@ def test_rename_agent_requires_persisted_token_and_clean_archive(isolated_env) -
     dirty_path.write_text("uncommitted\n", encoding="utf-8")
     dirty = CliRunner().invoke(app, ["rename-agent", PROJECT_KEY, OLD_NAME, NEW_NAME])
     assert dirty.exit_code != 0
-    assert "clean" in dirty.output.lower()
+    assert "clean" in unstyle(dirty.output).lower()
 
 
 def test_db_ahead_collision_is_rejected_without_matching_legacy_profile_id(isolated_env) -> None:
@@ -1769,7 +1772,7 @@ def test_db_ahead_collision_is_rejected_without_matching_legacy_profile_id(isola
     reset_database_state()
     result = CliRunner().invoke(app, ["rename-agent", PROJECT_KEY, OLD_NAME, NEW_NAME])
     assert result.exit_code != 0
-    assert "collision" in result.output.lower()
+    assert "collision" in unstyle(result.output).lower()
     assert _git(seeded.repo_root, "rev-parse", "HEAD") == seeded.seed_commit
 
 

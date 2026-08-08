@@ -128,6 +128,9 @@ jobs:
   sonar:
     name: SonarCloud
     needs: build-and-test
+    permissions:
+      contents: read
+      pull-requests: read
     if: >-
       ${{
         needs.build-and-test.result == 'success' &&

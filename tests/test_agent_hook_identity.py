@@ -820,6 +820,7 @@ def test_codex_and_copilot_integrators_write_only_temp_user_config(
         **_integration_env(home, fake_bin),
         "CODEX_HOME": _git_bash_path(codex_dir),
         "COPILOT_HOME": _git_bash_path(copilot_dir),
+        "VSCODE_MCP_CONFIG_PATH": _git_bash_path(vscode_config_path),
     }
 
     codex_result = subprocess.run(

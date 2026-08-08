@@ -1195,7 +1195,13 @@ def test_collect_preview_status_is_independent_of_directory_entry_order(tmp_path
     }
     monkeypatch.setattr(Path, "rglob", lambda root, _pattern: iter(entries_by_root[root]))
 
-    assert cli_module._collect_preview_status(first) == cli_module._collect_preview_status(second)
+    first_status = cli_module._collect_preview_status(first)
+    second_status = cli_module._collect_preview_status(second)
+
+    assert first_status == second_status
+    (first / "a.txt").write_text("expanded", encoding="utf-8")
+    os.utime(first / "a.txt", ns=(fixed_ns, fixed_ns))
+    assert cli_module._collect_preview_status(first)["signature"] != first_status["signature"]
 
 
 def test_share_export_chunking_and_viewer_data(monkeypatch, tmp_path: Path) -> None:

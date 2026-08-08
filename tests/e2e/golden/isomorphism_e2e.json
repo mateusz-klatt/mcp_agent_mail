@@ -848,7 +848,7 @@
       "manifest_iso": "2024-08-30T06:40:06+00:00",
       "manifest_ns": 1725000006000000000,
       "manual_token": 0,
-      "signature": "391c8cbe2f95af42682bfa7efb84abb6f2c3c652ff586c680184876fd21b2fdf"
+      "signature": "<runtime-dependent-signature>"
     },
     "scrub_summary": {
       "ack_flags_cleared": 6,

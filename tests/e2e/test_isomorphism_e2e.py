@@ -863,6 +863,10 @@ async def test_isomorphism_e2e_suite(
 
         _touch_bundle_files(bundle_root, base=1_725_000_000.0)
         preview_status = _collect_preview_status(bundle_root)
+        preview_signature = preview_status.get("signature")
+        assert isinstance(preview_signature, str)
+        assert len(preview_signature) == 64
+        assert set(preview_signature) <= set("0123456789abcdef")
         verify = share.verify_bundle(bundle_root)
         phases.append(
             {
@@ -996,7 +1000,10 @@ async def test_isomorphism_e2e_suite(
                 "viewer_data": bundle_artifacts.viewer_data,
             },
             "verify": verify,
-            "preview_status": preview_status,
+            "preview_status": {
+                **preview_status,
+                "signature": "<runtime-dependent-signature>",
+            },
         },
     }
 

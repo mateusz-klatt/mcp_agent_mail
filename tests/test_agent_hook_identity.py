@@ -27,6 +27,18 @@ INTEGRATORS = {
     "codex": ROOT / "scripts" / "integrate_codex_cli.sh",
     "copilot": ROOT / "scripts" / "integrate_github_copilot.sh",
 }
+BASH = shutil.which("bash") or "bash"
+
+
+def _git_bash_path(path: str | Path) -> str:
+    """Return a host path in the path dialect understood by Git Bash."""
+    value = str(path)
+    if os.name != "nt":
+        return value
+    normalized = value.replace("\\", "/")
+    if len(normalized) >= 2 and normalized[1] == ":":
+        return f"/{normalized[0].lower()}{normalized[2:]}"
+    return normalized
 
 
 def test_project_claude_template_is_an_inert_installer_pointer() -> None:
@@ -42,11 +54,22 @@ def test_project_claude_template_is_an_inert_installer_pointer() -> None:
     assert "YOUR_BEARER_TOKEN" not in template_text
 
 
+def test_mac_bash_32_case_labels_inside_command_substitutions_are_balanced() -> None:
+    """Keep case labels parseable by the Bash 3.2 shipped with macOS."""
+    shared_lib = LIB.read_text(encoding="utf-8")
+    codex_integrator = INTEGRATORS["codex"].read_text(encoding="utf-8")
+
+    assert "\n          (AGENT_MAIL_URL|" in shared_lib
+    assert "|AGENT_MAIL_*_SLOT)\n" in shared_lib
+    assert "\n  (session-end) export AGENT_MAIL_HOOK_TIMEOUT='2' ;;" in codex_integrator
+    assert "\n  (*) export AGENT_MAIL_HOOK_TIMEOUT='6' ;;" in codex_integrator
+
+
 def _bash(script: str, *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     process_env = os.environ.copy()
     process_env.update(env or {})
     return subprocess.run(
-        ["bash", "--noprofile", "--norc", "-c", script],
+        [BASH, "--noprofile", "--norc", "-c", script],
         cwd=ROOT,
         env=process_env,
         check=False,
@@ -65,7 +88,7 @@ def _bash(script: str, *, env: dict[str, str] | None = None) -> subprocess.Compl
 )
 def test_shell_and_python_state_components_are_identical(raw: str) -> None:
     result = _bash(
-        f"source {shlex.quote(str(HOOK_COMMON))}; am_state_component {shlex.quote(raw)}"
+        f"source {shlex.quote(_git_bash_path(HOOK_COMMON))}; am_state_component {shlex.quote(raw)}"
     )
 
     assert result.returncode == 0, result.stderr
@@ -75,7 +98,7 @@ def test_shell_and_python_state_components_are_identical(raw: str) -> None:
 def test_state_digest_fails_without_a_sha256_provider() -> None:
     result = _bash(
         f"""
-        source {shlex.quote(str(HOOK_COMMON))}
+        source {shlex.quote(_git_bash_path(HOOK_COMMON))}
         command() {{
           if [ "$1" = -v ]; then return 1; fi
           builtin command "$@"
@@ -118,7 +141,7 @@ def test_integration_agent_name_is_cross_platform_and_client_scoped(
 ) -> None:
     result = _bash(
         f"""
-        source {LIB!s}
+        source {shlex.quote(_git_bash_path(LIB))}
         uname() {{ printf '%s' '{uname_value}'; }}
         hostname() {{ printf 'Lab Box!'; }}
         {extra_setup}
@@ -136,7 +159,7 @@ def test_hook_identity_cannot_be_replaced_by_an_ambient_agent_override(
 ) -> None:
     result = _bash(
         f"""
-        source {shlex.quote(str(HOOK_COMMON))}
+        source {shlex.quote(_git_bash_path(HOOK_COMMON))}
         uname() {{ printf Linux; }}
         hostname() {{ printf 'Lab-Box'; }}
         grep() {{ return 1; }}
@@ -144,8 +167,8 @@ def test_hook_identity_cannot_be_replaced_by_an_ambient_agent_override(
         """,
         env={
             "AGENT_MAIL_AGENT": "manual-noncanonical-name",
-            "AGENT_MAIL_ENV_FILE": str(tmp_path / "missing.env"),
-            "AGENT_MAIL_STATE_DIR": str(tmp_path / "state"),
+            "AGENT_MAIL_ENV_FILE": _git_bash_path(tmp_path / "missing.env"),
+            "AGENT_MAIL_STATE_DIR": _git_bash_path(tmp_path / "state"),
             "WSL_DISTRO_NAME": "",
         },
     )
@@ -165,7 +188,8 @@ def test_integration_project_key_uses_origin_identity(tmp_path: Path) -> None:
         text=True,
     )
     result = _bash(
-        f"source {shlex.quote(str(LIB))}; integration_project_key {shlex.quote(str(repo))}"
+        f"source {shlex.quote(_git_bash_path(LIB))}; "
+        f"integration_project_key {shlex.quote(_git_bash_path(repo))}"
     )
 
     assert result.returncode == 0, result.stderr
@@ -181,14 +205,15 @@ def test_hook_does_not_load_client_or_slot_from_shared_env(tmp_path: Path) -> No
         "AGENT_MAIL_PROJECT_KEY=/wrong/project\n"
         "AGENT_MAIL_REGISTRATION_TOKEN=wrong-token\n",
         encoding="utf-8",
+        newline="\n",
     )
 
     result = _bash(
         f"""
-        export AGENT_MAIL_ENV_FILE={shlex.quote(str(env_file))}
+        export AGENT_MAIL_ENV_FILE={shlex.quote(_git_bash_path(env_file))}
         unset AGENT_MAIL_CLIENT AGENT_MAIL_SLOT AGENT_MAIL_AGENT
         unset AGENT_MAIL_PROJECT_KEY AGENT_MAIL_REGISTRATION_TOKEN
-        source {shlex.quote(str(HOOK_COMMON))}
+        source {shlex.quote(_git_bash_path(HOOK_COMMON))}
         printf '%s|%s|%s|%s|%s' \
           "${{AGENT_MAIL_CLIENT-unset}}" "${{AGENT_MAIL_SLOT-unset}}" \
           "${{AGENT_MAIL_AGENT-unset}}" "${{AGENT_MAIL_PROJECT_KEY-unset}}" \
@@ -237,7 +262,7 @@ def test_shared_env_merge_preserves_unmanaged_lines_and_removes_identity(
         "UNRELATED_SETTING=keep-me\n"
         "AGENT_MAIL_URL=http://old/mcp/\n"
         "HTTP_BEARER_TOKEN=old\n"
-        f"AGENT_MAIL_STATE_DIR={old_state}\n"
+        f"AGENT_MAIL_STATE_DIR={_git_bash_path(old_state)}\n"
         "AGENT_MAIL_AGENT=old-agent\n"
         "AGENT_MAIL_PROJECT_KEY=/old/project\n"
         "AGENT_MAIL_CLIENT=claude\n"
@@ -245,15 +270,16 @@ def test_shared_env_merge_preserves_unmanaged_lines_and_removes_identity(
         "AGENT_MAIL_CODEX_SLOT=2\n"
         "AGENT_MAIL_REGISTRATION_TOKEN=registration-secret\n",
         encoding="utf-8",
+        newline="\n",
     )
 
     result = _bash(
         f"""
-        export HOME={shlex.quote(str(home))}
-        export XDG_STATE_HOME={shlex.quote(str(state))}
-        export AGENT_MAIL_ENV_FILE={shlex.quote(str(env_file))}
+        export HOME={shlex.quote(_git_bash_path(home))}
+        export XDG_STATE_HOME={shlex.quote(_git_bash_path(state))}
+        export AGENT_MAIL_ENV_FILE={shlex.quote(_git_bash_path(env_file))}
         export DRY_RUN=0
-        source {shlex.quote(str(LIB))}
+        source {shlex.quote(_git_bash_path(LIB))}
         write_shared_agent_mail_env https://hermes.example/mcp/ bearer-123
         """
     )
@@ -264,7 +290,7 @@ def test_shared_env_merge_preserves_unmanaged_lines_and_removes_identity(
     assert "UNRELATED_SETTING=keep-me" in contents
     assert "AGENT_MAIL_URL=https://hermes.example/mcp/" in contents
     assert "HTTP_BEARER_TOKEN=bearer-123" in contents
-    assert f"AGENT_MAIL_STATE_DIR={old_state}" in contents
+    assert f"AGENT_MAIL_STATE_DIR={_git_bash_path(old_state)}" in contents
     for forbidden in (
         "AGENT_MAIL_AGENT=",
         "AGENT_MAIL_PROJECT_KEY=",
@@ -288,13 +314,13 @@ def test_user_config_backups_do_not_overwrite_with_same_timestamp(
 
     result = _bash(
         f"""
-        export HOME={shlex.quote(str(home))}
-        export XDG_STATE_HOME={shlex.quote(str(state))}
+        export HOME={shlex.quote(_git_bash_path(home))}
+        export XDG_STATE_HOME={shlex.quote(_git_bash_path(state))}
         export DRY_RUN=0
-        source {shlex.quote(str(LIB))}
+        source {shlex.quote(_git_bash_path(LIB))}
         date() {{ printf '20260808_120000'; }}
-        backup_user_file {shlex.quote(str(config))}
-        backup_user_file {shlex.quote(str(config))}
+        backup_user_file {shlex.quote(_git_bash_path(config))}
+        backup_user_file {shlex.quote(_git_bash_path(config))}
         """
     )
 
@@ -330,7 +356,8 @@ def test_vscode_user_mcp_path_is_platform_global(
     expected: str,
 ) -> None:
     result = _bash(
-        f"source {shlex.quote(str(LIB))}; uname() {{ printf '%s' '{uname_value}'; }}; integration_vscode_user_mcp_path",
+        f"source {shlex.quote(_git_bash_path(LIB))}; "
+        f"uname() {{ printf '%s' '{uname_value}'; }}; integration_vscode_user_mcp_path",
         env=environment,
     )
 
@@ -360,11 +387,12 @@ def test_hook_derives_stateless_base_from_streamable_mcp_url(tmp_path: Path) -> 
     env_file.write_text(
         "AGENT_MAIL_URL=https://hermes.example/mcp/\nHTTP_BEARER_TOKEN=test\n",
         encoding="utf-8",
+        newline="\n",
     )
     result = _bash(
         f"""
-        export AGENT_MAIL_ENV_FILE={shlex.quote(str(env_file))}
-        source {shlex.quote(str(HOOK_COMMON))}
+        export AGENT_MAIL_ENV_FILE={shlex.quote(_git_bash_path(env_file))}
+        source {shlex.quote(_git_bash_path(HOOK_COMMON))}
         printf '%s' "$AM_BASE_URL"
         """
     )
@@ -375,17 +403,26 @@ def test_hook_derives_stateless_base_from_streamable_mcp_url(tmp_path: Path) -> 
 
 def _integration_env(home: Path, fake_bin: Path) -> dict[str, str]:
     return {
-        "HOME": str(home),
-        "CODEX_HOME": str(home / ".codex"),
-        "COPILOT_HOME": str(home / ".copilot"),
-        "XDG_STATE_HOME": str(home / ".state"),
-        "XDG_CONFIG_HOME": str(home / ".config"),
+        "HOME": _git_bash_path(home),
+        "CODEX_HOME": _git_bash_path(home / ".codex"),
+        "COPILOT_HOME": _git_bash_path(home / ".copilot"),
+        "XDG_STATE_HOME": _git_bash_path(home / ".state"),
+        "XDG_CONFIG_HOME": _git_bash_path(home / ".config"),
         "INTEGRATION_MCP_URL": "https://hermes.example/mcp/",
         "INTEGRATION_BEARER_TOKEN": "test-bearer",
-        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
-        "TMPDIR": "/tmp",
-        "TEMP": "/tmp",
-        "TMP": "/tmp",
+        "PATH": ":".join(
+            [
+                _git_bash_path(fake_bin),
+                *(
+                    _git_bash_path(entry)
+                    for entry in os.environ["PATH"].split(os.pathsep)
+                    if entry
+                ),
+            ]
+        ),
+        "TMPDIR": _git_bash_path(home.parent),
+        "TEMP": _git_bash_path(home.parent),
+        "TMP": _git_bash_path(home.parent),
     }
 
 
@@ -407,25 +444,35 @@ def _hook_env(home: Path, state: Path, fake_bin: Path) -> dict[str, str]:
     env_file.write_text(
         "AGENT_MAIL_URL=https://hermes.example/mcp/\nHTTP_BEARER_TOKEN=test-bearer\n",
         encoding="utf-8",
+        newline="\n",
     )
     return {
         **os.environ,
-        "HOME": str(home),
-        "AGENT_MAIL_STATE_DIR": str(state),
-        "AGENT_MAIL_ENV_FILE": str(env_file),
+        "HOME": _git_bash_path(home),
+        "AGENT_MAIL_STATE_DIR": _git_bash_path(state),
+        "AGENT_MAIL_ENV_FILE": _git_bash_path(env_file),
         "AGENT_MAIL_AGENT": "",
         "AGENT_MAIL_PROJECT_KEY": "",
-        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
-        "TMPDIR": "/tmp",
-        "TEMP": "/tmp",
-        "TMP": "/tmp",
+        "PATH": ":".join(
+            [
+                _git_bash_path(fake_bin),
+                *(
+                    _git_bash_path(entry)
+                    for entry in os.environ["PATH"].split(os.pathsep)
+                    if entry
+                ),
+            ]
+        ),
+        "TMPDIR": _git_bash_path(home.parent),
+        "TEMP": _git_bash_path(home.parent),
+        "TMP": _git_bash_path(home.parent),
     }
 
 
 def _hook_names(env: dict[str, str]) -> tuple[str, str, str]:
     result = _bash(
         f"""
-        source {shlex.quote(str(HOOK_COMMON))}
+        source {shlex.quote(_git_bash_path(HOOK_COMMON))}
         printf '%s\n' "$(am_legacy_agent_name 1)"
         printf '%s\n' "$(am_agent_name claude 1)"
         printf '%s\n' "$(am_agent_name codex 1)"
@@ -447,9 +494,32 @@ def _put_credential(state: Path, agent: str, token: str = "registration-token") 
 def _install_fake_curl(fake_bin: Path, response_script: str) -> Path:
     fake_bin.mkdir(exist_ok=True)
     fake_curl = fake_bin / "curl"
-    fake_curl.write_text(response_script, encoding="utf-8")
+    fake_curl.write_text(response_script, encoding="utf-8", newline="\n")
     fake_curl.chmod(0o700)
     return fake_curl
+
+
+def _run_identity_sensitive_hook(
+    script_name: str,
+    repo: Path,
+    target: Path,
+    env: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    payload = {
+        "cwd": str(repo),
+        "session_id": "identity-migration",
+        "hook_event_name": "PostToolUse",
+        "tool_input": {"file_path": str(target)},
+    }
+    return subprocess.run(
+        [BASH, _git_bash_path(ROOT / "scripts" / "hooks" / script_name)],
+        cwd=repo,
+        env=env,
+        input=json.dumps(payload),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_claude_fresh_registration_without_token_persists_no_identity_state(
@@ -481,7 +551,7 @@ printf '%s\n200' "$envelope"
     )
     env = _hook_env(home, state, fake_bin)
     curl_log = tmp_path / "curl.log"
-    env["FAKE_CURL_LOG"] = str(curl_log)
+    env["FAKE_CURL_LOG"] = _git_bash_path(curl_log)
     payload = {
         "cwd": str(repo),
         "session_id": "claude-name-without-token",
@@ -490,7 +560,7 @@ printf '%s\n200' "$envelope"
     }
 
     result = subprocess.run(
-        ["bash", str(ROOT / "scripts" / "hooks" / "session_start.sh")],
+        [BASH, _git_bash_path(ROOT / "scripts" / "hooks" / "session_start.sh")],
         cwd=repo,
         env=env,
         input=json.dumps(payload),
@@ -524,7 +594,11 @@ def test_claude_integrator_migrates_only_managed_hooks_in_temp_home(
     project.mkdir()
     fake_bin.mkdir()
     fake_claude = fake_bin / "claude"
-    fake_claude.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+    fake_claude.write_text(
+        "#!/usr/bin/env bash\nexit 1\n",
+        encoding="utf-8",
+        newline="\n",
+    )
     fake_claude.chmod(0o700)
     settings = settings_dir / "settings.json"
     settings.write_text(
@@ -581,12 +655,12 @@ def test_claude_integrator_migrates_only_managed_hooks_in_temp_home(
 
     result = subprocess.run(
         [
-            "bash",
-            str(INTEGRATORS["claude"]),
+            BASH,
+            _git_bash_path(INTEGRATORS["claude"]),
             "--yes",
             "--debug",
             "--project-dir",
-            str(project),
+            _git_bash_path(project),
         ],
         cwd=ROOT,
         env={**os.environ, **_integration_env(home, fake_bin)},
@@ -744,12 +818,18 @@ def test_codex_and_copilot_integrators_write_only_temp_user_config(
     env = {
         **os.environ,
         **_integration_env(home, fake_bin),
-        "CODEX_HOME": str(codex_dir),
-        "COPILOT_HOME": str(copilot_dir),
+        "CODEX_HOME": _git_bash_path(codex_dir),
+        "COPILOT_HOME": _git_bash_path(copilot_dir),
     }
 
     codex_result = subprocess.run(
-        ["bash", str(INTEGRATORS["codex"]), "--yes", "--project-dir", str(project)],
+        [
+            BASH,
+            _git_bash_path(INTEGRATORS["codex"]),
+            "--yes",
+            "--project-dir",
+            _git_bash_path(project),
+        ],
         cwd=ROOT,
         env=env,
         check=False,
@@ -825,7 +905,7 @@ def test_codex_and_copilot_integrators_write_only_temp_user_config(
         encoding="utf-8",
     )
     poisoned = subprocess.run(
-        ["bash", str(wrapper), "stop"],
+        [BASH, _git_bash_path(wrapper), "stop"],
         env={
             **env,
             "AGENT_MAIL_HOOK_CLIENT": "copilot",
@@ -847,7 +927,13 @@ def test_codex_and_copilot_integrators_write_only_temp_user_config(
         encoding="utf-8",
     )
     codex_rerun = subprocess.run(
-        ["bash", str(INTEGRATORS["codex"]), "--yes", "--project-dir", str(project)],
+        [
+            BASH,
+            _git_bash_path(INTEGRATORS["codex"]),
+            "--yes",
+            "--project-dir",
+            _git_bash_path(project),
+        ],
         cwd=ROOT,
         env=env,
         check=False,
@@ -875,7 +961,13 @@ def test_codex_and_copilot_integrators_write_only_temp_user_config(
     assert not (home / ".codex").exists()
 
     copilot_result = subprocess.run(
-        ["bash", str(INTEGRATORS["copilot"]), "--yes", "--project-dir", str(project)],
+        [
+            BASH,
+            _git_bash_path(INTEGRATORS["copilot"]),
+            "--yes",
+            "--project-dir",
+            _git_bash_path(project),
+        ],
         cwd=ROOT,
         env=env,
         check=False,
@@ -938,7 +1030,13 @@ def test_codex_and_copilot_integrators_write_only_temp_user_config(
 
     # Reinstalling replaces exactly the three managed hook entries.
     copilot_rerun = subprocess.run(
-        ["bash", str(INTEGRATORS["copilot"]), "--yes", "--project-dir", str(project)],
+        [
+            BASH,
+            _git_bash_path(INTEGRATORS["copilot"]),
+            "--yes",
+            "--project-dir",
+            _git_bash_path(project),
+        ],
         cwd=ROOT,
         env=env,
         check=False,
@@ -1010,11 +1108,17 @@ def test_claude_and_codex_integrators_reject_invalid_nested_config_before_writes
     env = {
         **os.environ,
         **_integration_env(home, fake_bin),
-        "CODEX_HOME": str(home / "codex-profile"),
+        "CODEX_HOME": _git_bash_path(home / "codex-profile"),
     }
 
     result = subprocess.run(
-        ["bash", str(INTEGRATORS[client]), "--yes", "--project-dir", str(project)],
+        [
+            BASH,
+            _git_bash_path(INTEGRATORS[client]),
+            "--yes",
+            "--project-dir",
+            _git_bash_path(project),
+        ],
         cwd=ROOT,
         env=env,
         check=False,
@@ -1065,18 +1169,18 @@ def test_claude_and_codex_integrator_dry_run_has_zero_filesystem_mutations(
     env = {
         **os.environ,
         **_integration_env(home, fake_bin),
-        "CODEX_HOME": str(codex_dir),
+        "CODEX_HOME": _git_bash_path(codex_dir),
     }
 
     result = subprocess.run(
         [
-            "bash",
-            str(INTEGRATORS[client]),
+            BASH,
+            _git_bash_path(INTEGRATORS[client]),
             "--yes",
             "--dry-run",
             "--debug",
             "--project-dir",
-            str(project),
+            _git_bash_path(project),
         ],
         cwd=ROOT,
         env=env,
@@ -1147,11 +1251,17 @@ def test_codex_integrator_semantically_merges_all_supported_toml_shapes(
     env = {
         **os.environ,
         **_integration_env(home, fake_bin),
-        "CODEX_HOME": str(codex_dir),
+        "CODEX_HOME": _git_bash_path(codex_dir),
     }
 
     result = subprocess.run(
-        ["bash", str(INTEGRATORS["codex"]), "--yes", "--project-dir", str(project)],
+        [
+            BASH,
+            _git_bash_path(INTEGRATORS["codex"]),
+            "--yes",
+            "--project-dir",
+            _git_bash_path(project),
+        ],
         cwd=ROOT,
         env=env,
         check=False,
@@ -1202,11 +1312,11 @@ def test_codex_parser_is_isolated_from_the_callers_python_project(
     env = {
         **os.environ,
         **_integration_env(home, fake_bin),
-        "CODEX_HOME": str(codex_dir),
+        "CODEX_HOME": _git_bash_path(codex_dir),
     }
 
     result = subprocess.run(
-        ["bash", str(INTEGRATORS["codex"]), "--yes"],
+        [BASH, _git_bash_path(INTEGRATORS["codex"]), "--yes"],
         cwd=foreign_project,
         env=env,
         check=False,
@@ -1229,7 +1339,13 @@ def test_claude_posix_hook_commands_quote_spaces_and_apostrophes(
     fake_bin.mkdir()
 
     result = subprocess.run(
-        ["bash", str(INTEGRATORS["claude"]), "--yes", "--project-dir", str(project)],
+        [
+            BASH,
+            _git_bash_path(INTEGRATORS["claude"]),
+            "--yes",
+            "--project-dir",
+            _git_bash_path(project),
+        ],
         cwd=ROOT,
         env={**os.environ, **_integration_env(home, fake_bin)},
         check=False,
@@ -1270,12 +1386,17 @@ def test_claude_and_codex_windows_hooks_support_current_and_explicit_git_bash(
     project.mkdir()
     fake_bin.mkdir()
     portable_bash = fake_bin / "portable-git-bash"
-    portable_bash.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    portable_bash.write_text(
+        "#!/usr/bin/env bash\nexit 0\n",
+        encoding="utf-8",
+        newline="\n",
+    )
     portable_bash.chmod(0o700)
     fake_uname = fake_bin / "uname"
     fake_uname.write_text(
         "#!/usr/bin/env bash\nprintf 'MINGW64_NT-10.0\\n'\n",
         encoding="utf-8",
+        newline="\n",
     )
     fake_uname.chmod(0o700)
     fake_cygpath = fake_bin / "cygpath"
@@ -1298,14 +1419,15 @@ case "$1" in
 esac
 """,
         encoding="utf-8",
+        newline="\n",
     )
     fake_cygpath.chmod(0o700)
     env = {
         **os.environ,
         **_integration_env(home, fake_bin),
         "AGENT_MAIL_ENV_FILE": r"Q:\AgentMail\shared.env",
-        "FAKE_AGENT_MAIL_ENV_POSIX": str(agent_mail_env),
-        "FAKE_CODEX_POSIX": str(codex_dir),
+        "FAKE_AGENT_MAIL_ENV_POSIX": _git_bash_path(agent_mail_env),
+        "FAKE_CODEX_POSIX": _git_bash_path(codex_dir),
     }
     if client == "codex":
         env.update(
@@ -1314,10 +1436,16 @@ esac
             }
         )
     if use_override:
-        env["AGENT_MAIL_GIT_BASH_PATH"] = str(portable_bash)
+        env["AGENT_MAIL_GIT_BASH_PATH"] = _git_bash_path(portable_bash)
 
     result = subprocess.run(
-        ["bash", str(INTEGRATORS[client]), "--yes", "--project-dir", str(project)],
+        [
+            BASH,
+            _git_bash_path(INTEGRATORS[client]),
+            "--yes",
+            "--project-dir",
+            _git_bash_path(project),
+        ],
         cwd=ROOT,
         env=env,
         check=False,
@@ -1373,20 +1501,20 @@ def test_integrators_hide_bearer_under_external_xtrace(
     env = {
         **os.environ,
         **_integration_env(home, fake_bin),
-        "CODEX_HOME": str(home / "codex-profile"),
+        "CODEX_HOME": _git_bash_path(home / "codex-profile"),
         "INTEGRATION_BEARER_TOKEN": token,
     }
     before = _tree_snapshot(tmp_path)
 
     result = subprocess.run(
         [
-            "bash",
+            BASH,
             "-x",
-            str(INTEGRATORS[client]),
+            _git_bash_path(INTEGRATORS[client]),
             "--yes",
             "--dry-run",
             "--project-dir",
-            str(project),
+            _git_bash_path(project),
         ],
         cwd=ROOT,
         env=env,
@@ -1448,18 +1576,18 @@ def test_copilot_integrator_dry_run_has_zero_filesystem_mutations(
     env = {
         **os.environ,
         **_integration_env(home, fake_bin),
-        "COPILOT_HOME": str(copilot_dir),
+        "COPILOT_HOME": _git_bash_path(copilot_dir),
     }
 
     result = subprocess.run(
         [
-            "bash",
-            str(INTEGRATORS["copilot"]),
+            BASH,
+            _git_bash_path(INTEGRATORS["copilot"]),
             "--yes",
             "--dry-run",
             "--debug",
             "--project-dir",
-            str(project),
+            _git_bash_path(project),
         ],
         cwd=ROOT,
         env=env,
@@ -1493,11 +1621,17 @@ def test_copilot_integrator_rejects_invalid_user_json_before_any_write(
     env = {
         **os.environ,
         **_integration_env(home, fake_bin),
-        "COPILOT_HOME": str(copilot_dir),
+        "COPILOT_HOME": _git_bash_path(copilot_dir),
     }
 
     result = subprocess.run(
-        ["bash", str(INTEGRATORS["copilot"]), "--yes", "--project-dir", str(project)],
+        [
+            BASH,
+            _git_bash_path(INTEGRATORS["copilot"]),
+            "--yes",
+            "--project-dir",
+            _git_bash_path(project),
+        ],
         cwd=ROOT,
         env=env,
         check=False,
@@ -1525,6 +1659,7 @@ def test_copilot_windows_hooks_use_the_current_custom_git_bash(
     fake_uname.write_text(
         "#!/usr/bin/env bash\nprintf 'MINGW64_NT-10.0\\n'\n",
         encoding="utf-8",
+        newline="\n",
     )
     fake_uname.chmod(0o700)
     fake_cygpath = fake_bin / "cygpath"
@@ -1546,20 +1681,27 @@ case "$1" in
 esac
 """,
         encoding="utf-8",
+        newline="\n",
     )
     fake_cygpath.chmod(0o700)
     env = {
         **os.environ,
         **_integration_env(home, fake_bin),
         "AGENT_MAIL_ENV_FILE": r"D:\Profiles\agent-mail.env",
-        "APPDATA": str(home / "appdata"),
+        "APPDATA": _git_bash_path(home / "appdata"),
         "COPILOT_HOME": r"D:\Profiles\Copilot",
-        "FAKE_AGENT_MAIL_ENV_POSIX": str(home / "agent-mail.env"),
-        "FAKE_COPILOT_POSIX": str(copilot_dir),
+        "FAKE_AGENT_MAIL_ENV_POSIX": _git_bash_path(home / "agent-mail.env"),
+        "FAKE_COPILOT_POSIX": _git_bash_path(copilot_dir),
     }
 
     result = subprocess.run(
-        ["bash", str(INTEGRATORS["copilot"]), "--yes", "--project-dir", str(project)],
+        [
+            BASH,
+            _git_bash_path(INTEGRATORS["copilot"]),
+            "--yes",
+            "--project-dir",
+            _git_bash_path(project),
+        ],
         cwd=ROOT,
         env=env,
         check=False,
@@ -1598,7 +1740,7 @@ def test_copilot_session_start_uses_direct_context_and_no_unactivated_network(
         {
             "AGENT_MAIL_HOOK_CLIENT": "copilot",
             "AGENT_MAIL_HOOK_SLOT": "1",
-            "FAKE_CURL_LOG": str(curl_log),
+            "FAKE_CURL_LOG": _git_bash_path(curl_log),
         }
     )
     payload = {
@@ -1609,7 +1751,11 @@ def test_copilot_session_start_uses_direct_context_and_no_unactivated_network(
     }
 
     result = subprocess.run(
-        ["bash", str(ROOT / "scripts" / "hooks" / "codex_notify.sh"), "session-start"],
+        [
+            BASH,
+            _git_bash_path(ROOT / "scripts" / "hooks" / "codex_notify.sh"),
+            "session-start",
+        ],
         cwd=repo,
         env=env,
         input=json.dumps(payload),
@@ -1661,7 +1807,7 @@ printf '%s\n200' "$envelope"
         {
             "AGENT_MAIL_HOOK_CLIENT": "copilot",
             "AGENT_MAIL_HOOK_SLOT": "1",
-            "FAKE_CURL_LOG": str(curl_log),
+            "FAKE_CURL_LOG": _git_bash_path(curl_log),
         }
     )
     payload = {
@@ -1672,7 +1818,11 @@ printf '%s\n200' "$envelope"
     }
 
     result = subprocess.run(
-        ["bash", str(ROOT / "scripts" / "hooks" / "codex_notify.sh"), "session-start"],
+        [
+            BASH,
+            _git_bash_path(ROOT / "scripts" / "hooks" / "codex_notify.sh"),
+            "session-start",
+        ],
         cwd=repo,
         env=env,
         input=json.dumps(payload),
@@ -1741,7 +1891,11 @@ printf '%s\n200' "$envelope"
     )
 
     result = subprocess.run(
-        ["bash", str(ROOT / "scripts" / "hooks" / "codex_notify.sh"), "stop"],
+        [
+            BASH,
+            _git_bash_path(ROOT / "scripts" / "hooks" / "codex_notify.sh"),
+            "stop",
+        ],
         cwd=repo,
         env=env,
         input=payload,
@@ -1777,6 +1931,7 @@ def test_auto_installer_continues_after_failure_then_exits_nonzero(
     project = tmp_path / "project"
     fake_bin = tmp_path / "bin"
     codex_dir = home / "codex-profile"
+    vscode_mcp = home / "vscode-mcp.json"
     home.mkdir()
     project.mkdir()
     fake_bin.mkdir()
@@ -1790,29 +1945,30 @@ def test_auto_installer_continues_after_failure_then_exits_nonzero(
     (fake_bin / "uv").symlink_to(uv_path)
     env = {
         **os.environ,
-        "HOME": str(home),
-        "CODEX_HOME": str(codex_dir),
-        "XDG_STATE_HOME": str(home / ".state"),
-        "XDG_CONFIG_HOME": str(home / ".config"),
+        "HOME": _git_bash_path(home),
+        "CODEX_HOME": _git_bash_path(codex_dir),
+        "XDG_STATE_HOME": _git_bash_path(home / ".state"),
+        "XDG_CONFIG_HOME": _git_bash_path(home / ".config"),
+        "VSCODE_MCP_CONFIG_PATH": _git_bash_path(vscode_mcp),
         "INTEGRATION_MCP_URL": "https://hermes.example/mcp/",
         "INTEGRATION_BEARER_TOKEN": "never-log-prefix-123456-never-log-suffix",
         # Exclude real Claude/Codex binaries while retaining ordinary POSIX
         # tools. The explicit CODEX_HOME above still detects Codex.
-        "PATH": f"{fake_bin}{os.pathsep}/usr/bin:/bin",
-        "TMPDIR": "/tmp",
-        "TEMP": "/tmp",
-        "TMP": "/tmp",
+        "PATH": f"{_git_bash_path(fake_bin)}:/usr/bin:/bin",
+        "TMPDIR": _git_bash_path(home.parent),
+        "TEMP": _git_bash_path(home.parent),
+        "TMP": _git_bash_path(home.parent),
     }
 
     result = subprocess.run(
         [
-            "bash",
+            BASH,
             "-x",
-            str(AUTO_INSTALLER),
+            _git_bash_path(AUTO_INSTALLER),
             "--yes",
             "--debug",
             "--project-dir",
-            str(project),
+            _git_bash_path(project),
         ],
         cwd=ROOT,
         env=env,
@@ -1829,7 +1985,7 @@ def test_auto_installer_continues_after_failure_then_exits_nonzero(
     assert "Summary" in combined
     assert "Failed integrations: Codex CLI" in combined
     # A failed client does not prevent the remaining integrations from running.
-    assert (home / ".config" / "Code" / "User" / "mcp.json").is_file()
+    assert vscode_mcp.is_file()
 
 
 @pytest.mark.parametrize(
@@ -1842,10 +1998,10 @@ def test_legacy_identity_evidence_requires_explicit_migration(
 ) -> None:
     result = _bash(
         f"""
-        export AGENT_MAIL_STATE_DIR={shlex.quote(str(tmp_path))}
+        export AGENT_MAIL_STATE_DIR={shlex.quote(_git_bash_path(tmp_path))}
         export AGENT_MAIL_ENV_FILE=/dev/null
         unset AGENT_MAIL_AGENT
-        source {shlex.quote(str(HOOK_COMMON))}
+        source {shlex.quote(_git_bash_path(HOOK_COMMON))}
         legacy="$(am_legacy_agent_name 1)"
         if [[ {shlex.quote(evidence)} == credentials ]]; then
           am_cred_put /owner/repo "$legacy" legacy-token
@@ -1875,10 +2031,10 @@ def test_final_credential_overrides_a_stale_legacy_granted_marker(
         uname() {{ printf Linux; }}
         hostname() {{ printf home; }}
         export WSL_DISTRO_NAME=Ubuntu
-        export AGENT_MAIL_STATE_DIR={shlex.quote(str(tmp_path))}
+        export AGENT_MAIL_STATE_DIR={shlex.quote(_git_bash_path(tmp_path))}
         export AGENT_MAIL_ENV_FILE=/dev/null
         unset AGENT_MAIL_AGENT
-        source {shlex.quote(str(HOOK_COMMON))}
+        source {shlex.quote(_git_bash_path(HOOK_COMMON))}
         canonical="$(am_agent_name codex 1)"
         legacy="$(am_legacy_agent_name 1)"
         am_cred_put /owner/repo "$canonical" canonical-token
@@ -1907,10 +2063,10 @@ def test_existing_client_scoped_credential_is_not_misclassified_as_legacy(
         uname() {{ printf Linux; }}
         hostname() {{ printf home; }}
         export WSL_DISTRO_NAME=Ubuntu
-        export AGENT_MAIL_STATE_DIR={shlex.quote(str(tmp_path))}
+        export AGENT_MAIL_STATE_DIR={shlex.quote(_git_bash_path(tmp_path))}
         export AGENT_MAIL_ENV_FILE=/dev/null
         unset AGENT_MAIL_AGENT
-        source {shlex.quote(str(HOOK_COMMON))}
+        source {shlex.quote(_git_bash_path(HOOK_COMMON))}
         am_cred_put /owner/repo codex-wsl-home-1 canonical-token
         if am_identity_migration_pair /owner/repo codex 1; then
           printf blocked
@@ -1942,10 +2098,10 @@ def test_old_order_client_state_requires_final_identity_migration(
         uname() {{ printf Linux; }}
         hostname() {{ printf home; }}
         export WSL_DISTRO_NAME=Ubuntu
-        export AGENT_MAIL_STATE_DIR={shlex.quote(str(tmp_path))}
+        export AGENT_MAIL_STATE_DIR={shlex.quote(_git_bash_path(tmp_path))}
         export AGENT_MAIL_ENV_FILE=/dev/null
         unset AGENT_MAIL_AGENT
-        source {shlex.quote(str(HOOK_COMMON))}
+        source {shlex.quote(_git_bash_path(HOOK_COMMON))}
         transitional=home-wsl-codex-1
         if [[ {shlex.quote(evidence)} == credential ]]; then
           am_cred_put /owner/repo "$transitional" transitional-token
@@ -1977,9 +2133,9 @@ def test_preplatform_orphan_does_not_hide_exact_legacy_migration(
         hostname() {{ printf holzera; }}
         grep() {{ return 1; }}
         unset WSL_DISTRO_NAME AGENT_MAIL_AGENT
-        export AGENT_MAIL_STATE_DIR={shlex.quote(str(tmp_path))}
+        export AGENT_MAIL_STATE_DIR={shlex.quote(_git_bash_path(tmp_path))}
         export AGENT_MAIL_ENV_FILE=/dev/null
-        source {shlex.quote(str(HOOK_COMMON))}
+        source {shlex.quote(_git_bash_path(HOOK_COMMON))}
 
         am_cred_put /owner/repo holzera-1 orphan-token
         if am_identity_migration_pair /owner/repo claude 1; then
@@ -2023,7 +2179,7 @@ def test_session_start_makes_no_request_for_unactivated_repository(
     )
     env = _hook_env(home, state, fake_bin)
     curl_log = tmp_path / "curl.log"
-    env["FAKE_CURL_LOG"] = str(curl_log)
+    env["FAKE_CURL_LOG"] = _git_bash_path(curl_log)
     payload = {
         "cwd": str(repo),
         "session_id": "session-unactivated",
@@ -2033,7 +2189,11 @@ def test_session_start_makes_no_request_for_unactivated_repository(
     }
 
     result = subprocess.run(
-        ["bash", str(ROOT / "scripts" / "hooks" / script_name), *arguments],
+        [
+            BASH,
+            _git_bash_path(ROOT / "scripts" / "hooks" / script_name),
+            *arguments,
+        ],
         cwd=repo,
         env=env,
         input=json.dumps(payload),
@@ -2070,7 +2230,7 @@ def test_inherited_project_override_cannot_activate_a_different_repository(
     )
     env["AGENT_MAIL_PROJECT_KEY"] = "/owner/project-a"
     curl_log = tmp_path / "curl.log"
-    env["FAKE_CURL_LOG"] = str(curl_log)
+    env["FAKE_CURL_LOG"] = _git_bash_path(curl_log)
     payload = {
         "cwd": str(repo),
         "session_id": "poisoned-parent-project",
@@ -2081,8 +2241,8 @@ def test_inherited_project_override_cannot_activate_a_different_repository(
 
     result = subprocess.run(
         [
-            "bash",
-            str(ROOT / "scripts" / "hooks" / "codex_notify.sh"),
+            BASH,
+            _git_bash_path(ROOT / "scripts" / "hooks" / "codex_notify.sh"),
             "session-start",
         ],
         cwd=repo,
@@ -2121,10 +2281,10 @@ def test_explicit_repository_marker_activates_global_hook_locally(
 
     result = _bash(
         f"""
-        cd {shlex.quote(str(repo))}
-        export AGENT_MAIL_STATE_DIR={shlex.quote(str(state))}
+        cd {shlex.quote(_git_bash_path(repo))}
+        export AGENT_MAIL_STATE_DIR={shlex.quote(_git_bash_path(state))}
         export AGENT_MAIL_ENV_FILE=/dev/null
-        source {shlex.quote(str(HOOK_COMMON))}
+        source {shlex.quote(_git_bash_path(HOOK_COMMON))}
         am_project_is_active /owner/repo codex 1 .
         """
     )
@@ -2158,7 +2318,7 @@ def test_non_top_level_or_empty_project_uid_does_not_activate_or_call_server(
     )
     env = _hook_env(home, state, fake_bin)
     curl_log = tmp_path / "curl.log"
-    env["FAKE_CURL_LOG"] = str(curl_log)
+    env["FAKE_CURL_LOG"] = _git_bash_path(curl_log)
     payload = {
         "cwd": str(repo),
         "session_id": "invalid-discovery-opt-in",
@@ -2169,8 +2329,8 @@ def test_non_top_level_or_empty_project_uid_does_not_activate_or_call_server(
 
     result = subprocess.run(
         [
-            "bash",
-            str(ROOT / "scripts" / "hooks" / "codex_notify.sh"),
+            BASH,
+            _git_bash_path(ROOT / "scripts" / "hooks" / "codex_notify.sh"),
             "session-start",
         ],
         cwd=repo,
@@ -2205,7 +2365,7 @@ def test_relative_state_directory_fails_closed_without_repo_write_or_network(
     env = _hook_env(home, state, fake_bin)
     env["AGENT_MAIL_STATE_DIR"] = "relative-agent-mail-state"
     curl_log = tmp_path / "curl.log"
-    env["FAKE_CURL_LOG"] = str(curl_log)
+    env["FAKE_CURL_LOG"] = _git_bash_path(curl_log)
     payload = {
         "cwd": str(repo),
         "session_id": "relative-state-dir",
@@ -2216,8 +2376,8 @@ def test_relative_state_directory_fails_closed_without_repo_write_or_network(
 
     result = subprocess.run(
         [
-            "bash",
-            str(ROOT / "scripts" / "hooks" / "codex_notify.sh"),
+            BASH,
+            _git_bash_path(ROOT / "scripts" / "hooks" / "codex_notify.sh"),
             "session-start",
         ],
         cwd=repo,
@@ -2251,14 +2411,14 @@ def test_windows_user_paths_are_normalized_for_mocked_git_bash(tmp_path: Path) -
         cygpath() {{
           [ "$1" = -m ] || return 2
           case "$2" in
-            'Q:\\AgentMail\\shared.env') printf '%s' {shlex.quote(str(env_file))} ;;
-            'Q:\\AgentMail\\state') printf '%s' {shlex.quote(str(state))} ;;
+            'Q:\\AgentMail\\shared.env') printf '%s' {shlex.quote(_git_bash_path(env_file))} ;;
+            'Q:\\AgentMail\\state') printf '%s' {shlex.quote(_git_bash_path(state))} ;;
             *) return 3 ;;
           esac
         }}
         export AGENT_MAIL_ENV_FILE='Q:\\AgentMail\\shared.env'
         export AGENT_MAIL_STATE_DIR='Q:\\AgentMail\\state'
-        source {shlex.quote(str(HOOK_COMMON))}
+        source {shlex.quote(_git_bash_path(HOOK_COMMON))}
         printf '%s\n' "$AM_PATH_CONFIGURATION_VALID" "$AM_STATE_DIR" "$HTTP_BEARER_TOKEN"
         if am_normalize_runtime_user_path relative-state >/dev/null; then exit 91; fi
         am_cred_put /owner/repo codex-win-build-box-1 registration-token
@@ -2266,7 +2426,7 @@ def test_windows_user_paths_are_normalized_for_mocked_git_bash(tmp_path: Path) -
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["1", str(state), "git-bash-bearer"]
+    assert result.stdout.splitlines() == ["1", _git_bash_path(state), "git-bash-bearer"]
     credentials = json.loads((state / "credentials.json").read_text(encoding="utf-8"))
     assert credentials["/owner/repo"]["codex-win-build-box-1"] == "registration-token"
 
@@ -2285,22 +2445,22 @@ def test_windows_user_paths_are_normalized_for_mocked_wsl(tmp_path: Path) -> Non
         wslpath() {{
           [ "$1" = -u ] || return 2
           case "$2" in
-            'Q:\\AgentMail\\shared.env') printf '%s' {shlex.quote(str(env_file))} ;;
-            'Q:\\AgentMail\\state') printf '%s' {shlex.quote(str(state))} ;;
+            'Q:\\AgentMail\\shared.env') printf '%s' {shlex.quote(_git_bash_path(env_file))} ;;
+            'Q:\\AgentMail\\state') printf '%s' {shlex.quote(_git_bash_path(state))} ;;
             *) return 3 ;;
           esac
         }}
         export WSL_DISTRO_NAME=Ubuntu
         export AGENT_MAIL_ENV_FILE='Q:\\AgentMail\\shared.env'
         export AGENT_MAIL_STATE_DIR='Q:\\AgentMail\\state'
-        source {shlex.quote(str(HOOK_COMMON))}
+        source {shlex.quote(_git_bash_path(HOOK_COMMON))}
         printf '%s\n' "$AM_PATH_CONFIGURATION_VALID" "$AM_STATE_DIR" "$HTTP_BEARER_TOKEN"
         am_cred_put /owner/repo codex-wsl-build-box-1 registration-token
         """
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["1", str(state), "wsl-bearer"]
+    assert result.stdout.splitlines() == ["1", _git_bash_path(state), "wsl-bearer"]
     credentials = json.loads((state / "credentials.json").read_text(encoding="utf-8"))
     assert credentials["/owner/repo"]["codex-wsl-build-box-1"] == "registration-token"
 
@@ -2321,7 +2481,7 @@ def test_reservation_guard_makes_no_request_for_unactivated_repository(
     )
     env = _hook_env(home, state, fake_bin)
     curl_log = tmp_path / "curl.log"
-    env["FAKE_CURL_LOG"] = str(curl_log)
+    env["FAKE_CURL_LOG"] = _git_bash_path(curl_log)
     payload = {
         "cwd": str(repo),
         "hook_event_name": "PreToolUse",
@@ -2329,7 +2489,7 @@ def test_reservation_guard_makes_no_request_for_unactivated_repository(
     }
 
     result = subprocess.run(
-        ["bash", str(ROOT / "scripts" / "hooks" / "reservations_warn.sh")],
+        [BASH, _git_bash_path(ROOT / "scripts" / "hooks" / "reservations_warn.sh")],
         cwd=repo,
         env=env,
         input=json.dumps(payload),
@@ -2367,7 +2527,7 @@ def test_session_start_fails_closed_without_network_for_legacy_identity(
     )
     env = _hook_env(home, state, fake_bin)
     curl_log = tmp_path / "curl.log"
-    env["FAKE_CURL_LOG"] = str(curl_log)
+    env["FAKE_CURL_LOG"] = _git_bash_path(curl_log)
     legacy, claude_name, codex_name = _hook_names(env)
     expected = claude_name if client == "claude" else codex_name
     _put_credential(state, legacy, "legacy-token")
@@ -2380,7 +2540,11 @@ def test_session_start_fails_closed_without_network_for_legacy_identity(
         "model": "gpt-5.6",
     }
     result = subprocess.run(
-        ["bash", str(ROOT / "scripts" / "hooks" / script_name), *arguments],
+        [
+            BASH,
+            _git_bash_path(ROOT / "scripts" / "hooks" / script_name),
+            *arguments,
+        ],
         cwd=repo,
         env=env,
         input=json.dumps(payload),
@@ -2399,6 +2563,97 @@ def test_session_start_fails_closed_without_network_for_legacy_identity(
     assert not curl_log.exists()
     credentials = json.loads((state / "credentials.json").read_text(encoding="utf-8"))
     assert credentials == {"/owner/repo": {legacy: "legacy-token"}}
+
+
+@pytest.mark.parametrize(
+    "script_name",
+    ["inbox_check.sh", "inbox_watch.sh", "autoreserve.sh"],
+)
+def test_identity_sensitive_hooks_report_legacy_migration_without_network(
+    tmp_path: Path,
+    script_name: str,
+) -> None:
+    home = tmp_path / "home"
+    state = tmp_path / "state"
+    fake_bin = tmp_path / "bin"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    target = repo / "module.py"
+    target.write_text("pass\n", encoding="utf-8")
+    _install_fake_curl(
+        fake_bin,
+        "#!/usr/bin/env bash\nprintf called >> \"$FAKE_CURL_LOG\"\nexit 97\n",
+    )
+    env = _hook_env(home, state, fake_bin)
+    curl_log = tmp_path / "curl.log"
+    env["FAKE_CURL_LOG"] = _git_bash_path(curl_log)
+    legacy, canonical, _ = _hook_names(env)
+    _put_credential(state, legacy, "legacy-token")
+    expected = _bash(
+        f"""
+        source {shlex.quote(_git_bash_path(HOOK_COMMON))}
+        am_identity_migration_message \
+          {shlex.quote(legacy)} {shlex.quote(canonical)}
+        """,
+        env=env,
+    )
+    assert expected.returncode == 0, expected.stderr
+
+    result = _run_identity_sensitive_hook(script_name, repo, target, env)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    if script_name == "inbox_watch.sh":
+        assert result.stdout == f"{expected.stdout}\n"
+    else:
+        output = json.loads(result.stdout)
+        assert output["hookSpecificOutput"] == {
+            "hookEventName": "PostToolUse",
+            "additionalContext": expected.stdout,
+        }
+    assert "legacy-token" not in result.stdout
+    assert "test-bearer" not in result.stdout
+    assert not curl_log.exists()
+    credentials = json.loads((state / "credentials.json").read_text(encoding="utf-8"))
+    assert credentials == {"/owner/repo": {legacy: "legacy-token"}}
+
+
+@pytest.mark.parametrize(
+    "script_name",
+    ["inbox_check.sh", "inbox_watch.sh", "autoreserve.sh"],
+)
+@pytest.mark.parametrize("repository_active", [False, True])
+def test_identity_sensitive_hooks_do_not_report_migration_without_legacy_state(
+    tmp_path: Path,
+    script_name: str,
+    repository_active: bool,
+) -> None:
+    home = tmp_path / "home"
+    state = tmp_path / "state"
+    fake_bin = tmp_path / "bin"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    target = repo / "module.py"
+    target.write_text("pass\n", encoding="utf-8")
+    if repository_active:
+        (repo / ".agent-mail-project-id").write_text(
+            "project-id\n",
+            encoding="utf-8",
+        )
+    _install_fake_curl(
+        fake_bin,
+        "#!/usr/bin/env bash\nprintf called >> \"$FAKE_CURL_LOG\"\nexit 97\n",
+    )
+    env = _hook_env(home, state, fake_bin)
+    curl_log = tmp_path / "curl.log"
+    env["FAKE_CURL_LOG"] = _git_bash_path(curl_log)
+
+    result = _run_identity_sensitive_hook(script_name, repo, target, env)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+    assert result.stderr == ""
+    assert not curl_log.exists()
 
 
 def test_codex_stop_registers_first_call_then_rate_limits_before_network(
@@ -2439,7 +2694,9 @@ printf '%s\n200' "$envelope"
     )
     env = _hook_env(home, state, fake_bin)
     curl_log = tmp_path / "curl.log"
-    env.update({"FAKE_CURL_LOG": str(curl_log), "FAKE_INBOX_JSON": "[]"})
+    env.update(
+        {"FAKE_CURL_LOG": _git_bash_path(curl_log), "FAKE_INBOX_JSON": "[]"}
+    )
     payload = json.dumps(
         {
             "cwd": str(repo),
@@ -2450,7 +2707,11 @@ printf '%s\n200' "$envelope"
             "model": "gpt-5.6",
         }
     )
-    command = ["bash", str(ROOT / "scripts" / "hooks" / "codex_notify.sh"), "stop"]
+    command = [
+        BASH,
+        _git_bash_path(ROOT / "scripts" / "hooks" / "codex_notify.sh"),
+        "stop",
+    ]
 
     first = subprocess.run(
         command,
@@ -2530,11 +2791,11 @@ printf '%s\n200' "$envelope"
 def test_hook_remembers_granted_names_per_client_and_slot(tmp_path: Path) -> None:
     result = _bash(
         f"""
-        export AGENT_MAIL_STATE_DIR={tmp_path!s}
+        export AGENT_MAIL_STATE_DIR={shlex.quote(_git_bash_path(tmp_path))}
         export AGENT_MAIL_ENV_FILE=/dev/null
         export AGENT_MAIL_PROJECT_KEY=/owner/repo
         export AM_PROJECT_FOR_NAME=/owner/repo
-        source {HOOK_COMMON!s}
+        source {shlex.quote(_git_bash_path(HOOK_COMMON))}
 
         am_granted_name_put /owner/repo server-claude claude 1
         am_granted_name_put /owner/repo server-codex codex 1
@@ -2566,10 +2827,10 @@ def test_hook_rejects_invalid_client_or_slot(
 ) -> None:
     result = _bash(
         f"""
-        export AGENT_MAIL_STATE_DIR={tmp_path!s}
+        export AGENT_MAIL_STATE_DIR={shlex.quote(_git_bash_path(tmp_path))}
         export AGENT_MAIL_ENV_FILE=/dev/null
         export AGENT_MAIL_PROJECT_KEY=/owner/repo
-        source {HOOK_COMMON!s}
+        source {shlex.quote(_git_bash_path(HOOK_COMMON))}
         am_agent_name '{client}' '{slot}'
         """,
         env={"AGENT_MAIL_AGENT": ""},

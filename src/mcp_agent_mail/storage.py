@@ -4174,6 +4174,7 @@ async def create_diagnostic_backup(
     import shutil
 
     from .db import get_database_path
+    from .share import create_sqlite_snapshot
 
     # Create backup directory
     if backup_dir is None:
@@ -4199,15 +4200,7 @@ async def create_diagnostic_backup(
             db_backup = backup_path / "database.sqlite3"
 
             def _copy_db() -> None:
-                # Use shutil.copy2 to preserve metadata
-                shutil.copy2(db_path, db_backup)
-                # Also copy WAL and SHM files if they exist
-                wal_path, shm_path = get_sqlite_sidecar_paths(db_path)
-                backup_wal, backup_shm = get_sqlite_sidecar_paths(db_backup)
-                if wal_path.exists():
-                    shutil.copy2(wal_path, backup_wal)
-                if shm_path.exists():
-                    shutil.copy2(shm_path, backup_shm)
+                create_sqlite_snapshot(db_path, db_backup, checkpoint=False)
 
             await _to_thread(_copy_db)
             database_copied = db_backup.relative_to(backup_path).as_posix()

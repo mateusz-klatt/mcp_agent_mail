@@ -74,7 +74,9 @@ def _print_tools_and_resources(console: Console, mcp: Any) -> tuple[list[str], l
     subprocess.call(["git", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0,
     reason="git not available",
 )
-def test_worktrees_functionality_e2e(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_worktrees_functionality_e2e(
+    isolated_env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """
     Orchestrated E2E for the Worktree/Guards plan with rich logging:
       - Toggle gate off/on; verify tool/resource registration surface area
@@ -121,6 +123,7 @@ def test_worktrees_functionality_e2e(tmp_path: Path, monkeypatch: pytest.MonkeyP
     _git(repo, "init")
     _git(repo, "config", "user.name", "E2E Test")
     _git(repo, "config", "user.email", "e2e@example.com")
+    _git(repo, "config", "commit.gpgsign", "false")
     (repo / "src").mkdir()
     (repo / "src" / "shared.txt").write_text("v1\n", encoding="utf-8")
     _git(repo, "add", "src/shared.txt")

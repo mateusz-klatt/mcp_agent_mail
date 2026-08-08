@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from functools import wraps
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, AsyncContextManager, Callable, Optional, Protocol, Union, cast
 from urllib.parse import parse_qsl
 import uuid
@@ -102,6 +102,28 @@ except Exception:  # pragma: no cover - optional dependency fallback
     PathSpec = None
 
 logger = logging.getLogger(__name__)
+
+
+def _absolute_project_key_path(value: str) -> PurePosixPath | PureWindowsPath | None:
+    """Parse a traversal-free absolute project key without using host semantics."""
+    if not value:
+        return None
+    posix_path = PurePosixPath(value)
+    windows_path = PureWindowsPath(value)
+    if ".." in posix_path.parts or ".." in windows_path.parts:
+        return None
+    if value.startswith("/") and posix_path.is_absolute():
+        return posix_path
+    if windows_path.is_absolute():
+        return windows_path
+    if posix_path.is_absolute():
+        return posix_path
+    return None
+
+
+def _is_absolute_project_key(value: str) -> bool:
+    """Return whether ``value`` is an absolute, traversal-free project key."""
+    return _absolute_project_key_path(value) is not None
 
 
 class _FastMCPToolGetter(Protocol):
@@ -2174,6 +2196,9 @@ def _project_lookup_base_dir() -> Path:
 
 def _canonicalize_project_identifier(identifier: str) -> str:
     """Normalize path-like project identifiers without collapsing symlink identities."""
+    absolute_key = _absolute_project_key_path(identifier)
+    if absolute_key is not None:
+        return str(absolute_key)
     try:
         candidate = Path(identifier).expanduser()
     except Exception:
@@ -2476,7 +2501,9 @@ def _resolve_project_identity(
 
 
 def _normalize_project_human_key(human_key: str) -> str:
-    # Collapse redundant separators and ".." segments without following symlinks.
+    absolute_key = _absolute_project_key_path(human_key)
+    if absolute_key is not None:
+        return str(absolute_key)
     return os.path.normpath(human_key)
 
 
@@ -6213,7 +6240,7 @@ def build_mcp_server() -> FastMCP:
         """
         # Validate that human_key is an absolute path-like project key (cross-platform).
         # It need not exist on disk - it is an opaque project KEY, not a filesystem probe.
-        if not Path(human_key).is_absolute():
+        if not _is_absolute_project_key(human_key):
             raise ValueError(
                 f"human_key must be an absolute path-like project key, got: '{human_key}'. "
                 "Use the agent's working directory path (e.g., '/data/projects/backend' on Unix "

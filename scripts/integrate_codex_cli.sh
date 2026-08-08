@@ -136,6 +136,8 @@ if [[ -f "$USER_HOOKS" ]]; then
 fi
 
 printf -v _HOOK_RUNTIME_Q '%q' "$HOOK_RUNTIME"
+# The heredoc is parsed inside $().  Parenthesized case labels keep macOS's
+# Bash 3.2 parser from consuming their ')' as the command-substitution close.
 CODEX_WRAPPER_CONTENT="$(cat <<SH
 #!/usr/bin/env bash
 export AGENT_MAIL_CODEX_SLOT='${_CODEX_SLOT}'
@@ -143,8 +145,8 @@ export AGENT_MAIL_HOOK_CLIENT='codex'
 export AGENT_MAIL_HOOK_SLOT='${_CODEX_SLOT}'
 export AGENT_MAIL_INTERVAL='120'
 case "\${1:-}" in
-  session-end) export AGENT_MAIL_HOOK_TIMEOUT='2' ;;
-  *) export AGENT_MAIL_HOOK_TIMEOUT='6' ;;
+  (session-end) export AGENT_MAIL_HOOK_TIMEOUT='2' ;;
+  (*) export AGENT_MAIL_HOOK_TIMEOUT='6' ;;
 esac
 exec bash ${_HOOK_RUNTIME_Q} "\$@"
 SH

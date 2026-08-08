@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import sqlite3
 import threading
 import urllib.request
@@ -1166,6 +1167,35 @@ def test_start_preview_server_serves_content(tmp_path: Path) -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_collect_preview_status_is_independent_of_directory_entry_order(tmp_path: Path, monkeypatch) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    for name in ("z.txt", "a.txt", "nested/m.txt"):
+        path = first / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(name, encoding="utf-8")
+    for name in ("nested/m.txt", "a.txt", "z.txt"):
+        path = second / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(name, encoding="utf-8")
+
+    fixed_ns = 1_725_000_000_000_000_000
+    for root in (first, second):
+        for path in root.rglob("*"):
+            if path.is_file():
+                os.utime(path, ns=(fixed_ns, fixed_ns))
+
+    entries_by_root = {
+        first: [first / "z.txt", first / "nested", first / "a.txt", first / "nested/m.txt"],
+        second: [second / "nested/m.txt", second / "a.txt", second / "nested", second / "z.txt"],
+    }
+    monkeypatch.setattr(Path, "rglob", lambda root, _pattern: iter(entries_by_root[root]))
+
+    assert cli_module._collect_preview_status(first) == cli_module._collect_preview_status(second)
 
 
 def test_share_export_chunking_and_viewer_data(monkeypatch, tmp_path: Path) -> None:

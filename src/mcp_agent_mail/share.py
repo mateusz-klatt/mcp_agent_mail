@@ -498,7 +498,7 @@ def export_viewer_data(
         conn.close()
 
     messages_path = viewer_data_dir / "messages.json"
-    messages_path.write_text(json.dumps(messages, indent=2), encoding="utf-8")
+    messages_path.write_text(json.dumps(messages, indent=2), encoding="utf-8", newline="\n")
 
     meta = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -507,7 +507,7 @@ def export_viewer_data(
         "fts_enabled": fts_enabled,
     }
     meta_path = viewer_data_dir / "meta.json"
-    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8", newline="\n")
     return {
         # as_posix(), not str(): these land in manifest["viewer"] beside the
         # viewer.sri keys, which are already as_posix(). Under Windows str()
@@ -581,7 +581,11 @@ def sign_manifest(
     sig_path = output_path / "manifest.sig.json"
     try:
         if overwrite and sig_path.exists():
-            sig_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            sig_path.write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
         else:
             _write_json_file(sig_path, payload)
     except ShareExportError:
@@ -605,7 +609,11 @@ def sign_manifest(
             raise ShareExportError(f"Failed to create parent directory for public key: {exc}") from exc
 
         try:
-            public_out.write_text(base64.b64encode(public_key).decode("ascii"), encoding="utf-8")
+            public_out.write_text(
+                base64.b64encode(public_key).decode("ascii"),
+                encoding="utf-8",
+                newline="\n",
+            )
         except (IOError, OSError) as exc:
             raise ShareExportError(f"Failed to write public key to {public_out}: {exc}") from exc
 
@@ -1781,7 +1789,7 @@ def maybe_chunk_database(
 
     if checksum_lines:
         checksums_path = output_dir / "chunks.sha256"
-        checksums_path.write_text("".join(checksum_lines), encoding="utf-8")
+        checksums_path.write_text("".join(checksum_lines), encoding="utf-8", newline="\n")
 
     config = {
         "version": 1,
@@ -1960,14 +1968,18 @@ def _write_text_file(path: Path, content: str) -> None:
     """Write UTF-8 text without clobbering existing files."""
     if path.exists():
         raise ShareExportError(f"Refusing to overwrite existing file: {path}")
-    path.write_text(content, encoding="utf-8")
+    path.write_text(content, encoding="utf-8", newline="\n")
 
 
 def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
     """Serialize JSON with stable formatting."""
     if path.exists():
         raise ShareExportError(f"Refusing to overwrite existing file: {path}")
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
 
 
 def _compute_sha256(path: Path) -> str:

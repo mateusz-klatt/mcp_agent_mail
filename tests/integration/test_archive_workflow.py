@@ -12,7 +12,7 @@ from typer.testing import CliRunner
 
 from mcp_agent_mail import cli as cli_module
 from mcp_agent_mail.cli import app
-from mcp_agent_mail.db import ensure_schema, get_session
+from mcp_agent_mail.db import ensure_schema, get_session, reset_database_state
 from mcp_agent_mail.models import Agent, Message, MessageRecipient, Project
 from mcp_agent_mail.share import resolve_sqlite_database_path
 
@@ -86,6 +86,7 @@ def test_archive_save_list_restore_cycle(isolated_env):
         assert list_result.exit_code == 0
         assert archive_path.name in list_result.stdout
 
+        reset_database_state()
         database_path = resolve_sqlite_database_path()
         if database_path.exists():
             database_path.unlink()

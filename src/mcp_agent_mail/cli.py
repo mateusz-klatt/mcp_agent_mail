@@ -2963,9 +2963,11 @@ def _collect_preview_status(bundle_path: Path) -> dict[str, Any]:
     latest_ns = 0
     manifest_ns = None
     if bundle_path.is_dir():
-        for path in bundle_path.rglob("*"):
-            if not path.is_file():
-                continue
+        files = sorted(
+            (path for path in bundle_path.rglob("*") if path.is_file()),
+            key=lambda path: path.relative_to(bundle_path).as_posix(),
+        )
+        for path in files:
             stat = path.stat()
             rel = path.relative_to(bundle_path).as_posix()
             entries.append(f"{rel}:{stat.st_mtime_ns}:{stat.st_size}")

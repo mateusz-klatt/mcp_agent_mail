@@ -72,6 +72,12 @@ PROJECT="$(am_project_key)"
 export AM_PROJECT_FOR_NAME="$PROJECT"
 [ -z "$PROJECT" ] && exit 0
 am_project_is_active "$PROJECT" claude "${AGENT_MAIL_CLAUDE_SLOT:-1}" . || exit 0
+if migration_pair="$(am_identity_migration_pair "$PROJECT" claude "${AGENT_MAIL_CLAUDE_SLOT:-1}")"; then
+    legacy_agent="${migration_pair%%$'\t'*}"
+    client_agent="${migration_pair#*$'\t'}"
+    printf '%s\n' "$(am_identity_migration_message "$legacy_agent" "$client_agent")"
+    exit 0
+fi
 AGENT="$(am_agent_name claude "${AGENT_MAIL_CLAUDE_SLOT:-1}")"
 
 token="$(am_cred_get "$PROJECT" "$AGENT")"

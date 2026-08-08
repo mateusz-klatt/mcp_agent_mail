@@ -245,26 +245,31 @@ async def test_create_diagnostic_backup_uses_unique_sanitized_directory_names(
 
 
 @pytest.mark.asyncio
-async def test_create_diagnostic_backup_normalizes_sqlite_sidecar_backup_names(tmp_path, monkeypatch):
+async def test_create_diagnostic_backup_materializes_wal_as_single_file(tmp_path, monkeypatch):
     db_path = tmp_path / "mail.db"
     monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
     monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
     with contextlib.suppress(Exception):
         _config.clear_settings_cache()
 
-    sqlite3.connect(db_path).close()
-    wal_path, shm_path = get_sqlite_sidecar_paths(db_path)
-    wal_path.write_text("wal-data", encoding="utf-8")
-    shm_path.write_text("shm-data", encoding="utf-8")
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("CREATE TABLE witness (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO witness VALUES ('committed-in-wal')")
+        connection.commit()
 
-    settings = get_settings()
-    backup_path = await create_diagnostic_backup(settings, reason="custom-db")
+        settings = get_settings()
+        backup_path = await create_diagnostic_backup(settings, reason="custom-db")
+    finally:
+        connection.close()
 
-    backup_wal, backup_shm = get_sqlite_sidecar_paths(backup_path / "database.sqlite3")
-    assert backup_wal.read_text(encoding="utf-8") == "wal-data"
-    assert backup_shm.read_text(encoding="utf-8") == "shm-data"
-    assert (backup_path / wal_path.name).exists() is False
-    assert (backup_path / shm_path.name).exists() is False
+    database_copy = backup_path / "database.sqlite3"
+    backup_wal, backup_shm = get_sqlite_sidecar_paths(database_copy)
+    assert not backup_wal.exists()
+    assert not backup_shm.exists()
+    with contextlib.closing(sqlite3.connect(database_copy)) as backup_connection:
+        assert backup_connection.execute("SELECT value FROM witness").fetchone() == ("committed-in-wal",)
     manifest = json.loads((backup_path / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["database_path"] == "database.sqlite3"
     assert manifest["project_bundles"] == []

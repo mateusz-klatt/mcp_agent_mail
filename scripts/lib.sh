@@ -224,6 +224,9 @@ write_shared_agent_mail_env() {
     state="$(normalize_agent_mail_state_dir "$state")" || return 1
   fi
   local DRY_RUN="${DRY_RUN:-0}"
+  # Bash 3.2 (the system shell on macOS) can mistake an unbalanced case-label
+  # ')' for the end of the surrounding command substitution.  The optional
+  # opening '(' is valid case syntax and keeps that older parser balanced.
   merged="$({
     if [[ -f "$env_file" ]]; then
       while IFS= read -r line || [[ -n "$line" ]]; do
@@ -231,7 +234,7 @@ write_shared_agent_mail_env() {
         stripped="${stripped#export }"
         key="${stripped%%=*}"
         case "$key" in
-          AGENT_MAIL_URL|HTTP_BEARER_TOKEN|AGENT_MAIL_STATE_DIR|AGENT_MAIL_AGENT|AGENT_MAIL_PROJECT|AGENT_MAIL_PROJECT_KEY|AGENT_MAIL_CLIENT|AGENT_MAIL_SLOT|AGENT_MAIL_REGISTRATION_TOKEN|AGENT_MAIL_TOKEN|AGENT_MAIL_*_SLOT)
+          (AGENT_MAIL_URL|HTTP_BEARER_TOKEN|AGENT_MAIL_STATE_DIR|AGENT_MAIL_AGENT|AGENT_MAIL_PROJECT|AGENT_MAIL_PROJECT_KEY|AGENT_MAIL_CLIENT|AGENT_MAIL_SLOT|AGENT_MAIL_REGISTRATION_TOKEN|AGENT_MAIL_TOKEN|AGENT_MAIL_*_SLOT)
             continue ;;
         esac
         printf '%s\n' "$line"

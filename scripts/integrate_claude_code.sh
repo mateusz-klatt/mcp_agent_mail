@@ -268,17 +268,17 @@ fi
 # does nothing there: with `noacl` the mode is inferred, and a .sh stays 755
 # through `chmod 644` and `chmod -x`. So this guard is inert here and load
 # bearing elsewhere, which is the right way round.
-_shell_single_quote() {
-  local value="$1"
-  value="${value//\'/\'\\\'\'}"
-  printf "'%s'" "$value"
+_shell_quote() {
+  # Bash's printf %q is available in the macOS Bash 3.2 baseline and avoids
+  # that release's different parsing of quote-heavy // pattern substitution.
+  printf '%q' "$1"
 }
 
 _hook_cmd() {
   local hook_path="${HOOKS_DIR}/$1" hook_path_q
-  hook_path_q="$(_shell_single_quote "$hook_path")"
+  hook_path_q="$(_shell_quote "$hook_path")"
   if [[ -n "${_BASH_WRAP}" ]]; then
-    # Inner command single-quoted for bash, whole thing double-quoted for cmd.exe.
+    # Inner command shell-escaped for bash, whole thing double-quoted for cmd.exe.
     printf '"%s" -c "AGENT_MAIL_CLAUDE_SLOT=%s bash %s || true"' \
       "${_BASH_WRAP}" "${_CLAUDE_SLOT}" "$hook_path_q"
   else

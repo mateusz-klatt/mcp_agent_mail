@@ -207,6 +207,20 @@ async def _seed_rename_state(
         assert link.id is not None
 
     archive = await ensure_archive(get_settings(), "rename-project")
+    _git(
+        archive.repo_root,
+        "config",
+        "--local",
+        "user.name",
+        archive.settings.storage.git_author_name,
+    )
+    _git(
+        archive.repo_root,
+        "config",
+        "--local",
+        "user.email",
+        archive.settings.storage.git_author_email,
+    )
     profile_path = archive.root / "agents" / old_name / "profile.json"
     inbox_path = (
         archive.root

@@ -16,6 +16,7 @@ from zipfile import ZipFile
 
 import pytest
 from fastmcp import Client
+from fastmcp.exceptions import ToolError
 
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.config import get_settings
@@ -211,20 +212,15 @@ class TestProjectSlugValidation:
         assert ".." not in result
 
     @pytest.mark.asyncio
-    async def test_ensure_project_sanitizes_slug(self, isolated_env):
-        """ensure_project normalizes human_key to safe slug."""
+    async def test_ensure_project_rejects_traversal(self, isolated_env):
+        """ensure_project rejects traversal before creating a project."""
         server = build_mcp_server()
         async with Client(server) as client:
-            # Path traversal in human_key should be sanitized to safe slug
-            result = await client.call_tool(
-                "ensure_project",
-                {"human_key": "/path/to/../../../etc/passwd"},
-            )
-            # The slug should not contain traversal patterns
-            slug = result.data.get("slug", "")
-            assert ".." not in slug
-            assert "/" not in slug
-            assert "\\" not in slug
+            with pytest.raises(ToolError, match="absolute path-like project key"):
+                await client.call_tool(
+                    "ensure_project",
+                    {"human_key": "/path/to/../../../etc/passwd"},
+                )
 
 
 # ============================================================================
@@ -304,8 +300,6 @@ class TestAttachmentPathTraversal:
     @pytest.mark.asyncio
     async def test_attachment_nonexistent_traversal_path_rejected(self, isolated_env, monkeypatch):
         """Nonexistent attachment paths with traversal are rejected."""
-        from fastmcp.exceptions import ToolError
-
         # Disable image conversion
         monkeypatch.setenv("CONVERT_IMAGES", "false")
         from mcp_agent_mail import config as _config
@@ -381,8 +375,6 @@ class TestAttachmentPathTraversal:
     @pytest.mark.asyncio
     async def test_absolute_attachment_paths_disabled_by_default(self, isolated_env, monkeypatch, tmp_path):
         """Absolute attachment paths should be rejected unless explicitly enabled."""
-        from fastmcp.exceptions import ToolError
-
         monkeypatch.setenv("CONVERT_IMAGES", "false")
         from mcp_agent_mail import config as _config
 

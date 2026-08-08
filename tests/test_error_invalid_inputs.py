@@ -40,6 +40,11 @@ from tests.keys import pkey
 # ============================================================================
 
 
+def test_pkey_is_host_neutral() -> None:
+    """pkey should produce the same opaque project identity on every host."""
+    assert pkey("owner/repository") == "/owner/repository"
+
+
 @pytest.mark.asyncio
 async def test_ensure_project_requires_absolute_path(isolated_env):
     """ensure_project should require absolute path starting with /."""
@@ -53,6 +58,50 @@ async def test_ensure_project_requires_absolute_path(isolated_env):
             error_str = str(e).lower()
             # Must mention 'absolute' or 'path' (but not just "/" which is too loose)
             assert "absolute" in error_str or "path" in error_str
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "human_key",
+    [
+        "/owner/repository",
+        r"C:\projects\repository",
+        r"\\server\share\repository",
+    ],
+)
+async def test_ensure_project_accepts_host_neutral_absolute_path_syntax(isolated_env, human_key):
+    """ensure_project should accept POSIX, drive, and UNC syntax on every host."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        result = await client.call_tool("ensure_project", {"human_key": human_key})
+        agent_result = await client.call_tool(
+            "create_agent_identity",
+            {"project_key": human_key, "program": "test", "model": "test"},
+        )
+
+    assert result.data["human_key"] == human_key
+    assert agent_result.data["name"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "human_key",
+    [
+        "",
+        "relative/path",
+        "../repository",
+        "/owner/../repository",
+        r"/owner\..\repository",
+        r"C:relative\repository",
+        r"C:\owner\..\repository",
+    ],
+)
+async def test_ensure_project_rejects_relative_and_traversing_keys(isolated_env, human_key):
+    """ensure_project should reject empty, relative, and traversing keys."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        with pytest.raises(ToolError, match="absolute path-like project key"):
+            await client.call_tool("ensure_project", {"human_key": human_key})
 
 
 @pytest.mark.asyncio

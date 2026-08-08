@@ -12,7 +12,7 @@ USES_LINE = re.compile(
 IMMUTABLE_ACTION_REF = re.compile(r"[0-9a-f]{40}")
 VERSION_COMMENT = re.compile(r"v\d+(?:\.\d+){1,2}")
 BOUNDED_JOBS = {
-    "ci.yml": ("build-and-test", 30),
+    "ci.yml": ("build-and-test", 120),
     "sonarcloud.yml": ("scan", 15),
 }
 

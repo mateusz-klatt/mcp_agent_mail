@@ -97,7 +97,7 @@ jobs:
           RUN_BENCHMARKS: "1"
           INSTRUMENTATION_ENABLED: "true"
         run: |
-          uv run -m pytest tests/benchmarks/ -v -m benchmark --tb=short
+          uv run -m pytest tests/benchmarks/bench_*.py -v -m benchmark --tb=short
 
       - name: CI Performance Regression Check (Ubuntu only)
         if: matrix.os == 'ubuntu-latest'

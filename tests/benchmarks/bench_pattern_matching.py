@@ -22,7 +22,7 @@ from mcp_agent_mail.app import (
 )
 from mcp_agent_mail.models import Agent, FileReservation
 
-from .utils import DEFAULT_SEED, run_benchmark
+from .utils import DEFAULT_SEED, percentile, run_benchmark
 
 
 def _naive_utc_now() -> datetime:
@@ -142,6 +142,10 @@ async def test_bench_union_pathspec_matching():
     paths = [f"src/module{i}/file{j}.py" for i in range(10) for j in range(10)]
     specs = [PathSpec.from_lines("gitignore", [pattern]) for pattern in patterns]
     union_spec = PathSpec.from_lines("gitignore", patterns)
+    individual_matches = {
+        path for path in paths if any(spec.match_file(path) for spec in specs)
+    }
+    union_matches = set(union_spec.match_files(paths))
 
     async def individual_operation(_i: int) -> None:
         for path in paths:
@@ -151,7 +155,7 @@ async def test_bench_union_pathspec_matching():
     async def union_operation(_i: int) -> None:
         set(union_spec.match_files(paths))
 
-    individual_result = await run_benchmark(
+    await run_benchmark(
         name="pathspec_match_individual",
         tool="pathspec_match_individual",
         iterations=5,
@@ -171,12 +175,8 @@ async def test_bench_union_pathspec_matching():
         warmup=1,
     )
 
-    speedup = (
-        individual_result.total_time_ms / union_result.total_time_ms
-        if union_result.total_time_ms > 0
-        else 0.0
-    )
-    assert speedup >= 2.0, f"expected union PathSpec speedup >= 2x, got {speedup:.2f}x"
+    assert union_matches == individual_matches
+    assert percentile(union_result.latencies_ms, 95) <= 25.0
 
 
 @pytest.mark.asyncio

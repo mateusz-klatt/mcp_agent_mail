@@ -177,6 +177,101 @@ def _install_bash_command_forwarder(
     return forwarder
 
 
+def _install_simulated_windows_target_bash(
+    executable: Path,
+    target_tools: Path,
+) -> None:
+    executable.parent.mkdir(parents=True)
+    executable.write_text(
+        "#!/bin/sh\n"
+        "if [ \"${5:-}\" = agent-mail-runtime-discovery ]; then\n"
+        "  candidate=\"$FAKE_TARGET_TOOL_DIR/${7:-}\"\n"
+        "  [ -x \"$candidate\" ] || exit 71\n"
+        "  printf '%s\\n' \"$candidate\"\n"
+        "  exit 0\n"
+        "fi\n"
+        "case \"${1:-}\" in\n"
+        "  'D:\\Profiles\\Copilot\\hooks\\mcp-agent-mail\\hook_wrapper.sh')\n"
+        "    shift\n"
+        "    set -- \"$FAKE_COPILOT_POSIX/hooks/mcp-agent-mail/hook_wrapper.sh\" \"$@\"\n"
+        "    ;;\n"
+        "esac\n"
+        f"exec {shlex.quote(_git_bash_path(BASH))} \"$@\"\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    executable.chmod(0o700)
+    assert target_tools.is_dir()
+
+
+def _install_simulated_wslpath(fake_bin: Path) -> None:
+    fake_wslpath = fake_bin / "wslpath"
+    fake_wslpath.write_text(
+        r"""#!/usr/bin/env bash
+case "$1" in
+  -u)
+    case "$2" in
+      'D:\Profiles\Copilot') printf '%s\n' "$FAKE_COPILOT_POSIX" ;;
+      'D:\Portable Git\bin\bash.exe') printf '%s\n' "$FAKE_TARGET_BASH_POSIX" ;;
+      *) printf '%s\n' "$2" ;;
+    esac ;;
+  -w|-m)
+    case "$2" in
+      "$FAKE_TARGET_BASH_POSIX") printf '%s\n' 'D:\Portable Git\bin\bash.exe' ;;
+      *) printf '%s\n' 'D:\Profiles\Copilot\hooks\mcp-agent-mail\hook_wrapper.sh' ;;
+    esac ;;
+  *) exit 2 ;;
+esac
+""",
+        encoding="utf-8",
+        newline="\n",
+    )
+    fake_wslpath.chmod(0o700)
+
+
+def _simulated_wsl_windows_copilot_env(
+    tmp_path: Path,
+    *,
+    include_target_jq: bool,
+) -> tuple[dict[str, str], Path, Path, Path]:
+    home = tmp_path / "home"
+    outer_tools = tmp_path / "wsl tools"
+    target_tools = tmp_path / "Windows target tools"
+    target_bash = tmp_path / "target Git" / "bin" / "bash.exe"
+    copilot_dir = home / "copilot-profile"
+    for directory in (home, outer_tools, target_tools):
+        directory.mkdir(parents=True)
+    tool_paths = {tool: shutil.which(tool) for tool in ("git", "curl", "jq")}
+    assert all(tool_paths.values())
+    for tool, tool_path in tool_paths.items():
+        assert tool_path is not None
+        _install_bash_command_forwarder(outer_tools, tool, tool_path)
+        if tool != "jq" or include_target_jq:
+            _install_bash_command_forwarder(target_tools, tool, tool_path)
+    fake_uname = outer_tools / "uname"
+    fake_uname.write_text(
+        "#!/usr/bin/env bash\nprintf 'Linux\\n'\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    fake_uname.chmod(0o700)
+    _install_simulated_wslpath(outer_tools)
+    _install_simulated_windows_target_bash(target_bash, target_tools)
+    env = {
+        **os.environ,
+        **_integration_env(home, outer_tools),
+        "AGENT_MAIL_ENV_FILE": _git_bash_path(home / "agent-mail.env"),
+        "AGENT_MAIL_GIT_BASH_PATH": r"D:\Portable Git\bin\bash.exe",
+        "COPILOT_HOME": r"D:\Profiles\Copilot",
+        "FAKE_COPILOT_POSIX": _git_bash_path(copilot_dir),
+        "FAKE_TARGET_BASH_POSIX": _git_bash_path(target_bash),
+        "FAKE_TARGET_TOOL_DIR": _git_bash_path(target_tools),
+        "VSCODE_MCP_CONFIG_PATH": _git_bash_path(home / "vscode" / "mcp.json"),
+        "WSL_DISTRO_NAME": "Ubuntu",
+    }
+    return env, copilot_dir, outer_tools, target_tools
+
+
 def _install_forbidden_client_toolchain_guards(fake_bin: Path) -> None:
     fake_bin.mkdir(parents=True, exist_ok=True)
     for command in FORBIDDEN_CLIENT_TOOLCHAIN_COMMANDS:
@@ -245,6 +340,15 @@ def test_mac_bash_32_case_labels_inside_command_substitutions_are_balanced() -> 
     assert "|AGENT_MAIL_*_SLOT)\n" in shared_lib
     assert "\n  (session-end) export AGENT_MAIL_HOOK_TIMEOUT='2' ;;" in codex_integrator
     assert "\n  (*) export AGENT_MAIL_HOOK_TIMEOUT='6' ;;" in codex_integrator
+
+
+def test_copilot_runtime_path_dedupe_is_bash_32_nounset_safe() -> None:
+    copilot_integrator = INTEGRATORS["copilot"].read_text(encoding="utf-8")
+
+    assert (
+        'for existing in ${_COPILOT_RUNTIME_PATH_DIRS[@]+"'
+        '${_COPILOT_RUNTIME_PATH_DIRS[@]}"}; do'
+    ) in copilot_integrator
 
 
 def _bash(script: str, *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -2163,28 +2267,42 @@ def test_claude_and_codex_windows_hooks_support_current_and_explicit_git_bash(
     home = tmp_path / "home"
     project = tmp_path / "project"
     fake_bin = tmp_path / "bin"
+    git_root = tmp_path / "Portable Git"
+    git_bin = git_root / "mingw64" / "bin"
+    detected_bash = git_root / "bin" / "bash.exe"
     codex_dir = home / "codex-profile"
     agent_mail_env = home / "agent-mail.env"
     home.mkdir()
     project.mkdir()
     fake_bin.mkdir()
+    git_bin.mkdir(parents=True)
+    detected_bash.parent.mkdir(parents=True)
+    git_path = shutil.which("git")
+    assert git_path is not None
+    fake_git = _install_bash_command_forwarder(git_bin, "git", git_path)
+    detected_bash.write_text(
+        "#!/bin/sh\nexit 0\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    detected_bash.chmod(0o700)
     portable_bash = fake_bin / "portable-git-bash"
     portable_bash.write_text(
-        "#!/usr/bin/env bash\nexit 0\n",
+        "#!/bin/sh\nexit 0\n",
         encoding="utf-8",
         newline="\n",
     )
     portable_bash.chmod(0o700)
     fake_uname = fake_bin / "uname"
     fake_uname.write_text(
-        "#!/usr/bin/env bash\nprintf 'MINGW64_NT-10.0\\n'\n",
+        "#!/bin/sh\nprintf 'MINGW64_NT-10.0\\n'\n",
         encoding="utf-8",
         newline="\n",
     )
     fake_uname.chmod(0o700)
     fake_cygpath = fake_bin / "cygpath"
     fake_cygpath.write_text(
-        r"""#!/usr/bin/env bash
+        r"""#!/bin/sh
 case "$1" in
   -u)
     case "$2" in
@@ -2192,7 +2310,15 @@ case "$1" in
       'Q:\AgentMail\shared.env') printf '%s\n' "$FAKE_AGENT_MAIL_ENV_POSIX" ;;
       *) printf '%s\n' "$2" ;;
     esac ;;
-  -w|-m)
+  -m)
+    case "$2" in
+      "$FAKE_GIT_BIN_POSIX") printf '%s\n' "$FAKE_GIT_BIN_MIXED" ;;
+      "$FAKE_DETECTED_BASH") printf '%s\n' 'D:\Portable Git\bin\bash.exe' ;;
+      */bash|*/bash.exe|*/portable-git-bash)
+        printf '%s\n' 'D:\Portable Git\usr\bin\bash.exe' ;;
+      *) printf '%s\n' 'D:\Profiles\Codex\hooks\mcp-agent-mail\hook_wrapper.sh' ;;
+    esac ;;
+  -w)
     case "$2" in
       */bash|*/bash.exe|*/portable-git-bash)
         printf '%s\n' 'D:\Portable Git\usr\bin\bash.exe' ;;
@@ -2205,12 +2331,27 @@ esac
         newline="\n",
     )
     fake_cygpath.chmod(0o700)
+    integration_env = _integration_env(home, fake_bin)
+    fake_git_posix = _git_bash_path(fake_git)
+    git_root_native = str(git_root).replace("\\", "/")
+    fake_git_mixed = (
+        f"{git_root_native}/mingw64/bin/git" if os.name == "nt" else fake_git_posix
+    )
+    detected_bash_path = (
+        f"{git_root_native}/bin/bash.exe"
+        if os.name == "nt"
+        else _git_bash_path(detected_bash)
+    )
     env = {
         **os.environ,
-        **_integration_env(home, fake_bin),
+        **integration_env,
         "AGENT_MAIL_ENV_FILE": r"Q:\AgentMail\shared.env",
         "FAKE_AGENT_MAIL_ENV_POSIX": _git_bash_path(agent_mail_env),
         "FAKE_CODEX_POSIX": _git_bash_path(codex_dir),
+        "FAKE_DETECTED_BASH": detected_bash_path,
+        "FAKE_GIT_BIN_MIXED": fake_git_mixed,
+        "FAKE_GIT_BIN_POSIX": fake_git_posix,
+        "PATH": f"{_git_bash_path(git_bin)}:{integration_env['PATH']}",
     }
     if client == "codex":
         env.update(
@@ -2249,8 +2390,13 @@ esac
             if "mcp-agent-mail" in handler.get("command", "")
         ]
         assert len(managed_commands) == 6
+        expected_bash = (
+            "D:\\Portable Git\\usr\\bin\\bash.exe"
+            if use_override
+            else "D:\\Portable Git\\bin\\bash.exe"
+        )
         assert all(
-            '"D:\\Portable Git\\usr\\bin\\bash.exe"' in command
+            f'"{expected_bash}"' in command
             for command in managed_commands
         )
     else:
@@ -2429,26 +2575,43 @@ def test_copilot_integrator_rejects_invalid_user_json_before_any_write(
     assert _tree_snapshot(tmp_path) == before
 
 
-def test_copilot_windows_hooks_use_the_current_custom_git_bash(
+@pytest.mark.parametrize("use_override", [False, True])
+def test_copilot_windows_hooks_use_git_bash_launcher_with_poisoned_path(
     tmp_path: Path,
+    use_override: bool,
 ) -> None:
     home = tmp_path / "home"
     project = tmp_path / "project"
     fake_bin = tmp_path / "bin"
+    git_root = tmp_path / "Portable Git"
+    git_bin = git_root / "mingw64" / "bin"
+    git_bash = git_root / "bin" / "bash.exe"
     copilot_dir = home / "copilot-profile"
     home.mkdir()
     project.mkdir()
     fake_bin.mkdir()
+    git_bin.mkdir(parents=True)
+    git_bash.parent.mkdir(parents=True)
+    git_path = shutil.which("git")
+    assert git_path is not None
+    _install_bash_command_forwarder(git_bin, "git", git_path)
+    git_bash.write_text(
+        "#!/bin/sh\n"
+        f"exec {shlex.quote(_git_bash_path(BASH))} \"$@\"\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    git_bash.chmod(0o700)
     fake_uname = fake_bin / "uname"
     fake_uname.write_text(
-        "#!/usr/bin/env bash\nprintf 'MINGW64_NT-10.0\\n'\n",
+        "#!/bin/sh\nprintf 'MINGW64_NT-10.0\\n'\n",
         encoding="utf-8",
         newline="\n",
     )
     fake_uname.chmod(0o700)
     fake_cygpath = fake_bin / "cygpath"
     fake_cygpath.write_text(
-        r"""#!/usr/bin/env bash
+        r"""#!/bin/sh
 case "$1" in
   -u)
     case "$2" in
@@ -2456,9 +2619,14 @@ case "$1" in
       'D:\Profiles\agent-mail.env') printf '%s\n' "$FAKE_AGENT_MAIL_ENV_POSIX" ;;
       *) printf '%s\n' "$2" ;;
     esac ;;
-  -w|-m)
+  -m)
     case "$2" in
-      */bash|*/bash.exe) printf '%s\n' 'D:\Portable Git\usr\bin\bash.exe' ;;
+      "$FAKE_GIT_BIN_POSIX") printf '%s\n' "$FAKE_GIT_BIN_POSIX" ;;
+      *) printf '%s\n' "$2" ;;
+    esac ;;
+  -w)
+    case "$2" in
+      "$FAKE_GIT_BASH_POSIX") printf '%s\n' 'D:\Portable Git\bin\bash.exe' ;;
       *) printf '%s\n' 'D:\Profiles\Copilot\hooks\mcp-agent-mail\hook_wrapper.sh' ;;
     esac ;;
   *) exit 2 ;;
@@ -2468,15 +2636,34 @@ esac
         newline="\n",
     )
     fake_cygpath.chmod(0o700)
+    poison_log = tmp_path / "poisoned-bash.log"
+    poisoned_bash = fake_bin / "bash"
+    poisoned_bash.write_text(
+        "#!/bin/sh\n"
+        "printf invoked >\"$POISON_LOG\"\n"
+        "exit 97\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    poisoned_bash.chmod(0o700)
+    integration_env = _integration_env(home, fake_bin)
     env = {
         **os.environ,
-        **_integration_env(home, fake_bin),
+        **integration_env,
         "AGENT_MAIL_ENV_FILE": r"D:\Profiles\agent-mail.env",
         "APPDATA": _git_bash_path(home / "appdata"),
         "COPILOT_HOME": r"D:\Profiles\Copilot",
         "FAKE_AGENT_MAIL_ENV_POSIX": _git_bash_path(home / "agent-mail.env"),
         "FAKE_COPILOT_POSIX": _git_bash_path(copilot_dir),
+        "FAKE_GIT_BASH_POSIX": _git_bash_path(git_bash),
+        "FAKE_GIT_BIN_POSIX": _git_bash_path(git_bin / "git"),
+        "PATH": f"{_git_bash_path(git_bin)}:{integration_env['PATH']}",
+        "POISON_LOG": _git_bash_path(poison_log),
     }
+    if use_override:
+        env["AGENT_MAIL_GIT_BASH_PATH"] = (
+            str(git_bash) if os.name == "nt" else _git_bash_path(git_bash)
+        )
 
     result = subprocess.run(
         [
@@ -2500,28 +2687,240 @@ esac
     managed = [handler for handlers in hooks["hooks"].values() for handler in handlers]
     assert len(managed) == 3
     assert (home / "agent-mail.env").is_file()
-    assert all(
-        "D:\\Portable Git\\usr\\bin\\bash.exe" in handler["powershell"]
-        for handler in managed
+    assert not poison_log.exists()
+    expected_bash = (
+        str(git_bash).replace("\\", "/")
+        if use_override and os.name == "nt"
+        else "D:/Portable Git/bin/bash.exe"
     )
+    for handler in managed:
+        powershell = handler["powershell"].replace("\\", "/")
+        assert expected_bash in powershell
+        assert "usr/bin/bash.exe" not in powershell
+        assert "System32" not in powershell
+
+
+def test_copilot_native_windows_override_preserves_launcher_path() -> None:
+    integrator = INTEGRATORS["copilot"].read_text(encoding="utf-8")
+
+    assert '_candidate="${AGENT_MAIL_GIT_BASH_PATH//\\\\//}"' in integrator
+    assert '[a-zA-Z]:/*) _WINDOWS_BASH="$_candidate" ;;' in integrator
+    assert '_candidate="$(cygpath -u "$AGENT_MAIL_GIT_BASH_PATH"' not in integrator
+
+
+def test_copilot_wsl_windows_profile_embeds_only_target_git_bash_tools(
+    tmp_path: Path,
+) -> None:
+    env, copilot_dir, outer_tools, target_tools = _simulated_wsl_windows_copilot_env(
+        tmp_path,
+        include_target_jq=True,
+    )
+    project = tmp_path / "project"
+    _init_git_repo(project)
+
+    result = subprocess.run(
+        [
+            BASH,
+            _git_bash_path(INTEGRATORS["copilot"]),
+            "--yes",
+            "--project-dir",
+            _git_bash_path(project),
+        ],
+        cwd=ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    wrapper = copilot_dir / "hooks" / "mcp-agent-mail" / "hook_wrapper.sh"
+    wrapper_text = wrapper.read_text(encoding="utf-8")
+    target_dir_q = _git_bash_path(target_tools).replace(" ", r"\ ")
+    outer_dir_q = _git_bash_path(outer_tools).replace(" ", r"\ ")
+    assert f"export PATH={target_dir_q}:" in wrapper_text
+    assert outer_dir_q not in wrapper_text
+    assert "/usr/local/bin:/usr/bin:/bin:/mingw64/bin:/mingw32/bin" in wrapper_text
+    assert _git_bash_path(copilot_dir) not in wrapper_text
+    assert (
+        '_AM_HOOK_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" '
+        '&& pwd -P)" || exit 1'
+    ) in wrapper_text
+    assert (
+        'exec "$_AM_HOOK_BASH" "${_AM_HOOK_DIR}/agent_mail_hook.sh" "$@"'
+        in wrapper_text
+    )
+    hooks = json.loads(
+        (copilot_dir / "hooks" / "mcp-agent-mail.json").read_text(encoding="utf-8")
+    )
+    handlers = [handler for group in hooks["hooks"].values() for handler in group]
+    assert all(
+        "D:\\Portable Git\\bin\\bash.exe" in handler["powershell"]
+        for handler in handlers
+    )
+    assert all("usr\\bin\\bash.exe" not in handler["powershell"] for handler in handlers)
+    system32 = tmp_path / "Windows" / "System32"
+    system32.mkdir(parents=True)
+    poison_log = tmp_path / "wsl-target-poisoned-bash.log"
+    poisoned_bash = system32 / "bash"
+    poisoned_bash.write_text(
+        "#!/bin/sh\n"
+        "printf invoked >\"$POISON_LOG\"\n"
+        "exit 97\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    poisoned_bash.chmod(0o700)
+    payload = {
+        "cwd": _git_bash_path(project),
+        "session_id": "wsl-windows-target-wrapper",
+        "hook_event_name": "SessionStart",
+        "source": "startup",
+    }
+
+    execution = subprocess.run(
+        [
+            env["FAKE_TARGET_BASH_POSIX"],
+            r"D:\Profiles\Copilot\hooks\mcp-agent-mail\hook_wrapper.sh",
+            "session-start",
+        ],
+        cwd=ROOT,
+        env={
+            **env,
+            "BASH_ENV": "",
+            "CDPATH": _git_bash_path(tmp_path / "poisoned-cdpath"),
+            "PATH": _git_bash_path(system32),
+            "POISON_LOG": _git_bash_path(poison_log),
+        },
+        input=json.dumps(payload),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert execution.returncode == 0, execution.stderr
+    assert execution.stderr == ""
+    assert not poison_log.exists()
+    output = json.loads(execution.stdout)
+    assert "Agent Mail is not activated for /owner/repo" in output["additionalContext"]
+
+
+def test_copilot_wsl_windows_profile_missing_target_jq_fails_before_mutation(
+    tmp_path: Path,
+) -> None:
+    env, _, _, _ = _simulated_wsl_windows_copilot_env(
+        tmp_path,
+        include_target_jq=False,
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    before = _tree_snapshot(tmp_path)
+
+    result = subprocess.run(
+        [
+            BASH,
+            _git_bash_path(INTEGRATORS["copilot"]),
+            "--yes",
+            "--dry-run",
+            "--project-dir",
+            _git_bash_path(project),
+        ],
+        cwd=ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "cannot resolve required runtime command: jq" in (
+        result.stdout + result.stderr
+    ).lower()
+    assert _tree_snapshot(tmp_path) == before
+
+
+def test_copilot_wsl_windows_profile_failing_target_jq_fails_before_mutation(
+    tmp_path: Path,
+) -> None:
+    env, _, _, target_tools = _simulated_wsl_windows_copilot_env(
+        tmp_path,
+        include_target_jq=True,
+    )
+    target_jq = target_tools / "jq"
+    target_jq.write_text(
+        "#!/bin/sh\nexit 73\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    target_jq.chmod(0o700)
+    project = tmp_path / "project"
+    project.mkdir()
+    before = _tree_snapshot(tmp_path)
+
+    result = subprocess.run(
+        [
+            BASH,
+            _git_bash_path(INTEGRATORS["copilot"]),
+            "--yes",
+            "--dry-run",
+            "--project-dir",
+            _git_bash_path(project),
+        ],
+        cwd=ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "failed the dirname/git/curl/jq runtime preflight" in (
+        result.stdout + result.stderr
+    ).lower()
+    assert _tree_snapshot(tmp_path) == before
 
 
 def test_copilot_installed_wrapper_ignores_path_poisoned_system32_bash(
     tmp_path: Path,
 ) -> None:
+    env, copilot_dir, _, fake_bin = _simulated_wsl_windows_copilot_env(
+        tmp_path,
+        include_target_jq=True,
+    )
     home = tmp_path / "home"
     project = tmp_path / "project"
-    fake_bin = tmp_path / "bin"
     system32 = tmp_path / "Windows" / "System32"
-    copilot_dir = home / "copilot-profile"
-    for directory in (home, project, fake_bin, system32):
-        directory.mkdir(parents=True)
-    env = {
-        **os.environ,
-        **_integration_env(home, fake_bin),
-        "COPILOT_HOME": _git_bash_path(copilot_dir),
-    }
-
+    system32.mkdir(parents=True)
+    _init_git_repo(project)
+    (project / ".agent-mail-project-id").write_text(
+        "project-id\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    _install_fake_curl(
+        fake_bin,
+        """#!/usr/bin/env bash
+if [[ ${1:-} == --version ]]; then printf 'test curl\n'; exit 0; fi
+body="$(cat)"
+tool="$(printf '%s' "$body" | jq -r '.params.name // empty')"
+printf '%s\n' "$PATH" > "$FAKE_PATH_LOG"
+printf '%s\n' "$tool" >> "$FAKE_CURL_LOG"
+case "$tool" in
+  ensure_project) result='{"human_key":"/owner/repo"}' ;;
+  register_agent)
+    name="$(printf '%s' "$body" | jq -r '.params.arguments.name')"
+    printf '%s\n' "$name" > "$FAKE_AGENT_LOG"
+    result="$(jq -nc --arg name "$name" \
+      '{name:$name,registration_token:"registration-token",retired_at:null}')"
+    ;;
+  fetch_inbox) result='[]' ;;
+  *) result='{}' ;;
+esac
+envelope="$(jq -nc --arg text "$result" \
+  '{result:{content:[{type:"text",text:$text}],isError:false}}')"
+printf '%s\n200' "$envelope"
+""",
+    )
     install = subprocess.run(
         [
             BASH,
@@ -2540,19 +2939,14 @@ def test_copilot_installed_wrapper_ignores_path_poisoned_system32_bash(
     assert install.returncode == 0, install.stderr
     installed_hooks = copilot_dir / "hooks" / "mcp-agent-mail"
     installed_wrapper = installed_hooks / "hook_wrapper.sh"
-    installed_runtime = installed_hooks / "agent_mail_hook.sh"
     wrapper_text = installed_wrapper.read_text(encoding="utf-8")
+    assert f"{_git_bash_path(fake_bin).replace(' ', r'\ ')}:/usr/local/bin" in wrapper_text
+    assert "/usr/local/bin:/usr/bin:/bin" in wrapper_text
+    assert '"${PATH:+:${PATH}}"' in wrapper_text
     assert '_AM_HOOK_BASH="$(command -p -v bash)" || exit 1' in wrapper_text
     assert 'exec "$_AM_HOOK_BASH" ' in wrapper_text
     assert "exec bash " not in wrapper_text
     assert 'exec "$BASH" ' not in wrapper_text
-    installed_runtime.write_text(
-        "#!/usr/bin/env bash\n"
-        "printf '%s|%s|%s' \"$AGENT_MAIL_HOOK_CLIENT\" "
-        "\"$AGENT_MAIL_HOOK_SLOT\" \"$1\"\n",
-        encoding="utf-8",
-        newline="\n",
-    )
     poison_log = tmp_path / "poisoned-system32-bash.log"
     poisoned_bash = system32 / "bash"
     poisoned_bash.write_text(
@@ -2563,25 +2957,76 @@ def test_copilot_installed_wrapper_ignores_path_poisoned_system32_bash(
         newline="\n",
     )
     poisoned_bash.chmod(0o700)
+    curl_log = tmp_path / "curl.log"
+    agent_log = tmp_path / "agent.log"
+    path_log = tmp_path / "path.log"
     runtime_env = {
         **env,
         "BASH_ENV": "",
-        "PATH": f"{_git_bash_path(system32)}:{env['PATH']}",
+        "CDPATH": _git_bash_path(tmp_path / "poisoned-cdpath"),
+        "PATH": _git_bash_path(system32),
+        "FAKE_AGENT_LOG": _git_bash_path(agent_log),
+        "FAKE_CURL_LOG": _git_bash_path(curl_log),
+        "FAKE_PATH_LOG": _git_bash_path(path_log),
         "POISON_LOG": _git_bash_path(poison_log),
+    }
+    payload = {
+        "cwd": _git_bash_path(project),
+        "session_id": "copilot-system32-path",
+        "hook_event_name": "SessionStart",
+        "source": "startup",
+        "model": "test-model",
     }
 
     execution = subprocess.run(
-        [BASH, _git_bash_path(installed_wrapper), "session-start"],
+        [
+            env["FAKE_TARGET_BASH_POSIX"],
+            r"D:\Profiles\Copilot\hooks\mcp-agent-mail\hook_wrapper.sh",
+            "session-start",
+        ],
         cwd=ROOT,
         env=runtime_env,
+        input=json.dumps(payload),
         check=False,
         capture_output=True,
         text=True,
     )
 
     assert execution.returncode == 0, execution.stderr
-    assert execution.stdout == "copilot|1|session-start"
+    assert execution.stderr == ""
     assert not poison_log.exists()
+    registered_agent = agent_log.read_text(encoding="utf-8").strip()
+    assert re.fullmatch(
+        r"copilot-(?:linux|mac|win|wsl|other)-[a-z0-9._-]+-1",
+        registered_agent,
+    )
+    assert curl_log.read_text(encoding="utf-8").splitlines() == [
+        "ensure_project",
+        "register_agent",
+        "fetch_inbox",
+    ]
+    runtime_path = path_log.read_text(encoding="utf-8").strip().split(":")
+    assert runtime_path[:4] == [
+        _git_bash_path(fake_bin),
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+    ]
+    assert runtime_path[-1] == _git_bash_path(system32)
+    assert json.loads(execution.stdout) == {
+        "additionalContext": (
+            f"Agent Mail: you are {registered_agent} on /owner/repo. "
+            "Unread inbox: 0 message(s), 0 high/urgent. Use fetch_inbox before "
+            "proceeding when mail is pending."
+        )
+    }
+    state = home / ".state" / "agent-mail"
+    assert json.loads((state / "credentials.json").read_text(encoding="utf-8")) == {
+        "/owner/repo": {registered_agent: "registration-token"}
+    }
+    granted_files = list((state / "granted").iterdir())
+    assert len(granted_files) == 1
+    assert granted_files[0].read_text(encoding="utf-8") == registered_agent
 
 
 def test_copilot_session_start_uses_direct_context_and_no_unactivated_network(

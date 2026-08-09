@@ -54,7 +54,19 @@ _normalize_installer_user_path() {
   esac
 }
 
-COPILOT_DIR="$(_normalize_installer_user_path "${COPILOT_HOME:-${HOME}/.copilot}")" || exit 1
+_RAW_COPILOT_DIR="${COPILOT_HOME:-${HOME}/.copilot}"
+COPILOT_DIR="$(_normalize_installer_user_path "$_RAW_COPILOT_DIR")" || exit 1
+_COPILOT_WINDOWS_BACKED=0
+case "$(uname -s 2>/dev/null || printf unknown)" in
+  MINGW*|MSYS*|CYGWIN*) ;;
+  *)
+    case "$_RAW_COPILOT_DIR" in
+      [a-zA-Z]:\\*|[a-zA-Z]:/*) _COPILOT_WINDOWS_BACKED=1 ;;
+    esac
+    case "$COPILOT_DIR" in
+      /mnt/[a-zA-Z]/*) _COPILOT_WINDOWS_BACKED=1 ;;
+    esac ;;
+esac
 SHARED_ENV_FILE="$(_normalize_installer_user_path \
   "${AGENT_MAIL_ENV_FILE:-${HOME}/.agent-mail.env}")" || exit 1
 # Shared helpers resolve both existing URL/bearer values and the eventual write
@@ -187,7 +199,6 @@ MERGED_VSCODE_MCP="$(
 }
 
 printf -v _HOOK_WRAPPER_Q '%q' "$HOOK_WRAPPER"
-printf -v _HOOK_RUNTIME_Q '%q' "$HOOK_RUNTIME"
 _bash_hook_command() {
   printf 'bash %s %s' "$_HOOK_WRAPPER_Q" "$1"
 }
@@ -195,9 +206,18 @@ _bash_hook_command() {
 # Copilot selects `powershell` on Windows.  That command invokes one concrete
 # Git for Windows bash.exe and passes the wrapper as a separate argument, so
 # PowerShell never has to interpret Bash quoting or the bearer token.
+_RUNTIME_DISCOVERY_BASH=''
+case "$(uname -s 2>/dev/null || printf unknown)" in
+  MINGW*|MSYS*|CYGWIN*) ;;
+  *)
+    _RUNTIME_DISCOVERY_BASH="$(command -p -v bash 2>/dev/null)" || {
+      log_err "Could not resolve Bash for the installed Copilot hook runtime."
+      exit 1
+    } ;;
+esac
 _WINDOWS_BASH='C:\Program Files\Git\bin\bash.exe'
 _WINDOWS_WRAPPER=''
-if [[ "$HOOK_WRAPPER" == /mnt/[a-zA-Z]/* ]]; then
+if [[ "$_COPILOT_WINDOWS_BACKED" == "1" ]]; then
   if ! command -v wslpath >/dev/null 2>&1; then
     log_err "COPILOT_HOME is on a Windows drive, but wslpath is unavailable."
     exit 1
@@ -219,6 +239,7 @@ if [[ "$HOOK_WRAPPER" == /mnt/[a-zA-Z]/* ]]; then
       log_err "AGENT_MAIL_GIT_BASH_PATH is not an executable Git Bash: ${AGENT_MAIL_GIT_BASH_PATH}"
       exit 1
     fi
+    _RUNTIME_DISCOVERY_BASH="$_candidate"
     _WINDOWS_BASH="$(wslpath -w "$_candidate" 2>/dev/null)" || {
       log_err "Could not translate AGENT_MAIL_GIT_BASH_PATH for Windows."
       exit 1
@@ -226,6 +247,7 @@ if [[ "$HOOK_WRAPPER" == /mnt/[a-zA-Z]/* ]]; then
   else
     for _candidate in "/mnt/c/Program Files/Git/bin/bash.exe" "/mnt/c/Program Files (x86)/Git/bin/bash.exe"; do
       if [[ -x "$_candidate" ]]; then
+        _RUNTIME_DISCOVERY_BASH="$_candidate"
         _WINDOWS_BASH="$(wslpath -w "$_candidate" 2>/dev/null)" || {
           log_err "Could not translate Git Bash for Windows."
           exit 1
@@ -250,10 +272,7 @@ case "$(uname -s 2>/dev/null || printf unknown)" in
     if [[ -n "${AGENT_MAIL_GIT_BASH_PATH:-}" ]]; then
       case "$AGENT_MAIL_GIT_BASH_PATH" in
         [a-zA-Z]:\\*|[a-zA-Z]:/*)
-          _candidate="$(cygpath -u "$AGENT_MAIL_GIT_BASH_PATH" 2>/dev/null)" || {
-            log_err "Could not normalize AGENT_MAIL_GIT_BASH_PATH."
-            exit 1
-          } ;;
+          _candidate="${AGENT_MAIL_GIT_BASH_PATH//\\//}" ;;
         /*) _candidate="$AGENT_MAIL_GIT_BASH_PATH" ;;
         *)
           log_err "AGENT_MAIL_GIT_BASH_PATH must be an absolute Windows or Git Bash path."
@@ -263,20 +282,38 @@ case "$(uname -s 2>/dev/null || printf unknown)" in
         log_err "AGENT_MAIL_GIT_BASH_PATH is not an executable Git Bash: ${AGENT_MAIL_GIT_BASH_PATH}"
         exit 1
       fi
-      _WINDOWS_BASH="$(cygpath -w "$_candidate" 2>/dev/null)" || {
-        log_err "Could not translate AGENT_MAIL_GIT_BASH_PATH for Windows."
-        exit 1
-      }
-    else
-      _current_bash="$(command -v bash 2>/dev/null || true)"
-      for _candidate in "$_current_bash" "/c/Program Files/Git/bin/bash.exe" "/c/Program Files (x86)/Git/bin/bash.exe"; do
-        if [[ -n "$_candidate" && -x "$_candidate" ]]; then
+      _RUNTIME_DISCOVERY_BASH="$_candidate"
+      case "$_candidate" in
+        [a-zA-Z]:/*) _WINDOWS_BASH="$_candidate" ;;
+        *)
           _WINDOWS_BASH="$(cygpath -w "$_candidate" 2>/dev/null)" || {
-            log_err "Could not translate Git Bash for Windows."
+            log_err "Could not translate AGENT_MAIL_GIT_BASH_PATH for Windows."
             exit 1
-          }
-          break
-        fi
+          } ;;
+      esac
+    else
+      _roots=()
+      _git_bin="$(command -v git 2>/dev/null || true)"
+      _git_root=""
+      if [[ -n "$_git_bin" ]]; then
+        _git_root="$(cygpath -m "$_git_bin" 2>/dev/null || true)"
+      fi
+      while [[ -n "$_git_root" && "$_git_root" == */* ]]; do
+        _parent_root="${_git_root%/*}"
+        [[ -n "$_parent_root" && "$_parent_root" != "$_git_root" ]] || break
+        _git_root="$_parent_root"
+        _roots=("$_git_root" ${_roots[@]+"${_roots[@]}"})
+      done
+      _roots+=("/c/Program Files/Git" "/c/Program Files (x86)/Git")
+      for _git_root in ${_roots[@]+"${_roots[@]}"}; do
+        _candidate="${_git_root}/bin/bash.exe"
+        [[ -x "$_candidate" ]] || continue
+        _RUNTIME_DISCOVERY_BASH="$_candidate"
+        _WINDOWS_BASH="$(cygpath -w "$_candidate" 2>/dev/null)" || {
+          log_err "Could not translate Git Bash for Windows."
+          exit 1
+        }
+        break
       done
     fi
     if [[ -z "$_WINDOWS_BASH" ]]; then
@@ -290,6 +327,78 @@ case "$(uname -s 2>/dev/null || printf unknown)" in
     }
     ;;
 esac
+
+_RUNTIME_CORE_PATH='/usr/local/bin:/usr/bin:/bin:/mingw64/bin:/mingw32/bin'
+_RUNTIME_DISCOVERY_PATH_PREFIX=''
+case "$(uname -s 2>/dev/null || printf unknown)" in
+  MINGW*|MSYS*|CYGWIN*) _RUNTIME_DISCOVERY_PATH_PREFIX="$_RUNTIME_CORE_PATH" ;;
+  *)
+    if [[ "$_COPILOT_WINDOWS_BACKED" == "1" ]]; then
+      _RUNTIME_DISCOVERY_PATH_PREFIX="$_RUNTIME_CORE_PATH"
+    fi ;;
+esac
+_COPILOT_RUNTIME_PATH_DIRS=()
+_copilot_runtime_path_add() {
+  local candidate="$1" existing
+  for existing in ${_COPILOT_RUNTIME_PATH_DIRS[@]+"${_COPILOT_RUNTIME_PATH_DIRS[@]}"}; do
+    [[ "$existing" == "$candidate" ]] && return 0
+  done
+  _COPILOT_RUNTIME_PATH_DIRS[${#_COPILOT_RUNTIME_PATH_DIRS[@]}]="$candidate"
+}
+for _runtime_tool in git curl jq; do
+  _runtime_tool_path="$(
+    BASH_ENV='' MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' \
+      "$_RUNTIME_DISCOVERY_BASH" --noprofile --norc -c '
+        if [[ -n "$1" ]]; then
+          PATH="$1${PATH:+:${PATH}}"
+          export PATH
+        fi
+        tool_path="$(command -v "$2" 2>/dev/null)" || exit 1
+        case "$tool_path" in /*/*) ;; *) exit 1 ;; esac
+        [[ -x "$tool_path" ]] || exit 1
+        printf "%s\n" "$tool_path"
+      ' agent-mail-runtime-discovery "$_RUNTIME_DISCOVERY_PATH_PREFIX" "$_runtime_tool"
+  )" || {
+    log_err "Selected Copilot hook Bash cannot resolve required runtime command: ${_runtime_tool}"
+    exit 1
+  }
+  _runtime_tool_dir="${_runtime_tool_path%/*}"
+  [[ -n "$_runtime_tool_dir" ]] || _runtime_tool_dir='/'
+  case "$_runtime_tool_dir" in
+    /*) _copilot_runtime_path_add "$_runtime_tool_dir" ;;
+    *)
+      log_err "Selected Copilot hook Bash returned a non-absolute command path: ${_runtime_tool_path}"
+      exit 1 ;;
+  esac
+done
+for _runtime_tool_dir in /usr/local/bin /usr/bin /bin /mingw64/bin /mingw32/bin; do
+  _copilot_runtime_path_add "$_runtime_tool_dir"
+done
+_COPILOT_RUNTIME_PATH_PREFIX=''
+for _runtime_tool_dir in "${_COPILOT_RUNTIME_PATH_DIRS[@]}"; do
+  if [[ -z "$_COPILOT_RUNTIME_PATH_PREFIX" ]]; then
+    _COPILOT_RUNTIME_PATH_PREFIX="$_runtime_tool_dir"
+  else
+    _COPILOT_RUNTIME_PATH_PREFIX="${_COPILOT_RUNTIME_PATH_PREFIX}:${_runtime_tool_dir}"
+  fi
+done
+if ! BASH_ENV='' MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' \
+    "$_RUNTIME_DISCOVERY_BASH" --noprofile --norc -c '
+      PATH="$1${PATH:+:${PATH}}"
+      export PATH
+      for tool in dirname git curl jq; do
+        tool_path="$(command -v "$tool" 2>/dev/null)" || exit 1
+        [[ -x "$tool_path" ]] || exit 1
+        case "$tool" in
+          dirname) [[ "$("$tool_path" /agent-mail/runtime)" == /agent-mail ]] || exit 1 ;;
+          git|curl|jq) "$tool_path" --version >/dev/null 2>&1 || exit 1 ;;
+        esac
+      done
+    ' agent-mail-runtime-preflight "$_COPILOT_RUNTIME_PATH_PREFIX"; then
+  log_err "Selected Copilot hook Bash failed the dirname/git/curl/jq runtime preflight."
+  exit 1
+fi
+printf -v _RUNTIME_PATH_PREFIX_Q '%q' "$_COPILOT_RUNTIME_PATH_PREFIX"
 
 _powershell_single_quote() {
   printf '%s' "$1" | sed "s/'/''/g"
@@ -364,8 +473,10 @@ case "\${1:-}" in
   session-end) export AGENT_MAIL_HOOK_TIMEOUT='2' ;;
   *) export AGENT_MAIL_HOOK_TIMEOUT='6' ;;
 esac
+export PATH=${_RUNTIME_PATH_PREFIX_Q}"\${PATH:+:\${PATH}}"
 _AM_HOOK_BASH="\$(command -p -v bash)" || exit 1
-exec "\$_AM_HOOK_BASH" ${_HOOK_RUNTIME_Q} "\$@"
+_AM_HOOK_DIR="\$(CDPATH= cd -- "\$(dirname -- "\${BASH_SOURCE[0]}")" && pwd -P)" || exit 1
+exec "\$_AM_HOOK_BASH" "\${_AM_HOOK_DIR}/agent_mail_hook.sh" "\$@"
 SH
 set_secure_exec "$HOOK_RUNTIME" || exit 1
 set_secure_file "$HOOK_COMMON" || exit 1

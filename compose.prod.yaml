@@ -90,6 +90,7 @@ services:
       # letting them accumulate (defaults to off, which suits a laptop, not a daemon).
       FILE_RESERVATIONS_CLEANUP_ENABLED: "true"
       FILE_RESERVATIONS_CLEANUP_INTERVAL_SECONDS: "60"
+      AUTO_RETIRE_STALE_AGENTS_ENABLED: "false"
 
       # Attribution for the git archive commits.
       GIT_AUTHOR_NAME: "agent-mail"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -27,6 +28,24 @@ INTEGRATORS = {
     "codex": ROOT / "scripts" / "integrate_codex_cli.sh",
     "copilot": ROOT / "scripts" / "integrate_github_copilot.sh",
 }
+FORBIDDEN_CLIENT_TOOLCHAIN_COMMANDS = (
+    "python",
+    "python3",
+    "uv",
+    "uvx",
+    "node",
+    "npx",
+)
+INSTALLED_HOOK_SOURCES = (
+    HOOK_COMMON,
+    ROOT / "scripts" / "hooks" / "session_start.sh",
+    ROOT / "scripts" / "hooks" / "inbox_check.sh",
+    ROOT / "scripts" / "hooks" / "reservations_warn.sh",
+    ROOT / "scripts" / "hooks" / "autoreserve.sh",
+    ROOT / "scripts" / "hooks" / "session_end.sh",
+    ROOT / "scripts" / "hooks" / "inbox_watch.sh",
+    ROOT / "scripts" / "hooks" / "codex_notify.sh",
+)
 
 
 def _bash_executable() -> str:
@@ -98,6 +117,20 @@ def _install_bash_command_forwarder(
     )
     forwarder.chmod(0o700)
     return forwarder
+
+
+def _install_forbidden_client_toolchain_guards(fake_bin: Path) -> None:
+    fake_bin.mkdir(parents=True, exist_ok=True)
+    for command in FORBIDDEN_CLIENT_TOOLCHAIN_COMMANDS:
+        guard = fake_bin / command
+        guard.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf 'forbidden client dependency invoked: {command}\\n' >&2\n"
+            "exit 97\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        guard.chmod(0o700)
 
 
 def test_bash_command_forwarder_preserves_the_original_tool_location(
@@ -330,13 +363,42 @@ def test_integrators_keep_client_and_slot_out_of_shared_env() -> None:
 def test_integrators_fail_fast_for_their_actual_runtime_dependencies() -> None:
     expected = {
         "claude": ("jq", "curl", "git"),
-        "codex": ("jq", "curl", "git", "uv"),
+        "codex": ("jq", "curl", "git"),
         "copilot": ("jq", "curl", "git"),
     }
     for client, commands in expected.items():
         script = INTEGRATORS[client].read_text(encoding="utf-8")
         for command in commands:
             assert f"require_cmd {command}" in script
+
+
+def _forbidden_client_dependency_matches(text: str) -> list[str]:
+    command = "(?:" + "|".join(FORBIDDEN_CLIENT_TOOLCHAIN_COMMANDS) + ")"
+    patterns = (
+        rf"(?m)^[ \t]*(?:exec[ \t]+)?{command}(?=[ \t]|$)",
+        rf"\brequire_cmd[ \t]+{command}\b",
+        rf"\bcommand[ \t]+-v[ \t]+{command}\b",
+        rf"\benv[ \t]+{command}(?=[ \t]|$)",
+        rf"(?:&&|\|\||[|;(])[ \t]*{command}(?=[ \t]|$)",
+        r"\b(?:uv|uvx)[ \t]+run\b",
+        r"\b(?:python|python3)[ \t]+(?:-[cm]\b|<<)",
+        rf'["\']command["\'][ \t]*[:=][ \t]*["\']{command}\b',
+        r"(?:/|\\)\.venv(?:/|\\)[^\n]*\bpython3?\b",
+    )
+    return [match.group(0) for pattern in patterns for match in re.finditer(pattern, text)]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [AUTO_INSTALLER, *INTEGRATORS.values(), *INSTALLED_HOOK_SOURCES],
+    ids=lambda path: Path(path).name,
+)
+def test_client_installation_sources_do_not_invoke_language_toolchains(
+    path: Path,
+) -> None:
+    matches = _forbidden_client_dependency_matches(path.read_text(encoding="utf-8"))
+
+    assert matches == [], f"{path.relative_to(ROOT)} invokes {matches}"
 
 
 def test_shared_env_merge_preserves_unmanaged_lines_and_removes_identity(
@@ -502,7 +564,15 @@ def _install_bash_env(home: Path, fake_bin: Path) -> tuple[str, str]:
         f"export PATH={shlex.quote(_git_bash_path(fake_bin))}:\"$PATH\"\n"
         f"export TMPDIR={shlex.quote(bash_tmp_path)}\n"
         f"export TEMP={shlex.quote(bash_tmp_path)}\n"
-        f"export TMP={shlex.quote(bash_tmp_path)}\n",
+        f"export TMP={shlex.quote(bash_tmp_path)}\n"
+        "command() {\n"
+        "  if [[ ${1:-} == -v ]]; then\n"
+        "    case ${2:-} in\n"
+        "      python|python3|uv|uvx|node|npx) return 1 ;;\n"
+        "    esac\n"
+        "  fi\n"
+        "  builtin command \"$@\"\n"
+        "}\n",
         encoding="utf-8",
         newline="\n",
     )
@@ -510,6 +580,7 @@ def _install_bash_env(home: Path, fake_bin: Path) -> tuple[str, str]:
 
 
 def _integration_env(home: Path, fake_bin: Path) -> dict[str, str]:
+    _install_forbidden_client_toolchain_guards(fake_bin)
     bash_env, bash_tmp = _install_bash_env(home, fake_bin)
     return {
         "HOME": _git_bash_path(home),
@@ -536,6 +607,37 @@ def _integration_env(home: Path, fake_bin: Path) -> dict[str, str]:
     }
 
 
+def test_client_integration_environment_hides_language_toolchains(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    fake_bin = tmp_path / "bin"
+    environment = {**os.environ, **_integration_env(home, fake_bin)}
+    result = subprocess.run(
+        [
+            BASH,
+            "--noprofile",
+            "--norc",
+            "-c",
+            """
+            for tool in python python3 uv uvx node npx; do
+              if command -v "$tool" >/dev/null 2>&1; then
+                printf 'unexpected dependency: %s\n' "$tool" >&2
+                exit 90
+              fi
+            done
+            """,
+        ],
+        cwd=ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def _init_git_repo(repo: Path) -> None:
     repo.mkdir()
     subprocess.run(["git", "init", str(repo)], check=True, capture_output=True, text=True)
@@ -550,6 +652,7 @@ def _init_git_repo(repo: Path) -> None:
 def _hook_env(home: Path, state: Path, fake_bin: Path) -> dict[str, str]:
     home.mkdir(exist_ok=True)
     state.mkdir(exist_ok=True)
+    _install_forbidden_client_toolchain_guards(fake_bin)
     env_file = home / ".agent-mail.env"
     env_file.write_text(
         "AGENT_MAIL_URL=https://hermes.example/mcp/\nHTTP_BEARER_TOKEN=test-bearer\n",
@@ -833,6 +936,16 @@ def test_claude_integrator_migrates_only_managed_hooks_in_temp_home(
         "command": "keep-delegator",
         "args": ["--keep"],
     }
+    generated_files = {
+        home / ".agent-mail.env",
+        home / ".claude.json",
+        *(path for path in (home / ".claude").rglob("*") if path.is_file()),
+    }
+    for generated_file in sorted(generated_files, key=str):
+        matches = _forbidden_client_dependency_matches(
+            generated_file.read_text(encoding="utf-8")
+        )
+        assert matches == [], f"{generated_file} invokes {matches}"
     assert not (project / ".claude").exists()
 
 
@@ -1202,6 +1315,15 @@ def test_codex_and_copilot_integrators_write_only_temp_user_config(
     assert sum("mcp-agent-mail" in handler.get("bash", "") for handler in rerun_handlers) == 3
     assert sum(handler.get("bash") == "echo keep-copilot-foreign" for handler in rerun_handlers) == 1
 
+    generated_files = {home / ".agent-mail.env", vscode_config_path}
+    for generated_root in (codex_dir, copilot_dir):
+        generated_files.update(path for path in generated_root.rglob("*") if path.is_file())
+    for generated_file in sorted(generated_files, key=str):
+        matches = _forbidden_client_dependency_matches(
+            generated_file.read_text(encoding="utf-8")
+        )
+        assert matches == [], f"{generated_file} invokes {matches}"
+
     for forbidden in (
         project / ".claude",
         project / ".codex",
@@ -1230,11 +1352,159 @@ def _tree_snapshot(root: Path) -> dict[str, bytes | None]:
         ("codex", "codex-profile/hooks.json", '{"hooks":{"Stop":[{"hooks":{}}]}}'),
         ("codex", "codex-profile/hooks.json", ""),
         ("codex", "codex-profile/config.toml", "mcp_servers = 7\n"),
+        (
+            "codex",
+            "codex-profile/config.toml",
+            '[[mcp_servers]]\nname = "foreign"\n',
+        ),
         ("codex", "codex-profile/config.toml", "invalid = [\n"),
         (
             "codex",
             "codex-profile/config.toml",
             '[mcp_servers.mcp_agent_mail]\nhttp_headers = 7\n',
+        ),
+        (
+            "codex",
+            "codex-profile/config.toml",
+            'mcp_servers = { foreign = { command = "keep-foreign" }, '
+            'mcp_agent_mail = { url = "https://old.example/mcp/" } }\n',
+        ),
+        (
+            "codex",
+            "codex-profile/config.toml",
+            "[mcp_servers.mcp_agent_mail]\n"
+            'url = "https://first.example/mcp/"\n'
+            '[mcp_servers."mcp-agent-mail"]\n'
+            'url = "https://second.example/mcp/"\n',
+        ),
+        (
+            "codex",
+            "codex-profile/config.toml",
+            "[mcp_servers.mcp_agent_mail]\n"
+            'url = "https://first.example/mcp/"\n'
+            "[mcp_servers.mcp_agent_mail]\n"
+            'url = "https://second.example/mcp/"\n',
+        ),
+        (
+            "codex",
+            "codex-profile/config.toml",
+            "[mcp_servers.mcp_agent_mail\nurl = \"https://old.example/mcp/\"\n",
+        ),
+        (
+            "codex",
+            "codex-profile/config.toml",
+            "[mcp_servers..mcp_agent_mail]\n"
+            'url = "https://old.example/mcp/"\n',
+        ),
+        (
+            "codex",
+            "codex-profile/config.toml",
+            '[mcp_servers."mcp\\u005fagent_mail"]\n'
+            'url = "https://old.example/mcp/"\n',
+        ),
+        (
+            "codex",
+            "codex-profile/config.toml",
+            "[mcp_servers.mcp_agent_mail]\n"
+            '"u\\u0072l" = "https://old.example/mcp/"\n',
+        ),
+        (
+            "codex",
+            "codex-profile/config.toml",
+            "[mcp_servers.mcp_agent_mail]\n"
+            'url.host = "https://old.example/mcp/"\n',
+        ),
+        (
+            "codex",
+            "codex-profile/config.toml",
+            "[mcp_servers.mcp_agent_mail]\n"
+            'url = "https://old.example/mcp/"\n'
+            "[mcp_servers.mcp_agent_mail.http_headers]\n"
+            'Authorization.scheme = "Bearer old"\n',
+        ),
+        (
+            "codex",
+            "codex-profile/config.toml",
+            "[mcp_servers.mcp_agent_mail]\n"
+            'url = "https://first.example/mcp/"\n'
+            'url = "https://second.example/mcp/"\n',
+        ),
+        (
+            "codex",
+            "codex-profile/config.toml",
+            "[mcp_servers.mcp_agent_mail]\n"
+            'url = "https://old.example/mcp/"\n'
+            "[mcp_servers.mcp_agent_mail.http_headers]\n"
+            'Authorization = "Bearer first"\n'
+            'Authorization = "Bearer second"\n',
+        ),
+        (
+            "codex",
+            "codex-profile/config.toml",
+            'model = "first"\nmodel = "second"\n',
+        ),
+        (
+            "codex",
+            "codex-profile/config.toml",
+            "[foreign]\nvalue = 1\n\"value\" = 2\n",
+        ),
+        (
+            "codex",
+            "codex-profile/config.toml",
+            'foreign = "scalar"\n[foreign]\nvalue = "table"\n',
+        ),
+        (
+            "codex",
+            "codex-profile/config.toml",
+            "[[mcp_servers.mcp_agent_mail]]\nurl = \"https://old.example/mcp/\"\n",
+        ),
+        (
+            "codex",
+            "codex-profile/config.toml",
+            "[mcp_servers]\n"
+            'mcp_agent_mail = { url = "https://old.example/mcp/" }\n',
+        ),
+        (
+            "codex",
+            "codex-profile/config.toml",
+            "[mcp_servers]\n"
+            '"mcp-agent-mail" = { url = "https://old.example/mcp/" }\n',
+        ),
+        (
+            "codex",
+            "codex-profile/config.toml",
+            "[mcp_servers.mcp_agent_mail]\n"
+            "url = [\n\"https://old.example/mcp/\",\n]\n",
+        ),
+        (
+            "codex",
+            "codex-profile/config.toml",
+            "[mcp_servers.mcp_agent_mail]\n"
+            'url = "https://old.example/mcp/"\n'
+            "[mcp_servers.mcp_agent_mail.http_headers]\n"
+            "Authorization = [\n\"Bearer old\",\n]\n",
+        ),
+        (
+            "codex",
+            "codex-profile/config.toml",
+            'description = """\n'
+            "[mcp_servers.mcp_agent_mail]\n"
+            'url = "https://fake.example/mcp/"\n'
+            '"""\n',
+        ),
+        (
+            "codex",
+            "codex-profile/config.toml",
+            "description = '''\n"
+            "[mcp_servers.mcp_agent_mail]\n"
+            'url = "https://fake.example/mcp/"\n'
+            "'''\n",
+        ),
+        (
+            "codex",
+            "codex-profile/config.toml",
+            'notify = ["/old/.codex/hooks/mcp\\u002dagent\\u002dmail/'
+            'hook_wrapper.sh"]\n',
         ),
     ],
 )
@@ -1344,48 +1614,171 @@ def test_claude_and_codex_integrator_dry_run_has_zero_filesystem_mutations(
     assert _tree_snapshot(tmp_path) == before
 
 
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_codex_rejects_invalid_shared_state_without_mutation(
+    tmp_path: Path,
+    dry_run: bool,
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    fake_bin = tmp_path / "bin"
+    codex_dir = home / "codex-profile"
+    home.mkdir()
+    project.mkdir()
+    fake_bin.mkdir()
+    codex_dir.mkdir()
+    (codex_dir / "config.toml").write_text(
+        '[mcp_servers.foreign]\ncommand = "keep"\n',
+        encoding="utf-8",
+    )
+    (home / ".agent-mail.env").write_text(
+        "AGENT_MAIL_STATE_DIR=relative/state\n",
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ,
+        **_integration_env(home, fake_bin),
+        "CODEX_HOME": _git_bash_path(codex_dir),
+    }
+    before = _tree_snapshot(tmp_path)
+
+    arguments = [BASH, _git_bash_path(INTEGRATORS["codex"]), "--yes"]
+    if dry_run:
+        arguments.append("--dry-run")
+    arguments.extend(["--project-dir", _git_bash_path(project)])
+    result = subprocess.run(
+        arguments,
+        cwd=ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "shared agent mail environment is invalid" in (
+        result.stdout + result.stderr
+    ).lower()
+    assert "test-bearer" not in result.stdout + result.stderr
+    assert _tree_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("relative_path", ["hooks.json", "config.toml"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_codex_rejects_directory_config_destinations_without_mutation(
+    tmp_path: Path,
+    relative_path: str,
+    dry_run: bool,
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    fake_bin = tmp_path / "bin"
+    codex_dir = home / "codex-profile"
+    home.mkdir()
+    project.mkdir()
+    fake_bin.mkdir()
+    codex_dir.mkdir()
+    (codex_dir / relative_path).mkdir()
+    env = {
+        **os.environ,
+        **_integration_env(home, fake_bin),
+        "CODEX_HOME": _git_bash_path(codex_dir),
+    }
+    before = _tree_snapshot(tmp_path)
+
+    arguments = [BASH, _git_bash_path(INTEGRATORS["codex"]), "--yes"]
+    if dry_run:
+        arguments.append("--dry-run")
+    arguments.extend(["--project-dir", _git_bash_path(project)])
+    result = subprocess.run(
+        arguments,
+        cwd=ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "regular, non-symlink file" in (result.stdout + result.stderr).lower()
+    assert "test-bearer" not in result.stdout + result.stderr
+    assert _tree_snapshot(tmp_path) == before
+
+
 @pytest.mark.parametrize(
-    "existing_toml",
+    ("existing_toml", "expected_notify"),
     [
         (
-            'notify = ["/usr/local/bin/foreign-notify"]\n'
-            'model = "keep-model"\n\n'
-            '[mcp_servers . foreign]\ncommand = "keep-foreign"\n\n'
-            '[mcp_servers . "claude-delegator"]\ncommand = "keep-delegator"\n\n'
-            '[mcp_servers . mcp_agent_mail]\nurl = "https://old.example/mcp/"\n\n'
-            '[mcp_servers . mcp_agent_mail . http_headers]\n'
-            'Authorization = "Bearer old"\nX-Tenant = "keep-tenant"\n'
+            (
+                'notify = ["/usr/local/bin/foreign-notify"]\n'
+                'model = "keep-model"\n\n'
+                '[mcp_servers . foreign]\ncommand = "keep-foreign"\n\n'
+                '[mcp_servers . "claude-delegator"]\ncommand = "keep-delegator"\n\n'
+                '[mcp_servers . mcp_agent_mail]\nurl = "https://old.example/mcp/"\n\n'
+                '[mcp_servers . mcp_agent_mail . http_headers]\n'
+                'Authorization = "Bearer old"\nX-Tenant = "keep-tenant"\n'
+            ),
+            ["/usr/local/bin/foreign-notify"],
         ),
         (
-            'notify = ["/usr/local/bin/foreign-notify"]\n'
-            'mcp_servers = { foreign = { command = "keep-foreign" }, '
-            '"claude-delegator" = { command = "keep-delegator" }, '
-            'mcp_agent_mail = { url = "https://old.example/mcp/", '
-            'http_headers = { Authorization = "Bearer old", '
-            'X-Tenant = "keep-tenant" } } }\n'
+            (
+                'notify = ["/usr/local/bin/foreign-notify"]\n\n'
+                '[mcp_servers.foreign]\ncommand = "keep-foreign"\n\n'
+                '[mcp_servers."claude-delegator"]\ncommand = "keep-delegator"\n\n'
+                '[mcp_servers."mcp-agent-mail"]\nurl = "https://old.example/mcp/"\n\n'
+                '[mcp_servers."mcp-agent-mail".http_headers]\n'
+                'Authorization = "Bearer old"\nX-Tenant = "keep-tenant"\n'
+            ),
+            ["/usr/local/bin/foreign-notify"],
         ),
-        (
-            'notify = ["/usr/local/bin/foreign-notify"]\n\n'
-            '[mcp_servers.foreign]\ncommand = "keep-foreign"\n\n'
-            '[mcp_servers."claude-delegator"]\ncommand = "keep-delegator"\n\n'
-            '[mcp_servers."mcp-agent-mail"]\nurl = "https://old.example/mcp/"\n\n'
-            '[mcp_servers."mcp-agent-mail".http_headers]\n'
-            'Authorization = "Bearer old"\nX-Tenant = "keep-tenant"\n'
+        pytest.param(
+            (
+                'notify = ["/usr/local/bin/foreign-notify", '
+                '"/old/.codex/hooks/mcp-agent-mail/notify_wrapper.sh"]\n\n'
+                '[mcp_servers.foreign]\ncommand = "keep-foreign"\n\n'
+                '[mcp_servers.claude-delegator]\ncommand = "keep-delegator"\n\n'
+                '[mcp_servers.mcp_agent_mail]\nurl = "https://old.example/mcp/"\n\n'
+                '[mcp_servers.mcp_agent_mail.http_headers]\n'
+                'Authorization = "Bearer old"\nX-Tenant = "keep-tenant"\n'
+            ),
+            None,
+            id="managed-notify-removes-whole-argv",
         ),
-        (
-            'notify = ["/usr/local/bin/foreign-notify", '
-            '"/old/.codex/hooks/mcp-agent-mail/notify_wrapper.sh"]\n\n'
-            '[mcp_servers.foreign]\ncommand = "keep-foreign"\n\n'
-            '[mcp_servers.claude-delegator]\ncommand = "keep-delegator"\n\n'
-            '[mcp_servers.mcp_agent_mail]\nurl = "https://old.example/mcp/"\n\n'
-            '[mcp_servers.mcp_agent_mail.http_headers]\n'
-            'Authorization = "Bearer old"\nX-Tenant = "keep-tenant"\n'
+        pytest.param(
+            (
+                'notify = ["/old/.codex/hooks/mcp_agent_mail/hook_wrapper.sh", '
+                '"stop"]\n\n'
+                '[mcp_servers.mcp_agent_mail]\n'
+                'url = "https://old.example/mcp/"\n\n'
+                '[mcp_servers.mcp_agent_mail.http_headers]\n'
+                'Authorization = "Bearer old"\nX-Tenant = "keep-tenant"\n'
+            ),
+            None,
+            id="managed-underscore-notify-removes-whole-argv",
+        ),
+        pytest.param(
+            (
+                'notify = ["/usr/local/bin/foreign-notify"]\n\n'
+                '[mcp_servers.mcp_agent_mail]\nurl = "https://old.example/mcp/"\n\n'
+                '[mcp_servers.mcp_agent_mail.http_headers]\n'
+                'authorization = "Bearer lowercase"\n'
+                '"AuThOrIzAtIoN" = "Bearer mixed"\n'
+                'X-Tenant = "keep-tenant"\n'
+                '\n[[foreign_agents]]\nname = "first"\n'
+                '[foreign_agents.details]\nrank = 1\n'
+                '\n[[foreign_agents]]\nname = "second"\n'
+                '[foreign_agents.details]\nrank = 2\n'
+                '\n[foreign_settings]\nfeature.enabled = true\n'
+            ),
+            ["/usr/local/bin/foreign-notify"],
+            id="foreign-dotted-aot-and-case-insensitive-authorization",
         ),
     ],
 )
 def test_codex_integrator_semantically_merges_all_supported_toml_shapes(
     tmp_path: Path,
     existing_toml: str,
+    expected_notify: list[str] | None,
 ) -> None:
     home = tmp_path / "home"
     project = tmp_path / "project"
@@ -1420,7 +1813,8 @@ def test_codex_integrator_semantically_merges_all_supported_toml_shapes(
 
     assert result.returncode == 0, result.stderr
     assert "test-bearer" not in result.stdout + result.stderr
-    merged = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    rendered_config = config_path.read_text(encoding="utf-8")
+    merged = tomllib.loads(rendered_config)
     managed_key = (
         "mcp-agent-mail"
         if "mcp-agent-mail" in merged["mcp_servers"]
@@ -1432,11 +1826,28 @@ def test_codex_integrator_semantically_merges_all_supported_toml_shapes(
         "Authorization": "Bearer test-bearer",
         "X-Tenant": "keep-tenant",
     }
-    assert merged["mcp_servers"]["foreign"] == {"command": "keep-foreign"}
-    assert merged["mcp_servers"]["claude-delegator"] == {
-        "command": "keep-delegator"
-    }
-    assert merged["notify"] == ["/usr/local/bin/foreign-notify"]
+    if "foreign" in merged["mcp_servers"]:
+        assert merged["mcp_servers"]["foreign"] == {"command": "keep-foreign"}
+    if "claude-delegator" in merged["mcp_servers"]:
+        assert merged["mcp_servers"]["claude-delegator"] == {
+            "command": "keep-delegator"
+        }
+    if expected_notify is None:
+        assert "notify" not in merged
+    else:
+        assert merged["notify"] == expected_notify
+    if "foreign_agents" in merged:
+        assert merged["foreign_agents"] == [
+            {"name": "first", "details": {"rank": 1}},
+            {"name": "second", "details": {"rank": 2}},
+        ]
+        assert (
+            '\n[[foreign_agents]]\nname = "first"\n'
+            '[foreign_agents.details]\nrank = 1\n'
+            '\n[[foreign_agents]]\nname = "second"\n'
+            '[foreign_agents.details]\nrank = 2\n'
+        ) in rendered_config
+        assert merged["foreign_settings"] == {"feature": {"enabled": True}}
 
 
 def test_codex_parser_is_isolated_from_the_callers_python_project(
@@ -1695,7 +2106,8 @@ def test_claude_and_codex_installers_keep_bearers_off_argv_and_pseudofiles() -> 
     assert "--arg token" not in claude
     assert "--arg token" not in codex
     assert "AGENT_MAIL_INSTALL_AUTHORIZATION" in claude
-    assert "AGENT_MAIL_INSTALL_AUTHORIZATION" in codex
+    assert "AGENT_MAIL_JQ_VALUE" in codex
+    assert "AGENT_MAIL_TOML_AUTHORIZATION" in codex
 
 
 def test_copilot_integrator_dry_run_has_zero_filesystem_mutations(
@@ -2095,9 +2507,7 @@ def test_auto_installer_continues_after_failure_then_exits_nonzero(
     # Detection is driven only by this explicit profile.  Invalid managed JSON
     # makes the Codex child fail without touching any real user configuration.
     (codex_dir / "hooks.json").write_text("not-json\n", encoding="utf-8")
-    uv_path = shutil.which("uv")
-    assert uv_path is not None
-    _install_bash_command_forwarder(fake_bin, "uv", uv_path)
+    _install_forbidden_client_toolchain_guards(fake_bin)
     jq_path = shutil.which("jq")
     assert jq_path is not None
     _install_bash_command_forwarder(fake_bin, "jq", jq_path)

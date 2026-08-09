@@ -48,9 +48,6 @@ _print "Found: claude=${HAS_CLAUDE} codex=${HAS_CODEX} copilot=${HAS_COPILOT}; C
 # checks are unconditional and happen before any child can write configuration.
 require_cmd curl
 require_cmd git
-if [[ $HAS_CODEX -eq 1 ]]; then
-  require_cmd uv
-fi
 
 INTEGRATION_MCP_URL="$(resolve_integration_mcp_url)" || {
   log_err "Missing MCP endpoint. Set INTEGRATION_MCP_URL or AGENT_MAIL_URL."

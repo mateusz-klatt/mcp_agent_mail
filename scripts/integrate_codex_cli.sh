@@ -21,7 +21,6 @@ case "$-" in
     log_warn "Command tracing is disabled while the integration handles credentials."
     ;;
 esac
-require_cmd uv
 require_cmd jq
 require_cmd curl
 require_cmd git
@@ -71,6 +70,44 @@ for _user_target in "$CODEX_DIR" "$SHARED_ENV_FILE"; do
       log_err "User integration target must be an absolute path: ${_user_target}"
       exit 1 ;;
   esac
+done
+
+_validate_managed_file_target() {
+  local target="$1"
+  if [[ -L "$target" || ( -e "$target" && ! -f "$target" ) ]]; then
+    log_err "Managed user file target must be a regular, non-symlink file: ${target}"
+    return 1
+  fi
+}
+
+_validate_managed_directory_target() {
+  local target="$1"
+  if [[ -L "$target" || ( -e "$target" && ! -d "$target" ) ]]; then
+    log_err "Managed user directory target must be a real directory: ${target}"
+    return 1
+  fi
+}
+
+# Refuse ambiguous destinations before reading configuration or constructing
+# backups. In particular, write_atomic must never receive a directory or a
+# symlink where this installer owns a regular file.
+for _managed_dir in "$CODEX_DIR" "${CODEX_DIR}/hooks" "$HOOKS_DIR"; do
+  _validate_managed_directory_target "$_managed_dir" || {
+    log_err "No user configuration was changed."
+    exit 1
+  }
+done
+for _managed_file in \
+  "$SHARED_ENV_FILE" \
+  "$USER_HOOKS" \
+  "$USER_TOML" \
+  "$HOOK_RUNTIME" \
+  "$HOOK_WRAPPER" \
+  "${HOOKS_DIR}/agent_mail_common.sh"; do
+  _validate_managed_file_target "$_managed_file" || {
+    log_err "No user configuration was changed."
+    exit 1
+  }
 done
 
 log_step "OpenAI Codex CLI Integration (user scope)"
@@ -346,235 +383,687 @@ if ! printf '%s' "$MERGED_HOOKS" | jq -e '
   exit 1
 fi
 
-# Parse and re-emit TOML semantically rather than using table-header regexes.
-# This accepts valid spaced/quoted/dotted headers, inline mcp_servers tables and
-# nested http_headers tables.  Foreign values survive the round trip; only the
-# managed URL, Authorization header, legacy auth keys and managed notify entry
-# are changed.  uv is pinned to this repository and an isolated Python 3.14, so
-# a caller's pyproject, environment and lockfile are never discovered or synced.
-_UV_PYTHON=(
-  uv run --directory "$ROOT_DIR" --project "$ROOT_DIR"
-  --isolated --no-cache --no-sync --no-env-file --python 3.14 python
-)
+# Codex accepts static HTTP headers in config.toml.  This editor deliberately
+# handles only table-form MCP configuration: it recognizes bare, quoted and
+# whitespace-separated dotted table headers, while leaving foreign lines in
+# their original order. Inline/dotted MCP definitions, escaped key names and
+# multiline TOML strings are rejected because a bounded line editor cannot
+# disambiguate those shapes without risking unrelated user configuration.
+# Foreign dotted assignments and arrays of tables retain their original lines.
+if ! _URL_TOML="$(AGENT_MAIL_JQ_VALUE="$_URL" jq -Rn 'env.AGENT_MAIL_JQ_VALUE')"; then
+  log_err "Could not encode the MCP endpoint; no user configuration was changed."
+  exit 1
+fi
+if ! _AUTHORIZATION_TOML="$(
+  AGENT_MAIL_JQ_VALUE="Bearer $_TOKEN" jq -Rn 'env.AGENT_MAIL_JQ_VALUE'
+)"; then
+  log_err "Could not encode MCP authorization; no user configuration was changed."
+  exit 1
+fi
+
+_TOML_INPUT="$USER_TOML"
+if [[ ! -f "$_TOML_INPUT" ]]; then
+  _TOML_INPUT="/dev/null"
+fi
 if ! UPDATED_USER_TOML="$(
-  AGENT_MAIL_INSTALL_URL="$_URL" \
-  AGENT_MAIL_INSTALL_AUTHORIZATION="Bearer $_TOKEN" \
-  "${_UV_PYTHON[@]}" - "$USER_TOML" 2>/dev/null <<'PY'
-from __future__ import annotations
+  AGENT_MAIL_TOML_URL="$_URL_TOML" \
+  AGENT_MAIL_TOML_AUTHORIZATION="$_AUTHORIZATION_TOML" \
+  awk '
+    function trim(value) {
+      sub(/^[ \t\r\n]+/, "", value)
+      sub(/[ \t\r\n]+$/, "", value)
+      return value
+    }
 
-import datetime as dt
-import json
-import math
-import os
-import re
-import sys
-import tomllib
-from pathlib import Path
-from typing import Any
+    function fail(message) {
+      if (failure == "") {
+        failure = message
+      }
+    }
 
-path = Path(sys.argv[1])
-url = os.environ.get("AGENT_MAIL_INSTALL_URL", "")
-authorization = os.environ.get("AGENT_MAIL_INSTALL_AUTHORIZATION", "")
-if not url or not authorization:
-    raise SystemExit("missing managed MCP settings")
+    function is_managed_alias(value) {
+      return value == "mcp_agent_mail" || value == "mcp-agent-mail"
+    }
 
-try:
-    text = path.read_text(encoding="utf-8")
-except FileNotFoundError:
-    text = ""
-data = tomllib.loads(text)
-if not isinstance(data, dict):
-    raise SystemExit("TOML root must be a table")
+    function parse_key_path(value, parts,    length_value, index_value, quote,
+                            escaped, component, character, count) {
+      split("", parts)
+      key_path_had_escape = 0
+      value = trim(value)
+      length_value = length(value)
+      index_value = 1
+      count = 0
+      while (index_value <= length_value) {
+        while (index_value <= length_value &&
+               substr(value, index_value, 1) ~ /[ \t]/) {
+          index_value++
+        }
+        if (index_value > length_value) {
+          return 0
+        }
+        quote = substr(value, index_value, 1)
+        component = ""
+        if (quote == "\"" || quote == "\047") {
+          index_value++
+          escaped = 0
+          while (index_value <= length_value) {
+            character = substr(value, index_value, 1)
+            if (quote == "\"" && escaped) {
+              component = component "\\" character
+              escaped = 0
+            } else if (quote == "\"" && character == "\\") {
+              key_path_had_escape = 1
+              escaped = 1
+            } else if (character == quote) {
+              break
+            } else {
+              component = component character
+            }
+            index_value++
+          }
+          if (index_value > length_value || escaped) {
+            return 0
+          }
+          index_value++
+        } else {
+          while (index_value <= length_value) {
+            character = substr(value, index_value, 1)
+            if (character == "." || character ~ /[ \t]/) {
+              break
+            }
+            component = component character
+            index_value++
+          }
+          if (component !~ /^[A-Za-z0-9_-]+$/) {
+            return 0
+          }
+        }
+        count++
+        parts[count] = component
+        while (index_value <= length_value &&
+               substr(value, index_value, 1) ~ /[ \t]/) {
+          index_value++
+        }
+        if (index_value > length_value) {
+          return count
+        }
+        if (substr(value, index_value, 1) != ".") {
+          return 0
+        }
+        index_value++
+      }
+      return 0
+    }
 
-managed_hook_names = (
-    "codex_notify.sh",
-    "notify_wrapper.sh",
-    "notify_inbox.sh",
-    "hook_wrapper.sh",
-    "agent_mail_hook.sh",
-)
+    function path_id(parts, count,    item_number, identifier) {
+      identifier = count
+      for (item_number = 1; item_number <= count; item_number++) {
+        identifier = identifier ":" length(parts[item_number]) ":" parts[item_number]
+      }
+      return identifier
+    }
 
+    function combined_path_id(table_parts, table_count, key_parts, key_count,
+                              prefix_count,    item_number, identifier) {
+      identifier = table_count + prefix_count
+      for (item_number = 1; item_number <= table_count; item_number++) {
+        identifier = identifier ":" length(table_parts[item_number]) ":" table_parts[item_number]
+      }
+      for (item_number = 1; item_number <= prefix_count; item_number++) {
+        identifier = identifier ":" length(key_parts[item_number]) ":" key_parts[item_number]
+      }
+      return identifier
+    }
 
-def managed_notify(value: object) -> bool:
-    if not isinstance(value, str):
-        return False
-    normalized = value.lower().replace("\\", "/")
-    return "mcp-agent-mail/" in normalized and any(
-        name in normalized for name in managed_hook_names
-    )
+    function set_current_table(parts, count,    item_number) {
+      split("", current_table_parts)
+      current_table_count = count
+      for (item_number = 1; item_number <= count; item_number++) {
+        current_table_parts[item_number] = parts[item_number]
+      }
+    }
 
+    function find_active_array_parent(parts, count,    prefix_count,
+                                      identifier) {
+      active_parent_scope = ""
+      active_parent_count = 0
+      for (prefix_count = count - 1; prefix_count >= 1; prefix_count--) {
+        identifier = path_id(parts, prefix_count)
+        if (active_array_instance[identifier] != "") {
+          active_parent_scope = active_array_instance[identifier]
+          active_parent_count = prefix_count
+          return prefix_count
+        }
+      }
+      return 0
+    }
 
-notify = data.get("notify")
-if isinstance(notify, list):
-    kept_notify = [value for value in notify if not managed_notify(value)]
-    if kept_notify:
-        data["notify"] = kept_notify
-    else:
-        data.pop("notify", None)
-elif managed_notify(notify):
-    data.pop("notify", None)
+    function header_path(line, parts,    candidate, array_header, inner, count) {
+      candidate = trim(line)
+      sub(/\r$/, "", candidate)
+      if (candidate ~ /^\[\[[^]]+\]\][ \t]*(#.*)?$/) {
+        array_header = 1
+      } else if (candidate ~ /^\[[^]]+\][ \t]*(#.*)?$/) {
+        array_header = 0
+      } else {
+        return 0
+      }
+      inner = candidate
+      sub(/^[ \t]*\[\[?/, "", inner)
+      if (array_header) {
+        sub(/\]\][ \t]*(#.*)?$/, "", inner)
+      } else {
+        sub(/\][ \t]*(#.*)?$/, "", inner)
+      }
+      count = parse_key_path(inner, parts)
+      if (!count) {
+        return 0
+      }
+      parsed_array_header = array_header
+      return count
+    }
 
-servers = data.get("mcp_servers")
-if servers is None:
-    servers = {}
-elif not isinstance(servers, dict):
-    raise SystemExit("mcp_servers must be a table")
-else:
-    servers = dict(servers)
+    function assignment_path(line, parts,    length_line, index_line, quote,
+                             escaped, character, equals_at, left) {
+      length_line = length(line)
+      quote = ""
+      escaped = 0
+      equals_at = 0
+      for (index_line = 1; index_line <= length_line; index_line++) {
+        character = substr(line, index_line, 1)
+        if (quote != "") {
+          if (quote == "\"" && escaped) {
+            escaped = 0
+          } else if (quote == "\"" && character == "\\") {
+            escaped = 1
+          } else if (character == quote) {
+            quote = ""
+          }
+        } else if (character == "\"" || character == "\047") {
+          quote = character
+        } else if (character == "#") {
+          break
+        } else if (character == "=") {
+          equals_at = index_line
+          break
+        }
+      }
+      assignment_equals_at = equals_at
+      if (!equals_at) {
+        return 0
+      }
+      left = substr(line, 1, equals_at - 1)
+      return parse_key_path(left, parts)
+    }
 
-managed_keys = [
-    key for key in ("mcp_agent_mail", "mcp-agent-mail") if key in servers
-]
-if len(managed_keys) > 1:
-    raise SystemExit("multiple managed MCP server aliases")
-managed_key = managed_keys[0] if managed_keys else "mcp_agent_mail"
-managed = servers.get(managed_key, {})
-if not isinstance(managed, dict):
-    raise SystemExit("managed MCP server must be a table")
-managed = dict(managed)
+    function scan_balance(line,    index_line, character) {
+      depth_before[NR] = square_depth + brace_depth
+      quote_before[NR] = scan_quote
+      for (index_line = 1; index_line <= length(line); index_line++) {
+        character = substr(line, index_line, 1)
+        if (scan_quote != "") {
+          if (scan_quote == "\"" && scan_escaped) {
+            scan_escaped = 0
+          } else if (scan_quote == "\"" && character == "\\") {
+            scan_escaped = 1
+          } else if (character == scan_quote) {
+            scan_quote = ""
+          }
+        } else if (substr(line, index_line, 3) == "\"\"\"" ||
+                   substr(line, index_line, 3) == "\047\047\047") {
+          fail("TOML multiline strings are unsupported")
+          break
+        } else if (character == "\"" || character == "\047") {
+          scan_quote = character
+          scan_escaped = 0
+        } else if (character == "#") {
+          break
+        } else if (character == "[") {
+          square_depth++
+        } else if (character == "]") {
+          square_depth--
+        } else if (character == "{") {
+          brace_depth++
+        } else if (character == "}") {
+          brace_depth--
+        }
+        if (square_depth < 0 || brace_depth < 0) {
+          fail("unbalanced TOML delimiters")
+          return
+        }
+      }
+      depth_after[NR] = square_depth + brace_depth
+      quote_after[NR] = scan_quote
+    }
 
-headers = managed.get("http_headers", {})
-if not isinstance(headers, dict):
-    raise SystemExit("managed http_headers must be a table")
-headers = dict(headers)
-headers["Authorization"] = authorization
-managed["url"] = url
-managed["http_headers"] = headers
-managed.pop("bearer_token_env_var", None)
-managed.pop("env_http_headers", None)
-servers[managed_key] = managed
-data["mcp_servers"] = servers
+    function managed_notify_item(item,    normalized) {
+      normalized = tolower(item)
+      gsub(/\\/, "/", normalized)
+      if (normalized !~ /mcp[-_]agent[-_]mail/) {
+        return 0
+      }
+      if (normalized ~ /(codex_notify|notify_wrapper|notify_inbox|hook_wrapper|agent_mail_hook)[.]sh/) {
+        return 1
+      }
+      return 0
+    }
 
-bare_key_re = re.compile(r"^[A-Za-z0-9_-]+$")
+    function parse_notify(line, items,    equals_at, right, index_right,
+                          character, quote, escaped, token, count, comment_at,
+                          inner) {
+      split("", items)
+      assignment_path(line, notify_key_parts)
+      equals_at = assignment_equals_at
+      right = trim(substr(line, equals_at + 1))
+      quote = ""
+      escaped = 0
+      comment_at = 0
+      for (index_right = 1; index_right <= length(right); index_right++) {
+        character = substr(right, index_right, 1)
+        if (quote != "") {
+          if (quote == "\"" && escaped) {
+            escaped = 0
+          } else if (quote == "\"" && character == "\\") {
+            escaped = 1
+          } else if (character == quote) {
+            quote = ""
+          }
+        } else if (character == "\"" || character == "\047") {
+          quote = character
+        } else if (character == "#") {
+          comment_at = index_right
+          break
+        }
+      }
+      if (comment_at) {
+        notify_comment = trim(substr(right, comment_at))
+        right = trim(substr(right, 1, comment_at - 1))
+      } else {
+        notify_comment = ""
+      }
+      if (substr(right, 1, 1) != "[" ||
+          substr(right, length(right), 1) != "]") {
+        return -1
+      }
+      inner = substr(right, 2, length(right) - 2)
+      quote = ""
+      escaped = 0
+      token = ""
+      count = 0
+      for (index_right = 1; index_right <= length(inner); index_right++) {
+        character = substr(inner, index_right, 1)
+        if (quote != "") {
+          token = token character
+          if (quote == "\"" && escaped) {
+            if (!(character == "\"" || character == "\\" ||
+                  character == "b" || character == "t" ||
+                  character == "n" || character == "f" ||
+                  character == "r")) {
+              return -1
+            }
+            escaped = 0
+          } else if (quote == "\"" && character == "\\") {
+            escaped = 1
+          } else if (character == quote) {
+            quote = ""
+          }
+        } else if (character == "\"" || character == "\047") {
+          quote = character
+          token = token character
+        } else if (character == ",") {
+          token = trim(token)
+          if (token == "") {
+            return -1
+          }
+          count++
+          items[count] = token
+          token = ""
+        } else {
+          token = token character
+        }
+      }
+      if (quote != "" || escaped) {
+        return -1
+      }
+      token = trim(token)
+      if (token != "") {
+        count++
+        items[count] = token
+      } else if (count > 0 && trim(inner) ~ /,$/) {
+        return -1
+      }
+      for (index_right = 1; index_right <= count; index_right++) {
+        token = items[index_right]
+        if (!((substr(token, 1, 1) == "\"" &&
+               substr(token, length(token), 1) == "\"") ||
+              (substr(token, 1, 1) == "\047" &&
+               substr(token, length(token), 1) == "\047"))) {
+          return -1
+        }
+      }
+      return count
+    }
 
+    function section_kind(parts, count) {
+      if (count >= 2 && parts[1] == "mcp_servers" &&
+          is_managed_alias(parts[2])) {
+        if (count == 2) {
+          return "managed-root"
+        }
+        if (count == 3 && parts[3] == "http_headers") {
+          return "managed-headers"
+        }
+        return "managed-child"
+      }
+      return "foreign"
+    }
 
-def format_key(key: str) -> str:
-    if bare_key_re.fullmatch(key):
-        return key
-    return json.dumps(key, ensure_ascii=False)
+    function managed_replacement_key(section, key) {
+      if (section == "managed-root") {
+        return key == "url" || key == "bearer_token_env_var" ||
+               key == "env_http_headers"
+      }
+      return section == "managed-headers" && tolower(key) == "authorization"
+    }
 
+    function validate(    line_number, line, stripped, count, kind,
+                         key_count, notify_count, identifier, prefix_count,
+                         absolute_identifier, relative_identifier,
+                         scope_identifier, registry_identifier,
+                         header_semantic_scope, parent_scope) {
+      split("", explicit_table_seen)
+      split("", array_table_seen)
+      split("", table_prefix_seen)
+      split("", value_path_seen)
+      split("", assignment_seen)
+      split("", scope_table_prefix_seen)
+      split("", scope_value_path_seen)
+      split("", active_array_instance)
+      split("", current_table_parts)
+      current_table_count = 0
+      current_table_is_array = 0
+      current_scope = "root"
+      current_semantic_scope = "global"
+      current_section = "root"
+      for (line_number = 1; line_number <= total_lines; line_number++) {
+        line = source_lines[line_number]
+        stripped = trim(line)
+        sub(/\r$/, "", stripped)
+        if (depth_before[line_number] == 0 && substr(stripped, 1, 1) == "[") {
+          count = header_path(line, header_parts)
+          if (!count) {
+            fail("unsupported or malformed TOML table header")
+            continue
+          }
+          if (key_path_had_escape) {
+            fail("escaped TOML table keys are unsupported")
+            continue
+          }
+          identifier = path_id(header_parts, count)
+          kind = section_kind(header_parts, count)
+          find_active_array_parent(header_parts, count)
+          parent_scope = active_parent_scope
+          registry_identifier = identifier
+          header_semantic_scope = "global"
+          if (parent_scope != "") {
+            registry_identifier = parent_scope SUBSEP identifier
+            header_semantic_scope = parent_scope
+          }
+          if (parsed_array_header) {
+            if (count == 1 && header_parts[1] == "mcp_servers") {
+              fail("mcp_servers arrays of tables are unsupported")
+              continue
+            }
+            if (kind ~ /^managed-/) {
+              fail("managed MCP arrays of tables are unsupported")
+              continue
+            }
+            if (explicit_table_seen[registry_identifier]) {
+              fail("TOML table and array-of-tables paths conflict")
+            }
+            array_table_seen[registry_identifier]++
+            current_table_is_array = 1
+            current_scope = "array:" registry_identifier ":" array_table_seen[registry_identifier]
+            current_semantic_scope = current_scope
+            active_array_instance[identifier] = current_scope
+          } else {
+            if (explicit_table_seen[registry_identifier]) {
+              fail("duplicate TOML table")
+            }
+            if (array_table_seen[registry_identifier]) {
+              fail("TOML table and array-of-tables paths conflict")
+            }
+            explicit_table_seen[registry_identifier] = 1
+            current_table_is_array = (parent_scope != "")
+            current_scope = "table:" registry_identifier
+            current_semantic_scope = header_semantic_scope
+          }
+          for (prefix_count = 1; prefix_count <= count; prefix_count++) {
+            absolute_identifier = header_semantic_scope SUBSEP path_id(header_parts, prefix_count)
+            if (value_path_seen[absolute_identifier]) {
+              fail("TOML scalar and table paths conflict")
+            }
+            table_prefix_seen[absolute_identifier] = 1
+          }
+          set_current_table(header_parts, count)
+          current_section = kind
+          if (kind ~ /^managed-/) {
+            if (managed_alias != "" && managed_alias != header_parts[2]) {
+              fail("multiple managed MCP server aliases")
+            }
+            managed_alias = header_parts[2]
+            if (kind == "managed-root") {
+              managed_root_count++
+              if (managed_root_count > 1) {
+                fail("duplicate managed MCP server table")
+              }
+            } else if (kind == "managed-headers") {
+              managed_headers_count++
+              if (managed_headers_count > 1) {
+                fail("duplicate managed MCP http_headers table")
+              }
+            }
+          }
+          continue
+        }
+        if (stripped == "" || substr(stripped, 1, 1) == "#" ||
+            depth_before[line_number] > 0) {
+          continue
+        }
+        key_count = assignment_path(line, key_parts)
+        if (!key_count) {
+          fail("unsupported or malformed TOML assignment")
+          continue
+        }
+        if (key_path_had_escape) {
+          fail("escaped TOML assignment keys are unsupported")
+          continue
+        }
+        if (current_section == "root" && key_parts[1] == "mcp_servers") {
+          fail("inline or dotted mcp_servers configuration is unsupported")
+        }
+        if (current_table_count == 1 &&
+            current_table_parts[1] == "mcp_servers" &&
+            is_managed_alias(key_parts[1])) {
+          fail("inline managed MCP server aliases are unsupported")
+        }
+        if ((current_section == "managed-root" ||
+             current_section == "managed-headers") && key_count != 1) {
+          fail("dotted assignments in managed MCP tables are unsupported")
+        }
+        relative_identifier = path_id(key_parts, key_count)
+        scope_identifier = current_scope SUBSEP relative_identifier
+        if (assignment_seen[scope_identifier]) {
+          fail("duplicate TOML assignment key")
+        }
+        assignment_seen[scope_identifier] = 1
+        for (prefix_count = 1; prefix_count < key_count; prefix_count++) {
+          identifier = current_scope SUBSEP path_id(key_parts, prefix_count)
+          if (scope_value_path_seen[identifier]) {
+            fail("TOML scalar and dotted-key paths conflict")
+          }
+          scope_table_prefix_seen[identifier] = 1
+        }
+        identifier = current_scope SUBSEP relative_identifier
+        if (scope_table_prefix_seen[identifier]) {
+          fail("TOML scalar and dotted-key paths conflict")
+        }
+        scope_value_path_seen[identifier] = 1
+        for (prefix_count = 1; prefix_count < key_count; prefix_count++) {
+          absolute_identifier = current_semantic_scope SUBSEP combined_path_id(current_table_parts, current_table_count, key_parts, key_count, prefix_count)
+          if (value_path_seen[absolute_identifier]) {
+            fail("TOML scalar and dotted-key paths conflict")
+          }
+          table_prefix_seen[absolute_identifier] = 1
+        }
+        absolute_identifier = current_semantic_scope SUBSEP combined_path_id(current_table_parts, current_table_count, key_parts, key_count, key_count)
+        if (value_path_seen[absolute_identifier]) {
+          fail("duplicate TOML assignment key")
+        }
+        if (table_prefix_seen[absolute_identifier]) {
+          fail("TOML scalar and table paths conflict")
+        }
+        value_path_seen[absolute_identifier] = 1
+        if (managed_replacement_key(current_section, key_parts[1]) &&
+            (depth_after[line_number] != depth_before[line_number] ||
+             quote_after[line_number] != quote_before[line_number])) {
+          fail("multiline managed MCP values are unsupported")
+        }
+        if (current_section == "root" && key_count == 1 &&
+            key_parts[1] == "notify") {
+          notify_count = parse_notify(line, notify_items)
+          if (notify_count < 0) {
+            fail("notify must be a one-line array of strings")
+          }
+        }
+        if (current_section == "managed-root" && key_count == 1 &&
+            key_parts[1] == "http_headers") {
+          fail("managed http_headers must use a nested table")
+        }
+      }
+      if (scan_quote != "" || square_depth != 0 || brace_depth != 0) {
+        fail("unbalanced TOML value")
+      }
+      if (managed_alias != "" && managed_root_count == 0) {
+        fail("managed MCP child table has no server table")
+      }
+    }
 
-def format_path(parts: tuple[str, ...]) -> str:
-    return ".".join(format_key(part) for part in parts)
+    function output_notify(line,    count, item_number, combined) {
+      count = parse_notify(line, output_notify_items)
+      combined = ""
+      for (item_number = 1; item_number <= count; item_number++) {
+        combined = combined " " output_notify_items[item_number]
+        if (managed_notify_item(output_notify_items[item_number])) {
+          return
+        }
+      }
+      if (managed_notify_item(combined)) {
+        return
+      }
+      print line
+    }
 
+    function render(    line_number, line, stripped, count, kind, key_count,
+                        alias_header) {
+      current_section = "root"
+      for (line_number = 1; line_number <= total_lines; line_number++) {
+        line = source_lines[line_number]
+        stripped = trim(line)
+        sub(/\r$/, "", stripped)
+        if (depth_before[line_number] == 0 && substr(stripped, 1, 1) == "[") {
+          count = header_path(line, header_parts)
+          kind = section_kind(header_parts, count)
+          current_section = kind
+          print line
+          if (kind == "managed-root") {
+            print "url = " ENVIRON["AGENT_MAIL_TOML_URL"]
+          } else if (kind == "managed-headers") {
+            print "Authorization = " ENVIRON["AGENT_MAIL_TOML_AUTHORIZATION"]
+          }
+          continue
+        }
+        if (stripped == "" || substr(stripped, 1, 1) == "#" ||
+            depth_before[line_number] > 0) {
+          print line
+          continue
+        }
+        key_count = assignment_path(line, key_parts)
+        if (current_section == "root" && key_count == 1 &&
+            key_parts[1] == "notify") {
+          output_notify(line)
+          continue
+        }
+        if (current_section == "managed-root" && key_count == 1 &&
+            (key_parts[1] == "url" ||
+             key_parts[1] == "bearer_token_env_var" ||
+             key_parts[1] == "env_http_headers")) {
+          continue
+        }
+        if (current_section == "managed-headers" && key_count == 1 &&
+            tolower(key_parts[1]) == "authorization") {
+          continue
+        }
+        print line
+      }
 
-def is_array_of_tables(value: object) -> bool:
-    return (
-        isinstance(value, list)
-        and bool(value)
-        and all(isinstance(item, dict) for item in value)
-    )
+      if (managed_alias == "") {
+        if (total_lines > 0 && source_lines[total_lines] != "") {
+          print ""
+        }
+        print "[mcp_servers.mcp_agent_mail]"
+        print "url = " ENVIRON["AGENT_MAIL_TOML_URL"]
+        print ""
+        print "[mcp_servers.mcp_agent_mail.http_headers]"
+        print "Authorization = " ENVIRON["AGENT_MAIL_TOML_AUTHORIZATION"]
+      } else if (managed_headers_count == 0) {
+        alias_header = managed_alias
+        if (managed_alias == "mcp-agent-mail") {
+          alias_header = "\"mcp-agent-mail\""
+        }
+        if (total_lines > 0 && source_lines[total_lines] != "") {
+          print ""
+        }
+        print "[mcp_servers." alias_header ".http_headers]"
+        print "Authorization = " ENVIRON["AGENT_MAIL_TOML_AUTHORIZATION"]
+      }
+    }
 
+    {
+      source_lines[NR] = $0
+      total_lines = NR
+      scan_balance($0)
+    }
 
-def format_value(value: Any) -> str:
-    if isinstance(value, str):
-        return json.dumps(value, ensure_ascii=False)
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float):
-        if math.isnan(value):
-            return "nan"
-        if math.isinf(value):
-            return "-inf" if value < 0 else "inf"
-        return repr(value)
-    if isinstance(value, dt.datetime | dt.date | dt.time):
-        return value.isoformat()
-    if isinstance(value, list):
-        return "[" + ", ".join(format_value(item) for item in value) + "]"
-    if isinstance(value, dict):
-        entries = ", ".join(
-            f"{format_key(str(key))} = {format_value(item)}"
-            for key, item in value.items()
-        )
-        return "{ " + entries + " }"
-    raise TypeError(f"unsupported TOML value type: {type(value).__name__}")
-
-
-output: list[str] = []
-
-
-def blank_line() -> None:
-    if output and output[-1] != "":
-        output.append("")
-
-
-def split_items(table: dict[str, Any]) -> tuple[
-    list[tuple[str, Any]],
-    list[tuple[str, dict[str, Any]]],
-    list[tuple[str, list[dict[str, Any]]]],
-]:
-    scalar_items: list[tuple[str, Any]] = []
-    child_tables: list[tuple[str, dict[str, Any]]] = []
-    array_tables: list[tuple[str, list[dict[str, Any]]]] = []
-    for key, value in table.items():
-        if isinstance(value, dict):
-            child_tables.append((key, value))
-        elif is_array_of_tables(value):
-            array_tables.append((key, value))
-        else:
-            scalar_items.append((key, value))
-    return scalar_items, child_tables, array_tables
-
-
-def emit_table(table: dict[str, Any], path_parts: tuple[str, ...]) -> None:
-    scalar_items, child_tables, array_tables = split_items(table)
-    blank_line()
-    output.append(f"[{format_path(path_parts)}]")
-    output.extend(
-        f"{format_key(key)} = {format_value(value)}"
-        for key, value in scalar_items
-    )
-    for key, child in child_tables:
-        emit_table(child, (*path_parts, key))
-    for key, items in array_tables:
-        emit_array_table(items, (*path_parts, key))
-
-
-def emit_array_table(
-    items: list[dict[str, Any]], path_parts: tuple[str, ...]
-) -> None:
-    for item in items:
-        scalar_items, child_tables, array_tables = split_items(item)
-        blank_line()
-        output.append(f"[[{format_path(path_parts)}]]")
-        output.extend(
-            f"{format_key(key)} = {format_value(value)}"
-            for key, value in scalar_items
-        )
-        for key, child in child_tables:
-            emit_table(child, (*path_parts, key))
-        for key, nested_items in array_tables:
-            emit_array_table(nested_items, (*path_parts, key))
-
-
-root_scalars, root_tables, root_array_tables = split_items(data)
-output.extend(
-    f"{format_key(key)} = {format_value(value)}"
-    for key, value in root_scalars
-)
-for key, table in root_tables:
-    emit_table(table, (key,))
-for key, items in root_array_tables:
-    emit_array_table(items, (key,))
-
-updated = "\n".join(output).rstrip() + "\n"
-round_trip = tomllib.loads(updated)
-round_trip_server = round_trip["mcp_servers"][managed_key]
-if round_trip_server["url"] != url:
-    raise SystemExit("managed URL did not round-trip")
-if round_trip_server["http_headers"]["Authorization"] != authorization:
-    raise SystemExit("managed Authorization did not round-trip")
-sys.stdout.write(updated)
-PY
+    END {
+      validate()
+      if (failure != "") {
+        print "Codex TOML merge refused: " failure > "/dev/stderr"
+        exit 1
+      }
+      if (ENVIRON["AGENT_MAIL_TOML_URL"] == "" ||
+          ENVIRON["AGENT_MAIL_TOML_AUTHORIZATION"] == "") {
+        print "Codex TOML merge refused: missing managed MCP settings" > "/dev/stderr"
+        exit 1
+      }
+      render()
+    }
+  ' "$_TOML_INPUT"
 )"; then
   log_err "Existing ${USER_TOML} is invalid or could not be merged; no user configuration was changed."
   exit 1
 fi
 
-# Every prospective output has now been parsed or syntax-checked in memory.
-# A dry run stops before backups, mkdir, chmod, or any file publication.
+# Validate the shared state path through the same writer used by a real install.
+# The temporary DRY_RUN value is dynamically visible to its helper calls, so
+# this performs normalization and merge checks without backups or publication.
+if ! DRY_RUN=1 write_shared_agent_mail_env "${_URL}" "${_TOKEN}" >/dev/null; then
+  log_err "Shared Agent Mail environment is invalid; no user configuration was changed."
+  exit 1
+fi
+
+# Every prospective output has now been validated in memory.  A dry run stops
+# before backups, mkdir, chmod, or any file publication.
 if [[ "$DRY_RUN" == "1" ]]; then
   _print "[dry-run] write shared Agent Mail URL/bearer"
   _print "[dry-run] install Codex lifecycle scripts under ${HOOKS_DIR}"

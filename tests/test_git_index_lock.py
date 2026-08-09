@@ -13,6 +13,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from git import Git
+from git.exc import GitCommandError
 
 from mcp_agent_mail.storage import (
     GitIndexLockError,
@@ -73,6 +75,24 @@ class TestIsGitIndexLockError:
         """Detection is case-insensitive."""
         exc = OSError("Could not acquire INDEX.LOCK")
         assert _is_git_index_lock_error(exc) is True
+
+    def test_detects_git_command_error_with_index_lock_message(self):
+        """Git command failures naming index.lock are detected."""
+        exc = GitCommandError(
+            "git commit",
+            128,
+            stderr="fatal: Unable to create '/tmp/.git/index.lock': File exists.",
+        )
+        assert _is_git_index_lock_error(exc) is True
+
+    def test_ignores_unrelated_git_command_error(self):
+        """Unrelated git command failures are not lock contention."""
+        exc = GitCommandError(
+            "git commit",
+            1,
+            stderr="nothing to commit, working tree clean",
+        )
+        assert _is_git_index_lock_error(exc) is False
 
 
 # ============================================================================
@@ -245,6 +265,71 @@ class TestCommitRetryIntegration:
         # A new commit should exist
         final_commits = len(list(repo.iter_commits()))
         assert final_commits == initial_commits + 1
+
+    @pytest.mark.asyncio
+    async def test_subtree_deletion_retries_git_command_index_lock_once(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """A transient Git index lock failure retries the subtree commit."""
+        from mcp_agent_mail.config import get_settings
+        from mcp_agent_mail.storage import (
+            _commit,
+            commit_archive_subtree_deletion,
+            ensure_archive,
+        )
+
+        archive = await ensure_archive(get_settings(), "index-lock-retry")
+        target_dir = archive.root / "agents" / "RetryAgent"
+        target_dir.mkdir(parents=True)
+        target_file = target_dir / "profile.json"
+        target_file.write_text('{"name": "RetryAgent"}\n', encoding="utf-8")
+        relative_file = target_file.relative_to(archive.repo_root).as_posix()
+        await _commit(
+            archive.repo,
+            archive.settings,
+            "seed: index lock retry",
+            [relative_file],
+            use_queue=False,
+        )
+        target_file.unlink()
+
+        original_call_process = Git._call_process
+        commit_attempts = 0
+
+        def fail_first_commit(git, method, *args, **kwargs):
+            nonlocal commit_attempts
+            if method == "commit":
+                commit_attempts += 1
+                if commit_attempts == 1:
+                    raise GitCommandError(
+                        "git commit",
+                        128,
+                        stderr=(
+                            "fatal: Unable to create '/tmp/.git/index.lock': "
+                            "File exists."
+                        ),
+                    )
+            return original_call_process(git, method, *args, **kwargs)
+
+        monkeypatch.setattr(Git, "_call_process", fail_first_commit)
+
+        committed = await commit_archive_subtree_deletion(
+            archive,
+            target_dir,
+            "hard-delete: retry after index lock",
+        )
+
+        assert committed is True
+        assert commit_attempts == 2
+        assert archive.repo.git.ls_tree(
+            "-r",
+            "--name-only",
+            "HEAD",
+            "--",
+            f":(literal){relative_file}",
+        ) == ""
 
     @pytest.mark.asyncio
     async def test_commit_message_includes_trailers(self, isolated_env):

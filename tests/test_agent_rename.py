@@ -1322,6 +1322,68 @@ def test_staged_unrelated_lock_blocks_dedicated_rename_commit(isolated_env) -> N
     ).splitlines()
 
 
+def test_untracked_root_sqlite_runtime_files_do_not_block_rename(isolated_env) -> None:
+    seeded = _seed()
+    runtime_names = (
+        "storage.sqlite3",
+        "storage.sqlite3-journal",
+        "storage.sqlite3-shm",
+        "storage.sqlite3-wal",
+    )
+    for name in runtime_names:
+        (seeded.repo_root / name).write_bytes(b"runtime-only")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "rename-agent",
+            PROJECT_KEY,
+            OLD_NAME,
+            NEW_NAME,
+            "--apply",
+            "--confirm",
+            f"{OLD_NAME}=>{NEW_NAME}",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    for name in runtime_names:
+        assert (seeded.repo_root / name).read_bytes() == b"runtime-only"
+        assert _git(seeded.repo_root, "ls-files", "--", name) == ""
+
+
+@pytest.mark.parametrize("artifact_state", ["staged", "tracked-modified"])
+def test_root_sqlite_artifact_changes_still_block_rename(
+    isolated_env,
+    artifact_state: str,
+) -> None:
+    seeded = _seed()
+    database_path = seeded.repo_root / "storage.sqlite3"
+    database_path.write_bytes(b"operator-owned")
+    _git(seeded.repo_root, "add", "--", database_path.name)
+    if artifact_state == "tracked-modified":
+        _git(seeded.repo_root, "commit", "-m", "seed: tracked archive database")
+        database_path.write_bytes(b"operator-modified")
+    head_before = _git(seeded.repo_root, "rev-parse", "HEAD")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "rename-agent",
+            PROJECT_KEY,
+            OLD_NAME,
+            NEW_NAME,
+            "--apply",
+            "--confirm",
+            f"{OLD_NAME}=>{NEW_NAME}",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "clean" in unstyle(result.output).lower()
+    assert _git(seeded.repo_root, "rev-parse", "HEAD") == head_before
+
+
 def test_rename_agent_recovers_db_ahead_when_profile_proves_same_agent(isolated_env) -> None:
     seeded = _seed()
 

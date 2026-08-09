@@ -101,6 +101,8 @@ from .share import (
 from .storage import (
     ProjectArchive,
     archive_write_lock,
+    commit_archive_subtree_deletion,
+    delete_archive_tree_contents,
     ensure_archive,
     inspect_agent_archive_rename,
     migrate_agent_archive,
@@ -4624,17 +4626,21 @@ def hard_delete_agent(
         dirs_removed = 0
         fs_errors: list[str] = []
         try:
-            from .storage import ensure_archive
-
             archive = await ensure_archive(settings, proj.slug)
             agent_dir = archive.root / "agents" / agent_name
-            if agent_dir.exists():
-                for item in agent_dir.rglob("*"):
-                    if item.is_file():
-                        files_removed += 1
-                    elif item.is_dir():
-                        dirs_removed += 1
-                shutil.rmtree(agent_dir)
+            async with archive_write_lock(archive):
+                if agent_dir.exists():
+                    for item in agent_dir.rglob("*"):
+                        if item.is_file():
+                            files_removed += 1
+                        elif item.is_dir():
+                            dirs_removed += 1
+                    shutil.rmtree(agent_dir)
+                await commit_archive_subtree_deletion(
+                    archive,
+                    agent_dir,
+                    f"hard_delete: agent {agent_name}",
+                )
         except Exception as exc:
             fs_errors.append(str(exc))
 
@@ -4840,11 +4846,24 @@ def hard_delete_project(
             await session.commit()
 
         # Phase 2: Filesystem cleanup (best-effort)
-        files_removed, dirs_removed, fs_errors = await asyncio.to_thread(
-            _delete_project_archive_tree,
-            settings.storage.root,
-            project_slug,
-        )
+        files_removed = 0
+        dirs_removed = 0
+        fs_errors: list[str] = []
+        try:
+            archive = await ensure_archive(settings, project_slug)
+            async with archive_write_lock(archive):
+                files_removed, dirs_removed = await asyncio.to_thread(
+                    delete_archive_tree_contents,
+                    archive.root,
+                )
+                await commit_archive_subtree_deletion(
+                    archive,
+                    archive.root,
+                    f"hard_delete: project {project_slug}",
+                )
+            await asyncio.to_thread(archive.root.rmdir)
+        except Exception as exc:
+            fs_errors.append(str(exc))
 
         deleted_counts["archive_files_removed"] = files_removed
         deleted_counts["archive_dirs_removed"] = dirs_removed

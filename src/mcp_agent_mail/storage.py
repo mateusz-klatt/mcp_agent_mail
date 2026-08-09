@@ -24,6 +24,7 @@ import logging
 import os
 import random
 import re
+import shutil
 import sys
 import threading as _threading
 import time
@@ -406,6 +407,30 @@ class ProjectArchive:
     @property
     def attachments_dir(self) -> Path:
         return self.root / "attachments"
+
+
+def delete_archive_tree_contents(root: Path) -> tuple[int, int]:
+    """Remove a project archive's contents while preserving its active lock."""
+    if not root.exists():
+        return 0, 0
+    preserved_names = {".archive.lock", ".archive.lock.owner.json"}
+    files_removed = 0
+    dirs_removed = 0
+    for item in root.rglob("*"):
+        if item.parent == root and item.name in preserved_names:
+            continue
+        if item.is_file() or item.is_symlink():
+            files_removed += 1
+        elif item.is_dir():
+            dirs_removed += 1
+    for item in root.iterdir():
+        if item.name in preserved_names:
+            continue
+        if item.is_dir() and not item.is_symlink():
+            shutil.rmtree(item)
+        else:
+            item.unlink()
+    return files_removed, dirs_removed
 
 _PROCESS_LOCKS: dict[tuple[int, str], asyncio.Lock] = {}
 _PROCESS_LOCK_OWNERS: dict[tuple[int, str], int] = {}
@@ -1774,6 +1799,10 @@ def _is_ephemeral_archive_path(path_value: str) -> bool:
     if normalized in {
         "server.lock",
         "server.pid",
+        "storage.sqlite3",
+        "storage.sqlite3-journal",
+        "storage.sqlite3-shm",
+        "storage.sqlite3-wal",
         ".commit.lock",
         ".commit.lock.owner.json",
     }:
@@ -2942,11 +2971,20 @@ def _is_git_index_lock_error(exc: BaseException) -> bool:
 
     Git uses .git/index.lock for atomic index operations. When multiple
     processes/threads try to modify the index concurrently, the second one
-    gets FileExistsError (errno 17) or an OSError wrapping it.
+    gets FileExistsError (errno 17), an OSError wrapping it, or a
+    GitCommandError carrying Git's lock diagnostic.
     """
     # Direct FileExistsError
     if isinstance(exc, FileExistsError) and exc.errno == 17:
         return True
+    if isinstance(exc, GitCommandError):
+        details = " ".join(
+            str(value)
+            for value in (exc, exc.stderr, exc.stdout)
+            if value
+        ).lower()
+        if "index.lock" in details or "unable to create lock" in details:
+            return True
     # OSError wrapping FileExistsError from gitdb.util.LockedFD
     if isinstance(exc, OSError):
         err_str = str(exc).lower()
@@ -3005,6 +3043,75 @@ def _normalize_archive_text_line_endings(repo_root: Path, rel_paths: Sequence[st
         normalized = content.replace(b"\r\n", b"\n")
         if normalized != content:
             full_path.write_bytes(normalized)
+
+
+async def commit_archive_subtree_deletion(
+    archive: ProjectArchive,
+    tree_root: Path,
+    message: str,
+) -> bool:
+    """Commit one deleted archive subtree without consuming foreign staged changes."""
+    archive_root = archive.root.resolve(strict=False)
+    resolved_tree_root = tree_root.resolve(strict=False)
+    try:
+        resolved_tree_root.relative_to(archive_root)
+        relative_root = resolved_tree_root.relative_to(
+            archive.repo_root.resolve(strict=False)
+        ).as_posix().rstrip("/")
+    except ValueError as exc:
+        raise ValueError(
+            "Archive deletion target must stay within the project archive"
+        ) from exc
+    if not relative_root:
+        raise ValueError("Archive deletion target must not be the repository root")
+    pathspec = f":(literal){relative_root}"
+    commit_lock_path = _commit_lock_path(archive.repo_root, [relative_root])
+    await _to_thread(commit_lock_path.parent.mkdir, parents=True, exist_ok=True)
+
+    def _commit_only() -> bool:
+        repo = Repo(str(archive.repo_root))
+        try:
+            tracked = repo.git.ls_tree(
+                "-r",
+                "--name-only",
+                "HEAD",
+                "--",
+                pathspec,
+            )
+            if not tracked.strip():
+                return False
+            with repo.git.custom_environment(
+                GIT_AUTHOR_NAME=archive.settings.storage.git_author_name,
+                GIT_AUTHOR_EMAIL=archive.settings.storage.git_author_email,
+                GIT_COMMITTER_NAME=archive.settings.storage.git_author_name,
+                GIT_COMMITTER_EMAIL=archive.settings.storage.git_author_email,
+            ):
+                max_attempts = 5
+                for attempt in range(max_attempts):
+                    try:
+                        repo.git.commit(
+                            "--only",
+                            "--no-gpg-sign",
+                            "--no-verify",
+                            "-m",
+                            message,
+                            "--",
+                            pathspec,
+                        )
+                        break
+                    except GitCommandError as exc:
+                        if (
+                            not _is_git_index_lock_error(exc)
+                            or attempt == max_attempts - 1
+                        ):
+                            raise
+                        time.sleep(0.05 * (2**attempt))
+            return True
+        finally:
+            repo.close()
+
+    async with AsyncFileLock(commit_lock_path):
+        return await _to_thread(_commit_only)
 
 
 async def _commit_direct(

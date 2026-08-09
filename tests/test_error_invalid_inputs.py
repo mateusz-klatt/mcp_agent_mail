@@ -24,16 +24,28 @@ Reference: mcp_agent_mail-mj0
 from __future__ import annotations
 
 import contextlib
+import subprocess
 
 import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from sqlmodel import select
 
+from mcp_agent_mail import app as app_module
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import get_session
 from mcp_agent_mail.models import Agent, Project
 from tests.keys import pkey
+
+
+def _git(repo_root, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
 
 # ============================================================================
 # Test: Invalid project_key
@@ -330,7 +342,16 @@ async def test_hard_delete_project_rejects_legacy_tokenless_project(isolated_env
 
 
 @pytest.mark.asyncio
-async def test_hard_delete_project_removes_archive_tree(isolated_env, tmp_path):
+async def test_hard_delete_project_removes_archive_tree(isolated_env, tmp_path, monkeypatch):
+    original_commit = app_module.commit_archive_subtree_deletion
+    commit_saw_lock = False
+
+    async def observe_lock(archive, tree_root, message):
+        nonlocal commit_saw_lock
+        commit_saw_lock = archive.lock_path.is_file()
+        return await original_commit(archive, tree_root, message)
+
+    monkeypatch.setattr(app_module, "commit_archive_subtree_deletion", observe_lock)
     server = build_mcp_server()
     async with Client(server) as client:
         project_result = await client.call_tool("ensure_project", {"human_key": pkey("deletable/project")})
@@ -345,6 +366,10 @@ async def test_hard_delete_project_removes_archive_tree(isolated_env, tmp_path):
         archive_file = tmp_path / "storage" / "projects" / slug / "messages" / "dummy.txt"
         archive_file.parent.mkdir(parents=True, exist_ok=True)
         archive_file.write_text("dummy archive content", encoding="utf-8")
+        archive_repo_root = tmp_path / "storage"
+        archive_relpath = f"projects/{slug}"
+        head_before = _git(archive_repo_root, "rev-parse", "HEAD")
+        assert _git(archive_repo_root, "ls-files", "--", archive_relpath)
 
         result = await client.call_tool(
             "hard_delete_project",
@@ -358,10 +383,23 @@ async def test_hard_delete_project_removes_archive_tree(isolated_env, tmp_path):
     assert result.data["status"] == "hard_deleted"
     assert result.data["deleted_counts"]["archive_files_removed"] >= 1
     assert not (tmp_path / "storage" / "projects" / slug).exists()
+    assert _git(archive_repo_root, "rev-parse", "HEAD") != head_before
+    assert _git(archive_repo_root, "ls-files", "--", archive_relpath) == ""
+    assert _git(archive_repo_root, "status", "--porcelain") == ""
+    assert commit_saw_lock
 
 
 @pytest.mark.asyncio
-async def test_hard_delete_agent_removes_archive_tree(isolated_env, tmp_path):
+async def test_hard_delete_agent_removes_archive_tree(isolated_env, tmp_path, monkeypatch):
+    original_commit = app_module.commit_archive_subtree_deletion
+    commit_saw_lock = False
+
+    async def observe_lock(archive, tree_root, message):
+        nonlocal commit_saw_lock
+        commit_saw_lock = archive.lock_path.is_file()
+        return await original_commit(archive, tree_root, message)
+
+    monkeypatch.setattr(app_module, "commit_archive_subtree_deletion", observe_lock)
     server = build_mcp_server()
     async with Client(server) as client:
         project_result = await client.call_tool("ensure_project", {"human_key": pkey("deletable/agent")})
@@ -377,6 +415,10 @@ async def test_hard_delete_agent_removes_archive_tree(isolated_env, tmp_path):
         agent_archive_dir = tmp_path / "storage" / "projects" / slug / "agents" / agent_name
         agent_archive_dir.mkdir(parents=True, exist_ok=True)
         (agent_archive_dir / "dummy.txt").write_text("dummy archive content", encoding="utf-8")
+        archive_repo_root = tmp_path / "storage"
+        archive_relpath = f"projects/{slug}/agents/{agent_name}"
+        head_before = _git(archive_repo_root, "rev-parse", "HEAD")
+        assert _git(archive_repo_root, "ls-files", "--", archive_relpath)
 
         result = await client.call_tool(
             "hard_delete_agent",
@@ -391,6 +433,10 @@ async def test_hard_delete_agent_removes_archive_tree(isolated_env, tmp_path):
     assert result.data["status"] == "hard_deleted"
     assert result.data["deleted_counts"]["archive_files_removed"] >= 1
     assert not agent_archive_dir.exists()
+    assert _git(archive_repo_root, "rev-parse", "HEAD") != head_before
+    assert _git(archive_repo_root, "ls-files", "--", archive_relpath) == ""
+    assert _git(archive_repo_root, "status", "--porcelain") == ""
+    assert commit_saw_lock
 
 
 @pytest.mark.asyncio

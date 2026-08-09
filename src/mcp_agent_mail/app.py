@@ -77,6 +77,8 @@ from .storage import (
     clear_notification_signal,
     clear_repo_cache,
     collect_lock_status,
+    commit_archive_subtree_deletion,
+    delete_archive_tree_contents,
     emit_notification_signal,
     ensure_archive,
     get_identity_rename_tombstone,
@@ -6792,9 +6794,18 @@ def build_mcp_server() -> FastMCP:
             settings = get_settings()
             archive = await ensure_archive(settings, project.slug)
             agent_dir = archive.root / "agents" / agent_name
-            files_removed, dirs_removed = await asyncio.to_thread(_delete_tree_with_counts, agent_dir)
+            async with _archive_write_lock(archive):
+                files_removed, dirs_removed = await asyncio.to_thread(
+                    _delete_tree_with_counts,
+                    agent_dir,
+                )
+                await commit_archive_subtree_deletion(
+                    archive,
+                    agent_dir,
+                    f"hard_delete: agent {agent_name}",
+                )
         except Exception as exc:
-            fs_errors.append(f"Failed to remove agent archive directory: {exc}")
+            fs_errors.append(f"Failed to remove and commit agent archive directory: {exc}")
 
         deleted_counts["archive_files_removed"] = files_removed
         deleted_counts["archive_dirs_removed"] = dirs_removed
@@ -6980,13 +6991,20 @@ def build_mcp_server() -> FastMCP:
         fs_errors: list[str] = []
         try:
             settings = get_settings()
-            files_removed, dirs_removed = await asyncio.to_thread(
-                _delete_project_archive_tree,
-                settings.storage.root,
-                project_slug,
-            )
+            archive = await ensure_archive(settings, project_slug)
+            async with _archive_write_lock(archive):
+                files_removed, dirs_removed = await asyncio.to_thread(
+                    delete_archive_tree_contents,
+                    archive.root,
+                )
+                await commit_archive_subtree_deletion(
+                    archive,
+                    archive.root,
+                    f"hard_delete: project {project_slug}",
+                )
+            await asyncio.to_thread(archive.root.rmdir)
         except Exception as exc:
-            fs_errors.append(f"Failed to remove project archive directory: {exc}")
+            fs_errors.append(f"Failed to remove and commit project archive directory: {exc}")
 
         deleted_counts["archive_files_removed"] = files_removed
         deleted_counts["archive_dirs_removed"] = dirs_removed

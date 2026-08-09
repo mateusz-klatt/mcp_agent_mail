@@ -21,7 +21,11 @@ from mcp_agent_mail.cli import app
 from mcp_agent_mail.config import clear_settings_cache, get_settings
 from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.models import Agent, FileReservation, Project
-from mcp_agent_mail.storage import _commit as _archive_commit, ensure_archive
+from mcp_agent_mail.storage import (
+    _commit as _archive_commit,
+    commit_archive_subtree_deletion,
+    ensure_archive,
+)
 from tests.keys import pkey
 
 LIB_SH = Path(__file__).resolve().parents[1] / "scripts" / "lib.sh"
@@ -169,6 +173,72 @@ def _seed_projects_adopt_state(source_worktree: Path, target_worktree: Path) -> 
         return source_archive.root, target_archive.root, source_archive.repo_root, target_project.id
 
     return asyncio.run(_seed())
+
+
+def _seed_hard_delete_cli_state(
+    *,
+    project_key: str,
+    project_slug: str,
+    agent_name: str,
+    registration_token: str,
+) -> tuple[Path, Path]:
+    async def _seed() -> tuple[Path, Path]:
+        await ensure_schema()
+        async with get_session() as session:
+            project = Project(slug=project_slug, human_key=project_key)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+            assert project.id is not None
+            session.add(
+                Agent(
+                    project_id=project.id,
+                    name=agent_name,
+                    program="codex",
+                    model="gpt-5",
+                    task_description="hard-delete test",
+                    registration_token=registration_token,
+                )
+            )
+            await session.commit()
+
+        archive = await ensure_archive(get_settings(), project_slug)
+        profile = archive.root / "agents" / agent_name / "profile.json"
+        profile.parent.mkdir(parents=True, exist_ok=True)
+        profile.write_text('{"name": "BlueLake"}\n', encoding="utf-8")
+        await _archive_commit(
+            archive.repo,
+            archive.settings,
+            "seed: hard-delete CLI agent",
+            [profile.relative_to(archive.repo_root).as_posix()],
+            use_queue=False,
+        )
+        return archive.repo_root, archive.root
+
+    return asyncio.run(_seed())
+
+
+def _git_output(repo_root: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo_root), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def test_commit_archive_subtree_deletion_rejects_resolved_escape(isolated_env) -> None:
+    async def reject_escape() -> None:
+        archive = await ensure_archive(get_settings(), "containment-project")
+        escaped_target = archive.root / "agents" / ".." / ".." / "outside"
+        with pytest.raises(ValueError, match="stay within"):
+            await commit_archive_subtree_deletion(
+                archive,
+                escaped_target,
+                "test: reject escaped deletion target",
+            )
+
+    asyncio.run(reject_escape())
 
 
 def test_cli_lint(monkeypatch):
@@ -599,6 +669,236 @@ def test_cli_list_projects_json_returns_structured_error_on_failure(monkeypatch)
 
     assert result.exit_code == 1
     assert json.loads(result.stdout) == {"error": "projects exploded"}
+
+
+def test_cli_hard_delete_agent_commits_archive_deletion(isolated_env):
+    project_key = pkey("cli/delete-agent")
+    agent_name = "BlueLake"
+    registration_token = "agent-delete-token"
+    repo_root, project_root = _seed_hard_delete_cli_state(
+        project_key=project_key,
+        project_slug="cli-delete-agent",
+        agent_name=agent_name,
+        registration_token=registration_token,
+    )
+    agent_relpath = f"projects/cli-delete-agent/agents/{agent_name}"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "hard-delete-agent",
+            project_key,
+            agent_name,
+            "--confirm",
+            "I UNDERSTAND",
+            "--token",
+            registration_token,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert not (project_root / "agents" / agent_name).exists()
+    assert _git_output(repo_root, "ls-files", "--", agent_relpath) == ""
+    assert _git_output(repo_root, "status", "--porcelain") == ""
+
+
+def test_cli_hard_delete_project_commits_archive_deletion(isolated_env):
+    project_key = pkey("cli/delete-project")
+    registration_token = "project-delete-token"
+    repo_root, project_root = _seed_hard_delete_cli_state(
+        project_key=project_key,
+        project_slug="cli-delete-project",
+        agent_name="BlueLake",
+        registration_token=registration_token,
+    )
+    project_relpath = "projects/cli-delete-project"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "hard-delete-project",
+            project_key,
+            "--confirm",
+            "I UNDERSTAND",
+            "--token",
+            registration_token,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert not project_root.exists()
+    assert _git_output(repo_root, "ls-files", "--", project_relpath) == ""
+    assert _git_output(repo_root, "status", "--porcelain") == ""
+
+
+def test_cli_hard_delete_project_reports_archive_setup_failure_after_db_delete(
+    isolated_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_key = pkey("cli/delete-project-archive-failure")
+    registration_token = "project-delete-token"
+    _seed_hard_delete_cli_state(
+        project_key=project_key,
+        project_slug="cli-delete-project-archive-failure",
+        agent_name="BlueLake",
+        registration_token=registration_token,
+    )
+
+    async def fail_archive_setup(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("archive setup failed")
+
+    monkeypatch.setattr(cli_module, "ensure_archive", fail_archive_setup)
+    result = CliRunner().invoke(
+        app,
+        [
+            "hard-delete-project",
+            project_key,
+            "--confirm",
+            "I UNDERSTAND",
+            "--token",
+            registration_token,
+        ],
+    )
+
+    async def project_was_deleted() -> bool:
+        async with get_session() as session:
+            project = (
+                await session.execute(
+                    select(Project).where(
+                        cast(ColumnElement[bool], Project.human_key == project_key)
+                    )
+                )
+            ).scalars().first()
+            return project is None
+
+    assert result.exit_code == 0, result.output
+    assert "Filesystem warning" in result.output
+    assert "archive setup failed" in result.output
+    assert asyncio.run(project_was_deleted())
+
+
+def test_cli_hard_delete_project_preserves_foreign_staged_changes(isolated_env) -> None:
+    project_key = pkey("cli/delete-project-staged")
+    registration_token = "project-delete-token"
+    repo_root, project_root = _seed_hard_delete_cli_state(
+        project_key=project_key,
+        project_slug="cli-delete-project-staged",
+        agent_name="BlueLake",
+        registration_token=registration_token,
+    )
+    foreign_path = repo_root / "operator-note.txt"
+    foreign_path.write_text("keep staged\n", encoding="utf-8")
+    _git_output(repo_root, "add", "--", foreign_path.name)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "hard-delete-project",
+            project_key,
+            "--confirm",
+            "I UNDERSTAND",
+            "--token",
+            registration_token,
+        ],
+    )
+
+    committed_paths = _git_output(
+        repo_root,
+        "show",
+        "--format=",
+        "--name-only",
+        "HEAD",
+    ).splitlines()
+    assert result.exit_code == 0, result.output
+    assert not project_root.exists()
+    assert foreign_path.name not in committed_paths
+    assert any(path.startswith("projects/cli-delete-project-staged/") for path in committed_paths)
+    assert _git_output(repo_root, "diff", "--cached", "--name-only") == foreign_path.name
+
+
+@pytest.mark.parametrize("delete_kind", ["agent", "project"])
+def test_cli_hard_delete_holds_archive_lock_through_subtree_commit(
+    isolated_env,
+    monkeypatch: pytest.MonkeyPatch,
+    delete_kind: str,
+) -> None:
+    project_key = pkey(f"cli/delete-{delete_kind}-locked")
+    project_slug = f"cli-delete-{delete_kind}-locked"
+    registration_token = "delete-token"
+    _repo_root, _project_root = _seed_hard_delete_cli_state(
+        project_key=project_key,
+        project_slug=project_slug,
+        agent_name="BlueLake",
+        registration_token=registration_token,
+    )
+    original_commit = cli_module.commit_archive_subtree_deletion
+    observed_lock_paths: list[Path] = []
+
+    async def observe_lock(archive, tree_root, message):
+        assert archive.lock_path.is_file()
+        observed_lock_paths.append(archive.lock_path)
+        return await original_commit(archive, tree_root, message)
+
+    monkeypatch.setattr(cli_module, "commit_archive_subtree_deletion", observe_lock)
+    command = [
+        f"hard-delete-{delete_kind}",
+        project_key,
+    ]
+    if delete_kind == "agent":
+        command.append("BlueLake")
+    command.extend(
+        [
+            "--confirm",
+            "I UNDERSTAND",
+            "--token",
+            registration_token,
+        ]
+    )
+
+    result = CliRunner().invoke(app, command)
+
+    assert result.exit_code == 0, result.output
+    assert len(observed_lock_paths) == 1
+
+
+def test_cli_hard_delete_project_preserves_artifact_created_after_lock_release(
+    isolated_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_key = pkey("cli/delete-project-late-artifact")
+    project_slug = "cli-delete-project-late-artifact"
+    registration_token = "project-delete-token"
+    _repo_root, project_root = _seed_hard_delete_cli_state(
+        project_key=project_key,
+        project_slug=project_slug,
+        agent_name="BlueLake",
+        registration_token=registration_token,
+    )
+    original_lock = cli_module.archive_write_lock
+    late_artifact = project_root / "late-writer.txt"
+
+    @asynccontextmanager
+    async def inject_after_release(archive, *args, **kwargs):
+        async with original_lock(archive, *args, **kwargs):
+            yield
+        late_artifact.write_text("preserve me\n", encoding="utf-8")
+
+    monkeypatch.setattr(cli_module, "archive_write_lock", inject_after_release)
+    result = CliRunner().invoke(
+        app,
+        [
+            "hard-delete-project",
+            project_key,
+            "--confirm",
+            "I UNDERSTAND",
+            "--token",
+            registration_token,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Filesystem warning" in result.output
+    assert late_artifact.read_text(encoding="utf-8") == "preserve me\n"
 
 
 def test_archive_save_defaults_to_archive_preset(tmp_path, isolated_env, monkeypatch):

@@ -44,7 +44,15 @@ jobs:
         run: uv run ruff check --output-format=github
 
       - name: Ty Type Check
-        run: uvx ty check
+        # Same flags as ci.yml:68 and ci.yml:170, and the flags are the whole
+        # point. Bare `ty check` assumes the platform it runs on, and this job
+        # runs on ubuntu-latest, so every `if sys.platform == "win32"` branch in
+        # the tree is unreachable code it never analyses. Measured by
+        # claude-wsl-home-1 with a planted msvcrt error: bare `ty check` reports
+        # "All checks passed", `--python-platform all` reports the diagnostic.
+        # A release gate that cannot see the failures this project spent a week
+        # finding is worse than no gate, because it signs off on them.
+        run: uvx ty check --python-version 3.14 --python-platform all
 
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0

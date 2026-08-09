@@ -293,12 +293,15 @@ _hook_cmd() {
 
 # Migrate only hook commands previously managed by this installer.  Filter at
 # the inner command level so an operator's custom command sharing the same hook
-# group survives.  This removes both the old project-local .claude/hooks paths
-# and the current user-level marker before the canonical set is appended below.
+# group survives.  This removes the old direct-checkout scripts/hooks paths,
+# project-local .claude/hooks paths and the current user-level marker before the
+# canonical set is appended below.
 EXISTING_SETTINGS="$(printf '%s' "$EXISTING_SETTINGS" | jq '
   def agent_mail_command:
     ((.command? // "") | ascii_downcase | gsub("\\\\"; "/")) as $command |
-    ($command | contains("mcp-agent-mail/")) and
+    ($command |
+      contains("mcp-agent-mail/") or
+      contains("mcp_agent_mail/scripts/hooks/")) and
     ($command | test(
       "(?:session_start|inbox_check|reservations_warn|autoreserve|session_end)[.]sh"
     ));

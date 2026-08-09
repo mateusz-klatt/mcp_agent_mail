@@ -727,7 +727,15 @@ def test_claude_integrator_migrates_only_managed_hooks_in_temp_home(
                                 },
                                 {
                                     "type": "command",
+                                    "command": "/home/klattm/projects/mcp_agent_mail/scripts/hooks/session_start.sh || true",
+                                },
+                                {
+                                    "type": "command",
                                     "command": "bash /work/repo/.claude/hooks/session_start.sh || true",
+                                },
+                                {
+                                    "type": "command",
+                                    "command": "bash /work/foreign/scripts/hooks/session_start.sh || true",
                                 },
                                 {"type": "command", "command": "echo keep-foreign-hook"},
                             ],
@@ -740,6 +748,18 @@ def test_claude_integrator_migrates_only_managed_hooks_in_temp_home(
                                 {
                                     "type": "command",
                                     "command": "bash ~/.claude/hooks/mcp-agent-mail/inbox_check.sh || true",
+                                },
+                                {
+                                    "type": "command",
+                                    "command": "bash /mnt/d/projects/mcp_agent_mail/scripts/hooks/inbox_check.sh || true",
+                                },
+                                {
+                                    "type": "command",
+                                    "command": "bash C:\\projects\\mcp_agent_mail\\scripts\\hooks\\autoreserve.sh || true",
+                                },
+                                {
+                                    "type": "command",
+                                    "command": "bash /work/mcp_agent_mail/scripts/hooks/custom_hook.sh || true",
                                 }
                             ],
                         }
@@ -794,7 +814,12 @@ def test_claude_integrator_migrates_only_managed_hooks_in_temp_home(
     ]
     assert commands.count("echo keep-foreign-hook") == 1
     assert "/work/repo/.claude/hooks/mcp-agent-mail/session_start.sh" not in merged_text
+    assert "/home/klattm/projects/mcp_agent_mail/scripts/hooks/session_start.sh" not in merged_text
+    assert "/mnt/d/projects/mcp_agent_mail/scripts/hooks/inbox_check.sh" not in merged_text
+    assert "C:\\projects\\mcp_agent_mail\\scripts\\hooks\\autoreserve.sh" not in merged_text
     assert commands.count("bash /work/repo/.claude/hooks/session_start.sh || true") == 1
+    assert commands.count("bash /work/foreign/scripts/hooks/session_start.sh || true") == 1
+    assert commands.count("bash /work/mcp_agent_mail/scripts/hooks/custom_hook.sh || true") == 1
     assert "~/.claude/hooks/mcp-agent-mail/inbox_check.sh" not in merged_text
     assert sum("mcp-agent-mail/session_start.sh" in command for command in commands) == 1
     assert (home / ".claude" / "hooks" / "mcp-agent-mail" / "session_start.sh").is_file()

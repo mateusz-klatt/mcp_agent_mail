@@ -212,6 +212,7 @@ case "$1" in
   -u)
     case "$2" in
       'D:\Profiles\Copilot') printf '%s\n' "$FAKE_COPILOT_POSIX" ;;
+      'D:\Profiles\AppData\Roaming') printf '%s\n' '/mnt/d/Profiles/AppData/Roaming' ;;
       'D:\Portable Git\bin\bash.exe') printf '%s\n' "$FAKE_TARGET_BASH_POSIX" ;;
       *) printf '%s\n' "$2" ;;
     esac ;;
@@ -2706,6 +2707,133 @@ def test_copilot_native_windows_override_preserves_launcher_path() -> None:
     assert '_candidate="${AGENT_MAIL_GIT_BASH_PATH//\\\\//}"' in integrator
     assert '[a-zA-Z]:/*) _WINDOWS_BASH="$_candidate" ;;' in integrator
     assert '_candidate="$(cygpath -u "$AGENT_MAIL_GIT_BASH_PATH"' not in integrator
+
+
+def test_copilot_wsl_windows_profile_defaults_vscode_to_windows_appdata_without_writes(
+    tmp_path: Path,
+) -> None:
+    env, _, _, _ = _simulated_wsl_windows_copilot_env(
+        tmp_path,
+        include_target_jq=True,
+    )
+    env.pop("VSCODE_MCP_CONFIG_PATH")
+    env.pop("VSCODE_USER_DATA_DIR", None)
+    env["APPDATA"] = r"D:\Profiles\AppData\Roaming"
+    project = tmp_path / "project"
+    project.mkdir()
+    before = _tree_snapshot(tmp_path)
+
+    result = subprocess.run(
+        [
+            BASH,
+            _git_bash_path(INTEGRATORS["copilot"]),
+            "--yes",
+            "--dry-run",
+            "--project-dir",
+            _git_bash_path(project),
+        ],
+        cwd=ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    output = result.stdout + result.stderr
+    assert "/mnt/d/Profiles/AppData/Roaming/Code/User/mcp.json" in output
+    assert _git_bash_path(tmp_path / "home" / ".config" / "Code") not in output
+    assert "Copilot identity resolved by Windows hook runtime (client=copilot, slot=1)" in output
+    assert "copilot-wsl-" not in output
+    assert _tree_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize(
+    ("appdata", "expected_error"),
+    [
+        (None, "appdata is unavailable"),
+        ("/home/operator/.config", "appdata does not resolve to a windows drive"),
+    ],
+)
+def test_copilot_wsl_windows_profile_invalid_appdata_fails_before_mutation(
+    tmp_path: Path,
+    appdata: str | None,
+    expected_error: str,
+) -> None:
+    env, _, _, _ = _simulated_wsl_windows_copilot_env(
+        tmp_path,
+        include_target_jq=True,
+    )
+    env.pop("VSCODE_MCP_CONFIG_PATH")
+    env.pop("VSCODE_USER_DATA_DIR", None)
+    if appdata is None:
+        env.pop("APPDATA", None)
+    else:
+        env["APPDATA"] = appdata
+    project = tmp_path / "project"
+    project.mkdir()
+    before = _tree_snapshot(tmp_path)
+
+    result = subprocess.run(
+        [
+            BASH,
+            _git_bash_path(INTEGRATORS["copilot"]),
+            "--yes",
+            "--dry-run",
+            "--project-dir",
+            _git_bash_path(project),
+        ],
+        cwd=ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    output = result.stdout + result.stderr
+    assert expected_error in output.lower()
+    assert "VSCODE_MCP_CONFIG_PATH" in output
+    assert "copilot-wsl-" not in output
+    assert _tree_snapshot(tmp_path) == before
+
+
+def test_copilot_wsl_windows_profile_explicit_vscode_path_wins_without_appdata(
+    tmp_path: Path,
+) -> None:
+    env, _, _, _ = _simulated_wsl_windows_copilot_env(
+        tmp_path,
+        include_target_jq=True,
+    )
+    env.pop("VSCODE_USER_DATA_DIR", None)
+    env.pop("APPDATA", None)
+    explicit_vscode = env["VSCODE_MCP_CONFIG_PATH"]
+    project = tmp_path / "project"
+    project.mkdir()
+    before = _tree_snapshot(tmp_path)
+
+    result = subprocess.run(
+        [
+            BASH,
+            _git_bash_path(INTEGRATORS["copilot"]),
+            "--yes",
+            "--dry-run",
+            "--project-dir",
+            _git_bash_path(project),
+        ],
+        cwd=ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    output = result.stdout + result.stderr
+    assert explicit_vscode in output
+    assert "appdata is unavailable" not in output.lower()
+    assert "Copilot identity resolved by Windows hook runtime (client=copilot, slot=1)" in output
+    assert _tree_snapshot(tmp_path) == before
 
 
 def test_copilot_wsl_windows_profile_embeds_only_target_git_bash_tools(

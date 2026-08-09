@@ -82,7 +82,12 @@ echo "  - VS Code MCP: the platform's user mcp.json"
 echo "It never creates or modifies repository/workspace client configuration."
 echo
 _COPILOT_SLOT="$(integration_slot "${AGENT_MAIL_COPILOT_SLOT:-1}")"
-_AGENT="$(integration_agent_name "${_COPILOT_ID_CLIENT}" "${_COPILOT_SLOT}")"
+if [[ "$_COPILOT_WINDOWS_BACKED" == "1" ]]; then
+  _IDENTITY_DESCRIPTION="resolved by Windows hook runtime (client=${_COPILOT_ID_CLIENT}, slot=${_COPILOT_SLOT})"
+else
+  _AGENT="$(integration_agent_name "${_COPILOT_ID_CLIENT}" "${_COPILOT_SLOT}")"
+  _IDENTITY_DESCRIPTION="template: ${_AGENT}"
+fi
 if ! confirm "Proceed?"; then log_warn "Aborted."; exit 1; fi
 
 _URL="$(resolve_integration_mcp_url)" || {
@@ -94,14 +99,33 @@ _TOKEN="$(resolve_global_integration_bearer_token)" || {
   exit 1
 }
 log_ok "Using MCP endpoint: ${_URL}"
-log_ok "Copilot identity template: ${_AGENT}"
+log_ok "Copilot identity ${_IDENTITY_DESCRIPTION}"
 
 # Resolve every target and validate every existing JSON document before the
 # first write.  In particular, malformed user configuration is never replaced
 # with an empty object and --dry-run does not even create a parent directory.
 COPILOT_MCP_JSON="${COPILOT_DIR}/mcp-config.json"
 COPILOT_HOOKS_JSON="${COPILOT_DIR}/hooks/mcp-agent-mail.json"
-VSCODE_MCP_JSON="$(integration_vscode_user_mcp_path)" || exit 1
+if [[ -n "${VSCODE_MCP_CONFIG_PATH:-}" || -n "${VSCODE_USER_DATA_DIR:-}" ]]; then
+  VSCODE_MCP_JSON="$(integration_vscode_user_mcp_path)" || exit 1
+elif [[ "$_COPILOT_WINDOWS_BACKED" == "1" ]]; then
+  if [[ -z "${APPDATA:-}" ]]; then
+    log_err "COPILOT_HOME is shared with Windows, but APPDATA is unavailable in this shell."
+    log_err "Set VSCODE_MCP_CONFIG_PATH to the Windows VS Code user mcp.json and re-run."
+    exit 1
+  fi
+  _WINDOWS_APPDATA="$(_normalize_installer_user_path "$APPDATA")" || exit 1
+  case "$_WINDOWS_APPDATA" in
+    /mnt/[a-zA-Z]/*) ;;
+    *)
+      log_err "APPDATA does not resolve to a Windows drive from this shell: ${APPDATA}"
+      log_err "Set VSCODE_MCP_CONFIG_PATH to the Windows VS Code user mcp.json and re-run."
+      exit 1 ;;
+  esac
+  VSCODE_MCP_JSON="${_WINDOWS_APPDATA%/}/Code/User/mcp.json"
+else
+  VSCODE_MCP_JSON="$(integration_vscode_user_mcp_path)" || exit 1
+fi
 VSCODE_MCP_JSON="$(_normalize_installer_user_path "$VSCODE_MCP_JSON")" || exit 1
 HOOKS_DIR="${COPILOT_DIR}/hooks/mcp-agent-mail"
 HOOK_RUNTIME="${HOOKS_DIR}/agent_mail_hook.sh"
@@ -500,6 +524,6 @@ _print "Copilot CLI MCP config: ${COPILOT_MCP_JSON}"
 _print "Copilot CLI hook config: ${COPILOT_HOOKS_JSON}"
 _print "VS Code user MCP config: ${VSCODE_MCP_JSON}"
 _print "Authenticated server: ${_URL}"
-_print "Identity requested by Copilot CLI: ${_AGENT}"
+_print "Copilot identity ${_IDENTITY_DESCRIPTION}"
 _print "Restart Copilot CLI: user hook files are loaded only when the CLI starts."
 _print "Documentation: https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/use-hooks"

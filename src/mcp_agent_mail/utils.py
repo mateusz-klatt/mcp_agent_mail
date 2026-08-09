@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import importlib
+import os
 import random
 import re
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional, cast
 
 # Agent name word lists - used to generate memorable adjective+noun combinations
 # These lists are designed to provide a large namespace (62 x 69 = 4278 combinations)
@@ -287,6 +289,72 @@ def sanitize_agent_name(value: str) -> Optional[str]:
     if not cleaned:
         return None
     return cleaned[:128]
+
+
+def pid_is_alive(pid: int) -> bool:
+    """Report whether ``pid`` is a running process, without signalling it.
+
+    The single implementation for the whole package. It exists here, in a module
+    that imports nothing from the package, because there used to be two of these
+    under different names (``cli._pid_is_alive``, ``storage.AsyncFileLock._pid_alive``)
+    with different mechanisms and — the part that mattered — **opposite failure
+    policies**. Two properties are easy to get wrong and both were, in different
+    files:
+
+    **The probe must not send anything.** ``os.kill(pid, 0)`` is a pure query on
+    POSIX because signal 0 is defined to perform only the error checks. On
+    Windows ``0`` is ``CTRL_C_EVENT``, so the same line stops being an observer
+    and starts delivering Ctrl+C to a process group. That is why the Windows
+    branch goes through ``OpenProcess`` and never touches ``os.kill``.
+
+    **A failed probe is not evidence of death.** ``OpenProcess`` is refused for
+    any process owned by another user or running at higher integrity, and it
+    reports that refusal the same way it reports a genuine absence: no handle.
+    Only ``ERROR_INVALID_PARAMETER`` (87) actually means "no such process".
+    Reading anything else as a corpse means releasing a live process's lock,
+    which is a correctness failure and not a tidy one — the second holder is
+    told it acquired something.
+
+    Measured on this machine, unprivileged, against six protected processes
+    (``System``, ``smss``, ``csrss``, ``wininit``, ``services``, ``lsass``): a
+    raw ``OpenProcess`` handle check calls all six dead. This function calls all
+    six alive, and still calls PID 999999 dead, so the answer is not simply
+    "always alive".
+    """
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        winapi = cast(Any, importlib.import_module("_winapi"))
+        process_query_limited_information = 0x1000
+        try:
+            handle = winapi.OpenProcess(
+                process_query_limited_information,
+                False,
+                pid,
+            )
+        except OSError as exc:
+            # OpenProcess reports ERROR_INVALID_PARAMETER for a PID that no
+            # longer exists. Other failures (notably access denied) cannot
+            # prove that the process is dead, so preserve its lock.
+            return getattr(exc, "winerror", None) != 87
+        try:
+            try:
+                return bool(winapi.GetExitCodeProcess(handle) == winapi.STILL_ACTIVE)
+            except OSError:
+                # A failed status query is likewise not evidence of death.
+                return True
+        finally:
+            winapi.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # The process exists; we simply may not signal it.
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def validate_thread_id_format(thread_id: str) -> bool:

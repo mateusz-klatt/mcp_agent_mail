@@ -47,6 +47,7 @@ from PIL import Image
 from .config import Settings
 from .db import get_sqlite_pre_restore_path, get_sqlite_sidecar_paths
 from .utils import (
+    pid_is_alive,
     validate_agent_name_format,
     validate_client_platform_host_agent_id,
     validate_explicit_agent_id,
@@ -1295,46 +1296,27 @@ class AsyncFileLock:
 
     @staticmethod
     def _pid_alive(pid: int) -> bool:
-        """Check if a process with the given PID is alive (cross-platform)."""
-        if pid <= 0:
-            return False
+        """Check if a process with the given PID is alive (cross-platform).
 
-        # Try psutil first if available (most reliable cross-platform method)
-        try:
-            import psutil
-            return bool(psutil.pid_exists(pid))
-        except ImportError:
-            pass
+        Delegates rather than implementing. This used to be a second, independent
+        probe whose Windows branch read a NULL ``OpenProcess`` handle as proof of
+        death — but ``OpenProcess`` returns NULL for *access denied* exactly as it
+        does for a PID that never existed, so the branch called every protected
+        process a corpse. Measured on an unprivileged Windows session, it was
+        wrong on 6 of 6 (``System``, ``smss``, ``csrss``, ``wininit``,
+        ``services``, ``lsass``) while still correctly calling PID 999999 dead,
+        so the error was invisible to any check that only tried absent PIDs.
 
-        # Platform-specific fallbacks
-        if sys.platform == 'win32':
-            # Windows: Use ctypes to call OpenProcess
-            try:
-                import ctypes
-                kernel32 = ctypes.windll.kernel32
-                PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-                SYNCHRONIZE = 0x00100000
-                # Try to open the process with minimal permissions
-                handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, pid)
-                if handle:
-                    kernel32.CloseHandle(handle)
-                    return True
-                return False
-            except Exception:
-                # If ctypes fails, assume process doesn't exist
-                return False
-        else:
-            # Unix/Linux/macOS: Use os.kill(pid, 0)
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                return False
-            except PermissionError:
-                # Process exists but we don't have permission to signal it
-                return True
-            except OSError:
-                return False
-            return True
+        This is the lock path, so the consequence was not a slow answer but a
+        wrong one: a live holder's lock released and handed to a second caller
+        that is told it acquired something.
+
+        Worth naming rather than quietly deleting, because the knowledge was
+        already in this file — the POSIX branch carried a comment about the
+        platform difference — and the second copy was written without it. One
+        function with one failure policy is the only durable fix.
+        """
+        return pid_is_alive(pid)
 
 
 @asynccontextmanager

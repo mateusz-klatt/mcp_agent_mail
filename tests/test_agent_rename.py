@@ -23,7 +23,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.sql import ColumnElement
 from typer.testing import CliRunner
 
-from mcp_agent_mail import cli as cli_module, storage as storage_module
+from mcp_agent_mail import cli as cli_module, storage as storage_module, utils as utils_module
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.cli import app
 from mcp_agent_mail.config import clear_settings_cache, get_settings
@@ -1634,19 +1634,51 @@ def test_pid_is_alive_uses_non_signalling_windows_process_query(
     def record_kill(process_id: int, signal_number: int) -> None:
         kill_calls.append((process_id, signal_number))
 
-    monkeypatch.setattr(cli_module.os, "name", "nt")
-    monkeypatch.setattr(cli_module.os, "kill", record_kill)
-    monkeypatch.setattr(cli_module.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(utils_module.os, "name", "nt")
+    monkeypatch.setattr(utils_module.os, "kill", record_kill)
+    monkeypatch.setattr(utils_module.importlib, "import_module", fake_import_module)
 
-    assert cli_module._pid_is_alive(pid) is expected
-    assert open_calls == [(0x1000, False, pid)]
-    assert kill_calls == []
-    if open_winerror is not None:
-        assert query_calls == []
-        assert close_calls == []
-    else:
-        assert query_calls == [handle]
-        assert close_calls == [handle]
+    # Exercised through every entry point that ever had its own copy of this
+    # probe. Calling only one of them is what let the two drift apart: the CLI
+    # copy was covered by this test and correct, while the storage copy went
+    # uncovered and read access-denied as death.
+    for probe in (
+        utils_module.pid_is_alive,
+        cli_module._pid_is_alive,
+        storage_module.AsyncFileLock._pid_alive,
+    ):
+        open_calls.clear()
+        query_calls.clear()
+        close_calls.clear()
+        kill_calls.clear()
+
+        assert probe(pid) is expected
+        assert open_calls == [(0x1000, False, pid)]
+        assert kill_calls == []
+        if open_winerror is not None:
+            assert query_calls == []
+            assert close_calls == []
+        else:
+            assert query_calls == [handle]
+            assert close_calls == [handle]
+
+
+def test_pid_liveness_has_exactly_one_implementation() -> None:
+    """Pin the property that the parametrised test above can only sample.
+
+    ``open-denied`` proves the *current* callers agree today. This proves they
+    cannot disagree tomorrow without someone deliberately reintroducing a second
+    body, which is exactly how the first divergence happened: the knowledge that
+    ``OpenProcess`` fails identically for "denied" and "absent" lived in one file
+    and the second copy was written without it.
+    """
+    assert cli_module._pid_is_alive is utils_module.pid_is_alive
+    # The storage entry point keeps its own name for its callers, so it cannot be
+    # the same object. What it must not do is carry a second body: forwarding
+    # shows up as a call to ``pid_is_alive`` and nothing platform-specific.
+    storage_probe = storage_module.AsyncFileLock._pid_alive
+    assert "pid_is_alive" in storage_probe.__code__.co_names
+    assert "OpenProcess" not in storage_probe.__code__.co_names
 
 
 def test_migrate_agent_state_interoperable_lock_preserves_concurrent_insert(

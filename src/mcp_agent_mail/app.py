@@ -77,10 +77,12 @@ from .storage import (
     clear_notification_signal,
     clear_repo_cache,
     collect_lock_status,
+    commit_archive_path_deletions,
     commit_archive_subtree_deletion,
     delete_archive_tree_contents,
     emit_notification_signal,
     ensure_archive,
+    get_agent_reservation_archive_paths,
     get_identity_rename_tombstone,
     heal_archive_locks,
     process_attachments,
@@ -6702,6 +6704,8 @@ def build_mcp_server() -> FastMCP:
         )
 
         agent_id = agent.id
+        if agent_id is None:
+            raise ValueError("Agent must have an id before hard delete")
         project_id = project.id
         deleted_counts: dict[str, int] = {}
 
@@ -6793,25 +6797,36 @@ def build_mcp_server() -> FastMCP:
         files_removed = 0
         dirs_removed = 0
         fs_errors: list[str] = []
+        reservation_files_removed = 0
         try:
             settings = get_settings()
             archive = await ensure_archive(settings, project.slug)
             agent_dir = archive.root / "agents" / agent_name
             async with _archive_write_lock(archive):
+                reservation_paths = await get_agent_reservation_archive_paths(
+                    archive,
+                    agent_id,
+                    agent_name,
+                )
                 files_removed, dirs_removed = await asyncio.to_thread(
                     _delete_tree_with_counts,
                     agent_dir,
                 )
-                await commit_archive_subtree_deletion(
+                for reservation_path in reservation_paths:
+                    await asyncio.to_thread(reservation_path.unlink)
+                    files_removed += 1
+                    reservation_files_removed += 1
+                await commit_archive_path_deletions(
                     archive,
-                    agent_dir,
+                    [agent_dir, *reservation_paths],
                     f"hard_delete: agent {agent_name}",
                 )
         except Exception as exc:
-            fs_errors.append(f"Failed to remove and commit agent archive directory: {exc}")
+            fs_errors.append(f"Failed to remove and commit agent archive artifacts: {exc}")
 
         deleted_counts["archive_files_removed"] = files_removed
         deleted_counts["archive_dirs_removed"] = dirs_removed
+        deleted_counts["archive_reservation_files_removed"] = reservation_files_removed
 
         summary_parts = [
             f"Hard-deleted agent '{agent_name}' from project '{project.human_key}'.",

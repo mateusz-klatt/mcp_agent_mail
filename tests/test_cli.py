@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import shutil
@@ -181,6 +182,7 @@ def _seed_hard_delete_cli_state(
     project_slug: str,
     agent_name: str,
     registration_token: str,
+    agent_id: int | None = None,
 ) -> tuple[Path, Path]:
     async def _seed() -> tuple[Path, Path]:
         await ensure_schema()
@@ -192,6 +194,7 @@ def _seed_hard_delete_cli_state(
             assert project.id is not None
             session.add(
                 Agent(
+                    id=agent_id,
                     project_id=project.id,
                     name=agent_name,
                     program="codex",
@@ -673,15 +676,174 @@ def test_cli_list_projects_json_returns_structured_error_on_failure(monkeypatch)
 
 def test_cli_hard_delete_agent_commits_archive_deletion(isolated_env):
     project_key = pkey("cli/delete-agent")
+    project_slug = "cli-delete-agent"
     agent_name = "BlueLake"
     registration_token = "agent-delete-token"
     repo_root, project_root = _seed_hard_delete_cli_state(
         project_key=project_key,
-        project_slug="cli-delete-agent",
+        project_slug=project_slug,
         agent_name=agent_name,
         registration_token=registration_token,
+        agent_id=17,
     )
-    agent_relpath = f"projects/cli-delete-agent/agents/{agent_name}"
+    agent_relpath = f"projects/{project_slug}/agents/{agent_name}"
+
+    async def seed_reservations() -> tuple[
+        int,
+        int,
+        list[Path],
+        list[Path],
+        list[Path],
+    ]:
+        async with get_session() as session:
+            project_record = (
+                await session.execute(
+                    select(Project).where(
+                        cast(ColumnElement[bool], Project.human_key == project_key)
+                    )
+                )
+            ).scalars().one()
+            target_agent = (
+                await session.execute(
+                    select(Agent).where(
+                        cast(ColumnElement[bool], Agent.project_id == project_record.id),
+                        cast(ColumnElement[bool], Agent.name == agent_name),
+                    )
+                )
+            ).scalars().one()
+            assert project_record.id is not None
+            assert target_agent.id is not None
+            unrelated_agent = Agent(
+                project_id=project_record.id,
+                name="GreenCastle",
+                program="codex",
+                model="gpt-5",
+                task_description="unrelated hard-delete reservation",
+                registration_token="unrelated-token",
+            )
+            session.add(unrelated_agent)
+            await session.commit()
+            await session.refresh(unrelated_agent)
+            assert unrelated_agent.id is not None
+            expires_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=1)
+            reservations = [
+                FileReservation(
+                    project_id=project_record.id,
+                    agent_id=target_agent.id,
+                    path_pattern="src/target-a.py",
+                    expires_ts=expires_at,
+                ),
+                FileReservation(
+                    project_id=project_record.id,
+                    agent_id=target_agent.id,
+                    path_pattern="src/target-b.py",
+                    expires_ts=expires_at,
+                ),
+                FileReservation(
+                    project_id=project_record.id,
+                    agent_id=unrelated_agent.id,
+                    path_pattern="src/unrelated.py",
+                    expires_ts=expires_at,
+                ),
+            ]
+            session.add_all(reservations)
+            await session.commit()
+            for reservation in reservations:
+                await session.refresh(reservation)
+                assert reservation.id is not None
+
+        archive = await ensure_archive(get_settings(), project_slug)
+        reservations_dir = archive.root / "file_reservations"
+        reservations_dir.mkdir(parents=True, exist_ok=True)
+        target_artifacts: list[Path] = []
+        unrelated_artifacts: list[Path] = []
+        mismatched_artifacts: list[Path] = []
+        rel_paths: list[str] = []
+        for reservation in reservations:
+            payload = {
+                "id": reservation.id,
+                "agent": (
+                    agent_name
+                    if reservation.agent_id == target_agent.id
+                    else unrelated_agent.name
+                ),
+                "agent_id": reservation.agent_id,
+                "path_pattern": reservation.path_pattern,
+            }
+            digest = hashlib.sha1(
+                reservation.path_pattern.encode("utf-8"),
+                usedforsecurity=False,
+            ).hexdigest()
+            artifact_paths = [
+                reservations_dir / f"{digest}.json",
+                reservations_dir / f"id-{reservation.id}.json",
+            ]
+            for artifact_path in artifact_paths:
+                artifact_path.write_text(
+                    json.dumps(payload, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                rel_paths.append(artifact_path.relative_to(repo_root).as_posix())
+            if reservation.agent_id == target_agent.id:
+                target_artifacts.extend(artifact_paths)
+            else:
+                unrelated_artifacts.extend(artifact_paths)
+        legacy_target_artifact = reservations_dir / "legacy-target.json"
+        legacy_target_artifact.write_text(
+            json.dumps(
+                {
+                    "agent": agent_name,
+                    "path_pattern": "src/legacy-target.py",
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        target_artifacts.append(legacy_target_artifact)
+        rel_paths.append(legacy_target_artifact.relative_to(repo_root).as_posix())
+        for index, invalid_agent_id in enumerate((17.9, "17", True), start=1):
+            mismatched_artifact = reservations_dir / f"mismatched-agent-id-{index}.json"
+            mismatched_artifact.write_text(
+                json.dumps(
+                    {
+                        "agent": agent_name,
+                        "agent_id": invalid_agent_id,
+                        "path_pattern": f"src/mismatched-{index}.py",
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            mismatched_artifacts.append(mismatched_artifact)
+            rel_paths.append(mismatched_artifact.relative_to(repo_root).as_posix())
+        await _archive_commit(
+            archive.repo,
+            archive.settings,
+            "seed: hard-delete reservation artifacts",
+            rel_paths,
+            use_queue=False,
+        )
+        return (
+            target_agent.id,
+            unrelated_agent.id,
+            target_artifacts,
+            unrelated_artifacts,
+            mismatched_artifacts,
+        )
+
+    (
+        target_agent_id,
+        unrelated_agent_id,
+        target_artifacts,
+        unrelated_artifacts,
+        mismatched_artifacts,
+    ) = asyncio.run(seed_reservations())
+    assert target_agent_id == 17
+    foreign_path = repo_root / "operator-note.txt"
+    foreign_path.write_text("keep staged\n", encoding="utf-8")
+    _git_output(repo_root, "add", "--", foreign_path.name)
 
     result = CliRunner().invoke(
         app,
@@ -696,10 +858,70 @@ def test_cli_hard_delete_agent_commits_archive_deletion(isolated_env):
         ],
     )
 
+    async def load_reservations() -> tuple[
+        Agent | None,
+        list[FileReservation],
+        list[FileReservation],
+    ]:
+        async with get_session() as session:
+            deleted_agent = await session.get(Agent, target_agent_id)
+            target_rows = (
+                await session.execute(
+                    select(FileReservation).where(
+                        cast(
+                            ColumnElement[bool],
+                            FileReservation.agent_id == target_agent_id,
+                        )
+                    )
+                )
+            ).scalars().all()
+            unrelated_rows = (
+                await session.execute(
+                    select(FileReservation).where(
+                        cast(
+                            ColumnElement[bool],
+                            FileReservation.agent_id == unrelated_agent_id,
+                        )
+                    )
+                )
+            ).scalars().all()
+            return deleted_agent, list(target_rows), list(unrelated_rows)
+
+    deleted_agent, target_rows, unrelated_rows = asyncio.run(load_reservations())
+    committed_paths = _git_output(
+        repo_root,
+        "show",
+        "--format=",
+        "--name-only",
+        "HEAD",
+    ).splitlines()
+
     assert result.exit_code == 0, result.output
+    assert deleted_agent is None
+    assert target_rows == []
+    assert len(unrelated_rows) == 1
     assert not (project_root / "agents" / agent_name).exists()
+    assert all(not path.exists() for path in target_artifacts)
+    assert all(path.is_file() for path in unrelated_artifacts)
+    assert all(path.is_file() for path in mismatched_artifacts)
     assert _git_output(repo_root, "ls-files", "--", agent_relpath) == ""
-    assert _git_output(repo_root, "status", "--porcelain") == ""
+    assert foreign_path.name not in committed_paths
+    assert all(
+        path.relative_to(repo_root).as_posix() in committed_paths
+        for path in target_artifacts
+    )
+    assert all(
+        path.relative_to(repo_root).as_posix() not in committed_paths
+        for path in unrelated_artifacts
+    )
+    assert all(
+        path.relative_to(repo_root).as_posix() not in committed_paths
+        for path in mismatched_artifacts
+    )
+    assert _git_output(repo_root, "diff", "--cached", "--name-only") == foreign_path.name
+    assert _git_output(repo_root, "status", "--porcelain").splitlines() == [
+        f"A  {foreign_path.name}"
+    ]
 
 
 def test_cli_hard_delete_project_commits_archive_deletion(isolated_env):
@@ -831,15 +1053,20 @@ def test_cli_hard_delete_holds_archive_lock_through_subtree_commit(
         agent_name="BlueLake",
         registration_token=registration_token,
     )
-    original_commit = cli_module.commit_archive_subtree_deletion
+    if delete_kind == "agent":
+        original_commit = cli_module.commit_archive_path_deletions
+        commit_attribute = "commit_archive_path_deletions"
+    else:
+        original_commit = cli_module.commit_archive_subtree_deletion
+        commit_attribute = "commit_archive_subtree_deletion"
     observed_lock_paths: list[Path] = []
 
-    async def observe_lock(archive, tree_root, message):
+    async def observe_lock(archive, paths, message):
         assert archive.lock_path.is_file()
         observed_lock_paths.append(archive.lock_path)
-        return await original_commit(archive, tree_root, message)
+        return await original_commit(archive, paths, message)
 
-    monkeypatch.setattr(cli_module, "commit_archive_subtree_deletion", observe_lock)
+    monkeypatch.setattr(cli_module, commit_attribute, observe_lock)
     command = [
         f"hard-delete-{delete_kind}",
         project_key,

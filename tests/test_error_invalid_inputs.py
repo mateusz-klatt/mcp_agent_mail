@@ -24,6 +24,7 @@ Reference: mcp_agent_mail-mj0
 from __future__ import annotations
 
 import contextlib
+import json
 import subprocess
 
 import pytest
@@ -34,7 +35,7 @@ from sqlmodel import select
 from mcp_agent_mail import app as app_module
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import get_session
-from mcp_agent_mail.models import Agent, Project
+from mcp_agent_mail.models import Agent, FileReservation, Project
 from tests.keys import pkey
 
 
@@ -391,15 +392,17 @@ async def test_hard_delete_project_removes_archive_tree(isolated_env, tmp_path, 
 
 @pytest.mark.asyncio
 async def test_hard_delete_agent_removes_archive_tree(isolated_env, tmp_path, monkeypatch):
-    original_commit = app_module.commit_archive_subtree_deletion
+    original_commit = app_module.commit_archive_path_deletions
     commit_saw_lock = False
+    committed_paths = []
 
-    async def observe_lock(archive, tree_root, message):
+    async def observe_lock(archive, paths, message):
         nonlocal commit_saw_lock
         commit_saw_lock = archive.lock_path.is_file()
-        return await original_commit(archive, tree_root, message)
+        committed_paths.extend(paths)
+        return await original_commit(archive, paths, message)
 
-    monkeypatch.setattr(app_module, "commit_archive_subtree_deletion", observe_lock)
+    monkeypatch.setattr(app_module, "commit_archive_path_deletions", observe_lock)
     server = build_mcp_server()
     async with Client(server) as client:
         project_result = await client.call_tool("ensure_project", {"human_key": pkey("deletable/agent")})
@@ -407,16 +410,64 @@ async def test_hard_delete_agent_removes_archive_tree(isolated_env, tmp_path, mo
         slug = project_payload["slug"]
         agent_result = await client.call_tool(
             "register_agent",
-            {"project_key": pkey("deletable/agent"), "program": "test", "model": "test"},
+            {
+                "project_key": pkey("deletable/agent"),
+                "program": "test",
+                "model": "test",
+                "name": "BlueLake",
+            },
         )
         agent_name = agent_result.data["name"]
+        agent_id = agent_result.data["id"]
         registration_token = agent_result.data["registration_token"]
+        other_result = await client.call_tool(
+            "register_agent",
+            {
+                "project_key": pkey("deletable/agent"),
+                "program": "test",
+                "model": "test",
+                "name": "GreenCastle",
+            },
+        )
+        other_id = other_result.data["id"]
+        await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": pkey("deletable/agent"),
+                "agent_name": agent_name,
+                "paths": ["src/target-a.py", "src/target-b.py"],
+                "registration_token": registration_token,
+            },
+        )
+        await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": pkey("deletable/agent"),
+                "agent_name": other_result.data["name"],
+                "paths": ["src/unrelated.py"],
+                "registration_token": other_result.data["registration_token"],
+            },
+        )
 
         agent_archive_dir = tmp_path / "storage" / "projects" / slug / "agents" / agent_name
         agent_archive_dir.mkdir(parents=True, exist_ok=True)
         (agent_archive_dir / "dummy.txt").write_text("dummy archive content", encoding="utf-8")
         archive_repo_root = tmp_path / "storage"
         archive_relpath = f"projects/{slug}/agents/{agent_name}"
+        reservations_dir = tmp_path / "storage" / "projects" / slug / "file_reservations"
+        reservation_artifacts = list(reservations_dir.glob("*.json"))
+        target_artifacts = [
+            path
+            for path in reservation_artifacts
+            if json.loads(path.read_text(encoding="utf-8"))["agent_id"] == agent_id
+        ]
+        unrelated_artifacts = [
+            path
+            for path in reservation_artifacts
+            if json.loads(path.read_text(encoding="utf-8"))["agent_id"] == other_id
+        ]
+        assert len(target_artifacts) == 4
+        assert len(unrelated_artifacts) == 2
         head_before = _git(archive_repo_root, "rev-parse", "HEAD")
         assert _git(archive_repo_root, "ls-files", "--", archive_relpath)
 
@@ -430,11 +481,45 @@ async def test_hard_delete_agent_removes_archive_tree(isolated_env, tmp_path, mo
             },
         )
 
+    async with get_session() as session:
+        deleted_agent = await session.get(Agent, agent_id)
+        target_reservations = (
+            await session.execute(
+                select(FileReservation).where(FileReservation.agent_id == agent_id)
+            )
+        ).scalars().all()
+        unrelated_reservations = (
+            await session.execute(
+                select(FileReservation).where(FileReservation.agent_id == other_id)
+            )
+        ).scalars().all()
+
     assert result.data["status"] == "hard_deleted"
     assert result.data["deleted_counts"]["archive_files_removed"] >= 1
+    assert result.data["deleted_counts"]["archive_reservation_files_removed"] == 4
+    assert deleted_agent is None
+    assert target_reservations == []
+    assert len(unrelated_reservations) == 1
     assert not agent_archive_dir.exists()
+    assert all(not path.exists() for path in target_artifacts)
+    assert all(path.is_file() for path in unrelated_artifacts)
+    assert set(committed_paths) == {agent_archive_dir, *target_artifacts}
     assert _git(archive_repo_root, "rev-parse", "HEAD") != head_before
     assert _git(archive_repo_root, "ls-files", "--", archive_relpath) == ""
+    for path in target_artifacts:
+        assert _git(
+            archive_repo_root,
+            "ls-files",
+            "--",
+            path.relative_to(archive_repo_root).as_posix(),
+        ) == ""
+    for path in unrelated_artifacts:
+        assert _git(
+            archive_repo_root,
+            "ls-files",
+            "--",
+            path.relative_to(archive_repo_root).as_posix(),
+        )
     assert _git(archive_repo_root, "status", "--porcelain") == ""
     assert commit_saw_lock
 

@@ -101,9 +101,11 @@ from .share import (
 from .storage import (
     ProjectArchive,
     archive_write_lock,
+    commit_archive_path_deletions,
     commit_archive_subtree_deletion,
     delete_archive_tree_contents,
     ensure_archive,
+    get_agent_reservation_archive_paths,
     inspect_agent_archive_rename,
     migrate_agent_archive,
 )
@@ -4534,6 +4536,8 @@ def hard_delete_agent(
             raise ValueError("Invalid registration_token — only the agent's owner can hard-delete it")
 
         agent_id = agent.id
+        if agent_id is None:
+            raise ValueError("Agent must have an id before hard delete")
         project_id = proj.id
         deleted_counts: dict[str, int] = {}
 
@@ -4625,10 +4629,16 @@ def hard_delete_agent(
         files_removed = 0
         dirs_removed = 0
         fs_errors: list[str] = []
+        reservation_files_removed = 0
         try:
             archive = await ensure_archive(settings, proj.slug)
             agent_dir = archive.root / "agents" / agent_name
             async with archive_write_lock(archive):
+                reservation_paths = await get_agent_reservation_archive_paths(
+                    archive,
+                    agent_id,
+                    agent_name,
+                )
                 if agent_dir.exists():
                     for item in agent_dir.rglob("*"):
                         if item.is_file():
@@ -4636,9 +4646,13 @@ def hard_delete_agent(
                         elif item.is_dir():
                             dirs_removed += 1
                     shutil.rmtree(agent_dir)
-                await commit_archive_subtree_deletion(
+                for reservation_path in reservation_paths:
+                    reservation_path.unlink()
+                    files_removed += 1
+                    reservation_files_removed += 1
+                await commit_archive_path_deletions(
                     archive,
-                    agent_dir,
+                    [agent_dir, *reservation_paths],
                     f"hard_delete: agent {agent_name}",
                 )
         except Exception as exc:
@@ -4646,6 +4660,7 @@ def hard_delete_agent(
 
         deleted_counts["archive_files_removed"] = files_removed
         deleted_counts["archive_dirs_removed"] = dirs_removed
+        deleted_counts["archive_reservation_files_removed"] = reservation_files_removed
         return {"deleted_counts": deleted_counts, "fs_errors": fs_errors}
 
     try:

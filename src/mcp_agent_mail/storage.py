@@ -2043,9 +2043,19 @@ def _matching_rename_entry_sync(
 def _matching_agent_reservation_paths_sync(
     archive: ProjectArchive,
     agent_id: int,
+    agent_name: str | None = None,
 ) -> list[Path]:
-    """Validate every current reservation artifact before any rename mutation."""
+    """Validate reservation artifacts and return those owned by one agent."""
     matching: list[Path] = []
+    safe_legacy_name = (
+        agent_name
+        if agent_name is not None
+        and (
+            validate_explicit_agent_id(agent_name)
+            or validate_agent_name_format(agent_name)
+        )
+        else None
+    )
     reservations_root = archive.root / "file_reservations"
     if not reservations_root.is_dir():
         return matching
@@ -2064,15 +2074,36 @@ def _matching_agent_reservation_paths_sync(
                 f"File reservation artifact must contain an object: {reservation_path}"
             )
         reservation_agent_id = reservation.get("agent_id")
-        if isinstance(reservation_agent_id, bool):
-            continue
-        try:
-            matches_agent = int(cast(Any, reservation_agent_id)) == agent_id
-        except (TypeError, ValueError):
-            matches_agent = False
+        if reservation_agent_id is None:
+            recorded_name = reservation.get("agent")
+            matches_agent = (
+                safe_legacy_name is not None
+                and isinstance(recorded_name, str)
+                and recorded_name.casefold() == safe_legacy_name.casefold()
+            )
+        else:
+            matches_agent = (
+                isinstance(reservation_agent_id, int)
+                and not isinstance(reservation_agent_id, bool)
+                and reservation_agent_id == agent_id
+            )
         if matches_agent:
             matching.append(reservation_path)
     return matching
+
+
+async def get_agent_reservation_archive_paths(
+    archive: ProjectArchive,
+    agent_id: int,
+    agent_name: str,
+) -> list[Path]:
+    """Return exact reservation artifact paths owned by one persisted agent."""
+    return await _to_thread(
+        _matching_agent_reservation_paths_sync,
+        archive,
+        agent_id,
+        agent_name,
+    )
 
 
 def _inspect_agent_archive_rename_sync(
@@ -3045,40 +3076,49 @@ def _normalize_archive_text_line_endings(repo_root: Path, rel_paths: Sequence[st
             full_path.write_bytes(normalized)
 
 
-async def commit_archive_subtree_deletion(
+async def commit_archive_path_deletions(
     archive: ProjectArchive,
-    tree_root: Path,
+    paths: Sequence[Path],
     message: str,
 ) -> bool:
-    """Commit one deleted archive subtree without consuming foreign staged changes."""
+    """Commit exact deleted archive paths without consuming foreign staged changes."""
     archive_root = archive.root.resolve(strict=False)
-    resolved_tree_root = tree_root.resolve(strict=False)
-    try:
-        resolved_tree_root.relative_to(archive_root)
-        relative_root = resolved_tree_root.relative_to(
-            archive.repo_root.resolve(strict=False)
-        ).as_posix().rstrip("/")
-    except ValueError as exc:
-        raise ValueError(
-            "Archive deletion target must stay within the project archive"
-        ) from exc
-    if not relative_root:
-        raise ValueError("Archive deletion target must not be the repository root")
-    pathspec = f":(literal){relative_root}"
-    commit_lock_path = _commit_lock_path(archive.repo_root, [relative_root])
+    repo_root = archive.repo_root.resolve(strict=False)
+    relative_paths: list[str] = []
+    for path in paths:
+        resolved_path = path.resolve(strict=False)
+        try:
+            resolved_path.relative_to(archive_root)
+            relative_path = resolved_path.relative_to(repo_root).as_posix().rstrip("/")
+        except ValueError as exc:
+            raise ValueError(
+                "Archive deletion target must stay within the project archive"
+            ) from exc
+        if not relative_path:
+            raise ValueError("Archive deletion target must not be the repository root")
+        if relative_path not in relative_paths:
+            relative_paths.append(relative_path)
+    if not relative_paths:
+        return False
+    pathspecs = [f":(literal){relative_path}" for relative_path in relative_paths]
+    commit_lock_path = _commit_lock_path(archive.repo_root, relative_paths)
     await _to_thread(commit_lock_path.parent.mkdir, parents=True, exist_ok=True)
 
     def _commit_only() -> bool:
         repo = Repo(str(archive.repo_root))
         try:
-            tracked = repo.git.ls_tree(
-                "-r",
-                "--name-only",
-                "HEAD",
-                "--",
-                pathspec,
-            )
-            if not tracked.strip():
+            tracked_pathspecs = [
+                pathspec
+                for pathspec in pathspecs
+                if repo.git.ls_tree(
+                    "-r",
+                    "--name-only",
+                    "HEAD",
+                    "--",
+                    pathspec,
+                ).strip()
+            ]
+            if not tracked_pathspecs:
                 return False
             with repo.git.custom_environment(
                 GIT_AUTHOR_NAME=archive.settings.storage.git_author_name,
@@ -3096,7 +3136,7 @@ async def commit_archive_subtree_deletion(
                             "-m",
                             message,
                             "--",
-                            pathspec,
+                            *tracked_pathspecs,
                         )
                         break
                     except GitCommandError as exc:
@@ -3112,6 +3152,15 @@ async def commit_archive_subtree_deletion(
 
     async with AsyncFileLock(commit_lock_path):
         return await _to_thread(_commit_only)
+
+
+async def commit_archive_subtree_deletion(
+    archive: ProjectArchive,
+    tree_root: Path,
+    message: str,
+) -> bool:
+    """Commit one deleted archive subtree without consuming foreign staged changes."""
+    return await commit_archive_path_deletions(archive, [tree_root], message)
 
 
 async def _commit_direct(

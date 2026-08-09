@@ -1405,6 +1405,16 @@ def _tree_snapshot(root: Path) -> dict[str, bytes | None]:
         (
             "codex",
             "codex-profile/config.toml",
+            '["mcp\\u005fservers".foreign]\ncommand = "keep"\n',
+        ),
+        (
+            "codex",
+            "codex-profile/config.toml",
+            '[mcp_servers."fore\\u0069gn"]\ncommand = "keep"\n',
+        ),
+        (
+            "codex",
+            "codex-profile/config.toml",
             "[mcp_servers.mcp_agent_mail]\n"
             '"u\\u0072l" = "https://old.example/mcp/"\n',
         ),
@@ -1705,6 +1715,54 @@ def test_codex_rejects_directory_config_destinations_without_mutation(
     assert _tree_snapshot(tmp_path) == before
 
 
+def test_codex_dry_run_accepts_escaped_foreign_project_headers_without_mutation(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    fake_bin = tmp_path / "bin"
+    codex_dir = home / "codex-profile"
+    home.mkdir()
+    project.mkdir()
+    fake_bin.mkdir()
+    codex_dir.mkdir()
+    config_path = codex_dir / "config.toml"
+    config_path.write_text(
+        '[projects."C:\\\\Users\\\\mateu"]\ntrust_level = "trusted"\n'
+        '[projects."d:\\\\projects\\\\hestia"]\ntrust_level = "trusted"\n'
+        '[mcp_servers.mcp_agent_mail]\nurl = "https://old.example/mcp/"\n'
+        '[mcp_servers.mcp_agent_mail.http_headers]\n'
+        'Authorization = "Bearer old"\n',
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ,
+        **_integration_env(home, fake_bin),
+        "CODEX_HOME": _git_bash_path(codex_dir),
+    }
+    before = _tree_snapshot(tmp_path)
+
+    result = subprocess.run(
+        [
+            BASH,
+            _git_bash_path(INTEGRATORS["codex"]),
+            "--yes",
+            "--dry-run",
+            "--project-dir",
+            _git_bash_path(project),
+        ],
+        cwd=ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "test-bearer" not in result.stdout + result.stderr
+    assert _tree_snapshot(tmp_path) == before
+
+
 @pytest.mark.parametrize(
     ("existing_toml", "expected_notify"),
     [
@@ -1759,6 +1817,8 @@ def test_codex_rejects_directory_config_destinations_without_mutation(
         pytest.param(
             (
                 'notify = ["/usr/local/bin/foreign-notify"]\n\n'
+                '[projects."C:\\\\Users\\\\mateu"]\ntrust_level = "trusted"\n'
+                '[projects."d:\\\\projects\\\\hestia"]\ntrust_level = "trusted"\n\n'
                 '[mcp_servers.mcp_agent_mail]\nurl = "https://old.example/mcp/"\n\n'
                 '[mcp_servers.mcp_agent_mail.http_headers]\n'
                 'authorization = "Bearer lowercase"\n'
@@ -1848,6 +1908,11 @@ def test_codex_integrator_semantically_merges_all_supported_toml_shapes(
             '[foreign_agents.details]\nrank = 2\n'
         ) in rendered_config
         assert merged["foreign_settings"] == {"feature": {"enabled": True}}
+    if "projects" in merged:
+        assert merged["projects"] == {
+            r"C:\Users\mateu": {"trust_level": "trusted"},
+            r"d:\projects\hestia": {"trust_level": "trusted"},
+        }
 
 
 def test_codex_parser_is_isolated_from_the_callers_python_project(

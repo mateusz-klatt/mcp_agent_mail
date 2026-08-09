@@ -426,8 +426,10 @@ if ! UPDATED_USER_TOML="$(
     }
 
     function parse_key_path(value, parts,    length_value, index_value, quote,
-                            escaped, component, character, count) {
+                            escaped, component, component_had_escape,
+                            character, count) {
       split("", parts)
+      split("", key_path_component_escaped)
       key_path_had_escape = 0
       value = trim(value)
       length_value = length(value)
@@ -443,6 +445,7 @@ if ! UPDATED_USER_TOML="$(
         }
         quote = substr(value, index_value, 1)
         component = ""
+        component_had_escape = 0
         if (quote == "\"" || quote == "\047") {
           index_value++
           escaped = 0
@@ -453,6 +456,7 @@ if ! UPDATED_USER_TOML="$(
               escaped = 0
             } else if (quote == "\"" && character == "\\") {
               key_path_had_escape = 1
+              component_had_escape = 1
               escaped = 1
             } else if (character == quote) {
               break
@@ -480,6 +484,7 @@ if ! UPDATED_USER_TOML="$(
         }
         count++
         parts[count] = component
+        key_path_component_escaped[count] = component_had_escape
         while (index_value <= length_value &&
                substr(value, index_value, 1) ~ /[ \t]/) {
           index_value++
@@ -517,10 +522,24 @@ if ! UPDATED_USER_TOML="$(
 
     function set_current_table(parts, count,    item_number) {
       split("", current_table_parts)
+      split("", current_table_component_escaped)
       current_table_count = count
       for (item_number = 1; item_number <= count; item_number++) {
         current_table_parts[item_number] = parts[item_number]
+        current_table_component_escaped[item_number] = key_path_component_escaped[item_number]
       }
+    }
+
+    function escaped_table_path_is_foreign(parts) {
+      return !key_path_component_escaped[1] && parts[1] != "mcp_servers"
+    }
+
+    function escaped_assignment_path_is_foreign(parts) {
+      if (current_table_count > 0) {
+        return !current_table_component_escaped[1] &&
+               current_table_parts[1] != "mcp_servers"
+      }
+      return !key_path_component_escaped[1] && parts[1] != "mcp_servers"
     }
 
     function find_active_array_parent(parts, count,    prefix_count,
@@ -780,6 +799,7 @@ if ! UPDATED_USER_TOML="$(
       split("", scope_value_path_seen)
       split("", active_array_instance)
       split("", current_table_parts)
+      split("", current_table_component_escaped)
       current_table_count = 0
       current_table_is_array = 0
       current_scope = "root"
@@ -795,8 +815,8 @@ if ! UPDATED_USER_TOML="$(
             fail("unsupported or malformed TOML table header")
             continue
           }
-          if (key_path_had_escape) {
-            fail("escaped TOML table keys are unsupported")
+          if (key_path_had_escape && !escaped_table_path_is_foreign(header_parts)) {
+            fail("escaped TOML table keys require an unescaped foreign root")
             continue
           }
           identifier = path_id(header_parts, count)
@@ -875,8 +895,8 @@ if ! UPDATED_USER_TOML="$(
           fail("unsupported or malformed TOML assignment")
           continue
         }
-        if (key_path_had_escape) {
-          fail("escaped TOML assignment keys are unsupported")
+        if (key_path_had_escape && !escaped_assignment_path_is_foreign(key_parts)) {
+          fail("escaped TOML assignment keys require an unescaped foreign root")
           continue
         }
         if (current_section == "root" && key_parts[1] == "mcp_servers") {

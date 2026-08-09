@@ -13,8 +13,12 @@ from __future__ import annotations
 
 import pytest
 from fastmcp import Client
+from fastmcp.exceptions import ToolError
+from sqlmodel import select
 
 from mcp_agent_mail.app import build_mcp_server
+from mcp_agent_mail.db import get_session
+from mcp_agent_mail.models import Agent
 from mcp_agent_mail.utils import (
     ADJECTIVES,
     NOUNS,
@@ -749,6 +753,89 @@ async def test_send_message_with_valid_agents(isolated_env):
 
         assert result.data["count"] == 1
         assert len(result.data["deliveries"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_send_message_preserves_canonical_recipient_for_to_cc_and_bcc(isolated_env):
+    """Canonical client identities route through every recipient field."""
+    project_key = pkey("test/canonical-recipient")
+    sender_name = "codex-linux-home-1"
+    recipient_name = "claude-linux-holzera-1"
+    missing_name = "claude-linux-missing-99"
+    server = build_mcp_server()
+
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": project_key})
+        await client.call_tool(
+            "register_agent",
+            {
+                "project_key": project_key,
+                "program": "codex",
+                "model": "gpt-5",
+                "name": sender_name,
+            },
+        )
+        recipient = await client.call_tool(
+            "register_agent",
+            {
+                "project_key": project_key,
+                "program": "claude",
+                "model": "claude-sonnet",
+                "name": recipient_name,
+            },
+        )
+        recipient_id = recipient.data["id"]
+        project_id = recipient.data["project_id"]
+
+        for field in ("to", "cc", "bcc"):
+            recipients = {"to": [], field: [recipient_name]}
+            result = await client.call_tool(
+                "send_message",
+                {
+                    "project_key": project_key,
+                    "sender_name": sender_name,
+                    **recipients,
+                    "subject": f"Canonical recipient via {field}",
+                    "body_md": "Regression coverage for canonical routing.",
+                },
+            )
+            assert result.data["count"] == 1
+
+        with pytest.raises(ToolError, match="not registered"):
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": project_key,
+                    "sender_name": sender_name,
+                    "to": [missing_name],
+                    "subject": "Unknown canonical recipient",
+                    "body_md": "This delivery must still fail at recipient lookup.",
+                },
+            )
+
+        with pytest.raises(ToolError, match="not found"):
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": project_key,
+                    "sender_name": missing_name,
+                    "to": [recipient_name],
+                    "subject": "Unknown canonical sender",
+                    "body_md": "This delivery must still fail at sender lookup.",
+                },
+            )
+
+    async with get_session() as session:
+        rows = (
+            await session.execute(
+                select(Agent).where(
+                    Agent.project_id == project_id,
+                    Agent.name == recipient_name,
+                )
+            )
+        ).scalars().all()
+
+    assert [agent.id for agent in rows] == [recipient_id]
 
 
 # ============================================================================

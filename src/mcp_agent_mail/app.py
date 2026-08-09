@@ -93,6 +93,7 @@ from .utils import (
     sanitize_agent_name,
     slugify,
     validate_agent_name_format,
+    validate_client_platform_host_agent_id,
     validate_explicit_agent_id,
     validate_thread_id_format,
 )
@@ -2779,6 +2780,8 @@ def _detect_agent_name_mistake(value: str) -> tuple[str, str] | None:
     Detect common mistakes when agents provide invalid agent names.
     Returns (mistake_type, helpful_message) or None if no obvious mistake detected.
     """
+    if validate_client_platform_host_agent_id(value):
+        return None
     if _looks_like_program_name(value):
         return (
             "PROGRAM_NAME_AS_AGENT",

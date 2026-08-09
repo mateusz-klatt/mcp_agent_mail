@@ -647,6 +647,16 @@ def _integration_env(home: Path, fake_bin: Path) -> dict[str, str]:
         "COPILOT_HOME": _git_bash_path(home / ".copilot"),
         "XDG_STATE_HOME": _git_bash_path(home / ".state"),
         "XDG_CONFIG_HOME": _git_bash_path(home / ".config"),
+        # VS Code's user mcp.json is located through APPDATA on Windows, and this
+        # helper used to leave it inherited. On a fresh runner that is harmless
+        # because nothing lives there; on a developer's Windows machine the
+        # installer reached the real %APPDATA%\Code\User\mcp.json, refused to
+        # overwrite it — correctly — and failed the integration, and the test
+        # with it. The refusal is the safety gate working; the hole is that the
+        # test let the installer see the file at all. LOCALAPPDATA is pinned
+        # alongside it so the pair cannot drift.
+        "APPDATA": _git_bash_path(home / "appdata"),
+        "LOCALAPPDATA": _git_bash_path(home / "localappdata"),
         "INTEGRATION_MCP_URL": "https://hermes.example/mcp/",
         "INTEGRATION_BEARER_TOKEN": "test-bearer",
         "PATH": ":".join(

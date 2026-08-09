@@ -2506,6 +2506,84 @@ esac
     )
 
 
+def test_copilot_installed_wrapper_ignores_path_poisoned_system32_bash(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    fake_bin = tmp_path / "bin"
+    system32 = tmp_path / "Windows" / "System32"
+    copilot_dir = home / "copilot-profile"
+    for directory in (home, project, fake_bin, system32):
+        directory.mkdir(parents=True)
+    env = {
+        **os.environ,
+        **_integration_env(home, fake_bin),
+        "COPILOT_HOME": _git_bash_path(copilot_dir),
+    }
+
+    install = subprocess.run(
+        [
+            BASH,
+            _git_bash_path(INTEGRATORS["copilot"]),
+            "--yes",
+            "--project-dir",
+            _git_bash_path(project),
+        ],
+        cwd=ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert install.returncode == 0, install.stderr
+    installed_hooks = copilot_dir / "hooks" / "mcp-agent-mail"
+    installed_wrapper = installed_hooks / "hook_wrapper.sh"
+    installed_runtime = installed_hooks / "agent_mail_hook.sh"
+    wrapper_text = installed_wrapper.read_text(encoding="utf-8")
+    assert '_AM_HOOK_BASH="$(command -p -v bash)" || exit 1' in wrapper_text
+    assert 'exec "$_AM_HOOK_BASH" ' in wrapper_text
+    assert "exec bash " not in wrapper_text
+    assert 'exec "$BASH" ' not in wrapper_text
+    installed_runtime.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s|%s|%s' \"$AGENT_MAIL_HOOK_CLIENT\" "
+        "\"$AGENT_MAIL_HOOK_SLOT\" \"$1\"\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    poison_log = tmp_path / "poisoned-system32-bash.log"
+    poisoned_bash = system32 / "bash"
+    poisoned_bash.write_text(
+        "#!/bin/sh\n"
+        "printf invoked >\"$POISON_LOG\"\n"
+        "exit 97\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    poisoned_bash.chmod(0o700)
+    runtime_env = {
+        **env,
+        "BASH_ENV": "",
+        "PATH": f"{_git_bash_path(system32)}:{env['PATH']}",
+        "POISON_LOG": _git_bash_path(poison_log),
+    }
+
+    execution = subprocess.run(
+        [BASH, _git_bash_path(installed_wrapper), "session-start"],
+        cwd=ROOT,
+        env=runtime_env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert execution.returncode == 0, execution.stderr
+    assert execution.stdout == "copilot|1|session-start"
+    assert not poison_log.exists()
+
+
 def test_copilot_session_start_uses_direct_context_and_no_unactivated_network(
     tmp_path: Path,
 ) -> None:

@@ -364,7 +364,8 @@ case "\${1:-}" in
   session-end) export AGENT_MAIL_HOOK_TIMEOUT='2' ;;
   *) export AGENT_MAIL_HOOK_TIMEOUT='6' ;;
 esac
-exec bash ${_HOOK_RUNTIME_Q} "\$@"
+_AM_HOOK_BASH="\$(command -p -v bash)" || exit 1
+exec "\$_AM_HOOK_BASH" ${_HOOK_RUNTIME_Q} "\$@"
 SH
 set_secure_exec "$HOOK_RUNTIME" || exit 1
 set_secure_file "$HOOK_COMMON" || exit 1

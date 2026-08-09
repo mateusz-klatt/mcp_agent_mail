@@ -208,18 +208,34 @@ fi
 # server outage without blocking the user's edit; outside it, it absorbs the
 # hook not being runnable at all.
 _BASH_WRAP=""
+# Declared before the branch, not inside it: only the else-branch fills it, but
+# the diagnostic below reads it on both paths. An "only assigned on one branch"
+# variable read on the other is how this installer used to abort under `set -u`
+# after writing the operator's credentials and before installing any hook.
+_roots=()
 if [[ "${_OS}" == "windows" ]]; then
   command -v cygpath >/dev/null 2>&1 || {
     log_err "Windows detected but cygpath is unavailable."
     exit 1
   }
   if [[ -n "${AGENT_MAIL_GIT_BASH_PATH:-}" ]]; then
+    # A Windows path is kept in the form it was given. It used to be sent
+    # through cygpath -u and back through cygpath -m, and that round trip does
+    # not return what went in: MSYS mounts the Git install root at /, so
+    #
+    #   C:/Program Files/Git/bin/bash.exe  --cygpath -u-->  /bin/bash.exe
+    #   /bin/bash.exe                      --cygpath -m-->  C:/Program Files/Git/usr/bin/bash.exe
+    #
+    # and those are different binaries — 47 KB against 2.4 MB, the launcher that
+    # sets MSYSTEM=MINGW64 against the raw shell that does not. The POSIX view
+    # cannot express Git\bin at all, so it answers with the other one. The
+    # effect was that naming the correct shell explicitly got it silently
+    # swapped for the wrong one, in the escape hatch that exists for when
+    # detection fails. Bash tests C:/ paths directly, so nothing needs
+    # converting; only backslashes are normalised, for the JSON we emit.
     case "$AGENT_MAIL_GIT_BASH_PATH" in
       [a-zA-Z]:\\*|[a-zA-Z]:/*)
-        _c="$(cygpath -u "$AGENT_MAIL_GIT_BASH_PATH" 2>/dev/null)" || {
-          log_err "Could not normalize AGENT_MAIL_GIT_BASH_PATH."
-          exit 1
-        } ;;
+        _c="${AGENT_MAIL_GIT_BASH_PATH//\\//}" ;;
       /*) _c="$AGENT_MAIL_GIT_BASH_PATH" ;;
       *)
         log_err "AGENT_MAIL_GIT_BASH_PATH must be an absolute Windows or Git Bash path."
@@ -229,20 +245,94 @@ if [[ "${_OS}" == "windows" ]]; then
       log_err "AGENT_MAIL_GIT_BASH_PATH is not an executable Git Bash: ${AGENT_MAIL_GIT_BASH_PATH}"
       exit 1
     fi
-    _BASH_WRAP="$(cygpath -m "$_c" 2>/dev/null)" || {
-      log_err "Could not translate AGENT_MAIL_GIT_BASH_PATH for Windows."
-      exit 1
-    }
-  else
-    _current_bash="$(command -v bash 2>/dev/null || true)"
-    for _c in "$_current_bash" "/c/Program Files/Git/bin/bash.exe" "/c/Program Files (x86)/Git/bin/bash.exe"; do
-      if [[ -n "$_c" && -x "$_c" ]]; then
+    case "$_c" in
+      [a-zA-Z]:/*) _BASH_WRAP="$_c" ;;
+      *)
+        # A POSIX path has no Windows form to preserve, so converting is the
+        # only option here — including its ambiguity about /bin.
         _BASH_WRAP="$(cygpath -m "$_c" 2>/dev/null)" || {
-          log_err "Could not translate Git Bash for Windows."
+          log_err "Could not translate AGENT_MAIL_GIT_BASH_PATH for Windows."
           exit 1
-        }
-        break
-      fi
+        } ;;
+    esac
+  else
+    # Git for Windows ships TWO bash.exe and they are not interchangeable when
+    # the caller is Claude (cmd.exe), which is the only way these hooks ever
+    # run. Measured on this machine, same probe through each:
+    #
+    #   Git\bin\bash.exe        MSYSTEM=MINGW64  git=/mingw64/bin/git
+    #                                            curl=/mingw64/bin/curl
+    #   Git\usr\bin\bash.exe    MSYSTEM=         git=/cmd/git
+    #                                            curl=/c/WINDOWS/system32/curl
+    #
+    # `Git\bin\bash.exe` is the launcher that initialises the MSYS environment;
+    # `usr\bin\bash.exe` is the raw shell, and started from outside it comes up
+    # with no MSYSTEM and without /mingw64/bin on PATH. The hooks then resolve
+    # whatever Windows happens to have — system32's curl instead of Git's — so
+    # the failure is not "hook did not run" but "hook ran against different
+    # tools than it was written for", which is the harder kind to see.
+    #
+    # This matters because `command -v bash` picks the wrong one: run from
+    # inside Git Bash it answers /usr/bin/bash, so an installer that trusts it
+    # writes the raw shell into every hook command. Deriving from `git` instead
+    # walks the install root and finds bin/ before usr/bin/. `git` is a hard
+    # requirement of this script (require_cmd git above), so it is always there,
+    # and it locates Git for Windows wherever it was installed — scoop,
+    # chocolatey, portable, another drive — which the literals below cannot.
+    _git_bin="$(command -v git 2>/dev/null || true)"
+    _git_root=""
+    if [[ -n "$_git_bin" ]]; then
+      _git_root="$(cygpath -m "$_git_bin" 2>/dev/null || true)"
+    fi
+    # Ancestors of git.exe, SHALLOWEST FIRST. Depth is what separates the two
+    # binaries, and nothing else does: ordering by suffix cannot, because the
+    # suffix is relative to the root being tried. With git at Git/usr/bin the
+    # ancestor Git/usr plus bin/bash.exe *is* the raw shell, so "prefer bin over
+    # usr/bin" still selects it. The launcher lives one level higher, in the
+    # install root, so searching from the drive downwards reaches Git/bin first.
+    #
+    # Which layout a machine presents depends on whether the caller's PATH went
+    # through /etc/profile: a login shell answers Git/mingw64/bin/git, a plain
+    # `bash script.sh` answers Git/usr/bin/git. An order that only works for one
+    # of them flips on how the installer happened to be invoked.
+    while [[ -n "$_git_root" && "$_git_root" == */* ]]; do
+      _git_root="${_git_root%/*}"
+      _roots=("$_git_root" ${_roots[@]+"${_roots[@]}"})
+    done
+    # The literals stay as a last resort: they cost nothing and they cover a
+    # machine where `git` is a shim outside its own install tree.
+    _roots+=("/c/Program Files/Git" "/c/Program Files (x86)/Git")
+    # ${a[@]+"${a[@]}"} rather than "${a[@]}": an empty array is an unbound
+    # variable under `set -u` before Bash 4.4.
+    # Tested in the form it was built in. Converting to POSIX first looks more
+    # careful and is less reliable: `cygpath -u` on a path under the Git install
+    # root returns it relative to the MSYS mount table (C:/Program Files/Git/bin
+    # comes back as plain /bin), so the test stops asking about the file that was
+    # found and starts asking about the caller's mounts. Bash accepts the C:/
+    # form directly here; cygpath is used only to normalise the answer.
+    for _root in ${_roots[@]+"${_roots[@]}"}; do
+      for _suffix in bin/bash.exe usr/bin/bash.exe; do
+        _c="${_root}/${_suffix}"
+        [[ -x "$_c" ]] || continue
+        case "$_c" in
+          [a-zA-Z]:/*) _BASH_WRAP="$_c" ;;
+          *)
+            _BASH_WRAP="$(cygpath -m "$_c" 2>/dev/null)" || {
+              log_err "Could not translate Git Bash for Windows."
+              exit 1
+            } ;;
+        esac
+        break 2
+      done
+    done
+  fi
+  if [[ -n "${AGENT_MAIL_DEBUG_BASH_RESOLUTION:-}" ]]; then
+    printf 'DEBUG git=%s roots=%s wrap=%s\n' \
+      "${_git_bin:-<none>}" "${#_roots[@]}" "${_BASH_WRAP:-<none>}" >&2
+    for _r in ${_roots[@]+"${_roots[@]}"}; do
+      printf 'DEBUG root=%s bin=%s usrbin=%s\n' "$_r" \
+        "$([[ -x "$_r/bin/bash.exe" ]] && echo yes || echo no)" \
+        "$([[ -x "$_r/usr/bin/bash.exe" ]] && echo yes || echo no)" >&2
     done
   fi
   if [[ -z "${_BASH_WRAP}" ]]; then

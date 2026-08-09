@@ -49,12 +49,34 @@ INSTALLED_HOOK_SOURCES = (
 
 
 def _bash_executable() -> str:
+    """Locate the Git for Windows launcher, preferring ``bin`` over ``usr/bin``.
+
+    Git for Windows ships two different binaries with this name: ``Git\\bin\\bash.exe``
+    is a 47 KB launcher that sets ``MSYSTEM=MINGW64`` and puts ``/mingw64/bin`` on
+    PATH, and ``Git\\usr\\bin\\bash.exe`` is the 2.4 MB shell itself, which comes up
+    with neither. Starting the second one from outside MSYS gets a shell that
+    resolves ``curl`` to ``C:\\Windows\\System32\\curl.exe`` instead of Git's, so it
+    is not a slower path to the same place.
+
+    Ancestors are walked **shallowest first**, which is what actually separates
+    the two. Ordering by suffix does not, because the suffix is relative to the
+    root: with ``git`` at ``Git/usr/bin/git.exe`` the ancestor ``Git/usr`` plus
+    ``bin/bash.exe`` *is* the raw shell, so "prefer bin over usr/bin" still picks
+    it. Only depth distinguishes them — the launcher lives one level up, in the
+    install root, and the install root is the shallower ancestor.
+
+    Which layout a machine presents depends on whether the caller's PATH went
+    through ``/etc/profile``: a login shell resolves ``git`` to
+    ``Git/mingw64/bin/git.exe``, a plain ``bash script.sh`` to
+    ``Git/usr/bin/git.exe``. An order that only works for one of them is a
+    preference that flips on how the installer was invoked.
+    """
     discovered = shutil.which("bash")
     if os.name != "nt":
         return discovered or "bash"
     git = shutil.which("git")
     if git:
-        for git_root in Path(git).resolve().parents:
+        for git_root in reversed(Path(git).resolve().parents):
             for candidate in (
                 git_root / "bin" / "bash.exe",
                 git_root / "usr" / "bin" / "bash.exe",
@@ -90,6 +112,42 @@ def test_bash_executable_finds_git_root_above_mingw64(
     monkeypatch.setattr(shutil, "which", fake_which)
 
     assert _bash_executable() == str(bash)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Git layout")
+def test_bash_executable_prefers_launcher_when_git_sits_in_usr_bin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The layout that a per-root search order gets wrong.
+
+    ``git`` resolves to ``Git/usr/bin/git.exe`` whenever the caller's PATH did not
+    go through ``/etc/profile`` — a plain ``bash script.sh`` rather than a login
+    shell, which is how an installer is normally invoked. Searching both suffixes
+    per root then reaches ``Git/usr/bin/bash.exe`` one level before ``Git/bin``
+    and returns the raw shell. Both files exist here, so a helper that only
+    checks ``.name == "bash.exe"`` cannot tell the two answers apart.
+    """
+    git_root = tmp_path / "Git"
+    git = git_root / "usr" / "bin" / "git.exe"
+    launcher = git_root / "bin" / "bash.exe"
+    raw_shell = git_root / "usr" / "bin" / "bash.exe"
+    git.parent.mkdir(parents=True)
+    launcher.parent.mkdir(parents=True)
+    git.write_bytes(b"")
+    launcher.write_bytes(b"")
+    raw_shell.write_bytes(b"")
+
+    def fake_which(executable: str) -> str | None:
+        if executable == "git":
+            return str(git)
+        if executable == "bash":
+            return str(raw_shell)
+        return None
+
+    monkeypatch.setattr(shutil, "which", fake_which)
+
+    assert _bash_executable() == str(launcher)
 
 
 def _git_bash_path(path: str | Path) -> str:

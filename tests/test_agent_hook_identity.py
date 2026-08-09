@@ -1335,6 +1335,90 @@ def test_codex_and_copilot_integrators_write_only_temp_user_config(
         assert not forbidden.exists()
 
 
+def test_codex_wrapper_resolves_runtime_from_its_git_bash_view(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    fake_bin = tmp_path / "bin"
+    codex_dir = home / "WSL mounted Codex profile"
+    home.mkdir()
+    project.mkdir()
+    fake_bin.mkdir()
+
+    env = {
+        **os.environ,
+        **_integration_env(home, fake_bin),
+        "CODEX_HOME": _git_bash_path(codex_dir),
+    }
+    result = subprocess.run(
+        [
+            BASH,
+            _git_bash_path(INTEGRATORS["codex"]),
+            "--yes",
+            "--project-dir",
+            _git_bash_path(project),
+        ],
+        cwd=ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    installed_hooks = codex_dir / "hooks" / "mcp-agent-mail"
+    installed_wrapper = installed_hooks / "hook_wrapper.sh"
+    installed_runtime = installed_hooks / "agent_mail_hook.sh"
+    wrapper_text = installed_wrapper.read_text(encoding="utf-8")
+    assert _git_bash_path(installed_runtime) not in wrapper_text
+    assert "/mnt/c/" not in wrapper_text
+    assert 'exec bash "${_HOOK_DIR}/agent_mail_hook.sh" "$@"' in wrapper_text
+
+    installed_runtime.write_text(
+        "#!/usr/bin/env bash\nprintf 'wrong-runtime'\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    git_bash_hooks = (
+        tmp_path
+        / "Git Bash view"
+        / "c"
+        / "Users"
+        / "mateu"
+        / ".codex"
+        / "hooks"
+        / "mcp-agent-mail"
+    )
+    git_bash_hooks.mkdir(parents=True)
+    git_bash_wrapper = git_bash_hooks / "hook_wrapper.sh"
+    git_bash_wrapper.write_text(wrapper_text, encoding="utf-8", newline="\n")
+    git_bash_wrapper.chmod(0o700)
+    (git_bash_hooks / "agent_mail_hook.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s|%s|%s' \"$AGENT_MAIL_HOOK_CLIENT\" "
+        "\"$AGENT_MAIL_HOOK_SLOT\" \"$AGENT_MAIL_CODEX_SLOT\"\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    relocated = subprocess.run(
+        [BASH, _git_bash_path(git_bash_wrapper), "stop"],
+        env={
+            **env,
+            "AGENT_MAIL_HOOK_CLIENT": "copilot",
+            "AGENT_MAIL_HOOK_SLOT": "9",
+            "AGENT_MAIL_CODEX_SLOT": "8",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert relocated.returncode == 0, relocated.stderr
+    assert relocated.stdout == "codex|1|1"
+
+
 def _tree_snapshot(root: Path) -> dict[str, bytes | None]:
     return {
         str(path.relative_to(root)): None if path.is_dir() else path.read_bytes()
@@ -2621,6 +2705,283 @@ def test_auto_installer_continues_after_failure_then_exits_nonzero(
     assert "Failed integrations: Codex CLI" in combined
     # A failed client does not prevent the remaining integrations from running.
     assert vscode_mcp.is_file()
+
+
+def _install_wslpath_profile_mapper(
+    fake_bin: Path,
+    windows_codex_home: Path,
+) -> None:
+    fake_uname = fake_bin / "uname"
+    fake_uname.write_text(
+        "if [[ ${1:-} == -r ]]; then\n"
+        "  printf '%s\\n' '6.6.0-microsoft-standard-WSL2'\n"
+        "else\n"
+        "  printf '%s\\n' 'Linux'\n"
+        "fi\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    fake_uname.chmod(0o700)
+    mapper = fake_bin / "wslpath"
+    mapper.write_text(
+        "case $1:$2 in\n"
+        "  '-u:D:\\Profiles\\Codex')\n"
+        "    printf '%s\\n' \"$FAKE_WINDOWS_CODEX_HOME\" ;;\n"
+        "  -w:*bash.exe)\n"
+        "    printf '%s\\n' 'D:\\Portable Git\\bin\\bash.exe' ;;\n"
+        "  -w:*hook_wrapper.sh)\n"
+        "    printf '%s\\n' 'D:\\Profiles\\Codex\\hooks\\mcp-agent-mail\\hook_wrapper.sh' ;;\n"
+        "  *) exit 2 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    mapper.chmod(0o700)
+    assert windows_codex_home.is_absolute()
+
+
+def _install_fake_codex(executable: Path) -> None:
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    executable.write_text(
+        "#!/usr/bin/env bash\nexit 0\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    executable.chmod(0o700)
+
+
+def _install_isolated_shell_toolchain(fake_bin: Path) -> None:
+    commands = (
+        "awk",
+        "bash",
+        "cat",
+        "chmod",
+        "cp",
+        "curl",
+        "cut",
+        "date",
+        "dirname",
+        "git",
+        "grep",
+        "head",
+        "hostname",
+        "jq",
+        "mkdir",
+        "mktemp",
+        "mv",
+        "pwd",
+        "sed",
+        "sort",
+        "tail",
+        "tr",
+        "uname",
+        "wc",
+    )
+    for command in commands:
+        target = shutil.which(command)
+        assert target is not None, command
+        forwarder = fake_bin / command
+        forwarder.write_text(
+            f"exec {shlex.quote(_git_bash_path(target))} \"$@\"\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        forwarder.chmod(0o700)
+
+
+def _run_auto_installer(
+    env: dict[str, str],
+    project: Path,
+    *extra_arguments: str,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            BASH,
+            _git_bash_path(AUTO_INSTALLER),
+            "--yes",
+            *extra_arguments,
+            "--project-dir",
+            _git_bash_path(project),
+        ],
+        cwd=ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _managed_codex_commands(profile: Path) -> list[str]:
+    hooks = json.loads((profile / "hooks.json").read_text(encoding="utf-8"))
+    return [
+        handler["command"]
+        for groups in hooks["hooks"].values()
+        for group in groups
+        for handler in group["hooks"]
+        if "mcp-agent-mail" in handler.get("command", "")
+    ]
+
+
+def test_auto_installer_isolates_windows_desktop_and_native_wsl_codex_profiles(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    fake_bin = tmp_path / "bin"
+    windows_profile = tmp_path / "windows-profile"
+    native_profile = home / ".codex"
+    native_bin = tmp_path / "native-bin"
+    for directory in (home, project, fake_bin, windows_profile, native_profile):
+        directory.mkdir(parents=True)
+
+    (windows_profile / "config.toml").write_text(
+        'model_reasoning_effort = "ultra"\n',
+        encoding="utf-8",
+    )
+    (native_profile / "config.toml").write_text(
+        'model_reasoning_effort = "xhigh"\n',
+        encoding="utf-8",
+    )
+    windows_state = windows_profile / "state_5.sqlite"
+    native_state = native_profile / "state_5.sqlite"
+    windows_state.write_bytes(b"desktop-state")
+    native_state.write_bytes(b"native-state")
+    bundled_codex = windows_profile / "bin" / "wsl" / "build" / "codex"
+    native_codex = native_bin / "codex"
+    _install_fake_codex(bundled_codex)
+    _install_fake_codex(native_codex)
+    _install_wslpath_profile_mapper(fake_bin, windows_profile)
+    env = {
+        **os.environ,
+        **_integration_env(home, fake_bin),
+        "CODEX_HOME": r"D:\Profiles\Codex",
+        "FAKE_WINDOWS_CODEX_HOME": _git_bash_path(windows_profile),
+        "MSYS_NO_PATHCONV": "1",
+        "WSL_DISTRO_NAME": "Ubuntu",
+    }
+    env["PATH"] = ":".join(
+        (
+            _git_bash_path(bundled_codex.parent),
+            _git_bash_path(native_bin),
+            env["PATH"],
+        )
+    )
+
+    first = _run_auto_installer(env, project)
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert "Codex profiles: Windows/Desktop=" in first.stdout
+    assert first.stdout.count("-- Integrating Codex CLI (") == 2
+    windows_config = tomllib.loads(
+        (windows_profile / "config.toml").read_text(encoding="utf-8")
+    )
+    native_config = tomllib.loads(
+        (native_profile / "config.toml").read_text(encoding="utf-8")
+    )
+    assert windows_config["model_reasoning_effort"] == "ultra"
+    assert native_config["model_reasoning_effort"] == "xhigh"
+    for config in (windows_config, native_config):
+        assert config["mcp_servers"]["mcp_agent_mail"]["url"] == (
+            "https://hermes.example/mcp/"
+        )
+    windows_commands = _managed_codex_commands(windows_profile)
+    native_commands = _managed_codex_commands(native_profile)
+    assert len(windows_commands) == 3
+    assert len(native_commands) == 3
+    assert all(_git_bash_path(windows_profile) in item for item in windows_commands)
+    assert all(_git_bash_path(native_profile) in item for item in native_commands)
+    assert windows_state.read_bytes() == b"desktop-state"
+    assert native_state.read_bytes() == b"native-state"
+
+    before_rerun = {
+        "windows": _tree_snapshot(windows_profile),
+        "native": _tree_snapshot(native_profile),
+    }
+    second = _run_auto_installer(env, project)
+
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert _tree_snapshot(windows_profile) == before_rerun["windows"]
+    assert _tree_snapshot(native_profile) == before_rerun["native"]
+    assert len(_managed_codex_commands(windows_profile)) == 3
+    assert len(_managed_codex_commands(native_profile)) == 3
+
+    before_dry_run = _tree_snapshot(tmp_path)
+    dry_run = _run_auto_installer(env, project, "--dry-run")
+
+    assert dry_run.returncode == 0, dry_run.stdout + dry_run.stderr
+    assert "no files or directories were changed" in dry_run.stdout
+    assert _tree_snapshot(tmp_path) == before_dry_run
+
+
+def test_auto_installer_keeps_custom_native_codex_home_single_target(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    fake_bin = tmp_path / "bin"
+    custom_profile = Path("/home/agent-mail-test-custom-codex")
+    for directory in (home, project, fake_bin):
+        directory.mkdir(parents=True)
+    _install_fake_codex(fake_bin / "codex")
+    env = {
+        **os.environ,
+        **_integration_env(home, fake_bin),
+        "CODEX_HOME": str(custom_profile),
+        "WSL_DISTRO_NAME": "Ubuntu",
+    }
+    before = _tree_snapshot(tmp_path)
+
+    result = _run_auto_installer(env, project, "--dry-run")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.count("-- Integrating Codex CLI...") == 1
+    assert "Codex profiles: Windows/Desktop=" not in result.stdout
+    assert "merge Codex hooks into /home/agent-mail-test-custom-codex/hooks.json" in (
+        result.stdout
+    )
+    assert not (home / ".codex").exists()
+    assert _tree_snapshot(tmp_path) == before
+
+
+def test_auto_installer_keeps_windows_profile_single_without_native_wsl_codex(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    fake_bin = tmp_path / "bin"
+    windows_profile = tmp_path / "windows-profile"
+    for directory in (home, project, fake_bin, windows_profile):
+        directory.mkdir(parents=True)
+    (windows_profile / "config.toml").write_text(
+        'model_reasoning_effort = "ultra"\n',
+        encoding="utf-8",
+    )
+    bundled_codex = windows_profile / "bin" / "wsl" / "build" / "codex"
+    _install_fake_codex(bundled_codex)
+    base_env = _integration_env(home, fake_bin)
+    _install_isolated_shell_toolchain(fake_bin)
+    _install_wslpath_profile_mapper(fake_bin, windows_profile)
+    env = {
+        **os.environ,
+        **base_env,
+        "CODEX_HOME": r"D:\Profiles\Codex",
+        "FAKE_WINDOWS_CODEX_HOME": _git_bash_path(windows_profile),
+        "MSYS_NO_PATHCONV": "1",
+        "WSL_DISTRO_NAME": "Ubuntu",
+        "PATH": ":".join(
+            (_git_bash_path(bundled_codex.parent), _git_bash_path(fake_bin))
+        ),
+    }
+    before = _tree_snapshot(tmp_path)
+
+    result = _run_auto_installer(env, project, "--dry-run")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.count("-- Integrating Codex CLI...") == 1
+    assert "Codex profiles: Windows/Desktop=" not in result.stdout
+    assert _git_bash_path(windows_profile / "hooks.json") in result.stdout
+    assert _git_bash_path(home / ".codex" / "hooks.json") not in result.stdout
+    assert _tree_snapshot(tmp_path) == before
 
 
 @pytest.mark.parametrize(

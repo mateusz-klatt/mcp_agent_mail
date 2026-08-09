@@ -172,7 +172,6 @@ if [[ -f "$USER_HOOKS" ]]; then
   EXISTING_HOOKS="$(cat "$USER_HOOKS")"
 fi
 
-printf -v _HOOK_RUNTIME_Q '%q' "$HOOK_RUNTIME"
 # The heredoc is parsed inside $().  Parenthesized case labels keep macOS's
 # Bash 3.2 parser from consuming their ')' as the command-substitution close.
 CODEX_WRAPPER_CONTENT="$(cat <<SH
@@ -185,7 +184,8 @@ case "\${1:-}" in
   (session-end) export AGENT_MAIL_HOOK_TIMEOUT='2' ;;
   (*) export AGENT_MAIL_HOOK_TIMEOUT='6' ;;
 esac
-exec bash ${_HOOK_RUNTIME_Q} "\$@"
+_HOOK_DIR="\$(CDPATH= cd "\$(dirname "\$0")" && pwd -P)" || exit 1
+exec bash "\${_HOOK_DIR}/agent_mail_hook.sh" "\$@"
 SH
 )"
 if ! bash -n <<<"$CODEX_WRAPPER_CONTENT"; then

@@ -161,13 +161,15 @@ fi
 # task in flight yet, and this hook is already speaking. It cannot start the
 # watcher itself — a process spawned from a hook is not a task the agent's
 # runtime tracks, so its exit would wake nobody, and the exit IS the wake.
-watcher="$(dirname "$0")/inbox_watch.sh"
+watcher="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)/inbox_watch.sh"
 if [ -x "$watcher" ]; then
+    printf -v watcher_command '%q %q %q' \
+        "$watcher" claude "${AGENT_MAIL_CLAUDE_SLOT:-1}"
     summary="${summary}
 
 For instant delivery instead of polling, run this ONCE in the background now — it
 exits when mail arrives, and a background task that exits wakes you:
-    $(cd "$(dirname "$watcher")" && pwd)/$(basename "$watcher")"
+    ${watcher_command}"
 fi
 
 am_emit_context "SessionStart" "$summary"

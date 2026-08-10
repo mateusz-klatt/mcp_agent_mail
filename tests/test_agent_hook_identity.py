@@ -893,6 +893,7 @@ def _run_identity_sensitive_hook(
     target: Path,
     env: dict[str, str],
 ) -> subprocess.CompletedProcess[str]:
+    arguments = ["claude", "1"] if script_name == "inbox_watch.sh" else []
     payload = {
         "cwd": str(repo),
         "session_id": "identity-migration",
@@ -900,7 +901,11 @@ def _run_identity_sensitive_hook(
         "tool_input": {"file_path": str(target)},
     }
     return subprocess.run(
-        [BASH, _git_bash_path(ROOT / "scripts" / "hooks" / script_name)],
+        [
+            BASH,
+            _git_bash_path(ROOT / "scripts" / "hooks" / script_name),
+            *arguments,
+        ],
         cwd=repo,
         env=env,
         input=json.dumps(payload),
@@ -908,6 +913,249 @@ def _run_identity_sensitive_hook(
         capture_output=True,
         text=True,
     )
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        [],
+        ["codex"],
+        ["unsupported", "1"],
+        ["codex", "0"],
+        ["codex", "1", "extra"],
+    ],
+)
+def test_inbox_watch_requires_explicit_valid_client_and_slot_without_network(
+    tmp_path: Path,
+    arguments: list[str],
+) -> None:
+    home = tmp_path / "home"
+    state = tmp_path / "state"
+    fake_bin = tmp_path / "bin"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _install_fake_curl(
+        fake_bin,
+        "#!/usr/bin/env bash\nprintf called >> \"$FAKE_CURL_LOG\"\nexit 97\n",
+    )
+    env = _hook_env(home, state, fake_bin)
+    curl_log = tmp_path / "curl.log"
+    env["FAKE_CURL_LOG"] = _git_bash_path(curl_log)
+    before = _tree_snapshot(tmp_path)
+
+    result = subprocess.run(
+        [
+            BASH,
+            _git_bash_path(ROOT / "scripts" / "hooks" / "inbox_watch.sh"),
+            *arguments,
+        ],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert not curl_log.exists()
+    assert _tree_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_message"),
+    [
+        ("pending", "mail is already waiting"),
+        ("event", "new mail for {agent} (id 4242)"),
+        ("no-ready", "could not subscribe"),
+        ("cut", "event stream closed"),
+        ("timeout", "watch window elapsed"),
+    ],
+)
+def test_inbox_watch_uses_explicit_granted_identity_and_exact_rearm_command(
+    tmp_path: Path,
+    mode: str,
+    expected_message: str,
+) -> None:
+    home = tmp_path / "home"
+    state = tmp_path / "state"
+    fake_bin = tmp_path / "bin"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    (repo / ".agent-mail-project-id").write_text(
+        "project-id\n",
+        encoding="utf-8",
+    )
+    _install_fake_curl(
+        fake_bin,
+        """#!/usr/bin/env bash
+if [[ " $* " == *"/events?"* ]]; then
+  config="$(cat)"
+  printf '%s\n' "$config" > "$FAKE_STREAM_AUTH_LOG"
+  case "$FAKE_WATCH_MODE" in
+    no-ready) exit 0 ;;
+    cut) printf ': ready\n\n'; exit 0 ;;
+    timeout) printf ': ready\n\n'; sleep 1; exit 0 ;;
+    pending) printf ': ready\n\n'; sleep 30; exit 0 ;;
+    event) printf ': ready\n\ndata: {"id":4242}\n\n'; exit 0 ;;
+    *) exit 97 ;;
+  esac
+fi
+body="$(cat)"
+printf '%s\n' "$body" > "$FAKE_REQUEST_LOG"
+tool="$(printf '%s' "$body" | jq -r '.params.name // empty')"
+case "$tool:$FAKE_WATCH_MODE" in
+  fetch_inbox:pending) result='[{"id":9001}]' ;;
+  fetch_inbox:*) result='[]' ;;
+  *) result='{}' ;;
+esac
+envelope="$(jq -nc --arg text "$result" \
+  '{result:{content:[{type:"text",text:$text}],isError:false}}')"
+printf '%s\n200' "$envelope"
+""",
+    )
+    hook_dir = tmp_path / "hooks with space"
+    hook_dir.mkdir()
+    watcher = hook_dir / "inbox_watch.sh"
+    shutil.copy2(ROOT / "scripts" / "hooks" / "inbox_watch.sh", watcher)
+    shutil.copy2(HOOK_COMMON, hook_dir / "agent_mail_common.sh")
+    env = _hook_env(home, state, fake_bin)
+    grant = _bash(
+        f"""
+        source {shlex.quote(_git_bash_path(HOOK_COMMON))}
+        agent="$(am_agent_name codex 2)"
+        am_granted_name_put /owner/repo "$agent" codex 2
+        printf '%s' "$agent"
+        """,
+        env=env,
+    )
+    assert grant.returncode == 0, grant.stderr
+    agent_name = grant.stdout
+    (state / "credentials.json").write_text(
+        json.dumps(
+            {
+                "/owner/repo": {
+                    "claude-wsl-home-1": "claude-token",
+                    agent_name: "codex-token",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    stream_auth_log = tmp_path / "stream-auth.log"
+    request_log = tmp_path / "request.log"
+    env.update(
+        {
+            "AGENT_MAIL_WATCH_SECONDS": "1" if mode == "timeout" else "10",
+            "AGENT_MAIL_WATCH_READY_SECONDS": "1",
+            "FAKE_REQUEST_LOG": _git_bash_path(request_log),
+            "FAKE_STREAM_AUTH_LOG": _git_bash_path(stream_auth_log),
+            "FAKE_WATCH_MODE": mode,
+        }
+    )
+
+    result = subprocess.run(
+        [
+            BASH,
+            _git_bash_path(watcher),
+            "codex",
+            "2",
+        ],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert expected_message.format(agent=agent_name) in result.stdout
+    rearm = shlex.split(result.stdout.splitlines()[-1].strip())
+    assert rearm[0] == _git_bash_path(watcher.resolve())
+    assert rearm[1:] == ["codex", "2"]
+    stream_auth = stream_auth_log.read_text(encoding="utf-8")
+    assert "codex-token" in stream_auth
+    assert "claude-token" not in stream_auth
+    if mode == "no-ready":
+        assert not request_log.exists()
+    else:
+        request = json.loads(request_log.read_text(encoding="utf-8"))
+        assert request["params"]["arguments"]["agent_name"] == agent_name
+        assert request["params"]["arguments"]["registration_token"] == "codex-token"
+
+
+def test_claude_session_start_prints_slot_pinned_watcher_command(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    state = tmp_path / "state"
+    fake_bin = tmp_path / "bin"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    (repo / ".agent-mail-project-id").write_text(
+        "project-id\n",
+        encoding="utf-8",
+    )
+    _install_fake_curl(
+        fake_bin,
+        """#!/usr/bin/env bash
+if [[ " $* " == *"/mail/api/file-reservations"* ]]; then
+  cat >/dev/null
+  printf '{"reservations":[]}\n200'
+  exit 0
+fi
+body="$(cat)"
+tool="$(printf '%s' "$body" | jq -r '.params.name // empty')"
+case "$tool" in
+  register_agent)
+    name="$(printf '%s' "$body" | jq -r '.params.arguments.name')"
+    result="$(jq -nc --arg name "$name" '{name:$name,retired_at:null}')"
+    ;;
+  *) result='{}' ;;
+esac
+envelope="$(jq -nc --arg text "$result" \
+  '{result:{content:[{type:"text",text:$text}],isError:false}}')"
+printf '%s\n200' "$envelope"
+""",
+    )
+    env = _hook_env(home, state, fake_bin)
+    identity = _bash(
+        f"""
+        source {shlex.quote(_git_bash_path(HOOK_COMMON))}
+        am_agent_name claude 2
+        """,
+        env=env,
+    )
+    assert identity.returncode == 0, identity.stderr
+    agent_name = identity.stdout
+    _put_credential(state, agent_name, "claude-slot-two-token")
+    env["AGENT_MAIL_CLAUDE_SLOT"] = "2"
+    payload = {
+        "cwd": str(repo),
+        "session_id": "claude-watcher-slot-two",
+        "hook_event_name": "SessionStart",
+        "source": "startup",
+    }
+
+    result = subprocess.run(
+        [BASH, _git_bash_path(ROOT / "scripts" / "hooks" / "session_start.sh")],
+        cwd=repo,
+        env=env,
+        input=json.dumps(payload),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+    command_line = next(
+        line.strip() for line in context.splitlines() if "inbox_watch.sh" in line
+    )
+    watcher_command = shlex.split(command_line)
+    assert Path(watcher_command[0]).name == "inbox_watch.sh"
+    assert watcher_command[1:] == ["claude", "2"]
+    assert f"you are {agent_name} on /owner/repo" in context
 
 
 def test_claude_fresh_registration_without_token_persists_no_identity_state(

@@ -6,7 +6,7 @@
 # this script exiting *is* the wake. Nothing else needs to poll, and no monitor
 # runtime is required.
 #
-#     ./scripts/hooks/inbox_watch.sh        (run in background)
+#     ./scripts/hooks/inbox_watch.sh claude 1       (run in background)
 #
 # Order matters and is the whole reason this is not one curl in a command
 # substitution: subscribe, wait for `: ready`, and only THEN read the mailbox.
@@ -26,6 +26,13 @@
 set -uo pipefail
 # shellcheck source=/dev/null
 . "$(dirname "$0")/agent_mail_common.sh" 2>/dev/null || exit 0
+
+if [ "$#" -ne 2 ]; then
+    printf 'Agent Mail: inbox_watch.sh requires an explicit client and slot.\n' >&2
+    exit 0
+fi
+CLIENT="$(am_client "$1")" || exit 0
+SLOT="$(am_slot "$2")" || exit 0
 
 # How long to wait before giving up and exiting anyway. Exiting wakes the agent
 # for nothing, so this trades a cheap no-op turn against noticing sooner that
@@ -59,7 +66,8 @@ WATCH="${AGENT_MAIL_WATCH_SECONDS:-1800}"
 # chosen to avoid duplicating platform knowledge that `am_platform` already
 # holds — and avoiding a second copy of that knowledge is not the same as being
 # allowed to ignore it.
-SELF_CMD="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+SELF_PATH="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)/$(basename -- "$0")" || exit 0
+printf -v SELF_CMD '%q %q %q' "$SELF_PATH" "$CLIENT" "$SLOT"
 # How long to wait for `: ready` before giving up on the subscription.
 READY_WAIT="${AGENT_MAIL_WATCH_READY_SECONDS:-15}"
 
@@ -71,14 +79,14 @@ PROJECT="$(am_project_key)"
 # on Windows, so this is a doubled cost on every tool invocation there.
 export AM_PROJECT_FOR_NAME="$PROJECT"
 [ -z "$PROJECT" ] && exit 0
-am_project_is_active "$PROJECT" claude "${AGENT_MAIL_CLAUDE_SLOT:-1}" . || exit 0
-if migration_pair="$(am_identity_migration_pair "$PROJECT" claude "${AGENT_MAIL_CLAUDE_SLOT:-1}")"; then
+am_project_is_active "$PROJECT" "$CLIENT" "$SLOT" . || exit 0
+if migration_pair="$(am_identity_migration_pair "$PROJECT" "$CLIENT" "$SLOT")"; then
     legacy_agent="${migration_pair%%$'\t'*}"
     client_agent="${migration_pair#*$'\t'}"
     printf '%s\n' "$(am_identity_migration_message "$legacy_agent" "$client_agent")"
     exit 0
 fi
-AGENT="$(am_agent_name claude "${AGENT_MAIL_CLAUDE_SLOT:-1}")"
+AGENT="$(am_agent_name "$CLIENT" "$SLOT")"
 
 token="$(am_cred_get "$PROJECT" "$AGENT")"
 # No credential means SessionStart never ran, so there is no identity to
@@ -137,7 +145,8 @@ if [ "$ready" -ne 1 ]; then
     kill "$CURL_PID" 2>/dev/null
     wait "$CURL_PID" 2>/dev/null
     CURL_PID=""
-    printf 'Agent Mail: could not subscribe for %s (no stream opened). Check the server and credentials before relying on instant delivery.\n' "$AGENT"
+    printf 'Agent Mail: could not subscribe for %s (no stream opened). Check the server and credentials, then re-arm instant delivery by running this in the BACKGROUND:\n    %s\n' \
+        "$AGENT" "$SELF_CMD"
     exit 0
 fi
 
@@ -181,10 +190,10 @@ elif [ "$elapsed" -lt $(( WATCH - 5 )) ] 2>/dev/null; then
     # connection at its idle limit reports "no new mail" — a quiet period that
     # never occurred, and the exact shape of failure this layer keeps
     # producing.
-    printf 'Agent Mail: the event stream closed after %ss of a %ss window for %s — it was cut, not idle. This is NOT "no new mail": mail sent after the cut was not delivered here. Start the watcher again, and check the inbox directly if this keeps happening.\n' \
-        "$elapsed" "$WATCH" "$AGENT"
+    printf 'Agent Mail: the event stream closed after %ss of a %ss window for %s — it was cut, not idle. This is NOT "no new mail": mail sent after the cut was not delivered here. Check the inbox directly if this keeps happening, then re-arm instant delivery by running this in the BACKGROUND:\n    %s\n' \
+        "$elapsed" "$WATCH" "$AGENT" "$SELF_CMD"
 else
-    printf 'Agent Mail: watch window elapsed (%ss) with no new mail for %s. Start this watcher again in the background.\n' \
-        "$elapsed" "$AGENT"
+    printf 'Agent Mail: watch window elapsed (%ss) with no new mail for %s. Re-arm instant delivery by running this in the BACKGROUND:\n    %s\n' \
+        "$elapsed" "$AGENT" "$SELF_CMD"
 fi
 exit 0

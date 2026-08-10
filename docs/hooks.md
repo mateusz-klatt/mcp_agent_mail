@@ -18,23 +18,30 @@ agent about to edit a file somebody else is already in.
 | `reservations_warn.sh` | PreToolUse (Edit\|Write\|NotebookEdit) | somebody else holds the file you are opening |
 | `autoreserve.sh` | PostToolUse (same matcher) | never, on success |
 | `session_end.sh` | SessionEnd | never |
-| `inbox_watch.sh` | not a hook — a background task | it exits, which is the wake |
+| `inbox_watch.sh` | not a hook — a Claude background task | it exits, which is the Claude wake |
 
-`inbox_watch.sh` is run from the agent's own session as a background command.
-It blocks on a server-sent-events subscription and exits when mail arrives; a
-background task that exits re-invokes the agent, and `SessionStart` then runs
-`inbox_check.sh`, which delivers the message. Restart it after each wake — the
-line it prints says so. It deliberately does not read the mailbox: doing so
-would mark the ids announced and leave the background task as the sole carrier
-of a message the dedupe store already believes was delivered.
+`inbox_watch.sh <client> <slot>` binds the subscription to the identity
+established by that client's SessionStart; it never guesses between multiple
+identities on the same host. Today only Claude installs and advertises it,
+because Claude's tracked background task completion is the wake transport.
+Codex has no idle-turn wake for a completed terminal, while Copilot requires a
+separate `notification: shell_completed` bridge. Do not present the watcher as
+instant delivery on those clients until that bridge exists.
+
+Run the printed command from the same repository session. It blocks on a
+server-sent-events subscription and exits when mail arrives; Claude then runs
+`inbox_check.sh`, which delivers the message. Restart it after each wake using
+the exact client-and-slot command it prints. It deliberately does not read the
+mailbox: doing so would mark the ids announced and leave the background task as
+the sole carrier of a message the dedupe store already believes was delivered.
 
 ## Installing
 
-The integrator requires Bash, `jq`, `git`, and `curl`. Codex additionally uses
-`uv` to update its TOML without a lossy shell parser. On Windows, use Git for
-Windows Bash and install `jq` explicitly if `jq --version` is unavailable;
-Git Bash itself does not guarantee it. Verify `curl --version` and, for Codex,
-`uv --version` in that same shell before installing. The generated Codex
+The integrator requires Bash, `jq`, `git`, and `curl`; client installation and
+hook execution require no Python, `uv`, Node.js, or virtual environment. On
+Windows, use Git for Windows Bash and install `jq` explicitly if `jq --version`
+is unavailable; Git Bash itself does not guarantee it. Verify `curl --version`
+and `jq --version` in that same shell before installing. The generated Codex
 `commandWindows` also points directly to Git for Windows `bash.exe`.
 
 User scope, once per machine, in `~/.claude/settings.json`:
@@ -228,9 +235,9 @@ keeps the Windows desktop out of the WSL launcher while allowing the wrapper,
 once inside Git Bash, to invoke ordinary `bash`.
 
 Codex currently exposes lifecycle hooks, not Claude-style managed monitor
-processes. The integration therefore does not auto-spawn a daemon. For immediate
-mail delivery, start `inbox_watch.sh` explicitly as a background task; otherwise
-delivery occurs at the next lifecycle boundary.
+processes. The integration therefore does not auto-spawn a daemon. Mail is
+delivered at the next lifecycle boundary; a completed background terminal does
+not start a new Codex turn by itself.
 
 ## GitHub Copilot CLI lifecycle integration
 
@@ -265,7 +272,9 @@ normally a local no-op because this integration does not install autoreserve.
 
 Copilot CLI loads user hook files only at startup, so restart the CLI after
 installing or changing them. There is deliberately no automatically spawned
-watcher or daemon. The contracts are documented in GitHub's
+watcher or daemon. A future instant-delivery bridge must use Copilot's
+`notification` hook for `shell_completed`; watcher exit alone does not inject a
+new idle turn. The contracts are documented in GitHub's
 [hooks guide](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/use-hooks),
 [hooks reference](https://docs.github.com/en/copilot/reference/hooks-reference),
 and [CLI command reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference).

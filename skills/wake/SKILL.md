@@ -64,10 +64,16 @@ Confirm it actually started, then stop:
    cmp <the path in argv> <repo>/scripts/hooks/inbox_watch_monitor.sh
    ```
 
-   If they differ, the plugin is running an older snapshot. Bump `version` in
-   **both** manifests under `.claude-plugin/` and reinstall — an unchanged
-   version can be treated as nothing to do — or arm the monitor from the
-   repository path through the Monitor tool and skip the plugin copy entirely.
+   If they differ, the plugin is running an older snapshot. Refresh it with
+   **uninstall followed by install** — measured by `claude-win-home-1` to pull a
+   fresh snapshot at an unchanged `version` and move the recorded commit
+   forward. Do not reach for `plugin update`: at the same version it reports
+   "already at the latest version" and changes nothing, confirmed on two
+   machines. Bumping `version` in the manifests is *not* required, so an edit to
+   a plugin file does not drag two manifests with it.
+
+   Or skip the copy entirely and arm the monitor from the repository path
+   through the Monitor tool.
 
 Once armed, each new message wakes this session with a single line naming the
 message id. The hooks deliver the content as usual; the monitor only ends the

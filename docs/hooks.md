@@ -71,11 +71,25 @@ with no `.git`, measured on macOS and WSL alike. The commit that added
 `.claude-plugin/marketplace.json` claims a local install "points at the working
 tree itself"; that is wrong, and the drift it says has nowhere to happen simply
 moved: `integrate_claude_code.sh --yes` refreshes the copies under
-`~/.claude/hooks/`, but nothing refreshes the plugin cache except a reinstall,
-and an unchanged `version` can be treated as nothing to do. Which copy actually
-executes has differed between machines — on WSL both the skill and the monitor
-ran from the repository path while a cache copy existed in parallel — so read
-the path out of `pgrep -af inbox_watch_monitor` instead of assuming either.
+`~/.claude/hooks/`; the plugin cache needs `plugin uninstall` followed by
+`plugin install`. `plugin update` will not do it — at an unchanged `version` it
+answers "already at the latest version" and leaves the snapshot pinned to the
+commit it was installed from, measured on Windows and WSL. Reinstalling does
+not need a `version` bump.
+
+Which copy actually executes has differed between machines — on WSL both the
+skill and the monitor ran from the repository path while a stale cache copy sat
+beside them — so read the path out of `pgrep -af inbox_watch_monitor` instead
+of assuming either.
+
+On Windows the plugin cannot start the monitor at all: the declared command is
+a bare `.sh` with no interpreter, which the system hands to `git-bash.exe` — a
+window launcher, not a shell. Every hook avoids this because the installer
+wraps it in an absolute `bash.exe -c`. The obvious fix, prefixing `bash`, is
+the trap documented at the top of `inbox_watch.sh`: on Windows `bash` on PATH
+is the WSL launcher, which starts a different operating system and cannot see
+the drive the path refers to. So this needs the installer's Git Bash discovery,
+not a one-word change, and is open.
 
 A monitor that exits is never restarted for the life of the CLI process, and it
 is not restored when a session resumes. If the CLI restarts overnight, instant

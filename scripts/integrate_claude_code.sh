@@ -208,11 +208,12 @@ fi
 # server outage without blocking the user's edit; outside it, it absorbs the
 # hook not being runnable at all.
 _BASH_WRAP=""
-# Declared before the branch, not inside it: only the else-branch fills it, but
-# the diagnostic below reads it on both paths. An "only assigned on one branch"
+# Declared before the branch, not inside it: only the else-branch fills them, but
+# the diagnostic below reads them on both paths. An "only assigned on one branch"
 # variable read on the other is how this installer used to abort under `set -u`
 # after writing the operator's credentials and before installing any hook.
 _roots=()
+_fallback_roots=()
 if [[ "${_OS}" == "windows" ]]; then
   command -v cygpath >/dev/null 2>&1 || {
     log_err "Windows detected but cygpath is unavailable."
@@ -284,55 +285,98 @@ if [[ "${_OS}" == "windows" ]]; then
     if [[ -n "$_git_bin" ]]; then
       _git_root="$(cygpath -m "$_git_bin" 2>/dev/null || true)"
     fi
-    # Ancestors of git.exe, SHALLOWEST FIRST. Depth is what separates the two
-    # binaries, and nothing else does: ordering by suffix cannot, because the
-    # suffix is relative to the root being tried. With git at Git/usr/bin the
-    # ancestor Git/usr plus bin/bash.exe *is* the raw shell, so "prefer bin over
-    # usr/bin" still selects it. The launcher lives one level higher, in the
-    # install root, so searching from the drive downwards reaches Git/bin first.
-    #
-    # Which layout a machine presents depends on whether the caller's PATH went
-    # through /etc/profile: a login shell answers Git/mingw64/bin/git, a plain
-    # `bash script.sh` answers Git/usr/bin/git. An order that only works for one
-    # of them flips on how the installer happened to be invoked.
+    # Ancestors of git.exe, nearest first.
     while [[ -n "$_git_root" && "$_git_root" == */* ]]; do
       _git_root="${_git_root%/*}"
-      _roots=("$_git_root" ${_roots[@]+"${_roots[@]}"})
+      _roots+=("$_git_root")
     done
-    # The literals stay as a last resort: they cost nothing and they cover a
-    # machine where `git` is a shim outside its own install tree.
-    _roots+=("/c/Program Files/Git" "/c/Program Files (x86)/Git")
+    # The literals are a LAST resort and are kept in their own list, not appended
+    # to the discovered ones. Sharing a list makes them compete on equal terms:
+    # the default install satisfies any test the discovered root does, so a
+    # single ordered sweep can answer "C:\Program Files\Git" on a machine that
+    # runs a portable Git somewhere else entirely — silently, because that answer
+    # is a real working bash. Discovered roots are exhausted first, both passes,
+    # before a guess is allowed to win.
+    _fallback_roots=("/c/Program Files/Git" "/c/Program Files (x86)/Git")
     # ${a[@]+"${a[@]}"} rather than "${a[@]}": an empty array is an unbound
     # variable under `set -u` before Bash 4.4.
-    # Tested in the form it was built in. Converting to POSIX first looks more
-    # careful and is less reliable: `cygpath -u` on a path under the Git install
-    # root returns it relative to the MSYS mount table (C:/Program Files/Git/bin
-    # comes back as plain /bin), so the test stops asking about the file that was
-    # found and starts asking about the caller's mounts. Bash accepts the C:/
-    # form directly here; cygpath is used only to normalise the answer.
-    for _root in ${_roots[@]+"${_roots[@]}"}; do
-      for _suffix in bin/bash.exe usr/bin/bash.exe; do
-        _c="${_root}/${_suffix}"
-        [[ -x "$_c" ]] || continue
-        case "$_c" in
-          [a-zA-Z]:/*) _BASH_WRAP="$_c" ;;
-          *)
+    # Existence is tested in the form the candidate was built in — bash accepts
+    # C:/ paths directly — but the answer always goes through `cygpath -m`.
+    #
+    # Skipping that call for paths that already look like C:/... is tempting and
+    # wrong. It is a no-op on a mixed-form path, so it buys nothing, and it is
+    # the one place where the platform gets to say what this path is called on
+    # Windows. Removing it makes the installer assert a translation instead of
+    # asking for one, which is unobservable here and breaks anywhere the mapping
+    # is not identity — a portable Git reached through a subst'd or mapped
+    # drive, and the test harness that simulates exactly that.
+    #
+    # The `cygpath -u` round trip that this branch used to do IS still wrong and
+    # is not coming back: on a path under the Git install root, -u answers
+    # relative to the MSYS mount table (C:/Program Files/Git/bin comes back as
+    # plain /bin) and converting that back lands on Git\usr\bin — a different
+    # binary. Asking once, in one direction, is the whole fix.
+    #
+    # Two passes, and the first one is the point. Git for Windows ships BOTH
+    # bin/bash.exe (the 47 KB launcher that sets MSYSTEM=MINGW64) and
+    # usr/bin/bash.exe (the 2.4 MB shell, which comes up with neither MSYSTEM
+    # nor /mingw64/bin on PATH). Only the install root has both, so requiring
+    # both IDENTIFIES the root instead of guessing at it:
+    #
+    #   Git            bin/bash.exe yes   usr/bin/bash.exe yes   -> the root
+    #   Git/usr        bin/bash.exe yes   usr/bin/bash.exe no    -> the raw shell
+    #   some/ancestor  bin/bash.exe yes   usr/bin/bash.exe no    -> unrelated bash
+    #
+    # Both of those false positives are real. `Git/usr` appears whenever the
+    # caller's PATH did not go through /etc/profile, because `git` then resolves
+    # to Git/usr/bin/git rather than Git/mingw64/bin/git. The unrelated one
+    # appears whenever any ancestor directory of git.exe happens to contain
+    # bin/bash.exe — which is what ordering by depth alone gets wrong, in both
+    # directions: nearest-first walks into Git/usr, drive-first walks into the
+    # unrelated ancestor.
+    #
+    # The loose pass keeps an unusual install working (a tree with only one of
+    # the two), and runs nearest-first so it prefers the Git we actually found.
+    for _rootset in discovered fallback; do
+      if [[ "$_rootset" == discovered ]]; then
+        _candidate_roots=(${_roots[@]+"${_roots[@]}"})
+      else
+        _candidate_roots=(${_fallback_roots[@]+"${_fallback_roots[@]}"})
+      fi
+      for _pass in strict loose; do
+        for _root in ${_candidate_roots[@]+"${_candidate_roots[@]}"}; do
+          if [[ "$_pass" == strict ]]; then
+            [[ -x "${_root}/bin/bash.exe" && -x "${_root}/usr/bin/bash.exe" ]] || continue
+          fi
+          for _suffix in bin/bash.exe usr/bin/bash.exe; do
+            _c="${_root}/${_suffix}"
+            [[ -x "$_c" ]] || continue
             _BASH_WRAP="$(cygpath -m "$_c" 2>/dev/null)" || {
               log_err "Could not translate Git Bash for Windows."
               exit 1
-            } ;;
-        esac
-        break 2
+            }
+            break 4
+          done
+        done
       done
     done
   fi
+  # Diagnostic for the one decision on this platform that is invisible once
+  # made: which of the several bash.exe on the machine ends up in every hook
+  # command. Set AGENT_MAIL_DEBUG_BASH_RESOLUTION to 1 for stderr, or to an
+  # absolute path to append there instead — stderr is captured and truncated
+  # when the installer runs under a test harness, which is exactly when the
+  # answer matters most.
   if [[ -n "${AGENT_MAIL_DEBUG_BASH_RESOLUTION:-}" ]]; then
-    printf 'DEBUG git=%s roots=%s wrap=%s\n' \
-      "${_git_bin:-<none>}" "${#_roots[@]}" "${_BASH_WRAP:-<none>}" >&2
-    for _r in ${_roots[@]+"${_roots[@]}"}; do
-      printf 'DEBUG root=%s bin=%s usrbin=%s\n' "$_r" \
-        "$([[ -x "$_r/bin/bash.exe" ]] && echo yes || echo no)" \
-        "$([[ -x "$_r/usr/bin/bash.exe" ]] && echo yes || echo no)" >&2
+    _dbg() {
+      case "${AGENT_MAIL_DEBUG_BASH_RESOLUTION}" in
+        /*|[a-zA-Z]:/*) printf '%s\n' "$1" >> "${AGENT_MAIL_DEBUG_BASH_RESOLUTION}" ;;
+        *) printf '%s\n' "$1" >&2 ;;
+      esac
+    }
+    _dbg "DEBUG git=${_git_bin:-<none>} roots=${#_roots[@]} wrap=${_BASH_WRAP:-<none>}"
+    for _r in ${_roots[@]+"${_roots[@]}"} ${_fallback_roots[@]+"${_fallback_roots[@]}"}; do
+      _dbg "DEBUG root=$_r bin=$([[ -x "$_r/bin/bash.exe" ]] && echo yes || echo no) usrbin=$([[ -x "$_r/usr/bin/bash.exe" ]] && echo yes || echo no)"
     done
   fi
   if [[ -z "${_BASH_WRAP}" ]]; then

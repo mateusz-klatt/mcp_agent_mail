@@ -48,39 +48,114 @@ INSTALLED_HOOK_SOURCES = (
 )
 
 
+def _posix_tool_dirs() -> tuple[str, ...]:
+    """Return PATH entries that keep git and curl visible to a raw Git Bash.
+
+    A native Windows process commonly resolves ``git`` through
+    ``Git/cmd/git.exe`` or ``Git/bin/git.exe`` while Git's ``curl.exe`` lives in
+    ``Git/mingw64/bin``. Prefer a verified Git runtime containing both tools,
+    then retain the directories of the individually discovered executables.
+    """
+    resolved_tools: dict[str, Path] = {}
+    for command in ("git", "curl"):
+        executable = shutil.which(command)
+        if executable:
+            resolved_tools[command] = Path(executable).resolve()
+
+    candidates: list[Path] = []
+    git = resolved_tools.get("git")
+    if git is not None:
+        for root in git.parents:
+            runtime_found = False
+            for runtime_name in ("mingw64", "mingw32"):
+                runtime = root / runtime_name / "bin"
+                if all(
+                    any((runtime / name).is_file() for name in (tool, f"{tool}.exe"))
+                    for tool in ("git", "curl")
+                ):
+                    candidates.append(runtime)
+                    runtime_found = True
+                    break
+            if runtime_found:
+                break
+
+    candidates.extend(path.parent for path in resolved_tools.values())
+    entries: list[str] = []
+    for candidate in candidates:
+        entry = _git_bash_path(candidate)
+        if entry not in entries:
+            entries.append(entry)
+    return tuple(entries) or ("/usr/bin",)
+
+
+def test_posix_tool_dirs_include_windows_runtime_for_git_cmd_shim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    git_root = tmp_path / "Git"
+    cmd_git = git_root / "cmd" / "git.exe"
+    runtime = git_root / "mingw64" / "bin"
+    runtime_git = runtime / "git.exe"
+    runtime_curl = runtime / "curl.exe"
+    system_curl = tmp_path / "Windows" / "System32" / "curl.exe"
+    for executable in (cmd_git, runtime_git, runtime_curl, system_curl):
+        executable.parent.mkdir(parents=True, exist_ok=True)
+        executable.write_bytes(b"")
+
+    def fake_which(command: str) -> str | None:
+        return {
+            "git": str(cmd_git),
+            "curl": str(system_curl),
+        }.get(command)
+
+    monkeypatch.setattr(shutil, "which", fake_which)
+
+    entries = _posix_tool_dirs()
+
+    assert entries[0] == _git_bash_path(runtime)
+    assert _git_bash_path(cmd_git.parent) in entries
+    assert _git_bash_path(system_curl.parent) in entries
+
+
 def _bash_executable() -> str:
-    """Locate the Git for Windows launcher, preferring ``bin`` over ``usr/bin``.
+    """Locate the Git for Windows shell that runs an integrator under test.
 
-    Git for Windows ships two different binaries with this name: ``Git\\bin\\bash.exe``
-    is a 47 KB launcher that sets ``MSYSTEM=MINGW64`` and puts ``/mingw64/bin`` on
-    PATH, and ``Git\\usr\\bin\\bash.exe`` is the 2.4 MB shell itself, which comes up
-    with neither. Starting the second one from outside MSYS gets a shell that
-    resolves ``curl`` to ``C:\\Windows\\System32\\curl.exe`` instead of Git's, so it
-    is not a slower path to the same place.
+    Git for Windows ships two different binaries with this name and this helper
+    wants the one the *installers* must not use, which reads as a contradiction
+    until you see what each does to the environment:
 
-    Ancestors are walked **shallowest first**, which is what actually separates
-    the two. Ordering by suffix does not, because the suffix is relative to the
-    root: with ``git`` at ``Git/usr/bin/git.exe`` the ancestor ``Git/usr`` plus
-    ``bin/bash.exe`` *is* the raw shell, so "prefer bin over usr/bin" still picks
-    it. Only depth distinguishes them — the launcher lives one level up, in the
-    install root, and the install root is the shallower ancestor.
+    ``Git\\bin\\bash.exe`` is a 47 KB launcher. It re-initialises MSYS — sets
+    ``MSYSTEM=MINGW64`` and **rebuilds PATH**, putting ``/mingw64/bin`` and
+    ``/usr/bin`` in front of whatever it inherited. That is exactly right for a
+    hook command, which Claude hands to ``cmd.exe`` with no MSYS environment at
+    all, and exactly wrong here. Measured, same PATH handed to each:
 
-    Which layout a machine presents depends on whether the caller's PATH went
-    through ``/etc/profile``: a login shell resolves ``git`` to
-    ``Git/mingw64/bin/git.exe``, a plain ``bash script.sh`` to
-    ``Git/usr/bin/git.exe``. An order that only works for one of them is a
-    preference that flips on how the installer was invoked.
+        PATH=<fixture>/Portable Git/mingw64/bin:/usr/bin:/bin
+
+        Git\\bin\\bash.exe        PATH[0]=/mingw64/bin   git=/mingw64/bin/git
+        Git\\usr\\bin\\bash.exe    PATH[0]=<fixture>...   git=<fixture>.../git
+
+    Every Windows fixture in this module injects its fakes — ``git``, ``cygpath``,
+    ``uname``, ``jq`` — by putting a directory first on PATH. Under the launcher
+    that ordering is discarded before the script starts, so the installer sees the
+    real Git and the real cygpath, and the assertions compare against a simulation
+    that never ran. The failure is silent and looks like a resolver bug, because
+    the value that comes back is a genuine working path — just not the fixture's.
+
+    So: the installers pick the launcher (a hook must bring its own environment),
+    and the harness picks the raw shell (a test must keep the one it built).
+    ``usr/bin`` is therefore preferred here, and it is preferred per root before
+    falling back, since the raw shell is what makes the run reproducible.
     """
     discovered = shutil.which("bash")
     if os.name != "nt":
         return discovered or "bash"
     git = shutil.which("git")
     if git:
-        for git_root in reversed(Path(git).resolve().parents):
-            for candidate in (
-                git_root / "bin" / "bash.exe",
-                git_root / "usr" / "bin" / "bash.exe",
-            ):
+        roots = list(Path(git).resolve().parents)
+        for suffix in (("usr", "bin", "bash.exe"), ("bin", "bash.exe")):
+            for git_root in roots:
+                candidate = git_root.joinpath(*suffix)
                 if candidate.is_file():
                     return str(candidate)
     return discovered or "bash"
@@ -115,18 +190,21 @@ def test_bash_executable_finds_git_root_above_mingw64(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows Git layout")
-def test_bash_executable_prefers_launcher_when_git_sits_in_usr_bin(
+def test_bash_executable_prefers_raw_shell_when_both_exist(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The layout that a per-root search order gets wrong.
+    """The harness needs the shell that leaves its environment alone.
 
-    ``git`` resolves to ``Git/usr/bin/git.exe`` whenever the caller's PATH did not
-    go through ``/etc/profile`` — a plain ``bash script.sh`` rather than a login
-    shell, which is how an installer is normally invoked. Searching both suffixes
-    per root then reaches ``Git/usr/bin/bash.exe`` one level before ``Git/bin``
-    and returns the raw shell. Both files exist here, so a helper that only
-    checks ``.name == "bash.exe"`` cannot tell the two answers apart.
+    Both binaries exist in a real Git for Windows tree, and a helper that only
+    checks ``.name == "bash.exe"`` cannot tell the two answers apart — which is
+    how this preference got inverted once already without any test noticing.
+
+    ``Git/bin/bash.exe`` re-initialises MSYS and rebuilds PATH, discarding the
+    ordering every fixture in this module uses to inject its fakes. The
+    installers want exactly that (a hook starts from ``cmd.exe`` with no MSYS
+    environment); a test driving those installers wants the opposite, because
+    the PATH it constructed is the thing under test.
     """
     git_root = tmp_path / "Git"
     git = git_root / "usr" / "bin" / "git.exe"
@@ -147,7 +225,8 @@ def test_bash_executable_prefers_launcher_when_git_sits_in_usr_bin(
 
     monkeypatch.setattr(shutil, "which", fake_which)
 
-    assert _bash_executable() == str(launcher)
+    assert _bash_executable() == str(raw_shell)
+    assert _bash_executable() != str(launcher)
 
 
 def _git_bash_path(path: str | Path) -> str:
@@ -2506,12 +2585,20 @@ def test_claude_posix_hook_commands_quote_spaces_and_apostrophes(
         assert parsed[2].startswith(_git_bash_path(home / ".claude" / "hooks"))
 
 
-@pytest.mark.parametrize("client", ["claude", "codex"])
-@pytest.mark.parametrize("use_override", [False, True])
+@pytest.mark.parametrize(
+    ("client", "use_override", "debug_resolution"),
+    [
+        ("claude", False, False),
+        ("claude", True, True),
+        ("codex", False, False),
+        ("codex", True, False),
+    ],
+)
 def test_claude_and_codex_windows_hooks_support_current_and_explicit_git_bash(
     tmp_path: Path,
     client: str,
     use_override: bool,
+    debug_resolution: bool,
 ) -> None:
     home = tmp_path / "home"
     project = tmp_path / "project"
@@ -2519,6 +2606,7 @@ def test_claude_and_codex_windows_hooks_support_current_and_explicit_git_bash(
     git_root = tmp_path / "Portable Git"
     git_bin = git_root / "mingw64" / "bin"
     detected_bash = git_root / "bin" / "bash.exe"
+    raw_bash = git_root / "usr" / "bin" / "bash.exe"
     codex_dir = home / "codex-profile"
     agent_mail_env = home / "agent-mail.env"
     home.mkdir()
@@ -2526,6 +2614,7 @@ def test_claude_and_codex_windows_hooks_support_current_and_explicit_git_bash(
     fake_bin.mkdir()
     git_bin.mkdir(parents=True)
     detected_bash.parent.mkdir(parents=True)
+    raw_bash.parent.mkdir(parents=True)
     git_path = shutil.which("git")
     assert git_path is not None
     fake_git = _install_bash_command_forwarder(git_bin, "git", git_path)
@@ -2535,6 +2624,12 @@ def test_claude_and_codex_windows_hooks_support_current_and_explicit_git_bash(
         newline="\n",
     )
     detected_bash.chmod(0o700)
+    raw_bash.write_text(
+        "#!/bin/sh\nexit 0\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    raw_bash.chmod(0o700)
     portable_bash = fake_bin / "portable-git-bash"
     portable_bash.write_text(
         "#!/bin/sh\nexit 0\n",
@@ -2610,6 +2705,8 @@ esac
         )
     if use_override:
         env["AGENT_MAIL_GIT_BASH_PATH"] = _git_bash_path(portable_bash)
+    if debug_resolution:
+        env["AGENT_MAIL_DEBUG_BASH_RESOLUTION"] = "1"
 
     result = subprocess.run(
         [
@@ -2627,6 +2724,11 @@ esac
     )
 
     assert result.returncode == 0, result.stderr
+    if debug_resolution:
+        assert (
+            "DEBUG git=<none> roots=0 "
+            "wrap=D:\\Portable Git\\usr\\bin\\bash.exe"
+        ) in result.stderr
     assert agent_mail_env.is_file()
     assert not (ROOT / r"Q:\AgentMail\shared.env").exists()
     if client == "claude":
@@ -3156,6 +3258,14 @@ def test_copilot_wsl_windows_profile_embeds_only_target_git_bash_tools(
 
     execution = subprocess.run(
         [
+            # Run the simulated target shell *through* a real one. It is a
+            # shebang script that happens to be named bash.exe, which the POSIX
+            # loader honours and CreateProcess does not: naming it as argv[0] on
+            # Windows gets WinError 2 for the /c/... spelling and WinError 216
+            # ("not a valid Win32 application") for the native one, because the
+            # file is text. Passing it as an argument keeps $1.. identical to
+            # direct execution, so nothing about the simulation changes.
+            BASH,
             env["FAKE_TARGET_BASH_POSIX"],
             r"D:\Profiles\Copilot\hooks\mcp-agent-mail\hook_wrapper.sh",
             "session-start",
@@ -3356,6 +3466,14 @@ printf '%s\n200' "$envelope"
 
     execution = subprocess.run(
         [
+            # Run the simulated target shell *through* a real one. It is a
+            # shebang script that happens to be named bash.exe, which the POSIX
+            # loader honours and CreateProcess does not: naming it as argv[0] on
+            # Windows gets WinError 2 for the /c/... spelling and WinError 216
+            # ("not a valid Win32 application") for the native one, because the
+            # file is text. Passing it as an argument keeps $1.. identical to
+            # direct execution, so nothing about the simulation changes.
+            BASH,
             env["FAKE_TARGET_BASH_POSIX"],
             r"D:\Profiles\Copilot\hooks\mcp-agent-mail\hook_wrapper.sh",
             "session-start",
@@ -3640,7 +3758,24 @@ def test_auto_installer_continues_after_failure_then_exits_nonzero(
         "INTEGRATION_BEARER_TOKEN": "never-log-prefix-123456-never-log-suffix",
         # Exclude real Claude/Codex binaries while retaining ordinary POSIX
         # tools. The explicit CODEX_HOME above still detects Codex.
-        "PATH": f"{_git_bash_path(fake_bin)}:/usr/bin:/bin",
+        #
+        # _posix_tool_dirs() is what makes "ordinary POSIX tools" true on Windows
+        # as well: Git for Windows keeps git and curl in /mingw64/bin, not
+        # /usr/bin, so the two literals below are a complete toolchain on Linux
+        # and a partial one here. That went unnoticed while the harness started
+        # scripts through Git\bin\bash.exe, which quietly prepends /mingw64/bin
+        # during MSYS setup — the test was relying on the shell to repair a PATH
+        # it had declared complete.
+        "PATH": ":".join(
+            dict.fromkeys(
+                (
+                    _git_bash_path(fake_bin),
+                    *_posix_tool_dirs(),
+                    "/usr/bin",
+                    "/bin",
+                )
+            )
+        ),
         "TMPDIR": bash_tmp,
         "TEMP": bash_tmp,
         "TMP": bash_tmp,
@@ -3789,6 +3924,17 @@ def _managed_codex_commands(profile: Path) -> list[str]:
     ]
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason=(
+        "Simulates a WSL host: fakes uname as Linux, sets WSL_DISTRO_NAME and "
+        "resolves Windows profiles through a wslpath shim. Native Windows/MSYS "
+        "is not a coherent emulator of that — the real shell is MSYS, /mnt/c "
+        "does not exist, and the Copilot runtime probe has no consistent answer "
+        "for which hook Bash was selected. The WSL contract these pin still runs "
+        "on the Ubuntu and macOS legs, which is where it is meaningful."
+    ),
+)
 def test_auto_installer_isolates_windows_desktop_and_native_wsl_codex_profiles(
     tmp_path: Path,
 ) -> None:
@@ -3880,6 +4026,17 @@ def test_auto_installer_isolates_windows_desktop_and_native_wsl_codex_profiles(
     assert _tree_snapshot(tmp_path) == before_dry_run
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason=(
+        "Simulates a WSL host: fakes uname as Linux, sets WSL_DISTRO_NAME and "
+        "resolves Windows profiles through a wslpath shim. Native Windows/MSYS "
+        "is not a coherent emulator of that — the real shell is MSYS, /mnt/c "
+        "does not exist, and the Copilot runtime probe has no consistent answer "
+        "for which hook Bash was selected. The WSL contract these pin still runs "
+        "on the Ubuntu and macOS legs, which is where it is meaningful."
+    ),
+)
 def test_auto_installer_keeps_custom_native_codex_home_single_target(
     tmp_path: Path,
 ) -> None:
@@ -3910,6 +4067,17 @@ def test_auto_installer_keeps_custom_native_codex_home_single_target(
     assert _tree_snapshot(tmp_path) == before
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason=(
+        "Simulates a WSL host: fakes uname as Linux, sets WSL_DISTRO_NAME and "
+        "resolves Windows profiles through a wslpath shim. Native Windows/MSYS "
+        "is not a coherent emulator of that — the real shell is MSYS, /mnt/c "
+        "does not exist, and the Copilot runtime probe has no consistent answer "
+        "for which hook Bash was selected. The WSL contract these pin still runs "
+        "on the Ubuntu and macOS legs, which is where it is meaningful."
+    ),
+)
 def test_auto_installer_keeps_windows_profile_single_without_native_wsl_codex(
     tmp_path: Path,
 ) -> None:

@@ -82,14 +82,23 @@ skill and the monitor ran from the repository path while a stale cache copy sat
 beside them — so read the path out of `pgrep -af inbox_watch_monitor` instead
 of assuming either.
 
-On Windows the plugin cannot start the monitor at all: the declared command is
-a bare `.sh` with no interpreter, which the system hands to `git-bash.exe` — a
-window launcher, not a shell. Every hook avoids this because the installer
-wraps it in an absolute `bash.exe -c`. The obvious fix, prefixing `bash`, is
-the trap documented at the top of `inbox_watch.sh`: on Windows `bash` on PATH
-is the WSL launcher, which starts a different operating system and cannot see
-the drive the path refers to. So this needs the installer's Git Bash discovery,
-not a one-word change, and is open.
+The bare `.sh` in the manifest needs no interpreter of its own: the host
+resolves one, including on Windows, where it starts the command through Git for
+Windows' bash exactly as the installer does for every hook —
+
+```
+"C:\Program Files\Git\bin\bash.exe" -c "… <plugin root>/scripts/hooks/inbox_watch_monitor.sh claude 1"
+```
+
+— measured with the monitor running there. No file association is involved. An
+earlier revision of this file claimed the opposite; that came from probing the
+path through `cmd /c`, which is not how the host starts it.
+
+**Freshness is decided at arming time and never rechecked.** The running
+process holds the inode it started with, so a `git pull` that rewrites the
+script leaves the monitor executing the old code with nothing to show for it —
+a cache copy at least records the commit it came from, a live process records
+nothing. Re-arm after pulling.
 
 A monitor that exits is never restarted for the life of the CLI process, and it
 is not restored when a session resumes. If the CLI restarts overnight, instant

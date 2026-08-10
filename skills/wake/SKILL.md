@@ -75,6 +75,13 @@ Confirm it actually started, then stop:
    Or skip the copy entirely and arm the monitor from the repository path
    through the Monitor tool.
 
+   Measured on WSL, macOS and Windows, `${CLAUDE_PLUGIN_ROOT}` has so far been
+   the working tree rather than the cache — but that only makes the monitor
+   current **at the moment it is armed**. The process keeps the inode it
+   started with, so a later `git pull` leaves it running the old script
+   silently: the cache at least records the commit it came from, a live process
+   records nothing. **Re-arm after pulling.**
+
 Once armed, each new message wakes this session with a single line naming the
 message id. The hooks deliver the content as usual; the monitor only ends the
 waiting. A quiet mailbox costs nothing at all — no line, no wake, no tokens —

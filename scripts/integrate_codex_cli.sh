@@ -303,8 +303,14 @@ case "$(uname -s 2>/dev/null || printf unknown)" in
     }
     ;;
 esac
+_powershell_single_quote() {
+  printf '%s' "$1" | sed "s/'/''/g"
+}
 _windows_hook_command() {
-  printf '"%s" "%s" %s' "$_WINDOWS_BASH" "$_WINDOWS_WRAPPER" "$1"
+  local event="$1" bash_q wrapper_q
+  bash_q="$(_powershell_single_quote "$_WINDOWS_BASH")"
+  wrapper_q="$(_powershell_single_quote "$_WINDOWS_WRAPPER")"
+  printf "& '%s' '%s' '%s'" "$bash_q" "$wrapper_q" "$event"
 }
 
 SESSION_START_GROUP="$(jq -nc \

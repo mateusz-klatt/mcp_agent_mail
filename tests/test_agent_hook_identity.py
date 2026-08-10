@@ -1633,10 +1633,11 @@ def test_codex_and_copilot_integrators_write_only_temp_user_config(
         assert managed[0]["command"].endswith(event_arg)
         assert "commandWindows" in managed[0]
         windows_argv = shlex.split(managed[0]["commandWindows"], posix=False)
-        bash_executable = windows_argv[0].strip('"')
+        assert windows_argv[0] == "&"
+        bash_executable = windows_argv[1].strip("'")
         assert PureWindowsPath(bash_executable).name.casefold() == "bash.exe"
-        assert PureWindowsPath(windows_argv[1].strip('"')).name == "hook_wrapper.sh"
-        assert windows_argv[2] == event_arg
+        assert PureWindowsPath(windows_argv[2].strip("'")).name == "hook_wrapper.sh"
+        assert windows_argv[3].strip("'") == event_arg
         if os.name == "nt":
             assert Path(bash_executable).is_file()
     assert merged_hooks["hooks"]["SessionEnd"][-1]["hooks"][0]["timeout"] == 3

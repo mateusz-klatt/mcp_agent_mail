@@ -101,6 +101,13 @@ AGENT_MAIL_HOOKS=(
   autoreserve.sh
   session_end.sh
   inbox_watch.sh
+  # Installed for the same reason as inbox_watch.sh — copied, never registered
+  # on an event. It is started by the plugin monitor declared in
+  # .claude-plugin/plugin.json, or by hand for a session about to be left
+  # unattended. Shipping it here as well keeps the manual fallback in the
+  # directory the agent is already told about, so arming does not depend on the
+  # plugin being installed.
+  inbox_watch_monitor.sh
 )
 _hooks_missing=()
 for _h in "${AGENT_MAIL_HOOKS[@]}"; do

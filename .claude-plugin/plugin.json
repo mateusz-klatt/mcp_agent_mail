@@ -1,0 +1,29 @@
+{
+  "name": "mcp-agent-mail",
+  "version": "0.3.4",
+  "description": "Night-time instant mail delivery for Claude Code. Declares a background monitor that streams Agent Mail hints for the life of the session, armed on demand by the bundled `wake` skill. Identity, credentials and message delivery still come from the lifecycle hooks installed by scripts/integrate_claude_code.sh; this plugin adds only the arming.",
+  "author": {
+    "name": "Mateusz Klatt",
+    "url": "https://github.com/mateusz-klatt"
+  },
+  "homepage": "https://github.com/mateusz-klatt/mcp_agent_mail#readme",
+  "repository": "https://github.com/mateusz-klatt/mcp_agent_mail",
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "agent-mail",
+    "coordination",
+    "claude-code",
+    "instant-delivery"
+  ],
+  "experimental": {
+    "monitors": [
+      {
+        "name": "inbox-watch",
+        "description": "Agent Mail instant delivery (night monitor)",
+        "command": "${CLAUDE_PLUGIN_ROOT}/scripts/hooks/inbox_watch_monitor.sh claude ${AGENT_MAIL_CLAUDE_SLOT:-1}",
+        "when": "on-skill-invoke:mcp-agent-mail:wake"
+      }
+    ]
+  }
+}

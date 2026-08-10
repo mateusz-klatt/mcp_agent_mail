@@ -19,6 +19,7 @@ agent about to edit a file somebody else is already in.
 | `autoreserve.sh` | PostToolUse (same matcher) | never, on success |
 | `session_end.sh` | SessionEnd | never |
 | `inbox_watch.sh` | not a hook — a Claude background task | it exits, which is the Claude wake |
+| `inbox_watch_monitor.sh` | not a hook — a Claude plugin monitor | one line per message; silence otherwise |
 
 `inbox_watch.sh <client> <slot>` binds the subscription to the identity
 established by that client's SessionStart; it never guesses between multiple
@@ -34,6 +35,39 @@ server-sent-events subscription and exits when mail arrives; Claude then runs
 the exact client-and-slot command it prints. It deliberately does not read the
 mailbox: doing so would mark the ids announced and leave the background task as
 the sole carrier of a message the dedupe store already believes was delivered.
+
+### The night monitor
+
+`inbox_watch_monitor.sh <client> <slot>` is the same subscription with the
+opposite wake contract: the wake is **a line on stdout**, and exiting is death.
+It is declared as a Claude Code plugin monitor in `.claude-plugin/plugin.json`
+and armed on demand with `/wake`, the bundled skill.
+
+Use it for a session about to be left unattended. During the day the hooks above
+already deliver on every turn boundary and a person at the console can ask; the
+monitor exists for the hours when nobody is there to re-arm anything.
+
+The difference is not the delivery — receiving a message costs the same turn
+either way — but the two edges around it:
+
+| | `inbox_watch.sh` | `inbox_watch_monitor.sh` |
+|---|---|---|
+| quiet mailbox | wakes the agent every `AGENT_MAIL_WATCH_SECONDS` (1800 s) to report nothing | prints nothing, ever |
+| after a message | exits; somebody must re-arm it | reconnects by itself |
+| chain of custody | one link per wake, ~16 a night | one link per session |
+
+`GET /events` is one-shot by design — `: ready`, `: ping` every 15 s, exactly one
+`data:` frame, then the connection closes — so "never exits" is a reconnect loop
+rather than one held connection. Concurrent subscriptions for the same agent are
+supported server-side, so the catch-up query after each reconnect closes the gap
+between connections without risk of eviction. `session_start.sh` suppresses the
+manual watcher invitation while a monitor's pid file shows a live process, so the
+two are not armed at once.
+
+A monitor that exits is never restarted for the life of the CLI process, and it
+is not restored when a session resumes. If the CLI restarts overnight, instant
+delivery stays off until someone runs `/wake` again — the lifecycle hooks still
+deliver on the next turn, so mail is delayed rather than lost.
 
 ## Installing
 

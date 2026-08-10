@@ -161,8 +161,32 @@ fi
 # task in flight yet, and this hook is already speaking. It cannot start the
 # watcher itself — a process spawned from a hook is not a task the agent's
 # runtime tracks, so its exit would wake nobody, and the exit IS the wake.
+# Unless a monitor is already holding a subscription for this identity.
+#
+# inbox_watch_monitor.sh, armed by the plugin's `wake` skill, does the same job
+# without ever asking for a re-arm. Printing the invitation while it runs would
+# have the agent open a SECOND subscription: the server supports that — both are
+# woken and neither evicts the other — so it is waste rather than breakage, but
+# it is waste paid in wakes, which is the expensive unit here.
+#
+# Liveness by pid, not by mtime: the monitor blocks inside one connection for up
+# to an hour, so "wrote recently" cannot tell a working monitor from a dead one.
+# The marker is removed by the monitor's own EXIT trap, so the ordinary path
+# needs no expiry at all; the pid check is what covers the process being killed
+# in a way that skips traps. If the check is wrong in either direction the cost
+# is bounded — a missed suppression means one redundant watcher, a false
+# suppression means instant delivery falls back to the turn-boundary hooks.
+monitor_live=0
+if monitor_slug="$(am_state_component "${PROJECT}|${got_name}" 2>/dev/null)"; then
+    monitor_pid="$(cat "${AM_STATE_DIR}/watch/monitor-${monitor_slug}.pid" 2>/dev/null)"
+    case "$monitor_pid" in
+        ''|*[!0-9]*) ;;
+        *) kill -0 "$monitor_pid" 2>/dev/null && monitor_live=1 ;;
+    esac
+fi
+
 watcher="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)/inbox_watch.sh"
-if [ -x "$watcher" ]; then
+if [ -x "$watcher" ] && [ "$monitor_live" -eq 0 ]; then
     printf -v watcher_command '%q %q %q' \
         "$watcher" claude "${AGENT_MAIL_CLAUDE_SLOT:-1}"
     summary="${summary}

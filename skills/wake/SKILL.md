@@ -48,6 +48,27 @@ Confirm it actually started, then stop:
    failure — so verify by process, never by output. If it exited within a few
    seconds, the identity is not registered yet: let SessionStart run first.
 
+4. Before relying on it overnight, check that it is running the code you think
+   it is. **`${CLAUDE_PLUGIN_ROOT}` is not a live link to your working tree.**
+   Installing from a local directory also leaves a full copy under
+   `~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/`, and that copy
+   does not track the repository: measured on both macOS and WSL as a real
+   directory with no `.git`, a different inode, and — positive control on macOS
+   — a line written into the repo that never appeared in the copy.
+
+   Which of the two actually executes has differed between machines, so read it
+   off the process rather than assuming:
+
+   ```
+   pgrep -af inbox_watch_monitor
+   cmp <the path in argv> <repo>/scripts/hooks/inbox_watch_monitor.sh
+   ```
+
+   If they differ, the plugin is running an older snapshot. Bump `version` in
+   **both** manifests under `.claude-plugin/` and reinstall — an unchanged
+   version can be treated as nothing to do — or arm the monitor from the
+   repository path through the Monitor tool and skip the plugin copy entirely.
+
 Once armed, each new message wakes this session with a single line naming the
 message id. The hooks deliver the content as usual; the monitor only ends the
 waiting. A quiet mailbox costs nothing at all — no line, no wake, no tokens —

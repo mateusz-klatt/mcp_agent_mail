@@ -64,6 +64,19 @@ between connections without risk of eviction. `session_start.sh` suppresses the
 manual watcher invitation while a monitor's pid file shows a live process, so the
 two are not armed at once.
 
+**The plugin runs a copy, not your working tree.** Installing from a local
+directory leaves a full snapshot under
+`~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/` — a real directory
+with no `.git`, measured on macOS and WSL alike. The commit that added
+`.claude-plugin/marketplace.json` claims a local install "points at the working
+tree itself"; that is wrong, and the drift it says has nowhere to happen simply
+moved: `integrate_claude_code.sh --yes` refreshes the copies under
+`~/.claude/hooks/`, but nothing refreshes the plugin cache except a reinstall,
+and an unchanged `version` can be treated as nothing to do. Which copy actually
+executes has differed between machines — on WSL both the skill and the monitor
+ran from the repository path while a cache copy existed in parallel — so read
+the path out of `pgrep -af inbox_watch_monitor` instead of assuming either.
+
 A monitor that exits is never restarted for the life of the CLI process, and it
 is not restored when a session resumes. If the CLI restarts overnight, instant
 delivery stays off until someone runs `/wake` again — the lifecycle hooks still

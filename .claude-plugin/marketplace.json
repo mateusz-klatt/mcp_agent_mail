@@ -1,0 +1,33 @@
+{
+  "name": "mateusz-klatt-mcp-agent-mail",
+  "owner": {
+    "name": "Mateusz Klatt",
+    "url": "https://github.com/mateusz-klatt"
+  },
+  "metadata": {
+    "description": "MCP Agent Mail — coordinated multi-agent messaging. Ships the night monitor that delivers mail to an unattended Claude Code session, armed on demand by the bundled `wake` skill.",
+    "version": "0.3.4"
+  },
+  "plugins": [
+    {
+      "name": "mcp-agent-mail",
+      "source": "./",
+      "version": "0.3.4",
+      "description": "Night-time instant mail delivery for Claude Code. Declares a background monitor that streams Agent Mail hints for the life of the session, armed on demand by the bundled `wake` skill. Identity, credentials and message delivery still come from the lifecycle hooks installed by scripts/integrate_claude_code.sh; this plugin adds only the arming.",
+      "author": {
+        "name": "Mateusz Klatt",
+        "url": "https://github.com/mateusz-klatt"
+      },
+      "homepage": "https://github.com/mateusz-klatt/mcp_agent_mail#readme",
+      "repository": "https://github.com/mateusz-klatt/mcp_agent_mail",
+      "license": "MIT",
+      "keywords": [
+        "mcp",
+        "agent-mail",
+        "coordination",
+        "claude-code",
+        "instant-delivery"
+      ]
+    }
+  ]
+}

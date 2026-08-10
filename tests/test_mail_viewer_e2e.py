@@ -207,7 +207,7 @@ async def test_mail_unified_inbox_html(isolated_env):
     server = build_mcp_server()
     app = build_http_app(settings, server)
 
-    await _setup_test_data(settings)
+    data = await _setup_test_data(settings)
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -216,6 +216,7 @@ async def test_mail_unified_inbox_html(isolated_env):
         assert "text/html" in resp.headers.get("content-type", "")
         # Should contain some HTML structure
         assert "<html" in resp.text.lower() or "<!doctype" in resp.text.lower()
+        assert f"totalMessages: {len(data['message_ids'])}" in resp.text
 
 
 @pytest.mark.asyncio
@@ -232,7 +233,30 @@ async def test_mail_unified_inbox_api(isolated_env):
         resp = await client.get("/mail/api/unified-inbox")
         assert resp.status_code == 200
         data = resp.json()
-        assert "messages" in data or "items" in data or isinstance(data, list)
+        assert len(data["messages"]) == 2
+        assert data["total_messages"] == 2
+        assert data["returned_messages"] == 2
+        assert data["has_more"] is False
+
+
+@pytest.mark.asyncio
+async def test_mail_unified_inbox_api_reports_total_independent_of_page_limit(isolated_env):
+    settings = _config.get_settings()
+    server = build_mcp_server()
+    app = build_http_app(settings, server)
+
+    data = await _setup_test_data(settings)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/mail/api/unified-inbox?limit=1")
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert len(payload["messages"]) == 1
+    assert payload["total_messages"] == len(data["message_ids"])
+    assert payload["returned_messages"] == 1
+    assert payload["has_more"] is True
 
 
 @pytest.mark.asyncio

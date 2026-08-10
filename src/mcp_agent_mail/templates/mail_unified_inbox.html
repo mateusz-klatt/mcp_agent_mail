@@ -168,8 +168,7 @@
 
     <!-- Message Count -->
     <div class="hidden md:flex items-center gap-2 text-sm text-slate-600 dark:text-slate-400">
-      <span class="font-semibold text-slate-900 dark:text-white" x-text="filteredMessages.length"></span>
-      <span x-text="filteredMessages.length === 1 ? 'message' : 'messages'"></span>
+      <span class="font-semibold text-slate-900 dark:text-white" x-text="messageCountLabel"></span>
     </div>
   </div>
 
@@ -769,6 +768,7 @@ function unifiedInboxManager() {
   return {
     // Data
     allMessages: {{ messages | tojson if messages else '[]' }},
+    totalMessages: {{ total_messages | default(messages | length) | tojson }},
     filteredMessages: [],
     selectedMessage: null,
     selectedMessages: [],
@@ -833,6 +833,20 @@ function unifiedInboxManager() {
     get filtersActive() {
       return this.filters.project || this.filters.sender || this.filters.recipient ||
              this.filters.importance || this.filters.hasThread;
+    },
+
+    get messageCountLabel() {
+      const filtering = Boolean(this.searchQuery) || Boolean(this.filtersActive);
+      const count = filtering ? this.filteredMessages.length : this.totalMessages;
+      const noun = count === 1 ? 'message' : 'messages';
+      if (filtering && this.totalMessages > this.allMessages.length) {
+        const matchNoun = count === 1 ? 'match' : 'matches';
+        return `${count} ${matchNoun} in latest ${this.allMessages.length} loaded`;
+      }
+      if (!filtering && this.totalMessages > this.allMessages.length) {
+        return `${count} ${noun} · latest ${this.allMessages.length} loaded`;
+      }
+      return `${count} ${noun}`;
     },
 
     get lastRefreshLabel() {
@@ -1106,8 +1120,12 @@ function unifiedInboxManager() {
         }
         const payload = await response.json();
         const incomingMessages = Array.isArray(payload.messages) ? payload.messages : [];
+        const incomingTotal = Number(payload.total_messages);
 
         this.allMessages = incomingMessages;
+        this.totalMessages = Number.isSafeInteger(incomingTotal) && incomingTotal >= incomingMessages.length
+          ? incomingTotal
+          : incomingMessages.length;
         this.filterMessages();
 
         if (previouslySelectedId) {
@@ -1387,6 +1405,7 @@ function unifiedInboxManager() {
         // Remove deleted messages from local state
         const deletedSet = new Set(this.selectedMessages);
         this.allMessages = this.allMessages.filter(m => !deletedSet.has(m.id));
+        this.totalMessages = Math.max(this.allMessages.length, this.totalMessages - deletedCount);
         this.selectedMessages = [];
         if (this.selectedMessage && deletedSet.has(this.selectedMessage.id)) {
           this.selectedMessage = null;

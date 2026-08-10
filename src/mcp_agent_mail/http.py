@@ -2492,6 +2492,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             safe_limit = max(1, min(int(limit), 1000))
             messages: list[dict[str, Any]] = []
             projects: list[dict[str, Any]] = []
+            total_messages = 0
 
             try:
                 await ensure_schema()
@@ -2502,6 +2503,18 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     sibling_map = await get_project_sibling_data()
 
                 async with get_session() as session:
+                    total_result = await session.execute(
+                        text(
+                            """
+                            SELECT COUNT(*)
+                            FROM messages m
+                            JOIN agents sender ON sender.id = m.sender_id
+                            JOIN projects p ON p.id = m.project_id
+                            """
+                        )
+                    )
+                    total_messages = int(total_result.scalar_one())
+
                     # Fetch recent messages with sender/project and computed recipient list
                     query = text(
                         """
@@ -2648,7 +2661,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     )
                     agent_sounds = {r[0]: r[1] for r in srows.fetchall() if r[0] and r[1]}
 
-            return {"messages": messages, "projects": projects, "agent_sounds": agent_sounds}
+            return {
+                "messages": messages,
+                "projects": projects,
+                "agent_sounds": agent_sounds,
+                "total_messages": total_messages,
+                "returned_messages": len(messages),
+                "has_more": total_messages > len(messages),
+            }
 
         # ---------------------------------------------------------------
         # Login / logout for the viewer. MailUiAuthMiddleware lets exactly
@@ -2795,6 +2815,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 messages=payload.get("messages", []),
                 projects=payload.get("projects", []),
                 agent_sounds=payload.get("agent_sounds", {}),
+                total_messages=payload.get("total_messages", 0),
             )
 
         @fastapi_app.get("/mail/events")
@@ -2876,7 +2897,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             limit: int = 50000,
             include_projects: bool = False,
         ) -> JSONResponse:
-            """JSON feed for the unified inbox view (used for background refresh)."""
+            """Return a bounded message page plus the unbounded inbox total."""
 
             payload = await _build_unified_inbox_payload(limit=limit, include_projects=include_projects)
             if not include_projects:
@@ -3392,6 +3413,19 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
                 where_clause = "WHERE " + " AND ".join(importance_conditions) if importance_conditions else "WHERE 1=1"
 
+                total_result = await session.execute(
+                    text(
+                        f"""
+                        SELECT COUNT(*)
+                        FROM messages m
+                        JOIN agents sender ON sender.id = m.sender_id
+                        JOIN projects p ON p.id = m.project_id
+                        {where_clause}
+                        """
+                    )
+                )
+                total_messages = int(total_result.scalar_one())
+
                 messages_query = await session.execute(
                     text(
                         f"""
@@ -3469,7 +3503,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 projects=projects_data,
                 messages=messages,
                 total_agents=sum(p["agent_count"] for p in projects_data),
-                total_messages=len(messages),
+                total_messages=total_messages,
                 filter_importance=filter_importance or "",
                 # This route does carry agents on each project row, but the map
                 # is built the same way as on /mail so the two routes cannot

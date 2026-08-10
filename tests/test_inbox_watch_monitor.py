@@ -58,27 +58,73 @@ def _monitor_env(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
     return env, repo, tmp_path / "curl.log"
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _harness_can_actually_run_the_script(tmp_path_factory: pytest.TempPathFactory) -> None:
+    """Fail this module outright if the script dies before it reaches its own code.
+
+    Every refusal assertion below is of the form "exit 0 and touch nothing", and
+    a script that never starts satisfies all of them. `claude-win-home-1`
+    measured exactly that: run from a native Windows shell, `PATH` carries
+    `Git/cmd` but not `Git/usr/bin`, so `dirname` on line 47 is not found, the
+    `. agent_mail_common.sh` that follows fails, and the script exits 0 from the
+    top of the file. Seven refusal tests then went green while the two-argument
+    contract they claim to cover was never executed — deleting the validation
+    entirely would not have shown up.
+
+    So the module gets a precondition rather than better wording: start the
+    script with valid arguments and require it to still be alive. It cannot be,
+    unless sourcing worked and the loop was reached.
+    """
+    tmp = tmp_path_factory.mktemp("harness-canary")
+    env, repo, _ = _monitor_env(tmp)
+    proc = subprocess.Popen(
+        [BASH, _git_bash_path(MONITOR), "claude", "1"],
+        cwd=repo,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    time.sleep(3)
+    alive = proc.poll() is None
+    proc.terminate()
+    try:
+        _stdout, stderr = proc.communicate(timeout=15)
+    except subprocess.TimeoutExpired:  # pragma: no cover - failure path
+        proc.kill()
+        _stdout, stderr = proc.communicate()
+
+    if not alive:
+        pytest.fail(
+            "the monitor exited immediately with valid arguments, so nothing in "
+            "this module is testing what it says it tests. Usually PATH: the "
+            "script needs coreutils (`dirname`) from Git's usr/bin, which a "
+            "native Windows shell does not put on PATH but Git Bash does. "
+            f"stderr was: {stderr!r}"
+        )
+
+
 @pytest.mark.parametrize(
     "arguments",
     [
         [],
         ["claude"],
         ["claude", "1", "extra"],
-        ["bogus", "1"],
-        ["claude", "0"],
-        ["claude", "01"],
-        ["claude", "x"],
     ],
 )
-def test_monitor_refuses_without_a_valid_client_and_slot(
+def test_monitor_refuses_a_wrong_number_of_arguments(
     tmp_path: Path,
     arguments: list[str],
 ) -> None:
-    """Same two-argument contract as inbox_watch.sh, and refused the same way.
+    """Refusal has to be rc 0, touch nothing, and SAY so.
 
-    Refusal has to be rc 0 and touch nothing: the caller is a plugin host that
-    reads a non-zero exit as a broken plugin, and the operator would then be
-    told the integration is faulty when the only fault is a typo in a slot.
+    The message is asserted, not just the exit code: rc 0 alone is what a script
+    that crashed on its second line also produces, and that is how this same
+    assertion passed on Windows while testing nothing.
+
+    rc 0 rather than a diagnostic code because the caller is a plugin host that
+    reads a non-zero exit as a broken plugin — the operator would be told the
+    integration is faulty when the only fault is a typo in a slot.
     """
     env, repo, curl_log = _monitor_env(tmp_path)
     before = _tree_snapshot(tmp_path)
@@ -94,6 +140,50 @@ def test_monitor_refuses_without_a_valid_client_and_slot(
     )
 
     assert result.returncode == 0
+    assert "requires an explicit client and slot" in result.stderr
+    assert result.stdout == ""
+    assert not curl_log.exists()
+    assert _tree_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["bogus", "1"],
+        ["claude", "0"],
+        ["claude", "01"],
+        ["claude", "x"],
+    ],
+)
+def test_monitor_refuses_an_invalid_client_or_slot(
+    tmp_path: Path,
+    arguments: list[str],
+) -> None:
+    """Rejected by am_client/am_slot, which refuse silently by design.
+
+    There is nothing in the output to assert on here — which is why the module
+    canary exists. Without it, "silent and harmless" is indistinguishable from
+    "never ran", and this is the shape that went green on Windows for the wrong
+    reason.
+    """
+    env, repo, curl_log = _monitor_env(tmp_path)
+    before = _tree_snapshot(tmp_path)
+
+    result = subprocess.run(
+        [BASH, _git_bash_path(MONITOR), *arguments],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    # The arity guard is upstream of these, so seeing its message would mean the
+    # arguments never reached the client/slot validation this test is about.
+    assert "requires an explicit client and slot" not in result.stderr
     assert not curl_log.exists()
     assert _tree_snapshot(tmp_path) == before
 

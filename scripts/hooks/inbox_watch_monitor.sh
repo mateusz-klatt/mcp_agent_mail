@@ -138,8 +138,24 @@ while :; do
     # are all recoverable: a project activated after the monitor started, a
     # credential written by a SessionStart that had not run yet, an identity
     # migration completed by a human. Computing this once at startup would turn
-    # every one of those into a permanently dead monitor. The cost is a couple
-    # of git calls per cycle, and cycles are hourly.
+    # every one of those into a permanently dead monitor.
+    #
+    # The cost is real and this comment used to understate it by claiming cycles
+    # are hourly. They are hourly only while the mailbox is quiet: `GET /events`
+    # is one-shot, so every message ends a cycle and the next one starts by
+    # resolving the identity again. Measured by claude-win-home-1 on Windows,
+    # where git is slowest:
+    #
+    #     am_project_key 190 ms, am_project_is_active 102 ms,
+    #     am_identity_migration 718 ms, am_agent_name 419 ms  ->  1429 ms
+    #
+    # About ten cycles in eight minutes on a busy evening, so seconds of git per
+    # burst rather than a couple of calls an hour. Kept anyway: it buys the
+    # self-healing above, and it is latency between messages, never a lost one —
+    # the catch-up query after `: ready` covers the window in which no
+    # subscription is open. Resolve once every N cycles if this ever matters,
+    # but weigh it against a monitor that cannot recover from a late
+    # registration.
     PROJECT="$(am_project_key)"
     if [ -z "$PROJECT" ]; then nap "$BACKOFF_MAX"; continue; fi
     export AM_PROJECT_FOR_NAME="$PROJECT"

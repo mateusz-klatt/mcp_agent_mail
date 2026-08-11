@@ -40,6 +40,18 @@ SLOT="$(am_slot "$2")" || exit 0
 # own cap (AGENT_MAIL_EVENTS_MAX_SECONDS, 3600 by default) so the client is the
 # one that decides when to reconnect.
 WATCH="${AGENT_MAIL_WATCH_SECONDS:-1800}"
+case "$WATCH" in
+    ""|*[!0-9]*) WATCH=1800 ;;
+    *)
+        if [ "${#WATCH}" -gt 4 ]; then
+            WATCH=1800
+        else
+            WATCH=$(( 10#$WATCH ))
+            [ "$WATCH" -ge 1 ] 2>/dev/null && [ "$WATCH" -le 3600 ] 2>/dev/null \
+                || WATCH=1800
+        fi
+        ;;
+esac
 # The exact command to run again, carried in every message this script prints.
 #
 # Re-arming is the whole reason instant delivery went unused: the polling loop
@@ -70,6 +82,19 @@ SELF_PATH="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)/$(basename -- "$0")" 
 printf -v SELF_CMD '%q %q %q' "$SELF_PATH" "$CLIENT" "$SLOT"
 # How long to wait for `: ready` before giving up on the subscription.
 READY_WAIT="${AGENT_MAIL_WATCH_READY_SECONDS:-15}"
+case "$READY_WAIT" in
+    ""|*[!0-9]*) READY_WAIT=15 ;;
+    *)
+        if [ "${#READY_WAIT}" -gt 2 ]; then
+            READY_WAIT=15
+        else
+            READY_WAIT=$(( 10#$READY_WAIT ))
+            [ "$READY_WAIT" -ge 1 ] 2>/dev/null && [ "$READY_WAIT" -le 60 ] 2>/dev/null \
+                || READY_WAIT=15
+        fi
+        ;;
+esac
+[ "$READY_WAIT" -gt "$WATCH" ] 2>/dev/null && READY_WAIT="$WATCH"
 
 PROJECT="$(am_project_key)"
 # am_agent_name resolves the project itself when AM_PROJECT_FOR_NAME is unset,
@@ -129,11 +154,28 @@ CURL_PID=$!
 
 # ── wait for the subscription to be live ─────────────────────────────────────
 ready=0
-ready_deadline=$(( started + READY_WAIT ))
+ready_checks=0
+ready_max_checks=$(( READY_WAIT * 5 ))
+[ "$ready_max_checks" -lt 1 ] 2>/dev/null && ready_max_checks=1
 while :; do
     grep -q '^: ready' "$stream" 2>/dev/null && { ready=1; break; }
-    kill -0 "$CURL_PID" 2>/dev/null || break      # curl died before subscribing
-    [ "$(date +%s 2>/dev/null || echo 0)" -ge "$ready_deadline" ] 2>/dev/null && break
+    if ! kill -0 "$CURL_PID" 2>/dev/null; then
+        # A short-lived stream can write both `: ready` and the first event,
+        # then exit between the grep above and this liveness probe. Reaping the
+        # writer closes its redirected output; one final read is therefore the
+        # authoritative answer instead of treating a completed process as a
+        # subscription failure.
+        wait "$CURL_PID" 2>/dev/null
+        CURL_PID=""
+        grep -q '^: ready' "$stream" 2>/dev/null && ready=1
+        break
+    fi
+    # Wall-clock seconds are too coarse for this deadline: starting at xx.999
+    # made a configured one-second wait expire almost immediately. Count the
+    # 200 ms polling intervals instead so every configured second is actually
+    # available to the stream, independent of a clock boundary.
+    [ "$ready_checks" -ge "$ready_max_checks" ] 2>/dev/null && break
+    ready_checks=$(( ready_checks + 1 ))
     sleep 0.2
 done
 
@@ -142,8 +184,8 @@ if [ "$ready" -ne 1 ]; then
     # leaves curl alive until its own --max-time, so waiting on it here would
     # hold this message back for the entire watch window — half an hour of
     # silence to report that the first fifteen seconds failed.
-    kill "$CURL_PID" 2>/dev/null
-    wait "$CURL_PID" 2>/dev/null
+    [ -n "$CURL_PID" ] && kill "$CURL_PID" 2>/dev/null
+    [ -n "$CURL_PID" ] && wait "$CURL_PID" 2>/dev/null
     CURL_PID=""
     printf 'Agent Mail: could not subscribe for %s (no stream opened). Check the server and credentials, then re-arm instant delivery by running this in the BACKGROUND:\n    %s\n' \
         "$AGENT" "$SELF_CMD"
@@ -174,8 +216,10 @@ if printf '%s' "$pending" | jq -e 'type == "array" and length > 0' >/dev/null 2>
 fi
 
 # ── wait for a hint ──────────────────────────────────────────────────────────
-wait "$CURL_PID" 2>/dev/null
-CURL_PID=""
+if [ -n "$CURL_PID" ]; then
+    wait "$CURL_PID" 2>/dev/null
+    CURL_PID=""
+fi
 ended="$(date +%s 2>/dev/null || echo 0)"
 elapsed=$(( ended - started ))
 out="$(cat "$stream" 2>/dev/null)"

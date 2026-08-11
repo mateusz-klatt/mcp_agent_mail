@@ -17,14 +17,21 @@
 {% endblock %}
 
 {% block header_actions %}
-<div class="flex items-center gap-2">
-  <button @click="$refs.filterDropdown.open = true"
-          class="px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-xl transition-all duration-200 flex items-center gap-2 font-medium shadow-sm">
+<div class="flex w-full items-center gap-2 lg:w-auto"
+     x-data="{ filterOpen: false }"
+     @archive-filter-state.window="filterOpen = $event.detail.open">
+  <button @click="$dispatch('archive-filter-toggle')"
+          id="activity-filter-trigger"
+          data-archive-action="filter"
+          aria-controls="activity-filter-panel"
+          :aria-expanded="filterOpen.toString()"
+          class="flex min-h-[44px] flex-1 items-center justify-center gap-2 rounded-xl bg-slate-100 px-4 py-2 font-medium text-slate-700 shadow-sm transition-all duration-200 hover:bg-slate-200 dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600 lg:flex-none">
     <i data-lucide="filter" class="w-4 h-4"></i>
     Filter
   </button>
   <button onclick="window.location.reload()"
-          class="px-4 py-2 bg-primary-500 hover:bg-primary-600 text-white rounded-xl transition-all duration-200 flex items-center gap-2 font-medium shadow-md hover:shadow-lg">
+          data-archive-action="refresh"
+          class="flex min-h-[44px] flex-1 items-center justify-center gap-2 rounded-xl bg-primary-500 px-4 py-2 font-medium text-white shadow-md transition-all duration-200 hover:bg-primary-600 hover:shadow-lg lg:flex-none">
     <i data-lucide="refresh-cw" class="w-4 h-4"></i>
     Refresh
   </button>
@@ -32,7 +39,10 @@
 {% endblock %}
 
 {% block content %}
-<div class="page-transition" x-data="activityManager()">
+<div class="page-transition"
+     x-data="activityManager()"
+     @archive-filter-toggle.window="filterOpen = !filterOpen; $dispatch('archive-filter-state', { open: filterOpen }); if (filterOpen) $nextTick(() => $refs.filterQuery.focus())"
+     @keydown.escape.window="if (filterOpen) { filterOpen = false; $dispatch('archive-filter-state', { open: false }); $nextTick(() => document.getElementById('activity-filter-trigger')?.focus()); }">
   <!-- Header with gradient -->
   <div class="mb-8">
     <div class="flex items-center gap-4 mb-4">
@@ -52,7 +62,8 @@
     <!-- Stats Bar -->
     <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
       <div class="bg-white dark:bg-slate-800 rounded-xl p-4 border-2 border-slate-200 dark:border-slate-700 shadow-soft">
-        <div class="text-2xl font-bold text-slate-900 dark:text-white mb-1">{{ commits|length }}</div>
+        <div class="text-2xl font-bold text-slate-900 dark:text-white mb-1"
+             x-text="filteredCommits().length">{{ commits|length }}</div>
         <div class="text-xs text-slate-600 dark:text-slate-400 font-medium uppercase tracking-wide">Commits</div>
       </div>
       <div class="bg-white dark:bg-slate-800 rounded-xl p-4 border-2 border-slate-200 dark:border-slate-700 shadow-soft">
@@ -70,9 +81,42 @@
     </div>
   </div>
 
+  <!-- The sticky header lives outside this Alpine component. A window event is
+       the shared bridge between its Filter action and this page-owned state. -->
+  <div id="activity-filter-panel"
+       x-cloak
+       x-show="filterOpen"
+       x-transition
+       role="search"
+       class="mb-6 rounded-2xl border-2 border-slate-200 bg-white p-4 shadow-soft dark:border-slate-700 dark:bg-slate-800">
+    <div class="flex flex-col gap-3 sm:flex-row sm:items-end">
+      <label class="flex-1 text-sm font-medium text-slate-700 dark:text-slate-300">
+        Filter by subject, author, or SHA
+        <input x-ref="filterQuery"
+               x-model.debounce.150ms="filterQuery"
+               type="search"
+               autocomplete="off"
+               class="mt-2 min-h-[44px] w-full rounded-xl border-2 border-slate-200 bg-white px-4 py-2 text-slate-900 outline-none transition-colors focus:border-primary-500 dark:border-slate-600 dark:bg-slate-900 dark:text-white"
+               placeholder="Search activity">
+      </label>
+      <div class="flex gap-2">
+        <button type="button"
+                @click="filterQuery = ''"
+                class="min-h-[44px] flex-1 rounded-xl bg-slate-100 px-4 py-2 font-medium text-slate-700 transition-colors hover:bg-slate-200 dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600 sm:flex-none">
+          Clear
+        </button>
+        <button type="button"
+                @click="filterOpen = false; $dispatch('archive-filter-state', { open: false }); $nextTick(() => document.getElementById('activity-filter-trigger')?.focus())"
+                class="min-h-[44px] flex-1 rounded-xl bg-primary-500 px-4 py-2 font-medium text-white transition-colors hover:bg-primary-600 sm:flex-none">
+          Done
+        </button>
+      </div>
+    </div>
+  </div>
+
   <!-- Commit Timeline -->
   <div class="space-y-4">
-    <template x-for="(commit, index) in commits" :key="commit.sha">
+    <template x-for="(commit, index) in filteredCommits()" :key="commit.sha">
       <div class="relative" :style="`animation-delay: ${Math.min(index * 0.05, 1)}s`">
         <!-- Timeline connector -->
         <template x-if="index > 0">
@@ -140,7 +184,8 @@
               <!-- Arrow -->
               <div class="flex-shrink-0 flex items-center">
                 <a :href="'/mail/archive/commit/' + commit.sha"
-                   class="p-2 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-lg transition-colors">
+                   class="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-lg p-2 transition-colors hover:bg-slate-100 dark:hover:bg-slate-700"
+                   aria-label="Open commit details">
                   <i data-lucide="arrow-right" class="w-5 h-5 text-slate-400 group-hover:text-primary-600 dark:group-hover:text-primary-400 group-hover:translate-x-1 transition-all"></i>
                 </a>
               </div>
@@ -152,14 +197,14 @@
   </div>
 
   <!-- Empty State -->
-  <template x-if="commits.length === 0">
+  <template x-if="filteredCommits().length === 0">
     <div class="flex flex-col items-center justify-center py-20 animate-fade-in">
       <div class="w-24 h-24 bg-slate-200 dark:bg-slate-700 rounded-3xl flex items-center justify-center mb-6 shadow-lg">
         <i data-lucide="git-commit" class="w-12 h-12 text-slate-400 dark:text-slate-500"></i>
       </div>
       <h3 class="text-2xl font-bold text-slate-900 dark:text-white mb-2">No commits yet</h3>
-      <p class="text-slate-600 dark:text-slate-400 text-center max-w-md">
-        Commits will appear here as agents send messages and perform actions.
+      <p class="text-slate-600 dark:text-slate-400 text-center max-w-md"
+         x-text="filterQuery.trim() ? 'No commits match this filter.' : 'Commits will appear here as agents send messages and perform actions.'">
       </p>
     </div>
   </template>
@@ -169,17 +214,29 @@
 function activityManager() {
   return {
     commits: {{ commits|tojson }},
+    filterOpen: false,
+    filterQuery: '',
+
+    filteredCommits() {
+      const query = this.filterQuery.trim().toLowerCase();
+      if (!query) return this.commits;
+
+      return this.commits.filter(commit =>
+        [commit.subject, commit.author, commit.sha, commit.short_sha]
+          .some(value => String(value || '').toLowerCase().includes(query))
+      );
+    },
 
     totalInsertions() {
-      return this.commits.reduce((sum, c) => sum + (c.insertions || 0), 0);
+      return this.filteredCommits().reduce((sum, c) => sum + (c.insertions || 0), 0);
     },
 
     totalDeletions() {
-      return this.commits.reduce((sum, c) => sum + (c.deletions || 0), 0);
+      return this.filteredCommits().reduce((sum, c) => sum + (c.deletions || 0), 0);
     },
 
     uniqueAuthors() {
-      const authors = new Set(this.commits.map(c => c.author));
+      const authors = new Set(this.filteredCommits().map(c => c.author));
       return authors.size;
     }
   };

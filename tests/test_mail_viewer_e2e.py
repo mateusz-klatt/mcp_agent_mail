@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from html.parser import HTMLParser
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -19,6 +20,31 @@ from mcp_agent_mail.http import build_http_app
 from mcp_agent_mail.storage import ensure_archive, write_agent_profile
 
 MAIL_UI_TEST_SECRET = "mail-viewer-rbac-session-secret-0123456789"
+
+
+class _NestedAnchorDetector(HTMLParser):
+    """Detect invalid nested anchors in rendered template source."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.anchor_depth = 0
+        self.found_nested_anchor = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        if tag == "a":
+            self.found_nested_anchor |= self.anchor_depth > 0
+            self.anchor_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self.anchor_depth > 0:
+            self.anchor_depth -= 1
+
+
+def _has_nested_anchor(html: str) -> bool:
+    detector = _NestedAnchorDetector()
+    detector.feed(html)
+    return detector.found_nested_anchor
 
 
 # The viewer is behind a password login by default, and these tests exercise
@@ -444,9 +470,16 @@ async def test_mail_unified_inbox_html(isolated_env):
         assert "<html" in resp.text.lower() or "<!doctype" in resp.text.lower()
         assert f"totalMessages: {len(data['message_ids'])}" in resp.text
         assert '<span class="sm:hidden">Auto</span>' in resp.text
-        assert 'class="flex min-w-0 flex-1 items-center gap-4 lg:gap-8"' in resp.text
-        assert 'class="flex shrink-0 items-center gap-1 sm:gap-2 lg:gap-3"' in resp.text
+        assert 'class="flex min-h-[44px] min-w-[44px] shrink-0 items-center gap-3 group"' in resp.text
+        assert 'id="global-header-controls" class="ml-auto flex shrink-0 items-center gap-1 sm:gap-2 lg:gap-3"' in resp.text
         assert "min-h-[44px] min-w-[44px]" in resp.text
+        assert ":aria-label=\"'Sort messages: ' +" in resp.text
+        assert ':aria-expanded="sortOpen"' in resp.text
+        assert '@keydown.space.prevent="handleMessageClick(msg)"' in resp.text
+        assert "sticky top-28 lg:top-16" in resp.text
+        assert "sticky top-[17rem] sm:top-52 md:top-[17rem] lg:top-40" in resp.text
+        assert "fixed inset-0 top-[18rem] lg:top-48 z-50" in resp.text
+        assert "isFullscreen ? 'z-[60]' : 'z-10'" in resp.text
 
 
 @pytest.mark.asyncio
@@ -556,6 +589,8 @@ async def test_mail_projects_list(isolated_env):
 @pytest.mark.asyncio
 async def test_mail_project_view(isolated_env):
     """Test GET /mail/{project} returns project view."""
+    from sqlalchemy import text
+
     settings = _config.get_settings()
     server = build_mcp_server()
     app = build_http_app(settings, server)
@@ -577,6 +612,22 @@ async def test_mail_project_view(isolated_env):
         assert 'class="flex items-center gap-1 xl:gap-3"' in resp.text
         assert 'class="flex items-center gap-1 xl:gap-2"' in resp.text
         assert '<span class="hidden xl:inline text-sm">Human Overseer</span>' in resp.text
+        assert "min-h-[44px] min-w-[44px] p-2.5" in resp.text
+        assert "flex min-h-[44px] flex-1 items-center justify-center gap-2 rounded-lg bg-gradient-to-r" in resp.text
+
+        async with get_session() as session:
+            await session.execute(
+                text("UPDATE agents SET retired_at = datetime('now') WHERE name = 'BlueLake'")
+            )
+            await session.commit()
+
+        retired = await client.get("/mail/test-proj")
+        assert retired.status_code == 200
+        assert 'aria-controls="retired-agent-list"' in retired.text
+        assert ':aria-expanded="showRetired.toString()"' in retired.text
+        assert 'id="retired-agent-list"' in retired.text
+        assert "flex min-h-[44px] flex-1 items-center justify-center gap-2 rounded-lg bg-slate-200" in retired.text
+        assert "min-h-[44px] min-w-[44px] p-2.5 bg-green-100" in retired.text
 
 
 @pytest.mark.asyncio
@@ -593,6 +644,57 @@ async def test_mail_project_view_with_search(isolated_env):
         resp = await client.get("/mail/test-proj", params={"q": "definitely-absent-message-token"})
         assert resp.status_code == 200
         assert "No matching messages" in resp.text
+
+        results = await client.get("/mail/test-proj", params={"q": "Test Message"})
+        assert results.status_code == 200
+        assert "Found <span" in results.text
+        assert "block overflow-hidden group" in results.text
+        assert "flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2" in results.text
+
+
+@pytest.mark.asyncio
+async def test_mail_search_escapes_agent_html_before_restoring_fts_marks(
+    isolated_env,
+):
+    """Search highlights must not turn agent-controlled HTML into active DOM."""
+    from sqlalchemy import text
+
+    settings = _config.get_settings()
+    server = build_mcp_server()
+    app = build_http_app(settings, server)
+    data = await _setup_test_data(settings)
+
+    async with get_session() as session:
+        await session.execute(
+            text(
+                "INSERT INTO messages "
+                "(project_id, subject, body_md, importance, ack_required, "
+                "sender_id, thread_id, created_ts) "
+                "VALUES (:pid, :subject, :body, 'normal', 0, :sender_id, "
+                ":thread_id, datetime('now'))"
+            ),
+            {
+                "pid": data["project_id"],
+                "subject": "Search safety",
+                "body": '<img src=x onerror=alert(1)> needle <mark>literal</mark>',
+                "sender_id": data["agent_id"],
+                "thread_id": "search-xss",
+            },
+        )
+        await session.commit()
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        responses = [
+            await client.get("/mail/test-proj", params={"q": "needle"}),
+            await client.get("/mail/test-proj/search", params={"q": "needle"}),
+        ]
+
+    for response in responses:
+        assert response.status_code == 200
+        assert "<mark>needle</mark>" in response.text
+        assert "<img src=x onerror=alert(1)>" not in response.text
+        assert "&lt;img src=x onerror=alert(1)&gt;" in response.text
 
 
 @pytest.mark.asyncio
@@ -630,6 +732,11 @@ async def test_mail_agent_inbox(isolated_env):
         resp = await client.get("/mail/test-proj/inbox/BlueLake")
         assert resp.status_code == 200
         assert "text/html" in resp.headers.get("content-type", "")
+        assert "flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between" in resp.text
+        assert "line-clamp-2 mb-2 break-words text-lg font-semibold [overflow-wrap:anywhere]" in resp.text
+        assert "min-h-[44px] min-w-[44px]" in resp.text
+        assert ":aria-label=\"'Open message: ' + item.subject\"" in resp.text
+        assert not _has_nested_anchor(resp.text)
         # Should show messages
         assert "Test Message" in resp.text or "message" in resp.text.lower()
 
@@ -688,6 +795,7 @@ async def test_mail_message_detail(isolated_env):
         # Should show the message subject
         assert "Test Message" in resp.text or "message" in resp.text.lower()
         assert "<time datetime=" in resp.text
+        assert "inline-flex min-h-[44px] items-center gap-2" in resp.text
 
 
 @pytest.mark.asyncio
@@ -913,6 +1021,7 @@ async def test_mail_overseer_compose(isolated_env):
         # Should have a form
         assert "<form" in resp.text.lower() or "form" in resp.text.lower()
         assert 'sendEndpoint: "/mail/test-proj/overseer/send"' in resp.text
+        assert resp.text.count("inline-flex min-h-[44px] min-w-[44px] items-center justify-center") >= 7
 
 
 @pytest.mark.asyncio

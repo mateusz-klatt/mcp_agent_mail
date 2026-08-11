@@ -65,9 +65,11 @@
        by 45. That collision is now removed at its own end (see the panel), so
        the wrap is safe.
 
-       On >= sm nothing changes: there is room, so it never wraps. -->
-  <div class="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 px-6 py-4 flex flex-wrap items-center gap-4 sticky top-16 shadow-sm transition-all duration-300"
-       :class="isFullscreen ? 'z-50' : 'z-10'">
+       On >= sm nothing changes: there is room, so it never wraps. The base
+       navigation is 112 px below lg and 64 px at lg+, so the sticky offset
+       follows the same breakpoint instead of sliding underneath it. -->
+  <div class="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 px-6 py-4 flex flex-wrap items-center gap-4 sticky top-28 lg:top-16 shadow-sm transition-all duration-300"
+       :class="isFullscreen ? 'z-[60]' : 'z-10'">
     <!-- Search Bar -->
     <div class="flex-1 min-w-[16rem] relative group">
       <div class="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
@@ -79,14 +81,14 @@
         @keydown.escape="searchQuery = ''; filterMessages()"
         type="search"
         placeholder="Search loaded messages across projects (up to the latest 500)..."
-        class="w-full pl-12 pr-4 py-3 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 focus:border-primary-500 dark:focus:border-primary-500 rounded-xl text-slate-900 dark:text-white placeholder-slate-500 dark:placeholder-slate-400 transition-all duration-200 focus:ring-2 focus:ring-primary-500/20"
+        class="w-full pl-12 pr-14 py-3 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 focus:border-primary-500 dark:focus:border-primary-500 rounded-xl text-slate-900 dark:text-white placeholder-slate-500 dark:placeholder-slate-400 transition-all duration-200 focus:ring-2 focus:ring-primary-500/20"
         autocomplete="off"
         id="unified-search"
         aria-label="Search up to the latest 500 loaded messages"
       />
       <div class="absolute inset-y-0 right-0 pr-3 flex items-center gap-2">
         <template x-if="searchQuery">
-          <button @click="searchQuery = ''; filterMessages()" class="p-1 hover:bg-slate-200 dark:hover:bg-slate-700 rounded transition-colors" aria-label="Clear search">
+          <button type="button" @click="searchQuery = ''; filterMessages()" class="flex min-h-[44px] min-w-[44px] items-center justify-center rounded transition-colors hover:bg-slate-200 dark:hover:bg-slate-700" aria-label="Clear search">
             <i data-lucide="x" class="w-4 h-4 text-slate-500"></i>
           </button>
         </template>
@@ -175,15 +177,12 @@
        x-transition:leave="transition ease-in duration-150"
        x-transition:leave-start="opacity-100 translate-y-0"
        x-transition:leave-end="opacity-0 -translate-y-2"
-       {# top-56 below sm because the bar above wraps there and grows from 83 px
-          to 141 px. Stuck at top-16 it then ends at 205; top-40 catches at 160
-          and the two overlap by 45 px — measured, and only visible after
-          scrolling with the panel open, which is why the wrap was left undone
-          rather than shipped with this collision. 14rem gives 19 px of clearance
-          rather than the 3 px that 13rem measured, because the bar's height is a
-          consequence of its content and not a constant. #}
-       class="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 px-6 py-4 sticky top-56 sm:top-40 transition-all duration-300"
-       :class="isFullscreen ? 'z-50' : 'z-10'">
+       {# Measured clearances below the responsive header + sticky search bar:
+          mobile 112 + 141 = 253 px, sm 112 + 83 = 195 px, md 112 + 141 =
+          253 px, and lg 64 + 83 = 147 px. The next available Tailwind offsets
+          leave 19/13/19/13 px instead of allowing sticky surfaces to overlap. #}
+       class="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 px-6 py-4 sticky top-[17rem] sm:top-52 md:top-[17rem] lg:top-40 transition-all duration-300"
+       :class="isFullscreen ? 'z-[60]' : 'z-10'">
     <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
       <!-- Project Filter -->
       <div>
@@ -247,8 +246,8 @@
 
       <!-- Clear Filters -->
       <div class="flex items-end">
-        <button @click="clearFilters()"
-                class="w-full px-3 py-2 text-sm bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 font-medium rounded-lg transition-colors flex items-center justify-center gap-2">
+        <button type="button" @click="clearFilters()"
+                class="flex min-h-[44px] w-full items-center justify-center gap-2 rounded-lg bg-slate-100 px-3 py-2 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-200 dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600">
           <i data-lucide="x-circle" class="w-4 h-4"></i>
           Clear
         </button>
@@ -258,7 +257,7 @@
 
   <!-- Gmail-style Split Pane Layout -->
   <div class="flex overflow-hidden mb-8 transition-all duration-300"
-       :class="isFullscreen ? 'fixed inset-0 top-16 z-50 max-h-none min-h-0' : 'max-h-[500px] md:max-h-[650px] lg:max-h-[750px] min-h-[400px] md:min-h-[550px] lg:min-h-[650px]'">
+       :class="isFullscreen ? 'fixed inset-0 top-[18rem] lg:top-48 z-50 max-h-none min-h-0' : 'max-h-[500px] md:max-h-[650px] lg:max-h-[750px] min-h-[400px] md:min-h-[550px] lg:min-h-[650px]'">
 
     <!-- Left Pane: Message List -->
     <aside :class="viewMode === 'split' ? 'w-full md:w-2/5 lg:w-1/3 border-r border-slate-200 dark:border-slate-700' : 'w-full'"
@@ -268,7 +267,7 @@
       <div class="px-4 py-3 border-b border-slate-200 dark:border-slate-700 flex flex-wrap items-center justify-between gap-2 bg-slate-50 dark:bg-slate-900">
         <div class="flex min-w-0 flex-wrap items-center gap-3">
           {% if can_mutate %}
-          <label class="min-w-[44px] min-h-[44px] -my-2 -ml-2 flex items-center justify-center cursor-pointer md:min-w-5 md:min-h-5 md:m-0">
+          <label class="-my-2 -ml-2 flex min-h-[44px] min-w-[44px] cursor-pointer items-center justify-center md:my-0 md:ml-0">
             <span class="sr-only">Select all loaded messages</span>
             <input type="checkbox"
                    @change="toggleSelectAll()"
@@ -309,8 +308,11 @@
 
         <!-- Sort Options -->
         <div class="relative" x-data="{ sortOpen: false }">
-          <button @click="sortOpen = !sortOpen"
-                  class="px-2 py-1 text-xs bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded border border-slate-200 dark:border-slate-700 transition-colors flex items-center gap-1">
+          <button type="button"
+                  @click="sortOpen = !sortOpen"
+                  :aria-expanded="sortOpen"
+                  :aria-label="'Sort messages: ' + (sortBy === 'newest' ? 'newest first' : sortBy === 'oldest' ? 'oldest first' : sortBy === 'longest' ? 'longest first' : 'by sender')"
+                  class="min-h-[44px] min-w-[44px] px-3 py-2 text-xs bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded border border-slate-200 dark:border-slate-700 transition-colors flex items-center justify-center gap-1">
             <i data-lucide="arrow-down-up" class="w-3 h-3"></i>
             <span class="hidden sm:inline" x-text="sortBy === 'newest' ? 'Newest' : sortBy === 'oldest' ? 'Oldest' : sortBy === 'longest' ? 'Longest' : 'Sender'"></span>
           </button>
@@ -321,27 +323,27 @@
                x-transition:enter-start="opacity-0 scale-95"
                x-transition:enter-end="opacity-100 scale-100"
                class="absolute right-0 mt-1 w-40 bg-white dark:bg-slate-800 rounded-lg shadow-xl border border-slate-200 dark:border-slate-700 py-1 z-20">
-            <button @click="sortBy = 'newest'; filterMessages(); sortOpen = false"
+            <button type="button" @click="sortBy = 'newest'; filterMessages(); sortOpen = false"
                     :class="sortBy === 'newest' ? 'bg-primary-50 dark:bg-primary-900/20 text-primary-700 dark:text-primary-300' : 'text-slate-700 dark:text-slate-300'"
-                    class="w-full px-3 py-2 text-left text-sm hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors flex items-center gap-2">
+                    class="w-full min-h-[44px] px-3 py-2 text-left text-sm hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors flex items-center gap-2">
               <i data-lucide="arrow-down" class="w-4 h-4"></i>
               Newest First
             </button>
-            <button @click="sortBy = 'oldest'; filterMessages(); sortOpen = false"
+            <button type="button" @click="sortBy = 'oldest'; filterMessages(); sortOpen = false"
                     :class="sortBy === 'oldest' ? 'bg-primary-50 dark:bg-primary-900/20 text-primary-700 dark:text-primary-300' : 'text-slate-700 dark:text-slate-300'"
-                    class="w-full px-3 py-2 text-left text-sm hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors flex items-center gap-2">
+                    class="w-full min-h-[44px] px-3 py-2 text-left text-sm hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors flex items-center gap-2">
               <i data-lucide="arrow-up" class="w-4 h-4"></i>
               Oldest First
             </button>
-            <button @click="sortBy = 'sender'; filterMessages(); sortOpen = false"
+            <button type="button" @click="sortBy = 'sender'; filterMessages(); sortOpen = false"
                     :class="sortBy === 'sender' ? 'bg-primary-50 dark:bg-primary-900/20 text-primary-700 dark:text-primary-300' : 'text-slate-700 dark:text-slate-300'"
-                    class="w-full px-3 py-2 text-left text-sm hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors flex items-center gap-2">
+                    class="w-full min-h-[44px] px-3 py-2 text-left text-sm hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors flex items-center gap-2">
               <i data-lucide="user" class="w-4 h-4"></i>
               By Sender
             </button>
-            <button @click="sortBy = 'longest'; filterMessages(); sortOpen = false"
+            <button type="button" @click="sortBy = 'longest'; filterMessages(); sortOpen = false"
                     :class="sortBy === 'longest' ? 'bg-primary-50 dark:bg-primary-900/20 text-primary-700 dark:text-primary-300' : 'text-slate-700 dark:text-slate-300'"
-                    class="w-full px-3 py-2 text-left text-sm hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors flex items-center gap-2">
+                    class="w-full min-h-[44px] px-3 py-2 text-left text-sm hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors flex items-center gap-2">
               <i data-lucide="file-text" class="w-4 h-4"></i>
               Longest First
             </button>
@@ -355,9 +357,7 @@
           <div>
             <template x-for="(msg, index) in filteredMessages" :key="msg.id">
               <!-- Gmail-style Message Item -->
-              <div @click="handleMessageClick(msg)"
-                   @keydown.enter="handleMessageClick(msg)"
-                   :data-message-id="msg.id"
+              <div :data-message-id="msg.id"
                    {# the chime in base.html reads this to sound the right agent's
                       tone; the SSE frame carries no sender, by design #}
                    :data-sender="msg.sender"
@@ -366,17 +366,14 @@
                      'border-l-4 border-l-transparent hover:bg-slate-50 dark:hover:bg-slate-900': !selectedMessage || selectedMessage.id !== msg.id,
                      'font-semibold': !msg.read
                    }"
-                   class="px-4 py-3 border-b border-slate-100 dark:border-slate-700 cursor-pointer transition-all duration-200 group focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-inset"
-                   :style="`animation-delay: ${Math.min(index * 0.02, 0.5)}s;`"
-                   tabindex="0"
-                   role="button"
-                   :aria-label="'Message from ' + msg.sender + ': ' + msg.subject">
+                   class="group border-b border-slate-100 px-4 py-3 transition-all duration-200 dark:border-slate-700"
+                   :style="`animation-delay: ${Math.min(index * 0.02, 0.5)}s;`">
 
                 <div class="flex items-start gap-3">
                   {% if can_mutate %}
                   <!-- Checkbox -->
                   <label @click.stop
-                         class="min-w-[44px] min-h-[44px] -my-2 -ml-2 flex items-start justify-center pt-3 cursor-pointer md:min-w-5 md:min-h-5 md:m-0 md:pt-1">
+                         class="-my-2 -ml-2 flex min-h-[44px] min-w-[44px] cursor-pointer items-start justify-center pt-3 md:my-0 md:ml-0 md:pt-1">
                     <span class="sr-only" x-text="'Select message: ' + msg.subject"></span>
                     <input type="checkbox"
                            @change="toggleMessageSelection(msg.id)"
@@ -388,7 +385,13 @@
                   {% endif %}
 
                   <!-- Message Content -->
-                  <div class="flex-1 min-w-0">
+                  <div @click="handleMessageClick(msg)"
+                       @keydown.enter="handleMessageClick(msg)"
+                       @keydown.space.prevent="handleMessageClick(msg)"
+                       class="min-w-0 flex-1 cursor-pointer rounded focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2 dark:focus:ring-offset-slate-800"
+                       tabindex="0"
+                       role="button"
+                       :aria-label="'Open message from ' + msg.sender + ': ' + msg.subject">
                     <!-- Sender → Recipients -->
                     <div class="flex items-center gap-2 mb-1">
                       <span class="text-sm font-semibold text-slate-900 dark:text-white truncate" x-text="msg.sender"></span>

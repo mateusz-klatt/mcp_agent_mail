@@ -234,6 +234,19 @@
     <style>
       [x-cloak] { display: none !important; }
 
+      /* Jinja child blocks can leave whitespace text nodes behind, so :empty
+         cannot reliably identify pages without actions. :has only considers
+         actual child elements and keeps those pages from gaining a blank row. */
+      #page-header-actions:not(:has(> *)) { display: none; }
+
+      #header-breadcrumbs > nav { min-width: max-content; }
+
+      #header-breadcrumbs a {
+        display: inline-flex;
+        min-height: 44px;
+        align-items: center;
+      }
+
       /* Tutorial Animations */
       @keyframes shimmer {
         0% { transform: translateX(-100%); }
@@ -2153,7 +2166,11 @@
     <!-- Navigation Header -->
     <nav class="glass sticky top-0 z-40 border-b border-slate-200/80 dark:border-slate-700/80">
       <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div class="flex items-center justify-between h-16">
+        <div class="flex min-h-[64px] flex-wrap items-center gap-x-2 gap-y-2 py-2 lg:flex-nowrap lg:gap-x-8 lg:py-0">
+          <!-- These two wrappers become display:contents on desktop. On smaller
+               screens they form real rows, so visual order and DOM/tab order
+               stay identical at every breakpoint. -->
+          <div data-header-primary-row class="flex w-full min-w-0 items-center gap-2 lg:contents">
           <!-- Logo and Brand -->
           <!-- Below xl the wordmark gives way to the logo tile, which is still a
                link to /mail. Measured on a 440 px viewport (iPhone 17 Pro Max,
@@ -2162,24 +2179,35 @@
                sideways. The wordmark plus its gap is 83 px of that; the two tighter
                gaps are another 16. Breadcrumbs vary per page and a project slug is
                longer than "Unified Inbox", so the slack is deliberate. -->
-          <div class="flex min-w-0 flex-1 items-center gap-4 lg:gap-8">
-            <a href="/mail" class="flex items-center gap-3 group">
-              <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-primary-500 to-primary-700 flex items-center justify-center shadow-medium group-hover:shadow-glow transition-all duration-300">
-                <i data-lucide="mail" class="w-5 h-5 text-white"></i>
-              </div>
-              <span class="hidden xl:inline text-xl font-bold bg-gradient-to-r from-primary-600 to-primary-800 dark:from-primary-400 dark:to-primary-600 bg-clip-text text-transparent">
-                Agent Mail
-              </span>
-            </a>
+          <a href="/mail" aria-label="Agent Mail home"
+             class="flex min-h-[44px] min-w-[44px] shrink-0 items-center gap-3 group">
+            <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-primary-500 to-primary-700 flex items-center justify-center shadow-medium group-hover:shadow-glow transition-all duration-300">
+              <i data-lucide="mail" class="w-5 h-5 text-white"></i>
+            </div>
+            <span class="hidden xl:inline text-xl font-bold bg-gradient-to-r from-primary-600 to-primary-800 dark:from-primary-400 dark:to-primary-600 bg-clip-text text-transparent">
+              Agent Mail
+            </span>
+          </a>
 
-            <!-- Breadcrumbs -->
+          <!-- Archive paths can be wider than the 390/430 px viewport, so the
+               remaining space in this row scrolls rather than colliding. -->
+          <div id="header-breadcrumbs"
+               class="min-w-0 flex-1 overflow-x-auto">
             {% block breadcrumbs %}{% endblock %}
           </div>
+          </div>
 
-          <!-- Right side actions -->
-          <div class="flex shrink-0 items-center gap-1 sm:gap-2 lg:gap-3">
-            {% block header_actions %}{% endblock %}
+          <div data-header-secondary-row class="flex w-full flex-col gap-2 lg:contents">
 
+          <!-- Page actions receive a dedicated row below lg. Keeping them
+               separate from the global controls prevents archive actions from
+               overlapping the sticky header at 390/430/640/768 px widths. -->
+          <div id="page-header-actions"
+               class="flex w-full items-center justify-end lg:w-auto lg:shrink-0">{%- block header_actions -%}{%- endblock -%}</div>
+
+          <!-- Global controls follow page actions in both DOM and visual order,
+               preventing keyboard focus from jumping between header rows. -->
+          <div id="global-header-controls" class="ml-auto flex shrink-0 items-center gap-1 sm:gap-2 lg:gap-3">
             <!-- Live state + sound. Here rather than per page, so every view
                  that inherits this layout updates itself; the pages that land
                  on people are the index and the unified inbox, not only a
@@ -2222,6 +2250,7 @@
                 <path stroke-linecap="round" stroke-linejoin="round" d="M12 2v2m0 16v2m10-10h-2M6 12H4m15.364 6.364-1.414-1.414M6.05 6.05 4.636 4.636m12.728 0-1.414 1.414M6.05 17.95l-1.414 1.414" />
               </svg>
             </button>
+          </div>
           </div>
         </div>
       </div>

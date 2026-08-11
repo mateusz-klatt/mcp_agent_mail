@@ -26,6 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from git import NULL_TREE
+from markupsafe import Markup, escape as escape_markup
 from sqlalchemy import text
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -2658,6 +2659,23 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             like_pat = "%" + "%".join(like_terms) + "%" if like_terms else ""
             return fts, like_pat, like_scope, tokens
 
+        def _safe_fts_snippet(raw_snippet: object) -> tuple[Markup, int]:
+            """Escape agent-controlled FTS text while preserving highlights.
+
+            SQLite's ``snippet`` function returns source text and the two
+            caller-supplied highlight tags in one string.  Escaping the whole
+            value first, then restoring only exact, attribute-free ``mark``
+            tags keeps the highlight useful without trusting message HTML.
+            """
+
+            snippet = str(raw_snippet or "")
+            hits = snippet.count("<mark>")
+            escaped = str(escape_markup(snippet))
+            highlighted = escaped.replace("&lt;mark&gt;", "<mark>").replace(
+                "&lt;/mark&gt;", "</mark>"
+            )
+            return Markup(highlighted), hits
+
         @fastapi_app.get("/mail/api/locks", response_class=JSONResponse)
         async def mail_lock_status(request: Request) -> JSONResponse:
             """Return metadata about active archive locks for observability."""
@@ -3677,6 +3695,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         search = await session.execute(text(fts_sql), {"pid": pid, "q": fts_expr or q})
                         matched_messages = []
                         for r in search.mappings().all():
+                            safe_snippet, snippet_hits = _safe_fts_snippet(
+                                r["body_snippet"]
+                            )
                             sender_display, sender_meta = _http_sender_identity(
                                 message_project_id=pid,
                                 sender_name=r["sender_name"],
@@ -3691,8 +3712,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                 "created": str(r["created_ts"]),
                                 "importance": r["importance"],
                                 "thread_id": r["thread_id"],
-                                "snippet": r["body_snippet"],
-                                "hits": (r["body_snippet"] or "").count("<mark>"),
+                                "snippet": safe_snippet,
+                                "hits": snippet_hits,
                             }
                             item.update(sender_meta)
                             matched_messages.append(item)
@@ -4765,6 +4786,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     rows = await session.execute(text(fts_sql), {"pid": pid, "q": fts_expr or q, "lim": limit})
                     results = []
                     for r in rows.mappings().all():
+                        safe_snippet, snippet_hits = _safe_fts_snippet(
+                            r["body_snippet"]
+                        )
                         sender_display, sender_meta = _http_sender_identity(
                             message_project_id=pid,
                             sender_name=r["sender_name"],
@@ -4779,8 +4803,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                             "created": str(r["created_ts"]),
                             "importance": r["importance"],
                             "thread_id": r["thread_id"],
-                            "snippet": r["body_snippet"],
-                            "hits": (r["body_snippet"] or "").count("<mark>"),
+                            "snippet": safe_snippet,
+                            "hits": snippet_hits,
                         }
                         item.update(sender_meta)
                         results.append(item)

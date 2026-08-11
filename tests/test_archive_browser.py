@@ -196,6 +196,11 @@ async def test_archive_guide(isolated_env):
         resp = await client.get("/mail/archive/guide")
         assert resp.status_code == 200
         assert "text/html" in resp.headers.get("content-type", "")
+        body = resp.text
+        assert "#page-header-actions:not(:has(> *)) { display: none; }" in body
+        empty_actions = body.split('id="page-header-actions"', 1)[1].split("</div>", 1)[0]
+        assert "<button" not in empty_actions
+        assert "<a " not in empty_actions
 
 
 @pytest.mark.asyncio
@@ -470,6 +475,39 @@ async def test_archive_activity(isolated_env):
         resp = await client.get("/mail/archive/activity")
         assert resp.status_code == 200
         assert "text/html" in resp.headers.get("content-type", "")
+        body = resp.text
+        assert 'id="page-header-actions"' in body
+        assert 'data-header-primary-row class="flex w-full min-w-0 items-center gap-2 lg:contents"' in body
+        assert 'data-header-secondary-row class="flex w-full flex-col gap-2 lg:contents"' in body
+        assert 'class="flex w-full items-center justify-end lg:w-auto lg:shrink-0"' in body
+        assert 'id="header-breadcrumbs"' in body
+        assert 'id="global-header-controls"' in body
+        assert 'href="/mail" aria-label="Agent Mail home"' in body
+        assert body.index('aria-label="Agent Mail home"') < body.index('id="header-breadcrumbs"')
+        assert body.index('id="header-breadcrumbs"') < body.index('id="page-header-actions"')
+        assert body.index('id="page-header-actions"') < body.index('id="global-header-controls"')
+        header_markup = body.split("<!-- Navigation Header -->", 1)[1].split("<!-- Main Content -->", 1)[0]
+        assert 'class="order-' not in header_markup
+        assert " lg:order-" not in header_markup
+        assert 'data-archive-action="filter"' in body
+        assert 'data-archive-action="refresh"' in body
+        filter_action = body.split('data-archive-action="filter"', 1)[1].split("</button>", 1)[0]
+        refresh_action = body.split('data-archive-action="refresh"', 1)[1].split("</button>", 1)[0]
+        assert "min-h-[44px]" in filter_action
+        assert "min-h-[44px]" in refresh_action
+        assert "@click=\"$dispatch('archive-filter-toggle')\"" in body
+        assert "@archive-filter-toggle.window=" in body
+        assert ':aria-expanded="filterOpen.toString()"' in body
+        assert 'aria-controls="activity-filter-panel"' in body
+        assert 'aria-haspopup="true"' not in body
+        assert "@archive-filter-state.window=" in body
+        assert 'id="activity-filter-trigger"' in body
+        assert body.count("document.getElementById('activity-filter-trigger')?.focus()") == 2
+        assert 'id="activity-filter-panel"' in body
+        assert 'x-model.debounce.150ms="filterQuery"' in body
+        assert 'x-for="(commit, index) in filteredCommits()"' in body
+        assert 'x-text="filteredCommits().length"' in body
+        assert "$refs.filterDropdown" not in body
 
 
 @pytest.mark.asyncio
@@ -509,6 +547,17 @@ async def test_archive_commit_detail(isolated_env):
         resp = await client.get(f"/mail/archive/commit/{data['head_sha']}")
         assert resp.status_code == 200
         assert "text/html" in resp.headers.get("content-type", "")
+        body = resp.text
+        assert "diff2html-ui.min.js" in body
+        assert "new Diff2HtmlUI(targetElement, diffString, configuration)" in body
+        assert "diff2htmlUi.draw()" in body
+        assert "Diff2Html.html(" not in body
+        assert 'data-archive-action="copy-sha"' in body
+        assert 'data-archive-action="back"' in body
+        copy_action = body.split('data-archive-action="copy-sha"', 1)[1].split("</button>", 1)[0]
+        back_action = body.split('data-archive-action="back"', 1)[1].split("</button>", 1)[0]
+        assert "min-h-[44px]" in copy_action
+        assert "min-h-[44px]" in back_action
 
 
 @pytest.mark.asyncio
@@ -576,12 +625,45 @@ async def test_archive_timeline(isolated_env):
     app = build_http_app(settings, server)
 
     await _setup_archive_with_commits(settings)
+    # Each value survives the 20-character Mermaid tag limit. Concatenating
+    # three generated lines through innerHTML used to close the <pre>, build a
+    # script, comment out the Mermaid fragments, and execute alert(1).
+    hostile_senders = ["</pre><script>/*", "*/alert(1);/*", "*/</script><pre>"]
+    archive = await ensure_archive(settings, "archive-test")
+    for message_id, hostile_sender in enumerate(hostile_senders, start=2):
+        await write_message_bundle(
+            archive,
+            message={
+                "id": message_id,
+                "subject": "Hostile metadata",
+                "created": f"2026-01-12T12:0{message_id}:00",
+            },
+            body_md="Timeline metadata must remain inert.",
+            sender=hostile_sender,
+            recipients=["BlueLake"],
+        )
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.get("/mail/archive/timeline")
         assert resp.status_code == 200
         assert "text/html" in resp.headers.get("content-type", "")
+        body = resp.text
+        assert "data-timeline-graph" in body
+        assert "hidden overflow-hidden" in body
+        assert "lg:block" in body
+        assert "data-mobile-timeline-fallback" in body
+        assert "lg:hidden" in body
+        assert hostile_senders[0] not in body
+        assert hostile_senders[2] not in body
+        assert "\\u003c/pre\\u003e\\u003cscript\\u003e/*" in body
+        assert "*/\\u003c/script\\u003e\\u003cpre\\u003e" in body
+        assert "container.innerHTML" not in body
+        assert "document.createElement('pre')" in body
+        assert "mermaidElement.textContent = mermaidCode" in body
+        assert "container.replaceChildren(mermaidElement)" in body
+        first_event = body.split('href="/mail/archive/commit/', 1)[1].split("</a>", 1)[0]
+        assert "min-h-[44px]" in first_event
 
 
 # =============================================================================

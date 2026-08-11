@@ -21,15 +21,15 @@
 {% block content %}
 <div class="space-y-6 animate-fade-in" x-data="inboxManager()">
   <!-- Inbox Header with Filters -->
-  <div class="bg-white dark:bg-slate-800 rounded-xl p-8 shadow-soft border border-slate-200 dark:border-slate-700">
+  <div class="bg-white dark:bg-slate-800 rounded-xl p-4 sm:p-8 shadow-soft border border-slate-200 dark:border-slate-700">
     <!-- Top Row: Title and Actions -->
-    <div class="flex items-center justify-between mb-6">
-      <div class="flex items-center gap-4">
-        <div class="w-16 h-16 bg-gradient-to-br from-primary-500 to-primary-700 rounded-xl flex items-center justify-center shadow-medium float">
+    <div class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between mb-6">
+      <div class="flex min-w-0 items-center gap-4">
+        <div class="w-16 h-16 flex-shrink-0 bg-gradient-to-br from-primary-500 to-primary-700 rounded-xl flex items-center justify-center shadow-medium float">
           <i data-lucide="inbox" class="w-8 h-8 text-white"></i>
         </div>
-        <div>
-          <h1 class="text-3xl font-bold text-slate-900 dark:text-white mb-1">
+        <div class="min-w-0">
+          <h1 class="text-3xl font-bold text-slate-900 dark:text-white mb-1 break-words [overflow-wrap:anywhere]">
             {{ agent }}
           </h1>
           <p class="text-slate-600 dark:text-slate-400">
@@ -48,9 +48,9 @@
       </div>
 
       <!-- Quick Actions -->
-      <div class="flex items-center gap-2">
-        <button @click="refresh()"
-                class="px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-all duration-200 flex items-center gap-2 shadow-sm hover:shadow-md"
+      <div class="flex flex-wrap items-center gap-2 sm:justify-end">
+        <button type="button" @click="refresh()"
+                class="min-h-[44px] min-w-[44px] px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-all duration-200 flex items-center justify-center gap-2 shadow-sm hover:shadow-md"
                 data-tippy-content="Refresh inbox"
                 aria-label="Refresh inbox">
           <i data-lucide="refresh-cw" class="w-4 h-4" :class="{ 'animate-spin': isRefreshing }"></i>
@@ -65,31 +65,31 @@
              x-transition:enter-end="opacity-100 transform scale-100"
              class="flex items-center gap-2 border-l border-slate-300 dark:border-slate-600 pl-2 ml-2">
           <span class="text-sm text-slate-600 dark:text-slate-400" x-text="selectedMessages.length + ' selected'"></span>
-          <button @click="markSelectedAsRead()"
-                  class="px-3 py-2 bg-green-100 dark:bg-green-900/30 hover:bg-green-200 dark:hover:bg-green-800/40 text-green-700 dark:text-green-300 rounded-lg transition-colors flex items-center gap-1.5 text-sm font-medium"
+          <button type="button" @click="markSelectedAsRead()"
+                  class="min-h-[44px] min-w-[44px] px-3 py-2 bg-green-100 dark:bg-green-900/30 hover:bg-green-200 dark:hover:bg-green-800/40 text-green-700 dark:text-green-300 rounded-lg transition-colors flex items-center justify-center gap-1.5 text-sm font-medium"
                   data-tippy-content="Mark selected as read"
                   aria-label="Mark selected messages as read">
             <i data-lucide="check" class="w-4 h-4"></i>
             <span class="hidden sm:inline">Mark Read</span>
           </button>
-          <button @click="deleteSelectedMessages()"
-                  class="px-3 py-2 bg-red-100 dark:bg-red-900/30 hover:bg-red-200 dark:hover:bg-red-800/40 text-red-700 dark:text-red-300 rounded-lg transition-colors flex items-center gap-1.5 text-sm font-medium"
+          <button type="button" @click="deleteSelectedMessages()"
+                  class="min-h-[44px] min-w-[44px] px-3 py-2 bg-red-100 dark:bg-red-900/30 hover:bg-red-200 dark:hover:bg-red-800/40 text-red-700 dark:text-red-300 rounded-lg transition-colors flex items-center justify-center gap-1.5 text-sm font-medium"
                   data-tippy-content="Permanently delete selected messages"
                   aria-label="Delete selected messages">
             <i data-lucide="trash-2" class="w-4 h-4"></i>
             <span class="hidden sm:inline">Delete</span>
           </button>
-          <button @click="clearSelection()"
-                  class="px-3 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-colors flex items-center gap-1.5 text-sm"
+          <button type="button" @click="clearSelection()"
+                  class="min-h-[44px] min-w-[44px] px-3 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-colors flex items-center justify-center gap-1.5 text-sm"
                   data-tippy-content="Clear selection"
                   aria-label="Clear selection">
             <i data-lucide="x" class="w-4 h-4"></i>
           </button>
         </div>
 
-        <button @click="markAllAsRead()"
+        <button type="button" @click="markAllAsRead()"
                 :disabled="isRefreshing"
-                class="px-4 py-2 bg-success-600 hover:bg-success-500 dark:bg-success-600 dark:hover:bg-success-500 text-white rounded-lg transition-all duration-200 flex items-center gap-2 shadow-sm hover:shadow-md disabled:opacity-50 disabled:cursor-not-allowed"
+                class="min-h-[44px] min-w-[44px] px-4 py-2 bg-success-600 hover:bg-success-500 dark:bg-success-600 dark:hover:bg-success-500 text-white rounded-lg transition-all duration-200 flex items-center justify-center gap-2 shadow-sm hover:shadow-md disabled:opacity-50 disabled:cursor-not-allowed"
                 data-tippy-content="Mark all messages as read"
                 aria-label="Mark All Read">
           <i data-lucide="check-check" class="w-4 h-4" :class="{ 'animate-spin': isRefreshing }"></i>
@@ -116,41 +116,43 @@
 
       <!-- Filter Buttons -->
       <div class="flex items-center gap-2 flex-wrap">
-        <button @click="activeFilter = 'all'; filterMessages()"
+        <button type="button" @click="activeFilter = 'all'; filterMessages()"
                 :class="activeFilter === 'all' ? 'bg-primary-600 text-white ring-2 ring-primary-500 ring-offset-2 dark:ring-offset-slate-900' : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700'"
-                class="px-4 py-2.5 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2 shadow-sm">
+                class="min-h-[44px] px-4 py-2.5 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2 shadow-sm">
           <i data-lucide="inbox" class="w-4 h-4"></i>
           <span>All</span>
         </button>
-        <button @click="activeFilter = 'unread'; filterMessages()"
+        <button type="button" @click="activeFilter = 'unread'; filterMessages()"
                 :class="activeFilter === 'unread' ? 'bg-primary-600 text-white ring-2 ring-primary-500 ring-offset-2 dark:ring-offset-slate-900' : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700'"
-                class="px-4 py-2.5 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2 shadow-sm">
+                class="min-h-[44px] px-4 py-2.5 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2 shadow-sm">
           <i data-lucide="mail" class="w-4 h-4"></i>
           <span>Unread</span>
           <template x-if="unreadCount > 0">
             <span class="px-1.5 py-0.5 bg-white/20 rounded-full text-xs font-bold" x-text="unreadCount"></span>
           </template>
         </button>
-        <button @click="activeFilter = 'needs_ack'; filterMessages()"
+        <button type="button" @click="activeFilter = 'needs_ack'; filterMessages()"
                 :class="activeFilter === 'needs_ack' ? 'bg-warning-600 text-white ring-2 ring-warning-500 ring-offset-2 dark:ring-offset-slate-900' : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700'"
-                class="px-4 py-2.5 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2 shadow-sm">
+                class="min-h-[44px] px-4 py-2.5 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2 shadow-sm">
           <i data-lucide="bell" class="w-4 h-4"></i>
           <span>Needs ack</span>
           <template x-if="needsAckCount > 0">
             <span class="px-1.5 py-0.5 bg-white/20 rounded-full text-xs font-bold" x-text="needsAckCount"></span>
           </template>
         </button>
-        <button @click="activeFilter = 'urgent'; filterMessages()"
+        <button type="button" @click="activeFilter = 'urgent'; filterMessages()"
                 :class="activeFilter === 'urgent' ? 'bg-danger-600 text-white ring-2 ring-danger-500 ring-offset-2 dark:ring-offset-slate-900' : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700'"
-                class="px-4 py-2.5 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2 shadow-sm">
+                class="min-h-[44px] px-4 py-2.5 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2 shadow-sm">
           <i data-lucide="alert-circle" class="w-4 h-4"></i>
           <span>Urgent</span>
         </button>
 
         <!-- Sort Dropdown -->
         <div class="relative" x-data="{ open: false }">
-          <button @click="open = !open"
-                  class="px-4 py-2.5 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2 shadow-sm border border-slate-300 dark:border-slate-600">
+          <button type="button" @click="open = !open"
+                  :aria-expanded="open"
+                  aria-label="Sort inbox messages"
+                  class="min-h-[44px] px-4 py-2.5 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2 shadow-sm border border-slate-300 dark:border-slate-600">
             <i data-lucide="arrow-up-down" class="w-4 h-4"></i>
             <span>Sort</span>
             <i data-lucide="chevron-down" class="w-4 h-4 transition-transform" :class="{ 'rotate-180': open }"></i>
@@ -162,21 +164,21 @@
                x-transition:enter-start="opacity-0 transform scale-95 -translate-y-2"
                x-transition:enter-end="opacity-100 transform scale-100 translate-y-0"
                class="absolute right-0 mt-2 w-48 bg-white dark:bg-slate-800 rounded-lg shadow-xl border border-slate-200 dark:border-slate-700 py-2 z-10">
-            <button @click="sortBy = 'newest'; filterMessages(); open = false"
+            <button type="button" @click="sortBy = 'newest'; filterMessages(); open = false"
                     :class="sortBy === 'newest' ? 'bg-primary-50 dark:bg-primary-900/20 text-primary-700 dark:text-primary-300' : 'text-slate-700 dark:text-slate-300'"
-                    class="w-full px-4 py-2 text-left text-sm hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors flex items-center gap-2">
+                    class="flex min-h-[44px] w-full items-center gap-2 px-4 py-2 text-left text-sm transition-colors hover:bg-slate-50 dark:hover:bg-slate-700">
               <i data-lucide="arrow-down" class="w-4 h-4"></i>
               Newest First
             </button>
-            <button @click="sortBy = 'oldest'; filterMessages(); open = false"
+            <button type="button" @click="sortBy = 'oldest'; filterMessages(); open = false"
                     :class="sortBy === 'oldest' ? 'bg-primary-50 dark:bg-primary-900/20 text-primary-700 dark:text-primary-300' : 'text-slate-700 dark:text-slate-300'"
-                    class="w-full px-4 py-2 text-left text-sm hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors flex items-center gap-2">
+                    class="flex min-h-[44px] w-full items-center gap-2 px-4 py-2 text-left text-sm transition-colors hover:bg-slate-50 dark:hover:bg-slate-700">
               <i data-lucide="arrow-up" class="w-4 h-4"></i>
               Oldest First
             </button>
-            <button @click="sortBy = 'sender'; filterMessages(); open = false"
+            <button type="button" @click="sortBy = 'sender'; filterMessages(); open = false"
                     :class="sortBy === 'sender' ? 'bg-primary-50 dark:bg-primary-900/20 text-primary-700 dark:text-primary-300' : 'text-slate-700 dark:text-slate-300'"
-                    class="w-full px-4 py-2 text-left text-sm hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors flex items-center gap-2">
+                    class="flex min-h-[44px] w-full items-center gap-2 px-4 py-2 text-left text-sm transition-colors hover:bg-slate-50 dark:hover:bg-slate-700">
               <i data-lucide="user" class="w-4 h-4"></i>
               By Sender
             </button>
@@ -193,43 +195,47 @@
         <div class="bg-white dark:bg-slate-800 rounded-xl shadow-soft border-2 transition-all duration-300 transform hover:-translate-y-0.5 hover:shadow-medium hover:border-primary-300 dark:hover:border-primary-700 overflow-hidden stagger-item"
              :class="item.unread ? 'border-primary-300 dark:border-primary-700 bg-primary-50/30 dark:bg-primary-900/10' : 'border-slate-200 dark:border-slate-700'"
              :style="`animation-delay: ${Math.min(index * 0.05, 1.0)}s;`">
-          <div class="flex items-start p-6 gap-4">
+          <div class="flex items-start p-4 gap-3 sm:p-6 sm:gap-4">
             {% if can_mutate %}
             <!-- Checkbox for bulk selection -->
-            <div class="flex-shrink-0 pt-1">
+            <label class="-my-2 -ml-2 flex min-h-[44px] min-w-[44px] flex-shrink-0 cursor-pointer items-start justify-center pt-3 sm:my-0 sm:ml-0 sm:pt-1">
+              <span class="sr-only" x-text="'Select message: ' + item.subject"></span>
               <input type="checkbox"
                      :value="item.id"
                      @change="toggleSelection(item.id)"
                      :checked="selectedMessages.includes(item.id)"
                      class="w-5 h-5 text-primary-600 bg-white dark:bg-slate-700 border-slate-300 dark:border-slate-600 rounded focus:ring-2 focus:ring-primary-500 transition-all duration-200 cursor-pointer"
                      :aria-label="'Select message: ' + item.subject" />
-            </div>
+            </label>
             {% endif %}
 
-            <!-- Message Content (clickable) -->
-            <a :href="`/mail/{{ project.slug }}/message/${item.id}`"
-               class="flex-1 min-w-0 group">
+            <!-- Message Content. Keep the message and thread links separate:
+                 nested anchors are invalid HTML and confuse touch/screen-reader users. -->
+            <div class="flex-1 min-w-0">
 
               <!-- Message Header -->
-              <div class="flex items-start justify-between mb-3">
+              <div class="flex flex-col gap-3 mb-3 sm:flex-row sm:items-start sm:justify-between">
                 <div class="flex-1 min-w-0">
-                  <h3 class="text-lg font-semibold text-slate-900 dark:text-white group-hover:text-primary-600 dark:group-hover:text-primary-400 transition-colors line-clamp-1 mb-2"
-                      x-text="item.subject"></h3>
+                  <h3 class="line-clamp-2 mb-2 break-words text-lg font-semibold [overflow-wrap:anywhere]">
+                    <a :href="`/mail/{{ project.slug }}/message/${item.id}`"
+                       class="block min-h-[44px] text-slate-900 transition-colors hover:text-primary-600 dark:text-white dark:hover:text-primary-400"
+                       x-text="item.subject"></a>
+                  </h3>
 
                   <!-- Message Meta -->
-                  <div class="flex items-center gap-4 text-sm text-slate-600 dark:text-slate-400 flex-wrap">
-                    <div class="flex items-center gap-1.5">
+                  <div class="flex flex-col items-start gap-2 text-sm text-slate-600 dark:text-slate-400 sm:flex-row sm:items-center sm:gap-4 sm:flex-wrap">
+                    <div class="flex min-w-0 items-center gap-1.5">
                       <i data-lucide="user" class="w-4 h-4"></i>
-                      <span class="font-medium" x-text="item.sender"></span>
+                      <span class="font-medium break-words [overflow-wrap:anywhere]" x-text="item.sender"></span>
                     </div>
-                    <div class="flex items-center gap-1.5">
+                    <div class="flex min-w-0 items-center gap-1.5">
                       <i data-lucide="calendar" class="w-4 h-4"></i>
-                      <span x-text="item.created"></span>
+                      <span class="break-words [overflow-wrap:anywhere]" x-text="item.created"></span>
                     </div>
                     <template x-if="item.thread_id">
                       <a :href="`/mail/{{ project.slug }}/thread/${item.thread_id}`"
                          @click.stop
-                         class="flex items-center gap-1.5 px-2 py-1 bg-primary-100 dark:bg-primary-900/30 hover:bg-primary-200 dark:hover:bg-primary-800/40 text-primary-700 dark:text-primary-300 rounded-md transition-colors">
+                         class="flex min-h-[44px] items-center gap-1.5 px-2 py-1 bg-primary-100 dark:bg-primary-900/30 hover:bg-primary-200 dark:hover:bg-primary-800/40 text-primary-700 dark:text-primary-300 rounded-md transition-colors">
                         <i data-lucide="messages-square" class="w-3.5 h-3.5"></i>
                         <span class="font-mono text-xs font-medium">Thread</span>
                         <span class="font-mono text-xs opacity-75" x-text="'#' + item.thread_id"></span>
@@ -239,7 +245,7 @@
                 </div>
 
                 <!-- Badges and Status -->
-                <div class="flex items-center gap-2 ml-4">
+                <div class="flex flex-wrap items-center gap-2 sm:ml-4 sm:flex-nowrap">
                   <!-- Read/Ack state -->
                   <template x-if="item.unread">
                     <span class="px-2.5 py-1 bg-primary-100 dark:bg-primary-900/40 text-primary-700 dark:text-primary-300 text-xs font-bold rounded-full flex items-center gap-1.5">
@@ -287,12 +293,14 @@
                   </template>
 
                   <!-- Arrow Icon -->
-                  <div class="text-slate-400 group-hover:text-primary-600 dark:group-hover:text-primary-400 group-hover:translate-x-1 transition-all duration-300">
+                  <a :href="`/mail/{{ project.slug }}/message/${item.id}`"
+                     :aria-label="'Open message: ' + item.subject"
+                     class="flex min-h-[44px] min-w-[44px] items-center justify-center text-slate-400 transition-all duration-300 hover:translate-x-1 hover:text-primary-600 dark:hover:text-primary-400">
                     <i data-lucide="arrow-right" class="w-5 h-5"></i>
-                  </div>
+                  </a>
                 </div>
               </div>
-            </a>
+            </div>
           </div>
         </div>
       </template>

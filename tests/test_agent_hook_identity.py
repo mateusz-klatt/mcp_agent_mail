@@ -1047,6 +1047,9 @@ def test_inbox_watch_requires_explicit_valid_client_and_slot_without_network(
         ("event", "new mail for {agent} (id 4242)"),
         ("no-ready", "could not subscribe"),
         ("cut", "event stream closed"),
+        ("invalid-watch", "event stream closed"),
+        ("overflow-watch", "event stream closed"),
+        ("overflow-ready", "event stream closed"),
         ("timeout", "watch window elapsed"),
     ],
 )
@@ -1072,7 +1075,16 @@ if [[ " $* " == *"/events?"* ]]; then
   printf '%s\n' "$config" > "$FAKE_STREAM_AUTH_LOG"
   case "$FAKE_WATCH_MODE" in
     no-ready) exit 0 ;;
-    cut) printf ': ready\n\n'; exit 0 ;;
+    cut)
+      while [[ ! -f "$FAKE_READINESS_RELEASE" ]]; do
+        /usr/bin/sleep 0.01
+      done
+      printf ': ready\n\n'
+      exit 0
+      ;;
+    invalid-watch) printf ': ready\n\n'; exit 0 ;;
+    overflow-watch) printf ': ready\n\n'; exit 0 ;;
+    overflow-ready) /usr/bin/sleep 1.2; printf ': ready\n\n'; exit 0 ;;
     timeout) printf ': ready\n\n'; sleep 1; exit 0 ;;
     pending) printf ': ready\n\n'; sleep 30; exit 0 ;;
     event) printf ': ready\n\ndata: {"id":4242}\n\n'; exit 0 ;;
@@ -1092,6 +1104,39 @@ envelope="$(jq -nc --arg text "$result" \
 printf '%s\n200' "$envelope"
 """,
     )
+    fake_date = fake_bin / "date"
+    fake_date.write_text(
+        """#!/usr/bin/env bash
+if [[ ${FAKE_WATCH_MODE:-} == cut && ${1:-} == +%s ]]; then
+  calls=0
+  [[ -f $FAKE_DATE_CALL_LOG ]] && read -r calls < "$FAKE_DATE_CALL_LOG"
+  calls=$(( calls + 1 ))
+  printf '%s\n' "$calls" > "$FAKE_DATE_CALL_LOG"
+  if [[ $calls -eq 1 ]]; then
+    printf '100\n'
+  else
+    printf '101\n'
+  fi
+  exit 0
+fi
+exec /usr/bin/date "$@"
+""",
+        encoding="utf-8",
+        newline="\n",
+    )
+    fake_date.chmod(0o700)
+    fake_sleep = fake_bin / "sleep"
+    fake_sleep.write_text(
+        """#!/usr/bin/env bash
+if [[ ${FAKE_WATCH_MODE:-} == cut && ${1:-} == 0.2 ]]; then
+  : > "$FAKE_READINESS_RELEASE"
+fi
+exec /usr/bin/sleep "$@"
+""",
+        encoding="utf-8",
+        newline="\n",
+    )
+    fake_sleep.chmod(0o700)
     hook_dir = tmp_path / "hooks with space"
     hook_dir.mkdir()
     watcher = hook_dir / "inbox_watch.sh"
@@ -1122,12 +1167,30 @@ printf '%s\n200' "$envelope"
     )
     stream_auth_log = tmp_path / "stream-auth.log"
     request_log = tmp_path / "request.log"
+    date_call_log = tmp_path / "date-calls.log"
+    readiness_release = tmp_path / "readiness-release"
     env.update(
         {
-            "AGENT_MAIL_WATCH_SECONDS": "1" if mode == "timeout" else "10",
-            "AGENT_MAIL_WATCH_READY_SECONDS": "1",
+            "AGENT_MAIL_WATCH_SECONDS": (
+                "1"
+                if mode == "timeout"
+                else "1+2"
+                if mode == "invalid-watch"
+                else "18446744073709551617"
+                if mode == "overflow-watch"
+                else "10"
+            ),
+            "AGENT_MAIL_WATCH_READY_SECONDS": (
+                "abc"
+                if mode == "no-ready"
+                else "18446744073709551617"
+                if mode == "overflow-ready"
+                else "1"
+            ),
             "FAKE_REQUEST_LOG": _git_bash_path(request_log),
             "FAKE_STREAM_AUTH_LOG": _git_bash_path(stream_auth_log),
+            "FAKE_DATE_CALL_LOG": _git_bash_path(date_call_log),
+            "FAKE_READINESS_RELEASE": _git_bash_path(readiness_release),
             "FAKE_WATCH_MODE": mode,
         }
     )
@@ -1161,6 +1224,9 @@ printf '%s\n200' "$envelope"
         request = json.loads(request_log.read_text(encoding="utf-8"))
         assert request["params"]["arguments"]["agent_name"] == agent_name
         assert request["params"]["arguments"]["registration_token"] == "codex-token"
+    if mode == "cut":
+        assert readiness_release.is_file()
+        assert date_call_log.read_text(encoding="utf-8").strip() == "2"
 
 
 def test_claude_session_start_prints_slot_pinned_watcher_command(

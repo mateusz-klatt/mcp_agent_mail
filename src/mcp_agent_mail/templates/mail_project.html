@@ -123,13 +123,13 @@
       <div class="flex self-start items-center gap-2" x-data="{ showArchiveConfirm: false }">
         {% if project.archived_at %}
         <button @click="fetch('/mail/api/unarchive-project', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project_id:{{ project.id }}})}).then(r=>r.json()).then(d=>{if(d.success) location.reload()})"
-                class="inline-flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 text-white text-sm font-semibold rounded-lg shadow-sm hover:shadow-md transition-all duration-200">
+                class="inline-flex min-h-[44px] items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 text-white text-sm font-semibold rounded-lg shadow-sm hover:shadow-md transition-all duration-200">
           <i data-lucide="archive-restore" class="w-4 h-4"></i>
           Restore Project
         </button>
         {% else %}
         <button @click="showArchiveConfirm = true"
-                class="inline-flex items-center gap-2 px-4 py-2 bg-amber-500 hover:bg-amber-600 text-white text-sm font-semibold rounded-lg shadow-sm hover:shadow-md transition-all duration-200">
+                class="inline-flex min-h-[44px] items-center gap-2 px-4 py-2 bg-amber-500 hover:bg-amber-600 text-white text-sm font-semibold rounded-lg shadow-sm hover:shadow-md transition-all duration-200">
           <i data-lucide="archive" class="w-4 h-4"></i>
           Archive Project
         </button>
@@ -163,11 +163,11 @@
             </p>
             <div class="flex items-center justify-end gap-3">
               <button @click="showArchiveConfirm = false"
-                      class="px-4 py-2 text-slate-700 dark:text-slate-300 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 rounded-lg text-sm font-medium transition-colors">
+                      class="min-h-[44px] px-4 py-2 text-slate-700 dark:text-slate-300 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 rounded-lg text-sm font-medium transition-colors">
                 Cancel
               </button>
               <button @click="fetch('/mail/api/archive-project', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project_id:{{ project.id }}})}).then(r=>r.json()).then(d=>{if(d.success) location.reload()})"
-                      class="px-4 py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-lg text-sm font-semibold transition-colors">
+                      class="min-h-[44px] px-4 py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-lg text-sm font-semibold transition-colors">
                 Archive Project
               </button>
             </div>
@@ -347,42 +347,42 @@
           {% for r in results %}
             <a href="/mail/{{ project.slug }}/message/{{ r.id }}"
                data-message-id="{{ r.id }}" data-sender="{{ r.sender }}"
-               class="block group bg-slate-50 dark:bg-slate-900 hover:bg-white dark:hover:bg-slate-800 rounded-xl p-5 border-2 border-slate-200 dark:border-slate-700 hover:border-primary-400 dark:hover:border-primary-600 transition-all duration-300 shadow-sm hover:shadow-md stagger-item"
+               class="block overflow-hidden group bg-slate-50 dark:bg-slate-900 hover:bg-white dark:hover:bg-slate-800 rounded-xl p-5 border-2 border-slate-200 dark:border-slate-700 hover:border-primary-400 dark:hover:border-primary-600 transition-all duration-300 shadow-sm hover:shadow-md stagger-item"
                style="animation-delay: {{ [loop.index0 * 0.05, 1.0]|min }}s;">
-              <div class="flex items-start justify-between mb-3">
-                <h4 class="text-lg font-semibold text-slate-900 dark:text-white group-hover:text-primary-600 dark:group-hover:text-primary-400 transition-colors line-clamp-1">
+              <div class="flex min-w-0 flex-col gap-2 mb-3 sm:flex-row sm:items-start sm:justify-between">
+                <h4 class="min-w-0 text-lg font-semibold text-slate-900 dark:text-white group-hover:text-primary-600 dark:group-hover:text-primary-400 transition-colors line-clamp-2 break-words [overflow-wrap:anywhere]">
                   {{ r.subject }}
                 </h4>
                 {% if r.hits %}
-                  <span class="px-3 py-1 bg-primary-100 dark:bg-primary-900/30 text-primary-700 dark:text-primary-300 text-xs font-bold rounded-full whitespace-nowrap ml-4">
+                  <span class="self-start px-3 py-1 bg-primary-100 dark:bg-primary-900/30 text-primary-700 dark:text-primary-300 text-xs font-bold rounded-full whitespace-nowrap sm:ml-4">
                     {{ r.hits }} match{{ 'es' if r.hits != 1 else '' }}
                   </span>
                 {% endif %}
               </div>
 
-              <div class="flex items-center gap-4 text-sm text-slate-600 dark:text-slate-400 mb-3">
-                <div class="flex items-center gap-1.5">
+              <div class="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2 text-sm text-slate-600 dark:text-slate-400 mb-3">
+                <div class="flex min-w-0 items-center gap-1.5">
                   <i data-lucide="user" class="w-4 h-4"></i>
-                  <span class="font-medium">{{ r.sender }}</span>
+                  <span class="font-medium break-words [overflow-wrap:anywhere]">{{ r.sender }}</span>
                 </div>
                 <span class="text-slate-300 dark:text-slate-600">•</span>
-                <div class="flex items-center gap-1.5">
+                <div class="flex min-w-0 items-center gap-1.5">
                   <i data-lucide="calendar" class="w-4 h-4"></i>
-                  <span>{{ r.created }}</span>
+                  <span class="break-words [overflow-wrap:anywhere]">{{ r.created }}</span>
                 </div>
                 {% if r.thread_id %}
                   <span class="text-slate-300 dark:text-slate-600">•</span>
-                  <div class="flex items-center gap-1.5" data-tippy-content="Canonical thread identifier shared across agents" title="Canonical thread identifier shared across agents">
+                  <div class="flex min-w-0 flex-wrap items-center gap-1.5" data-tippy-content="Canonical thread identifier shared across agents" title="Canonical thread identifier shared across agents">
                     <i data-lucide="message-circle" class="w-4 h-4"></i>
                     <span class="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-500">Thread</span>
-                    <span class="font-mono text-xs">{{ r.thread_id }}</span>
+                    <span class="font-mono text-xs break-all">{{ r.thread_id }}</span>
                   </div>
                 {% endif %}
               </div>
 
               {% if r.snippet %}
                 <div class="text-sm text-slate-700 dark:text-slate-300 bg-white dark:bg-slate-800 rounded-lg p-3 line-clamp-2 border border-slate-200 dark:border-slate-700">
-                  {{ r.snippet | safe }}
+                  {{ r.snippet }}
                 </div>
               {% endif %}
             </a>
@@ -467,20 +467,20 @@
             <!-- Agent Actions -->
             <div class="relative flex items-center gap-2">
               <a href="/mail/{{ project.slug }}/inbox/{{ a.name }}"
-                 class="flex-1 px-4 py-2.5 bg-gradient-to-r from-primary-600 to-primary-700 hover:from-primary-700 hover:to-primary-800 text-white text-sm font-semibold rounded-lg shadow-medium hover:shadow-large transition-all duration-300 text-center flex items-center justify-center gap-2 btn-ripple">
+                 class="flex min-h-[44px] flex-1 items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-primary-600 to-primary-700 px-4 py-2.5 text-center text-sm font-semibold text-white shadow-medium transition-all duration-300 hover:from-primary-700 hover:to-primary-800 hover:shadow-large btn-ripple">
                 <i data-lucide="inbox" class="w-4 h-4"></i>
                 <span>Inbox</span>
               </a>
-              <button onclick="copyToClipboard(this.dataset.agentName, 'Agent name copied!')"
+              <button type="button" onclick="copyToClipboard(this.dataset.agentName, 'Agent name copied!')"
                       data-agent-name="{{ a.name }}"
-                      class="p-2.5 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-all duration-200 shadow-sm hover:shadow-md"
+                      class="min-h-[44px] min-w-[44px] p-2.5 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-all duration-200 shadow-sm hover:shadow-md"
                       data-tippy-content="Copy agent name"
                       aria-label="Copy agent name">
                 <i data-lucide="copy" class="w-4 h-4"></i>
               </button>
               {% if can_mutate %}
-              <button onclick="if(confirm('Retire agent ' + {{ a.name | tojson | forceescape }} + '? It will stop accepting new messages but message history is preserved.')) fetch('/mail/api/retire-agent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agent_id:{{ a.id }}})}).then(r=>r.json()).then(d=>{if(d.success) location.reload()})"
-                      class="p-2.5 bg-slate-100 dark:bg-slate-700 hover:bg-amber-100 dark:hover:bg-amber-900/30 text-slate-700 dark:text-slate-300 hover:text-amber-700 dark:hover:text-amber-400 rounded-lg transition-all duration-200 shadow-sm hover:shadow-md"
+              <button type="button" onclick="if(confirm('Retire agent ' + {{ a.name | tojson | forceescape }} + '? It will stop accepting new messages but message history is preserved.')) fetch('/mail/api/retire-agent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agent_id:{{ a.id }}})}).then(r=>r.json()).then(d=>{if(d.success) location.reload()})"
+                      class="min-h-[44px] min-w-[44px] p-2.5 bg-slate-100 dark:bg-slate-700 hover:bg-amber-100 dark:hover:bg-amber-900/30 text-slate-700 dark:text-slate-300 hover:text-amber-700 dark:hover:text-amber-400 rounded-lg transition-all duration-200 shadow-sm hover:shadow-md"
                       data-tippy-content="Retire agent"
                       aria-label="Retire agent">
                 <i data-lucide="user-minus" class="w-4 h-4"></i>
@@ -495,14 +495,17 @@
     {% if retired_agents %}
       <!-- Retired Agents Section -->
       <div class="mt-8" x-data="{ showRetired: false }">
-        <button @click="showRetired = !showRetired"
-                class="flex items-center gap-2 text-sm font-medium text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white transition-colors mb-4">
+        <button type="button"
+                @click="showRetired = !showRetired"
+                :aria-expanded="showRetired.toString()"
+                aria-controls="retired-agent-list"
+                class="mb-4 flex min-h-[44px] items-center gap-2 text-sm font-medium text-slate-600 transition-colors hover:text-slate-900 dark:text-slate-400 dark:hover:text-white">
           <i data-lucide="chevron-right" class="w-4 h-4 transition-transform duration-200" :class="showRetired ? 'rotate-90' : ''"></i>
           <i data-lucide="archive" class="w-4 h-4"></i>
           {{ retired_agents|length }} Retired Agent{{ 's' if retired_agents|length != 1 else '' }}
         </button>
 
-        <div x-show="showRetired" x-collapse>
+        <div id="retired-agent-list" x-show="showRetired" x-collapse>
           <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
             {% for a in retired_agents %}
               <div class="group relative bg-slate-50 dark:bg-slate-800/50 rounded-2xl p-6 shadow-soft border-2 border-dashed border-slate-300 dark:border-slate-600 transition-all duration-300 overflow-hidden opacity-75 hover:opacity-100"
@@ -531,13 +534,13 @@
                 <!-- Agent Actions -->
                 <div class="relative flex items-center gap-2">
                   <a href="/mail/{{ project.slug }}/inbox/{{ a.name }}"
-                     class="flex-1 px-4 py-2.5 bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 text-sm font-semibold rounded-lg shadow-sm transition-all duration-300 text-center flex items-center justify-center gap-2">
+                     class="flex min-h-[44px] flex-1 items-center justify-center gap-2 rounded-lg bg-slate-200 px-4 py-2.5 text-center text-sm font-semibold text-slate-700 shadow-sm transition-all duration-300 hover:bg-slate-300 dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600">
                     <i data-lucide="inbox" class="w-4 h-4"></i>
                     <span>View Inbox</span>
                   </a>
                   {% if can_mutate %}
-                  <button onclick="fetch('/mail/api/unretire-agent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agent_id:{{ a.id }}})}).then(r=>r.json()).then(d=>{if(d.success) location.reload()})"
-                          class="p-2.5 bg-green-100 dark:bg-green-900/30 hover:bg-green-200 dark:hover:bg-green-800/40 text-green-700 dark:text-green-400 rounded-lg transition-all duration-200 shadow-sm hover:shadow-md"
+                  <button type="button" onclick="fetch('/mail/api/unretire-agent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agent_id:{{ a.id }}})}).then(r=>r.json()).then(d=>{if(d.success) location.reload()})"
+                          class="min-h-[44px] min-w-[44px] p-2.5 bg-green-100 dark:bg-green-900/30 hover:bg-green-200 dark:hover:bg-green-800/40 text-green-700 dark:text-green-400 rounded-lg transition-all duration-200 shadow-sm hover:shadow-md"
                           data-tippy-content="Restore agent to accept mail"
                           aria-label="Restore agent to accept mail">
                     <i data-lucide="user-plus" class="w-4 h-4"></i>

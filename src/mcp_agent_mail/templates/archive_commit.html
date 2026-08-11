@@ -21,14 +21,16 @@
 {% endblock %}
 
 {% block header_actions %}
-<div class="flex items-center gap-2">
+<div class="flex w-full items-center gap-2 lg:w-auto">
   <button onclick='copyToClipboard({{ commit.sha|tojson }})'
-          class="px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-xl transition-all duration-200 flex items-center gap-2 font-medium shadow-sm">
+          data-archive-action="copy-sha"
+          class="flex min-h-[44px] flex-1 items-center justify-center gap-2 rounded-xl bg-slate-100 px-4 py-2 font-medium text-slate-700 shadow-sm transition-all duration-200 hover:bg-slate-200 dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600 lg:flex-none">
     <i data-lucide="copy" class="w-4 h-4"></i>
     Copy SHA
   </button>
   <button onclick="window.history.back()"
-          class="px-4 py-2 bg-primary-500 hover:bg-primary-600 text-white rounded-xl transition-all duration-200 flex items-center gap-2 font-medium shadow-md hover:shadow-lg">
+          data-archive-action="back"
+          class="flex min-h-[44px] flex-1 items-center justify-center gap-2 rounded-xl bg-primary-500 px-4 py-2 font-medium text-white shadow-md transition-all duration-200 hover:bg-primary-600 hover:shadow-lg lg:flex-none">
     <i data-lucide="arrow-left" class="w-4 h-4"></i>
     Back
   </button>
@@ -176,8 +178,8 @@
       </h3>
     </div>
 
-    <div class="p-8">
-      <div id="diff-viewer" class="rounded-xl overflow-hidden border-2 border-slate-200 dark:border-slate-700"></div>
+    <div class="p-4 sm:p-8">
+      <div id="diff-viewer" class="overflow-x-auto rounded-xl border-2 border-slate-200 dark:border-slate-700"></div>
     </div>
   </div>
 </div>
@@ -191,21 +193,30 @@ function copyToClipboard(text) {
   });
 }
 
-// Initialize Diff2Html
+// The loaded `diff2html-ui` browser bundle exposes `Diff2HtmlUI`, not the
+// parser-only `Diff2Html.html` global from the separate diff2html bundle.
 document.addEventListener('DOMContentLoaded', () => {
   const diffString = {{ commit.diff|tojson }};
+  const targetElement = document.getElementById('diff-viewer');
 
   if (diffString && diffString.trim()) {
-    const diffHtml = Diff2Html.html(diffString, {
+    if (typeof Diff2HtmlUI !== 'function') {
+      targetElement.innerHTML = '<p class="p-6 text-center text-red-600 dark:text-red-400">Unable to load the diff viewer</p>';
+      console.error('Diff2HtmlUI bundle did not expose its browser API');
+      return;
+    }
+
+    const configuration = {
       drawFileList: true,
       matching: 'lines',
       outputFormat: 'side-by-side',
       renderNothingWhenEmpty: false,
-    });
+    };
 
-    document.getElementById('diff-viewer').innerHTML = diffHtml;
+    const diff2htmlUi = new Diff2HtmlUI(targetElement, diffString, configuration);
+    diff2htmlUi.draw();
   } else {
-    document.getElementById('diff-viewer').innerHTML = `
+    targetElement.innerHTML = `
       <div class="flex flex-col items-center justify-center py-12 text-slate-500 dark:text-slate-400">
         <i data-lucide="info" class="w-12 h-12 mb-4"></i>
         <p class="text-center">No diff available for this commit</p>

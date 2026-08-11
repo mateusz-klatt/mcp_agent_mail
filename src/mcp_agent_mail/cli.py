@@ -3430,6 +3430,10 @@ def _collect_preview_status(bundle_path: Path) -> dict[str, Any]:
 
 def _start_preview_server(bundle_path: Path, host: str, port: int) -> ThreadingHTTPServer:
     bundle_path = bundle_path.resolve()
+    preview_reload_tag = (
+        '<script type="module" src="./preview-reload.js" '
+        'data-preview-only></script>'
+    )
 
     class PreviewRequestHandler(SimpleHTTPRequestHandler):
         def __init__(self, *args, **kwargs):
@@ -3451,6 +3455,27 @@ def _start_preview_server(bundle_path: Path, host: str, port: int) -> ThreadingH
                 self.end_headers()
                 self.wfile.write(data)
                 return
+            request_path = self.path.partition("?")[0]
+            if request_path in {"/viewer/", "/viewer/index.html"}:
+                viewer_index = bundle_path / "viewer" / "index.html"
+                if viewer_index.is_file():
+                    html = viewer_index.read_text(encoding="utf-8")
+                    if preview_reload_tag not in html:
+                        if "</body>" in html:
+                            html = html.replace(
+                                "</body>",
+                                f"  {preview_reload_tag}\n</body>",
+                                1,
+                            )
+                        else:
+                            html = f"{html}\n{preview_reload_tag}\n"
+                    data = html.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
             # Quiet common noisy requests in preview
             if self.path == "/favicon.ico" or self.path.endswith(".map") or self.path.startswith("/.well-known/"):
                 # Return 204 No Content to avoid browser/server 404 noise

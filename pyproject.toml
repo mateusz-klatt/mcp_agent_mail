@@ -76,9 +76,32 @@ Repository = "https://example.com/mcp-agent-mail"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mcp_agent_mail"]
+exclude = [
+    "/src/mcp_agent_mail/viewer_assets/vendor/clusterize.min.css",
+    "/src/mcp_agent_mail/viewer_assets/vendor/clusterize.min.js",
+]
 
 [tool.hatch.build.targets.sdist]
-exclude = ["/.venv", "/.vscode", "/.idea", "/.git", "/__pycache__", "*.py[cod]", "*.db*", ".DS_Store"]
+exclude = [
+    "/.git",
+    "/.idea",
+    "/.mypy_cache",
+    "/.playwright-mcp",
+    "/.pytest_cache",
+    "/.ruff_cache",
+    "/.venv",
+    "/.vscode",
+    "/__pycache__",
+    "/htmlcov",
+    "/ui/coverage",
+    "/ui/dist",
+    "/ui/node_modules",
+    "/src/mcp_agent_mail/viewer_assets/vendor/clusterize.min.css",
+    "/src/mcp_agent_mail/viewer_assets/vendor/clusterize.min.js",
+    "*.db*",
+    "*.py[cod]",
+    ".DS_Store",
+]
 
 [tool.ruff]
 line-length = 120
@@ -141,6 +164,7 @@ markers = [
 
 [dependency-groups]
 dev = [
+    "playwright==1.62.0",
     "pytest-asyncio>=1.2.0",
     "pytest-cov>=7.0.0",
     "pytest-timeout>=2.4.0",

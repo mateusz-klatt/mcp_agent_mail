@@ -57,6 +57,14 @@ jobs:
         run: |
           uv sync --dev
 
+      # Browser-level security and mobile-layout tests are part of the full
+      # suite.  Installing Chromium here makes them a real Ubuntu gate instead
+      # of an import-only test which silently skips in CI.
+      - name: Install Chromium for browser UAT
+        shell: bash
+        run: |
+          uv run playwright install --with-deps chromium
+
       - name: Lint (ruff)
         shell: bash
         run: |
@@ -71,6 +79,10 @@ jobs:
         shell: bash
         env:
           PYTHONUTF8: "1"
+          # Only this job installs Chromium.  The viewer's browser UAT must be
+          # a hard gate here, while macOS/Windows portability jobs remain
+          # allowed to skip when a host browser is unavailable.
+          AGENT_MAIL_BROWSER_UAT_REQUIRED: "1"
         run: |
           uv run -m pytest -q --cov-report=xml:coverage.xml
 

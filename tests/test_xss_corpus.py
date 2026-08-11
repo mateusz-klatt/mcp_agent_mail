@@ -401,20 +401,72 @@ def test_dompurify_sanitization_end_to_end() -> None:
                 pytest.skip(f"Chromium not installed for Playwright: {exc}")
 
             page = browser.new_page()
-
-            # Surface any uncaught page error (e.g. an executed XSS payload throwing)
-            # and any alert() so they fail the assertions below instead of passing silently.
-            alerts: list[str] = []
-            page.on("dialog", lambda dialog: (alerts.append(dialog.message), dialog.dismiss()))
+            standalone_requests: list[str] = []
+            page.on("request", lambda request: standalone_requests.append(request.url))
 
             # Establish the server origin by loading the real viewer index first, then
             # swap in the minimal sink harness. Relative ./vendor/ + ./viewer.js URLs in
             # the harness then resolve against the served viewer_assets directory.
             page.goto(f"{base_url}/index.html", wait_until="domcontentloaded")
+            page.wait_for_timeout(2_150)
+            assert not any(
+                "/__preview__/status" in url or url.endswith("/preview-reload.js")
+                for url in standalone_requests
+            ), f"standalone viewer started preview polling: {standalone_requests!r}"
             page.set_content(_SINK_HARNESS_HTML, wait_until="load")
             page.wait_for_function("typeof renderMarkdownSafe === 'function'")
             page.wait_for_function("typeof marked !== 'undefined'")
             page.wait_for_function("typeof DOMPurify !== 'undefined'")
+
+            # Surface any payload-triggered alert() so it fails the assertions below.
+            # The minimal source-assets server intentionally has no manifest/database,
+            # so install this listener only after replacing the full viewer document.
+            alerts: list[str] = []
+            page.on("dialog", lambda dialog: (alerts.append(dialog.message), dialog.dismiss()))
+
+            # Resource-loading elements must be removed while DOMPurify still
+            # owns an inert document. If an <img> reaches the live sink, the
+            # request event below fires even when CSP or routing later blocks it.
+            image_probe_origin = "https://viewer-probe.invalid"
+            image_requests: list[str] = []
+            console_errors: list[str] = []
+            page.route(f"{image_probe_origin}/**", lambda route: route.abort())
+            page.on(
+                "request",
+                lambda request: image_requests.append(request.url)
+                if request.url.startswith(image_probe_origin)
+                else None,
+            )
+            page.on(
+                "console",
+                lambda message: console_errors.append(message.text)
+                if message.type == "error"
+                else None,
+            )
+            hostile_images = {
+                "raw HTML": f'<img src="{image_probe_origin}/raw.png" alt="raw probe">',
+                "Markdown": f"![markdown probe]({image_probe_origin}/markdown.png)",
+            }
+            for payload_kind, payload in hostile_images.items():
+                image_count = page.evaluate(
+                    """(value) => {
+                        const sink = document.getElementById('sink');
+                        sink.innerHTML = renderMarkdownSafe(value);
+                        return sink.querySelectorAll('img').length;
+                    }""",
+                    payload,
+                )
+                assert image_count == 0, (
+                    f"{payload_kind} image survived before live DOM insertion"
+                )
+
+            page.wait_for_timeout(50)
+            assert image_requests == [], (
+                f"sanitized images attempted external requests: {image_requests!r}"
+            )
+            assert console_errors == [], (
+                f"sanitized images produced console errors: {console_errors!r}"
+            )
 
             for payload in _all_xss_payloads():
                 # Render through the production sink and assign to a live innerHTML node.
@@ -440,16 +492,18 @@ def test_dompurify_sanitization_end_to_end() -> None:
                 """() => {
                     const sink = document.getElementById('sink');
                     const scripts = sink.querySelectorAll('script').length;
+                    const images = sink.querySelectorAll('img').length;
                     let handlers = 0;
                     sink.querySelectorAll('*').forEach((el) => {
                         for (const attr of el.attributes) {
                             if (attr.name.toLowerCase().startsWith('on')) handlers += 1;
                         }
                     });
-                    return { scripts, handlers };
+                    return { scripts, images, handlers };
                 }"""
             )
             assert residual["scripts"] == 0, f"<script> survived sanitization: {residual}"
+            assert residual["images"] == 0, f"<img> survived sanitization: {residual}"
             assert residual["handlers"] == 0, f"inline event handler survived sanitization: {residual}"
 
             browser.close()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sqlite3
 import threading
@@ -24,7 +25,12 @@ warnings.filterwarnings("ignore", category=ResourceWarning)
 console = Console()
 
 
-def _seed_mailbox(db_path: Path, storage_root: Path) -> None:
+def _seed_mailbox(
+    db_path: Path,
+    storage_root: Path,
+    *,
+    message_count: int = 1,
+) -> None:
     storage_root.mkdir(parents=True, exist_ok=True)
     attachments_dir = storage_root / "attachments" / "raw"
     attachments_dir.mkdir(parents=True, exist_ok=True)
@@ -46,6 +52,8 @@ def _seed_mailbox(db_path: Path, storage_root: Path) -> None:
             CREATE TABLE messages (
                 id INTEGER PRIMARY KEY,
                 project_id INTEGER,
+                sender_id INTEGER,
+                thread_id TEXT,
                 subject TEXT,
                 body_md TEXT,
                 importance TEXT,
@@ -96,12 +104,14 @@ def _seed_mailbox(db_path: Path, storage_root: Path) -> None:
 
         conn.execute(
             """
-            INSERT INTO messages (id, project_id, subject, body_md, importance, ack_required, created_ts, attachments)
+            INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments)
             VALUES (
                 1,
                 1,
+                1,
+                'integration-thread',
                 'Integration Test',
-                'Body with bearer TOKEN <script>window._xss=1</script>',
+                'Body with bearer TOKEN [Docs](https://docs.example.invalid/uat) <img src="https://viewer-probe.invalid/raw.png"> ![probe](https://viewer-probe.invalid/markdown.png) <script>window._xss=1</script>',
                 'normal',
                 1,
                 '2025-01-01T00:00:00Z',
@@ -110,6 +120,21 @@ def _seed_mailbox(db_path: Path, storage_root: Path) -> None:
             """,
             (json.dumps(attachments),),
         )
+        if message_count > 1:
+            conn.executemany(
+                """
+                INSERT INTO messages (
+                    id, project_id, sender_id, thread_id, subject, body_md,
+                    importance, ack_required, created_ts, attachments
+                )
+                VALUES (?, 1, 1, 'bulk-thread', ?, ?, 'normal', 0,
+                        '2024-01-01T00:00:00Z', '[]')
+                """,
+                (
+                    (message_id, f"Bulk Message {message_id}", f"Bulk body {message_id}")
+                    for message_id in range(2, message_count + 1)
+                ),
+            )
         conn.execute(
             """
             INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
@@ -194,10 +219,17 @@ def test_share_export_end_to_end(monkeypatch, tmp_path: Path) -> None:
     assert (viewer_dir / "index.html").is_file()
     assert (viewer_dir / "styles.css").is_file()
     assert (viewer_dir / "viewer.js").is_file()
+    assert (viewer_dir / "THIRD_PARTY_LICENSES.txt").is_file()
+    assert (viewer_dir / "vendor" / "alpine.min.js").is_file()
+    assert (viewer_dir / "vendor" / "lucide.min.js").is_file()
+    assert (viewer_dir / "vendor" / "tailwind.min.css").is_file()
     index_content = (viewer_dir / "index.html").read_text(encoding="utf-8")
     # The legacy "Static Viewer" compat marker was removed (#224); assert the
     # stable page title instead, which still proves index.html was exported.
     assert "Agent Mail Viewer" in index_content
+    assert "https://cdn." not in index_content
+    assert "https://unpkg.com" not in index_content
+    assert "https://fonts." not in index_content
 
     zip_path = output_dir.with_suffix(".zip")
     assert zip_path.is_file()
@@ -237,7 +269,7 @@ def test_viewer_playwright_smoke(monkeypatch, tmp_path: Path) -> None:
     if storage_root.exists():
         shutil.rmtree(storage_root)
 
-    _seed_mailbox(db_path, storage_root)
+    _seed_mailbox(db_path, storage_root, message_count=1_001)
 
     output_dir = tmp_path / "bundle_playwright"
     runner = CliRunner()
@@ -264,16 +296,209 @@ def test_viewer_playwright_smoke(monkeypatch, tmp_path: Path) -> None:
 
     try:
         with playwright_sync.sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=True)
-            context = browser.new_context()
+            try:
+                browser = playwright.chromium.launch(headless=True)
+            except Exception as exc:  # pragma: no cover - local browser availability
+                if os.environ.get("AGENT_MAIL_BROWSER_UAT_REQUIRED") == "1":
+                    pytest.fail(f"Chromium must launch in CI after the install step: {exc}")
+                pytest.skip(f"Chromium not installed for local Playwright UAT: {exc}")
+            context = browser.new_context(viewport={"width": 390, "height": 844})
             page = context.new_page()
             server_host = host or "127.0.0.1"
-            page.goto(f"http://{server_host}:{port}/viewer/index.html", wait_until="networkidle")
+            origin = f"http://{server_host}:{port}"
+            request_urls: list[str] = []
+            console_messages: list[tuple[str, str]] = []
+            page_errors: list[str] = []
+            page.on("request", lambda request: request_urls.append(request.url))
+            page.on(
+                "console",
+                lambda message: console_messages.append((message.type, message.text)),
+            )
+            page.on("pageerror", lambda error: page_errors.append(str(error)))
+            page.goto(f"{origin}/viewer/index.html", wait_until="networkidle")
+
+            def assert_mobile_touch_targets() -> None:
+                page.wait_for_timeout(175)
+                layout = page.evaluate(
+                    """
+                    () => {
+                      const viewportWidth = document.documentElement.clientWidth;
+                      const visibleRect = (element) => {
+                        const style = getComputedStyle(element);
+                        const rect = element.getBoundingClientRect();
+                        return {
+                          rect,
+                          visible: style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && Number(style.opacity) > 0
+                            && rect.width > 0
+                            && rect.height > 0,
+                        };
+                      };
+                      const undersized = Array.from(document.querySelectorAll(
+                        'button, select, input[type="search"], input[type="checkbox"], a[href], [role="button"]'
+                      )).flatMap((element) => {
+                        const { rect, visible } = visibleRect(element);
+                        const active = visible
+                          && getComputedStyle(element).pointerEvents !== 'none'
+                          && !element.matches(':disabled')
+                          && element.getAttribute('aria-hidden') !== 'true'
+                          && rect.right > 0
+                          && rect.bottom > 0
+                          && rect.left < viewportWidth
+                          && rect.top < innerHeight;
+                        if (!active || (rect.width >= 43.5 && rect.height >= 43.5)) return [];
+                        return [{
+                          tag: element.tagName.toLowerCase(),
+                          label: element.getAttribute('aria-label')
+                            || element.textContent.trim().replace(/\\s+/g, ' ').slice(0, 80),
+                          width: Math.round(rect.width * 10) / 10,
+                          height: Math.round(rect.height * 10) / 10,
+                        }];
+                      });
+                      const outOfViewport = Array.from(document.body.querySelectorAll('*')).flatMap((element) => {
+                        const { rect, visible } = visibleRect(element);
+                        if (!visible || (rect.left >= -0.5 && rect.right <= viewportWidth + 0.5)) return [];
+                        return [{
+                          tag: element.tagName.toLowerCase(),
+                          id: element.id,
+                          className: typeof element.className === 'string'
+                            ? element.className.slice(0, 120)
+                            : '',
+                          left: Math.round(rect.left * 10) / 10,
+                          right: Math.round(rect.right * 10) / 10,
+                        }];
+                      });
+                      return {
+                        undersized,
+                        outOfViewport,
+                        viewportWidth,
+                        bodyScrollWidth: document.body.scrollWidth,
+                        documentScrollWidth: document.documentElement.scrollWidth,
+                        scrollX,
+                      };
+                    }
+                    """
+                )
+                assert layout["undersized"] == []
+                assert layout["outOfViewport"] == []
+                assert layout["bodyScrollWidth"] <= layout["viewportWidth"]
+                assert layout["documentScrollWidth"] <= layout["viewportWidth"]
+                assert layout["scrollX"] == 0
+
             # The legacy #message-list shim was removed (#224); the live viewer
             # renders rows as `.message-row` divs inside the virtual list.
             page.wait_for_selector("#virtual-message-list .message-row")
             first_entry = page.inner_text("#virtual-message-list .message-row")
             assert "Integration Test" in (first_entry or "")
+            assert page.evaluate("typeof window.Alpine") == "object"
+            assert page.evaluate("typeof window.Clusterize") == "undefined"
+            assert page.locator("svg.lucide").count() > 0
+            initial_window_ids = page.locator(
+                "#virtual-message-list .message-row"
+            ).evaluate_all(
+                "rows => rows.map(row => row.getAttribute('data-message-id'))"
+            )
+            assert 0 < len(initial_window_ids) < 50
+            assert page.locator("#virtual-message-list .virtual-spacer").count() == 2
+            assert page.evaluate(
+                """() => {
+                    const list = document.getElementById('virtual-message-list');
+                    return list.scrollHeight > list.clientHeight * 10;
+                }"""
+            )
+            page.evaluate(
+                """() => {
+                    const list = document.getElementById('virtual-message-list');
+                    list.scrollTop = list.scrollHeight;
+                }"""
+            )
+            page.wait_for_function(
+                """() => {
+                    const row = document.querySelector(
+                        '#virtual-message-list .message-row'
+                    );
+                    return row && row.getAttribute('data-message-id') !== '1';
+                }"""
+            )
+            tail_window_ids = page.locator(
+                "#virtual-message-list .message-row"
+            ).evaluate_all(
+                "rows => rows.map(row => row.getAttribute('data-message-id'))"
+            )
+            assert 0 < len(tail_window_ids) < 50
+            assert set(initial_window_ids).isdisjoint(tail_window_ids)
+            page.evaluate(
+                "document.getElementById('virtual-message-list').scrollTop = 0"
+            )
+            page.wait_for_function(
+                """() => document.querySelector(
+                    '#virtual-message-list .message-row'
+                )?.getAttribute('data-message-id') === '1'"""
+            )
+            assert_mobile_touch_targets()
+
+            page.locator('[data-select-message-id="1"]').click()
+            page.wait_for_function(
+                "document.querySelector('[data-select-message-id=\"1\"]')?.getAttribute('aria-pressed') === 'true'"
+            )
+            assert_mobile_touch_targets()
+
+            page.get_by_role("button", name="Sort messages").click()
+            page.get_by_role("button", name="Newest First").wait_for(state="visible")
+            assert_mobile_touch_targets()
+            page.get_by_role("button", name="Newest First").click()
+
+            page.get_by_role("button", name="Toggle message filters").first.click()
+            page.locator("select").first.wait_for(state="visible")
+            assert_mobile_touch_targets()
+            page.get_by_role("button", name="Toggle message filters").first.click()
+
+            page.fill("#unified-search", "does-not-exist")
+            assert_mobile_touch_targets()
+            page.wait_for_function(
+                "document.querySelectorAll('#virtual-message-list .message-row').length === 0"
+            )
+            page.fill("#unified-search", "Integration")
+            page.wait_for_function(
+                "document.querySelectorAll('#virtual-message-list .message-row').length === 1"
+            )
+            page.locator("#virtual-message-list .message-row").click(
+                position={"x": 120, "y": 40}
+            )
+            page.get_by_role("button", name="Close message view").wait_for(
+                state="visible"
+            )
+            assert page.locator("img[src^='https://viewer-probe.invalid']").count() == 0
+            body_link = page.get_by_role("link", name="Docs")
+            assert body_link.count() == 1
+            body_link_box = body_link.bounding_box()
+            assert body_link_box is not None
+            assert body_link_box["width"] >= 43.5
+            assert body_link_box["height"] >= 43.5
+            assert_mobile_touch_targets()
+            page.get_by_role("button", name="Close message view").click()
+
+            page.get_by_role("button", name="Threads", exact=True).click()
+            page.locator("#thread-search-input").wait_for(state="visible")
+            assert_mobile_touch_targets()
+            page.locator("[data-thread-id]").first.click()
+            assert_mobile_touch_targets()
+            external_requests = [
+                url
+                for url in request_urls
+                if not url.startswith((origin, "blob:", "data:"))
+            ]
+            assert external_requests == []
+            assert any(
+                url.startswith(f"{origin}/__preview__/status") for url in request_urls
+            )
+            assert page_errors == []
+            assert [
+                entry
+                for entry in console_messages
+                if entry[0] in {"error", "warning"}
+            ] == []
             # Ensure sanitization removed inline script execution.
             xss_value = page.evaluate("window._xss || null")
             assert xss_value is None

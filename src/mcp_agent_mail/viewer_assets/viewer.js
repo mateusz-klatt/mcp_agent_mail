@@ -30,6 +30,40 @@ const ADMIN_BODY_PATTERNS = [
   /\bauto-handshake\b/i,
 ];
 
+// Message bodies are inert, text-centric content. Keeping a narrow element and
+// attribute allow-list means no sanitized node can initiate a network request
+// merely by being inserted into the live DOM (for example, <img src=...>).
+const MARKDOWN_SANITIZE_CONFIG = Object.freeze({
+  ALLOWED_TAGS: Object.freeze([
+    "a",
+    "blockquote",
+    "br",
+    "code",
+    "del",
+    "em",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "hr",
+    "li",
+    "ol",
+    "p",
+    "pre",
+    "strong",
+    "table",
+    "tbody",
+    "td",
+    "th",
+    "thead",
+    "tr",
+    "ul",
+  ]),
+  ALLOWED_ATTR: Object.freeze(["class", "href", "title"]),
+});
+
 // Trusted Types Policy for secure Markdown rendering
 // See plan document lines 190-205 for security requirements
 let trustedTypesPolicy;
@@ -40,7 +74,7 @@ try {
       createHTML: (dirty) => {
         // DOMPurify will be loaded from vendor/dompurify.min.js
         if (typeof DOMPurify !== "undefined") {
-          return DOMPurify.sanitize(dirty, { RETURN_TRUSTED_TYPE: true });
+          return DOMPurify.sanitize(dirty, MARKDOWN_SANITIZE_CONFIG);
         }
         // Fallback to basic escaping if DOMPurify not loaded
         console.warn("DOMPurify not available, falling back to basic escaping");
@@ -57,12 +91,11 @@ try {
 
     trustedScriptURLPolicy = trustedTypesPolicy;
 
-    // Default policy for Clusterize.js compatibility
-    // Clusterize uses innerHTML but doesn't understand Trusted Types
-    // This policy passes through HTML that we've already escaped in createThreadHTML/createMessageHTML
+    // Default policy for the in-house windowed list. Its markup is assembled
+    // from static tags and values escaped by the helpers below before innerHTML.
     trustedTypes.createPolicy("default", {
       createHTML: (dirty) => {
-        // For Clusterize.js: HTML is already escaped via escapeHtml() in our rendering functions
+        // Windowed-list HTML is already escaped in our rendering functions.
         // We verify this is safe because:
         // 1. All user content (subjects, snippets, thread keys) goes through escapeHtml()
         // 2. highlightText() calls escapeHtml() before regex replacement
@@ -144,7 +177,7 @@ function renderMarkdownSafe(markdown) {
 
   // Fallback for browsers without Trusted Types
   if (typeof DOMPurify !== "undefined") {
-    return DOMPurify.sanitize(html);
+    return DOMPurify.sanitize(html, MARKDOWN_SANITIZE_CONFIG);
   }
 
   // Last resort: return escaped HTML
@@ -424,17 +457,19 @@ function getScalar(db, sql, params = []) {
 }
 
 function detectFts(db) {
+  let statement;
   try {
-    const statement = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='fts_messages'");
-    try {
-      const hasTable = statement.step();
-      return hasTable;
-    } finally {
+    // A virtual-table entry can exist in sqlite_master even when this sql.js
+    // build lacks the FTS5 module required to open it. Preparing a real query
+    // verifies both the exported table and the browser runtime capability.
+    statement = db.prepare("SELECT rowid FROM fts_messages LIMIT 0");
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (statement) {
       statement.free();
     }
-  } catch (error) {
-    console.warn("FTS detection failed", error);
-    return false;
   }
 }
 
@@ -1792,7 +1827,7 @@ function viewerController() {
       }
     },
 
-    // Virtual list (Clusterize.js)
+    // In-house windowed list: render only the rows near the scroll viewport.
     virtualList: null,
     buildMessageRow(msg, index) {
       const isSelected = this.selectedMessage?.id === msg.id;
@@ -1805,7 +1840,9 @@ function viewerController() {
       return (
         `<div class="message-row px-4 py-3 border-b border-slate-100 dark:border-slate-700 cursor-pointer transition-all duration-200 group focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-inset ${selectedClasses}" data-message-id="${msg.id}" tabindex="0" role="button" aria-label="Message from ${escapeHtml(msg.sender || '')}: ${escapeHtml(msg.subject || '')}" style="animation-delay: ${Math.min(index * 0.02, 0.5)}s;">`
         + `<div class="flex items-start gap-3">`
-        + `<input type="checkbox" class="mt-1 w-4 h-4 text-primary-600 bg-white dark:bg-slate-700 border-slate-300 dark:border-slate-600 rounded focus:ring-2 focus:ring-primary-500 transition-all duration-200 cursor-pointer opacity-0 group-hover:opacity-100" aria-hidden="true">`
+        + `<button type="button" data-select-message-id="${msg.id}" aria-label="Select message: ${escapeHtml(msg.subject || '')}" aria-pressed="${this.selectedMessages.includes(msg.id)}" class="inline-flex flex-shrink-0 items-center justify-center rounded-lg hover:bg-slate-100 dark:hover:bg-slate-700 focus:ring-2 focus:ring-primary-500 transition-colors">`
+        + `<span aria-hidden="true" class="w-5 h-5 inline-flex items-center justify-center border rounded text-sm font-bold leading-none ${this.selectedMessages.includes(msg.id) ? 'bg-primary-600 border-primary-600 text-white' : 'bg-white dark:bg-slate-700 border-slate-300 dark:border-slate-600 text-transparent'}">✓</span>`
+        + `</button>`
         + `<div class="flex-1 min-w-0">`
         + `<div class="flex items-center gap-2 mb-1">`
         + `<span class="text-sm font-semibold text-slate-900 dark:text-white truncate">${escapeHtml(msg.sender || '')}</span>`
@@ -1896,6 +1933,13 @@ function viewerController() {
 
       if (!this._onRowClick) {
         this._onRowClick = (event) => {
+          const selectionControl = event.target.closest('[data-select-message-id]');
+          if (selectionControl) {
+            const selectedId = Number(selectionControl.getAttribute('data-select-message-id'));
+            this.toggleMessageSelection(selectedId);
+            this.renderVirtualSlice(true);
+            return;
+          }
           const row = event.target.closest('[data-message-id]');
           if (!row) return;
           const id = Number(row.getAttribute('data-message-id'));
@@ -1953,8 +1997,12 @@ function viewerController() {
       const viewportHeight = scrollElem.clientHeight || 1;
       const scrollTop = scrollElem.scrollTop || 0;
       const estRow = Math.max(estimatedRowHeight, 56);
-      const startIndex = Math.max(0, Math.floor(scrollTop / estRow) - overscan);
       const visibleCount = Math.ceil(viewportHeight / estRow) + overscan * 2;
+      const maxStartIndex = Math.max(0, total - visibleCount);
+      const startIndex = Math.min(
+        maxStartIndex,
+        Math.max(0, Math.floor(scrollTop / estRow) - overscan),
+      );
       const endIndex = Math.min(total, startIndex + visibleCount);
 
       const beforeHeight = startIndex * estRow;
@@ -1986,7 +2034,7 @@ function viewerController() {
       this.syncVisibleSelectionHighlight();
     },
 
-    // Update selected-row styling for visible rows only, without touching Clusterize data
+    // Update selected-row styling for visible rows only.
     syncVisibleSelectionHighlight() {
       try {
         const container = document.getElementById('virtual-message-list');

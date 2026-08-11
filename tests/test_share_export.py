@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import sqlite3
+import subprocess
+import tarfile
 import threading
 import urllib.request
 import warnings
+from html.parser import HTMLParser
 from pathlib import Path
 from types import SimpleNamespace
+from zipfile import ZipFile
 
 import pytest
 from typer.testing import CliRunner
@@ -31,6 +36,37 @@ from mcp_agent_mail.share import (
 warnings.filterwarnings("ignore", category=ResourceWarning)
 
 pytestmark = pytest.mark.filterwarnings("ignore:.*ResourceWarning")
+
+
+class _ViewerAssetReferenceCollector(HTMLParser):
+    """Collect browser-active asset references from the standalone viewer."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.references: list[str] = []
+        self.csp = ""
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        attributes = dict(attrs)
+        if tag in {"audio", "embed", "iframe", "img", "script", "source", "video"}:
+            source = attributes.get("src")
+            if source is not None:
+                self.references.append(source)
+        if tag == "link":
+            href = attributes.get("href")
+            if href is not None:
+                self.references.append(href)
+        http_equiv = attributes.get("http-equiv")
+        if (
+            tag == "meta"
+            and http_equiv is not None
+            and http_equiv.lower() == "content-security-policy"
+        ):
+            self.csp = attributes.get("content") or ""
 
 
 def _build_snapshot(tmp_path: Path) -> Path:
@@ -279,6 +315,8 @@ def test_copy_viewer_assets_excludes_python_runtime_artifacts(
         "index.html": "viewer",
         "helpers.py": "# package marker",
         "scripts/app.js": "console.log('viewer')",
+        "vendor/clusterize.min.css": "historical GPL source",
+        "vendor/clusterize.min.js": "historical GPL source",
         "orphan.pyc": "compiled",
         "orphan.PYO": "optimized",
         "__pycache__/helpers.cpython-314.pyc": "cached",
@@ -316,6 +354,140 @@ def test_copy_viewer_assets_excludes_python_runtime_artifacts(
     assert exported == {"helpers.py", "index.html", "scripts/app.js"}
     assert not (viewer_root / "__pycache__").exists()
     assert not (viewer_root / "scripts" / "__pycache__").exists()
+
+
+@pytest.mark.parametrize("source_mode", ["live", "package"])
+def test_copy_viewer_assets_is_self_contained_and_air_gapped(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    source_mode: str,
+) -> None:
+    """Source-tree and installed-package exports use only bundled resources."""
+    source_tree = Path(share.__file__).parent / "viewer_assets"
+    if source_mode == "package":
+        monkeypatch.setattr(
+            share,
+            "__file__",
+            str(tmp_path / "installed-package" / "share.py"),
+        )
+        monkeypatch.setattr(share.resources, "files", lambda _package: source_tree)
+
+    output_dir = tmp_path / "bundle"
+    share.copy_viewer_assets(output_dir)
+
+    viewer_root = output_dir / "viewer"
+    index_text = (viewer_root / "index.html").read_text(encoding="utf-8")
+    collector = _ViewerAssetReferenceCollector()
+    collector.feed(index_text)
+
+    assert collector.csp
+    assert "https:" not in collector.csp
+    assert "http:" not in collector.csp
+    assert all(
+        not reference.startswith(("http://", "https://", "//"))
+        for reference in collector.references
+    )
+    assert "./preview-reload.js" not in collector.references
+    assert all("clusterize" not in reference.lower() for reference in collector.references)
+    assert not (viewer_root / "vendor" / "clusterize.min.css").exists()
+    assert not (viewer_root / "vendor" / "clusterize.min.js").exists()
+
+    expected_vendor_hashes = {
+        "alpine.min.js": "358d9afbb1ab5befa2f48061a30776e5bcd7707f410a606ba985f98bc3b1c034",
+        "lucide.min.js": "e47754dcfb8e1d354d7da3dbd2ddc2d4ae3ef4065e34582fbced11737e29bea1",
+        "tailwind.min.css": "d832a38b699b0ced1ccb9ad1598036601a5f5c32c24d7cbf78084fedeac3d482",
+    }
+    for filename, expected_digest in expected_vendor_hashes.items():
+        asset = viewer_root / "vendor" / filename
+        assert asset.is_file()
+        assert hashlib.sha256(asset.read_bytes()).hexdigest() == expected_digest
+
+    license_text = (viewer_root / "THIRD_PARTY_LICENSES.txt").read_text(
+        encoding="utf-8"
+    )
+    assert "Alpine.js 3.14.1" in license_text
+    assert "Lucide 0.474.0" in license_text
+    assert "Tailwind CSS 3.4.17" in license_text
+    assert "sql.js 1.10.1" in license_text
+    assert "Marked 11.0.0" in license_text
+    assert "DOMPurify 3.0.8" in license_text
+    assert "Clusterize.js 0.18.0 - repository-only historical source" in license_text
+    assert "Distribution status: excluded from the standalone viewer" in license_text
+    assert "coi-serviceworker 0.1.7" in license_text
+    assert "Version 2.0, January 2004" in license_text
+    assert "Mozilla Public License Version 2.0" in license_text
+    assert "GNU GENERAL PUBLIC LICENSE\n                       Version 3" in license_text
+
+    vendor_manifest = json.loads(
+        (viewer_root / "vendor_manifest.json").read_text(encoding="utf-8")
+    )
+    expected_licenses = {
+        "sql_js": "MIT",
+        "marked": "MIT AND BSD-3-Clause",
+        "dompurify": "Apache-2.0 OR MPL-2.0",
+        "alpinejs": "MIT",
+        "lucide": "ISC",
+        "tailwindcss": "MIT",
+        "coi_serviceworker": "MIT",
+    }
+    for component, expected_license in expected_licenses.items():
+        assert vendor_manifest[component]["license"] == expected_license
+        assert vendor_manifest[component]["license_file"] == (
+            "THIRD_PARTY_LICENSES.txt"
+        )
+    assert "clusterize" not in vendor_manifest
+    coi_asset = viewer_root / vendor_manifest["coi_serviceworker"]["asset"]["path"]
+    assert hashlib.sha256(coi_asset.read_bytes()).hexdigest() == (
+        vendor_manifest["coi_serviceworker"]["asset"]["sha256"]
+    )
+
+    assert "./vendor/alpine.min.js" in collector.references
+    assert "./vendor/lucide.min.js" in collector.references
+    assert "./vendor/tailwind.min.css" in collector.references
+    assert all(
+        b"sourceMappingURL" not in asset.read_bytes()
+        for asset in (viewer_root / "vendor").glob("*.js")
+    )
+
+
+def test_wheel_and_sdist_exclude_repository_only_clusterize(tmp_path: Path) -> None:
+    """Built Python distributions must never contain the retained GPL sources."""
+    repository_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            "uv",
+            "build",
+            "--wheel",
+            "--sdist",
+            "--no-progress",
+            "--no-create-gitignore",
+            "--out-dir",
+            str(tmp_path),
+        ],
+        cwd=repository_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    wheel = next(tmp_path.glob("*.whl"))
+    sdist = next(tmp_path.glob("*.tar.gz"))
+    with ZipFile(wheel) as archive:
+        wheel_names = archive.namelist()
+    with tarfile.open(sdist, mode="r:gz") as archive:
+        sdist_names = archive.getnames()
+
+    for artifact_names in (wheel_names, sdist_names):
+        normalized = [name.lower() for name in artifact_names]
+        assert not any("clusterize" in name for name in normalized)
+        assert any(name.endswith("viewer_assets/index.html") for name in normalized)
+        assert any(name.endswith("viewer_assets/viewer.js") for name in normalized)
+        assert any(name.endswith("viewer_assets/vendor_manifest.json") for name in normalized)
+        assert any(
+            name.endswith("viewer_assets/third_party_licenses.txt")
+            for name in normalized
+        )
 
 
 def test_detect_hosting_hints_uses_output_dir_repo_when_cwd_elsewhere(
@@ -1151,6 +1323,12 @@ def test_start_preview_server_serves_content(tmp_path: Path) -> None:
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     (bundle / "index.html").write_text("hello preview", encoding="utf-8")
+    viewer = bundle / "viewer"
+    viewer.mkdir()
+    standalone_html = "<!doctype html><body>standalone viewer</body>"
+    viewer_index = viewer / "index.html"
+    viewer_index.write_text(standalone_html, encoding="utf-8")
+    (viewer / "preview-reload.js").write_text("// preview reload", encoding="utf-8")
 
     server = cli_module._start_preview_server(bundle, "127.0.0.1", 0)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1160,6 +1338,15 @@ def test_start_preview_server_serves_content(tmp_path: Path) -> None:
         with urllib.request.urlopen(f"http://{host}:{port}/", timeout=2) as response:
             body = response.read().decode("utf-8")
         assert "hello preview" in body
+        with urllib.request.urlopen(
+            f"http://{host}:{port}/viewer/", timeout=2
+        ) as response:
+            preview_body = response.read().decode("utf-8")
+        assert (
+            '<script type="module" src="./preview-reload.js" '
+            "data-preview-only></script>"
+        ) in preview_body
+        assert viewer_index.read_text(encoding="utf-8") == standalone_html
         with urllib.request.urlopen(f"http://{host}:{port}/__preview__/status", timeout=2) as response:
             status_payload = json.loads(response.read().decode("utf-8"))
         assert "signature" in status_payload

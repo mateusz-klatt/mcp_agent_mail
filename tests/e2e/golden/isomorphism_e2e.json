@@ -842,9 +842,9 @@
       }
     },
     "preview_status": {
-      "files_indexed": 23,
-      "last_modified_iso": "2024-08-30T06:40:21+00:00",
-      "last_modified_ns": 1725000021000000000,
+      "files_indexed": 25,
+      "last_modified_iso": "2024-08-30T06:40:23+00:00",
+      "last_modified_ns": 1725000023000000000,
       "manifest_iso": "2024-08-30T06:40:06+00:00",
       "manifest_ns": 1725000006000000000,
       "manual_token": 0,

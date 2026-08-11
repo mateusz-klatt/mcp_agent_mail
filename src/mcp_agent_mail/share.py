@@ -1858,7 +1858,18 @@ def build_bundle_assets(
 
 
 def _is_runtime_viewer_artifact(relative_path: Path) -> bool:
-    """Return whether an asset is generated Python bytecode, not source data."""
+    """Return whether a source-tree file must not enter a distributed viewer.
+
+    Clusterize.js 0.18.0 is GPL-3.0-only unless separately commercially
+    licensed.  The repository retains its historical source files until the
+    user explicitly authorizes deletion, but the viewer no longer loads it and
+    neither source-tree nor installed-package exports may distribute it.
+    """
+    if relative_path.as_posix() in {
+        "vendor/clusterize.min.css",
+        "vendor/clusterize.min.js",
+    }:
+        return True
     return "__pycache__" in relative_path.parts or relative_path.suffix.lower() in {
         ".pyc",
         ".pyo",

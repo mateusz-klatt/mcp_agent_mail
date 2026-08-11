@@ -218,6 +218,10 @@ async def test_mail_unified_inbox_html(isolated_env):
         # Should contain some HTML structure
         assert "<html" in resp.text.lower() or "<!doctype" in resp.text.lower()
         assert f"totalMessages: {len(data['message_ids'])}" in resp.text
+        assert '<span class="sm:hidden">Auto</span>' in resp.text
+        assert 'class="flex min-w-0 flex-1 items-center gap-4 lg:gap-8"' in resp.text
+        assert 'class="flex shrink-0 items-center gap-1 sm:gap-2 lg:gap-3"' in resp.text
+        assert "min-h-[44px] min-w-[44px]" in resp.text
 
 
 @pytest.mark.asyncio
@@ -343,6 +347,11 @@ async def test_mail_project_view(isolated_env):
         assert "accepting mail" in resp.text
         assert "Last recorded activity:" in resp.text
         assert "Active collaborators" not in resp.text
+        assert 'class="hidden min-w-0 items-center gap-2 text-sm lg:flex"' in resp.text
+        assert "[overflow-wrap:anywhere]" in resp.text
+        assert 'class="flex items-center gap-1 xl:gap-3"' in resp.text
+        assert 'class="flex items-center gap-1 xl:gap-2"' in resp.text
+        assert '<span class="hidden xl:inline text-sm">Human Overseer</span>' in resp.text
 
 
 @pytest.mark.asyncio
@@ -453,6 +462,7 @@ async def test_mail_message_detail(isolated_env):
         assert "text/html" in resp.headers.get("content-type", "")
         # Should show the message subject
         assert "Test Message" in resp.text or "message" in resp.text.lower()
+        assert "<time datetime=" in resp.text
 
 
 @pytest.mark.asyncio
@@ -557,6 +567,8 @@ async def test_mail_thread_view(isolated_env):
         resp = await client.get("/mail/test-proj/thread/thread-1")
         assert resp.status_code == 200
         assert "text/html" in resp.headers.get("content-type", "")
+        assert 'class="hidden truncate text-slate-600' in resp.text
+        assert "dark:hover:text-primary-400 lg:inline" in resp.text
 
 
 @pytest.mark.asyncio
@@ -675,6 +687,21 @@ async def test_mail_overseer_compose(isolated_env):
         assert "text/html" in resp.headers.get("content-type", "")
         # Should have a form
         assert "<form" in resp.text.lower() or "form" in resp.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_mail_overseer_compose_unknown_project_is_not_found(isolated_env):
+    settings = _config.get_settings()
+    server = build_mcp_server()
+    app = build_http_app(settings, server)
+    await _setup_test_data(settings)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/mail/not-a-project/overseer/compose")
+
+    assert resp.status_code == 404
+    assert "Project not found" in resp.text
 
 
 @pytest.mark.asyncio

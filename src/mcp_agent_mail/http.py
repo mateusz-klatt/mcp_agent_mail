@@ -4537,7 +4537,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     )
                 ).fetchone()
                 if not prow:
-                    return await _render("error.html", message="Project not found")
+                    return await _render("error.html", status_code=404, message="Project not found")
 
                 # Retired identities remain visible in project history, but they
                 # are not addressable from the human compose surface.

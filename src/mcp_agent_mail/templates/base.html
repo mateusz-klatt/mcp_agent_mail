@@ -2155,19 +2155,19 @@
       <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div class="flex items-center justify-between h-16">
           <!-- Logo and Brand -->
-          <!-- Below sm the wordmark gives way to the logo tile, which is still a
+          <!-- Below xl the wordmark gives way to the logo tile, which is still a
                link to /mail. Measured on a 440 px viewport (iPhone 17 Pro Max,
                operator's UAT): this row wanted 443 px of a 408 px content box, so
                the right-hand controls sat 35 px past the edge and the page scrolled
                sideways. The wordmark plus its gap is 83 px of that; the two tighter
                gaps are another 16. Breadcrumbs vary per page and a project slug is
                longer than "Unified Inbox", so the slack is deliberate. -->
-          <div class="flex items-center gap-4 sm:gap-8">
+          <div class="flex min-w-0 flex-1 items-center gap-4 lg:gap-8">
             <a href="/mail" class="flex items-center gap-3 group">
               <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-primary-500 to-primary-700 flex items-center justify-center shadow-medium group-hover:shadow-glow transition-all duration-300">
                 <i data-lucide="mail" class="w-5 h-5 text-white"></i>
               </div>
-              <span class="hidden sm:inline text-xl font-bold bg-gradient-to-r from-primary-600 to-primary-800 dark:from-primary-400 dark:to-primary-600 bg-clip-text text-transparent">
+              <span class="hidden xl:inline text-xl font-bold bg-gradient-to-r from-primary-600 to-primary-800 dark:from-primary-400 dark:to-primary-600 bg-clip-text text-transparent">
                 Agent Mail
               </span>
             </a>
@@ -2177,7 +2177,7 @@
           </div>
 
           <!-- Right side actions -->
-          <div class="flex items-center gap-2 sm:gap-3">
+          <div class="flex shrink-0 items-center gap-1 sm:gap-2 lg:gap-3">
             {% block header_actions %}{% endblock %}
 
             <!-- Live state + sound. Here rather than per page, so every view
@@ -2191,7 +2191,7 @@
               <span class="hidden sm:inline">live</span>
             </span>
             <button id="sound-toggle" type="button" data-on="no"
-                    class="p-2 rounded-lg hover:bg-primary-100 dark:hover:bg-primary-900/30 text-slate-500 dark:text-slate-400 transition-all duration-200"
+                    class="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-lg p-2 text-slate-500 transition-all duration-200 hover:bg-primary-100 dark:text-slate-400 dark:hover:bg-primary-900/30"
                     aria-label="Toggle a sound when new mail arrives" title="Sound on new mail">
               <i id="bell-on" data-lucide="bell" class="w-4 h-4 hidden"></i>
               <i id="bell-off" data-lucide="bell-off" class="w-4 h-4"></i>
@@ -2199,7 +2199,7 @@
 
             <!-- Help Button -->
             <button onclick="window.restartTutorial()"
-                    class="p-2 rounded-lg hover:bg-primary-100 dark:hover:bg-primary-900/30 text-primary-600 dark:text-primary-400 transition-all duration-200 relative group"
+                    class="group relative flex min-h-[44px] min-w-[44px] items-center justify-center rounded-lg p-2 text-primary-600 transition-all duration-200 hover:bg-primary-100 dark:text-primary-400 dark:hover:bg-primary-900/30"
                     data-tippy-content="Show interactive tutorial"
                     aria-label="Show help">
               <i data-lucide="help-circle" class="w-5 h-5"></i>
@@ -2211,7 +2211,7 @@
 
             <!-- Dark Mode Toggle -->
             <button @click="toggleDarkMode()"
-                    class="p-2 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+                    class="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-lg p-2 transition-colors hover:bg-slate-100 dark:hover:bg-slate-800"
                     data-tippy-content="Toggle dark/light mode"
                     aria-label="Toggle dark mode">
               <svg x-show="!darkMode" xmlns="http://www.w3.org/2000/svg" class="w-5 h-5 text-slate-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">

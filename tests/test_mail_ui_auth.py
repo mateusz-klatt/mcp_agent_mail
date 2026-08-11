@@ -24,6 +24,7 @@ import asyncio
 import contextlib
 import time
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 from authlib.jose import jwt
@@ -295,6 +296,29 @@ async def _cookie(username: str, epoch: int) -> dict[str, str]:
     }
 
 
+def _install_react_dist(monkeypatch, tmp_path: Path) -> Path:
+    """Point the server at a minimal, production-shaped Vite build tree."""
+    dist_root = tmp_path / "ui_dist"
+    assets_root = dist_root / "assets"
+    assets_root.mkdir(parents=True)
+    (dist_root / "index.html").write_text(
+        "<!doctype html><title>Hermes React shell marker</title>"
+        '<script type="module" src="/mail/v2/assets/index-test.js"></script>'
+        '<link rel="stylesheet" href="/mail/v2/assets/index-test.css">',
+        encoding="utf-8",
+    )
+    (assets_root / "index-test.js").write_text(
+        'document.documentElement.dataset.shell = "react";\n',
+        encoding="utf-8",
+    )
+    (assets_root / "index-test.css").write_text(
+        "html { color-scheme: dark; }\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(http_module, "_mail_react_dist_root", lambda: dist_root)
+    return dist_root
+
+
 class TestMailUiSession:
     """The branches that need a real user, including the one that revokes them.
 
@@ -417,6 +441,277 @@ class TestMailUiSession:
         assert read.status_code == 200
         assert write.status_code == 403
         assert "admin" in write.json()["detail"]
+
+
+class TestMailReactShell:
+    """The Vite shell is session-gated, non-cacheable, and path-contained."""
+
+    @pytest.mark.asyncio
+    async def test_authenticated_base_redirects_to_canonical_slash_and_keeps_query(
+        self,
+        isolated_env,
+        monkeypatch,
+        tmp_path,
+    ):
+        _install_react_dist(monkeypatch, tmp_path)
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        epoch = await _make_user("react-redirect-admin")
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("react-redirect-admin", epoch),
+        ) as client:
+            response = await client.get("/mail/v2?tab=projects")
+
+        assert response.status_code == 307
+        assert response.headers["location"] == "/mail/v2/?tab=projects"
+
+    @pytest.mark.asyncio
+    async def test_anonymous_navigation_redirects_to_login_with_exact_next(
+        self,
+        isolated_env,
+        monkeypatch,
+        tmp_path,
+    ):
+        _install_react_dist(monkeypatch, tmp_path)
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get(
+                "/mail/v2/?tab=inbox&filter=high",
+                headers={"Accept": "text/html"},
+            )
+
+        assert response.status_code == 303
+        assert response.headers["location"] == (
+            "/mail/login?next=%2Fmail%2Fv2%2F%3Ftab%3Dinbox%26filter%3Dhigh"
+        )
+
+    @pytest.mark.parametrize(
+        ("username", "global_role", "project_role"),
+        [
+            pytest.param("react-admin", webauth.ROLE_ADMIN, None, id="admin"),
+            pytest.param(
+                "react-viewer",
+                webauth.ROLE_MEMBER,
+                webauth.PROJECT_ROLE_VIEWER,
+                id="viewer",
+            ),
+            pytest.param(
+                "react-operator",
+                webauth.ROLE_MEMBER,
+                webauth.PROJECT_ROLE_OPERATOR,
+                id="operator",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_every_authenticated_human_role_can_open_the_shell(
+        self,
+        isolated_env,
+        monkeypatch,
+        tmp_path,
+        username: str,
+        global_role: str,
+        project_role: str | None,
+    ):
+        _install_react_dist(monkeypatch, tmp_path)
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        epoch = await _make_user(username, role=global_role)
+        if project_role is not None:
+            project_id, _message_id = await _seed_project(
+                f"{username}-project",
+                subject="React role shell",
+                agent_name=f"{username}-agent",
+                sound="soft",
+            )
+            await _assign(username, project_id, project_role)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie(username, epoch),
+        ) as client:
+            response = await client.get("/mail/v2/")
+
+        assert response.status_code == 200
+        assert "Hermes React shell marker" in response.text
+        assert "Project not found" not in response.text
+
+    @pytest.mark.asyncio
+    async def test_root_and_deep_link_serve_non_cacheable_csp_protected_index(
+        self,
+        isolated_env,
+        monkeypatch,
+        tmp_path,
+    ):
+        _install_react_dist(monkeypatch, tmp_path)
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        epoch = await _make_user("react-deep-admin")
+        expected_csp = (
+            "default-src 'self'; connect-src 'self'; object-src 'none'; "
+            "base-uri 'none'; frame-ancestors 'none'"
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("react-deep-admin", epoch),
+        ) as client:
+            root = await client.get("/mail/v2/")
+            deep = await client.get("/mail/v2/settings/profile?tab=password")
+
+        for response in (root, deep):
+            assert response.status_code == 200
+            assert response.headers["Cache-Control"] == "no-store"
+            assert response.headers["Content-Security-Policy"] == expected_csp
+            assert response.headers["Content-Type"].startswith("text/html")
+            assert "Hermes React shell marker" in response.text
+
+    @pytest.mark.asyncio
+    async def test_assets_are_typed_immutable_and_cannot_escape_assets_root(
+        self,
+        isolated_env,
+        monkeypatch,
+        tmp_path,
+    ):
+        _install_react_dist(monkeypatch, tmp_path)
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        epoch = await _make_user("react-assets-admin")
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("react-assets-admin", epoch),
+        ) as client:
+            javascript = await client.get("/mail/v2/assets/index-test.js")
+            stylesheet = await client.get("/mail/v2/assets/index-test.css")
+            missing = await client.get("/mail/v2/assets/not-built.js")
+            bare_namespace = await client.get("/mail/v2/assets")
+            encoded_namespace = await client.get("/mail/v2/%61ssets")
+            directory = await client.get("/mail/v2/assets/")
+            traversal = await client.get(
+                "/mail/v2/assets/%2e%2e%2findex.html",
+            )
+
+        immutable = "public, max-age=31536000, immutable"
+        assert javascript.status_code == 200
+        assert javascript.headers["Cache-Control"] == immutable
+        assert javascript.headers["Content-Type"].split(";", 1)[0] in {
+            "application/javascript",
+            "text/javascript",
+        }
+        assert stylesheet.status_code == 200
+        assert stylesheet.headers["Cache-Control"] == immutable
+        assert stylesheet.headers["Content-Type"].startswith("text/css")
+        assert missing.status_code == 404
+        for response in (bare_namespace, encoded_namespace, directory):
+            assert response.status_code == 404
+            assert "Hermes React shell marker" not in response.text
+        assert traversal.status_code == 404
+        assert "Hermes React shell marker" not in traversal.text
+
+    @pytest.mark.asyncio
+    async def test_asset_symlinks_cannot_escape_the_build_tree(
+        self,
+        isolated_env,
+        monkeypatch,
+        tmp_path,
+    ):
+        dist_root = _install_react_dist(monkeypatch, tmp_path)
+        outside_file = tmp_path / "outside-secret.js"
+        outside_file.write_text("outside-file-secret", encoding="utf-8")
+        outside_directory = tmp_path / "outside-assets"
+        outside_directory.mkdir()
+        (outside_directory / "secret.js").write_text(
+            "outside-directory-secret",
+            encoding="utf-8",
+        )
+        try:
+            (dist_root / "assets" / "outside-file.js").symlink_to(outside_file)
+            (dist_root / "assets" / "outside-directory").symlink_to(
+                outside_directory,
+                target_is_directory=True,
+            )
+        except OSError as exc:
+            pytest.skip(f"This platform cannot create test symlinks: {exc}")
+
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        epoch = await _make_user("react-symlink-admin")
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("react-symlink-admin", epoch),
+        ) as client:
+            file_escape = await client.get("/mail/v2/assets/outside-file.js")
+            directory_escape = await client.get(
+                "/mail/v2/assets/outside-directory/secret.js",
+            )
+
+        for response in (file_escape, directory_escape):
+            assert response.status_code == 404
+            assert "outside-file-secret" not in response.text
+            assert "outside-directory-secret" not in response.text
+
+    @pytest.mark.asyncio
+    async def test_missing_build_is_explicit_503_for_root_deep_and_assets(
+        self,
+        isolated_env,
+        monkeypatch,
+        tmp_path,
+    ):
+        missing_dist = tmp_path / "missing-ui-dist"
+        monkeypatch.setattr(http_module, "_mail_react_dist_root", lambda: missing_dist)
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        epoch = await _make_user("react-missing-admin")
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("react-missing-admin", epoch),
+        ) as client:
+            root = await client.get("/mail/v2/")
+            deep = await client.get("/mail/v2/settings")
+            asset = await client.get("/mail/v2/assets/index-missing.js")
+
+        for response in (root, deep, asset):
+            assert response.status_code == 503
+            assert response.json() == {"detail": "React Mail UI build is unavailable."}
+        assert "Project not found" not in root.text
+
+    @pytest.mark.asyncio
+    async def test_versioned_account_apis_are_never_captured_by_the_spa(
+        self,
+        isolated_env,
+        monkeypatch,
+        tmp_path,
+    ):
+        _install_react_dist(monkeypatch, tmp_path)
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        epoch = await _make_user("react-api-member", role=webauth.ROLE_MEMBER)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("react-api-member", epoch),
+        ) as client:
+            preferences = await client.get("/mail/api/v1/me/preferences")
+            password = await client.patch(
+                "/mail/api/v1/me/password",
+                json={},
+                headers=SAME_ORIGIN_HEADERS,
+            )
+
+        assert preferences.status_code == 200
+        assert preferences.headers["Content-Type"].startswith("application/json")
+        assert "Hermes React shell marker" not in preferences.text
+        assert password.status_code == 422
+        assert password.headers["Content-Type"].startswith("application/json")
+        assert "Hermes React shell marker" not in password.text
 
 
 class TestMailUiPreferences:
@@ -2365,6 +2660,10 @@ class TestMailUiRbacSurface:
             "/mail/api/v1/me/preferences": "self-only",
             "/mail/projects": "aggregate-scoped",
             "/mail/unified-inbox": "aggregate-scoped",
+            "/mail/v2": "session-shell",
+            "/mail/v2/": "session-shell",
+            "/mail/v2/assets/{asset_path:path}": "session-static-asset",
+            "/mail/v2/{spa_path:path}": "session-shell",
             "/mail/api/locks": "admin-only",
             "/mail/api/file-reservations": "service-or-project-scoped",
             "/mail/{project}": "project-guarded",
@@ -2404,4 +2703,6 @@ class TestMailUiRbacSurface:
             "project-role-guarded",
             "project-query-guarded",
             "self-only",
+            "session-shell",
+            "session-static-asset",
         }

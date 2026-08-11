@@ -853,6 +853,17 @@ _MAIL_FILE_RESERVATIONS_API_PATH = "/mail/api/file-reservations"
 _MAIL_PREFERENCES_API_PATH = "/mail/api/v1/me/preferences"
 _MAIL_PASSWORD_API_PATH = "/mail/api/v1/me/password"
 _MAIL_ACCOUNT_API_PATHS = frozenset({_MAIL_PREFERENCES_API_PATH, _MAIL_PASSWORD_API_PATH})
+_MAIL_REACT_BASE_PATH = "/mail/v2"
+_MAIL_REACT_INDEX_HEADERS = {
+    "Cache-Control": "no-store",
+    "Content-Security-Policy": (
+        "default-src 'self'; connect-src 'self'; object-src 'none'; "
+        "base-uri 'none'; frame-ancestors 'none'"
+    ),
+}
+_MAIL_REACT_ASSET_HEADERS = {
+    "Cache-Control": "public, max-age=31536000, immutable",
+}
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _OVERSEER_REPLY_PATH_RE = re.compile(r"^/mail/[^/]+/overseer/reply$")
 _mail_ui_template_user: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
@@ -861,6 +872,23 @@ _mail_ui_template_user: contextvars.ContextVar[dict[str, Any] | None] = contextv
 )
 
 MailUiLocale = Literal["en", "pl"]
+
+
+def _mail_react_dist_root() -> Path:
+    """Return the immutable container/package location of the Vite build."""
+    return Path(__file__).resolve().parent / "ui_dist"
+
+
+def _mail_react_resolve_file(root: Path, relative_path: str) -> Path | None:
+    """Resolve one existing regular file without allowing an escape from ``root``."""
+    try:
+        resolved_root = root.resolve(strict=True)
+        candidate = (resolved_root / relative_path).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if candidate == resolved_root or not candidate.is_relative_to(resolved_root):
+        return None
+    return candidate if candidate.is_file() else None
 
 
 class MailUiSessionPrincipal(TypedDict):
@@ -4126,6 +4154,85 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 limit=limit,
                 filter_importance=filter_importance,
             )
+
+        def _mail_react_index_response() -> FileResponse:
+            """Serve the Vite entry point without allowing account data to be cached."""
+            index_file = _mail_react_resolve_file(
+                _mail_react_dist_root(),
+                "index.html",
+            )
+            if index_file is None:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="React Mail UI build is unavailable.",
+                )
+            return FileResponse(
+                index_file,
+                media_type="text/html",
+                headers=_MAIL_REACT_INDEX_HEADERS,
+            )
+
+        @fastapi_app.get(_MAIL_REACT_BASE_PATH, include_in_schema=False)
+        async def mail_react_slash_redirect(request: Request) -> Response:
+            """Canonicalize the React shell URL before the project-slug route."""
+            location = f"{_MAIL_REACT_BASE_PATH}/"
+            if request.url.query:
+                location = f"{location}?{request.url.query}"
+            return Response(
+                status_code=status.HTTP_307_TEMPORARY_REDIRECT,
+                headers={"Location": location},
+            )
+
+        @fastapi_app.get(f"{_MAIL_REACT_BASE_PATH}/", include_in_schema=False)
+        async def mail_react_index() -> FileResponse:
+            """Serve the authenticated React shell."""
+            return _mail_react_index_response()
+
+        @fastapi_app.get(
+            f"{_MAIL_REACT_BASE_PATH}/assets/{{asset_path:path}}",
+            include_in_schema=False,
+        )
+        async def mail_react_asset(asset_path: str) -> FileResponse:
+            """Serve only fingerprinted build files physically contained in ``assets``."""
+            dist_root = _mail_react_dist_root()
+            if _mail_react_resolve_file(dist_root, "index.html") is None:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="React Mail UI build is unavailable.",
+                )
+
+            asset_file = _mail_react_resolve_file(
+                dist_root,
+                f"assets/{asset_path}",
+            )
+            try:
+                resolved_assets_root = (dist_root / "assets").resolve(strict=True)
+            except (OSError, RuntimeError, ValueError):
+                resolved_assets_root = None
+            if (
+                asset_file is None
+                or resolved_assets_root is None
+                or asset_file == resolved_assets_root
+                or not asset_file.is_relative_to(resolved_assets_root)
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="React Mail UI asset not found.",
+                )
+            return FileResponse(asset_file, headers=_MAIL_REACT_ASSET_HEADERS)
+
+        @fastapi_app.get(
+            f"{_MAIL_REACT_BASE_PATH}/{{spa_path:path}}",
+            include_in_schema=False,
+        )
+        async def mail_react_spa_fallback(spa_path: str) -> FileResponse:
+            """Return the shell for authenticated client-side deep links."""
+            if spa_path == "assets":
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="React Mail UI asset not found.",
+                )
+            return _mail_react_index_response()
 
         @fastapi_app.get("/mail/{project}", response_class=HTMLResponse)
         async def mail_project(

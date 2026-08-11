@@ -11,6 +11,7 @@ import hmac
 import importlib
 import json
 import logging
+import math
 import re
 import threading
 from collections.abc import MutableMapping
@@ -21,13 +22,14 @@ from typing import Any, Literal, Protocol, TypedDict, cast
 import structlog
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, status
-from fastapi.exception_handlers import http_exception_handler
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from git import NULL_TREE
 from markupsafe import Markup, escape as escape_markup
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from sqlalchemy import text, update
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -849,6 +851,8 @@ _MAIL_LOGIN_PATH = "/mail/login"
 _MAIL_LOGOUT_PATH = "/mail/logout"
 _MAIL_FILE_RESERVATIONS_API_PATH = "/mail/api/file-reservations"
 _MAIL_PREFERENCES_API_PATH = "/mail/api/v1/me/preferences"
+_MAIL_PASSWORD_API_PATH = "/mail/api/v1/me/password"
+_MAIL_ACCOUNT_API_PATHS = frozenset({_MAIL_PREFERENCES_API_PATH, _MAIL_PASSWORD_API_PATH})
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _OVERSEER_REPLY_PATH_RE = re.compile(r"^/mail/[^/]+/overseer/reply$")
 _mail_ui_template_user: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
@@ -904,6 +908,36 @@ class MailUiPreferencesPatch(BaseModel):
         """Canonicalize human-entered locale tags before the closed-set check."""
         return value.strip().casefold() if isinstance(value, str) else value
 
+
+class MailUiPasswordPatch(BaseModel):
+    """Bounded secrets for self-service password rotation.
+
+    ``SecretStr`` keeps both fields masked in model representations and logs.
+    Deliberately do not canonicalize or trim either value: whitespace and all
+    other Unicode code points are valid password material.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    current_password: SecretStr = Field(min_length=1, max_length=1024)
+    new_password: SecretStr = Field(min_length=15, max_length=1024)
+
+    @field_validator("current_password", "new_password")
+    @classmethod
+    def require_utf8(cls, value: SecretStr) -> SecretStr:
+        """Reject lone surrogates before either secret can reach scrypt."""
+        try:
+            value.get_secret_value().encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("Password must be valid UTF-8 Unicode text.") from None
+        return value
+
+
+class MailUiPasswordChangeResponse(BaseModel):
+    """Stable success response for a completed password rotation."""
+
+    changed: Literal[True] = True
+
 # Login brute-force throttle, keyed by client address and normalized username. scrypt already caps an
 # attacker at roughly 20 guesses/second/core, but that is still ~1.7M/day against
 # a weak password, so cap it properly. In-process state is sufficient and correct
@@ -912,6 +946,60 @@ class MailUiPreferencesPatch(BaseModel):
 _LOGIN_MAX_FAILURES = 8
 _LOGIN_WINDOW_SECONDS = 300.0
 _login_failures: dict[str, list[float]] = {}
+
+# Password rotation is intentionally stricter than login throttling. A caller
+# already has a valid session, so the key is the immutable account lifetime
+# rather than an attacker-controlled address or username. Registration is a
+# synchronous operation which the endpoint performs before its first await;
+# concurrent requests therefore cannot all pass the threshold before yielding.
+_PASSWORD_CHANGE_MAX_ATTEMPTS = 5
+_PASSWORD_CHANGE_WINDOW_SECONDS = 15 * 60.0
+_PASSWORD_CHANGE_MAX_KEYS = 4096
+_password_change_attempts: dict[tuple[int, str], list[float]] = {}
+
+
+def _password_change_clock() -> float:
+    """Return a monotonic instant, isolated for deterministic limiter tests."""
+    import time
+
+    return time.monotonic()
+
+
+def _password_change_register_attempt(*, user_id: int, generation: str) -> int | None:
+    """Register an attempt or return the seconds until this account may retry."""
+    now = _password_change_clock()
+    key = (user_id, generation)
+
+    # Never evict a live bucket: doing so would let account churn reset that
+    # lifetime's attempt count. At capacity, first reclaim only fully expired
+    # buckets. If every slot is live, fail closed until the earliest complete
+    # bucket can expire, without inserting a 4097th key.
+    if key not in _password_change_attempts and len(_password_change_attempts) >= _PASSWORD_CHANGE_MAX_KEYS:
+        stale = [
+            candidate
+            for candidate, attempts in _password_change_attempts.items()
+            if not attempts or now - attempts[-1] >= _PASSWORD_CHANGE_WINDOW_SECONDS
+        ]
+        for candidate in stale:
+            _password_change_attempts.pop(candidate, None)
+        if len(_password_change_attempts) >= _PASSWORD_CHANGE_MAX_KEYS:
+            earliest_release = min(attempts[-1] for attempts in _password_change_attempts.values())
+            remaining = _PASSWORD_CHANGE_WINDOW_SECONDS - (now - earliest_release)
+            return max(1, math.ceil(remaining))
+
+    recent = [
+        instant
+        for instant in _password_change_attempts.get(key, [])
+        if now - instant < _PASSWORD_CHANGE_WINDOW_SECONDS
+    ]
+    if len(recent) >= _PASSWORD_CHANGE_MAX_ATTEMPTS:
+        _password_change_attempts[key] = recent
+        remaining = _PASSWORD_CHANGE_WINDOW_SECONDS - (now - recent[0])
+        return max(1, math.ceil(remaining))
+
+    recent.append(now)
+    _password_change_attempts[key] = recent
+    return None
 
 
 def _login_throttled(client: str) -> bool:
@@ -1065,7 +1153,7 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
                 )
             if (
                 user["role"] != webauth.ROLE_ADMIN
-                and path != _MAIL_PREFERENCES_API_PATH
+                and path not in _MAIL_ACCOUNT_API_PATHS
                 and not _OVERSEER_REPLY_PATH_RE.fullmatch(path)
             ):
                 return JSONResponse(
@@ -1086,6 +1174,31 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         finally:
             _mail_ui_template_user.reset(token)
+
+
+class MailUiAccountNoStoreMiddleware:
+    """Prevent browsers and intermediaries from caching account-bound API data."""
+
+    def __init__(self, app: Any) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") != "http" or scope.get("path") not in _MAIL_ACCOUNT_API_PATHS:
+            await self._app(scope, receive, send)
+            return
+
+        async def send_no_store(message: MutableMapping[str, Any]) -> None:
+            if message.get("type") == "http.response.start":
+                headers = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if bytes(name).lower() != b"cache-control"
+                ]
+                headers.append((b"cache-control", b"no-store"))
+                message["headers"] = headers
+            await send(cast(Any, message))
+
+        await self._app(scope, receive, cast(Send, send_no_store))
 
 
 async def _load_session_user(
@@ -1266,6 +1379,93 @@ async def _mail_ui_preferences_cas_update(
         return False
     await session.commit()
     return True
+
+
+def _mail_ui_password_principal(request: Request) -> MailUiSessionPrincipal:
+    """Require the authenticated internal human principal for password rotation."""
+    principal = _mail_ui_request_user(request)
+    if principal is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Password changes require an authenticated Mail UI session.",
+        )
+    return principal
+
+
+async def _mail_ui_password_user(
+    request: Request,
+    session: AsyncSession,
+) -> Any:
+    """Revalidate every cookie-bound fact before reading a password hash."""
+    from sqlmodel import select
+
+    from .models import UiUser
+
+    principal = _mail_ui_password_principal(request)
+    result = await session.execute(
+        select(UiUser)
+        .where(UiUser.id == principal["id"])
+        .where(UiUser.username == principal["username"])
+        .where(UiUser.session_epoch == principal["session_epoch"])
+        .where(UiUser.session_generation == principal["session_generation"])
+        .where(UiUser.disabled == False)  # noqa: E712
+    )
+    row = result.scalars().first()
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authenticated Mail UI session is no longer current.",
+        )
+    return row
+
+
+async def _mail_ui_password_cas_update(
+    session: AsyncSession,
+    *,
+    principal: MailUiSessionPrincipal,
+    old_password_hash: str,
+    new_password_hash: str,
+) -> bool:
+    """Rotate one current account lifetime and revoke every previous cookie."""
+    from .models import UiUser
+
+    result = await session.execute(
+        update(UiUser)
+        .where(cast(Any, UiUser.id == principal["id"]))
+        .where(cast(Any, UiUser.username == principal["username"]))
+        .where(cast(Any, UiUser.session_epoch == principal["session_epoch"]))
+        .where(cast(Any, UiUser.session_generation == principal["session_generation"]))
+        .where(cast(Any, UiUser.password_hash == old_password_hash))
+        .where(cast(Any, UiUser.disabled == False))  # noqa: E712
+        .values(
+            password_hash=new_password_hash,
+            session_epoch=principal["session_epoch"] + 1,
+        )
+    )
+    if int(getattr(result, "rowcount", 0) or 0) != 1:
+        await session.rollback()
+        return False
+    await session.commit()
+    return True
+
+
+def _set_mail_ui_session_cookie(
+    response: Response,
+    *,
+    token: str,
+    settings: Settings,
+) -> None:
+    """Attach the one canonical Mail UI session cookie to a response."""
+    cfg = settings.mail_ui
+    response.set_cookie(
+        cfg.cookie_name,
+        token,
+        max_age=cfg.session_ttl_seconds,
+        httponly=True,
+        secure=cfg.cookie_secure,
+        samesite="lax",
+        path="/mail",
+    )
 
 
 def _mail_ui_request_is_admin(*, settings: Settings, request: Request) -> bool:
@@ -2320,6 +2520,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     app_any4 = cast(Any, fastapi_app)
     app_any4.add_middleware(Utf8BodyGuardMiddleware)
 
+    # Registered after the body guard so even authentication, CSRF, rate-limit,
+    # validation, and invalid-encoding failures on account-bound endpoints are
+    # explicitly non-cacheable.
+    app_any5 = cast(Any, fastapi_app)
+    app_any5.add_middleware(MailUiAccountNoStoreMiddleware)
+
     # Optional CORS
     if settings.cors.enabled:
         from typing import Any as _Any, cast as _cast  # local type-only import
@@ -3323,15 +3529,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     await s_touch.commit()
 
             response = Response(status_code=status.HTTP_303_SEE_OTHER, headers={"Location": next_url})
-            response.set_cookie(
-                cfg.cookie_name,
-                token,
-                max_age=cfg.session_ttl_seconds,
-                httponly=True,          # JavaScript must never be able to read it
-                secure=cfg.cookie_secure,
-                samesite="lax",         # blocks the cookie on cross-site POSTs
-                path="/mail",           # never sent to the MCP mounts
-            )
+            _set_mail_ui_session_cookie(response, token=token, settings=settings)
             structlog.get_logger("mail_ui").info("mail_ui.login_ok", username=username, client=client_ip)
             return response
 
@@ -3550,6 +3748,90 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 async with get_session() as session:
                     row = await _mail_ui_preferences_user(request, session)
             return _preferences_response_for_user(row)
+
+        @fastapi_app.patch(
+            _MAIL_PASSWORD_API_PATH,
+            response_model=MailUiPasswordChangeResponse,
+        )
+        async def mail_ui_password_patch(
+            request: Request,
+            response: Response,
+            passwords: MailUiPasswordPatch,
+        ) -> MailUiPasswordChangeResponse:
+            """Rotate the signed-in human's password and refresh only this session."""
+            if not webauth.same_origin(
+                request.headers.get("origin", ""),
+                request.headers.get("referer", ""),
+                request.headers.get("host", ""),
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Cross-origin request rejected",
+                )
+
+            # Do not yield between identifying the limiter key and registering
+            # the attempt. Five concurrent requests consume all five slots;
+            # another request observes the full bucket immediately.
+            principal = _mail_ui_password_principal(request)
+            retry_after = _password_change_register_attempt(
+                user_id=principal["id"],
+                generation=principal["session_generation"],
+            )
+            if retry_after is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Too many password change attempts. Try again later.",
+                    headers={"Retry-After": str(retry_after)},
+                )
+
+            await ensure_schema()
+            async with get_session() as session:
+                row = await _mail_ui_password_user(request, session)
+                old_password_hash = str(row.password_hash)
+
+            current_password = passwords.current_password.get_secret_value()
+            new_password = passwords.new_password.get_secret_value()
+            current_matches = await asyncio.to_thread(
+                webauth.verify_password,
+                current_password,
+                old_password_hash,
+            )
+            if not current_matches:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Current password is incorrect.",
+                )
+            new_password_hash = await asyncio.to_thread(webauth.hash_password, new_password)
+
+            async with get_session() as session:
+                changed = await _mail_ui_password_cas_update(
+                    session,
+                    principal=principal,
+                    old_password_hash=old_password_hash,
+                    new_password_hash=new_password_hash,
+                )
+            if not changed:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Authenticated Mail UI session is no longer current.",
+                )
+
+            import time as _time
+
+            refreshed_token = webauth.make_session(
+                principal["username"],
+                epoch=principal["session_epoch"] + 1,
+                generation=principal["session_generation"],
+                now=_time.time(),
+                secret=settings.mail_ui.session_secret.encode("utf-8"),
+                ttl=float(settings.mail_ui.session_ttl_seconds),
+            )
+            _set_mail_ui_session_cookie(response, token=refreshed_token, settings=settings)
+            structlog.get_logger("mail_ui").info(
+                "mail_ui.password_changed",
+                username=principal["username"],
+            )
+            return MailUiPasswordChangeResponse()
 
         @fastapi_app.post("/mail/api/delete-messages", response_class=JSONResponse)
         async def delete_messages_api(request: Request) -> JSONResponse:
@@ -6357,6 +6639,27 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             structlog.get_logger("ui").error("ui_init_failed", error=str(exc))
         pass
 
+    @fastapi_app.exception_handler(RequestValidationError)
+    async def _redact_mail_password_validation(
+        request: Request,
+        exc: RequestValidationError,
+    ) -> Response:
+        """Keep invalid password values out of the typed API's 422 response."""
+        if request.url.path != _MAIL_PASSWORD_API_PATH:
+            return await request_validation_exception_handler(request, exc)
+        detail = [
+            {
+                key: error[key]
+                for key in ("type", "loc", "msg")
+                if key in error
+            }
+            for error in exc.errors()
+        ]
+        return JSONResponse(
+            {"detail": detail},
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
+
     # Keep the auto-generated /openapi.json focused on the real API contract.
     # The browser-facing SSR mail UI and its legacy JSON helpers live under the
     # `/mail` prefix; they are registered for humans, not as part of the typed
@@ -6380,7 +6683,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             schema["paths"] = {
                 path: item
                 for path, item in paths.items()
-                if path == _MAIL_PREFERENCES_API_PATH
+                if path in _MAIL_ACCOUNT_API_PATHS
                 or not (path == "/mail" or path.startswith("/mail/"))
             }
         fastapi_app.openapi_schema = schema

@@ -42,6 +42,12 @@ SECRET = "mail-ui-gate-session-secret-0123456789"
 # A route the gate protects and that renders without any project existing, so a
 # failure here is the gate's answer and not a missing fixture.
 GUARDED = "/mail/archive/guide"
+PASSWORD_PATH = "/mail/api/v1/me/password"
+SAME_ORIGIN_HEADERS = {
+    "Origin": "http://test",
+    "Referer": "http://test/",
+    "Host": "test",
+}
 
 
 def _build(monkeypatch, **env: str):
@@ -146,7 +152,12 @@ class TestMailUiGate:
         assert response.status_code != 401
 
 
-async def _make_user(username: str = "operator", *, role: str = webauth.ROLE_ADMIN) -> int:
+async def _make_user(
+    username: str = "operator",
+    *,
+    role: str = webauth.ROLE_ADMIN,
+    password: str = "irrelevant-here",
+) -> int:
     """Insert a UiUser and return its session_epoch."""
     from mcp_agent_mail.models import UiUser
 
@@ -154,7 +165,7 @@ async def _make_user(username: str = "operator", *, role: str = webauth.ROLE_ADM
     async with get_session() as session:
         user = UiUser(
             username=username,
-            password_hash=webauth.hash_password("irrelevant-here"),
+            password_hash=webauth.hash_password(password),
             role=role,
         )
         session.add(user)
@@ -185,6 +196,20 @@ async def _user_id(username: str) -> int:
             {"username": username},
         )
         return int(result.scalar_one())
+
+
+async def _user_auth_state(username: str) -> tuple[str, int, str, bool]:
+    """Return the stored hash and all cookie-bound account facts."""
+    async with get_session() as session:
+        result = await session.execute(
+            text(
+                "SELECT password_hash, session_epoch, session_generation, disabled "
+                "FROM ui_users WHERE username = :username"
+            ),
+            {"username": username},
+        )
+        row = result.one()
+    return str(row[0]), int(row[1]), str(row[2]), bool(row[3])
 
 
 async def _seed_project(
@@ -397,7 +422,7 @@ class TestMailUiSession:
 class TestMailUiPreferences:
     """Per-human locale state stays self-only, canonical, and migration-safe."""
 
-    def test_custom_openapi_exposes_only_the_typed_preferences_api(
+    def test_custom_openapi_exposes_only_the_typed_self_service_apis(
         self,
         isolated_env,
         monkeypatch,
@@ -412,7 +437,10 @@ class TestMailUiPreferences:
             if path == "/mail" or path.startswith("/mail/")
         }
 
-        assert set(mail_paths) == {"/mail/api/v1/me/preferences"}
+        assert set(mail_paths) == {
+            "/mail/api/v1/me/password",
+            "/mail/api/v1/me/preferences",
+        }
         operations = mail_paths["/mail/api/v1/me/preferences"]
         assert set(operations) == {"get", "patch"}
         assert operations["patch"]["requestBody"]["content"]["application/json"]["schema"] == {
@@ -425,6 +453,32 @@ class TestMailUiPreferences:
         assert schema["components"]["schemas"]["MailUiPreferencesPatch"][
             "additionalProperties"
         ] is False
+        password_operations = mail_paths["/mail/api/v1/me/password"]
+        assert set(password_operations) == {"patch"}
+        assert password_operations["patch"]["requestBody"]["content"]["application/json"][
+            "schema"
+        ] == {"$ref": "#/components/schemas/MailUiPasswordPatch"}
+        assert password_operations["patch"]["responses"]["200"]["content"][
+            "application/json"
+        ]["schema"] == {"$ref": "#/components/schemas/MailUiPasswordChangeResponse"}
+        password_schema = schema["components"]["schemas"]["MailUiPasswordPatch"]
+        assert password_schema["additionalProperties"] is False
+        assert password_schema["properties"]["current_password"] == {
+            "type": "string",
+            "format": "password",
+            "writeOnly": True,
+            "minLength": 1,
+            "maxLength": 1024,
+            "title": "Current Password",
+        }
+        assert password_schema["properties"]["new_password"] == {
+            "type": "string",
+            "format": "password",
+            "writeOnly": True,
+            "minLength": 15,
+            "maxLength": 1024,
+            "title": "New Password",
+        }
         assert "/mail/api/unified-inbox" not in schema["paths"]
 
     @pytest.mark.asyncio
@@ -493,6 +547,7 @@ class TestMailUiPreferences:
             response = await client.get("/mail/api/v1/me/preferences")
 
         assert response.status_code == 200
+        assert response.headers["Cache-Control"] == "no-store"
         assert response.json() == {
             "stored": {
                 "preferred_ui_locale": "en",
@@ -536,6 +591,8 @@ class TestMailUiPreferences:
             )
 
         assert both.status_code == 200
+        assert both.headers["Cache-Control"] == "no-store"
+        assert inherited.headers["Cache-Control"] == "no-store"
         assert both.json() == {
             "stored": {
                 "preferred_ui_locale": "pl",
@@ -636,6 +693,7 @@ class TestMailUiPreferences:
             unchanged = await client.get("/mail/api/v1/me/preferences")
 
         assert rejected.status_code == 403
+        assert rejected.headers["Cache-Control"] == "no-store"
         assert unchanged.json()["stored"]["preferred_ui_locale"] == "en"
 
     @pytest.mark.asyncio
@@ -848,9 +906,963 @@ class TestMailUiPreferences:
                 json={"preferred_ui_locale": "pl"},
                 headers=headers,
             )
+            password_write = await client.patch(
+                PASSWORD_PATH,
+                json={
+                    "current_password": "irrelevant-here",
+                    "new_password": "valid replacement password",
+                },
+                headers=headers,
+            )
 
         assert read.status_code == 401
         assert write.status_code == 401
+        assert password_write.status_code == 401
+        assert password_write.headers["Cache-Control"] == "no-store"
+
+
+class TestMailUiPasswordChange:
+    """Password rotation is self-only, revoking, bounded, and race-safe."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_password_change_attempts(self):
+        http_module._password_change_attempts.clear()
+        try:
+            yield
+        finally:
+            http_module._password_change_attempts.clear()
+
+    @pytest.mark.asyncio
+    async def test_anonymous_request_is_401_and_non_cacheable(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """The typed route never exposes validation details before authentication."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.patch(
+                PASSWORD_PATH,
+                json={
+                    "current_password": "anonymous current secret",
+                    "new_password": "anonymous replacement secret",
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+
+        assert response.status_code == 401
+        assert response.headers["Cache-Control"] == "no-store"
+        assert "anonymous" not in response.text
+
+    @pytest.mark.asyncio
+    async def test_success_rotates_hash_revokes_other_session_and_refreshes_caller(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """Only the requesting browser receives a cookie for the incremented epoch."""
+        settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        username = "password-member"
+        current_password = "current password with spaces"
+        new_password = "nowe hasło 🔐 with spaces"
+        epoch = await _make_user(
+            username,
+            role=webauth.ROLE_MEMBER,
+            password=current_password,
+        )
+        original_cookie = await _cookie(username, epoch)
+
+        async with (
+            AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://test",
+                cookies=original_cookie,
+            ) as caller,
+            AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://test",
+                cookies=original_cookie,
+            ) as other_session,
+        ):
+            changed = await caller.patch(
+                PASSWORD_PATH,
+                json={
+                    "current_password": current_password,
+                    "new_password": new_password,
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            # `_cookie()` supplies a bare test-client cookie (Path=/), whereas
+            # browsers obtain the real cookie from login with Path=/mail. Drop
+            # that test-only root cookie so the refreshed /mail cookie is the
+            # sole value, exactly as it is in production.
+            caller.cookies.clear()
+            caller.cookies.set(
+                settings.mail_ui.cookie_name,
+                changed.cookies[settings.mail_ui.cookie_name],
+                path="/mail",
+            )
+            refreshed = await caller.get("/mail/api/v1/me/preferences")
+            stale = await other_session.patch(
+                PASSWORD_PATH,
+                json={
+                    "current_password": current_password,
+                    "new_password": "another valid replacement password",
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+
+        stored_hash, stored_epoch, _generation, disabled = await _user_auth_state(username)
+        assert changed.status_code == 200
+        assert changed.json() == {"changed": True}
+        assert changed.headers["Cache-Control"] == "no-store"
+        set_cookie = changed.headers["set-cookie"].lower()
+        assert f"max-age={settings.mail_ui.session_ttl_seconds}" in set_cookie
+        assert "httponly" in set_cookie
+        assert "samesite=lax" in set_cookie
+        assert "path=/mail" in set_cookie
+        assert ("secure" in set_cookie) is settings.mail_ui.cookie_secure
+        assert stored_epoch == epoch + 1
+        assert disabled is False
+        assert webauth.verify_password(new_password, stored_hash) is True
+        assert webauth.verify_password(current_password, stored_hash) is False
+        assert refreshed.status_code == 200
+        assert refreshed.headers["Cache-Control"] == "no-store"
+        assert stale.status_code == 401
+        assert stale.headers["Cache-Control"] == "no-store"
+
+    @pytest.mark.asyncio
+    async def test_wrong_current_password_is_400_and_keeps_state_and_cookie(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """A wrong current secret neither mutates the account nor signs a cookie."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        username = "password-wrong-current"
+        current_password = "the actual current password"
+        wrong_password = "wrong secret must stay private"
+        epoch = await _make_user(username, password=current_password)
+        before = await _user_auth_state(username)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie(username, epoch),
+        ) as client:
+            response = await client.patch(
+                PASSWORD_PATH,
+                json={
+                    "current_password": wrong_password,
+                    "new_password": "a valid replacement password",
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            still_live = await client.get("/mail/api/v1/me/preferences")
+
+        assert response.status_code == 400
+        assert response.json() == {"detail": "Current password is incorrect."}
+        assert wrong_password not in response.text
+        assert "set-cookie" not in response.headers
+        assert response.headers["Cache-Control"] == "no-store"
+        assert still_live.status_code == 200
+        assert await _user_auth_state(username) == before
+
+    @pytest.mark.asyncio
+    async def test_cross_origin_is_403_without_consuming_attempt_or_mutating_state(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """The middleware rejects CSRF before limiter registration or scrypt work."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        username = "password-cross-origin"
+        epoch = await _make_user(username, password="cross origin current")
+        before = await _user_auth_state(username)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie(username, epoch),
+        ) as client:
+            response = await client.patch(
+                PASSWORD_PATH,
+                json={
+                    "current_password": "cross origin current",
+                    "new_password": "cross origin replacement",
+                },
+                headers={
+                    "Origin": "https://evil.example",
+                    "Referer": "https://evil.example/",
+                    "Host": "test",
+                },
+            )
+
+        assert response.status_code == 403
+        assert response.headers["Cache-Control"] == "no-store"
+        assert await _user_auth_state(username) == before
+        assert http_module._password_change_attempts == {}
+
+    @pytest.mark.asyncio
+    async def test_validation_is_422_forbidden_extra_and_never_reflects_secrets(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """Every invalid body is sanitized before it reaches the client or limiter."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        username = "password-validation"
+        epoch = await _make_user(username)
+        too_long_current = "current-private-" + ("c" * 1010)
+        too_short_new = "short-private"
+        too_long_new = "new-private-" + ("n" * 1014)
+        extra_secret = "extra-private-value"
+        payloads = [
+            {"current_password": "", "new_password": "valid replacement password"},
+            {
+                "current_password": too_long_current,
+                "new_password": "valid replacement password",
+            },
+            {"current_password": "irrelevant-here", "new_password": too_short_new},
+            {"current_password": "irrelevant-here", "new_password": too_long_new},
+            {
+                "current_password": "irrelevant-here",
+                "new_password": "valid replacement password",
+                "repeated_password": extra_secret,
+            },
+        ]
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie(username, epoch),
+        ) as client:
+            responses = [
+                await client.patch(PASSWORD_PATH, json=payload, headers=SAME_ORIGIN_HEADERS)
+                for payload in payloads
+            ]
+
+        assert [response.status_code for response in responses] == [422] * len(payloads)
+        assert all(response.headers["Cache-Control"] == "no-store" for response in responses)
+        combined = "\n".join(response.text for response in responses)
+        for secret in (too_long_current, too_short_new, too_long_new, extra_secret):
+            assert secret not in combined
+        assert http_module._password_change_attempts == {}
+
+    @pytest.mark.asyncio
+    async def test_lone_surrogates_in_either_secret_are_sanitized_422_before_scrypt(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """Python-only Unicode surrogates cannot escape validation into UTF-8 hashing."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        username = "password-surrogate-validation"
+        epoch = await _make_user(username)
+        current_surrogate = "current-" + chr(0xD800) + "-private"
+        new_surrogate = "new-password-" + chr(0xDFFF) + "-private"
+
+        async def forbidden_to_thread(*_args, **_kwargs):
+            pytest.fail("invalid Unicode must not reach password verification or hashing")
+
+        monkeypatch.setattr(http_module.asyncio, "to_thread", forbidden_to_thread)
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie(username, epoch),
+        ) as client:
+            current_response = await client.patch(
+                PASSWORD_PATH,
+                content=(
+                    b'{"current_password":"current-\\ud800-private",'
+                    b'"new_password":"valid replacement password"}'
+                ),
+                headers={**SAME_ORIGIN_HEADERS, "Content-Type": "application/json"},
+            )
+            new_response = await client.patch(
+                PASSWORD_PATH,
+                content=(
+                    b'{"current_password":"irrelevant-here",'
+                    b'"new_password":"new-password-\\udfff-private"}'
+                ),
+                headers={**SAME_ORIGIN_HEADERS, "Content-Type": "application/json"},
+            )
+
+        assert current_response.status_code == 422
+        assert new_response.status_code == 422
+        assert current_response.headers["Cache-Control"] == "no-store"
+        assert new_response.headers["Cache-Control"] == "no-store"
+        assert current_surrogate not in current_response.text
+        assert new_surrogate not in new_response.text
+        assert http_module._password_change_attempts == {}
+
+    @pytest.mark.parametrize(
+        ("username", "current_password", "new_password"),
+        [
+            ("password-minimum", "x", "🔐" * 15),
+            ("password-maximum", "c" * 1024, "n" * 1024),
+            (
+                "password-whitespace",
+                " current password is not trimmed ",
+                " new password is not trimmed either ",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_unicode_length_boundaries_and_whitespace_are_exact(
+        self,
+        isolated_env,
+        monkeypatch,
+        username,
+        current_password,
+        new_password,
+    ):
+        """Lengths count Unicode characters and neither secret is normalized."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        epoch = await _make_user(username, password=current_password)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie(username, epoch),
+        ) as client:
+            response = await client.patch(
+                PASSWORD_PATH,
+                json={
+                    "current_password": current_password,
+                    "new_password": new_password,
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+
+        stored_hash, stored_epoch, _generation, _disabled = await _user_auth_state(username)
+        assert response.status_code == 200
+        assert stored_epoch == epoch + 1
+        assert webauth.verify_password(new_password, stored_hash) is True
+        if new_password != new_password.strip():
+            assert webauth.verify_password(new_password.strip(), stored_hash) is False
+
+    @pytest.mark.asyncio
+    async def test_verify_and_hash_are_offloaded_outside_every_database_session(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """Both scrypt calls run through to_thread with no read or write session open."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        username = "password-offload"
+        current_password = "offload current password"
+        epoch = await _make_user(username, password=current_password)
+        original_get_session = http_module.get_session
+        session_depth = 0
+        offloaded = []
+
+        @contextlib.asynccontextmanager
+        async def tracked_get_session():
+            nonlocal session_depth
+            async with original_get_session() as session:
+                session_depth += 1
+                try:
+                    yield session
+                finally:
+                    session_depth -= 1
+
+        async def observed_to_thread(function, *args, **kwargs):
+            assert session_depth == 0
+            offloaded.append(function)
+            return function(*args, **kwargs)
+
+        monkeypatch.setattr(http_module, "get_session", tracked_get_session)
+        monkeypatch.setattr(http_module.asyncio, "to_thread", observed_to_thread)
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie(username, epoch),
+        ) as client:
+            response = await client.patch(
+                PASSWORD_PATH,
+                json={
+                    "current_password": current_password,
+                    "new_password": "offloaded replacement password",
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+
+        assert response.status_code == 200
+        assert offloaded == [webauth.verify_password, webauth.hash_password]
+
+    @pytest.mark.asyncio
+    async def test_limiter_is_per_account_lifetime_expires_and_sets_retry_after(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """Five attempts are admitted; the sixth is blocked without affecting peers."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        epoch_a = await _make_user("password-limited-a")
+        epoch_b = await _make_user("password-limited-b")
+        now = [100.0]
+        monkeypatch.setattr(http_module, "_password_change_clock", lambda: now[0])
+        monkeypatch.setattr(webauth, "verify_password", lambda _password, _stored: False)
+
+        async with (
+            AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://test",
+                cookies=await _cookie("password-limited-a", epoch_a),
+            ) as client_a,
+            AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://test",
+                cookies=await _cookie("password-limited-b", epoch_b),
+            ) as client_b,
+        ):
+            attempts = [
+                await client_a.patch(
+                    PASSWORD_PATH,
+                    json={
+                        "current_password": "wrong password",
+                        "new_password": "valid replacement password",
+                    },
+                    headers=SAME_ORIGIN_HEADERS,
+                )
+                for _ in range(http_module._PASSWORD_CHANGE_MAX_ATTEMPTS)
+            ]
+            blocked = await client_a.patch(
+                PASSWORD_PATH,
+                json={
+                    "current_password": "wrong password",
+                    "new_password": "valid replacement password",
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            peer = await client_b.patch(
+                PASSWORD_PATH,
+                json={
+                    "current_password": "wrong password",
+                    "new_password": "valid replacement password",
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            now[0] += http_module._PASSWORD_CHANGE_WINDOW_SECONDS
+            expired = await client_a.patch(
+                PASSWORD_PATH,
+                json={
+                    "current_password": "wrong password",
+                    "new_password": "valid replacement password",
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+
+        assert [response.status_code for response in attempts] == [400] * 5
+        assert blocked.status_code == 429
+        assert blocked.headers["Retry-After"] == "900"
+        assert blocked.headers["Cache-Control"] == "no-store"
+        assert peer.status_code == 400
+        assert expired.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_limiter_registers_all_five_concurrent_attempts_before_scrypt_await(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """A sixth request is blocked while five admitted verifications are suspended."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        username = "password-concurrent-limit"
+        epoch = await _make_user(username)
+        started = 0
+        all_started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocked_to_thread(function, *args, **kwargs):
+            nonlocal started
+            if function is webauth.verify_password:
+                started += 1
+                if started == http_module._PASSWORD_CHANGE_MAX_ATTEMPTS:
+                    all_started.set()
+                await release.wait()
+                return False
+            return function(*args, **kwargs)
+
+        monkeypatch.setattr(http_module.asyncio, "to_thread", blocked_to_thread)
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie(username, epoch),
+        ) as client:
+            admitted_tasks = [
+                asyncio.create_task(
+                    client.patch(
+                        PASSWORD_PATH,
+                        json={
+                            "current_password": "wrong password",
+                            "new_password": "valid replacement password",
+                        },
+                        headers=SAME_ORIGIN_HEADERS,
+                    )
+                )
+                for _ in range(http_module._PASSWORD_CHANGE_MAX_ATTEMPTS)
+            ]
+            try:
+                await asyncio.wait_for(all_started.wait(), timeout=5)
+                blocked = await client.patch(
+                    PASSWORD_PATH,
+                    json={
+                        "current_password": "wrong password",
+                        "new_password": "valid replacement password",
+                    },
+                    headers=SAME_ORIGIN_HEADERS,
+                )
+            finally:
+                release.set()
+            admitted = await asyncio.gather(*admitted_tasks)
+
+        assert started == http_module._PASSWORD_CHANGE_MAX_ATTEMPTS
+        assert blocked.status_code == 429
+        assert int(blocked.headers["Retry-After"]) in range(1, 901)
+        assert [response.status_code for response in admitted] == [400] * 5
+
+    def test_limiter_key_includes_account_generation(self, isolated_env, monkeypatch):
+        """A recreated lifetime cannot inherit the previous account's throttle bucket."""
+        now = [50.0]
+        monkeypatch.setattr(http_module, "_password_change_clock", lambda: now[0])
+        for _ in range(http_module._PASSWORD_CHANGE_MAX_ATTEMPTS):
+            assert (
+                http_module._password_change_register_attempt(
+                    user_id=17,
+                    generation="old-generation",
+                )
+                is None
+            )
+        assert http_module._password_change_register_attempt(
+            user_id=17,
+            generation="old-generation",
+        ) == 900
+        assert (
+            http_module._password_change_register_attempt(
+                user_id=17,
+                generation="new-generation",
+            )
+            is None
+        )
+
+    def test_limiter_has_a_fail_closed_hard_cap_for_fresh_account_keys(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """A 4097th live lifetime is rejected without evicting or growing state."""
+        now = [75.0]
+        monkeypatch.setattr(http_module, "_password_change_clock", lambda: now[0])
+
+        for user_id in range(http_module._PASSWORD_CHANGE_MAX_KEYS):
+            assert (
+                http_module._password_change_register_attempt(
+                    user_id=user_id,
+                    generation=f"generation-{user_id}",
+                )
+                is None
+            )
+
+        assert len(http_module._password_change_attempts) == http_module._PASSWORD_CHANGE_MAX_KEYS
+        blocked = http_module._password_change_register_attempt(
+            user_id=http_module._PASSWORD_CHANGE_MAX_KEYS,
+            generation="fresh-over-capacity",
+        )
+        assert blocked == 900
+        assert len(http_module._password_change_attempts) == http_module._PASSWORD_CHANGE_MAX_KEYS
+        assert (
+            http_module._PASSWORD_CHANGE_MAX_KEYS,
+            "fresh-over-capacity",
+        ) not in http_module._password_change_attempts
+
+        # The oldest live bucket remains intact and continues accumulating its
+        # own attempts; capacity pressure cannot reset its throttle history.
+        for _ in range(http_module._PASSWORD_CHANGE_MAX_ATTEMPTS - 1):
+            assert (
+                http_module._password_change_register_attempt(
+                    user_id=0,
+                    generation="generation-0",
+                )
+                is None
+            )
+        assert http_module._password_change_register_attempt(
+            user_id=0,
+            generation="generation-0",
+        ) == 900
+
+        # Once every old bucket is fully expired, deterministic stale cleanup
+        # creates exactly one slot for the formerly blocked lifetime.
+        now[0] += http_module._PASSWORD_CHANGE_WINDOW_SECONDS
+        assert (
+            http_module._password_change_register_attempt(
+                user_id=http_module._PASSWORD_CHANGE_MAX_KEYS,
+                generation="fresh-over-capacity",
+            )
+            is None
+        )
+        assert len(http_module._password_change_attempts) == 1
+
+    @pytest.mark.asyncio
+    async def test_epoch_race_after_verification_loses_cas_with_401(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """An epoch bump in the verification-to-write gap wins over this request."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        username = "password-epoch-race"
+        current_password = "epoch race current password"
+        epoch = await _make_user(username, password=current_password)
+        original = http_module._mail_ui_password_cas_update
+        raced = False
+
+        async def bump_epoch_before_cas(
+            session,
+            *,
+            principal,
+            old_password_hash,
+            new_password_hash,
+        ):
+            nonlocal raced
+            if not raced:
+                raced = True
+                async with get_session() as competing_session:
+                    await competing_session.execute(
+                        text(
+                            "UPDATE ui_users SET session_epoch = session_epoch + 1 "
+                            "WHERE username = :username"
+                        ),
+                        {"username": username},
+                    )
+                    await competing_session.commit()
+            return await original(
+                session,
+                principal=principal,
+                old_password_hash=old_password_hash,
+                new_password_hash=new_password_hash,
+            )
+
+        monkeypatch.setattr(
+            http_module,
+            "_mail_ui_password_cas_update",
+            bump_epoch_before_cas,
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie(username, epoch),
+        ) as client:
+            response = await client.patch(
+                PASSWORD_PATH,
+                json={
+                    "current_password": current_password,
+                    "new_password": "epoch race requested replacement",
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+
+        stored_hash, stored_epoch, _generation, _disabled = await _user_auth_state(username)
+        assert raced is True
+        assert response.status_code == 401
+        assert response.headers["Cache-Control"] == "no-store"
+        assert "set-cookie" not in response.headers
+        assert stored_epoch == epoch + 1
+        assert webauth.verify_password(current_password, stored_hash) is True
+
+    @pytest.mark.asyncio
+    async def test_password_hash_race_loses_cas_without_overwriting_competing_change(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """The old hash is part of CAS even when all cookie facts remain unchanged."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        username = "password-hash-race"
+        current_password = "hash race current password"
+        competing_password = "hash race competing password"
+        requested_password = "hash race requested password"
+        epoch = await _make_user(username, password=current_password)
+        competing_hash = webauth.hash_password(competing_password)
+        original = http_module._mail_ui_password_cas_update
+
+        async def replace_hash_before_cas(
+            session,
+            *,
+            principal,
+            old_password_hash,
+            new_password_hash,
+        ):
+            async with get_session() as competing_session:
+                await competing_session.execute(
+                    text(
+                        "UPDATE ui_users SET password_hash = :password_hash "
+                        "WHERE username = :username"
+                    ),
+                    {"password_hash": competing_hash, "username": username},
+                )
+                await competing_session.commit()
+            return await original(
+                session,
+                principal=principal,
+                old_password_hash=old_password_hash,
+                new_password_hash=new_password_hash,
+            )
+
+        monkeypatch.setattr(
+            http_module,
+            "_mail_ui_password_cas_update",
+            replace_hash_before_cas,
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie(username, epoch),
+        ) as client:
+            response = await client.patch(
+                PASSWORD_PATH,
+                json={
+                    "current_password": current_password,
+                    "new_password": requested_password,
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+
+        stored_hash, stored_epoch, _generation, _disabled = await _user_auth_state(username)
+        assert response.status_code == 401
+        assert stored_epoch == epoch
+        assert webauth.verify_password(competing_password, stored_hash) is True
+        assert webauth.verify_password(requested_password, stored_hash) is False
+
+    @pytest.mark.asyncio
+    async def test_disable_race_loses_cas_without_reenabling_or_changing_password(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """The enabled predicate makes a concurrent account disable authoritative."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        username = "password-disabled-race"
+        current_password = "disabled race current password"
+        requested_password = "disabled race requested password"
+        epoch = await _make_user(username, password=current_password)
+        original = http_module._mail_ui_password_cas_update
+
+        async def disable_before_cas(
+            session,
+            *,
+            principal,
+            old_password_hash,
+            new_password_hash,
+        ):
+            async with get_session() as competing_session:
+                await competing_session.execute(
+                    text(
+                        "UPDATE ui_users SET disabled = 1 "
+                        "WHERE username = :username"
+                    ),
+                    {"username": username},
+                )
+                await competing_session.commit()
+            return await original(
+                session,
+                principal=principal,
+                old_password_hash=old_password_hash,
+                new_password_hash=new_password_hash,
+            )
+
+        monkeypatch.setattr(
+            http_module,
+            "_mail_ui_password_cas_update",
+            disable_before_cas,
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie(username, epoch),
+        ) as client:
+            response = await client.patch(
+                PASSWORD_PATH,
+                json={
+                    "current_password": current_password,
+                    "new_password": requested_password,
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+
+        stored_hash, stored_epoch, _generation, disabled = await _user_auth_state(username)
+        assert response.status_code == 401
+        assert stored_epoch == epoch
+        assert disabled is True
+        assert webauth.verify_password(current_password, stored_hash) is True
+        assert webauth.verify_password(requested_password, stored_hash) is False
+
+    @pytest.mark.asyncio
+    async def test_recreated_account_with_reused_primary_key_cannot_be_modified(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """The generation predicate protects a replacement created during rotation."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        username = "password-recreated-race"
+        current_password = "original account current password"
+        replacement_password = "replacement account current password"
+        requested_password = "requested password for old account"
+        epoch = await _make_user(username, password=current_password)
+        user_id = await _user_id(username)
+        replacement_generation = "replacement-password-generation"
+        replacement_hash = webauth.hash_password(replacement_password)
+        original = http_module._mail_ui_password_cas_update
+
+        async def recreate_before_cas(
+            session,
+            *,
+            principal,
+            old_password_hash,
+            new_password_hash,
+        ):
+            async with get_session() as competing_session:
+                await competing_session.execute(
+                    text("DELETE FROM ui_users WHERE id = :user_id"),
+                    {"user_id": user_id},
+                )
+                await competing_session.execute(
+                    text(
+                        "INSERT INTO ui_users "
+                        "(id, username, password_hash, role, disabled, session_epoch, "
+                        "session_generation, preferred_ui_locale, "
+                        "preferred_correspondence_locale, created_ts) "
+                        "VALUES (:user_id, :username, :password_hash, 'member', 0, "
+                        ":epoch, :generation, 'en', NULL, datetime('now'))"
+                    ),
+                    {
+                        "user_id": user_id,
+                        "username": username,
+                        "password_hash": replacement_hash,
+                        "epoch": epoch,
+                        "generation": replacement_generation,
+                    },
+                )
+                await competing_session.commit()
+            return await original(
+                session,
+                principal=principal,
+                old_password_hash=old_password_hash,
+                new_password_hash=new_password_hash,
+            )
+
+        monkeypatch.setattr(
+            http_module,
+            "_mail_ui_password_cas_update",
+            recreate_before_cas,
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie(username, epoch),
+        ) as client:
+            response = await client.patch(
+                PASSWORD_PATH,
+                json={
+                    "current_password": current_password,
+                    "new_password": requested_password,
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+
+        stored_hash, stored_epoch, generation, _disabled = await _user_auth_state(username)
+        assert response.status_code == 401
+        assert stored_epoch == epoch
+        assert generation == replacement_generation
+        assert webauth.verify_password(replacement_password, stored_hash) is True
+        assert webauth.verify_password(requested_password, stored_hash) is False
+
+    @pytest.mark.asyncio
+    async def test_two_concurrent_valid_rotations_have_one_winner_and_one_401(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """Two sessions can verify the old hash, but only one exact CAS may commit."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        username = "password-concurrent-cas"
+        current_password = "concurrent CAS current password"
+        replacements = (
+            "concurrent CAS replacement alpha",
+            "concurrent CAS replacement bravo",
+        )
+        epoch = await _make_user(username, password=current_password)
+        cookie = await _cookie(username, epoch)
+        original = http_module._mail_ui_password_cas_update
+        arrived = 0
+        both_ready = asyncio.Event()
+
+        async def synchronize_cas(
+            session,
+            *,
+            principal,
+            old_password_hash,
+            new_password_hash,
+        ):
+            nonlocal arrived
+            arrived += 1
+            if arrived == 2:
+                both_ready.set()
+            await asyncio.wait_for(both_ready.wait(), timeout=5)
+            return await original(
+                session,
+                principal=principal,
+                old_password_hash=old_password_hash,
+                new_password_hash=new_password_hash,
+            )
+
+        monkeypatch.setattr(
+            http_module,
+            "_mail_ui_password_cas_update",
+            synchronize_cas,
+        )
+        async with (
+            AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://test",
+                cookies=cookie,
+            ) as first,
+            AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://test",
+                cookies=cookie,
+            ) as second,
+        ):
+            responses = await asyncio.gather(
+                first.patch(
+                    PASSWORD_PATH,
+                    json={
+                        "current_password": current_password,
+                        "new_password": replacements[0],
+                    },
+                    headers=SAME_ORIGIN_HEADERS,
+                ),
+                second.patch(
+                    PASSWORD_PATH,
+                    json={
+                        "current_password": current_password,
+                        "new_password": replacements[1],
+                    },
+                    headers=SAME_ORIGIN_HEADERS,
+                ),
+            )
+
+        stored_hash, stored_epoch, _generation, _disabled = await _user_auth_state(username)
+        assert arrived == 2
+        assert sorted(response.status_code for response in responses) == [200, 401]
+        assert stored_epoch == epoch + 1
+        assert sum(webauth.verify_password(password, stored_hash) for password in replacements) == 1
 
 
 class TestMailUiRbacSurface:

@@ -127,6 +127,51 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+  frontend:
+    name: Frontend lint, type check, test, and build (Node 22.22.2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ui
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Node.js 22.22.2
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22.22.2'
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Lint frontend
+        run: npm run lint
+
+      - name: Type check frontend
+        run: npm run typecheck
+
+      - name: Run frontend tests with coverage
+        run: npm run coverage
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Audit frontend dependencies
+        run: npm audit --audit-level=high
+
+      - name: Upload frontend coverage
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: frontend-coverage-${{ github.sha }}
+          path: ui/coverage/lcov.info
+          if-no-files-found: error
+          retention-days: 7
+
   portability:
     name: Lint, Type Check, Test (${{ matrix.os }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
@@ -178,13 +223,14 @@ jobs:
 
   sonar:
     name: SonarCloud
-    needs: build-and-test
+    needs: [build-and-test, frontend]
     permissions:
       contents: read
       pull-requests: read
     if: >-
       ${{
         needs.build-and-test.result == 'success' &&
+        needs.frontend.result == 'success' &&
         (
           github.event_name == 'push' ||
           github.event.pull_request.head.repo.full_name == github.repository

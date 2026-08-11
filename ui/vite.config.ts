@@ -1,5 +1,8 @@
 import react from "@vitejs/plugin-react";
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
+
+const repositoryRoot = fileURLToPath(new URL("../", import.meta.url));
 
 export default defineConfig({
   plugins: [react()],
@@ -8,7 +11,11 @@ export default defineConfig({
     setupFiles: ["./src/test/setup.ts"],
     coverage: {
       provider: "v8",
-      reporter: ["text", "json-summary", "lcov"],
+      reporter: [
+        "text",
+        "json-summary",
+        ["lcov", { projectRoot: repositoryRoot }],
+      ],
       include: ["src/**/*.{ts,tsx}"],
       exclude: [
         "src/main.tsx",

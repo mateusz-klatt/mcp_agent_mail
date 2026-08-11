@@ -17,6 +17,7 @@ import pytest
 from fastmcp import Client
 from sqlalchemy import select as sa_select, update as sa_update
 
+from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server, sweep_stale_agents
 from mcp_agent_mail.db import get_session
 from mcp_agent_mail.models import Agent, FileReservation, Project
@@ -28,6 +29,21 @@ def _naive_utc(when: datetime | None = None) -> datetime:
     if target.tzinfo is not None:
         target = target.astimezone(timezone.utc).replace(tzinfo=None)
     return target
+
+
+def test_background_auto_retire_is_opt_in_by_default(isolated_env, monkeypatch, tmp_path):
+    monkeypatch.delenv("AUTO_RETIRE_STALE_AGENTS_ENABLED", raising=False)
+    monkeypatch.setattr(_config, "_DOTENV_PATH", tmp_path / "missing.env")
+    _config.clear_settings_cache()
+
+    assert _config.get_settings().auto_retire_stale_agents_enabled is False
+
+
+def test_background_auto_retire_can_be_enabled_explicitly(isolated_env, monkeypatch):
+    monkeypatch.setenv("AUTO_RETIRE_STALE_AGENTS_ENABLED", "true")
+    _config.clear_settings_cache()
+
+    assert _config.get_settings().auto_retire_stale_agents_enabled is True
 
 
 @pytest.mark.asyncio

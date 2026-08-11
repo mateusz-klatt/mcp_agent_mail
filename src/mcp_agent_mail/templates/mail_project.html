@@ -382,7 +382,7 @@
           {% endfor %}
         </div>
       </div>
-    {% elif results is defined %}
+    {% elif q is defined and q | trim %}
       <div class="mt-8 text-center py-12 bg-slate-50 dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-700">
         <div class="w-16 h-16 bg-slate-100 dark:bg-slate-800 rounded-full flex items-center justify-center mx-auto mb-4">
           <i data-lucide="search-x" class="w-8 h-8 text-slate-400"></i>
@@ -395,38 +395,37 @@
 
   <!-- Agents Section -->
   <div>
-    <div class="flex items-center justify-between mb-6">
+    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-6">
       <div class="flex items-center gap-3">
-        <div class="w-1 h-10 bg-gradient-to-b from-success-600 to-success-800 rounded-full"></div>
+        <div class="w-1 h-10 bg-gradient-to-b from-primary-500 to-primary-700 rounded-full"></div>
         <div>
-          <h2 class="text-2xl font-bold text-slate-900 dark:text-white">Registered Agents</h2>
-          <p class="text-sm text-slate-600 dark:text-slate-400">Active collaborators in this project</p>
+          <h2 class="text-2xl font-bold text-slate-900 dark:text-white">Agents accepting mail</h2>
+          <p class="text-sm text-slate-600 dark:text-slate-400">Registered mailboxes available for new messages</p>
         </div>
       </div>
-      {% set active_count = agents | selectattr('retired_at', 'none') | list | length %}
-      {% if active_count > 0 %}
-        <span class="px-4 py-2 bg-success-100 dark:bg-success-900/30 text-success-700 dark:text-success-300 text-sm font-bold rounded-full flex items-center gap-2">
-          <span class="w-2 h-2 bg-success-500 rounded-full animate-pulse"></span>
-          {{ active_count }} active
+      {% set accepting_count = agents | selectattr('retired_at', 'none') | list | length %}
+      {% if accepting_count > 0 %}
+        <span class="self-start sm:self-auto whitespace-nowrap px-4 py-2 bg-primary-100 dark:bg-primary-900/30 text-primary-700 dark:text-primary-300 text-sm font-bold rounded-full">
+          {{ accepting_count }} accepting mail
         </span>
       {% endif %}
     </div>
 
-    {% set active_agents = agents | selectattr('retired_at', 'none') | list %}
+    {% set accepting_agents = agents | selectattr('retired_at', 'none') | list %}
     {% set retired_agents = agents | rejectattr('retired_at', 'none') | list %}
 
-    {% if active_agents %}
+    {% if accepting_agents %}
       <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-        {% for a in active_agents %}
-          <div class="group relative bg-white dark:bg-slate-800 rounded-2xl p-6 shadow-soft border-2 border-slate-200 dark:border-slate-700 hover:border-success-400 dark:hover:border-success-600 transition-all duration-300 card-hover overflow-hidden stagger-item"
+        {% for a in accepting_agents %}
+          <div class="group relative bg-white dark:bg-slate-800 rounded-2xl p-6 shadow-soft border-2 border-slate-200 dark:border-slate-700 hover:border-primary-400 dark:hover:border-primary-600 transition-all duration-300 card-hover overflow-hidden stagger-item"
                style="animation-delay: {{ [loop.index0 * 0.05, 1.0]|min }}s;">
 
             <!-- Decorative gradient blob -->
-            <div class="absolute top-0 right-0 w-32 h-32 bg-gradient-to-br from-success-500/10 to-emerald-500/10 rounded-full blur-3xl group-hover:scale-150 transition-transform duration-500 pointer-events-none"></div>
+            <div class="absolute top-0 right-0 w-32 h-32 bg-gradient-to-br from-primary-500/10 to-sky-500/10 rounded-full blur-3xl group-hover:scale-150 transition-transform duration-500 pointer-events-none"></div>
 
             <!-- Agent Header -->
             <div class="relative flex items-center gap-4 mb-5">
-              <div class="w-14 h-14 bg-gradient-to-br from-success-500 to-success-700 rounded-2xl flex items-center justify-center shadow-medium group-hover:shadow-glow group-hover:scale-110 transition-all duration-300">
+              <div class="w-14 h-14 bg-gradient-to-br from-primary-500 to-primary-700 rounded-2xl flex items-center justify-center shadow-medium group-hover:shadow-large group-hover:scale-110 transition-all duration-300">
                 <i data-lucide="bot" class="w-7 h-7 text-white"></i>
               </div>
               <div class="flex-1 min-w-0">
@@ -435,7 +434,7 @@
                    become addressable, because `name` is what `to:` resolves and a
                    mutable identity orphans every memorised address. Showing only
                    the alias would teach people to address it. #}
-                <h3 class="text-lg font-bold text-slate-900 dark:text-white truncate group-hover:text-success-600 dark:group-hover:text-success-400 transition-colors">
+                <h3 class="text-lg font-bold text-slate-900 dark:text-white truncate group-hover:text-primary-600 dark:group-hover:text-primary-400 transition-colors">
                   {{ a.name }}
                 </h3>
                 <div class="flex items-center gap-2 text-xs text-slate-600 dark:text-slate-400 mt-1">
@@ -448,13 +447,20 @@
                   <span class="text-slate-300 dark:text-slate-600">•</span>
                   <span class="truncate">{{ a.model }}</span>
                 </div>
+                {% if a.last_active_ts %}
+                  <div class="mt-2 flex min-w-0 items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400">
+                    <i data-lucide="clock" class="w-3.5 h-3.5 flex-shrink-0"></i>
+                    <span class="flex-shrink-0">Last recorded activity:</span>
+                    <time class="truncate font-mono" datetime="{{ a.last_active_ts }}" title="{{ a.last_active_ts }}">{{ a.last_active_ts[:19] }}</time>
+                  </div>
+                {% endif %}
               </div>
             </div>
 
             <!-- Agent Actions -->
             <div class="relative flex items-center gap-2">
               <a href="/mail/{{ project.slug }}/inbox/{{ a.name }}"
-                 class="flex-1 px-4 py-2.5 bg-gradient-to-r from-success-600 to-success-700 hover:from-success-700 hover:to-success-800 text-white text-sm font-semibold rounded-lg shadow-medium hover:shadow-large transition-all duration-300 text-center flex items-center justify-center gap-2 btn-ripple">
+                 class="flex-1 px-4 py-2.5 bg-gradient-to-r from-primary-600 to-primary-700 hover:from-primary-700 hover:to-primary-800 text-white text-sm font-semibold rounded-lg shadow-medium hover:shadow-large transition-all duration-300 text-center flex items-center justify-center gap-2 btn-ripple">
                 <i data-lucide="inbox" class="w-4 h-4"></i>
                 <span>Inbox</span>
               </a>
@@ -522,8 +528,8 @@
                   </a>
                   <button onclick="fetch('/mail/api/unretire-agent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agent_id:{{ a.id }}})}).then(r=>r.json()).then(d=>{if(d.success) location.reload()})"
                           class="p-2.5 bg-green-100 dark:bg-green-900/30 hover:bg-green-200 dark:hover:bg-green-800/40 text-green-700 dark:text-green-400 rounded-lg transition-all duration-200 shadow-sm hover:shadow-md"
-                          data-tippy-content="Restore agent to active"
-                          aria-label="Restore agent">
+                          data-tippy-content="Restore agent to accept mail"
+                          aria-label="Restore agent to accept mail">
                     <i data-lucide="user-plus" class="w-4 h-4"></i>
                   </button>
                 </div>
@@ -534,14 +540,14 @@
       </div>
     {% endif %}
 
-    {% if not active_agents and not retired_agents %}
+    {% if not accepting_agents and not retired_agents %}
       <!-- Premium Empty State for Agents -->
       <div class="bg-gradient-to-br from-white to-slate-50 dark:from-slate-800 dark:to-slate-800/50 rounded-2xl p-16 shadow-soft border border-slate-200 dark:border-slate-700 text-center">
         <div class="relative inline-flex mb-6">
           <div class="absolute inset-0 flex items-center justify-center">
-            <div class="w-32 h-32 bg-success-500/10 rounded-full animate-pulse"></div>
+            <div class="w-32 h-32 bg-primary-500/10 rounded-full"></div>
           </div>
-          <div class="relative w-20 h-20 bg-gradient-to-br from-success-500 to-success-700 rounded-2xl flex items-center justify-center shadow-large float">
+          <div class="relative w-20 h-20 bg-gradient-to-br from-primary-500 to-primary-700 rounded-2xl flex items-center justify-center shadow-large">
             <i data-lucide="user-plus" class="w-10 h-10 text-white"></i>
           </div>
         </div>

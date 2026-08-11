@@ -125,13 +125,10 @@ if [ -n "$got_token" ] && ! am_cred_put "$PROJECT" "$got_name" "$got_token"; the
     exit 0
 fi
 
-# An agent idle for a day is auto-retired, and re-registering does NOT clear
-# that flag — the session would look fine while every message sent to it failed.
 if [ "$(printf '%s' "$resp" | jq -r '.retired_at // empty' 2>/dev/null)" != "" ]; then
-    am_call unretire_agent "$(AGENT_MAIL_JQ_REGISTRATION_TOKEN="${got_token:-$token}" \
-        jq -nc --arg p "$PROJECT" --arg n "$got_name" \
-        '{project_key:$p,agent_name:$n,registration_token:env.AGENT_MAIL_JQ_REGISTRATION_TOKEN}')" \
-        >/dev/null 2>&1
+    am_emit_context "SessionStart" \
+        "Agent Mail: identity ${got_name} on ${PROJECT} is retired and cannot receive new mail. This hook will not restore a manually decommissioned identity. Stop this session and have an operator explicitly restore the identity before restarting."
+    exit 0
 fi
 
 summary="Agent Mail: you are ${got_name} on ${PROJECT}."

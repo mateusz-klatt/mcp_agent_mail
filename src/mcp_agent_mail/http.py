@@ -26,6 +26,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.exc import NoResultFound
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.types import Receive, Scope, Send
 
@@ -42,7 +43,7 @@ from .app import (
     update_project_sibling_status,
 )
 from .config import Settings, get_settings
-from .db import ensure_schema, get_session
+from .db import ensure_schema, get_immediate_session, get_session
 from .notify import KEEPALIVE_SECONDS, MAX_STREAM_SECONDS, hub
 from .storage import (
     ProjectArchive,
@@ -3181,10 +3182,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     # the column exists, a tool sets it, and this dict is the only
                     # thing the project page ever sees. A preference nobody can
                     # perceive is indistinguishable from one nobody set.
-                    text("SELECT id, name, program, model, retired_at, display_name, notify_sound FROM agents WHERE project_id = :pid ORDER BY name"),
+                    text("SELECT id, name, program, model, retired_at, display_name, notify_sound, last_active_ts FROM agents WHERE project_id = :pid ORDER BY name"),
                     {"pid": pid},
                 )
-                agents = [{"id": r[0], "name": r[1], "program": r[2], "model": r[3], "retired_at": str(r[4]) if r[4] else None, "display_name": r[5], "notify_sound": r[6]} for r in agents_q.fetchall()]
+                agents = [{"id": r[0], "name": r[1], "program": r[2], "model": r[3], "retired_at": str(r[4]) if r[4] else None, "display_name": r[5], "notify_sound": r[6], "last_active_ts": str(r[7]) if r[7] else None} for r in agents_q.fetchall()]
                 matched_messages: list[dict] = []
                 if q and q.strip():
                     # Prefer FTS5 when available (fts_messages maintained by triggers)
@@ -3285,17 +3286,18 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                             }
                             item.update(sender_meta)
                             matched_messages.append(item)
-            return await _render(
-                "mail_project.html",
-                project={"id": pid, "slug": prow[1], "human_key": prow[2], "archived_at": project_archived_at},
-                agents=agents,
-                q=q or "",
-                scope=scope or "",
-                order=order or "relevance",
-                boost=bool(boost),
-                tokens=tokens if q and q.strip() else [],
-                results=matched_messages,
-            )
+            render_context: dict[str, Any] = {
+                "project": {"id": pid, "slug": prow[1], "human_key": prow[2], "archived_at": project_archived_at},
+                "agents": agents,
+                "q": q or "",
+                "scope": scope or "",
+                "order": order or "relevance",
+                "boost": bool(boost),
+            }
+            if q and q.strip():
+                render_context["tokens"] = tokens
+                render_context["results"] = matched_messages
+            return await _render("mail_project.html", **render_context)
 
         @fastapi_app.post("/mail/api/projects/{project_id}/siblings/{other_id}", response_class=JSONResponse)
         async def update_project_sibling(project_id: int, other_id: int, request: Request) -> JSONResponse:
@@ -4418,20 +4420,112 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
         # ========== Human Overseer Routes ==========
 
+        async def _resolve_overseer_reply(
+            session: AsyncSession,
+            *,
+            message_id: int,
+            project_id: int,
+        ) -> tuple[list[str], str, str]:
+            """Resolve immutable recipient, subject, and thread fields for a reply.
+
+            Args:
+                session: Open database session containing the message snapshot.
+                message_id: Message being answered or followed up.
+                project_id: Project that owns the message.
+
+            Returns:
+                Recipient names, reply subject, and thread id.
+
+            Raises:
+                HTTPException: If the message is missing, retired, or crosses
+                    a routing boundary the Web UI cannot verify.
+            """
+            original = (
+                await session.execute(
+                    text(
+                        "SELECT m.thread_id, m.subject, a.name, a.project_id, a.retired_at "
+                        "FROM messages m JOIN agents a ON a.id = m.sender_id "
+                        "WHERE m.id = :mid AND m.project_id = :pid"
+                    ),
+                    {"mid": message_id, "pid": project_id},
+                )
+            ).fetchone()
+            if original is None:
+                raise HTTPException(status_code=404, detail="Reply target was not found in this project")
+            if int(original[3]) != project_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Cannot reply to a cross-project sender until verified routing is available",
+                )
+
+            sender_name = str(original[2])
+            if sender_name == "HumanOverseer":
+                rows = await session.execute(
+                    text(
+                        "SELECT a.name, a.project_id, a.retired_at "
+                        "FROM message_recipients mr JOIN agents a ON a.id = mr.agent_id "
+                        "WHERE mr.message_id = :mid "
+                        "ORDER BY CASE mr.kind WHEN 'to' THEN 0 WHEN 'cc' THEN 1 ELSE 2 END, a.name"
+                    ),
+                    {"mid": message_id},
+                )
+                recipient_rows = rows.fetchall()
+                if any(int(row[1]) != project_id for row in recipient_rows):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Cannot follow up to cross-project recipients until verified routing is available",
+                    )
+                retired = sorted(
+                    {
+                        str(row[0])
+                        for row in recipient_rows
+                        if str(row[0]) != "HumanOverseer" and row[2] is not None
+                    }
+                )
+                if retired:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Cannot follow up to retired recipients: {', '.join(retired)}",
+                    )
+                recipients = list(
+                    dict.fromkeys(
+                        str(row[0])
+                        for row in recipient_rows
+                        if str(row[0]) != "HumanOverseer"
+                    )
+                )
+                if not recipients:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="This Human Overseer message has no addressable recipients to follow up with",
+                    )
+            else:
+                if original[4] is not None:
+                    raise HTTPException(status_code=409, detail="Cannot reply to a retired sender")
+                recipients = [sender_name]
+
+            original_subject = str(original[1] or "")
+            reply_subject = (
+                original_subject
+                if original_subject.lower().startswith("re:")
+                else f"Re: {original_subject}"
+            )
+            subject = reply_subject[:200]
+            thread_id = str(original[0] or message_id)
+            return recipients, subject, thread_id
+
         @fastapi_app.get("/mail/{project}/overseer/compose", response_class=HTMLResponse)
         async def overseer_compose(project: str, reply_to: int | None = None) -> HTMLResponse:
-            """Display Human Overseer message composer.
+            """Display a new-message composer or a validated reply composer.
 
-            `reply_to` is a message id to answer. Everything needed to thread a
-            reply already existed — overseer_send accepts thread_id and writes it
-            straight through — but nothing carried the id from a message the
-            operator was reading to the form, so the viewer shipped Reply and
-            Forward as disabled buttons with a "Soon" badge.
+            Args:
+                project: Project slug or canonical human key.
+                reply_to: Optional message id whose routing and thread fields
+                    are resolved by the server.
 
-            An unknown or malformed id prefills nothing rather than erroring: the
-            composer is still the right page to be on, and a blank form is a
-            smaller surprise than an error page when the only thing lost is
-            convenience.
+            Returns:
+                The composer, or an explicit error page when the requested
+                reply cannot be routed safely.
             """
             await ensure_schema()
             async with get_session() as session:
@@ -4445,37 +4539,41 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 if not prow:
                     return await _render("error.html", message="Project not found")
 
-                # Get all agents for this project
+                # Retired identities remain visible in project history, but they
+                # are not addressable from the human compose surface.
                 pid = int(prow[0])
                 agent_rows = await session.execute(
-                    text("SELECT name FROM agents WHERE project_id = :pid ORDER BY name"),
+                    text("SELECT name FROM agents WHERE project_id = :pid AND retired_at IS NULL ORDER BY name"),
                     {"pid": pid}
                 )
                 agents = [{"name": r[0]} for r in agent_rows.fetchall()]
 
-            prefill: dict[str, Any] = {"thread_id": "", "subject": "", "recipients": []}
+            prefill: dict[str, Any] = {
+                "reply_to": None,
+                "thread_id": "",
+                "subject": "",
+                "recipients": [],
+            }
             if reply_to is not None:
                 async with get_session() as session:
-                    mrow = (
-                        await session.execute(
-                            text(
-                                "SELECT m.thread_id, m.subject, a.name "
-                                "FROM messages m LEFT JOIN agents a ON a.id = m.sender_id "
-                                "WHERE m.id = :mid AND m.project_id = :pid"
-                            ),
-                            {"mid": reply_to, "pid": pid},
+                    try:
+                        reply_recipients, reply_subject, reply_thread_id = await _resolve_overseer_reply(
+                            session,
+                            message_id=reply_to,
+                            project_id=pid,
                         )
-                    ).fetchone()
-                if mrow is not None:
-                    subject = str(mrow[1] or "")
-                    # Thread on the original's thread_id when it has one, else on the
-                    # message id — the same rule reply_message applies, so a reply sent
-                    # from the browser lands in the thread the agents are reading.
-                    prefill = {
-                        "thread_id": str(mrow[0] or reply_to),
-                        "subject": subject if subject.lower().startswith("re:") else f"Re: {subject}",
-                        "recipients": [str(mrow[2])] if mrow[2] else [],
-                    }
+                    except HTTPException as exc:
+                        return await _render(
+                            "error.html",
+                            status_code=exc.status_code,
+                            message=str(exc.detail),
+                        )
+                prefill = {
+                    "reply_to": reply_to,
+                    "thread_id": reply_thread_id,
+                    "subject": reply_subject,
+                    "recipients": reply_recipients,
+                }
 
             return await _render(
                 "overseer_compose.html",
@@ -4490,29 +4588,65 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             await ensure_schema()
 
             try:
-                # Parse request body
-                request_body = await request.json()
-                recipients: list[str] = request_body.get("recipients", [])
-                subject: str = request_body.get("subject", "").strip()
-                body_md: str = request_body.get("body_md", "").strip()
-                thread_id: str | None = request_body.get("thread_id")
+                try:
+                    request_body = await request.json()
+                except Exception as exc:
+                    raise HTTPException(status_code=400, detail="Request body must be a valid JSON object") from exc
+                if not isinstance(request_body, dict):
+                    raise HTTPException(status_code=400, detail="Request body must be a JSON object")
 
-                # Comprehensive validation
-                if not recipients:
-                    raise HTTPException(status_code=400, detail="At least one recipient is required")
-                if len(recipients) > 100:
-                    raise HTTPException(status_code=400, detail="Too many recipients (maximum 100 agents)")
-                if not subject:
-                    raise HTTPException(status_code=400, detail="Subject is required")
-                if len(subject) > 200:
-                    raise HTTPException(status_code=400, detail="Subject too long (maximum 200 characters)")
+                raw_reply_to = request_body.get("reply_to")
+                if raw_reply_to is not None and (
+                    isinstance(raw_reply_to, bool)
+                    or not isinstance(raw_reply_to, int)
+                    or raw_reply_to <= 0
+                ):
+                    raise HTTPException(status_code=400, detail="Reply target must be a positive integer or null")
+                reply_to: int | None = raw_reply_to
+
+                raw_body_md = request_body.get("body_md", "")
+                if not isinstance(raw_body_md, str):
+                    raise HTTPException(status_code=400, detail="Message body must be a string")
+                body_md = raw_body_md.strip()
                 if not body_md:
                     raise HTTPException(status_code=400, detail="Message body is required")
                 if len(body_md) > 50000:
                     raise HTTPException(status_code=400, detail="Message body too long (maximum 50,000 characters)")
 
-                # Remove duplicate recipients while preserving order
-                recipients = list(dict.fromkeys(recipients))
+                if reply_to is None:
+                    raw_recipients = request_body.get("recipients", [])
+                    if not isinstance(raw_recipients, list) or any(
+                        not isinstance(name, str) or not name.strip()
+                        for name in raw_recipients
+                    ):
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Recipients must be a list of non-empty strings",
+                        )
+                    recipients = list(dict.fromkeys(raw_recipients))
+                    if len(recipients) > 100:
+                        raise HTTPException(status_code=400, detail="Too many recipients (maximum 100 agents)")
+
+                    raw_subject = request_body.get("subject", "")
+                    if not isinstance(raw_subject, str):
+                        raise HTTPException(status_code=400, detail="Subject must be a string")
+                    subject = raw_subject.strip()
+                    if len(subject) > 200:
+                        raise HTTPException(status_code=400, detail="Subject too long (maximum 200 characters)")
+
+                    raw_thread_id = request_body.get("thread_id")
+                    if raw_thread_id is not None and not isinstance(raw_thread_id, str):
+                        raise HTTPException(status_code=400, detail="Thread ID must be a string or null")
+                    thread_id = raw_thread_id.strip() or None if raw_thread_id is not None else None
+
+                    if not recipients:
+                        raise HTTPException(status_code=400, detail="At least one recipient is required")
+                    if not subject:
+                        raise HTTPException(status_code=400, detail="Subject is required")
+                else:
+                    recipients = []
+                    subject = ""
+                    thread_id = None
 
                 # Add Human Overseer preamble (pure markdown for cross-renderer compatibility)
                 preamble = """---
@@ -4552,7 +4686,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 project_human_key = ""
                 overseer_name = "HumanOverseer"
                 now = datetime.now(timezone.utc).replace(tzinfo=None)
-                async with get_session() as session:
+                async with get_immediate_session() as session:
                     # Get project
                     prow = (
                         await session.execute(
@@ -4567,6 +4701,53 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     project_id = int(prow[0])
                     project_slug = prow[1]
                     project_human_key = prow[2]
+
+                    if reply_to is not None:
+                        recipients, subject, thread_id = await _resolve_overseer_reply(
+                            session,
+                            message_id=reply_to,
+                            project_id=project_id,
+                        )
+
+                    placeholders = ", ".join([f":name_{i}" for i in range(len(recipients))])
+                    recipient_params: dict[str, Any] = {"pid": project_id}
+                    recipient_params.update({f"name_{i}": name for i, name in enumerate(recipients)})
+                    recipient_rows = await session.execute(
+                        text(
+                            f"SELECT id, name, retired_at FROM agents "
+                            f"WHERE project_id = :pid AND name IN ({placeholders})"
+                        ),
+                        recipient_params,
+                    )
+                    recipient_records = {
+                        str(row[1]): (int(row[0]), row[2])
+                        for row in recipient_rows.fetchall()
+                    }
+                    missing_recipients = [name for name in recipients if name not in recipient_records]
+                    retired_recipients = [
+                        name
+                        for name in recipients
+                        if name in recipient_records and recipient_records[name][1] is not None
+                    ]
+                    if retired_recipients:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "Cannot send to retired recipients: "
+                                f"{', '.join(retired_recipients)}. Restore them before sending."
+                            ),
+                        )
+                    if missing_recipients:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Unknown recipients in this project: {', '.join(missing_recipients)}",
+                        )
+
+                    recipient_map = {
+                        name: record[0]
+                        for name, record in recipient_records.items()
+                    }
+                    valid_recipients = list(recipients)
 
                     # Get or create "HumanOverseer" agent (with race condition protection)
                     overseer_row = (
@@ -4631,8 +4812,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
                     result = await session.execute(
                         text("""
-                            INSERT INTO messages (project_id, sender_id, subject, body_md, importance, thread_id, created_ts, ack_required)
-                            VALUES (:pid, :sid, :subj, :body, :imp, :tid, :ts, :ack)
+                            INSERT INTO messages (project_id, sender_id, subject, body_md, importance, thread_id, reply_to, created_ts, ack_required)
+                            VALUES (:pid, :sid, :subj, :body, :imp, :tid, :reply_to, :ts, :ack)
                             RETURNING id
                         """),
                         {
@@ -4642,6 +4823,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                             "body": full_body,
                             "imp": "high",  # Always high importance for overseer
                             "tid": thread_id,
+                            "reply_to": reply_to,
                             "ts": now,
                             "ack": False
                         }
@@ -4651,45 +4833,18 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         raise HTTPException(status_code=500, detail="Failed to create message")
                     message_id = message_row[0]
 
-                    # Insert recipients (optimized: bulk SELECT + bulk INSERT instead of N+1 queries)
-                    # Build SQL with proper parameter expansion for IN clause
-                    placeholders = ", ".join([f":name_{i}" for i in range(len(recipients))])
-                    params: dict[str, Any] = {"pid": project_id}
-                    params.update({f"name_{i}": name for i, name in enumerate(recipients)})
-
-                    # Single query to get all valid recipient IDs
-                    recipient_rows = await session.execute(
-                        text(f"SELECT id, name FROM agents WHERE project_id = :pid AND name IN ({placeholders})"),
-                        params
-                    )
-                    recipient_map = {row[1]: row[0] for row in recipient_rows.fetchall()}  # name -> id mapping
-
-                    # Build valid recipients list (only those that exist)
-                    valid_recipients = [name for name in recipients if name in recipient_map]
-
                     # Bulk insert all message_recipients (single executemany call)
-                    if valid_recipients:
-                        # Prepare bulk insert params
-                        insert_params = [
-                            {"mid": message_id, "aid": recipient_map[name], "kind": "to"}
-                            for name in valid_recipients
-                        ]
-                        # Use executemany for bulk insert
-                        await session.execute(
-                            text("""
-                                INSERT INTO message_recipients (message_id, agent_id, kind)
-                                VALUES (:mid, :aid, :kind)
-                            """),
-                            insert_params
-                        )
-
-                    # If no valid recipients found, rollback and error
-                    if not valid_recipients:
-                        await session.rollback()
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"None of the specified recipients exist in this project. Available agents can be seen at /mail/{project_slug}"
-                        )
+                    insert_params = [
+                        {"mid": message_id, "aid": recipient_map[name], "kind": "to"}
+                        for name in valid_recipients
+                    ]
+                    await session.execute(
+                        text("""
+                            INSERT INTO message_recipients (message_id, agent_id, kind)
+                            VALUES (:mid, :aid, :kind)
+                        """),
+                        insert_params
+                    )
 
                     # Update HumanOverseer activity timestamp before commit.
                     await session.execute(
@@ -4706,6 +4861,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 message_dict = {
                     "id": message_id,
                     "thread_id": thread_id,
+                    "reply_to": reply_to,
                     "project": project_human_key,
                     "project_slug": project_slug,
                     "from": overseer_name,

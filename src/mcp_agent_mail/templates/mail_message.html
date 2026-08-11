@@ -36,36 +36,23 @@
 {% block header_actions %}
 <div class="flex items-center gap-2">
   <a href="/mail/{{ project.slug }}/overseer/compose?reply_to={{ message.id }}"
-     class="px-4 py-2 text-sm font-medium text-white bg-primary-600 hover:bg-primary-700 rounded-lg flex items-center gap-2 transition-colors"
+     class="min-w-[44px] min-h-[44px] px-4 py-2 text-sm font-medium text-white bg-primary-600 hover:bg-primary-700 rounded-lg flex items-center justify-center gap-2 transition-colors"
      data-tippy-content="Reply to this message as the Human Overseer"
      aria-label="Reply">
     <i data-lucide="reply" class="w-4 h-4"></i>
-    {# Icon-only below sm. The breadcrumb alone did not buy enough room: this
-       page adds Reply and Forward to the six controls every page already
-       carries, and the right-hand group is 357 px of a 440 px viewport on its
-       own. aria-label on the anchor keeps the name for anyone not reading
-       pixels. #}
     <span class="hidden sm:inline">Reply</span>
   </a>
-  <button disabled
-          class="px-4 py-2 text-sm font-medium text-slate-400 dark:text-slate-500 bg-slate-100 dark:bg-slate-800 rounded-lg flex items-center gap-2 opacity-60 cursor-not-allowed relative"
-          data-tippy-content="Coming soon - Forward this message"
-          aria-label="Forward (Coming Soon)">
-    <i data-lucide="forward" class="w-4 h-4"></i>
-    <span class="hidden sm:inline">Forward</span>
-    <span class="hidden sm:block absolute -top-1 -right-1 px-1 py-0.5 bg-amber-500 text-white text-[9px] font-bold rounded-full shadow-sm">Soon</span>
-  </button>
 </div>
 {% endblock %}
 
 {% block content %}
 <div class="space-y-6 animate-fade-in">
   <!-- Message Header Card -->
-  <div class="bg-white dark:bg-slate-800 rounded-xl p-8 shadow-soft border border-slate-200 dark:border-slate-700">
+  <div class="bg-white dark:bg-slate-800 rounded-xl p-5 sm:p-8 shadow-soft border border-slate-200 dark:border-slate-700">
     <!-- Subject -->
     <div class="mb-6">
       <div class="flex items-start justify-between gap-4 mb-3">
-        <h1 class="text-3xl font-bold text-slate-900 dark:text-white">
+        <h1 class="text-2xl sm:text-3xl font-bold text-slate-900 dark:text-white break-words">
           {{ message.subject }}
         </h1>
 
@@ -189,7 +176,23 @@
   </div>
 
   <!-- Message Body -->
-  <div class="bg-white dark:bg-slate-800 rounded-xl p-8 shadow-soft border border-slate-200 dark:border-slate-700">
+  <div class="bg-white dark:bg-slate-800 rounded-xl p-5 sm:p-8 shadow-soft border border-slate-200 dark:border-slate-700">
+    <div class="flex flex-wrap items-center gap-2 mb-5 pb-4 border-b border-slate-200 dark:border-slate-700">
+      <button type="button"
+              onclick="copyToClipboard({{ (message.body_md or '') | tojson | forceescape }}, 'Message copied!')"
+              class="min-h-[44px] px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-colors inline-flex items-center gap-2 text-sm font-medium"
+              aria-label="Copy message Markdown">
+        <i data-lucide="copy" class="w-4 h-4"></i>
+        Copy Message
+      </button>
+      <button type="button"
+              onclick="copyToClipboard(window.location.href, 'Message link copied!')"
+              class="min-h-[44px] px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-colors inline-flex items-center gap-2 text-sm font-medium"
+              aria-label="Copy message link">
+        <i data-lucide="link" class="w-4 h-4"></i>
+        Copy Link
+      </button>
+    </div>
     <div class="prose prose-slate dark:prose-invert max-w-none">
       {% if message.body_html %}
         <!-- SECURITY: Using | safe assumes backend properly sanitizes HTML to prevent XSS -->
@@ -242,8 +245,10 @@
               wrapper.appendChild(pre);
 
               const button = document.createElement('button');
+              button.type = 'button';
+              button.setAttribute('aria-label', 'Copy code block');
               button.innerHTML = '<i data-lucide="copy" class="w-4 h-4"></i>';
-              button.className = 'absolute top-2 right-2 p-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg opacity-0 group-hover:opacity-100 transition-opacity';
+              button.className = 'absolute top-2 right-2 min-w-[44px] min-h-[44px] p-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity flex items-center justify-center';
               button.onclick = async () => {
                 try {
                   if (navigator.clipboard && navigator.clipboard.writeText) {

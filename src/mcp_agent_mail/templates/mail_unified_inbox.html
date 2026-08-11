@@ -76,11 +76,11 @@
         @input="filterMessages()"
         @keydown.escape="searchQuery = ''; filterMessages()"
         type="search"
-        placeholder="Search all messages across all projects and agents..."
+        placeholder="Search loaded messages across projects (up to the latest 500)..."
         class="w-full pl-12 pr-4 py-3 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 focus:border-primary-500 dark:focus:border-primary-500 rounded-xl text-slate-900 dark:text-white placeholder-slate-500 dark:placeholder-slate-400 transition-all duration-200 focus:ring-2 focus:ring-primary-500/20"
         autocomplete="off"
         id="unified-search"
-        aria-label="Search all messages"
+        aria-label="Search up to the latest 500 loaded messages"
       />
       <div class="absolute inset-y-0 right-0 pr-3 flex items-center gap-2">
         <template x-if="searchQuery">
@@ -97,7 +97,9 @@
     <!-- Filters Toggle -->
     <button @click="showFilters = !showFilters"
             :class="filtersActive ? 'bg-primary-100 dark:bg-primary-900/30 text-primary-700 dark:text-primary-400 border-primary-300 dark:border-primary-700' : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:border-primary-300 dark:hover:border-primary-700'"
-            class="px-4 py-2.5 border rounded-lg transition-all duration-200 flex items-center gap-2 font-medium shadow-sm hover:shadow-md">
+            class="min-w-[44px] min-h-[44px] px-4 py-2.5 border rounded-lg transition-all duration-200 flex items-center justify-center gap-2 font-medium shadow-sm hover:shadow-md"
+            aria-label="Toggle message filters"
+            :aria-expanded="showFilters">
       <i data-lucide="sliders-horizontal" class="w-4 h-4"></i>
       <span class="hidden sm:inline">Filters</span>
       <template x-if="filtersActive">
@@ -106,16 +108,16 @@
     </button>
 
     <!-- View Options -->
-    <div class="flex items-center gap-1 p-1 bg-slate-100 dark:bg-slate-900 rounded-lg border border-slate-200 dark:border-slate-700">
+    <div class="hidden md:flex items-center gap-1 p-1 bg-slate-100 dark:bg-slate-900 rounded-lg border border-slate-200 dark:border-slate-700">
       <button @click="switchToSplitView()"
               :class="viewMode === 'split' ? 'bg-white dark:bg-slate-800 shadow-sm' : 'hover:bg-slate-200 dark:hover:bg-slate-800'"
-              class="p-2 rounded transition-colors"
+              class="min-w-[44px] min-h-[44px] p-2 rounded transition-colors flex items-center justify-center"
               aria-label="Split view (Gmail style)">
         <i data-lucide="columns-2" class="w-4 h-4 text-slate-700 dark:text-slate-300"></i>
       </button>
       <button @click="viewMode = 'list'"
               :class="viewMode === 'list' ? 'bg-white dark:bg-slate-800 shadow-sm' : 'hover:bg-slate-200 dark:hover:bg-slate-800'"
-              class="p-2 rounded transition-colors"
+              class="min-w-[44px] min-h-[44px] p-2 rounded transition-colors flex items-center justify-center"
               aria-label="List view only">
         <i data-lucide="list" class="w-4 h-4 text-slate-700 dark:text-slate-300"></i>
       </button>
@@ -124,7 +126,7 @@
     <!-- Fullscreen Toggle -->
     <button @click="isFullscreen = !isFullscreen"
             :class="isFullscreen ? 'bg-primary-100 dark:bg-primary-900/30 text-primary-700 dark:text-primary-400 border-primary-300 dark:border-primary-700' : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:border-primary-300 dark:hover:border-primary-700'"
-            class="px-4 py-2.5 border rounded-lg transition-all duration-200 flex items-center gap-2 font-medium shadow-sm hover:shadow-md"
+            class="hidden md:flex min-w-[44px] min-h-[44px] px-4 py-2.5 border rounded-lg transition-all duration-200 items-center justify-center gap-2 font-medium shadow-sm hover:shadow-md"
             :aria-label="isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'">
       <i x-show="!isFullscreen" data-lucide="maximize-2" class="w-4 h-4"></i>
       <i x-show="isFullscreen" data-lucide="minimize-2" class="w-4 h-4"></i>
@@ -134,7 +136,7 @@
     <!-- Refresh Controls -->
     <div class="flex items-center gap-3">
       <button @click="fetchLatestMessages()"
-              class="px-3 py-2 border border-slate-200 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 font-medium flex items-center gap-2 transition-all duration-200 hover:border-primary-300 dark:hover:border-primary-700 hover:text-primary-700 dark:hover:text-primary-400"
+              class="min-w-[44px] min-h-[44px] px-3 py-2 border border-slate-200 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 font-medium flex items-center justify-center gap-2 transition-all duration-200 hover:border-primary-300 dark:hover:border-primary-700 hover:text-primary-700 dark:hover:text-primary-400"
               :aria-busy="isRefreshing"
               aria-label="Refresh inbox">
         <i data-lucide="refresh-cw"
@@ -142,27 +144,17 @@
            :class="isRefreshing ? 'animate-spin text-primary-500' : 'text-slate-500 dark:text-slate-400'"></i>
         <span class="hidden xl:inline">Refresh</span>
       </button>
-      <!-- Both texts step aside below sm. Measured on a 440 px viewport: this
-           group is 180 px of a 408 px bar and pushed it 88 px past the edge —
-           "Updated just now" is 49 of that and the Auto-refresh word 44. Neither
-           is load-bearing on a phone: the navbar's live pip already says whether
-           the stream is carrying the page, and the checkbox keeps its own
-           aria-label. The error line is NOT hidden with them; it is the one thing
-           here that only appears when something is wrong. -->
-      <div class="flex flex-col">
-        <span class="hidden sm:inline text-xs font-medium text-slate-500 dark:text-slate-400" x-text="lastRefreshLabel"></span>
-        <template x-if="refreshError">
-          <span class="text-xs text-rose-500" x-text="refreshError"></span>
-        </template>
-      </div>
-      <label class="flex items-center gap-2 text-xs font-medium text-slate-600 dark:text-slate-400 cursor-pointer select-none"
-             data-tippy-content="Auto-refresh">
+      <template x-if="refreshError">
+        <span class="text-xs text-rose-500" x-text="refreshError" aria-live="polite"></span>
+      </template>
+      <label class="flex min-w-[44px] min-h-[44px] items-center justify-center gap-2 text-xs font-medium text-slate-600 dark:text-slate-400 cursor-pointer select-none"
+             data-tippy-content="Pause or resume automatic page updates">
         <input type="checkbox"
-               class="form-checkbox h-4 w-4 rounded border-slate-300 dark:border-slate-600 text-primary-600 focus:ring-primary-500"
+               class="form-checkbox h-5 w-5 rounded border-slate-300 dark:border-slate-600 text-primary-600 focus:ring-primary-500"
                x-model="autoRefreshEnabled"
-               @change="handleAutoRefreshToggle()"
-               aria-label="Toggle automatic refresh" />
-        <span class="hidden sm:inline">Auto-refresh</span>
+               @change="handleAutomaticUpdatesToggle()"
+               aria-label="Pause or resume automatic page updates" />
+        <span class="hidden md:inline">Automatic updates</span>
       </label>
     </div>
 
@@ -270,36 +262,38 @@
            class="bg-white dark:bg-slate-800 flex flex-col overflow-hidden">
 
       <!-- List Header with Bulk Actions -->
-      <div class="px-4 py-3 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between bg-slate-50 dark:bg-slate-900">
-        <div class="flex items-center gap-3">
-          <input type="checkbox"
-                 @change="toggleSelectAll()"
-                 :checked="selectedMessages.length > 0 && selectedMessages.length === filteredMessages.length"
-                 x-init="
-                   const updateIndeterminate = () => {
-                     $el.indeterminate = selectedMessages.length > 0 && selectedMessages.length < filteredMessages.length;
-                   };
-                   $watch('selectedMessages', updateIndeterminate);
-                   $watch('filteredMessages', updateIndeterminate);
-                   updateIndeterminate();
-                 "
-                 class="w-4 h-4 text-primary-600 bg-white dark:bg-slate-700 border-slate-300 dark:border-slate-600 rounded focus:ring-2 focus:ring-primary-500 transition-all duration-200 cursor-pointer"
-                 aria-label="Select all messages">
+      <div class="px-4 py-3 border-b border-slate-200 dark:border-slate-700 flex flex-wrap items-center justify-between gap-2 bg-slate-50 dark:bg-slate-900">
+        <div class="flex min-w-0 flex-wrap items-center gap-3">
+          <label class="min-w-[44px] min-h-[44px] -my-2 -ml-2 flex items-center justify-center cursor-pointer md:min-w-5 md:min-h-5 md:m-0">
+            <span class="sr-only">Select all loaded messages</span>
+            <input type="checkbox"
+                   @change="toggleSelectAll()"
+                   :checked="selectedMessages.length > 0 && selectedMessages.length === filteredMessages.length"
+                   x-init="
+                     const updateIndeterminate = () => {
+                       $el.indeterminate = selectedMessages.length > 0 && selectedMessages.length < filteredMessages.length;
+                     };
+                     $watch('selectedMessages', updateIndeterminate);
+                     $watch('filteredMessages', updateIndeterminate);
+                     updateIndeterminate();
+                   "
+                   class="w-5 h-5 text-primary-600 bg-white dark:bg-slate-700 border-slate-300 dark:border-slate-600 rounded focus:ring-2 focus:ring-primary-500 transition-all duration-200 cursor-pointer"
+                   aria-label="Select all loaded messages">
+          </label>
+          <span x-show="selectedMessages.length === 0"
+                class="md:hidden truncate text-xs font-semibold text-slate-700 dark:text-slate-300"
+                x-text="messageCountLabel"
+                aria-live="polite"></span>
           <template x-if="selectedMessages.length > 0">
-            <div class="flex items-center gap-2 text-sm animate-slide-in">
+            <div class="flex flex-wrap items-center gap-2 text-sm animate-slide-in">
               <span class="font-semibold text-primary-600 dark:text-primary-400" x-text="selectedMessages.length + ' selected'"></span>
-              <button @click="markSelectedAsRead()"
-                      class="px-2 py-1 text-xs bg-success-100 dark:bg-success-900/30 hover:bg-success-200 dark:hover:bg-success-800/40 text-success-700 dark:text-success-300 rounded font-medium transition-colors flex items-center gap-1">
-                <i data-lucide="check" class="w-3 h-3"></i>
-                Mark Read
-              </button>
               <button @click="deleteSelectedMessages()"
-                      class="px-2 py-1 text-xs bg-red-100 dark:bg-red-900/30 hover:bg-red-200 dark:hover:bg-red-800/40 text-red-700 dark:text-red-300 rounded font-medium transition-colors flex items-center gap-1">
+                      class="min-h-[44px] px-3 py-1 text-xs bg-red-100 dark:bg-red-900/30 hover:bg-red-200 dark:hover:bg-red-800/40 text-red-700 dark:text-red-300 rounded font-medium transition-colors flex items-center gap-1">
                 <i data-lucide="trash-2" class="w-3 h-3"></i>
                 Delete
               </button>
               <button @click="selectedMessages = []"
-                      class="px-2 py-1 text-xs bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded font-medium transition-colors">
+                      class="min-h-[44px] px-3 py-1 text-xs bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded font-medium transition-colors">
                 Clear
               </button>
             </div>
@@ -373,12 +367,16 @@
 
                 <div class="flex items-start gap-3">
                   <!-- Checkbox -->
-                  <input type="checkbox"
-                         @click.stop
-                         @change="toggleMessageSelection(msg.id)"
-                         :checked="selectedMessages.includes(msg.id)"
-                         class="mt-1 w-4 h-4 text-primary-600 bg-white dark:bg-slate-700 border-slate-300 dark:border-slate-600 rounded focus:ring-2 focus:ring-primary-500 transition-all duration-200 cursor-pointer opacity-0 group-hover:opacity-100"
-                         :class="selectedMessages.includes(msg.id) ? 'opacity-100' : ''">
+                  <label @click.stop
+                         class="min-w-[44px] min-h-[44px] -my-2 -ml-2 flex items-start justify-center pt-3 cursor-pointer md:min-w-5 md:min-h-5 md:m-0 md:pt-1">
+                    <span class="sr-only" x-text="'Select message: ' + msg.subject"></span>
+                    <input type="checkbox"
+                           @change="toggleMessageSelection(msg.id)"
+                           :checked="selectedMessages.includes(msg.id)"
+                           class="w-5 h-5 text-primary-600 bg-white dark:bg-slate-700 border-slate-300 dark:border-slate-600 rounded focus:ring-2 focus:ring-primary-500 transition-all duration-200 cursor-pointer opacity-100 md:w-4 md:h-4 md:opacity-0 md:group-hover:opacity-100"
+                           :class="selectedMessages.includes(msg.id) ? 'opacity-100' : ''"
+                           :aria-label="'Select message: ' + msg.subject">
+                  </label>
 
                   <!-- Message Content -->
                   <div class="flex-1 min-w-0">
@@ -550,20 +548,30 @@
               </div>
 
               <!-- Quick Actions -->
-              <div class="flex items-center gap-2 mt-6 pt-6 border-t border-slate-200 dark:border-slate-700">
+              <div class="flex flex-wrap items-center gap-2 mt-6 pt-6 border-t border-slate-200 dark:border-slate-700">
+                <a :href="`/mail/${selectedMessage.project_slug}/overseer/compose?reply_to=${selectedMessage.id}`"
+                   class="min-h-[44px] px-4 py-2 bg-primary-600 hover:bg-primary-700 text-white rounded-lg transition-colors flex items-center gap-2 text-sm font-medium">
+                  <i data-lucide="reply" class="w-4 h-4"></i>
+                  Reply
+                </a>
+                <button @click="copyMessageBody(selectedMessage)"
+                        class="min-h-[44px] px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-colors flex items-center gap-2 text-sm font-medium">
+                  <i data-lucide="copy" class="w-4 h-4"></i>
+                  Copy Message
+                </button>
                 <button @click="copyMessageLink(selectedMessage)"
-                        class="px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-colors flex items-center gap-2 text-sm font-medium">
+                        class="min-h-[44px] px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-colors flex items-center gap-2 text-sm font-medium">
                   <i data-lucide="link" class="w-4 h-4"></i>
                   Copy Link
                 </button>
                 <a :href="`/mail/${selectedMessage.project_slug}/message/${selectedMessage.id}`"
-                   class="px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-colors flex items-center gap-2 text-sm font-medium">
+                   class="min-h-[44px] px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-colors flex items-center gap-2 text-sm font-medium">
                   <i data-lucide="external-link" class="w-4 h-4"></i>
                   Open in Project
                 </a>
                 <template x-if="selectedMessage.thread_id">
                   <a :href="`/mail/${selectedMessage.project_slug}/thread/${selectedMessage.thread_id}`"
-                     class="px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-colors flex items-center gap-2 text-sm font-medium">
+                     class="min-h-[44px] px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-colors flex items-center gap-2 text-sm font-medium">
                     <i data-lucide="git-branch" class="w-4 h-4"></i>
                     View Thread
                   </a>
@@ -782,11 +790,8 @@ function unifiedInboxManager() {
     // and not a guess at a phone width.
     viewMode: window.matchMedia('(min-width: 768px)').matches ? 'split' : 'list',
     isFullscreen: false,
-    autoRefreshSeconds: 45,
     autoRefreshEnabled: true,
-    autoRefreshHandle: null,
     isRefreshing: false,
-    lastRefreshTime: null,
     refreshError: null,
 
     // Filters
@@ -849,36 +854,9 @@ function unifiedInboxManager() {
       return `${count} ${noun}`;
     },
 
-    get lastRefreshLabel() {
-      if (this.isRefreshing) {
-        return 'Refreshing…';
-      }
-      if (!this.lastRefreshTime) {
-        return 'Awaiting first refresh';
-      }
-      const diffSeconds = Math.floor((Date.now() - this.lastRefreshTime.getTime()) / 1000);
-      if (diffSeconds < 10) {
-        return 'Updated just now';
-      }
-      if (diffSeconds < 60) {
-        return `Updated ${diffSeconds}s ago`;
-      }
-      const diffMinutes = Math.floor(diffSeconds / 60);
-      if (diffMinutes < 60) {
-        return `Updated ${diffMinutes}m ago`;
-      }
-      const diffHours = Math.floor(diffMinutes / 60);
-      if (diffHours < 24) {
-        return `Updated ${diffHours}h ago`;
-      }
-      const diffDays = Math.floor(diffHours / 24);
-      return `Updated ${diffDays}d ago`;
-    },
-
     init() {
       this.filteredMessages = [...this.allMessages];
       this.filterMessages();
-      this.lastRefreshTime = new Date();
 
       // Setup keyboard shortcuts with proper cleanup
       this._keydownHandler = (e) => {
@@ -942,16 +920,10 @@ function unifiedInboxManager() {
         this.selectMessage(this.filteredMessages[0]);
       }
 
-      this.scheduleAutoRefresh();
-
       // Return cleanup function for Alpine.js v3
       return () => {
         if (this._keydownHandler) {
           document.removeEventListener('keydown', this._keydownHandler);
-        }
-        if (this.autoRefreshHandle) {
-          clearInterval(this.autoRefreshHandle);
-          this.autoRefreshHandle = null;
         }
       };
     },
@@ -1077,25 +1049,9 @@ function unifiedInboxManager() {
     },
 
     // Refresh helpers
-    scheduleAutoRefresh() {
-      if (this.autoRefreshHandle) {
-        clearInterval(this.autoRefreshHandle);
-        this.autoRefreshHandle = null;
-      }
-      if (!this.autoRefreshEnabled) {
-        return;
-      }
-      this.autoRefreshHandle = setInterval(() => {
-        this.fetchLatestMessages({ silent: true });
-      }, this.autoRefreshSeconds * 1000);
-    },
-
-    handleAutoRefreshToggle() {
+    handleAutomaticUpdatesToggle() {
       if (this.autoRefreshEnabled) {
-        this.scheduleAutoRefresh();
-      } else if (this.autoRefreshHandle) {
-        clearInterval(this.autoRefreshHandle);
-        this.autoRefreshHandle = null;
+        this.fetchLatestMessages({ silent: true });
       }
     },
 
@@ -1147,8 +1103,6 @@ function unifiedInboxManager() {
           this.selectedMessages = [];
         }
 
-        this.lastRefreshTime = new Date();
-
         if (!silent && typeof window.showToast === 'function') {
           window.showToast('Inbox refreshed', 'success');
         }
@@ -1160,9 +1114,6 @@ function unifiedInboxManager() {
         }
       } finally {
         this.isRefreshing = false;
-        if (!silent) {
-          this.scheduleAutoRefresh();
-        }
       }
     },
 
@@ -1285,8 +1236,10 @@ function unifiedInboxManager() {
             wrapper.appendChild(pre);
 
             const button = document.createElement('button');
+            button.type = 'button';
+            button.setAttribute('aria-label', 'Copy code block');
             button.innerHTML = '<i data-lucide="copy" class="w-4 h-4"></i>';
-            button.className = 'absolute top-2 right-2 p-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg opacity-0 group-hover:opacity-100 transition-opacity';
+            button.className = 'absolute top-2 right-2 min-w-[44px] min-h-[44px] p-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity flex items-center justify-center';
             button.onclick = async () => {
               try {
                 if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -1363,14 +1316,6 @@ function unifiedInboxManager() {
       }
     },
 
-    markSelectedAsRead() {
-      if (this.selectedMessages.length === 0) return;
-      if (typeof window.showToast === 'function') {
-        window.showToast(`Marked ${this.selectedMessages.length} message(s) as read`, 'success');
-      }
-      this.selectedMessages = [];
-    },
-
     async deleteSelectedMessages() {
       if (this.selectedMessages.length === 0) return;
 
@@ -1424,6 +1369,14 @@ function unifiedInboxManager() {
     },
 
     // Helpers
+    copyMessageBody(msg) {
+      if (!msg) return;
+      const body = typeof msg.body_md === 'string' ? msg.body_md : '';
+      if (typeof window.copyToClipboard === 'function') {
+        window.copyToClipboard(body, 'Message copied!');
+      }
+    },
+
     copyMessageLink(msg) {
       if (!msg) return;
       const projectSlug = encodeURIComponent(msg.project_slug || '');

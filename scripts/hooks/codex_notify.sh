@@ -144,11 +144,9 @@ hook_ensure_agent() {
   fi
 
   retired="$(printf '%s' "$response" | jq -r '.retired_at // empty' 2>/dev/null)"
-  if [[ "$refresh" == "1" && -n "$retired" ]]; then
-    am_call unretire_agent "$(AGENT_MAIL_JQ_REGISTRATION_TOKEN="$HOOK_TOKEN" \
-      jq -nc --arg p "$PROJECT" --arg n "$HOOK_AGENT" \
-      '{project_key:$p,agent_name:$n,registration_token:env.AGENT_MAIL_JQ_REGISTRATION_TOKEN}')" \
-      >/dev/null 2>&1
+  if [[ -n "$retired" ]]; then
+    HOOK_ERROR="identity ${HOOK_AGENT} is retired and cannot receive new mail; this hook will not restore a manually decommissioned identity, so stop this session and have an operator explicitly restore it before restarting"
+    return 1
   fi
   return 0
 }

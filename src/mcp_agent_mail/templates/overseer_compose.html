@@ -35,9 +35,11 @@
 
   <!-- Clean Professional Header -->
   <div class="mb-6">
-    <h1 class="text-3xl font-semibold text-slate-900 dark:text-white mb-2">Send Message as Human Overseer</h1>
+    <h1 class="text-3xl font-semibold text-slate-900 dark:text-white mb-2">
+      {{ 'Reply as Human Overseer' if prefill and prefill.reply_to else 'Send Message as Human Overseer' }}
+    </h1>
     <p class="text-slate-600 dark:text-slate-400">
-      Send high-priority instructions directly to your agents. Messages are automatically marked as urgent.
+      Send high-priority instructions directly to your agents. Messages are automatically marked as high priority.
     </p>
   </div>
 
@@ -54,36 +56,46 @@
 
   <!-- Main Composer Form -->
   <form @submit.prevent="sendMessage()" class="space-y-6">
+    <input type="hidden" name="reply_to" :value="replyTo || ''">
 
     <!-- Recipients Section -->
     <div class="bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700 overflow-hidden">
       <!-- Section Header -->
       <div class="px-6 py-4 border-b border-slate-200 dark:border-slate-700">
-        <div class="flex items-center justify-between">
+        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>
             <h2 class="text-lg font-semibold text-slate-900 dark:text-white">
               Recipients
-              <span class="ml-2 text-sm font-normal" :class="selectedRecipients.length > 100 ? 'text-red-600 dark:text-red-400' : 'text-slate-500 dark:text-slate-400'">
-                (<span x-text="selectedRecipients.length"></span> of 100 max)
+              <span class="ml-2 text-sm font-normal text-slate-500 dark:text-slate-400">
+                (<span x-text="selectedRecipients.length"></span>{% if not (prefill and prefill.reply_to) %} of 100 max{% endif %})
               </span>
             </h2>
-            <p class="text-sm text-slate-600 dark:text-slate-400 mt-1">Select which agents should receive this message</p>
+            <p class="text-sm text-slate-600 dark:text-slate-400 mt-1">
+              {% if prefill and prefill.reply_to %}
+                Routing is locked to the original sender or recipients and will be verified again when you send.
+              {% else %}
+                Select which agents should receive this message.
+              {% endif %}
+            </p>
           </div>
 
           <!-- Quick actions -->
-          <div class="flex items-center gap-2">
+          {% if not (prefill and prefill.reply_to) %}
+          <div class="flex flex-wrap items-center gap-2">
             <button type="button" @click="selectAll()"
-                    class="px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-md transition-colors">
+                    class="min-h-[44px] px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-md transition-colors">
               Select All
             </button>
             <button type="button" @click="selectNone()"
-                    class="px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-md transition-colors">
+                    class="min-h-[44px] px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-md transition-colors">
               Clear
             </button>
           </div>
+          {% endif %}
         </div>
 
         <!-- Search bar for recipients (if many agents) -->
+        {% if not (prefill and prefill.reply_to) %}
         <div x-show="agents.length > 6" class="mt-4">
           <div class="relative">
             <i data-lucide="search" class="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-slate-400"></i>
@@ -93,11 +105,21 @@
                    aria-label="Search agents">
           </div>
         </div>
+        {% endif %}
       </div>
 
       <!-- Recipients Grid -->
       <div class="p-6">
-        {% if agents %}
+        {% if prefill and prefill.reply_to %}
+          <div class="flex flex-wrap gap-2" aria-label="Locked reply recipients">
+            {% for recipient in prefill.recipients %}
+              <span class="inline-flex min-h-[44px] items-center gap-2 rounded-lg border border-primary-200 bg-primary-50 px-3 py-2 text-sm font-medium text-primary-800 dark:border-primary-800 dark:bg-primary-900/20 dark:text-primary-200">
+                <i data-lucide="bot" class="h-4 w-4"></i>
+                {{ recipient }}
+              </span>
+            {% endfor %}
+          </div>
+        {% elif agents %}
           <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
             {% for agent in agents %}
               <label x-show="!recipientSearch || '{{ agent.name|replace('\\', '\\\\')|replace("'", "\\'") }}'.toLowerCase().includes(recipientSearch.toLowerCase())"
@@ -141,28 +163,28 @@
     <div class="bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700 overflow-hidden">
       <!-- Section Header -->
       <div class="px-6 py-4 border-b border-slate-200 dark:border-slate-700">
-        <div class="flex items-center justify-between">
+        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>
             <h2 class="text-lg font-semibold text-slate-900 dark:text-white">Message Content</h2>
             <p class="text-sm text-slate-600 dark:text-slate-400 mt-1">Compose your message in GitHub-flavored Markdown</p>
           </div>
 
           <!-- View mode toggle -->
-          <div class="flex items-center gap-1 p-0.5 bg-slate-100 dark:bg-slate-900 rounded-lg">
+          <div class="flex flex-wrap items-center gap-1 p-0.5 bg-slate-100 dark:bg-slate-900 rounded-lg">
             <button type="button" @click="viewMode = 'write'"
-                    class="px-3 py-1.5 text-xs font-medium rounded-md transition-all flex items-center gap-1.5"
+                    class="min-h-[44px] px-3 py-1.5 text-xs font-medium rounded-md transition-all flex items-center gap-1.5"
                     :class="viewMode === 'write' ? 'bg-white dark:bg-slate-800 shadow-sm text-slate-900 dark:text-white' : 'text-slate-600 dark:text-slate-400'">
               <i data-lucide="edit-3" class="w-3.5 h-3.5"></i>
               Write
             </button>
             <button type="button" @click="viewMode = 'preview'"
-                    class="px-3 py-1.5 text-xs font-medium rounded-md transition-all flex items-center gap-1.5"
+                    class="min-h-[44px] px-3 py-1.5 text-xs font-medium rounded-md transition-all flex items-center gap-1.5"
                     :class="viewMode === 'preview' ? 'bg-white dark:bg-slate-800 shadow-sm text-slate-900 dark:text-white' : 'text-slate-600 dark:text-slate-400'">
               <i data-lucide="eye" class="w-3.5 h-3.5"></i>
               Preview
             </button>
             <button type="button" @click="viewMode = 'split'"
-                    class="px-3 py-1.5 text-xs font-medium rounded-md transition-all flex items-center gap-1.5"
+                    class="hidden sm:flex min-h-[44px] px-3 py-1.5 text-xs font-medium rounded-md transition-all items-center gap-1.5"
                     :class="viewMode === 'split' ? 'bg-white dark:bg-slate-800 shadow-sm text-slate-900 dark:text-white' : 'text-slate-600 dark:text-slate-400'">
               <i data-lucide="columns" class="w-3.5 h-3.5"></i>
               Split
@@ -181,6 +203,7 @@
                  id="subject"
                  x-model="subject"
                  required
+                 {% if prefill and prefill.reply_to %}readonly aria-readonly="true"{% endif %}
                  maxlength="200"
                  placeholder="e.g., Urgent: Review security vulnerability"
                  class="w-full px-4 py-2.5 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white placeholder-slate-400 focus:ring-2 focus:ring-primary-500 focus:border-transparent transition-all" />
@@ -276,10 +299,15 @@ Please investigate the following:
           <input type="text"
                  id="threadId"
                  x-model="threadId"
+                 {% if prefill and prefill.reply_to %}readonly aria-readonly="true"{% endif %}
                  placeholder="e.g., 42 or custom-thread-id"
                  class="w-full px-4 py-2.5 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white placeholder-slate-400 font-mono text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent transition-all" />
           <p class="mt-1.5 text-xs text-slate-500 dark:text-slate-500">
-            Leave blank to start a new conversation
+            {% if prefill and prefill.reply_to %}
+              Replies remain in the original conversation.
+            {% else %}
+              Leave blank to start a new conversation.
+            {% endif %}
           </p>
         </div>
       </div>
@@ -413,6 +441,7 @@ function overseerComposer() {
        so a subject containing a quote or a backslash cannot break out of the
        literal — these values come from message bodies written by anyone. #}
     selectedRecipients: {{ (prefill.recipients if prefill else []) | tojson }},
+    replyTo: {{ (prefill.reply_to if prefill else none) | tojson }},
     subject: {{ (prefill.subject if prefill else '') | tojson }},
     body: '',
     threadId: {{ (prefill.thread_id if prefill else '') | tojson }},
@@ -543,17 +572,24 @@ function overseerComposer() {
             subject: this.subject.trim(),
             body_md: this.body.trim(),
             thread_id: this.threadId.trim() || null,
+            reply_to: this.replyTo,
           })
         });
 
+        const result = await response.json().catch(() => ({}));
+
         if (!response.ok) {
-          const error = await response.json().catch(() => ({}));
-          throw new Error(error.detail || error.error || `Server error: ${response.status}`);
+          throw new Error(result.detail || result.error || `Server error: ${response.status}`);
         }
+
+        const deliveredRecipients = Array.isArray(result.recipients)
+          ? result.recipients.filter(name => typeof name === 'string')
+          : [];
+        this.selectedRecipients = deliveredRecipients;
 
         this.toastType = 'success';
         this.toastTitle = 'Message Sent Successfully';
-        this.toastMessage = `Delivered to ${this.selectedRecipients.length} agent${this.selectedRecipients.length !== 1 ? 's' : ''}`;
+        this.toastMessage = `Delivered to ${deliveredRecipients.length} agent${deliveredRecipients.length !== 1 ? 's' : ''}`;
         this.showToast = true;
 
         setTimeout(() => {

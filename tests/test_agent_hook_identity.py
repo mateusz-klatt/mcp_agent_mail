@@ -4342,6 +4342,87 @@ def test_session_start_makes_no_request_for_unactivated_repository(
     assert not (state / "credentials.json").exists()
 
 
+@pytest.mark.parametrize(
+    ("script_name", "arguments", "client"),
+    [
+        ("session_start.sh", [], "claude"),
+        ("codex_notify.sh", ["session-start"], "codex"),
+    ],
+)
+def test_session_start_never_restores_retired_identity(
+    tmp_path: Path,
+    script_name: str,
+    arguments: list[str],
+    client: str,
+) -> None:
+    home = tmp_path / "home"
+    state = tmp_path / "state"
+    fake_bin = tmp_path / "bin"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    (repo / ".agent-mail-project-id").write_text("project-id\n", encoding="utf-8")
+    _install_fake_curl(
+        fake_bin,
+        """#!/usr/bin/env bash
+body="$(cat)"
+tool="$(printf '%s' "$body" | jq -r '.params.name // empty')"
+printf '%s\n' "$tool" >> "$FAKE_CURL_LOG"
+case "$tool" in
+  ensure_project) result='{"human_key":"/owner/repo"}' ;;
+  register_agent)
+    name="$(printf '%s' "$body" | jq -r '.params.arguments.name')"
+    result="$(jq -nc --arg name "$name" \
+      '{name:$name,registration_token:"registration-token",retired_at:"2026-08-11T08:00:00Z"}')"
+    ;;
+  unretire_agent) result='{"status":"active"}' ;;
+  fetch_inbox) result='[]' ;;
+  *) result='{}' ;;
+esac
+envelope="$(jq -nc --arg text "$result" \
+  '{result:{content:[{type:"text",text:$text}],isError:false}}')"
+printf '%s\n200' "$envelope"
+""",
+    )
+    env = _hook_env(home, state, fake_bin)
+    curl_log = tmp_path / "curl.log"
+    env["FAKE_CURL_LOG"] = _git_bash_path(curl_log)
+    _, claude_name, codex_name = _hook_names(env)
+    agent_name = claude_name if client == "claude" else codex_name
+    _put_credential(state, agent_name)
+    payload = {
+        "cwd": str(repo),
+        "session_id": "retired-session",
+        "hook_event_name": "SessionStart",
+        "source": "startup",
+        "model": "gpt-5.6",
+    }
+
+    result = subprocess.run(
+        [
+            BASH,
+            _git_bash_path(ROOT / "scripts" / "hooks" / script_name),
+            *arguments,
+        ],
+        cwd=repo,
+        env=env,
+        input=json.dumps(payload),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert f"identity {agent_name}" in context
+    assert "is retired and cannot receive new mail" in context
+    assert "will not restore a manually decommissioned identity" in context
+    assert "explicitly restore" in context
+    calls = curl_log.read_text(encoding="utf-8").splitlines()
+    assert calls[-1] == "register_agent"
+    assert "unretire_agent" not in calls
+    assert "fetch_inbox" not in calls
+
+
 def test_inherited_project_override_cannot_activate_a_different_repository(
     tmp_path: Path,
 ) -> None:

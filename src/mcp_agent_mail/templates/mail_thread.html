@@ -21,19 +21,19 @@
 <div class="max-w-5xl mx-auto space-y-6 page-transition pb-12">
 
   <!-- Thread Header - Gmail Style -->
-  <div class="bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700 p-6">
-    <div class="flex items-start justify-between mb-4">
+  <div class="bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700 p-4 sm:p-6">
+    <div class="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
       <div class="flex-1 min-w-0">
         <div class="flex items-center gap-3 mb-2">
           <i data-lucide="messages-square" class="w-6 h-6 text-primary-600 dark:text-primary-400 flex-shrink-0"></i>
-          <h1 class="text-2xl font-bold text-slate-900 dark:text-white truncate">
+          <h1 class="text-xl sm:text-2xl font-bold text-slate-900 dark:text-white break-words sm:truncate">
             {{ thread_subject }}
           </h1>
         </div>
-        <div class="flex items-center gap-4 text-sm text-slate-600 dark:text-slate-400">
-          <div class="flex items-center gap-1.5">
+        <div class="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-slate-600 dark:text-slate-400">
+          <div class="flex min-w-0 items-center gap-1.5">
             <i data-lucide="hash" class="w-4 h-4"></i>
-            <span class="font-mono">{{ thread_id }}</span>
+            <span class="max-w-[14rem] truncate font-mono" title="{{ thread_id }}">{{ thread_id }}</span>
           </div>
           <div class="flex items-center gap-1.5">
             <i data-lucide="layers" class="w-4 h-4"></i>
@@ -45,9 +45,10 @@
       <!-- Actions -->
       <div class="flex items-center gap-2">
         <a href="/mail/{{ project.slug }}"
-           class="px-3 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-all duration-200 flex items-center gap-2 text-sm font-medium">
+           class="min-w-[44px] min-h-[44px] px-3 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-all duration-200 flex items-center justify-center gap-2 text-sm font-medium"
+           aria-label="Back to project">
           <i data-lucide="arrow-left" class="w-4 h-4"></i>
-          Back to Project
+          <span class="hidden sm:inline">Back to Project</span>
         </a>
       </div>
     </div>
@@ -61,8 +62,14 @@
 
         <!-- Message Header (Always Visible) -->
         <div @click="expanded = !expanded"
-             class="p-5 cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-900/50 transition-colors"
-             :class="expanded ? 'bg-slate-50 dark:bg-slate-900/30' : ''">
+             @keydown.enter.prevent="expanded = !expanded"
+             @keydown.space.prevent="expanded = !expanded"
+             class="w-full min-h-[44px] p-4 sm:p-5 text-left cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-900/50 transition-colors"
+             :class="expanded ? 'bg-slate-50 dark:bg-slate-900/30' : ''"
+             :aria-expanded="expanded"
+             role="button"
+             tabindex="0"
+             aria-label="Expand or collapse message">
           <div class="flex items-start justify-between gap-4">
             <div class="flex items-start gap-3 flex-1 min-w-0">
               <!-- Avatar -->
@@ -72,9 +79,9 @@
 
               <!-- Sender Info -->
               <div class="flex-1 min-w-0">
-                <div class="flex items-baseline gap-2 mb-1">
-                  <span class="font-semibold text-slate-900 dark:text-white">{{ msg.sender }}</span>
-                  <span class="text-sm text-slate-500 dark:text-slate-400">{{ msg.created }}</span>
+                <div class="flex flex-col sm:flex-row sm:items-baseline gap-1 sm:gap-2 mb-1">
+                  <span class="font-semibold text-slate-900 dark:text-white break-all sm:break-normal">{{ msg.sender }}</span>
+                  <time class="text-sm text-slate-500 dark:text-slate-400 whitespace-nowrap" datetime="{{ msg.created }}" title="{{ msg.created }}">{{ msg.created[:19] }}</time>
                 </div>
 
                 <!-- Preview (when collapsed) -->
@@ -117,7 +124,7 @@
              x-transition:enter="transition ease-out duration-200"
              x-transition:enter-start="opacity-0 transform -translate-y-2"
              x-transition:enter-end="opacity-100 transform translate-y-0"
-             class="px-5 pb-5 pt-2">
+             class="px-4 sm:px-5 pb-5 pt-2">
 
           <!-- Divider -->
           <div class="mb-4 -mx-5 px-5">
@@ -145,10 +152,30 @@
           </div>
 
           <!-- Message Actions -->
-          <div class="mt-6 pt-4 border-t border-slate-200 dark:border-slate-700 flex items-center justify-between">
-            <div class="flex items-center gap-2">
+          <div class="mt-6 pt-4 border-t border-slate-200 dark:border-slate-700 flex flex-wrap items-center justify-between gap-3">
+            <div class="flex flex-wrap items-center gap-2">
+              <a href="/mail/{{ project.slug }}/overseer/compose?reply_to={{ msg.id }}"
+                 class="min-h-[44px] inline-flex items-center gap-1.5 px-3 py-2 bg-primary-600 hover:bg-primary-700 text-white rounded-lg transition-colors text-sm font-medium">
+                <i data-lucide="reply" class="w-3.5 h-3.5"></i>
+                Reply
+              </a>
+              <button type="button"
+                      onclick="copyToClipboard({{ (msg.body_md or '') | tojson | forceescape }}, 'Message copied!')"
+                      class="min-h-[44px] inline-flex items-center gap-1.5 px-3 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-colors text-sm font-medium"
+                      aria-label="Copy message Markdown">
+                <i data-lucide="copy" class="w-3.5 h-3.5"></i>
+                Copy Message
+              </button>
+              <button type="button"
+                      data-message-url="/mail/{{ project.slug }}/message/{{ msg.id }}"
+                      onclick="copyToClipboard(new URL(this.dataset.messageUrl, window.location.origin).href, 'Message link copied!')"
+                      class="min-h-[44px] inline-flex items-center gap-1.5 px-3 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-colors text-sm font-medium"
+                      aria-label="Copy message link">
+                <i data-lucide="link" class="w-3.5 h-3.5"></i>
+                Copy Link
+              </button>
               <a href="/mail/{{ project.slug }}/message/{{ msg.id }}"
-                 class="inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-colors text-sm font-medium">
+                 class="min-h-[44px] inline-flex items-center gap-1.5 px-3 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-colors text-sm font-medium">
                 <i data-lucide="external-link" class="w-3.5 h-3.5"></i>
                 View Full Message
               </a>
@@ -164,20 +191,8 @@
     {% endfor %}
   </div>
 
-  <!-- Thread Actions Footer -->
-  <div class="bg-slate-50 dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-700 p-6">
-    <div class="flex items-center justify-between">
-      <div class="text-sm text-slate-600 dark:text-slate-400">
-        <p class="mb-1">End of conversation</p>
-        <p class="text-xs">{{ message_count }} message{{ 's' if message_count != 1 else '' }} in this thread</p>
-      </div>
-
-      <a href="/mail/{{ project.slug }}"
-         class="inline-flex items-center gap-2 px-4 py-2 bg-primary-600 hover:bg-primary-700 text-white rounded-lg shadow-sm hover:shadow-md transition-all duration-200 font-medium">
-        <i data-lucide="arrow-left" class="w-4 h-4"></i>
-        Back to Project
-      </a>
-    </div>
+  <div class="text-center text-sm text-slate-500 dark:text-slate-400">
+    End of conversation · {{ message_count }} message{{ 's' if message_count != 1 else '' }}
   </div>
 </div>
 

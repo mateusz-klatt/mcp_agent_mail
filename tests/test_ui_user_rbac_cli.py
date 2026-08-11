@@ -8,13 +8,28 @@ from pathlib import Path
 from typing import Any, TypeVar, cast
 
 import pytest
+from sqlalchemy.exc import IntegrityError as SAIntegrityError
 from sqlmodel import select
 from typer.testing import CliRunner
 
 from mcp_agent_mail import webauth
 from mcp_agent_mail.cli import app
 from mcp_agent_mail.db import ensure_schema, get_session, reset_database_state
-from mcp_agent_mail.models import Project, UiProjectAssignment, UiUser
+from mcp_agent_mail.models import (
+    Project,
+    UiAccessAuditEvent,
+    UiProjectAssignment,
+    UiUser,
+)
+from mcp_agent_mail.ui_access import (
+    UiAccessMutationError,
+    UiAccessMutationResult,
+    UiProfileMutationError,
+    UiProfileMutationResult,
+    mutate_ui_project_access,
+    mutate_ui_user_display_name,
+    normalize_ui_display_name,
+)
 
 T = TypeVar("T")
 
@@ -94,6 +109,80 @@ async def _user_and_assignments(username: str) -> tuple[UiUser, list[UiProjectAs
         return user, list(assignments_result.scalars().all())
 
 
+async def _access_audit_events() -> list[UiAccessAuditEvent]:
+    """Read access audit events in insertion order.
+
+    Returns:
+        Every immutable access event ordered by primary key.
+    """
+    await ensure_schema()
+    async with get_session() as session:
+        result = await session.execute(
+            select(UiAccessAuditEvent).order_by(cast(Any, UiAccessAuditEvent.id))
+        )
+        return list(result.scalars().all())
+
+
+async def _project_by_id(project_id: int) -> Project:
+    """Read one project by its stable numeric identifier."""
+    await ensure_schema()
+    async with get_session() as session:
+        result = await session.execute(select(Project).where(Project.id == project_id))
+        return result.scalars().one()
+
+
+async def _mutate_access(
+    *,
+    actor_user_id: int | None,
+    actor_account_generation: str | None,
+    expected_actor_session_epoch: int | None,
+    trusted_cli_actor: bool,
+    target_user_id: int,
+    project_id: int,
+    expected_project_generation: str,
+    role: webauth.ProjectRole | None,
+    expected_access_version: int,
+    account_generation: str,
+) -> UiAccessMutationResult:
+    """Invoke the shared access domain operation with a fresh session."""
+    await ensure_schema()
+    async with get_session() as session:
+        return await mutate_ui_project_access(
+            session,
+            actor_user_id=actor_user_id,
+            actor_account_generation=actor_account_generation,
+            expected_actor_session_epoch=expected_actor_session_epoch,
+            trusted_cli_actor=trusted_cli_actor,
+            target_user_id=target_user_id,
+            project_id=project_id,
+            expected_project_generation=expected_project_generation,
+            role=role,
+            expected_access_version=expected_access_version,
+            account_generation=account_generation,
+        )
+
+
+async def _mutate_display_name(
+    *,
+    target_user_id: int,
+    account_generation: str,
+    expected_session_epoch: int,
+    expected_profile_revision: int,
+    display_name: str | None,
+) -> UiProfileMutationResult:
+    """Invoke the shared profile domain operation with a fresh session."""
+    await ensure_schema()
+    async with get_session() as session:
+        return await mutate_ui_user_display_name(
+            session,
+            target_user_id=target_user_id,
+            account_generation=account_generation,
+            expected_session_epoch=expected_session_epoch,
+            expected_profile_revision=expected_profile_revision,
+            display_name=display_name,
+        )
+
+
 def _database_path() -> Path:
     """Return the isolated SQLite file selected by the test fixture.
 
@@ -165,6 +254,9 @@ def test_schema_migrates_legacy_viewer_once_and_preserves_unknown_role(isolated_
         second_generations = connection.execute(
             "SELECT username, session_generation FROM ui_users ORDER BY username"
         ).fetchall()
+        profiles = connection.execute(
+            "SELECT username, display_name, profile_revision FROM ui_users ORDER BY username"
+        ).fetchall()
         assignment_table = connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ui_project_assignments'"
         ).fetchone()
@@ -174,9 +266,21 @@ def test_schema_migrates_legacy_viewer_once_and_preserves_unknown_role(isolated_
         assignment_foreign_keys = connection.execute(
             "PRAGMA foreign_key_list('ui_project_assignments')"
         ).fetchall()
+        audit_table = connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'ui_access_audit_events'"
+        ).fetchone()
+        immutable_triggers = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                "AND name LIKE 'ui_access_audit_events_immutable_%'"
+            )
+        }
 
     assert roles == [("legacy", "member", 8), ("unknown", "owner", 11)]
     assert first_generations == second_generations
+    assert profiles == [("legacy", None, 1), ("unknown", None, 1)]
     assert all(
         isinstance(generation, str) and len(generation) == 64
         for _username, generation in first_generations
@@ -185,6 +289,12 @@ def test_schema_migrates_legacy_viewer_once_and_preserves_unknown_role(isolated_
     assert "idx_ui_project_assignments_user_project" in assignment_indexes
     assert {row[2] for row in assignment_foreign_keys} == {"projects", "ui_users"}
     assert {row[6] for row in assignment_foreign_keys} == {"CASCADE"}
+    assert audit_table == ("ui_access_audit_events",)
+    assert immutable_triggers == {
+        "ui_access_audit_events_immutable_bi",
+        "ui_access_audit_events_immutable_bu",
+        "ui_access_audit_events_immutable_bd",
+    }
 
 
 def test_account_recreation_uses_a_new_session_generation(
@@ -285,6 +395,895 @@ def test_grant_revoke_access_and_list_bump_epoch_only_on_change(isolated_env) ->
     assert unchanged_revoke.exit_code == 0, unchanged_revoke.output
     after_unchanged_revoke, _ = _run_database(_user_and_assignments("member"))
     assert after_unchanged_revoke.session_epoch == 13
+    audit_events = _run_database(_access_audit_events())
+    assert [
+        (
+            event.actor_user_id,
+            event.actor_username_snapshot,
+            event.target_user_id,
+            event.target_username_snapshot,
+            event.project_id,
+            event.project_slug_snapshot,
+            event.old_role,
+            event.new_role,
+            event.target_epoch_before,
+            event.target_epoch_after,
+        )
+        for event in audit_events
+    ] == [
+        (
+            None,
+            "cli",
+            ids["member"],
+            "member",
+            ids["backend"],
+            "backend",
+            None,
+            "operator",
+            10,
+            11,
+        ),
+        (
+            None,
+            "cli",
+            ids["member"],
+            "member",
+            ids["backend"],
+            "backend",
+            "operator",
+            "viewer",
+            11,
+            12,
+        ),
+        (
+            None,
+            "cli",
+            ids["member"],
+            "member",
+            ids["backend"],
+            "backend",
+            "viewer",
+            None,
+            12,
+            13,
+        ),
+    ]
+
+
+def test_display_name_uses_normalized_profile_cas_without_session_revocation(
+    isolated_env,
+) -> None:
+    ids = _run_database(_seed_users_and_projects())
+    original, _assignments = _run_database(_user_and_assignments("member"))
+
+    assert normalize_ui_display_name(None) is None
+    assert normalize_ui_display_name(" \t\n ") is None
+    assert normalize_ui_display_name("  Mateusz\n  Klatt  ") == "Mateusz Klatt"
+    assert normalize_ui_display_name("Zo\u0301łw") == "Zółw"
+    with pytest.raises(UiProfileMutationError, match="invalid_display_name"):
+        normalize_ui_display_name("x" * 129)
+    for unsafe_name in ("hidden\x00suffix", "right-to-left\u202eoverride"):
+        with pytest.raises(UiProfileMutationError, match="invalid_display_name"):
+            normalize_ui_display_name(unsafe_name)
+
+    changed = _run_database(
+        _mutate_display_name(
+            target_user_id=ids["member"],
+            account_generation=original.session_generation,
+            expected_session_epoch=original.session_epoch,
+            expected_profile_revision=1,
+            display_name="  Mateusz\n  Klatt  ",
+        )
+    )
+    assert changed == UiProfileMutationResult(
+        changed=True,
+        display_name="Mateusz Klatt",
+        profile_revision=2,
+    )
+    after_change, _assignments = _run_database(_user_and_assignments("member"))
+    assert after_change.display_name == "Mateusz Klatt"
+    assert after_change.profile_revision == 2
+    assert after_change.session_epoch == original.session_epoch
+
+    unchanged = _run_database(
+        _mutate_display_name(
+            target_user_id=ids["member"],
+            account_generation=original.session_generation,
+            expected_session_epoch=original.session_epoch,
+            expected_profile_revision=2,
+            display_name="Mateusz   Klatt",
+        )
+    )
+    assert unchanged == UiProfileMutationResult(
+        changed=False,
+        display_name="Mateusz Klatt",
+        profile_revision=2,
+    )
+
+    cleared = _run_database(
+        _mutate_display_name(
+            target_user_id=ids["member"],
+            account_generation=original.session_generation,
+            expected_session_epoch=original.session_epoch,
+            expected_profile_revision=2,
+            display_name=" ",
+        )
+    )
+    assert cleared == UiProfileMutationResult(
+        changed=True,
+        display_name=None,
+        profile_revision=3,
+    )
+    after_clear, _assignments = _run_database(_user_and_assignments("member"))
+    assert after_clear.display_name is None
+    assert after_clear.profile_revision == 3
+    assert after_clear.session_epoch == original.session_epoch
+
+    with pytest.raises(UiProfileMutationError) as stale_revision:
+        _run_database(
+            _mutate_display_name(
+                target_user_id=ids["member"],
+                account_generation=original.session_generation,
+                expected_session_epoch=original.session_epoch,
+                expected_profile_revision=2,
+                display_name="Stale",
+            )
+        )
+    assert stale_revision.value.code == "profile_revision_conflict"
+
+    with pytest.raises(UiProfileMutationError) as recreated:
+        _run_database(
+            _mutate_display_name(
+                target_user_id=ids["member"],
+                account_generation="different-account-lifetime",
+                expected_session_epoch=original.session_epoch,
+                expected_profile_revision=3,
+                display_name="Wrong account",
+            )
+        )
+    assert recreated.value.code == "account_recreated"
+
+    with sqlite3.connect(_database_path()) as connection:
+        connection.execute(
+            "UPDATE ui_users SET session_epoch = session_epoch + 1 WHERE id = ?",
+            (ids["member"],),
+        )
+        connection.commit()
+    with pytest.raises(UiProfileMutationError) as stale_session:
+        _run_database(
+            _mutate_display_name(
+                target_user_id=ids["member"],
+                account_generation=original.session_generation,
+                expected_session_epoch=original.session_epoch,
+                expected_profile_revision=3,
+                display_name="Must not persist",
+            )
+        )
+    assert stale_session.value.code == "session_epoch_conflict"
+    after_stale_session, _assignments = _run_database(_user_and_assignments("member"))
+    assert after_stale_session.session_epoch == original.session_epoch + 1
+    assert after_stale_session.profile_revision == 3
+    assert after_stale_session.display_name is None
+
+
+def test_access_mutation_serializes_stale_writers_and_audits_real_admin(
+    isolated_env,
+) -> None:
+    ids = _run_database(_seed_users_and_projects())
+    member, _assignments = _run_database(_user_and_assignments("member"))
+    admin, _assignments = _run_database(_user_and_assignments("admin"))
+    backend = _run_database(_project_by_id(ids["backend"]))
+
+    async def _race() -> tuple[
+        UiAccessMutationResult | UiAccessMutationError,
+        UiAccessMutationResult | UiAccessMutationError,
+    ]:
+        await ensure_schema()
+
+        async def _writer(
+            role: webauth.ProjectRole,
+        ) -> UiAccessMutationResult | UiAccessMutationError:
+            async with get_session() as session:
+                try:
+                    return await mutate_ui_project_access(
+                        session,
+                        actor_user_id=ids["admin"],
+                        actor_account_generation=admin.session_generation,
+                        expected_actor_session_epoch=admin.session_epoch,
+                        trusted_cli_actor=False,
+                        target_user_id=ids["member"],
+                        project_id=ids["backend"],
+                        expected_project_generation=backend.project_generation,
+                        role=role,
+                        expected_access_version=member.session_epoch,
+                        account_generation=member.session_generation,
+                    )
+                except UiAccessMutationError as exc:
+                    return exc
+
+        return await asyncio.gather(_writer("viewer"), _writer("operator"))
+
+    outcomes = _run_database(_race())
+    successes = [outcome for outcome in outcomes if isinstance(outcome, UiAccessMutationResult)]
+    failures = [outcome for outcome in outcomes if isinstance(outcome, UiAccessMutationError)]
+    assert len(successes) == 1
+    assert successes[0].changed
+    assert successes[0].access_version == 11
+    assert len(failures) == 1
+    assert failures[0].code == "access_version_conflict"
+
+    after_race, assignments = _run_database(_user_and_assignments("member"))
+    assert after_race.session_epoch == 11
+    assert len(assignments) == 1
+    assert assignments[0].role == successes[0].role
+    events = _run_database(_access_audit_events())
+    assert len(events) == 1
+    assert events[0].actor_user_id == ids["admin"]
+    assert events[0].actor_username_snapshot == "admin"
+    assert events[0].actor_account_generation_snapshot == admin.session_generation
+    assert events[0].actor_session_epoch_snapshot == admin.session_epoch
+    assert events[0].target_account_generation == member.session_generation
+    assert events[0].project_generation_snapshot == backend.project_generation
+    assert events[0].new_role == successes[0].role
+    assert (events[0].target_epoch_before, events[0].target_epoch_after) == (10, 11)
+
+    no_op = _run_database(
+        _mutate_access(
+            actor_user_id=ids["admin"],
+            actor_account_generation=admin.session_generation,
+            expected_actor_session_epoch=admin.session_epoch,
+            trusted_cli_actor=False,
+            target_user_id=ids["member"],
+            project_id=ids["backend"],
+            expected_project_generation=backend.project_generation,
+            role=successes[0].role,
+            expected_access_version=11,
+            account_generation=member.session_generation,
+        )
+    )
+    assert no_op == UiAccessMutationResult(
+        changed=False,
+        role=successes[0].role,
+        access_version=11,
+    )
+    assert len(_run_database(_access_audit_events())) == 1
+
+
+def test_archived_project_access_remains_mutable_and_audited(isolated_env) -> None:
+    ids = _run_database(_seed_users_and_projects())
+    member, _assignments = _run_database(_user_and_assignments("member"))
+    admin, _assignments = _run_database(_user_and_assignments("admin"))
+    backend = _run_database(_project_by_id(ids["backend"]))
+    database_path = _database_path()
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE projects SET archived_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (ids["backend"],),
+        )
+        connection.commit()
+
+    access_version = member.session_epoch
+    for requested_role, expected_old_role in (
+        ("viewer", None),
+        ("operator", "viewer"),
+        (None, "operator"),
+    ):
+        result = _run_database(
+            _mutate_access(
+                actor_user_id=ids["admin"],
+                actor_account_generation=admin.session_generation,
+                expected_actor_session_epoch=admin.session_epoch,
+                trusted_cli_actor=False,
+                target_user_id=ids["member"],
+                project_id=ids["backend"],
+                expected_project_generation=backend.project_generation,
+                role=requested_role,
+                expected_access_version=access_version,
+                account_generation=member.session_generation,
+            )
+        )
+        access_version += 1
+        assert result == UiAccessMutationResult(
+            changed=True,
+            role=requested_role,
+            access_version=access_version,
+        )
+        assert _run_database(_access_audit_events())[-1].old_role == expected_old_role
+
+    current, assignments = _run_database(_user_and_assignments("member"))
+    assert current.session_epoch == member.session_epoch + 3
+    assert assignments == []
+    events = _run_database(_access_audit_events())
+    assert [(event.old_role, event.new_role) for event in events] == [
+        (None, "viewer"),
+        ("viewer", "operator"),
+        ("operator", None),
+    ]
+    assert all(
+        event.project_generation_snapshot == backend.project_generation
+        for event in events
+    )
+
+    with sqlite3.connect(database_path) as connection:
+        archived_at = connection.execute(
+            "SELECT archived_at FROM projects WHERE id = ?",
+            (ids["backend"],),
+        ).fetchone()
+        active_ids = {
+            int(row[0])
+            for row in connection.execute(
+                "SELECT id FROM projects WHERE archived_at IS NULL"
+            ).fetchall()
+        }
+    assert archived_at is not None and archived_at[0] is not None
+    assert ids["backend"] not in active_ids
+    assert ids["frontend"] in active_ids
+
+
+def test_access_mutation_fail_closed_and_audit_rows_are_immutable(isolated_env) -> None:
+    ids = _run_database(_seed_users_and_projects())
+    member, _assignments = _run_database(_user_and_assignments("member"))
+    admin, _assignments = _run_database(_user_and_assignments("admin"))
+    backend = _run_database(_project_by_id(ids["backend"]))
+
+    granted = _run_database(
+        _mutate_access(
+            actor_user_id=ids["admin"],
+            actor_account_generation=admin.session_generation,
+            expected_actor_session_epoch=admin.session_epoch,
+            trusted_cli_actor=False,
+            target_user_id=ids["member"],
+            project_id=ids["backend"],
+            expected_project_generation=backend.project_generation,
+            role="viewer",
+            expected_access_version=member.session_epoch,
+            account_generation=member.session_generation,
+        )
+    )
+    assert granted.access_version == 11
+
+    with pytest.raises(UiAccessMutationError) as stale_version:
+        _run_database(
+            _mutate_access(
+                actor_user_id=ids["admin"],
+                actor_account_generation=admin.session_generation,
+                expected_actor_session_epoch=admin.session_epoch,
+                trusted_cli_actor=False,
+                target_user_id=ids["member"],
+                project_id=ids["backend"],
+                expected_project_generation=backend.project_generation,
+                role="operator",
+                expected_access_version=10,
+                account_generation=member.session_generation,
+            )
+        )
+    assert stale_version.value.code == "access_version_conflict"
+
+    with pytest.raises(UiAccessMutationError) as recreated:
+        _run_database(
+            _mutate_access(
+                actor_user_id=ids["admin"],
+                actor_account_generation=admin.session_generation,
+                expected_actor_session_epoch=admin.session_epoch,
+                trusted_cli_actor=False,
+                target_user_id=ids["member"],
+                project_id=ids["backend"],
+                expected_project_generation=backend.project_generation,
+                role="operator",
+                expected_access_version=11,
+                account_generation="different-account-lifetime",
+            )
+        )
+    assert recreated.value.code == "account_recreated"
+
+    with pytest.raises(UiAccessMutationError) as forbidden_actor:
+        _run_database(
+            _mutate_access(
+                actor_user_id=ids["member"],
+                actor_account_generation=member.session_generation,
+                expected_actor_session_epoch=11,
+                trusted_cli_actor=False,
+                target_user_id=ids["member"],
+                project_id=ids["backend"],
+                expected_project_generation=backend.project_generation,
+                role="operator",
+                expected_access_version=11,
+                account_generation=member.session_generation,
+            )
+        )
+    assert forbidden_actor.value.code == "actor_forbidden"
+
+    with pytest.raises(UiAccessMutationError) as global_admin:
+        _run_database(
+            _mutate_access(
+                actor_user_id=None,
+                actor_account_generation=None,
+                expected_actor_session_epoch=None,
+                trusted_cli_actor=True,
+                target_user_id=ids["admin"],
+                project_id=ids["backend"],
+                expected_project_generation=backend.project_generation,
+                role="viewer",
+                expected_access_version=admin.session_epoch,
+                account_generation=admin.session_generation,
+            )
+        )
+    assert global_admin.value.code == "target_global_admin"
+
+    with pytest.raises(UiAccessMutationError) as missing_target:
+        _run_database(
+            _mutate_access(
+                actor_user_id=ids["admin"],
+                actor_account_generation=admin.session_generation,
+                expected_actor_session_epoch=admin.session_epoch,
+                trusted_cli_actor=False,
+                target_user_id=999_999,
+                project_id=ids["backend"],
+                expected_project_generation=backend.project_generation,
+                role="operator",
+                expected_access_version=1,
+                account_generation="missing",
+            )
+        )
+    assert missing_target.value.code == "target_not_found"
+
+    with pytest.raises(UiAccessMutationError) as missing_project:
+        _run_database(
+            _mutate_access(
+                actor_user_id=ids["admin"],
+                actor_account_generation=admin.session_generation,
+                expected_actor_session_epoch=admin.session_epoch,
+                trusted_cli_actor=False,
+                target_user_id=ids["member"],
+                project_id=999_999,
+                expected_project_generation=backend.project_generation,
+                role="operator",
+                expected_access_version=11,
+                account_generation=member.session_generation,
+            )
+        )
+    assert missing_project.value.code == "project_not_found"
+
+    database_path = _database_path()
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE ui_users SET disabled = 1 WHERE id = ?",
+            (ids["member"],),
+        )
+        connection.commit()
+
+    with pytest.raises(UiAccessMutationError) as disabled_target:
+        _run_database(
+            _mutate_access(
+                actor_user_id=ids["admin"],
+                actor_account_generation=admin.session_generation,
+                expected_actor_session_epoch=admin.session_epoch,
+                trusted_cli_actor=False,
+                target_user_id=ids["member"],
+                project_id=ids["backend"],
+                expected_project_generation=backend.project_generation,
+                role="operator",
+                expected_access_version=11,
+                account_generation=member.session_generation,
+            )
+        )
+    assert disabled_target.value.code == "target_disabled"
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE ui_users SET disabled = 0 WHERE id = ?",
+            (ids["member"],),
+        )
+        connection.commit()
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute(
+                "UPDATE ui_access_audit_events SET new_role = 'operator'"
+            )
+        connection.rollback()
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute("DELETE FROM ui_access_audit_events")
+        connection.rollback()
+
+    current, assignments = _run_database(_user_and_assignments("member"))
+    assert current.session_epoch == 11
+    assert [assignment.role for assignment in assignments] == ["viewer"]
+    assert len(_run_database(_access_audit_events())) == 1
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DELETE FROM ui_users WHERE id = ?", (ids["member"],))
+        connection.execute("DELETE FROM projects WHERE id = ?", (ids["backend"],))
+        connection.commit()
+        preserved_audit = connection.execute(
+            "SELECT target_username_snapshot, project_slug_snapshot "
+            "FROM ui_access_audit_events"
+        ).fetchall()
+    assert preserved_audit == [("member", "backend")]
+
+
+def test_mutators_reject_stale_identity_maps_and_implicit_cli_authority(
+    isolated_env,
+) -> None:
+    ids = _run_database(_seed_users_and_projects())
+    member, _assignments = _run_database(_user_and_assignments("member"))
+    admin, _assignments = _run_database(_user_and_assignments("admin"))
+    backend = _run_database(_project_by_id(ids["backend"]))
+    database_path = _database_path()
+
+    async def _stale_access_session() -> str:
+        await ensure_schema()
+        async with get_session() as session:
+            result = await session.execute(
+                select(UiUser).where(UiUser.id == ids["admin"])
+            )
+            cached_actor = result.scalars().one()
+            await session.commit()
+            assert cached_actor.role == webauth.ROLE_ADMIN
+            assert bool(session.identity_map)
+            with sqlite3.connect(database_path) as connection:
+                connection.execute(
+                    "UPDATE ui_users SET role = 'member', session_epoch = session_epoch + 1 "
+                    "WHERE id = ?",
+                    (ids["admin"],),
+                )
+                connection.commit()
+            with pytest.raises(UiAccessMutationError) as refused:
+                await mutate_ui_project_access(
+                    session,
+                    actor_user_id=ids["admin"],
+                    actor_account_generation=admin.session_generation,
+                    expected_actor_session_epoch=admin.session_epoch,
+                    trusted_cli_actor=False,
+                    target_user_id=ids["member"],
+                    project_id=ids["backend"],
+                    expected_project_generation=backend.project_generation,
+                    role="viewer",
+                    expected_access_version=member.session_epoch,
+                    account_generation=member.session_generation,
+                )
+            return refused.value.code
+
+    async def _stale_profile_session() -> str:
+        await ensure_schema()
+        async with get_session() as session:
+            result = await session.execute(
+                select(UiUser).where(UiUser.id == ids["member"])
+            )
+            cached_target = result.scalars().one()
+            await session.commit()
+            assert cached_target.display_name is None
+            assert bool(session.identity_map)
+            with pytest.raises(UiProfileMutationError) as refused:
+                await mutate_ui_user_display_name(
+                    session,
+                    target_user_id=ids["member"],
+                    account_generation=member.session_generation,
+                    expected_session_epoch=member.session_epoch,
+                    expected_profile_revision=member.profile_revision,
+                    display_name="Must not persist",
+                )
+            return refused.value.code
+
+    assert _run_database(_stale_access_session()) == "session_not_fresh"
+    assert _run_database(_stale_profile_session()) == "session_not_fresh"
+
+    with pytest.raises(UiAccessMutationError) as implicit_cli:
+        _run_database(
+            _mutate_access(
+                actor_user_id=None,
+                actor_account_generation=None,
+                expected_actor_session_epoch=None,
+                trusted_cli_actor=False,
+                target_user_id=ids["member"],
+                project_id=ids["backend"],
+                expected_project_generation=backend.project_generation,
+                role="viewer",
+                expected_access_version=member.session_epoch,
+                account_generation=member.session_generation,
+            )
+        )
+    assert implicit_cli.value.code == "actor_contract_invalid"
+    current, assignments = _run_database(_user_and_assignments("member"))
+    assert current.session_epoch == member.session_epoch
+    assert assignments == []
+    assert _run_database(_access_audit_events()) == []
+
+
+def test_web_actor_generation_and_epoch_are_authoritative_cas_inputs(
+    isolated_env,
+) -> None:
+    ids = _run_database(_seed_users_and_projects())
+    member, _assignments = _run_database(_user_and_assignments("member"))
+    admin, _assignments = _run_database(_user_and_assignments("admin"))
+    backend = _run_database(_project_by_id(ids["backend"]))
+    database_path = _database_path()
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE ui_users SET session_epoch = session_epoch + 1 WHERE id = ?",
+            (ids["admin"],),
+        )
+        connection.commit()
+    with pytest.raises(UiAccessMutationError) as stale_actor:
+        _run_database(
+            _mutate_access(
+                actor_user_id=ids["admin"],
+                actor_account_generation=admin.session_generation,
+                expected_actor_session_epoch=admin.session_epoch,
+                trusted_cli_actor=False,
+                target_user_id=ids["member"],
+                project_id=ids["backend"],
+                expected_project_generation=backend.project_generation,
+                role="viewer",
+                expected_access_version=member.session_epoch,
+                account_generation=member.session_generation,
+            )
+        )
+    assert stale_actor.value.code == "actor_session_epoch_conflict"
+
+    replacement_generation = "f" * 64
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DELETE FROM ui_users WHERE id = ?", (ids["admin"],))
+        connection.execute(
+            """
+            INSERT INTO ui_users (
+                id, username, password_hash, role, disabled, session_epoch,
+                session_generation, display_name, profile_revision,
+                preferred_ui_locale, preferred_correspondence_locale,
+                created_ts, last_login_ts
+            ) VALUES (?, 'recreated-admin', 'unused', 'admin', 0, 20, ?, NULL, 1,
+                      'en', NULL, CURRENT_TIMESTAMP, NULL)
+            """,
+            (ids["admin"], replacement_generation),
+        )
+        connection.commit()
+    with pytest.raises(UiAccessMutationError) as recreated_actor:
+        _run_database(
+            _mutate_access(
+                actor_user_id=ids["admin"],
+                actor_account_generation=admin.session_generation,
+                expected_actor_session_epoch=admin.session_epoch,
+                trusted_cli_actor=False,
+                target_user_id=ids["member"],
+                project_id=ids["backend"],
+                expected_project_generation=backend.project_generation,
+                role="viewer",
+                expected_access_version=member.session_epoch,
+                account_generation=member.session_generation,
+            )
+        )
+    assert recreated_actor.value.code == "actor_recreated"
+    assert _run_database(_access_audit_events()) == []
+
+
+def test_project_generation_migrates_and_is_immutable(isolated_env) -> None:
+    database_path = _database_path()
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug VARCHAR(255) NOT NULL,
+                human_key VARCHAR(255) NOT NULL,
+                created_at DATETIME NOT NULL,
+                archived_at DATETIME
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO projects (id, slug, human_key, created_at) "
+            "VALUES (1, 'legacy', '/legacy', CURRENT_TIMESTAMP)"
+        )
+        connection.commit()
+
+    _run_database(ensure_schema())
+    with sqlite3.connect(database_path) as connection:
+        migrated_generation = connection.execute(
+            "SELECT project_generation FROM projects WHERE id = 1"
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO projects (id, slug, human_key, created_at) "
+            "VALUES (2, 'raw-after-migration', '/raw', CURRENT_TIMESTAMP)"
+        )
+        connection.commit()
+        raw_generation = connection.execute(
+            "SELECT project_generation FROM projects WHERE id = 2"
+        ).fetchone()[0]
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute(
+                "UPDATE projects SET project_generation = ? WHERE id = 1",
+                ("a" * 64,),
+            )
+        connection.rollback()
+
+    _run_database(ensure_schema())
+    with sqlite3.connect(database_path) as connection:
+        migrated_again = connection.execute(
+            "SELECT project_generation FROM projects WHERE id = 1"
+        ).fetchone()[0]
+    assert isinstance(migrated_generation, str) and len(migrated_generation) == 64
+    assert isinstance(raw_generation, str) and len(raw_generation) == 64
+    assert raw_generation != migrated_generation
+    assert migrated_again == migrated_generation
+
+
+def test_project_delete_recreate_same_id_rejects_stale_assignment_request(
+    isolated_env,
+) -> None:
+    ids = _run_database(_seed_users_and_projects())
+    member, _assignments = _run_database(_user_and_assignments("member"))
+    backend = _run_database(_project_by_id(ids["backend"]))
+    database_path = _database_path()
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DELETE FROM projects WHERE id = ?", (ids["backend"],))
+        connection.execute(
+            "INSERT INTO projects (id, slug, human_key, created_at) "
+            "VALUES (?, 'backend-recreated', '/example/recreated', CURRENT_TIMESTAMP)",
+            (ids["backend"],),
+        )
+        connection.commit()
+        replacement_generation = connection.execute(
+            "SELECT project_generation FROM projects WHERE id = ?",
+            (ids["backend"],),
+        ).fetchone()[0]
+    assert replacement_generation != backend.project_generation
+
+    with pytest.raises(UiAccessMutationError) as stale_project:
+        _run_database(
+            _mutate_access(
+                actor_user_id=None,
+                actor_account_generation=None,
+                expected_actor_session_epoch=None,
+                trusted_cli_actor=True,
+                target_user_id=ids["member"],
+                project_id=ids["backend"],
+                expected_project_generation=backend.project_generation,
+                role="viewer",
+                expected_access_version=member.session_epoch,
+                account_generation=member.session_generation,
+            )
+        )
+    assert stale_project.value.code == "project_recreated"
+    current, assignments = _run_database(_user_and_assignments("member"))
+    assert current.session_epoch == member.session_epoch
+    assert assignments == []
+    assert _run_database(_access_audit_events()) == []
+
+
+def test_audit_rejects_replace_with_recursive_triggers_off_and_rolls_back(
+    isolated_env,
+) -> None:
+    ids = _run_database(_seed_users_and_projects())
+    member, _assignments = _run_database(_user_and_assignments("member"))
+    admin, _assignments = _run_database(_user_and_assignments("admin"))
+    backend = _run_database(_project_by_id(ids["backend"]))
+
+    granted = _run_database(
+        _mutate_access(
+            actor_user_id=ids["admin"],
+            actor_account_generation=admin.session_generation,
+            expected_actor_session_epoch=admin.session_epoch,
+            trusted_cli_actor=False,
+            target_user_id=ids["member"],
+            project_id=ids["backend"],
+            expected_project_generation=backend.project_generation,
+            role="viewer",
+            expected_access_version=member.session_epoch,
+            account_generation=member.session_generation,
+        )
+    )
+    assert granted.access_version == 11
+    audit_event = _run_database(_access_audit_events())[0]
+    assert audit_event.id is not None
+
+    database_path = _database_path()
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA recursive_triggers=OFF")
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute(
+                "UPDATE ui_access_audit_events SET new_role = 'operator' WHERE id = ?",
+                (audit_event.id,),
+            )
+        connection.rollback()
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute(
+                "DELETE FROM ui_access_audit_events WHERE id = ?",
+                (audit_event.id,),
+            )
+        connection.rollback()
+        with pytest.raises(sqlite3.IntegrityError, match="id collision"):
+            connection.execute(
+                "INSERT OR REPLACE INTO ui_access_audit_events "
+                "SELECT * FROM ui_access_audit_events WHERE id = ?",
+                (audit_event.id,),
+            )
+        connection.rollback()
+        with pytest.raises(sqlite3.IntegrityError, match="id collision"):
+            connection.execute(
+                "REPLACE INTO ui_access_audit_events "
+                "SELECT * FROM ui_access_audit_events WHERE id = ?",
+                (audit_event.id,),
+            )
+        connection.rollback()
+        preserved = connection.execute(
+            "SELECT old_role, new_role, target_epoch_before, target_epoch_after "
+            "FROM ui_access_audit_events WHERE id = ?",
+            (audit_event.id,),
+        ).fetchone()
+        connection.execute(
+            """
+            CREATE TRIGGER force_test_audit_failure
+            BEFORE INSERT ON ui_access_audit_events
+            BEGIN
+                SELECT RAISE(ABORT, 'forced audit failure');
+            END
+            """
+        )
+        connection.commit()
+    assert preserved == (None, "viewer", 10, 11)
+
+    with pytest.raises(SAIntegrityError, match="forced audit failure"):
+        _run_database(
+            _mutate_access(
+                actor_user_id=ids["admin"],
+                actor_account_generation=admin.session_generation,
+                expected_actor_session_epoch=admin.session_epoch,
+                trusted_cli_actor=False,
+                target_user_id=ids["member"],
+                project_id=ids["backend"],
+                expected_project_generation=backend.project_generation,
+                role="operator",
+                expected_access_version=11,
+                account_generation=member.session_generation,
+            )
+        )
+    current, assignments = _run_database(_user_and_assignments("member"))
+    assert current.session_epoch == 11
+    assert [assignment.role for assignment in assignments] == ["viewer"]
+    assert len(_run_database(_access_audit_events())) == 1
+
+
+def test_profile_compare_and_swap_serializes_concurrent_writers(isolated_env) -> None:
+    ids = _run_database(_seed_users_and_projects())
+    member, _assignments = _run_database(_user_and_assignments("member"))
+
+    async def _race() -> tuple[
+        UiProfileMutationResult | UiProfileMutationError,
+        UiProfileMutationResult | UiProfileMutationError,
+    ]:
+        await ensure_schema()
+
+        async def _writer(
+            display_name: str,
+        ) -> UiProfileMutationResult | UiProfileMutationError:
+            async with get_session() as session:
+                try:
+                    return await mutate_ui_user_display_name(
+                        session,
+                        target_user_id=ids["member"],
+                        account_generation=member.session_generation,
+                        expected_session_epoch=member.session_epoch,
+                        expected_profile_revision=member.profile_revision,
+                        display_name=display_name,
+                    )
+                except UiProfileMutationError as exc:
+                    return exc
+
+        return await asyncio.gather(_writer("Alice"), _writer("Alicja"))
+
+    outcomes = _run_database(_race())
+    successes = [outcome for outcome in outcomes if isinstance(outcome, UiProfileMutationResult)]
+    failures = [outcome for outcome in outcomes if isinstance(outcome, UiProfileMutationError)]
+    assert len(successes) == 1
+    assert successes[0].changed
+    assert successes[0].profile_revision == 2
+    assert len(failures) == 1
+    assert failures[0].code == "profile_revision_conflict"
+    current, _assignments = _run_database(_user_and_assignments("member"))
+    assert current.display_name == successes[0].display_name
+    assert current.profile_revision == 2
+    assert current.session_epoch == member.session_epoch
 
 
 def test_admin_project_grant_is_refused_as_redundant(isolated_env) -> None:

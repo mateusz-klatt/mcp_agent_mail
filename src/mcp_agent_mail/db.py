@@ -457,6 +457,12 @@ def _build_engine(settings: DatabaseSettings) -> AsyncEngine:
                 # This is particularly helpful for read-heavy workloads
                 cursor.execute("PRAGMA mmap_size=268435456")
 
+                # REPLACE normally suppresses its implicit DELETE triggers when
+                # recursion is disabled. Audit rows also have a BEFORE INSERT
+                # collision guard, but enabling recursion closes that SQLite
+                # escape hatch for every trigger-backed invariant.
+                cursor.execute("PRAGMA recursive_triggers=ON")
+
             finally:
                 cursor.close()
 
@@ -948,6 +954,7 @@ def _setup_fts(connection: Any) -> None:
     # SQLite ALTER TABLE ADD COLUMN is idempotent-safe via try/except.
     for migration_sql in [
         "ALTER TABLE agents ADD COLUMN retired_at DATETIME DEFAULT NULL",
+        "ALTER TABLE projects ADD COLUMN project_generation VARCHAR(64) DEFAULT NULL",
         "ALTER TABLE projects ADD COLUMN archived_at DATETIME DEFAULT NULL",
         "ALTER TABLE agents ADD COLUMN registration_token VARCHAR(64) DEFAULT NULL",
         "ALTER TABLE messages ADD COLUMN topic VARCHAR(64) DEFAULT NULL",
@@ -960,8 +967,16 @@ def _setup_fts(connection: Any) -> None:
         "ALTER TABLE agents ADD COLUMN display_name VARCHAR(128) DEFAULT NULL",
         "ALTER TABLE agents ADD COLUMN notify_sound VARCHAR(32) DEFAULT NULL",
         "ALTER TABLE ui_users ADD COLUMN session_generation VARCHAR(64) DEFAULT NULL",
+        "ALTER TABLE ui_users ADD COLUMN display_name VARCHAR(128) DEFAULT NULL",
+        "ALTER TABLE ui_users ADD COLUMN profile_revision INTEGER NOT NULL DEFAULT 1",
         "ALTER TABLE ui_users ADD COLUMN preferred_ui_locale VARCHAR(2) NOT NULL DEFAULT 'en'",
         "ALTER TABLE ui_users ADD COLUMN preferred_correspondence_locale VARCHAR(2) DEFAULT NULL",
+        "ALTER TABLE ui_access_audit_events ADD COLUMN "
+        "actor_account_generation_snapshot VARCHAR(64) DEFAULT NULL",
+        "ALTER TABLE ui_access_audit_events ADD COLUMN "
+        "actor_session_epoch_snapshot INTEGER DEFAULT NULL",
+        "ALTER TABLE ui_access_audit_events ADD COLUMN "
+        "project_generation_snapshot VARCHAR(64) DEFAULT NULL",
     ]:
         with suppress(Exception):  # Column already exists — safe to ignore
             connection.exec_driver_sql(migration_sql)
@@ -972,6 +987,10 @@ def _setup_fts(connection: Any) -> None:
         "CREATE INDEX IF NOT EXISTS ix_agents_registration_token ON agents (registration_token)",
         "CREATE INDEX IF NOT EXISTS idx_messages_project_topic ON messages (project_id, topic)",
         "CREATE INDEX IF NOT EXISTS ix_messages_reply_to ON messages (reply_to)",
+        "CREATE INDEX IF NOT EXISTS idx_ui_access_audit_target_created "
+        "ON ui_access_audit_events (target_user_id, created_ts)",
+        "CREATE INDEX IF NOT EXISTS idx_ui_access_audit_project_created "
+        "ON ui_access_audit_events (project_id, created_ts)",
     ]:
         connection.exec_driver_sql(index_sql)
 
@@ -1014,6 +1033,32 @@ def _setup_fts(connection: Any) -> None:
     )
     connection.exec_driver_sql(
         """
+        CREATE TRIGGER IF NOT EXISTS ui_users_profile_guard_bi
+        BEFORE INSERT ON ui_users
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid display_name')
+            WHERE new.display_name IS NOT NULL
+              AND (length(trim(new.display_name)) = 0 OR length(new.display_name) > 128);
+            SELECT RAISE(ABORT, 'invalid profile_revision')
+            WHERE new.profile_revision < 1;
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS ui_users_profile_guard_bu
+        BEFORE UPDATE OF display_name, profile_revision ON ui_users
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid display_name')
+            WHERE new.display_name IS NOT NULL
+              AND (length(trim(new.display_name)) = 0 OR length(new.display_name) > 128);
+            SELECT RAISE(ABORT, 'invalid profile_revision')
+            WHERE new.profile_revision < 1;
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
         CREATE TRIGGER IF NOT EXISTS ui_users_locale_guard_bu
         BEFORE UPDATE OF preferred_ui_locale, preferred_correspondence_locale ON ui_users
         BEGIN
@@ -1038,6 +1083,61 @@ def _setup_fts(connection: Any) -> None:
             "UPDATE ui_users SET session_generation = ? WHERE id = ?",
             (secrets.token_hex(32), int(generation_row[0])),
         )
+    project_generation_rows = connection.exec_driver_sql(
+        """
+        SELECT id
+        FROM projects
+        WHERE project_generation IS NULL OR trim(project_generation) = ''
+        """
+    ).fetchall()
+    for project_generation_row in project_generation_rows:
+        connection.exec_driver_sql(
+            "UPDATE projects SET project_generation = ? WHERE id = ?",
+            (secrets.token_hex(32), int(project_generation_row[0])),
+        )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS projects_generation_guard_bi
+        BEFORE INSERT ON projects
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid project_generation')
+            WHERE new.project_generation IS NOT NULL
+              AND trim(new.project_generation) != ''
+              AND (
+                  length(new.project_generation) != 64
+                  OR new.project_generation GLOB '*[^0-9a-f]*'
+              );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS projects_generation_guard_bu
+        BEFORE UPDATE OF project_generation ON projects
+        WHEN old.project_generation IS NOT new.project_generation
+        BEGIN
+            SELECT RAISE(ABORT, 'project_generation is immutable')
+            WHERE old.project_generation IS NOT NULL
+              AND trim(old.project_generation) != '';
+            SELECT RAISE(ABORT, 'invalid project_generation')
+            WHERE new.project_generation IS NULL
+               OR length(new.project_generation) != 64
+               OR new.project_generation GLOB '*[^0-9a-f]*';
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS projects_generation_ai
+        AFTER INSERT ON projects
+        WHEN new.project_generation IS NULL OR trim(new.project_generation) = ''
+        BEGIN
+            UPDATE projects
+            SET project_generation = lower(hex(randomblob(32)))
+            WHERE id = new.id;
+        END
+        """
+    )
     connection.exec_driver_sql(
         """
         CREATE TRIGGER IF NOT EXISTS ui_project_assignments_user_ad
@@ -1077,6 +1177,73 @@ def _setup_fts(connection: Any) -> None:
         AFTER DELETE ON projects
         BEGIN
             DELETE FROM ui_project_assignments WHERE project_id = old.id;
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS ui_access_audit_events_guard_bi
+        BEFORE INSERT ON ui_access_audit_events
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid old project role')
+            WHERE new.old_role IS NOT NULL
+              AND new.old_role NOT IN ('viewer', 'operator');
+            SELECT RAISE(ABORT, 'invalid new project role')
+            WHERE new.new_role IS NOT NULL
+              AND new.new_role NOT IN ('viewer', 'operator');
+            SELECT RAISE(ABORT, 'access audit requires an effective change')
+            WHERE new.old_role IS new.new_role;
+            SELECT RAISE(ABORT, 'invalid access epoch step')
+            WHERE new.target_epoch_after != new.target_epoch_before + 1;
+            SELECT RAISE(ABORT, 'invalid target account generation snapshot')
+            WHERE length(new.target_account_generation) != 64;
+            SELECT RAISE(ABORT, 'invalid project generation snapshot')
+            WHERE length(new.project_generation_snapshot) != 64;
+            SELECT RAISE(ABORT, 'invalid actor provenance snapshot')
+            WHERE NOT (
+                (
+                    new.actor_user_id IS NULL
+                    AND new.actor_account_generation_snapshot IS NULL
+                    AND new.actor_session_epoch_snapshot IS NULL
+                )
+                OR (
+                    new.actor_user_id IS NOT NULL
+                    AND length(new.actor_account_generation_snapshot) = 64
+                    AND new.actor_session_epoch_snapshot >= 1
+                )
+            );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS ui_access_audit_events_immutable_bi
+        BEFORE INSERT ON ui_access_audit_events
+        BEGIN
+            SELECT RAISE(ABORT, 'ui_access_audit_events id collision is immutable')
+            WHERE EXISTS (
+                SELECT 1
+                FROM ui_access_audit_events
+                WHERE id = new.id
+            );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS ui_access_audit_events_immutable_bu
+        BEFORE UPDATE ON ui_access_audit_events
+        BEGIN
+            SELECT RAISE(ABORT, 'ui_access_audit_events are immutable');
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS ui_access_audit_events_immutable_bd
+        BEFORE DELETE ON ui_access_audit_events
+        BEGIN
+            SELECT RAISE(ABORT, 'ui_access_audit_events are immutable');
         END
         """
     )

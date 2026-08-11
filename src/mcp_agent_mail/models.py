@@ -6,7 +6,7 @@ import secrets
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import CheckConstraint, Column, Index, String, UniqueConstraint
+from sqlalchemy import CheckConstraint, Column, Index, Integer, String, UniqueConstraint, text
 from sqlalchemy.types import JSON
 from sqlmodel import Field, SQLModel
 
@@ -26,12 +26,25 @@ def _new_session_generation() -> str:
     return secrets.token_hex(32)
 
 
+def _new_project_generation() -> str:
+    """Return an unpredictable identifier for one project-row lifetime."""
+    return secrets.token_hex(32)
+
+
 class Project(SQLModel, table=True):
     __tablename__ = "projects"
 
     id: Optional[int] = Field(default=None, primary_key=True)
     slug: str = Field(index=True, unique=True, max_length=255)
     human_key: str = Field(max_length=255, index=True)
+    project_generation: str = Field(
+        default_factory=_new_project_generation,
+        sa_column=Column(
+            String(64),
+            nullable=False,
+            server_default=text("(lower(hex(randomblob(32))))"),
+        ),
+    )
     created_at: datetime = Field(default_factory=_utcnow_naive)
     archived_at: Optional[datetime] = Field(default=None)
 
@@ -245,6 +258,15 @@ class UiUser(SQLModel, table=True):
     __tablename__ = "ui_users"
     __table_args__ = (
         CheckConstraint(
+            "display_name IS NULL OR (length(trim(display_name)) > 0 "
+            "AND length(display_name) <= 128)",
+            name="ck_ui_users_display_name",
+        ),
+        CheckConstraint(
+            "profile_revision >= 1",
+            name="ck_ui_users_profile_revision",
+        ),
+        CheckConstraint(
             "preferred_ui_locale IN ('en', 'pl')",
             name="ck_ui_users_preferred_ui_locale",
         ),
@@ -262,6 +284,14 @@ class UiUser(SQLModel, table=True):
     disabled: bool = Field(default=False)
     session_epoch: int = Field(default=1)
     session_generation: str = Field(default_factory=_new_session_generation, max_length=64)
+    display_name: Optional[str] = Field(
+        default=None,
+        sa_column=Column(String(128), nullable=True),
+    )
+    profile_revision: int = Field(
+        default=1,
+        sa_column=Column(Integer, nullable=False, server_default="1"),
+    )
     preferred_ui_locale: str = Field(
         default="en",
         sa_column=Column(String(2), nullable=False, server_default="en"),
@@ -302,6 +332,80 @@ class UiProjectAssignment(SQLModel, table=True):
     role: str = Field(default="viewer", max_length=16)
     created_ts: datetime = Field(default_factory=_utcnow_naive)
     updated_ts: datetime = Field(default_factory=_utcnow_naive)
+
+
+class UiAccessAuditEvent(SQLModel, table=True):
+    """Immutable record of one effective human project-access change.
+
+    The identifiers deliberately are snapshots rather than foreign keys. An
+    administrator may later remove an account or archive/delete a project, but
+    those lifecycle operations must never erase or rewrite the security audit.
+    The account generation distinguishes a recreated username from its previous
+    lifetime even if SQLite reuses the numeric primary key.
+    """
+
+    __tablename__ = "ui_access_audit_events"
+    __table_args__ = (
+        CheckConstraint(
+            "old_role IS NULL OR old_role IN ('viewer', 'operator')",
+            name="ck_ui_access_audit_old_role",
+        ),
+        CheckConstraint(
+            "new_role IS NULL OR new_role IN ('viewer', 'operator')",
+            name="ck_ui_access_audit_new_role",
+        ),
+        CheckConstraint(
+            "old_role IS NOT new_role",
+            name="ck_ui_access_audit_effective_change",
+        ),
+        CheckConstraint(
+            "target_epoch_after = target_epoch_before + 1",
+            name="ck_ui_access_audit_epoch_step",
+        ),
+        CheckConstraint(
+            "length(target_account_generation) = 64",
+            name="ck_ui_access_audit_target_generation",
+        ),
+        CheckConstraint(
+            "length(project_generation_snapshot) = 64",
+            name="ck_ui_access_audit_project_generation",
+        ),
+        CheckConstraint(
+            "(actor_user_id IS NULL AND actor_account_generation_snapshot IS NULL "
+            "AND actor_session_epoch_snapshot IS NULL) OR "
+            "(actor_user_id IS NOT NULL "
+            "AND length(actor_account_generation_snapshot) = 64 "
+            "AND actor_session_epoch_snapshot >= 1)",
+            name="ck_ui_access_audit_actor_provenance",
+        ),
+        Index(
+            "idx_ui_access_audit_target_created",
+            "target_user_id",
+            "created_ts",
+        ),
+        Index(
+            "idx_ui_access_audit_project_created",
+            "project_id",
+            "created_ts",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    actor_user_id: Optional[int] = Field(default=None, index=True)
+    actor_username_snapshot: str = Field(max_length=64)
+    actor_account_generation_snapshot: Optional[str] = Field(default=None, max_length=64)
+    actor_session_epoch_snapshot: Optional[int] = Field(default=None)
+    target_user_id: int = Field(index=True)
+    target_username_snapshot: str = Field(max_length=64)
+    target_account_generation: str = Field(max_length=64)
+    project_id: int = Field(index=True)
+    project_slug_snapshot: str = Field(max_length=255)
+    project_generation_snapshot: str = Field(max_length=64)
+    old_role: Optional[str] = Field(default=None, max_length=16)
+    new_role: Optional[str] = Field(default=None, max_length=16)
+    target_epoch_before: int
+    target_epoch_after: int
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
 
 
 class ProjectSiblingSuggestion(SQLModel, table=True):

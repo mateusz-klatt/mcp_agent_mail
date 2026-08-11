@@ -886,10 +886,8 @@ def ui_users_grant(
     role: str = typer.Option("viewer", "--role", "-r", help="Project role: viewer or operator"),
 ) -> None:
     """Grant or replace one member's explicit project role."""
-    from sqlmodel import select
-
-    from .db import ensure_schema, get_immediate_session
-    from .models import UiProjectAssignment
+    from .db import ensure_schema, get_session
+    from .ui_access import UiAccessMutationError, mutate_ui_project_access
     from .webauth import (
         PROJECT_ROLES,
         ROLE_ADMIN,
@@ -898,7 +896,8 @@ def ui_users_grant(
         normalize_ui_user_role,
     )
 
-    if role not in PROJECT_ROLES:
+    normalized_role = normalize_project_role(role)
+    if normalized_role is None:
         typer.secho(
             f"Invalid project role {role!r}; use one of: {', '.join(PROJECT_ROLES)}",
             fg="red",
@@ -907,7 +906,7 @@ def ui_users_grant(
 
     async def _grant() -> tuple[str, str | None]:
         await ensure_schema()
-        async with get_immediate_session() as session:
+        async with get_session() as session:
             user = await _ui_users_find_user(session, username)
             if user is None or user.id is None:
                 return "user_not_found", None
@@ -921,34 +920,37 @@ def ui_users_grant(
                 return "project_ambiguous", ", ".join(ambiguous_projects)
             if project_row is None or project_row.id is None:
                 return "project_not_found", None
-            result = await session.execute(
-                select(UiProjectAssignment).where(
-                    UiProjectAssignment.user_id == user.id,
-                    UiProjectAssignment.project_id == project_row.id,
-                )
-            )
-            assignment = result.scalars().first()
-            if assignment is not None and normalize_project_role(assignment.role) == role:
-                return "unchanged", project_row.slug
-            now = datetime.now(timezone.utc).replace(tzinfo=None)
-            if assignment is None:
-                assignment = UiProjectAssignment(
-                    user_id=user.id,
-                    project_id=project_row.id,
-                    role=role,
-                    created_ts=now,
-                    updated_ts=now,
-                )
-            else:
-                assignment.role = role
-                assignment.updated_ts = now
-            user.session_epoch = user.session_epoch + 1
-            session.add(assignment)
-            session.add(user)
-            await session.commit()
-            return "granted", project_row.slug
+            user_id = int(user.id)
+            project_id = int(project_row.id)
+            account_generation = str(user.session_generation)
+            access_version = int(user.session_epoch)
+            project_slug = str(project_row.slug)
+            project_generation = str(project_row.project_generation)
 
-    outcome, project_slug = _run_async(_grant())
+        async with get_session() as session:
+            result = await mutate_ui_project_access(
+                session,
+                actor_user_id=None,
+                actor_account_generation=None,
+                expected_actor_session_epoch=None,
+                trusted_cli_actor=True,
+                target_user_id=user_id,
+                project_id=project_id,
+                expected_project_generation=project_generation,
+                role=normalized_role,
+                expected_access_version=access_version,
+                account_generation=account_generation,
+            )
+        return ("granted" if result.changed else "unchanged"), project_slug
+
+    try:
+        outcome, project_slug = _run_async(_grant())
+    except UiAccessMutationError as exc:
+        typer.secho(
+            f"Refused: access state changed or is not eligible ({exc.code}). Retry after listing it.",
+            fg="red",
+        )
+        raise typer.Exit(code=1) from exc
     if outcome == "user_not_found":
         typer.secho(f"No such user {username!r}", fg="red")
         raise typer.Exit(code=1)
@@ -975,12 +977,12 @@ def ui_users_grant(
         raise typer.Exit(code=1)
     if outcome == "unchanged":
         typer.echo(
-            f"{username!r} already has {role!r} access to project {project_slug!r}; "
+            f"{username!r} already has {normalized_role!r} access to project {project_slug!r}; "
             "no sessions were invalidated."
         )
         return
     typer.secho(
-        f"Granted {role!r} access to project {project_slug!r} for {username!r}.",
+        f"Granted {normalized_role!r} access to project {project_slug!r} for {username!r}.",
         fg="green",
     )
     typer.echo("Existing browser sessions for this user were invalidated.")
@@ -992,15 +994,13 @@ def ui_users_revoke(
     project: str = typer.Argument(..., help="Project slug, human key, or repository path"),
 ) -> None:
     """Revoke one member's explicit access to a project."""
-    from sqlmodel import select
-
-    from .db import ensure_schema, get_immediate_session
-    from .models import UiProjectAssignment
+    from .db import ensure_schema, get_session
+    from .ui_access import UiAccessMutationError, mutate_ui_project_access
     from .webauth import ROLE_ADMIN, ROLE_MEMBER, normalize_ui_user_role
 
     async def _revoke() -> tuple[str, str | None]:
         await ensure_schema()
-        async with get_immediate_session() as session:
+        async with get_session() as session:
             user = await _ui_users_find_user(session, username)
             if user is None or user.id is None:
                 return "user_not_found", None
@@ -1014,22 +1014,37 @@ def ui_users_revoke(
                 return "project_ambiguous", ", ".join(ambiguous_projects)
             if project_row is None or project_row.id is None:
                 return "project_not_found", None
-            result = await session.execute(
-                select(UiProjectAssignment).where(
-                    UiProjectAssignment.user_id == user.id,
-                    UiProjectAssignment.project_id == project_row.id,
-                )
-            )
-            assignment = result.scalars().first()
-            if assignment is None:
-                return "unchanged", project_row.slug
-            await session.delete(assignment)
-            user.session_epoch = user.session_epoch + 1
-            session.add(user)
-            await session.commit()
-            return "revoked", project_row.slug
+            user_id = int(user.id)
+            project_id = int(project_row.id)
+            account_generation = str(user.session_generation)
+            access_version = int(user.session_epoch)
+            project_slug = str(project_row.slug)
+            project_generation = str(project_row.project_generation)
 
-    outcome, project_slug = _run_async(_revoke())
+        async with get_session() as session:
+            result = await mutate_ui_project_access(
+                session,
+                actor_user_id=None,
+                actor_account_generation=None,
+                expected_actor_session_epoch=None,
+                trusted_cli_actor=True,
+                target_user_id=user_id,
+                project_id=project_id,
+                expected_project_generation=project_generation,
+                role=None,
+                expected_access_version=access_version,
+                account_generation=account_generation,
+            )
+        return ("revoked" if result.changed else "unchanged"), project_slug
+
+    try:
+        outcome, project_slug = _run_async(_revoke())
+    except UiAccessMutationError as exc:
+        typer.secho(
+            f"Refused: access state changed or is not eligible ({exc.code}). Retry after listing it.",
+            fg="red",
+        )
+        raise typer.Exit(code=1) from exc
     if outcome == "user_not_found":
         typer.secho(f"No such user {username!r}", fg="red")
         raise typer.Exit(code=1)

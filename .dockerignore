@@ -16,6 +16,9 @@ env/
 htmlcov/
 .tox/
 *.cover
+ui/node_modules/
+ui/dist/
+ui/coverage/
 
 # Development
 .git/

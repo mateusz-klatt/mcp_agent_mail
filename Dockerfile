@@ -65,7 +65,26 @@ RUN git init -q /build/toon_rust && \
     strip /tru
 
 # --------------------------------------------------------------------------
-# Stage 2: Python application runtime.
+# Stage 2: build the React mail viewer.
+#
+# Node and npm are intentionally confined to this builder. The final runtime
+# receives only Vite's static output and remains a Python-only image.
+# --------------------------------------------------------------------------
+FROM node:22.22.2-bookworm-slim AS ui-builder
+
+WORKDIR /ui
+
+# Install the exact locked dependency graph before copying application sources
+# so dependency installation remains cacheable across frontend-only edits.
+COPY ui/package*.json ./
+RUN npm ci --ignore-scripts
+
+COPY ui/eslint.config.js ui/index.html ui/tsconfig.json ui/vite.config.ts ./
+COPY ui/src ./src
+RUN npm run build
+
+# --------------------------------------------------------------------------
+# Stage 3: Python application runtime.
 # --------------------------------------------------------------------------
 FROM python:3.14-slim AS base
 
@@ -100,6 +119,10 @@ RUN uv sync --no-dev --no-install-project
 # Copy source, then install the project itself now that src/ exists.
 COPY src ./src
 RUN uv sync --no-dev
+
+# Copy the frontend only after the Python project has been installed, so no
+# source-copy or project-install step can replace the production assets.
+COPY --from=ui-builder /ui/dist ./src/mcp_agent_mail/ui_dist
 
 # Defaults suitable for container
 ENV HTTP_HOST=0.0.0.0 \

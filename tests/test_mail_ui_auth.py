@@ -39,6 +39,13 @@ from mcp_agent_mail.http import build_http_app
 
 BEARER = "mail-ui-gate-bearer"
 SECRET = "mail-ui-gate-session-secret-0123456789"
+EXPECTED_FAVICON_SVG = (
+    b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">\n'
+    b'  <rect width="64" height="64" rx="14" fill="#12242c"/>\n'
+    b'  <path d="M17 14h9v14h12V14h9v36h-9V36H26v14h-9z" fill="#f4cf8a"/>\n'
+    b"</svg>\n"
+)
+FAVICON_LINK = '<link rel="icon" href="/favicon.ico" type="image/svg+xml" sizes="any" />'
 
 # A route the gate protects and that renders without any project existing, so a
 # failure here is the gate's answer and not a missing fixture.
@@ -151,6 +158,225 @@ class TestMailUiGate:
         response = await _get(app, "/mail/login")
 
         assert response.status_code != 401
+
+
+class TestPublicRootAndFavicon:
+    """The two public entry points stay narrow and outside transport auth."""
+
+    @pytest.mark.asyncio
+    async def test_get_and_head_are_public_for_anonymous_bearer_and_jwt(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        settings, app = _build(
+            monkeypatch,
+            MAIL_UI_SESSION_SECRET=SECRET,
+            HTTP_PATH="/api/",
+            HTTP_JWT_ENABLED="true",
+            HTTP_JWT_ALGORITHMS="HS256",
+            HTTP_JWT_SECRET="public-entrypoint-jwt-secret",
+        )
+        jwt_token = jwt.encode(
+            {"alg": "HS256"},
+            {"sub": "favicon-client", settings.http.jwt_role_claim: "reader"},
+            settings.http.jwt_secret,
+        ).decode("utf-8")
+        callers = {
+            "anonymous": {},
+            "static-bearer": {"Authorization": f"Bearer {BEARER}"},
+            "jwt": {"Authorization": f"Bearer {jwt_token}"},
+        }
+        raw_query = "next=%2Fmail%2Fv2%2Fsettings&plus=a+b&empty=&flag"
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            for caller, headers in callers.items():
+                root = await client.get(f"/?{raw_query}", headers=headers)
+                root_head = await client.head(f"/?{raw_query}", headers=headers)
+                favicon = await client.get("/favicon.ico", headers=headers)
+                favicon_head = await client.head("/favicon.ico", headers=headers)
+
+                expected_root_headers = {
+                    "cache-control": "no-store",
+                    "location": f"/mail/v2/?{raw_query}",
+                    "content-length": "0",
+                }
+                assert root.status_code == 307, caller
+                assert dict(root.headers) == expected_root_headers, caller
+                assert root.content == b"", caller
+                assert root_head.status_code == 307, caller
+                assert dict(root_head.headers) == expected_root_headers, caller
+                assert root_head.content == b"", caller
+
+                expected_favicon_headers = {
+                    "cache-control": "public, max-age=86400",
+                    "content-length": str(len(EXPECTED_FAVICON_SVG)),
+                    "x-content-type-options": "nosniff",
+                    "content-type": "image/svg+xml",
+                }
+                assert favicon.status_code == 200, caller
+                assert dict(favicon.headers) == expected_favicon_headers, caller
+                assert favicon.content == EXPECTED_FAVICON_SVG, caller
+                assert favicon_head.status_code == 200, caller
+                assert dict(favicon_head.headers) == expected_favicon_headers, caller
+                assert favicon_head.content == b"", caller
+
+        passive_svg = EXPECTED_FAVICON_SVG.lower()
+        for active_fragment in (
+            b"<script",
+            b"javascript:",
+            b"onload=",
+            b"onclick=",
+            b"href=",
+            b"<foreignobject",
+            b"<animate",
+            b"<set",
+        ):
+            assert active_fragment not in passive_svg
+
+    @pytest.mark.asyncio
+    async def test_other_methods_and_nearby_paths_still_require_transport_auth(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        _settings, app = _build(
+            monkeypatch,
+            MAIL_UI_SESSION_SECRET=SECRET,
+            HTTP_PATH="/api/",
+        )
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            root_post = await client.post("/")
+            favicon_post = await client.post("/favicon.ico")
+            favicon_directory = await client.get("/favicon.ico/")
+
+        for response in (root_post, favicon_post, favicon_directory):
+            assert response.status_code == 401
+            assert response.json() == {"detail": "Unauthorized"}
+            assert "location" not in response.headers
+
+    @pytest.mark.asyncio
+    async def test_api_and_mcp_aliases_keep_their_existing_auth_boundary(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        settings, app = _build(
+            monkeypatch,
+            MAIL_UI_SESSION_SECRET=SECRET,
+            HTTP_PATH="/api/",
+            HTTP_JWT_ENABLED="true",
+            HTTP_JWT_ALGORITHMS="HS256",
+            HTTP_JWT_SECRET="transport-boundary-jwt-secret",
+        )
+        jwt_token = jwt.encode(
+            {"alg": "HS256"},
+            {"sub": "transport-client", settings.http.jwt_role_claim: "reader"},
+            settings.http.jwt_secret,
+        ).decode("utf-8")
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": "public-entrypoint-auth-check",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "root-favicon-test", "version": "1.0"},
+            },
+        }
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            for path in ("/api/", "/mcp/"):
+                anonymous = await client.post(path, json=initialize)
+                assert anonymous.status_code == 401, path
+                assert anonymous.json() == {"detail": "Unauthorized"}, path
+
+                for headers in (
+                    {"Authorization": f"Bearer {BEARER}"},
+                    {"Authorization": f"Bearer {jwt_token}"},
+                ):
+                    authenticated = await client.post(path, headers=headers, json=initialize)
+                    assert authenticated.status_code == 200, (path, authenticated.text)
+
+    @pytest.mark.parametrize("configured_path", ["/", "////"])
+    @pytest.mark.asyncio
+    async def test_root_mcp_mount_is_never_replaced_by_the_redirect(
+        self,
+        isolated_env,
+        monkeypatch,
+        configured_path: str,
+    ):
+        _settings, app = _build(
+            monkeypatch,
+            MAIL_UI_SESSION_SECRET=SECRET,
+            HTTP_PATH=configured_path,
+        )
+        health_call = {
+            "jsonrpc": "2.0",
+            "id": "root-mcp-health",
+            "method": "tools/call",
+            "params": {"name": "health_check", "arguments": {}},
+        }
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            anonymous_get = await client.get("/")
+            authenticated_post = await client.post(
+                "/",
+                headers={"Authorization": f"Bearer {BEARER}"},
+                json=health_call,
+            )
+
+        assert anonymous_get.status_code == 401
+        assert "location" not in anonymous_get.headers
+        assert authenticated_post.status_code == 200
+        assert authenticated_post.json()["result"]["structuredContent"]["status"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_favicon_mcp_mount_is_never_replaced_by_public_svg(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        _settings, app = _build(
+            monkeypatch,
+            MAIL_UI_SESSION_SECRET=SECRET,
+            HTTP_PATH="/favicon.ico/",
+        )
+        health_call = {
+            "jsonrpc": "2.0",
+            "id": "favicon-mcp-health",
+            "method": "tools/call",
+            "params": {"name": "health_check", "arguments": {}},
+        }
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            anonymous_get = await client.get("/favicon.ico")
+            authenticated_post = await client.post(
+                "/favicon.ico",
+                headers={"Authorization": f"Bearer {BEARER}"},
+                json=health_call,
+            )
+
+        assert anonymous_get.status_code == 401
+        assert anonymous_get.json() == {"detail": "Unauthorized"}
+        assert authenticated_post.status_code == 200
+        assert authenticated_post.json()["result"]["structuredContent"]["status"] == "ok"
+
+    @pytest.mark.parametrize(
+        "relative_path",
+        [
+            "ui/index.html",
+            "src/mcp_agent_mail/templates/base.html",
+            "src/mcp_agent_mail/templates/mail_login.html",
+            "web/index.html",
+        ],
+    )
+    def test_every_html_source_links_the_public_favicon(self, relative_path: str):
+        repository_root = Path(__file__).resolve().parents[1]
+        source = (repository_root / relative_path).read_text(encoding="utf-8")
+
+        assert source.count(FAVICON_LINK) == 1
 
 
 async def _make_user(

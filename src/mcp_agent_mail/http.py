@@ -854,6 +854,13 @@ _MAIL_PREFERENCES_API_PATH = "/mail/api/v1/me/preferences"
 _MAIL_PASSWORD_API_PATH = "/mail/api/v1/me/password"
 _MAIL_ACCOUNT_API_PATHS = frozenset({_MAIL_PREFERENCES_API_PATH, _MAIL_PASSWORD_API_PATH})
 _MAIL_REACT_BASE_PATH = "/mail/v2"
+_HERMES_FAVICON_PATH = "/favicon.ico"
+_HERMES_FAVICON_SVG = (
+    b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">\n'
+    b'  <rect width="64" height="64" rx="14" fill="#12242c"/>\n'
+    b'  <path d="M17 14h9v14h12V14h9v36h-9V36H26v14h-9z" fill="#f4cf8a"/>\n'
+    b"</svg>\n"
+)
 _MAIL_REACT_INDEX_HEADERS = {
     "Cache-Control": "no-store",
     "Content-Security-Policy": (
@@ -872,6 +879,14 @@ _mail_ui_template_user: contextvars.ContextVar[dict[str, Any] | None] = contextv
 )
 
 MailUiLocale = Literal["en", "pl"]
+
+
+def _normalized_http_base_path(path: str) -> str:
+    """Return the exact mount prefix used by the configured MCP transport."""
+    normalized = path or "/api"
+    if not normalized.startswith("/"):
+        normalized = f"/{normalized}"
+    return normalized.rstrip("/") or "/"
 
 
 def _mail_react_dist_root() -> Path:
@@ -1103,7 +1118,41 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
             return False
         return "text/html" in request.headers.get("accept", "")
 
+    def _public_entrypoint(self, request: Request) -> Response | None:
+        """Serve only the public root redirect and passive Hermes favicon."""
+        if request.method not in {"GET", "HEAD"}:
+            return None
+
+        path = request.url.path
+        mcp_base = _normalized_http_base_path(self._settings.http.path)
+        if path == "/" and mcp_base != "/":
+            raw_query = cast(bytes, request.scope.get("query_string", b""))
+            location = f"{_MAIL_REACT_BASE_PATH}/"
+            if raw_query:
+                location = f"{location}?{raw_query.decode('latin-1')}"
+            return Response(
+                status_code=status.HTTP_307_TEMPORARY_REDIRECT,
+                headers={"Cache-Control": "no-store", "Location": location},
+            )
+
+        if path == _HERMES_FAVICON_PATH and mcp_base not in {"/", _HERMES_FAVICON_PATH}:
+            body = _HERMES_FAVICON_SVG if request.method == "GET" else b""
+            return Response(
+                content=body,
+                media_type="image/svg+xml",
+                headers={
+                    "Cache-Control": "public, max-age=86400",
+                    "Content-Length": str(len(_HERMES_FAVICON_SVG)),
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
+        return None
+
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
+        public_entrypoint = self._public_entrypoint(request)
+        if public_entrypoint is not None:
+            return public_entrypoint
+
         path = request.url.path
         if not (path == "/mail" or path.startswith("/mail/")):
             return await call_next(request)
@@ -2789,10 +2838,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
     # Mount at both '/base' and '/base/' to tolerate either form from clients/tests.
     # Also mount compatibility aliases for both '/api' and '/mcp' regardless of configured base.
-    mount_base = settings.http.path or "/api"
-    if not mount_base.startswith("/"):
-        mount_base = "/" + mount_base
-    base_no_slash = mount_base.rstrip("/") or "/"
+    base_no_slash = _normalized_http_base_path(settings.http.path)
     base_with_slash = base_no_slash if base_no_slash == "/" else base_no_slash + "/"
     stateless_app = _HeaderFixupMCPApp(mcp_http_app)
     stateful_app = _HeaderFixupMCPApp(mcp_stateful_http_app)

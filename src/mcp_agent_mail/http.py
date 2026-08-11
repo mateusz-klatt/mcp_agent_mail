@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import contextvars
 import hmac
 import importlib
 import json
@@ -24,6 +25,7 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from git import NULL_TREE
 from sqlalchemy import text
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -843,9 +845,15 @@ def _localhost_bypass_allowed(request: Request, *, allow_localhost: bool) -> boo
 # otherwise there is no way to obtain one.
 _MAIL_LOGIN_PATH = "/mail/login"
 _MAIL_LOGOUT_PATH = "/mail/logout"
+_MAIL_FILE_RESERVATIONS_API_PATH = "/mail/api/file-reservations"
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_OVERSEER_REPLY_PATH_RE = re.compile(r"^/mail/[^/]+/overseer/reply$")
+_mail_ui_template_user: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "mail_ui_template_user",
+    default=None,
+)
 
-# Login brute-force throttle, keyed by client address. scrypt already caps an
+# Login brute-force throttle, keyed by client address and normalized username. scrypt already caps an
 # attacker at roughly 20 guesses/second/core, but that is still ~1.7M/day against
 # a weak password, so cap it properly. In-process state is sufficient and correct
 # here precisely because this server must run as a single process anyway (stateful
@@ -874,9 +882,8 @@ def _login_record_failure(client: str) -> None:
     bucket = [t for t in _login_failures.get(client, []) if now - t < _LOGIN_WINDOW_SECONDS]
     bucket.append(now)
     _login_failures[client] = bucket
-    # Bound the dict so a spray across forged client addresses cannot grow it
-    # without limit. Behind this deployment's proxy every client looks like
-    # 127.0.0.1 anyway, but the server is not required to run behind one.
+    # Bound the dict so a spray across forged client/account pairs cannot grow it
+    # without limit.
     if len(_login_failures) > 4096:
         stale = [k for k, v in _login_failures.items() if not v or now - v[-1] > _LOGIN_WINDOW_SECONDS]
         for k in stale:
@@ -897,14 +904,16 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
     in. Requests outside ``/mail`` are passed straight through untouched — the MCP
     mounts keep their bearer-only behaviour exactly as before.
 
-    Three ways a ``/mail`` request may proceed:
+    Two ways a normal ``/mail`` request may proceed:
 
     1. A valid session cookie. The user row is re-read on every request, so
        ``disabled`` and ``session_epoch`` changes take effect immediately rather
        than whenever the cookie happens to expire.
-    2. An ``Authorization`` header. Left for the bearer middleware to validate,
-       which keeps ``curl``/CLI access to the UI's JSON routes working.
-    3. The login and logout endpoints themselves.
+    2. The login and logout endpoints themselves.
+
+    The static service bearer is accepted only for the read-only file-reservation
+    endpoint used by editor hooks. It cannot read the human mailbox, archive, or
+    event stream.
 
     Anything else is redirected to the login page (for navigations) or answered
     401 (for anything expecting JSON).
@@ -936,9 +945,18 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
 
         cfg = self._settings.mail_ui
         if not cfg.enabled:
+            if self._settings.environment.strip().lower() not in {"development", "test"}:
+                return JSONResponse(
+                    {"detail": "Mail UI authentication may only be disabled in development or test."},
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
             # Auth explicitly switched off: fall through to the bearer middleware,
             # which is then the only thing standing in front of the UI.
-            return await call_next(request)
+            token = _mail_ui_template_user.set(None)
+            try:
+                return await call_next(request)
+            finally:
+                _mail_ui_template_user.reset(token)
         if not cfg.session_secret:
             # Fail closed. An unset secret cannot sign cookies, and serving the
             # destructive UI unauthenticated is never the safer default.
@@ -949,15 +967,30 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
 
         if path in (_MAIL_LOGIN_PATH, _MAIL_LOGOUT_PATH):
             request.state.mail_ui_authenticated = True  # let the bearer layer stand aside
-            return await call_next(request)
+            token = _mail_ui_template_user.set(None)
+            try:
+                return await call_next(request)
+            finally:
+                _mail_ui_template_user.reset(token)
 
         token = request.cookies.get(cfg.cookie_name, "")
         user = await _load_session_user(token, settings=self._settings) if token else None
 
         if user is None:
-            if request.headers.get("Authorization", "").startswith("Bearer "):
-                # An API client: hand it to the bearer middleware unchanged.
-                return await call_next(request)
+            static_bearer = self._settings.http.bearer_token or ""
+            presented_bearer = request.headers.get("Authorization", "")
+            if (
+                request.method == "GET"
+                and path == _MAIL_FILE_RESERVATIONS_API_PATH
+                and bool(static_bearer)
+                and hmac.compare_digest(presented_bearer, f"Bearer {static_bearer}")
+            ):
+                request.state.mail_ui_service_principal = True
+                token = _mail_ui_template_user.set(None)
+                try:
+                    return await call_next(request)
+                finally:
+                    _mail_ui_template_user.reset(token)
             if self._wants_html(request):
                 target = request.url.path
                 if request.url.query:
@@ -979,7 +1012,7 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
                 return JSONResponse(
                     {"detail": "Cross-origin request rejected"}, status_code=status.HTTP_403_FORBIDDEN
                 )
-            if user["role"] != webauth.ROLE_ADMIN:
+            if user["role"] != webauth.ROLE_ADMIN and not _OVERSEER_REPLY_PATH_RE.fullmatch(path):
                 return JSONResponse(
                     {"detail": "Forbidden: this action requires the admin role"},
                     status_code=status.HTTP_403_FORBIDDEN,
@@ -987,16 +1020,25 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
 
         request.state.mail_ui_authenticated = True
         request.state.mail_ui_user = user
-        return await call_next(request)
+        template_user = {
+            **user,
+            "is_admin": user["role"] == webauth.ROLE_ADMIN,
+        }
+        token = _mail_ui_template_user.set(template_user)
+        try:
+            return await call_next(request)
+        finally:
+            _mail_ui_template_user.reset(token)
 
 
 async def _load_session_user(token: str, *, settings: Settings) -> "dict[str, Any] | None":
     """Resolve a session cookie to a live, enabled user row, or ``None``.
 
     Re-reads the database on every request rather than trusting the cookie's
-    contents. The signed payload carries ``session_epoch``; if the stored epoch
-    has moved on (password change, account disable) the cookie is stale and is
-    refused even though its signature is still valid and it has not expired.
+    contents. The signed payload carries both ``session_epoch`` and the
+    account-lifetime ``session_generation``; if either stored value differs,
+    the cookie is stale and is refused even though its signature is still valid
+    and it has not expired.
     """
     import time
 
@@ -1005,7 +1047,7 @@ async def _load_session_user(token: str, *, settings: Settings) -> "dict[str, An
     )
     if verified is None:
         return None
-    username, epoch = verified
+    username, epoch, generation = verified
     try:
         from sqlmodel import select
 
@@ -1014,13 +1056,259 @@ async def _load_session_user(token: str, *, settings: Settings) -> "dict[str, An
         async with get_session() as session:
             result = await session.execute(select(UiUser).where(UiUser.username == username))
             row = result.scalars().first()
-            if row is None or row.disabled or row.session_epoch != epoch:
+            if (
+                row is None
+                or row.disabled
+                or row.session_epoch != epoch
+                or not isinstance(row.session_generation, str)
+                or not row.session_generation
+                or not hmac.compare_digest(row.session_generation, generation)
+            ):
                 return None
-            return {"id": row.id, "username": row.username, "role": row.role}
+            role = webauth.normalize_ui_user_role(row.role)
+            if role is None or row.id is None:
+                return None
+            return {"id": int(row.id), "username": row.username, "role": role}
     except Exception:
         # A database hiccup must not be an authentication bypass.
         structlog.get_logger("mail_ui").warning("mail_ui.session_lookup_failed", exc_info=True)
         return None
+
+
+async def _resolve_mail_project(
+    session: AsyncSession,
+    identifier: str,
+) -> tuple[Any, ...] | None:
+    """Resolve a project with slug precedence and ambiguity rejection.
+
+    Args:
+        session: Open database session.
+        identifier: Project slug or canonical human key from the URL.
+
+    Returns:
+        ``(id, slug, human_key, archived_at)`` for one unambiguous project, or
+        ``None`` when no project or multiple human-key matches exist.
+    """
+    rows = (
+        await session.execute(
+            text(
+                "SELECT id, slug, human_key, archived_at FROM projects "
+                "WHERE slug = :identifier OR human_key = :identifier ORDER BY id"
+            ),
+            {"identifier": identifier},
+        )
+    ).fetchall()
+    slug_matches = [row for row in rows if str(row[1]) == identifier]
+    if len(slug_matches) == 1:
+        return tuple(slug_matches[0])
+    human_key_matches = [row for row in rows if str(row[2]) == identifier]
+    if len(human_key_matches) == 1:
+        return tuple(human_key_matches[0])
+    return None
+
+
+def _mail_ui_request_user(request: Request) -> dict[str, Any] | None:
+    """Return the authenticated human principal stored by the mail middleware.
+
+    Args:
+        request: Current HTTP request.
+
+    Returns:
+        The normalized principal, or ``None`` outside authenticated UI mode.
+    """
+    user = getattr(request.state, "mail_ui_user", None)
+    return user if isinstance(user, dict) else None
+
+
+def _mail_ui_request_is_admin(*, settings: Settings, request: Request) -> bool:
+    """Return whether the request has global administrator authority.
+
+    Args:
+        settings: Active application settings.
+        request: Current HTTP request.
+
+    Returns:
+        ``True`` for an administrator or explicit auth-disabled development mode.
+    """
+    user = _mail_ui_request_user(request)
+    return not settings.mail_ui.enabled or bool(user and user["role"] == webauth.ROLE_ADMIN)
+
+
+def _mail_ui_access_context(
+    *,
+    settings: Settings,
+    request: Request,
+    project_id: int,
+    project_role: str | None,
+) -> dict[str, Any]:
+    """Build template permissions for one project.
+
+    Args:
+        settings: Active application settings.
+        request: Current HTTP request.
+        project_id: Database identifier of the project.
+        project_role: Normalized assignment role for a member.
+
+    Returns:
+        A stable permission mapping consumed by mail templates.
+    """
+    is_admin = _mail_ui_request_is_admin(settings=settings, request=request)
+    can_read = is_admin or webauth.project_role_allows_view(project_role)
+    can_reply = is_admin or webauth.project_role_allows_operate(project_role)
+    return {
+        "project_id": project_id,
+        "project_role": project_role,
+        "can_read": can_read,
+        "can_reply": can_reply,
+        "can_compose": is_admin,
+        "can_mutate": is_admin,
+        "is_admin": is_admin,
+    }
+
+
+async def _mail_ui_visible_project_roles(
+    *,
+    settings: Settings,
+    request: Request,
+    session: AsyncSession,
+) -> dict[int, str | None]:
+    """Return visible project ids and normalized assignment roles.
+
+    Args:
+        settings: Active application settings.
+        request: Current HTTP request.
+        session: Open database session.
+
+    Returns:
+        Mapping from visible project id to member role. Administrators and the
+        explicit auth-disabled development mode receive every project with a
+        ``None`` assignment role.
+    """
+    user = _mail_ui_request_user(request)
+    if not settings.mail_ui.enabled or bool(user and user["role"] == webauth.ROLE_ADMIN):
+        rows = await session.execute(text("SELECT id FROM projects"))
+        return {int(row[0]): None for row in rows.fetchall()}
+    if user is None or user["role"] != webauth.ROLE_MEMBER:
+        return {}
+    rows = await session.execute(
+        text(
+            "SELECT project_id, role FROM ui_project_assignments "
+            "WHERE user_id = :user_id"
+        ),
+        {"user_id": int(user["id"])},
+    )
+    visible: dict[int, str | None] = {}
+    for project_id, raw_role in rows.fetchall():
+        role = webauth.normalize_project_role(raw_role)
+        if role is not None and webauth.project_role_allows_view(role):
+            visible[int(project_id)] = role
+    return visible
+
+
+async def _mail_ui_require_project_access(
+    *,
+    settings: Settings,
+    request: Request,
+    session: AsyncSession,
+    project_id: int,
+    operate: bool = False,
+) -> dict[str, Any]:
+    """Require read or operator access to one project.
+
+    Args:
+        settings: Active application settings.
+        request: Current HTTP request.
+        session: Open database session.
+        project_id: Database identifier of the project.
+        operate: Require operator-level reply permission when true.
+
+    Returns:
+        Template permission mapping for the authorized project.
+
+    Raises:
+        HTTPException: With 404 for an invisible project or 403 when a visible
+            assignment lacks operator permission.
+    """
+    visible = await _mail_ui_visible_project_roles(
+        settings=settings,
+        request=request,
+        session=session,
+    )
+    if project_id not in visible:
+        raise HTTPException(status_code=404, detail="Project not found")
+    access = _mail_ui_access_context(
+        settings=settings,
+        request=request,
+        project_id=project_id,
+        project_role=visible[project_id],
+    )
+    if operate and not access["can_reply"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Forbidden: this action requires the project operator role",
+        )
+    return access
+
+
+def _mail_ui_require_admin_read(*, settings: Settings, request: Request) -> None:
+    """Require an administrator for a sensitive read-only endpoint.
+
+    Args:
+        settings: Active application settings.
+        request: Current HTTP request.
+
+    Raises:
+        HTTPException: When an authenticated member attempts the operation.
+    """
+    if not settings.mail_ui.enabled:
+        return
+    user = _mail_ui_request_user(request)
+    if user is None or user["role"] != webauth.ROLE_ADMIN:
+        raise HTTPException(status_code=403, detail="Forbidden: this action requires the admin role")
+
+
+async def _mail_ui_stream_access_valid(
+    *,
+    settings: Settings,
+    session_token: str,
+    project_slug: str | None,
+) -> bool:
+    """Revalidate a streaming session and its current project assignments.
+
+    Args:
+        settings: Active application settings.
+        session_token: Signed browser session cookie captured at connection time.
+        project_slug: Specific project slug, or ``None`` for any visible project.
+
+    Returns:
+        ``True`` while the session remains live and its assignment still covers
+        the requested scope.
+    """
+    if not settings.mail_ui.enabled:
+        return True
+    user = await _load_session_user(session_token, settings=settings)
+    if user is None:
+        return False
+    if user["role"] == webauth.ROLE_ADMIN:
+        return True
+    async with get_session() as session:
+        params: dict[str, Any] = {"user_id": int(user["id"])}
+        project_filter = ""
+        if project_slug is not None:
+            project_filter = " AND p.slug = :project_slug"
+            params["project_slug"] = project_slug
+        rows = await session.execute(
+            text(
+                "SELECT a.role FROM ui_project_assignments a "
+                "JOIN projects p ON p.id = a.project_id "
+                "WHERE a.user_id = :user_id" + project_filter
+            ),
+            params,
+        )
+        return any(
+            webauth.project_role_allows_view(webauth.normalize_project_role(row[0]))
+            for row in rows.fetchall()
+        )
 
 
 class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
@@ -1253,7 +1541,9 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
         kind, tool_name = self._classify_request(request.url.path, request.method, body_bytes)
 
         # JWT auth (if enabled)
-        if self._jwt_enabled:
+        if getattr(request.state, "mail_ui_authenticated", False):
+            roles = {self._default_role}
+        elif self._jwt_enabled:
             auth_header = request.headers.get("Authorization", "")
             # #210: when JWT is enabled, a valid *static* bearer is still accepted
             # as the OR-alternative to a JWT (the outer BearerAuthMiddleware defers
@@ -1873,9 +2163,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     # it must decide /mail before the bearer layer can 401 a browser that has no
     # way to send an Authorization header. Everything outside /mail passes straight
     # through, so the MCP mounts are unaffected.
-    if settings.mail_ui.enabled:
-        app_any3 = cast(Any, fastapi_app)
-        app_any3.add_middleware(MailUiAuthMiddleware, settings=settings)
+    app_any3 = cast(Any, fastapi_app)
+    app_any3.add_middleware(MailUiAuthMiddleware, settings=settings)
 
     # Registered last, so it wraps everything and inspects the body before any
     # layer tries to parse it. An undecodable body is a property of the request,
@@ -1960,23 +2249,25 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
         await ensure_schema()
         async with get_session() as session:
+            project_row = await _resolve_mail_project(session, project_key)
+            if project_row is None:
+                return unauthorized
             row = (
                 await session.execute(
                     text(
-                        "SELECT p.slug, a.name, a.registration_token, a.retired_at "
-                        "FROM agents a JOIN projects p ON p.id = a.project_id "
-                        "WHERE (p.slug = :k OR p.human_key = :k) AND lower(a.name) = lower(:a)"
+                        "SELECT a.name, a.registration_token, a.retired_at "
+                        "FROM agents a WHERE a.project_id = :pid AND lower(a.name) = lower(:a)"
                     ),
-                    {"k": project_key, "a": agent_name},
+                    {"pid": int(project_row[0]), "a": agent_name},
                 )
             ).fetchone()
 
-        if row is None or not row[2] or row[3] is not None:
+        if row is None or not row[1] or row[2] is not None:
             return unauthorized
         # compare_digest, not ==, so a caller cannot narrow the token by timing.
-        if not hmac.compare_digest(str(row[2]), token):
+        if not hmac.compare_digest(str(row[1]), token):
             return unauthorized
-        project_slug, canonical_agent = str(row[0]), str(row[1])
+        project_slug, canonical_agent = str(project_row[1]), str(row[0])
 
         # Subscribe BEFORE the client catches up, not after. The client's
         # contract is: connect, wait for `: ready`, pull the inbox, then wait.
@@ -2307,6 +2598,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         )
 
         async def _render(name: str, status_code: int = 200, **ctx: Any) -> HTMLResponse:
+            ctx.setdefault("mail_ui_user", _mail_ui_template_user.get())
+            ctx.setdefault("mail_ui_access", None)
             tpl = env.get_template(name)
             html = await tpl.render_async(**ctx)
             return HTMLResponse(html, status_code=status_code)
@@ -2366,16 +2659,19 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             return fts, like_pat, like_scope, tokens
 
         @fastapi_app.get("/mail/api/locks", response_class=JSONResponse)
-        async def mail_lock_status() -> JSONResponse:
+        async def mail_lock_status(request: Request) -> JSONResponse:
             """Return metadata about active archive locks for observability."""
 
             settings_local = get_settings()
+            _mail_ui_require_admin_read(settings=settings_local, request=request)
             payload = collect_lock_status(settings_local)
             return JSONResponse(payload)
 
         @fastapi_app.get("/mail/api/file-reservations", response_class=JSONResponse)
         async def mail_active_file_reservations(
-            project: str, path: str | None = None
+            request: Request,
+            project: str,
+            path: str | None = None,
         ) -> JSONResponse:
             """Active advisory file reservations, optionally narrowed to one path.
 
@@ -2402,14 +2698,16 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             await ensure_schema()
             now = datetime.now(timezone.utc).replace(tzinfo=None)
             async with get_session() as session:
-                prow = (
-                    await session.execute(
-                        text("SELECT id FROM projects WHERE slug = :k OR human_key = :k"),
-                        {"k": project},
-                    )
-                ).fetchone()
+                prow = await _resolve_mail_project(session, project)
                 if not prow:
                     return JSONResponse({"detail": "Project not found"}, status_code=404)
+                if not getattr(request.state, "mail_ui_service_principal", False):
+                    await _mail_ui_require_project_access(
+                        settings=settings,
+                        request=request,
+                        session=session,
+                        project_id=int(prow[0]),
+                    )
                 rows = (
                     await session.execute(
                         text(
@@ -2486,7 +2784,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             return JSONResponse({"active": len(items), "reservations": items})
 
         async def _build_unified_inbox_payload(
-            *, limit: int = 500, include_projects: bool = True
+            *, request: Request, limit: int = 500, include_projects: bool = True
         ) -> dict[str, Any]:
             """Fetch unified inbox data for HTML and JSON consumers."""
 
@@ -2494,31 +2792,56 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             messages: list[dict[str, Any]] = []
             projects: list[dict[str, Any]] = []
             total_messages = 0
+            visible_roles: dict[int, str | None] = {}
 
             try:
                 await ensure_schema()
 
                 sibling_map: dict[int, dict[str, Any]] = {}
                 if include_projects:
-                    await refresh_project_sibling_suggestions()
+                    if _mail_ui_request_is_admin(settings=settings, request=request):
+                        await refresh_project_sibling_suggestions()
                     sibling_map = await get_project_sibling_data()
 
                 async with get_session() as session:
+                    visible_roles = await _mail_ui_visible_project_roles(
+                        settings=settings,
+                        request=request,
+                        session=session,
+                    )
+                    visible_ids = sorted(visible_roles)
+                    if not visible_ids:
+                        return {
+                            "messages": [],
+                            "projects": [],
+                            "agent_sounds": {},
+                            "total_messages": 0,
+                            "returned_messages": 0,
+                            "has_more": False,
+                        }
+                    visible_params = {
+                        f"visible_pid_{index}": project_id
+                        for index, project_id in enumerate(visible_ids)
+                    }
+                    visible_placeholders = ", ".join(f":visible_pid_{index}" for index in range(len(visible_ids)))
+                    project_predicate = f"m.project_id IN ({visible_placeholders})"
                     total_result = await session.execute(
                         text(
-                            """
+                            f"""
                             SELECT COUNT(*)
                             FROM messages m
                             JOIN agents sender ON sender.id = m.sender_id
                             JOIN projects p ON p.id = m.project_id
+                            WHERE {project_predicate}
                             """
-                        )
+                        ),
+                        visible_params,
                     )
                     total_messages = int(total_result.scalar_one())
 
                     # Fetch recent messages with sender/project and computed recipient list
                     query = text(
-                        """
+                        f"""
                         SELECT
                             m.id,
                             m.subject,
@@ -2551,12 +2874,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         JOIN agents sender ON m.sender_id = sender.id
                         LEFT JOIN projects sp ON sp.id = sender.project_id
                         JOIN projects p ON m.project_id = p.id
+                        WHERE {project_predicate}
                         ORDER BY m.created_ts DESC
                         LIMIT :limit
                         """
                     )
 
-                    rows = await session.execute(query, {"limit": safe_limit})
+                    rows = await session.execute(query, {**visible_params, "limit": safe_limit})
 
                     for r in rows.mappings().all():
                         body = r["body_md"] or ""
@@ -2620,6 +2944,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                 part.strip() for part in (r["recipients"] or "").split(",") if part.strip()
                             ),
                             "read": False,
+                            "can_reply": _mail_ui_access_context(
+                                settings=settings,
+                                request=request,
+                                project_id=int(r["message_project_id"]),
+                                project_role=visible_roles[int(r["message_project_id"])],
+                            )["can_reply"],
                         }
                         message_payload.update(sender_meta)
                         messages.append(message_payload)
@@ -2630,7 +2960,25 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         )
                         for r in rows.fetchall():
                             project_id = int(r[0])
+                            if project_id not in visible_roles:
+                                continue
                             siblings = sibling_map.get(project_id, {"confirmed": [], "suggested": []})
+                            access = _mail_ui_access_context(
+                                settings=settings,
+                                request=request,
+                                project_id=project_id,
+                                project_role=visible_roles[project_id],
+                            )
+                            confirmed_siblings = [
+                                sibling
+                                for sibling in siblings.get("confirmed", [])
+                                if int(sibling["peer"]["id"]) in visible_roles
+                            ]
+                            suggested_siblings = [
+                                sibling
+                                for sibling in siblings.get("suggested", [])
+                                if int(sibling["peer"]["id"]) in visible_roles
+                            ]
                             projects.append(
                                 {
                                     "id": project_id,
@@ -2638,8 +2986,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                     "human_key": r[2],
                                     "created_at": str(r[3]),
                                     "archived_at": str(r[4]) if r[4] else None,
-                                    "confirmed_siblings": siblings.get("confirmed", []),
-                                    "suggested_siblings": siblings.get("suggested", []),
+                                    "confirmed_siblings": confirmed_siblings,
+                                    "suggested_siblings": suggested_siblings,
+                                    "access_role": access["project_role"],
+                                    "can_read": access["can_read"],
+                                    "can_reply": access["can_reply"],
+                                    "can_compose": access["can_compose"],
+                                    "can_mutate": access["can_mutate"],
                                 }
                             )
 
@@ -2655,10 +3008,20 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             # agents who actually chose a tone belong in it — an empty map and a
             # missing island behave identically in the reader.
             agent_sounds: dict[str, str] = {}
-            with contextlib.suppress(Exception):
+            if visible_roles:
                 async with get_session() as session:
+                    visible_ids = sorted(visible_roles)
+                    sound_params = {
+                        f"sound_pid_{index}": project_id
+                        for index, project_id in enumerate(visible_ids)
+                    }
+                    sound_placeholders = ", ".join(f":sound_pid_{index}" for index in range(len(visible_ids)))
                     srows = await session.execute(
-                        text("SELECT name, notify_sound FROM agents WHERE notify_sound IS NOT NULL")
+                        text(
+                            "SELECT name, notify_sound FROM agents "
+                            f"WHERE notify_sound IS NOT NULL AND project_id IN ({sound_placeholders})"
+                        ),
+                        sound_params,
                     )
                     agent_sounds = {r[0]: r[1] for r in srows.fetchall() if r[0] and r[1]}
 
@@ -2685,7 +3048,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             user straight off the site.
             """
             candidate = (raw or "").strip()
-            if not candidate.startswith("/") or candidate.startswith("//"):
+            if (
+                not candidate.startswith("/")
+                or candidate.startswith("//")
+                or "\\" in candidate
+                or any(ord(character) < 32 or ord(character) == 127 for character in candidate)
+            ):
                 return "/mail"
             return candidate
 
@@ -2723,7 +3091,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 return JSONResponse({"detail": "Cross-origin request rejected"}, status_code=403)
 
             client_ip = request.client.host if request.client else "-"
-            if _login_throttled(client_ip):
+            throttle_key = f"{client_ip}\0{username.casefold()[:64]}"
+            if _login_throttled(throttle_key):
                 return await _render(
                     "mail_login.html",
                     error="Too many failed attempts. Wait a minute and try again.",
@@ -2733,6 +3102,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
             stored: str | None = None
             row_epoch = 1
+            row_generation = ""
             row_disabled = False
             if webauth.valid_username(username):
                 from sqlmodel import select as _select
@@ -2743,14 +3113,17 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     res = await s_login.execute(_select(_UiUser).where(_UiUser.username == username))
                     row = res.scalars().first()
                     if row is not None:
-                        stored, row_epoch, row_disabled = row.password_hash, row.session_epoch, row.disabled
+                        stored = row.password_hash
+                        row_epoch = row.session_epoch
+                        row_generation = row.session_generation
+                        row_disabled = row.disabled
 
             # authenticate() runs a dummy scrypt for an unknown user, so a bad
             # username and a bad password take the same time and cannot be told
             # apart. A disabled account is checked after, and reports the same
             # generic failure for the same reason.
             if not webauth.authenticate(username, password, stored) or row_disabled:
-                _login_record_failure(client_ip)
+                _login_record_failure(throttle_key)
                 structlog.get_logger("mail_ui").info(
                     "mail_ui.login_failed", username=username[:64], client=client_ip
                 )
@@ -2761,12 +3134,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     status_code=status.HTTP_401_UNAUTHORIZED,
                 )
 
-            _login_clear_failures(client_ip)
+            _login_clear_failures(throttle_key)
             import time as _time
 
             token = webauth.make_session(
                 username,
                 epoch=row_epoch,
+                generation=row_generation,
                 now=_time.time(),
                 secret=cfg.session_secret.encode("utf-8"),
                 ttl=float(cfg.session_ttl_seconds),
@@ -2807,10 +3181,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             return response
 
         @fastapi_app.get("/mail", response_class=HTMLResponse)
-        async def mail_unified_inbox() -> HTMLResponse:
+        async def mail_unified_inbox(request: Request) -> HTMLResponse:
             """Unified inbox showing ALL messages across ALL projects (Gmail-style) + Projects below"""
 
-            payload = await _build_unified_inbox_payload()
+            payload = await _build_unified_inbox_payload(request=request)
             return await _render(
                 "mail_unified_inbox.html",
                 messages=payload.get("messages", []),
@@ -2844,19 +3218,27 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             # the same either way and carries nothing, so the wider scope reveals
             # nothing wider.
             project_key = (request.query_params.get("project") or "").strip()
+            session_token = request.cookies.get(settings.mail_ui.cookie_name, "")
             if project_key:
                 await ensure_schema()
                 async with get_session() as session:
-                    row = (
-                        await session.execute(
-                            text("SELECT slug FROM projects WHERE slug = :k OR human_key = :k"),
-                            {"k": project_key},
-                        )
-                    ).fetchone()
-                if row is None:
-                    return JSONResponse({"detail": "Project not found"}, status_code=404)
-                project_slug = str(row[0])
+                    row = await _resolve_mail_project(session, project_key)
+                    if row is None:
+                        return JSONResponse({"detail": "Project not found"}, status_code=404)
+                    await _mail_ui_require_project_access(
+                        settings=settings,
+                        request=request,
+                        session=session,
+                        project_id=int(row[0]),
+                    )
+                project_slug = str(row[1])
             else:
+                if not await _mail_ui_stream_access_valid(
+                    settings=settings,
+                    session_token=session_token,
+                    project_slug=None,
+                ):
+                    return JSONResponse({"detail": "Forbidden"}, status_code=403)
                 project_slug = hub.ANY_PROJECT
 
             queue = hub.subscribe_project(project_slug)
@@ -2874,8 +3256,32 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                 queue.get(), timeout=min(KEEPALIVE_SECONDS, remaining)
                             )
                         except asyncio.TimeoutError:
+                            if not await _mail_ui_stream_access_valid(
+                                settings=settings,
+                                session_token=session_token,
+                                project_slug=None if project_slug == hub.ANY_PROJECT else project_slug,
+                            ):
+                                return
                             yield b": ping\n\n"
                             continue
+                        event_project = event.get("project") if isinstance(event, dict) else None
+                        event_scope = (
+                            str(event_project)
+                            if project_slug == hub.ANY_PROJECT and isinstance(event_project, str)
+                            else None if project_slug == hub.ANY_PROJECT else project_slug
+                        )
+                        if not await _mail_ui_stream_access_valid(
+                            settings=settings,
+                            session_token=session_token,
+                            project_slug=event_scope,
+                        ):
+                            if project_slug == hub.ANY_PROJECT and await _mail_ui_stream_access_valid(
+                                settings=settings,
+                                session_token=session_token,
+                                project_slug=None,
+                            ):
+                                continue
+                            return
                         # Unlike the agent stream this does NOT close after one
                         # frame: a page stays open and would otherwise have to
                         # reconnect after every message it displays.
@@ -2895,12 +3301,17 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
         @fastapi_app.get("/mail/api/unified-inbox", response_class=JSONResponse)
         async def mail_unified_inbox_api(
+            request: Request,
             limit: int = 50000,
             include_projects: bool = False,
         ) -> JSONResponse:
             """Return a bounded message page plus the unbounded inbox total."""
 
-            payload = await _build_unified_inbox_payload(limit=limit, include_projects=include_projects)
+            payload = await _build_unified_inbox_payload(
+                request=request,
+                limit=limit,
+                include_projects=include_projects,
+            )
             if not include_projects:
                 # Reduce payload size when polling for message updates only
                 payload["projects"] = []
@@ -3124,19 +3535,33 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 raise HTTPException(status_code=500, detail=f"Failed to unarchive project: {exc!s}") from exc
 
         @fastapi_app.get("/mail/projects", response_class=HTMLResponse)
-        async def mail_projects_list() -> HTMLResponse:
+        async def mail_projects_list(request: Request) -> HTMLResponse:
             """Projects list view (moved from /mail)"""
             await ensure_schema()
-            await refresh_project_sibling_suggestions()
+            if _mail_ui_request_is_admin(settings=settings, request=request):
+                await refresh_project_sibling_suggestions()
             sibling_map = await get_project_sibling_data()
             async with get_session() as session:
+                visible_roles = await _mail_ui_visible_project_roles(
+                    settings=settings,
+                    request=request,
+                    session=session,
+                )
                 rows = await session.execute(
                     text("SELECT id, slug, human_key, created_at, archived_at FROM projects ORDER BY created_at DESC")
                 )
                 projects = []
                 for r in rows.fetchall():
                     project_id = int(r[0])
+                    if project_id not in visible_roles:
+                        continue
                     siblings = sibling_map.get(project_id, {"confirmed": [], "suggested": []})
+                    access = _mail_ui_access_context(
+                        settings=settings,
+                        request=request,
+                        project_id=project_id,
+                        project_role=visible_roles[project_id],
+                    )
                     projects.append(
                         {
                             "id": project_id,
@@ -3144,15 +3569,52 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                             "human_key": r[2],
                             "created_at": str(r[3]),
                             "archived_at": str(r[4]) if r[4] else None,
-                            "confirmed_siblings": siblings.get("confirmed", []),
-                            "suggested_siblings": siblings.get("suggested", []),
+                            "confirmed_siblings": [
+                                sibling
+                                for sibling in siblings.get("confirmed", [])
+                                if int(sibling["peer"]["id"]) in visible_roles
+                            ],
+                            "suggested_siblings": [
+                                sibling
+                                for sibling in siblings.get("suggested", [])
+                                if int(sibling["peer"]["id"]) in visible_roles
+                            ],
+                            "access_role": access["project_role"],
+                            "can_read": access["can_read"],
+                            "can_reply": access["can_reply"],
+                            "can_compose": access["can_compose"],
+                            "can_mutate": access["can_mutate"],
                         }
                     )
             return await _render("mail_index.html", projects=projects)
 
+        @fastapi_app.get("/mail/unified-inbox", response_class=HTMLResponse)
+        async def unified_inbox_alias(
+            request: Request,
+            limit: int = 10000,
+            filter_importance: str | None = None,
+        ) -> HTMLResponse:
+            """Render the legacy unified URL through the scoped inbox builder.
+
+            Args:
+                request: Current HTTP request.
+                limit: Maximum recent messages to load.
+                filter_importance: Optional high-priority filter retained for
+                    URL compatibility.
+
+            Returns:
+                The scoped unified inbox page.
+            """
+            return await _render_legacy_unified_inbox(
+                request=request,
+                limit=limit,
+                filter_importance=filter_importance,
+            )
+
         @fastapi_app.get("/mail/{project}", response_class=HTMLResponse)
         async def mail_project(
             project: str,
+            request: Request,
             q: str | None = None,
             scope: str | None = None,
             order: str | None = None,
@@ -3162,13 +3624,16 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 order = "relevance"
             await ensure_schema()
             async with get_session() as session:
-                proj = await session.execute(
-                    text("SELECT id, slug, human_key, archived_at FROM projects WHERE slug = :k OR human_key = :k"), {"k": project}
-                )
-                prow = proj.fetchone()
+                prow = await _resolve_mail_project(session, project)
                 if not prow:
-                    return await _render("error.html", message="Project not found")
+                    return await _render("error.html", status_code=404, message="Project not found")
                 pid = int(prow[0])
+                access = await _mail_ui_require_project_access(
+                    settings=settings,
+                    request=request,
+                    session=session,
+                    project_id=pid,
+                )
                 project_archived_at = str(prow[3]) if prow[3] else None
                 # display_name is selected because the viewer had no way to show
                 # it: the column has existed and been settable via
@@ -3287,12 +3752,21 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                             item.update(sender_meta)
                             matched_messages.append(item)
             render_context: dict[str, Any] = {
-                "project": {"id": pid, "slug": prow[1], "human_key": prow[2], "archived_at": project_archived_at},
+                "project": {
+                    "id": pid,
+                    "slug": prow[1],
+                    "human_key": prow[2],
+                    "archived_at": project_archived_at,
+                    "can_reply": access["can_reply"],
+                    "can_compose": access["can_compose"],
+                    "can_mutate": access["can_mutate"],
+                },
                 "agents": agents,
                 "q": q or "",
                 "scope": scope or "",
                 "order": order or "relevance",
                 "boost": bool(boost),
+                "mail_ui_access": access,
             }
             if q and q.strip():
                 render_context["tokens"] = tokens
@@ -3335,12 +3809,30 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
             return JSONResponse({"status": suggestion["status"], "suggestion": suggestion})
 
-        @fastapi_app.get("/mail/unified-inbox", response_class=HTMLResponse)
-        async def unified_inbox(limit: int = 10000, filter_importance: str | None = None) -> HTMLResponse:
+        async def _render_legacy_unified_inbox(
+            request: Request,
+            limit: int = 10000,
+            filter_importance: str | None = None,
+        ) -> HTMLResponse:
             """Unified inbox showing messages from all active agents across all projects."""
             limit = min(max(1, limit), 10000)
             await ensure_schema()
             async with get_session() as session:
+                visible_roles = await _mail_ui_visible_project_roles(
+                    settings=settings,
+                    request=request,
+                    session=session,
+                )
+                visible_ids = sorted(visible_roles)
+                visible_params = {
+                    f"legacy_visible_pid_{index}": project_id
+                    for index, project_id in enumerate(visible_ids)
+                }
+                visible_placeholders = (
+                    ", ".join(f":legacy_visible_pid_{index}" for index in range(len(visible_ids)))
+                    if visible_ids
+                    else "-1"
+                )
                 # Get all projects with their agents
                 projects_query = await session.execute(
                     text(
@@ -3361,6 +3853,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 projects_data: list[dict[str, Any]] = []
                 for r in projects_query.fetchall():
                     proj_id = int(r[0])
+                    if proj_id not in visible_roles:
+                        continue
+                    access = _mail_ui_access_context(
+                        settings=settings,
+                        request=request,
+                        project_id=proj_id,
+                        project_role=visible_roles[proj_id],
+                    )
                     # Get agents for this project
                     agents_query = await session.execute(
                         text(
@@ -3402,13 +3902,18 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                 "human_key": r[2],
                                 "agent_count": int(r[3] or 0),
                                 "agents": agents_list,
+                                "access_role": access["project_role"],
+                                "can_read": access["can_read"],
+                                "can_reply": access["can_reply"],
+                                "can_compose": access["can_compose"],
+                                "can_mutate": access["can_mutate"],
                             }
                         )
 
                 # Get recent messages across all projects with thread information
                 # Build WHERE clause safely using parameterized queries
-                importance_conditions = []
-                query_params = {"lim": limit}
+                importance_conditions = [f"m.project_id IN ({visible_placeholders})"]
+                query_params = {"lim": limit, **visible_params}
 
                 if filter_importance and filter_importance.lower() in ["urgent", "high"]:
                     importance_conditions.append("m.importance IN ('urgent', 'high')")
@@ -3424,7 +3929,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         JOIN projects p ON p.id = m.project_id
                         {where_clause}
                         """
-                    )
+                    ),
+                    query_params,
                 )
                 total_messages = int(total_result.scalar_one())
 
@@ -3496,6 +4002,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         "sender": sender_display,
                         "recipients": r["recipient_names"] or "",
                         "thread_count": int(r["thread_count"] or 0),
+                        "can_reply": _mail_ui_access_context(
+                            settings=settings,
+                            request=request,
+                            project_id=int(r["message_project_id"]),
+                            project_role=visible_roles[int(r["message_project_id"])],
+                        )["can_reply"],
                     }
                     item.update(sender_meta)
                     messages.append(item)
@@ -3519,20 +4031,27 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             )
 
         @fastapi_app.get("/mail/{project}/inbox/{agent}", response_class=HTMLResponse)
-        async def mail_inbox(project: str, agent: str, limit: int = 10000, page: int = 1) -> HTMLResponse:
+        async def mail_inbox(
+            project: str,
+            agent: str,
+            request: Request,
+            limit: int = 10000,
+            page: int = 1,
+        ) -> HTMLResponse:
             limit = min(max(1, limit), 10000)
             page = min(max(1, page), 10000)
             await ensure_schema()
             async with get_session() as session:
-                prow = (
-                    await session.execute(
-                        text("SELECT id, slug, human_key FROM projects WHERE slug = :k OR human_key = :k"),
-                        {"k": project},
-                    )
-                ).fetchone()
+                prow = await _resolve_mail_project(session, project)
                 if not prow:
-                    return await _render("error.html", message="Project not found")
+                    return await _render("error.html", status_code=404, message="Project not found")
                 pid = int(prow[0])
+                access = await _mail_ui_require_project_access(
+                    settings=settings,
+                    request=request,
+                    session=session,
+                    project_id=pid,
+                )
                 arow = (
                     await session.execute(
                         text("SELECT id, name FROM agents WHERE project_id = :pid AND lower(name) = lower(:name)"),
@@ -3607,21 +4126,23 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 limit=limit,
                 next_page=page + 1,
                 prev_page=page - 1 if page > 1 else None,
+                mail_ui_access=access,
             )
 
         @fastapi_app.get("/mail/{project}/message/{mid}", response_class=HTMLResponse)
-        async def mail_message(project: str, mid: int) -> HTMLResponse:
+        async def mail_message(project: str, mid: int, request: Request) -> HTMLResponse:
             await ensure_schema()
             async with get_session() as session:
-                prow = (
-                    await session.execute(
-                        text("SELECT id, slug, human_key FROM projects WHERE slug = :k OR human_key = :k"),
-                        {"k": project},
-                    )
-                ).fetchone()
+                prow = await _resolve_mail_project(session, project)
                 if not prow:
-                    return await _render("error.html", message="Project not found")
+                    return await _render("error.html", status_code=404, message="Project not found")
                 pid = int(prow[0])
+                access = await _mail_ui_require_project_access(
+                    settings=settings,
+                    request=request,
+                    session=session,
+                    project_id=pid,
+                )
                 mrow = (
                     await session.execute(
                         text(
@@ -3737,8 +4258,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             # Get commit SHA for provenance badge
             commit_sha = None
             try:
-                settings = get_settings()
-                archive = await ensure_archive(settings, prow[1])
+                settings_local = get_settings()
+                archive = await ensure_archive(settings_local, prow[1])
                 commit_sha = await get_message_commit_sha(archive, mid)
             except Exception:
                 pass  # Commit SHA is optional
@@ -3794,6 +4315,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 ack_summary=ack_summary,
                 thread_items=thread_items,
                 commit_sha=commit_sha,
+                mail_ui_access=access,
             )
 
         @fastapi_app.post("/mail/{project}/inbox/{agent}/mark-read")
@@ -3819,12 +4341,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
                 async with get_session() as session:
                     # Get project
-                    prow = (
-                        await session.execute(
-                            text("SELECT id, slug FROM projects WHERE slug = :k OR human_key = :k"),
-                            {"k": project},
-                        )
-                    ).fetchone()
+                    prow = await _resolve_mail_project(session, project)
                     if not prow:
                         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -3890,12 +4407,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             try:
                 async with get_session() as session:
                     # Get project
-                    prow = (
-                        await session.execute(
-                            text("SELECT id, slug FROM projects WHERE slug = :k OR human_key = :k"),
-                            {"k": project},
-                        )
-                    ).fetchone()
+                    prow = await _resolve_mail_project(session, project)
                     if not prow:
                         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -3973,12 +4485,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 recip_map: dict[int, list[str]] = {}
                 async with get_session() as session:
                     # Resolve project
-                    prow = (
-                        await session.execute(
-                            text("SELECT id, slug, human_key FROM projects WHERE slug = :k OR human_key = :k"),
-                            {"k": project},
-                        )
-                    ).fetchone()
+                    prow = await _resolve_mail_project(session, project)
                     if not prow:
                         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -4083,7 +4590,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 ) from exc
 
         @fastapi_app.get("/mail/{project}/thread/{thread_id}", response_class=HTMLResponse)
-        async def mail_thread(project: str, thread_id: str) -> HTMLResponse:
+        async def mail_thread(project: str, thread_id: str, request: Request) -> HTMLResponse:
             """Display all messages in a thread chronologically (Gmail-style conversation view).
 
             NOTE: Currently loads ALL messages in thread without pagination.
@@ -4092,16 +4599,17 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             await ensure_schema()
             async with get_session() as session:
                 # Get project
-                prow = (
-                    await session.execute(
-                        text("SELECT id, slug, human_key FROM projects WHERE slug = :k OR human_key = :k"),
-                        {"k": project},
-                    )
-                ).fetchone()
+                prow = await _resolve_mail_project(session, project)
                 if not prow:
-                    return await _render("error.html", message="Project not found")
+                    return await _render("error.html", status_code=404, message="Project not found")
 
                 pid = int(prow[0])
+                access = await _mail_ui_require_project_access(
+                    settings=settings,
+                    request=request,
+                    session=session,
+                    project_id=pid,
+                )
 
                 # Get all messages in this thread, ordered chronologically
                 # Include messages where thread_id matches OR message id matches (for thread starter)
@@ -4205,6 +4713,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     thread_subject=thread_subject,
                     messages=messages,
                     message_count=len(messages),
+                    mail_ui_access=access,
                 )
 
         # Full-text search UI across subject/body using LIKE fallback (SQLite FTS handled elsewhere)
@@ -4212,6 +4721,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         async def mail_search(
             project: str,
             q: str,
+            request: Request,
             limit: int = 10000,
             scope: str | None = None,
             order: str | None = None,
@@ -4222,15 +4732,16 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 order = "relevance"
             await ensure_schema()
             async with get_session() as session:
-                prow = (
-                    await session.execute(
-                        text("SELECT id, slug, human_key FROM projects WHERE slug = :k OR human_key = :k"),
-                        {"k": project},
-                    )
-                ).fetchone()
+                prow = await _resolve_mail_project(session, project)
                 if not prow:
-                    return await _render("error.html", message="Project not found")
+                    return await _render("error.html", status_code=404, message="Project not found")
                 pid = int(prow[0])
+                access = await _mail_ui_require_project_access(
+                    settings=settings,
+                    request=request,
+                    session=session,
+                    project_id=pid,
+                )
                 fts_expr, like_pat, like_scope, tokens = _parse_fts_query(q, scope)
                 weights = (0.0, 3.0, 1.0) if (boost or 0) else (0.0, 1.0, 1.0)
                 fts_sql = (
@@ -4338,22 +4849,24 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 tokens=tokens,
                 results=results,
                 boost=bool(boost),
+                mail_ui_access=access,
             )
 
         # File reservations and attachments views
         @fastapi_app.get("/mail/{project}/file_reservations", response_class=HTMLResponse)
-        async def mail_file_reservations(project: str) -> HTMLResponse:
+        async def mail_file_reservations(project: str, request: Request) -> HTMLResponse:
             await ensure_schema()
             async with get_session() as session:
-                prow = (
-                    await session.execute(
-                        text("SELECT id, slug, human_key FROM projects WHERE slug = :k OR human_key = :k"),
-                        {"k": project},
-                    )
-                ).fetchone()
+                prow = await _resolve_mail_project(session, project)
                 if not prow:
-                    return await _render("error.html", message="Project not found")
+                    return await _render("error.html", status_code=404, message="Project not found")
                 pid = int(prow[0])
+                access = await _mail_ui_require_project_access(
+                    settings=settings,
+                    request=request,
+                    session=session,
+                    project_id=pid,
+                )
                 # LEFT JOIN so orphaned reservations whose owning agent row
                 # has been deleted still surface in the web UI (`a.name` will
                 # be NULL — render as "<orphaned>" so operators see them and
@@ -4378,21 +4891,27 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     }
                     for r in rows.fetchall()
                 ]
-            return await _render("mail_file_reservations.html", project={"slug": prow[1], "human_key": prow[2]}, file_reservations=file_reservations)
+            return await _render(
+                "mail_file_reservations.html",
+                project={"slug": prow[1], "human_key": prow[2]},
+                file_reservations=file_reservations,
+                mail_ui_access=access,
+            )
 
         @fastapi_app.get("/mail/{project}/attachments", response_class=HTMLResponse)
-        async def mail_attachments(project: str) -> HTMLResponse:
+        async def mail_attachments(project: str, request: Request) -> HTMLResponse:
             await ensure_schema()
             async with get_session() as session:
-                prow = (
-                    await session.execute(
-                        text("SELECT id, slug, human_key FROM projects WHERE slug = :k OR human_key = :k"),
-                        {"k": project},
-                    )
-                ).fetchone()
+                prow = await _resolve_mail_project(session, project)
                 if not prow:
-                    return await _render("error.html", message="Project not found")
+                    return await _render("error.html", status_code=404, message="Project not found")
                 pid = int(prow[0])
+                access = await _mail_ui_require_project_access(
+                    settings=settings,
+                    request=request,
+                    session=session,
+                    project_id=pid,
+                )
                 rows = await session.execute(
                     text(
                         "SELECT id, subject, created_ts, attachments FROM messages WHERE project_id = :pid AND json_array_length(attachments) > 0 ORDER BY created_ts DESC LIMIT 10000"
@@ -4416,7 +4935,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     except Exception:
                         attachments = []
                     items.append({"id": r[0], "subject": r[1], "created": str(r[2]), "attachments": attachments})
-            return await _render("mail_attachments.html", project={"slug": prow[1], "human_key": prow[2]}, items=items)
+            return await _render(
+                "mail_attachments.html",
+                project={"slug": prow[1], "human_key": prow[2]},
+                items=items,
+                mail_ui_access=access,
+            )
 
         # ========== Human Overseer Routes ==========
 
@@ -4515,7 +5039,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             return recipients, subject, thread_id
 
         @fastapi_app.get("/mail/{project}/overseer/compose", response_class=HTMLResponse)
-        async def overseer_compose(project: str, reply_to: int | None = None) -> HTMLResponse:
+        async def overseer_compose(
+            project: str,
+            request: Request,
+            reply_to: int | None = None,
+        ) -> HTMLResponse:
             """Display a new-message composer or a validated reply composer.
 
             Args:
@@ -4530,18 +5058,25 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             await ensure_schema()
             async with get_session() as session:
                 # Get project
-                prow = (
-                    await session.execute(
-                        text("SELECT id, slug, human_key FROM projects WHERE slug = :k OR human_key = :k"),
-                        {"k": project},
-                    )
-                ).fetchone()
+                prow = await _resolve_mail_project(session, project)
                 if not prow:
                     return await _render("error.html", status_code=404, message="Project not found")
 
                 # Retired identities remain visible in project history, but they
                 # are not addressable from the human compose surface.
                 pid = int(prow[0])
+                access = await _mail_ui_require_project_access(
+                    settings=settings,
+                    request=request,
+                    session=session,
+                    project_id=pid,
+                    operate=reply_to is not None,
+                )
+                if reply_to is None and not access["can_compose"]:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Forbidden: new messages require the admin role",
+                    )
                 agent_rows = await session.execute(
                     text("SELECT name FROM agents WHERE project_id = :pid AND retired_at IS NULL ORDER BY name"),
                     {"pid": pid}
@@ -4580,12 +5115,26 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 project={"slug": prow[1], "human_key": prow[2]},
                 agents=agents,
                 prefill=prefill,
+                mail_ui_access=access,
             )
 
+        @fastapi_app.post("/mail/{project}/overseer/reply")
         @fastapi_app.post("/mail/{project}/overseer/send")
         async def overseer_send(project: str, request: Request) -> JSONResponse:
             """Send message from Human Overseer to selected agents."""
             await ensure_schema()
+            reply_endpoint = request.url.path.endswith("/overseer/reply")
+            async with get_session() as authorization_session:
+                authorization_project = await _resolve_mail_project(authorization_session, project)
+                if authorization_project is None:
+                    raise HTTPException(status_code=404, detail="Project not found")
+                await _mail_ui_require_project_access(
+                    settings=settings,
+                    request=request,
+                    session=authorization_session,
+                    project_id=int(authorization_project[0]),
+                    operate=reply_endpoint,
+                )
 
             try:
                 try:
@@ -4603,6 +5152,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 ):
                     raise HTTPException(status_code=400, detail="Reply target must be a positive integer or null")
                 reply_to: int | None = raw_reply_to
+                if reply_endpoint and reply_to is None:
+                    raise HTTPException(status_code=400, detail="Reply target is required")
+                if not reply_endpoint and reply_to is not None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Replies must use the project reply endpoint",
+                    )
 
                 raw_body_md = request_body.get("body_md", "")
                 if not isinstance(raw_body_md, str):
@@ -4688,12 +5244,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 now = datetime.now(timezone.utc).replace(tzinfo=None)
                 async with get_immediate_session() as session:
                     # Get project
-                    prow = (
-                        await session.execute(
-                            text("SELECT id, slug, human_key FROM projects WHERE slug = :k OR human_key = :k"),
-                            {"k": project},
-                        )
-                    ).fetchone()
+                    prow = await _resolve_mail_project(session, project)
                     if not prow:
                         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -4701,6 +5252,21 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     project_id = int(prow[0])
                     project_slug = prow[1]
                     project_human_key = prow[2]
+
+                    access = await _mail_ui_require_project_access(
+                        settings=settings,
+                        request=request,
+                        session=session,
+                        project_id=project_id,
+                        operate=reply_endpoint,
+                    )
+                    if not reply_endpoint and not access["can_compose"]:
+                        raise HTTPException(
+                            status_code=403,
+                            detail="Forbidden: new messages require the admin role",
+                        )
+                    if reply_endpoint and reply_to is None:
+                        raise HTTPException(status_code=400, detail="Reply target is required")
 
                     if reply_to is not None:
                         recipients, subject, thread_id = await _resolve_overseer_reply(
@@ -4856,8 +5422,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
                 from .storage import ensure_archive, write_message_bundle
 
-                settings = get_settings()
-                archive = await ensure_archive(settings, project_slug)
+                settings_local = get_settings()
+                archive = await ensure_archive(settings_local, project_slug)
                 message_dict = {
                     "id": message_id,
                     "thread_id": thread_id,
@@ -4932,6 +5498,234 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
         # ========== Archive Visualization Routes ==========
 
+        async def _visible_archive_projects(request: Request) -> list[dict[str, Any]]:
+            """Return archive project picker rows visible to the current principal.
+
+            Args:
+                request: Current HTTP request.
+
+            Returns:
+                Visible project rows with their template access mappings.
+            """
+            await ensure_schema()
+            async with get_session() as session:
+                visible_roles = await _mail_ui_visible_project_roles(
+                    settings=settings,
+                    request=request,
+                    session=session,
+                )
+                rows = await session.execute(
+                    text("SELECT id, slug, human_key FROM projects ORDER BY human_key")
+                )
+                projects: list[dict[str, Any]] = []
+                for row in rows.fetchall():
+                    project_id = int(row[0])
+                    if project_id not in visible_roles:
+                        continue
+                    access = _mail_ui_access_context(
+                        settings=settings,
+                        request=request,
+                        project_id=project_id,
+                        project_role=visible_roles[project_id],
+                    )
+                    projects.append(
+                        {
+                            "id": project_id,
+                            "slug": str(row[1]),
+                            "human_key": str(row[2]),
+                            "access": access,
+                        }
+                    )
+                return projects
+
+        async def _require_archive_project(
+            request: Request,
+            project_slug: str,
+        ) -> tuple[dict[str, Any], dict[str, Any]]:
+            """Resolve an archive project and enforce project visibility.
+
+            Args:
+                request: Current HTTP request.
+                project_slug: Canonical archive slug.
+
+            Returns:
+                Project metadata and template permission mappings.
+
+            Raises:
+                HTTPException: With 404 when the project is absent or invisible.
+            """
+            await ensure_schema()
+            async with get_session() as session:
+                row = (
+                    await session.execute(
+                        text("SELECT id, slug, human_key FROM projects WHERE slug = :slug"),
+                        {"slug": project_slug},
+                    )
+                ).fetchone()
+                if row is None:
+                    if not settings.mail_ui.enabled:
+                        return {
+                            "id": -1,
+                            "slug": project_slug,
+                            "human_key": project_slug,
+                        }, _mail_ui_access_context(
+                            settings=settings,
+                            request=request,
+                            project_id=-1,
+                            project_role=None,
+                        )
+                    raise HTTPException(status_code=404, detail="Project not found")
+                access = await _mail_ui_require_project_access(
+                    settings=settings,
+                    request=request,
+                    session=session,
+                    project_id=int(row[0]),
+                )
+                return {
+                    "id": int(row[0]),
+                    "slug": str(row[1]),
+                    "human_key": str(row[2]),
+                }, access
+
+        async def _scoped_archive_commits(
+            request: Request,
+            *,
+            limit: int,
+        ) -> list[dict[str, Any]]:
+            """Return recent commits without crossing project assignments.
+
+            Args:
+                request: Current HTTP request.
+                limit: Maximum number of merged commits.
+
+            Returns:
+                Reverse-chronological visible commit metadata.
+            """
+            settings_local = get_settings()
+            repo_root = await asyncio.to_thread(_expanduser_resolve_path, Path(settings_local.storage.root))
+            if not await asyncio.to_thread(_path_exists, repo_root / ".git"):
+                return []
+            repo = None
+            try:
+                repo = await asyncio.to_thread(_open_git_repo, repo_root)
+                if _mail_ui_request_is_admin(settings=settings_local, request=request):
+                    return await get_recent_commits(repo, limit=limit)
+                projects = await _visible_archive_projects(request)
+                prefixes = tuple(f"projects/{project['slug']}/" for project in projects)
+                merged: dict[str, dict[str, Any]] = {}
+                for project in projects:
+                    rows = await get_recent_commits(
+                        repo,
+                        limit=limit,
+                        project_slug=project["slug"],
+                    )
+                    for row in rows:
+                        merged[str(row["sha"])] = row
+                scoped = await _filter_archive_commits_to_prefixes(
+                    repo,
+                    list(merged.values()),
+                    prefixes,
+                )
+                return sorted(
+                    scoped,
+                    key=lambda item: str(item.get("date", "")),
+                    reverse=True,
+                )[:limit]
+            finally:
+                if repo is not None:
+                    await asyncio.to_thread(repo.close)
+
+        async def _filter_archive_commits_to_prefixes(
+            repo: Any,
+            commits: list[dict[str, Any]],
+            prefixes: tuple[str, ...],
+        ) -> list[dict[str, Any]]:
+            """Keep commits whose every changed path belongs to a visible project.
+
+            Args:
+                repo: Open Git archive repository.
+                commits: Commit metadata containing full SHA values.
+                prefixes: Visible project path prefixes.
+
+            Returns:
+                Commit metadata safe to expose to the current principal.
+            """
+
+            def filter_commits() -> list[dict[str, Any]]:
+                scoped: list[dict[str, Any]] = []
+                for row in commits:
+                    sha = str(row.get("sha", ""))
+                    try:
+                        commit = repo.commit(sha)
+                        diffs = (
+                            commit.parents[0].diff(commit)
+                            if commit.parents
+                            else commit.diff(NULL_TREE)
+                        )
+                        changed_paths = {
+                            str(path).replace("\\", "/")
+                            for diff in diffs
+                            for path in (diff.a_path, diff.b_path)
+                            if path and path != "/dev/null"
+                        }
+                    except Exception:
+                        continue
+                    if changed_paths and all(
+                        any(path.startswith(prefix) for prefix in prefixes)
+                        for path in changed_paths
+                    ):
+                        scoped.append(row)
+                return scoped
+
+            return await asyncio.to_thread(filter_commits)
+
+        def _archive_graph_from_timeline(
+            commits: list[dict[str, Any]],
+        ) -> dict[str, list[dict[str, Any]]]:
+            """Build a communication graph from already scoped timeline rows.
+
+            Args:
+                commits: Timeline rows whose changed paths passed visibility checks.
+
+            Returns:
+                Graph nodes and edges derived only from the supplied commits.
+            """
+            agent_stats: dict[str, dict[str, int]] = {}
+            connections: dict[tuple[str, str], int] = {}
+            for commit in commits:
+                sender = commit.get("sender")
+                recipients = commit.get("recipients")
+                if not isinstance(sender, str) or not isinstance(recipients, list):
+                    continue
+                sender_stats = agent_stats.setdefault(sender, {"sent": 0, "received": 0})
+                sender_stats["sent"] += 1
+                for recipient in recipients:
+                    if not isinstance(recipient, str) or not recipient:
+                        continue
+                    recipient_stats = agent_stats.setdefault(
+                        recipient,
+                        {"sent": 0, "received": 0},
+                    )
+                    recipient_stats["received"] += 1
+                    edge = (sender, recipient)
+                    connections[edge] = connections.get(edge, 0) + 1
+
+            nodes = [
+                {
+                    "id": agent,
+                    "label": agent,
+                    "sent": stats["sent"],
+                    "received": stats["received"],
+                    "total": stats["sent"] + stats["received"],
+                }
+                for agent, stats in agent_stats.items()
+            ]
+            edges = [
+                {"from": sender, "to": recipient, "count": count}
+                for (sender, recipient), count in connections.items()
+            ]
+            return {"nodes": nodes, "edges": edges}
+
         def _validate_project_slug(slug: str) -> bool:
             """Validate project slug format to prevent path traversal."""
 
@@ -4947,15 +5741,27 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             return bool(_SLUG_VALIDATOR_RE.match(slug))
 
         @fastapi_app.get("/mail/archive/guide", response_class=HTMLResponse)
-        async def archive_guide() -> HTMLResponse:
+        async def archive_guide(request: Request) -> HTMLResponse:
             """Display the archive access guide and overview."""
-            settings = get_settings()
-            guide_stats = await asyncio.to_thread(_collect_archive_guide_stats_sync, settings)
-
-            # Get list of projects for picker
-            async with get_session() as session:
-                rows = await session.execute(text("SELECT slug, human_key FROM projects ORDER BY human_key"))
-                projects = [{"slug": r[0], "human_key": r[1]} for r in rows.fetchall()]
+            settings_local = get_settings()
+            projects = await _visible_archive_projects(request)
+            if _mail_ui_request_is_admin(settings=settings_local, request=request):
+                guide_stats = await asyncio.to_thread(_collect_archive_guide_stats_sync, settings_local)
+            else:
+                commits = await _scoped_archive_commits(request, limit=10000)
+                last_commit_time = "Never"
+                if commits:
+                    with contextlib.suppress(ValueError, TypeError):
+                        last_commit_time = datetime.fromisoformat(
+                            str(commits[0]["date"]).replace("Z", "+00:00")
+                        ).strftime("%b %d, %Y")
+                guide_stats = {
+                    "storage_root": "Scoped view",
+                    "total_commits": f"{len(commits):,}",
+                    "project_count": len(projects),
+                    "repo_size": "Scoped view",
+                    "last_commit_time": last_commit_time,
+                }
 
             return await _render(
                 "archive_guide.html",
@@ -4968,27 +5774,16 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             )
 
         @fastapi_app.get("/mail/archive/activity", response_class=HTMLResponse)
-        async def archive_activity(limit: int = 50) -> HTMLResponse:
+        async def archive_activity(request: Request, limit: int = 50) -> HTMLResponse:
             """Display recent commits across all projects."""
             # Validate and cap limit to prevent DoS
             limit = max(1, min(limit, 500))  # Between 1 and 500
 
-            settings = get_settings()
-            repo_root = await asyncio.to_thread(_expanduser_resolve_path, Path(settings.storage.root))
-            if not await asyncio.to_thread(_path_exists, repo_root / ".git"):
-                return await _render("archive_activity.html", commits=[])
-
-            repo = None
-            try:
-                repo = await asyncio.to_thread(_open_git_repo, repo_root)
-                commits = await get_recent_commits(repo, limit=limit)
-                return await _render("archive_activity.html", commits=commits)
-            finally:
-                if repo is not None:
-                    await asyncio.to_thread(repo.close)
+            commits = await _scoped_archive_commits(request, limit=limit)
+            return await _render("archive_activity.html", commits=commits)
 
         @fastapi_app.get("/mail/archive/commit/{sha}", response_class=HTMLResponse)
-        async def archive_commit(sha: str) -> HTMLResponse:
+        async def archive_commit(sha: str, request: Request) -> HTMLResponse:
             """Display detailed commit information with diffs."""
             settings = get_settings()
             repo_root = await asyncio.to_thread(_expanduser_resolve_path, Path(settings.storage.root))
@@ -4999,6 +5794,20 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             try:
                 repo = await asyncio.to_thread(_open_git_repo, repo_root)
                 commit = await get_commit_detail(repo, sha)
+                if not _mail_ui_request_is_admin(settings=settings, request=request):
+                    projects = await _visible_archive_projects(request)
+                    prefixes = tuple(f"projects/{project['slug']}/" for project in projects)
+                    scoped = await _filter_archive_commits_to_prefixes(
+                        repo,
+                        [{"sha": str(commit.get("sha", sha))}],
+                        prefixes,
+                    )
+                    if not scoped:
+                        return await _render(
+                            "error.html",
+                            status_code=404,
+                            message="Commit not found",
+                        )
                 return await _render("archive_commit.html", commit=commit)
             except ValueError:
                 # Validation errors (bad SHA, etc.)
@@ -5011,7 +5820,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     await asyncio.to_thread(repo.close)
 
         @fastapi_app.get("/mail/archive/timeline", response_class=HTMLResponse)
-        async def archive_timeline(project: str | None = None) -> HTMLResponse:
+        async def archive_timeline(request: Request, project: str | None = None) -> HTMLResponse:
             """Display communication timeline with Mermaid.js visualization."""
             # Validate project slug if provided
             if project and not _validate_project_slug(project):
@@ -5024,35 +5833,43 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
             # Default to first project if not specified
             if not project:
-                async with get_session() as session:
-                    row = (
-                        await session.execute(text("SELECT slug, human_key FROM projects ORDER BY id LIMIT 1"))
-                    ).fetchone()
-                    if row:
-                        project = row[0]
-                    else:
-                        return await _render("error.html", message="No projects found")
+                projects = await _visible_archive_projects(request)
+                if not projects:
+                    return await _render("error.html", message="No projects found")
+                project = str(projects[0]["slug"])
 
-            # Get project name
-            project_name = project
-            async with get_session() as session:
-                row = (
-                    await session.execute(text("SELECT human_key FROM projects WHERE slug = :s"), {"s": project})
-                ).fetchone()
-                if row:
-                    project_name = row[0]
+            project_data, access = await _require_archive_project(request, project)
+            project_name = project_data["human_key"]
 
             repo = None
             try:
                 repo = await asyncio.to_thread(_open_git_repo, repo_root)
                 commits = await get_timeline_commits(repo, project, limit=100)
-                return await _render("archive_timeline.html", commits=commits, project=project, project_name=project_name)
+                if not _mail_ui_request_is_admin(settings=settings, request=request):
+                    projects = await _visible_archive_projects(request)
+                    prefixes = tuple(f"projects/{row['slug']}/" for row in projects)
+                    commits = await _filter_archive_commits_to_prefixes(
+                        repo,
+                        commits,
+                        prefixes,
+                    )
+                return await _render(
+                    "archive_timeline.html",
+                    commits=commits,
+                    project=project,
+                    project_name=project_name,
+                    mail_ui_access=access,
+                )
             finally:
                 if repo is not None:
                     await asyncio.to_thread(repo.close)
 
         @fastapi_app.get("/mail/archive/browser", response_class=HTMLResponse)
-        async def archive_browser(project: str | None = None, path: str = "") -> HTMLResponse:
+        async def archive_browser(
+            request: Request,
+            project: str | None = None,
+            path: str = "",
+        ) -> HTMLResponse:
             """Browse archive files and directories."""
             if not project:
                 # Show project selector - requires project parameter
@@ -5062,25 +5879,33 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             if not _validate_project_slug(project):
                 return await _render("error.html", message="Invalid project identifier")
 
+            _project_data, access = await _require_archive_project(request, project)
             settings = get_settings()
             archive = await _open_existing_project_archive(settings, project)
             if archive is None:
                 return await _render("error.html", message="Project archive not found")
             try:
                 tree = await get_archive_tree(archive, path)
-                return await _render("archive_browser.html", tree=tree, project=project, path=path)
+                return await _render(
+                    "archive_browser.html",
+                    tree=tree,
+                    project=project,
+                    path=path,
+                    mail_ui_access=access,
+                )
             except ValueError:
                 return await _render("error.html", message="Invalid archive path")
             finally:
                 await asyncio.to_thread(archive.repo.close)
 
         @fastapi_app.get("/mail/archive/browser/{project}/file")
-        async def archive_browser_file(project: str, path: str) -> JSONResponse:
+        async def archive_browser_file(project: str, path: str, request: Request) -> JSONResponse:
             """Get file content from archive."""
             # Validate project slug
             if not _validate_project_slug(project):
                 raise HTTPException(status_code=400, detail="Invalid project identifier")
 
+            await _require_archive_project(request, project)
             try:
                 settings = get_settings()
                 archive = await _open_existing_project_archive(settings, project)
@@ -5104,12 +5929,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 raise HTTPException(status_code=404, detail="File not found") from err
 
         @fastapi_app.get("/mail/archive/browser/{project}/download")
-        async def archive_browser_download(project: str, path: str) -> Response:
+        async def archive_browser_download(project: str, path: str, request: Request) -> Response:
             """Download a file from the archive as an attachment (#221)."""
             # Validate project slug
             if not _validate_project_slug(project):
                 raise HTTPException(status_code=400, detail="Invalid project identifier")
 
+            await _require_archive_project(request, project)
             try:
                 settings = get_settings()
                 archive = await _open_existing_project_archive(settings, project)
@@ -5141,7 +5967,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 raise HTTPException(status_code=404, detail="File not found") from err
 
         @fastapi_app.get("/mail/archive/network", response_class=HTMLResponse)
-        async def archive_network(project: str | None = None) -> HTMLResponse:
+        async def archive_network(request: Request, project: str | None = None) -> HTMLResponse:
             """Display agent communication network graph."""
             # Validate project slug if provided
             if project and not _validate_project_slug(project):
@@ -5154,35 +5980,42 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
             # Default to first project
             if not project:
-                async with get_session() as session:
-                    row = (
-                        await session.execute(text("SELECT slug, human_key FROM projects ORDER BY id LIMIT 1"))
-                    ).fetchone()
-                    if row:
-                        project = row[0]
-                    else:
-                        return await _render("error.html", message="No projects found")
+                projects = await _visible_archive_projects(request)
+                if not projects:
+                    return await _render("error.html", message="No projects found")
+                project = str(projects[0]["slug"])
 
-            # Get project name
-            project_name = project
-            async with get_session() as session:
-                row = (
-                    await session.execute(text("SELECT human_key FROM projects WHERE slug = :s"), {"s": project})
-                ).fetchone()
-                if row:
-                    project_name = row[0]
+            project_data, access = await _require_archive_project(request, project)
+            project_name = project_data["human_key"]
 
             repo = None
             try:
                 repo = await asyncio.to_thread(_open_git_repo, repo_root)
-                graph = await get_agent_communication_graph(repo, project, limit=200)
-                return await _render("archive_network.html", graph=graph, project=project, project_name=project_name)
+                if _mail_ui_request_is_admin(settings=settings, request=request):
+                    graph = await get_agent_communication_graph(repo, project, limit=200)
+                else:
+                    projects = await _visible_archive_projects(request)
+                    prefixes = tuple(f"projects/{row['slug']}/" for row in projects)
+                    timeline = await get_timeline_commits(repo, project, limit=200)
+                    scoped_timeline = await _filter_archive_commits_to_prefixes(
+                        repo,
+                        timeline,
+                        prefixes,
+                    )
+                    graph = _archive_graph_from_timeline(scoped_timeline)
+                return await _render(
+                    "archive_network.html",
+                    graph=graph,
+                    project=project,
+                    project_name=project_name,
+                    mail_ui_access=access,
+                )
             finally:
                 if repo is not None:
                     await asyncio.to_thread(repo.close)
 
         @fastapi_app.get("/mail/api/projects/{project}/agents")
-        async def api_project_agents(project: str) -> JSONResponse:
+        async def api_project_agents(project: str, request: Request) -> JSONResponse:
             """Get list of agents for a project."""
             # Validate project slug
             if not _validate_project_slug(project):
@@ -5190,13 +6023,15 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
             async with get_session() as session:
                 # Get project ID
-                proj_result = await session.execute(
-                    text("SELECT id FROM projects WHERE slug = :k OR human_key = :k"),
-                    {"k": project}
-                )
-                prow = proj_result.fetchone()
+                prow = await _resolve_mail_project(session, project)
                 if not prow:
                     raise HTTPException(status_code=404, detail="Project not found")
+                await _mail_ui_require_project_access(
+                    settings=settings,
+                    request=request,
+                    session=session,
+                    project_id=int(prow[0]),
+                )
 
                 # Get agents for this project
                 agents_result = await session.execute(
@@ -5208,17 +6043,20 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             return JSONResponse({"agents": agents})
 
         @fastapi_app.get("/mail/archive/time-travel", response_class=HTMLResponse)
-        async def archive_time_travel() -> HTMLResponse:
+        async def archive_time_travel(request: Request) -> HTMLResponse:
             """Display time-travel interface."""
-            # Get all projects
-            async with get_session() as session:
-                rows = await session.execute(text("SELECT slug FROM projects ORDER BY human_key"))
-                projects = [r[0] for r in rows.fetchall()]
+            project_rows = await _visible_archive_projects(request)
+            projects = [row["slug"] for row in project_rows]
 
             return await _render("archive_time_travel.html", projects=projects)
 
         @fastapi_app.get("/mail/archive/time-travel/snapshot")
-        async def archive_time_travel_snapshot(project: str, agent: str, timestamp: str) -> JSONResponse:
+        async def archive_time_travel_snapshot(
+            project: str,
+            agent: str,
+            timestamp: str,
+            request: Request,
+        ) -> JSONResponse:
             """Get historical inbox snapshot."""
             # Validate project slug
             if not _validate_project_slug(project):
@@ -5232,6 +6070,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             if not timestamp or not _TIMESTAMP_VALIDATOR_RE.match(timestamp):
                 raise HTTPException(status_code=400, detail="Invalid timestamp format. Use ISO 8601 format (YYYY-MM-DDTHH:MM)")
 
+            await _require_archive_project(request, project)
             try:
                 # Get project archive
                 settings = get_settings()

@@ -1,5 +1,7 @@
 {% extends "base.html" %}
 
+{% set can_mutate = mail_ui_access.can_mutate if mail_ui_access else not mail_ui_user %}
+
 {% block title %}{{ agent }} — Inbox{% endblock %}
 
 {% block breadcrumbs %}
@@ -55,6 +57,7 @@
           <span class="hidden sm:inline">Refresh</span>
         </button>
 
+        {% if can_mutate %}
         <!-- Bulk Actions (shown when messages are selected) -->
         <div x-show="selectedMessages.length > 0"
              x-transition:enter="transition ease-out duration-200"
@@ -92,6 +95,7 @@
           <i data-lucide="check-check" class="w-4 h-4" :class="{ 'animate-spin': isRefreshing }"></i>
           <span class="hidden sm:inline">Mark All Read</span>
         </button>
+        {% endif %}
       </div>
     </div>
 
@@ -190,6 +194,7 @@
              :class="item.unread ? 'border-primary-300 dark:border-primary-700 bg-primary-50/30 dark:bg-primary-900/10' : 'border-slate-200 dark:border-slate-700'"
              :style="`animation-delay: ${Math.min(index * 0.05, 1.0)}s;`">
           <div class="flex items-start p-6 gap-4">
+            {% if can_mutate %}
             <!-- Checkbox for bulk selection -->
             <div class="flex-shrink-0 pt-1">
               <input type="checkbox"
@@ -199,6 +204,7 @@
                      class="w-5 h-5 text-primary-600 bg-white dark:bg-slate-700 border-slate-300 dark:border-slate-600 rounded focus:ring-2 focus:ring-primary-500 transition-all duration-200 cursor-pointer"
                      :aria-label="'Select message: ' + item.subject" />
             </div>
+            {% endif %}
 
             <!-- Message Content (clickable) -->
             <a :href="`/mail/{{ project.slug }}/message/${item.id}`"

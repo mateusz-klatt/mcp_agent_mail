@@ -22,6 +22,7 @@ import contextvars
 import logging
 import random
 import re
+import secrets
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -958,6 +959,7 @@ def _setup_fts(connection: Any) -> None:
         # working and every agent simply has no alias until it sets one.
         "ALTER TABLE agents ADD COLUMN display_name VARCHAR(128) DEFAULT NULL",
         "ALTER TABLE agents ADD COLUMN notify_sound VARCHAR(32) DEFAULT NULL",
+        "ALTER TABLE ui_users ADD COLUMN session_generation VARCHAR(64) DEFAULT NULL",
     ]:
         with suppress(Exception):  # Column already exists — safe to ignore
             connection.exec_driver_sql(migration_sql)
@@ -970,6 +972,68 @@ def _setup_fts(connection: Any) -> None:
         "CREATE INDEX IF NOT EXISTS ix_messages_reply_to ON messages (reply_to)",
     ]:
         connection.exec_driver_sql(index_sql)
+
+    connection.exec_driver_sql(
+        """
+        UPDATE ui_users
+        SET role = 'member', session_epoch = session_epoch + 1
+        WHERE role = 'viewer'
+        """
+    )
+    generation_rows = connection.exec_driver_sql(
+        """
+        SELECT id
+        FROM ui_users
+        WHERE session_generation IS NULL OR trim(session_generation) = ''
+        """
+    ).fetchall()
+    for generation_row in generation_rows:
+        connection.exec_driver_sql(
+            "UPDATE ui_users SET session_generation = ? WHERE id = ?",
+            (secrets.token_hex(32), int(generation_row[0])),
+        )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS ui_project_assignments_user_ad
+        AFTER DELETE ON ui_users
+        BEGIN
+            DELETE FROM ui_project_assignments WHERE user_id = old.id;
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS ui_project_assignments_parent_bi
+        BEFORE INSERT ON ui_project_assignments
+        BEGIN
+            SELECT RAISE(ABORT, 'ui_project_assignments user does not exist')
+            WHERE NOT EXISTS (SELECT 1 FROM ui_users WHERE id = new.user_id);
+            SELECT RAISE(ABORT, 'ui_project_assignments project does not exist')
+            WHERE NOT EXISTS (SELECT 1 FROM projects WHERE id = new.project_id);
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS ui_project_assignments_parent_bu
+        BEFORE UPDATE OF user_id, project_id ON ui_project_assignments
+        BEGIN
+            SELECT RAISE(ABORT, 'ui_project_assignments user does not exist')
+            WHERE NOT EXISTS (SELECT 1 FROM ui_users WHERE id = new.user_id);
+            SELECT RAISE(ABORT, 'ui_project_assignments project does not exist')
+            WHERE NOT EXISTS (SELECT 1 FROM projects WHERE id = new.project_id);
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS ui_project_assignments_project_ad
+        AFTER DELETE ON projects
+        BEGIN
+            DELETE FROM ui_project_assignments WHERE project_id = old.id;
+        END
+        """
+    )
 
 
 def get_database_path(settings: Settings | None = None) -> Path | None:

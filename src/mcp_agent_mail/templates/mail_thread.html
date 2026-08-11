@@ -1,5 +1,7 @@
 {% extends "base.html" %}
 
+{% set can_reply = mail_ui_access.can_reply if mail_ui_access else not mail_ui_user %}
+
 {% block title %}{{ thread_subject }} — Thread{% endblock %}
 
 {% block breadcrumbs %}
@@ -154,11 +156,13 @@
           <!-- Message Actions -->
           <div class="mt-6 pt-4 border-t border-slate-200 dark:border-slate-700 flex flex-wrap items-center justify-between gap-3">
             <div class="flex flex-wrap items-center gap-2">
+              {% if can_reply %}
               <a href="/mail/{{ project.slug }}/overseer/compose?reply_to={{ msg.id }}"
                  class="min-h-[44px] inline-flex items-center gap-1.5 px-3 py-2 bg-primary-600 hover:bg-primary-700 text-white rounded-lg transition-colors text-sm font-medium">
                 <i data-lucide="reply" class="w-3.5 h-3.5"></i>
                 Reply
               </a>
+              {% endif %}
               <button type="button"
                       onclick="copyToClipboard({{ (msg.body_md or '') | tojson | forceescape }}, 'Message copied!')"
                       class="min-h-[44px] inline-flex items-center gap-1.5 px-3 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-colors text-sm font-medium"

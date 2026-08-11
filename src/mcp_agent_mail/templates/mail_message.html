@@ -1,5 +1,7 @@
 {% extends "base.html" %}
 
+{% set can_reply = mail_ui_access.can_reply if mail_ui_access else not mail_ui_user %}
+
 {% block title %}{{ message.subject }} — Agent Mail{% endblock %}
 
 {% block breadcrumbs %}
@@ -34,6 +36,7 @@
 {% endblock %}
 
 {% block header_actions %}
+{% if can_reply %}
 <div class="flex items-center gap-2">
   <a href="/mail/{{ project.slug }}/overseer/compose?reply_to={{ message.id }}"
      class="min-w-[44px] min-h-[44px] px-4 py-2 text-sm font-medium text-white bg-primary-600 hover:bg-primary-700 rounded-lg flex items-center justify-center gap-2 transition-colors"
@@ -43,6 +46,7 @@
     <span class="hidden sm:inline">Reply</span>
   </a>
 </div>
+{% endif %}
 {% endblock %}
 
 {% block content %}

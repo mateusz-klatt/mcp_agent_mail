@@ -1,5 +1,8 @@
 {% extends "base.html" %}
 
+{% set can_compose = mail_ui_access.can_compose if mail_ui_access else not mail_ui_user %}
+{% set can_mutate = mail_ui_access.can_mutate if mail_ui_access else not mail_ui_user %}
+
 {% block title %}{{ project.human_key }} — Agent Mail{% endblock %}
 
 {% block breadcrumbs %}
@@ -41,6 +44,7 @@
    than at the pattern. Every control keeps its icon and its aria-label; only
    text and two decorative rules are hidden. #}
 <div class="flex items-center gap-1 xl:gap-3">
+  {% if can_compose %}
   <!-- Divider -->
   <div class="hidden xl:block w-px h-8 bg-slate-200 dark:bg-slate-700"></div>
 
@@ -54,6 +58,7 @@
 
   <!-- Divider -->
   <div class="hidden xl:block w-px h-8 bg-slate-200 dark:bg-slate-700"></div>
+  {% endif %}
 
   <!-- Secondary Actions -->
   <div class="flex items-center gap-1 xl:gap-2">
@@ -113,6 +118,7 @@
           </div>
         </div>
       </div>
+      {% if can_mutate %}
       <!-- Archive / Unarchive Button -->
       <div class="flex self-start items-center gap-2" x-data="{ showArchiveConfirm: false }">
         {% if project.archived_at %}
@@ -169,6 +175,7 @@
         </div>
         {% endif %}
       </div>
+      {% endif %}
     </div>
 
     <!-- Subtle accent -->
@@ -471,12 +478,14 @@
                       aria-label="Copy agent name">
                 <i data-lucide="copy" class="w-4 h-4"></i>
               </button>
+              {% if can_mutate %}
               <button onclick="if(confirm('Retire agent ' + {{ a.name | tojson | forceescape }} + '? It will stop accepting new messages but message history is preserved.')) fetch('/mail/api/retire-agent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agent_id:{{ a.id }}})}).then(r=>r.json()).then(d=>{if(d.success) location.reload()})"
                       class="p-2.5 bg-slate-100 dark:bg-slate-700 hover:bg-amber-100 dark:hover:bg-amber-900/30 text-slate-700 dark:text-slate-300 hover:text-amber-700 dark:hover:text-amber-400 rounded-lg transition-all duration-200 shadow-sm hover:shadow-md"
                       data-tippy-content="Retire agent"
                       aria-label="Retire agent">
                 <i data-lucide="user-minus" class="w-4 h-4"></i>
               </button>
+              {% endif %}
             </div>
           </div>
         {% endfor %}
@@ -526,12 +535,14 @@
                     <i data-lucide="inbox" class="w-4 h-4"></i>
                     <span>View Inbox</span>
                   </a>
+                  {% if can_mutate %}
                   <button onclick="fetch('/mail/api/unretire-agent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agent_id:{{ a.id }}})}).then(r=>r.json()).then(d=>{if(d.success) location.reload()})"
                           class="p-2.5 bg-green-100 dark:bg-green-900/30 hover:bg-green-200 dark:hover:bg-green-800/40 text-green-700 dark:text-green-400 rounded-lg transition-all duration-200 shadow-sm hover:shadow-md"
                           data-tippy-content="Restore agent to accept mail"
                           aria-label="Restore agent to accept mail">
                     <i data-lucide="user-plus" class="w-4 h-4"></i>
                   </button>
+                  {% endif %}
                 </div>
               </div>
             {% endfor %}

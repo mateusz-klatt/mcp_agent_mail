@@ -5,18 +5,21 @@ Tests all /mail/archive/* endpoints for proper rendering and functionality.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import text
 
-from mcp_agent_mail import config as _config
+from mcp_agent_mail import config as _config, webauth
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.http import build_http_app
-from mcp_agent_mail.storage import ensure_archive, write_agent_profile, write_message_bundle
+from mcp_agent_mail.storage import ensure_archive, get_commit_detail, write_agent_profile, write_message_bundle
 
 
 # The viewer is behind a password login by default, and these tests exercise
@@ -100,6 +103,80 @@ async def _setup_archive_with_commits(settings: _config.Settings) -> dict:
     }
 
 
+async def _setup_named_archive(
+    settings: _config.Settings,
+    *,
+    slug: str,
+    subject: str,
+    agent_name: str,
+) -> tuple[int, str | None]:
+    """Create one named project archive and return its id and head commit."""
+    await ensure_schema()
+    async with get_session() as session:
+        result = await session.execute(
+            text(
+                "INSERT INTO projects (slug, human_key, created_at) "
+                "VALUES (:slug, :human_key, datetime('now')) RETURNING id"
+            ),
+            {"slug": slug, "human_key": f"/{slug}"},
+        )
+        project_id = int(result.scalar_one())
+        await session.commit()
+    archive = await ensure_archive(settings, slug)
+    await write_agent_profile(
+        archive,
+        {
+            "name": agent_name,
+            "program": "test",
+            "model": "test",
+            "task_description": subject,
+        },
+    )
+    await write_message_bundle(
+        archive,
+        message={"id": project_id, "subject": subject, "created": "2026-01-12T12:00:00"},
+        body_md=subject,
+        sender=agent_name,
+        recipients=[agent_name],
+    )
+    return project_id, _get_git_head_sha(archive.root)
+
+
+async def _rbac_cookie(username: str, project_id: int) -> dict[str, str]:
+    """Create a member assigned as viewer to one archive project."""
+    from mcp_agent_mail.models import UiProjectAssignment, UiUser
+
+    async with get_session() as session:
+        user = UiUser(
+            username=username,
+            password_hash=webauth.hash_password("irrelevant"),
+            role=webauth.ROLE_MEMBER,
+        )
+        session.add(user)
+        await session.commit()
+        await session.refresh(user)
+        assert user.id is not None
+        session.add(
+            UiProjectAssignment(
+                user_id=int(user.id),
+                project_id=project_id,
+                role=webauth.PROJECT_ROLE_VIEWER,
+            )
+        )
+        await session.commit()
+        epoch = int(user.session_epoch)
+        generation = user.session_generation
+    return {
+        "agent_mail_session": webauth.make_session(
+            username,
+            epoch=epoch,
+            generation=generation,
+            now=time.time(),
+            secret=b"archive-rbac-session-secret-0123456789",
+        )
+    }
+
+
 # =============================================================================
 # Archive Guide Tests
 # =============================================================================
@@ -119,6 +196,259 @@ async def test_archive_guide(isolated_env):
         resp = await client.get("/mail/archive/guide")
         assert resp.status_code == 200
         assert "text/html" in resp.headers.get("content-type", "")
+
+
+@pytest.mark.asyncio
+async def test_member_archive_routes_hide_unassigned_and_mixed_scope_commits(
+    isolated_env,
+    monkeypatch,
+):
+    """Archive pages cannot leak another project through alternate read routes."""
+    monkeypatch.setenv("MAIL_UI_AUTH_ENABLED", "true")
+    monkeypatch.setenv("MAIL_UI_SESSION_SECRET", "archive-rbac-session-secret-0123456789")
+    _config.clear_settings_cache()
+    settings = _config.get_settings()
+    visible_id, visible_sha = await _setup_named_archive(
+        settings,
+        slug="archive-visible",
+        subject="VISIBLE-ARCHIVE-SUBJECT",
+        agent_name="VisibleArchiveAgent",
+    )
+    _hidden_id, hidden_sha = await _setup_named_archive(
+        settings,
+        slug="archive-hidden",
+        subject="HIDDEN-ARCHIVE-SUBJECT",
+        agent_name="HiddenArchiveAgent",
+    )
+    visible_archive = await ensure_archive(settings, "archive-visible")
+    await write_message_bundle(
+        visible_archive,
+        message={"id": 9001, "subject": "VISIBLE-ONLY-COMMIT", "created": "2026-01-12T13:00:00"},
+        body_md="visible only",
+        sender="VisibleArchiveAgent",
+        recipients=["VisibleArchiveAgent"],
+    )
+    visible_sha = _get_git_head_sha(visible_archive.root)
+    assert visible_sha is not None
+    assert hidden_sha is not None
+    cookies = await _rbac_cookie("archive-member", visible_id)
+    root = Path(settings.storage.root).expanduser().resolve()
+    visible_mixed = root / "projects" / "archive-visible" / "messages" / "mixed-scope.txt"
+    hidden_mixed = root / "projects" / "archive-hidden" / "messages" / "mixed-scope.txt"
+    visible_mixed.parent.mkdir(parents=True, exist_ok=True)
+    hidden_mixed.parent.mkdir(parents=True, exist_ok=True)
+    visible_mixed.write_text("visible", encoding="utf-8")
+    hidden_mixed.write_text("hidden", encoding="utf-8")
+    await asyncio.to_thread(
+        subprocess.run,
+        ["git", "add", visible_mixed.relative_to(root), hidden_mixed.relative_to(root)],
+        cwd=root,
+        check=True,
+    )
+    await asyncio.to_thread(
+        subprocess.run,
+        [
+            "git",
+            "commit",
+            "-m",
+            "mail: HiddenLeakedAgent -> VisibleArchiveAgent | MIXED-HIDDEN-METADATA",
+        ],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    mixed_sha = _get_git_head_sha(root)
+    hidden_rename_source = (
+        root / "projects" / "archive-hidden" / "messages" / "hidden-rename-source.txt"
+    )
+    visible_rename_target = (
+        root / "projects" / "archive-visible" / "messages" / "renamed-from-hidden.txt"
+    )
+    hidden_rename_source.write_text("HIDDEN-RENAME-SENTINEL", encoding="utf-8")
+    await asyncio.to_thread(
+        subprocess.run,
+        ["git", "add", hidden_rename_source.relative_to(root)],
+        cwd=root,
+        check=True,
+    )
+    await asyncio.to_thread(
+        subprocess.run,
+        ["git", "commit", "-m", "HIDDEN-RENAME-SOURCE"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    await asyncio.to_thread(
+        subprocess.run,
+        [
+            "git",
+            "mv",
+            str(hidden_rename_source.relative_to(root)),
+            str(visible_rename_target.relative_to(root)),
+        ],
+        cwd=root,
+        check=True,
+    )
+    await asyncio.to_thread(
+        subprocess.run,
+        ["git", "commit", "-m", "RENAME-HIDDEN-METADATA"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    rename_sha = _get_git_head_sha(root)
+    app = build_http_app(settings, build_mcp_server())
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        cookies=cookies,
+    ) as client:
+        hidden_routes = [
+            "/mail/archive/browser?project=archive-hidden",
+            "/mail/archive/browser/archive-hidden/file?path=agents/HiddenArchiveAgent/profile.json",
+            "/mail/archive/browser/archive-hidden/download?path=agents/HiddenArchiveAgent/profile.json",
+            "/mail/archive/timeline?project=archive-hidden",
+            "/mail/archive/network?project=archive-hidden",
+            "/mail/archive/time-travel/snapshot?project=archive-hidden&agent=HiddenArchiveAgent&timestamp=2026-01-12T12:00",
+        ]
+        hidden_responses = [await client.get(path) for path in hidden_routes]
+        hidden_commit = await client.get(f"/mail/archive/commit/{hidden_sha}")
+        mixed_commit = await client.get(f"/mail/archive/commit/{mixed_sha}")
+        rename_commit = await client.get(f"/mail/archive/commit/{rename_sha}")
+        visible_commit = await client.get(f"/mail/archive/commit/{visible_sha}")
+        activity = await client.get("/mail/archive/activity")
+        guide = await client.get("/mail/archive/guide")
+        time_travel = await client.get("/mail/archive/time-travel")
+        visible_timeline = await client.get(
+            "/mail/archive/timeline?project=archive-visible"
+        )
+        visible_network = await client.get(
+            "/mail/archive/network?project=archive-visible"
+        )
+
+    assert all(response.status_code == 404 for response in hidden_responses)
+    assert hidden_commit.status_code == 404
+    assert mixed_commit.status_code == 404
+    assert rename_commit.status_code == 404
+    assert "HIDDEN-RENAME-SENTINEL" not in rename_commit.text
+    visible_paths_result = await asyncio.to_thread(
+        subprocess.run,
+        ["git", "show", "--name-only", "--format=", visible_sha],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    visible_paths = visible_paths_result.stdout.splitlines()
+    visible_detail = await get_commit_detail(visible_archive.repo, visible_sha)
+    detail_paths = [item["path"] for item in visible_detail["files_changed"]]
+    assert visible_commit.status_code == 200, {"git": visible_paths, "detail": detail_paths}
+    for response in (activity, guide, time_travel, visible_timeline, visible_network):
+        assert response.status_code == 200
+        assert "archive-hidden" not in response.text
+        assert "HIDDEN-ARCHIVE-SUBJECT" not in response.text
+        assert "MIXED-HIDDEN-METADATA" not in response.text
+        assert "HiddenLeakedAgent" not in response.text
+        assert "RENAME-HIDDEN-METADATA" not in response.text
+        assert "HIDDEN-RENAME-SENTINEL" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_member_archive_root_commit_uses_empty_tree_for_scope(
+    isolated_env,
+    monkeypatch,
+):
+    """A mixed root commit cannot be scoped against the current working tree."""
+    monkeypatch.setenv("MAIL_UI_AUTH_ENABLED", "true")
+    monkeypatch.setenv("MAIL_UI_SESSION_SECRET", "archive-rbac-session-secret-0123456789")
+    _config.clear_settings_cache()
+    settings = _config.get_settings()
+    await ensure_schema()
+    async with get_session() as session:
+        visible_result = await session.execute(
+            text(
+                "INSERT INTO projects (slug, human_key, created_at) "
+                "VALUES ('root-visible', '/root-visible', datetime('now')) RETURNING id"
+            )
+        )
+        visible_id = int(visible_result.scalar_one())
+        await session.execute(
+            text(
+                "INSERT INTO projects (slug, human_key, created_at) "
+                "VALUES ('root-hidden', '/root-hidden', datetime('now'))"
+            )
+        )
+        await session.commit()
+
+    root = Path(settings.storage.root).expanduser().resolve()
+    visible_file = root / "projects" / "root-visible" / "messages" / "visible.txt"
+    hidden_file = root / "projects" / "root-hidden" / "messages" / "hidden.txt"
+    visible_file.parent.mkdir(parents=True, exist_ok=True)
+    hidden_file.parent.mkdir(parents=True, exist_ok=True)
+    visible_file.write_text("visible root content", encoding="utf-8")
+    hidden_file.write_text("HIDDEN-ROOT-SENTINEL", encoding="utf-8")
+    for command in (
+        ["git", "init"],
+        ["git", "config", "user.email", "archive-test@example.invalid"],
+        ["git", "config", "user.name", "Archive Test"],
+        ["git", "add", "projects"],
+        [
+            "git",
+            "commit",
+            "-m",
+            "mail: HiddenRootAgent -> VisibleRootAgent | ROOT-MIXED-HIDDEN-METADATA",
+        ],
+    ):
+        await asyncio.to_thread(
+            subprocess.run,
+            command,
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    root_sha = _get_git_head_sha(root)
+    assert root_sha is not None
+    later_file = root / "projects" / "root-visible" / "messages" / "later.txt"
+    later_file.write_text("visible later content", encoding="utf-8")
+    await asyncio.to_thread(
+        subprocess.run,
+        ["git", "add", later_file.relative_to(root)],
+        cwd=root,
+        check=True,
+    )
+    await asyncio.to_thread(
+        subprocess.run,
+        ["git", "commit", "-m", "VISIBLE-LATER"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    cookies = await _rbac_cookie("root-archive-member", visible_id)
+    app = build_http_app(settings, build_mcp_server())
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        cookies=cookies,
+    ) as client:
+        detail = await client.get(f"/mail/archive/commit/{root_sha}")
+        activity = await client.get("/mail/archive/activity")
+        timeline = await client.get("/mail/archive/timeline?project=root-visible")
+        network = await client.get("/mail/archive/network?project=root-visible")
+
+    assert detail.status_code == 404
+    assert "HIDDEN-ROOT-SENTINEL" not in detail.text
+    for response in (activity, timeline, network):
+        assert response.status_code == 200
+        assert "ROOT-MIXED-HIDDEN-METADATA" not in response.text
+        assert "HIDDEN-ROOT-SENTINEL" not in response.text
+        assert "HiddenRootAgent" not in response.text
 
 
 # =============================================================================

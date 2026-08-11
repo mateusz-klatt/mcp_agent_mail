@@ -5054,3 +5054,13 @@ def test_hook_rejects_invalid_client_or_slot(
 
     assert result.returncode != 0
     assert error_fragment in result.stderr
+
+
+def test_hook_mail_ui_bearer_surface_is_limited_to_file_reservations() -> None:
+    mail_paths = {
+        match.group(0)
+        for path in INSTALLED_HOOK_SOURCES
+        for match in re.finditer(r"/mail/[A-Za-z0-9_/-]+", path.read_text(encoding="utf-8"))
+    }
+
+    assert mail_paths == {"/mail/api/file-reservations"}

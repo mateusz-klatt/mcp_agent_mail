@@ -1,5 +1,7 @@
 {% extends "base.html" %}
 
+{% set is_admin = true if not mail_ui_user else mail_ui_user.is_admin %}
+
 {% block title %}Archive Guide — Agent Mail{% endblock %}
 
 {% block breadcrumbs %}
@@ -159,8 +161,9 @@
   </div>
 
   <!-- Feature Sections Grid -->
-  <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-8">
+  <div class="grid grid-cols-1 {% if is_admin %}lg:grid-cols-2{% endif %} gap-8 mb-8">
 
+    {% if is_admin %}
     <!-- Local Access -->
     <div class="bg-white dark:bg-slate-800 rounded-2xl shadow-soft border-2 border-slate-200 dark:border-slate-700 overflow-hidden hover:border-primary-400 dark:hover:border-primary-600 transition-all duration-300">
       <div class="bg-gradient-to-r from-slate-700 to-slate-600 dark:from-slate-800 dark:to-slate-700 p-6">
@@ -254,6 +257,7 @@
         </div>
       </div>
     </div>
+    {% endif %}
 
     <!-- UI Features -->
     <div class="bg-white dark:bg-slate-800 rounded-2xl shadow-soft border-2 border-slate-200 dark:border-slate-700 overflow-hidden hover:border-primary-400 dark:hover:border-primary-600 transition-all duration-300" x-data="{ selectedProject: '' }">

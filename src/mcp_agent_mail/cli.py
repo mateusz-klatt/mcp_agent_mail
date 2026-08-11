@@ -434,56 +434,156 @@ ui_users_app = typer.Typer(help="Manage human logins for the /mail web viewer")
 app.add_typer(ui_users_app, name="ui-users")
 
 
-async def _ui_users_load(username: str) -> Any:
-    from sqlmodel import select
+async def _ui_users_find_user(session: Any, username: str) -> Any:
+    """Load one human UI user in an existing transaction.
 
-    from .db import ensure_schema, get_session
-    from .models import UiUser
+    Args:
+        session: Open async database session.
+        username: Exact login name to find.
 
-    await ensure_schema()
-    async with get_session() as session:
-        result = await session.execute(select(UiUser).where(UiUser.username == username))
-        return result.scalars().first()
-
-
-async def _ui_users_enabled_admins(exclude: str | None = None) -> int:
-    """How many enabled admins exist, optionally ignoring one username.
-
-    Used to refuse the last step that would lock every human out of the UI.
+    Returns:
+        The matching ``UiUser`` row or ``None``.
     """
     from sqlmodel import select
 
-    from .db import ensure_schema, get_session
+    from .models import UiUser
+
+    result = await session.execute(select(UiUser).where(UiUser.username == username))
+    return result.scalars().first()
+
+
+async def _ui_users_other_admin_count(
+    session: Any,
+    *,
+    user_id: int,
+    enabled_only: bool,
+) -> int:
+    """Count other global administrators in an existing transaction.
+
+    Args:
+        session: Open async database session.
+        user_id: User excluded from the count.
+        enabled_only: Whether disabled administrators should be excluded.
+
+    Returns:
+        The number of matching administrator rows.
+    """
+    from sqlmodel import select
+
     from .models import UiUser
     from .webauth import ROLE_ADMIN
 
-    await ensure_schema()
-    async with get_session() as session:
-        result = await session.execute(
-            select(UiUser).where(UiUser.role == ROLE_ADMIN).where(UiUser.disabled == False)  # noqa: E712
+    statement = select(UiUser).where(UiUser.role == ROLE_ADMIN).where(UiUser.id != user_id)
+    if enabled_only:
+        statement = statement.where(UiUser.disabled == False)  # noqa: E712
+    result = await session.execute(statement)
+    return len(result.scalars().all())
+
+
+async def _ui_users_find_project(
+    session: Any,
+    identifier: str,
+) -> tuple[Any | None, tuple[str, ...]]:
+    """Resolve a project slug, canonical key, or repository path.
+
+    Args:
+        session: Open async database session.
+        identifier: Project slug, human key, or repository path.
+
+    Returns:
+        The matching ``Project`` row and an empty ambiguity tuple. When no
+        unique match exists, the row is ``None`` and the tuple contains every
+        conflicting project slug.
+    """
+    from sqlmodel import select
+
+    from .models import Project
+
+    raw_identifier = identifier.strip()
+    if not raw_identifier:
+        return None, ()
+    canonical_identifier = raw_identifier
+    with suppress(Exception):
+        canonical_identifier = await asyncio.to_thread(
+            _canonicalize_project_identifier,
+            raw_identifier,
         )
-        rows = list(result.scalars().all())
-    return sum(1 for r in rows if r.username != exclude)
+    exact_slug_result = await session.execute(
+        select(Project).where(Project.slug == raw_identifier)
+    )
+    exact_slug = exact_slug_result.scalars().first()
+    if exact_slug is not None:
+        return exact_slug, ()
+
+    human_key_conditions = [
+        cast(ColumnElement[bool], Project.human_key == raw_identifier),
+    ]
+    if canonical_identifier != raw_identifier:
+        human_key_conditions.append(
+            cast(ColumnElement[bool], Project.human_key == canonical_identifier)
+        )
+    human_key_result = await session.execute(
+        select(Project).where(_sa_or(*human_key_conditions))
+    )
+    human_key_rows_by_id = {
+        int(row.id): row
+        for row in human_key_result.scalars().all()
+        if row.id is not None
+    }
+    if len(human_key_rows_by_id) == 1:
+        return next(iter(human_key_rows_by_id.values())), ()
+    if len(human_key_rows_by_id) > 1:
+        return None, tuple(
+            sorted(str(row.slug) for row in human_key_rows_by_id.values())
+        )
+
+    casefolded_slug_result = await session.execute(
+        select(Project).where(func.lower(Project.slug) == raw_identifier.lower())
+    )
+    casefolded_slug_rows = list(casefolded_slug_result.scalars().all())
+    if len(casefolded_slug_rows) == 1:
+        return casefolded_slug_rows[0], ()
+    if len(casefolded_slug_rows) > 1:
+        return None, tuple(sorted(str(row.slug) for row in casefolded_slug_rows))
+
+    canonical_slug = slugify(canonical_identifier)
+    canonical_slug_result = await session.execute(
+        select(Project).where(Project.slug == canonical_slug)
+    )
+    return canonical_slug_result.scalars().first(), ()
 
 
 @ui_users_app.command("add")
 def ui_users_add(
     username: str = typer.Argument(..., help="Login name"),
-    role: str = typer.Option(None, "--role", help="admin (may perform destructive actions) or viewer"),
+    role: str = typer.Option(None, "--role", help="Global role: admin or member"),
 ) -> None:
     """Create a user, or reset an existing user's password.
 
     Resetting a password bumps ``session_epoch``, which immediately invalidates
     that user's existing browser sessions.
     """
-    from .db import get_session
-    from .webauth import DEFAULT_NEW_ROLE, ROLES, hash_password, valid_username
+    from sqlmodel import select
+
+    from .db import ensure_schema, get_immediate_session
+    from .models import UiUser
+    from .webauth import (
+        DEFAULT_NEW_ROLE,
+        ROLE_ADMIN,
+        UI_USER_ROLES,
+        hash_password,
+        normalize_ui_user_role,
+        valid_username,
+    )
 
     if not valid_username(username):
         typer.secho("Invalid username (1-64 chars, no '|' or '/', no surrounding whitespace)", fg="red")
         raise typer.Exit(code=2)
-    if role is not None and role not in ROLES:
-        typer.secho(f"Invalid role {role!r}; use one of: {', '.join(ROLES)}", fg="red")
+    if role is not None and role not in UI_USER_ROLES:
+        typer.secho(
+            f"Invalid role {role!r}; use one of: {', '.join(UI_USER_ROLES)}",
+            fg="red",
+        )
         raise typer.Exit(code=2)
 
     password = typer.prompt("Password", hide_input=True, confirmation_prompt=True)
@@ -492,10 +592,10 @@ def ui_users_add(
         raise typer.Exit(code=1)
 
     async def _save() -> tuple[str, str]:
-        from .models import UiUser
-
-        existing = await _ui_users_load(username)
-        async with get_session() as session:
+        await ensure_schema()
+        async with get_immediate_session() as session:
+            result = await session.execute(select(UiUser).where(UiUser.username == username))
+            existing = result.scalars().first()
             if existing is None:
                 effective = role or DEFAULT_NEW_ROLE
                 session.add(
@@ -503,25 +603,43 @@ def ui_users_add(
                 )
                 await session.commit()
                 return "created", effective
-            # Explicit --role wins; a bare password reset preserves the current role.
-            effective = role or existing.role
-            row = await session.get(UiUser, existing.id)
-            if row is None:
-                # Re-read in a fresh session, so the row can be gone between the
-                # lookup and the write. Reported rather than crashed on: the
-                # caller already distinguishes outcomes, and "deleted while you
-                # were typing your password" is a true thing to say.
-                return "vanished", effective
-            row.password_hash = hash_password(password)
-            row.role = effective
-            row.session_epoch = row.session_epoch + 1  # revoke live sessions
-            session.add(row)
+            existing_role = normalize_ui_user_role(existing.role)
+            if role is None and existing_role is None:
+                return "invalid_global_role", existing.role
+            effective = role or existing_role
+            assert effective is not None
+            if (
+                existing.id is not None
+                and existing_role == ROLE_ADMIN
+                and effective != ROLE_ADMIN
+                and await _ui_users_other_admin_count(
+                    session,
+                    user_id=existing.id,
+                    enabled_only=True,
+                )
+                == 0
+            ):
+                return "last_admin", effective
+            existing.password_hash = hash_password(password)
+            existing.role = effective
+            existing.session_epoch = existing.session_epoch + 1
+            session.add(existing)
             await session.commit()
             return "updated", effective
 
     action, effective = _run_async(_save())
-    if action == "vanished":
-        typer.secho(f"User {username!r} was deleted while this command ran", fg="red")
+    if action == "last_admin":
+        typer.secho(
+            f"Refused: {username!r} is the last administrator account; changing its role "
+            "would eliminate the admin recovery path.",
+            fg="red",
+        )
+        raise typer.Exit(code=1)
+    if action == "invalid_global_role":
+        typer.secho(
+            f"Refused: {username!r} has an invalid global role; pass --role admin or --role member to repair it.",
+            fg="red",
+        )
         raise typer.Exit(code=1)
     typer.secho(f"{action} user {username!r} with role {effective!r}", fg="green")
     if action == "updated":
@@ -530,58 +648,102 @@ def ui_users_add(
 
 @ui_users_app.command("list")
 def ui_users_list() -> None:
-    """List viewer logins."""
+    """List human logins and their effective project-access summary."""
     from sqlmodel import select
 
     from .db import ensure_schema, get_session
-    from .models import UiUser
+    from .models import Project, UiProjectAssignment, UiUser
+    from .webauth import (
+        ROLE_ADMIN,
+        ROLE_MEMBER,
+        normalize_project_role,
+        normalize_ui_user_role,
+    )
 
-    async def _list() -> list[Any]:
+    async def _list() -> tuple[list[Any], list[Any]]:
         await ensure_schema()
         async with get_session() as session:
-            result = await session.execute(select(UiUser).order_by(UiUser.username))
-            return list(result.scalars().all())
+            users_result = await session.execute(select(UiUser).order_by(UiUser.username))
+            assignments_result = await session.execute(
+                select(UiProjectAssignment, Project)
+                .join(
+                    Project,
+                    cast(ColumnElement[bool], UiProjectAssignment.project_id == Project.id),
+                )
+                .order_by(
+                    cast(Any, UiProjectAssignment.user_id),
+                    cast(Any, Project.slug),
+                )
+            )
+            return list(users_result.scalars().all()), list(assignments_result.all())
 
-    rows = _run_async(_list())
+    rows, assignment_rows = _run_async(_list())
     if not rows:
-        typer.echo("No viewer logins yet. Create one with: mcp-agent-mail ui-users add <name> --role admin")
+        typer.echo("No human logins yet. Create one with: mcp-agent-mail ui-users add <name> --role admin")
         return
+    assignments_by_user: dict[int, list[tuple[str, str]]] = {}
+    for assignment, project in assignment_rows:
+        normalized_project_role = normalize_project_role(assignment.role)
+        role_label = normalized_project_role or f"invalid:{assignment.role}"
+        assignments_by_user.setdefault(assignment.user_id, []).append((project.slug, role_label))
     for r in rows:
         state = "disabled" if r.disabled else "enabled"
         last = r.last_login_ts.isoformat(sep=" ", timespec="seconds") if r.last_login_ts else "never"
-        typer.echo(f"{r.username:<24} {r.role:<8} {state:<9} last login: {last}")
+        normalized_role = normalize_ui_user_role(r.role)
+        assignments = assignments_by_user.get(r.id, [])
+        valid_assignment_count = sum(
+            1 for _project_slug, assignment_role in assignments if not assignment_role.startswith("invalid:")
+        )
+        if normalized_role == ROLE_ADMIN:
+            access = "all projects"
+        elif normalized_role == ROLE_MEMBER:
+            access = f"{valid_assignment_count} project(s)"
+        else:
+            access = "none (invalid global role)"
+        role_label = normalized_role or f"invalid:{r.role}"
+        typer.echo(
+            f"{r.username:<24} {role_label:<14} {state:<9} access: {access}; last login: {last}"
+        )
 
 
 @ui_users_app.command("role")
 def ui_users_role(
     username: str = typer.Argument(...),
-    role: str = typer.Argument(..., help="admin or viewer"),
+    role: str = typer.Argument(..., help="admin or member"),
 ) -> None:
     """Change a user's role."""
-    from .db import get_session
-    from .models import UiUser
-    from .webauth import ROLE_ADMIN, ROLES
+    from .db import ensure_schema, get_immediate_session
+    from .webauth import ROLE_ADMIN, UI_USER_ROLES, normalize_ui_user_role
 
-    if role not in ROLES:
-        typer.secho(f"Invalid role {role!r}; use one of: {', '.join(ROLES)}", fg="red")
+    if role not in UI_USER_ROLES:
+        typer.secho(
+            f"Invalid role {role!r}; use one of: {', '.join(UI_USER_ROLES)}",
+            fg="red",
+        )
         raise typer.Exit(code=2)
 
     async def _set() -> str:
-        existing = await _ui_users_load(username)
-        if existing is None:
-            return "not_found"
-        if (
-            existing.role == ROLE_ADMIN and role != ROLE_ADMIN
-            and await _ui_users_enabled_admins(exclude=username) == 0
-        ):
-            return "last_admin"
-        async with get_session() as session:
-            row = await session.get(UiUser, existing.id)
+        await ensure_schema()
+        async with get_immediate_session() as session:
+            row = await _ui_users_find_user(session, username)
             if row is None:
-                # Same race as above; "not_found" is what the caller already
-                # prints for a user that is not there.
                 return "not_found"
+            if normalize_ui_user_role(row.role) == role:
+                return "unchanged"
+            if (
+                row.id is not None
+                and normalize_ui_user_role(row.role) == ROLE_ADMIN
+                and role != ROLE_ADMIN
+                and await _ui_users_other_admin_count(
+                    session,
+                    user_id=row.id,
+                    enabled_only=True,
+                )
+                == 0
+            ):
+                return "last_admin"
             row.role = role
+            row.session_epoch = row.session_epoch + 1
             session.add(row)
             await session.commit()
         return "ok"
@@ -592,11 +754,16 @@ def ui_users_role(
         raise typer.Exit(code=1)
     if outcome == "last_admin":
         typer.secho(
-            f"Refused: {username!r} is the only enabled admin; demoting it would lock everyone out.",
+            f"Refused: {username!r} is the last administrator account; demoting it "
+            "would eliminate the admin recovery path.",
             fg="red",
         )
         raise typer.Exit(code=1)
+    if outcome == "unchanged":
+        typer.echo(f"{username!r} already has role {role!r}; no sessions were invalidated.")
+        return
     typer.secho(f"Set {username!r} role to {role!r}", fg="green")
+    typer.echo("Existing browser sessions for this user were invalidated.")
 
 
 @ui_users_app.command("remove")
@@ -604,27 +771,39 @@ def ui_users_remove(
     username: str = typer.Argument(...),
     yes: bool = typer.Option(False, "--yes", help="Skip the confirmation prompt"),
 ) -> None:
-    """Delete a viewer login permanently."""
-    from .db import get_session
-    from .models import UiUser
-    from .webauth import ROLE_ADMIN
+    """Delete a human login and its project assignments permanently."""
+    from sqlmodel import select
+
+    from .db import ensure_schema, get_immediate_session
+    from .models import UiProjectAssignment
+    from .webauth import ROLE_ADMIN, normalize_ui_user_role
 
     async def _remove() -> str:
-        existing = await _ui_users_load(username)
-        if existing is None:
-            return "not_found"
-        if (
-            existing.role == ROLE_ADMIN and not existing.disabled
-            and await _ui_users_enabled_admins(exclude=username) == 0
-        ):
-            return "last_admin"
-        async with get_session() as session:
-            row = await session.get(UiUser, existing.id)
+        await ensure_schema()
+        async with get_immediate_session() as session:
+            row = await _ui_users_find_user(session, username)
+            if row is None or row.id is None:
+                return "not_found"
+            if (
+                normalize_ui_user_role(row.role) == ROLE_ADMIN
+                and await _ui_users_other_admin_count(
+                    session,
+                    user_id=row.id,
+                    enabled_only=True,
+                )
+                == 0
+            ):
+                return "last_admin"
+            assignments_result = await session.execute(
+                select(UiProjectAssignment).where(UiProjectAssignment.user_id == row.id)
+            )
+            for assignment in assignments_result.scalars().all():
+                await session.delete(assignment)
             await session.delete(row)
             await session.commit()
         return "ok"
 
-    if not yes and not typer.confirm(f"Permanently delete viewer login {username!r}?"):
+    if not yes and not typer.confirm(f"Permanently delete human login {username!r}?"):
         typer.echo("Aborted.")
         raise typer.Exit(code=1)
 
@@ -634,7 +813,9 @@ def ui_users_remove(
         raise typer.Exit(code=1)
     if outcome == "last_admin":
         typer.secho(
-            f"Refused: {username!r} is the only enabled admin (would lock everyone out).", fg="red"
+            f"Refused: {username!r} is the last administrator account; deleting it "
+            "would eliminate the admin recovery path.",
+            fg="red",
         )
         raise typer.Exit(code=1)
     typer.secho(f"Removed user {username!r}", fg="green")
@@ -653,26 +834,30 @@ def ui_users_enable(username: str = typer.Argument(...)) -> None:
 
 
 def _ui_users_set_disabled(username: str, disabled: bool) -> None:
-    from .db import get_session
-    from .models import UiUser
-    from .webauth import ROLE_ADMIN
+    from .db import ensure_schema, get_immediate_session
+    from .webauth import ROLE_ADMIN, normalize_ui_user_role
 
     async def _set() -> str:
-        existing = await _ui_users_load(username)
-        if existing is None:
-            return "not_found"
-        if (
-            disabled and existing.role == ROLE_ADMIN and not existing.disabled
-            and await _ui_users_enabled_admins(exclude=username) == 0
-        ):
-            return "last_admin"
-        async with get_session() as session:
-            row = await session.get(UiUser, existing.id)
-            if row is None:
+        await ensure_schema()
+        async with get_immediate_session() as session:
+            row = await _ui_users_find_user(session, username)
+            if row is None or row.id is None:
                 return "not_found"
+            if row.disabled == disabled:
+                return "unchanged"
+            if (
+                disabled
+                and normalize_ui_user_role(row.role) == ROLE_ADMIN
+                and not row.disabled
+                and await _ui_users_other_admin_count(
+                    session,
+                    user_id=row.id,
+                    enabled_only=True,
+                )
+                == 0
+            ):
+                return "last_admin"
             row.disabled = disabled
-            # Bump the epoch so a disable takes effect on the next request rather
-            # than whenever the cookie happens to expire.
             row.session_epoch = row.session_epoch + 1
             session.add(row)
             await session.commit()
@@ -687,7 +872,253 @@ def _ui_users_set_disabled(username: str, disabled: bool) -> None:
             f"Refused: {username!r} is the only enabled admin (would lock everyone out).", fg="red"
         )
         raise typer.Exit(code=1)
+    if outcome == "unchanged":
+        typer.echo(f"User {username!r} is already {'disabled' if disabled else 'enabled'}.")
+        return
     typer.secho(f"{'Disabled' if disabled else 'Enabled'} user {username!r}", fg="green")
+    typer.echo("Existing browser sessions for this user were invalidated.")
+
+
+@ui_users_app.command("grant")
+def ui_users_grant(
+    username: str = typer.Argument(..., help="Human login name"),
+    project: str = typer.Argument(..., help="Project slug, human key, or repository path"),
+    role: str = typer.Option("viewer", "--role", "-r", help="Project role: viewer or operator"),
+) -> None:
+    """Grant or replace one member's explicit project role."""
+    from sqlmodel import select
+
+    from .db import ensure_schema, get_immediate_session
+    from .models import UiProjectAssignment
+    from .webauth import (
+        PROJECT_ROLES,
+        ROLE_ADMIN,
+        ROLE_MEMBER,
+        normalize_project_role,
+        normalize_ui_user_role,
+    )
+
+    if role not in PROJECT_ROLES:
+        typer.secho(
+            f"Invalid project role {role!r}; use one of: {', '.join(PROJECT_ROLES)}",
+            fg="red",
+        )
+        raise typer.Exit(code=2)
+
+    async def _grant() -> tuple[str, str | None]:
+        await ensure_schema()
+        async with get_immediate_session() as session:
+            user = await _ui_users_find_user(session, username)
+            if user is None or user.id is None:
+                return "user_not_found", None
+            global_role = normalize_ui_user_role(user.role)
+            if global_role == ROLE_ADMIN:
+                return "global_admin", None
+            if global_role != ROLE_MEMBER:
+                return "invalid_global_role", None
+            project_row, ambiguous_projects = await _ui_users_find_project(session, project)
+            if ambiguous_projects:
+                return "project_ambiguous", ", ".join(ambiguous_projects)
+            if project_row is None or project_row.id is None:
+                return "project_not_found", None
+            result = await session.execute(
+                select(UiProjectAssignment).where(
+                    UiProjectAssignment.user_id == user.id,
+                    UiProjectAssignment.project_id == project_row.id,
+                )
+            )
+            assignment = result.scalars().first()
+            if assignment is not None and normalize_project_role(assignment.role) == role:
+                return "unchanged", project_row.slug
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            if assignment is None:
+                assignment = UiProjectAssignment(
+                    user_id=user.id,
+                    project_id=project_row.id,
+                    role=role,
+                    created_ts=now,
+                    updated_ts=now,
+                )
+            else:
+                assignment.role = role
+                assignment.updated_ts = now
+            user.session_epoch = user.session_epoch + 1
+            session.add(assignment)
+            session.add(user)
+            await session.commit()
+            return "granted", project_row.slug
+
+    outcome, project_slug = _run_async(_grant())
+    if outcome == "user_not_found":
+        typer.secho(f"No such user {username!r}", fg="red")
+        raise typer.Exit(code=1)
+    if outcome == "project_not_found":
+        typer.secho(f"No such project {project!r}", fg="red")
+        raise typer.Exit(code=1)
+    if outcome == "project_ambiguous":
+        typer.secho(
+            f"Ambiguous project {project!r}; matches slugs: {project_slug}. Use one exact slug.",
+            fg="red",
+        )
+        raise typer.Exit(code=1)
+    if outcome == "global_admin":
+        typer.secho(
+            f"Refused: {username!r} is an admin and already has global project access.",
+            fg="red",
+        )
+        raise typer.Exit(code=1)
+    if outcome == "invalid_global_role":
+        typer.secho(
+            f"Refused: {username!r} has an invalid global role; repair it with ui-users role.",
+            fg="red",
+        )
+        raise typer.Exit(code=1)
+    if outcome == "unchanged":
+        typer.echo(
+            f"{username!r} already has {role!r} access to project {project_slug!r}; "
+            "no sessions were invalidated."
+        )
+        return
+    typer.secho(
+        f"Granted {role!r} access to project {project_slug!r} for {username!r}.",
+        fg="green",
+    )
+    typer.echo("Existing browser sessions for this user were invalidated.")
+
+
+@ui_users_app.command("revoke")
+def ui_users_revoke(
+    username: str = typer.Argument(..., help="Human login name"),
+    project: str = typer.Argument(..., help="Project slug, human key, or repository path"),
+) -> None:
+    """Revoke one member's explicit access to a project."""
+    from sqlmodel import select
+
+    from .db import ensure_schema, get_immediate_session
+    from .models import UiProjectAssignment
+    from .webauth import ROLE_ADMIN, ROLE_MEMBER, normalize_ui_user_role
+
+    async def _revoke() -> tuple[str, str | None]:
+        await ensure_schema()
+        async with get_immediate_session() as session:
+            user = await _ui_users_find_user(session, username)
+            if user is None or user.id is None:
+                return "user_not_found", None
+            global_role = normalize_ui_user_role(user.role)
+            if global_role == ROLE_ADMIN:
+                return "global_admin", None
+            if global_role != ROLE_MEMBER:
+                return "invalid_global_role", None
+            project_row, ambiguous_projects = await _ui_users_find_project(session, project)
+            if ambiguous_projects:
+                return "project_ambiguous", ", ".join(ambiguous_projects)
+            if project_row is None or project_row.id is None:
+                return "project_not_found", None
+            result = await session.execute(
+                select(UiProjectAssignment).where(
+                    UiProjectAssignment.user_id == user.id,
+                    UiProjectAssignment.project_id == project_row.id,
+                )
+            )
+            assignment = result.scalars().first()
+            if assignment is None:
+                return "unchanged", project_row.slug
+            await session.delete(assignment)
+            user.session_epoch = user.session_epoch + 1
+            session.add(user)
+            await session.commit()
+            return "revoked", project_row.slug
+
+    outcome, project_slug = _run_async(_revoke())
+    if outcome == "user_not_found":
+        typer.secho(f"No such user {username!r}", fg="red")
+        raise typer.Exit(code=1)
+    if outcome == "project_not_found":
+        typer.secho(f"No such project {project!r}", fg="red")
+        raise typer.Exit(code=1)
+    if outcome == "project_ambiguous":
+        typer.secho(
+            f"Ambiguous project {project!r}; matches slugs: {project_slug}. Use one exact slug.",
+            fg="red",
+        )
+        raise typer.Exit(code=1)
+    if outcome == "global_admin":
+        typer.secho(
+            f"Refused: {username!r} is an admin; project revocation cannot narrow global access.",
+            fg="red",
+        )
+        raise typer.Exit(code=1)
+    if outcome == "invalid_global_role":
+        typer.secho(
+            f"Refused: {username!r} has an invalid global role; repair it with ui-users role.",
+            fg="red",
+        )
+        raise typer.Exit(code=1)
+    if outcome == "unchanged":
+        typer.echo(
+            f"{username!r} has no assignment for project {project_slug!r}; "
+            "no sessions were invalidated."
+        )
+        return
+    typer.secho(
+        f"Revoked access to project {project_slug!r} from {username!r}.",
+        fg="green",
+    )
+    typer.echo("Existing browser sessions for this user were invalidated.")
+
+
+@ui_users_app.command("access")
+def ui_users_access(username: str = typer.Argument(..., help="Human login name")) -> None:
+    """Show one human login's effective project access."""
+    from sqlmodel import select
+
+    from .db import ensure_schema, get_session
+    from .models import Project, UiProjectAssignment
+    from .webauth import ROLE_ADMIN, ROLE_MEMBER, normalize_project_role, normalize_ui_user_role
+
+    async def _access() -> tuple[Any, list[Any]]:
+        await ensure_schema()
+        async with get_session() as session:
+            user = await _ui_users_find_user(session, username)
+            if user is None or user.id is None:
+                return None, []
+            result = await session.execute(
+                select(UiProjectAssignment, Project)
+                .join(
+                    Project,
+                    cast(ColumnElement[bool], UiProjectAssignment.project_id == Project.id),
+                )
+                .where(UiProjectAssignment.user_id == user.id)
+                .order_by(cast(Any, Project.slug))
+            )
+            return user, list(result.all())
+
+    user, assignments = _run_async(_access())
+    if user is None:
+        typer.secho(f"No such user {username!r}", fg="red")
+        raise typer.Exit(code=1)
+    state = "disabled" if user.disabled else "enabled"
+    global_role = normalize_ui_user_role(user.role)
+    if global_role == ROLE_ADMIN:
+        typer.echo(f"{username} admin {state}: all projects (global)")
+        return
+    if global_role != ROLE_MEMBER:
+        typer.secho(
+            f"{username} invalid:{user.role} {state}: no access (invalid global role)",
+            fg="red",
+        )
+        raise typer.Exit(code=1)
+    typer.echo(f"{username} member {state}")
+    valid_assignments = 0
+    for assignment, project_row in assignments:
+        project_role = normalize_project_role(assignment.role)
+        if project_role is None:
+            typer.echo(f"  {project_row.slug:<32} invalid:{assignment.role} (denied)")
+            continue
+        valid_assignments += 1
+        typer.echo(f"  {project_row.slug:<32} {project_role}")
+    if valid_assignments == 0:
+        typer.echo("  no project access")
 
 
 def _canonical_project_path(path: Path) -> Path:

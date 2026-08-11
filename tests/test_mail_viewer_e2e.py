@@ -7,15 +7,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from mcp_agent_mail import config as _config
+from mcp_agent_mail import config as _config, webauth
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import ensure_schema, get_immediate_session, get_session
 from mcp_agent_mail.http import build_http_app
 from mcp_agent_mail.storage import ensure_archive, write_agent_profile
+
+MAIL_UI_TEST_SECRET = "mail-viewer-rbac-session-secret-0123456789"
 
 
 # The viewer is behind a password login by default, and these tests exercise
@@ -194,6 +197,228 @@ async def _setup_test_data(
         "message_ids": message_ids,
         "cross_project_message_id": cross_project_message_id,
     }
+
+
+def _rbac_settings(monkeypatch) -> _config.Settings:
+    monkeypatch.setenv("MAIL_UI_AUTH_ENABLED", "true")
+    monkeypatch.setenv("MAIL_UI_SESSION_SECRET", MAIL_UI_TEST_SECRET)
+    monkeypatch.setenv("MAIL_UI_COOKIE_SECURE", "false")
+    monkeypatch.setenv("HTTP_BEARER_TOKEN", "")
+    _config.clear_settings_cache()
+    return _config.get_settings()
+
+
+async def _ui_session_cookie(
+    settings: _config.Settings,
+    *,
+    username: str,
+    global_role: str,
+    project_id: int | None = None,
+    project_role: str | None = None,
+) -> dict[str, str]:
+    from mcp_agent_mail.models import UiProjectAssignment, UiUser
+
+    async with get_session() as session:
+        user = UiUser(
+            username=username,
+            password_hash=webauth.hash_password("not-used-by-this-session-test"),
+            role=global_role,
+        )
+        session.add(user)
+        await session.commit()
+        await session.refresh(user)
+        assert user.id is not None
+        session_epoch = int(user.session_epoch)
+        session_generation = user.session_generation
+        if project_id is not None and project_role is not None:
+            session.add(
+                UiProjectAssignment(
+                    user_id=int(user.id),
+                    project_id=project_id,
+                    role=project_role,
+                )
+            )
+            await session.commit()
+
+    token = webauth.make_session(
+        username,
+        epoch=session_epoch,
+        generation=session_generation,
+        now=time.time(),
+        secret=MAIL_UI_TEST_SECRET.encode("utf-8"),
+    )
+    return {settings.mail_ui.cookie_name: token}
+
+
+@pytest.mark.asyncio
+async def test_mail_admin_render_keeps_all_existing_controls(isolated_env, monkeypatch):
+    settings = _rbac_settings(monkeypatch)
+    data = await _setup_test_data(settings)
+    cookies = await _ui_session_cookie(
+        settings,
+        username="admin-render",
+        global_role=webauth.ROLE_ADMIN,
+    )
+    app = build_http_app(settings, build_mcp_server())
+    message_id = int(data["message_ids"][0])
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        cookies=cookies,
+    ) as client:
+        project = await client.get("/mail/test-proj")
+        inbox = await client.get("/mail/test-proj/inbox/BlueLake")
+        message = await client.get(f"/mail/test-proj/message/{message_id}")
+        compose = await client.get("/mail/test-proj/overseer/compose")
+
+    assert project.status_code == 200
+    assert 'aria-label="Send high-priority message as Human Overseer"' in project.text
+    assert 'aria-label="Retire agent"' in project.text
+    assert "Archive Project" in project.text
+    assert inbox.status_code == 200
+    assert 'aria-label="Mark All Read"' in inbox.text
+    assert '@change="toggleSelection(item.id)"' in inbox.text
+    assert message.status_code == 200
+    assert 'data-tippy-content="Reply to this message as the Human Overseer"' in message.text
+    assert compose.status_code == 200
+    assert 'sendEndpoint: "/mail/test-proj/overseer/send"' in compose.text
+
+
+@pytest.mark.asyncio
+async def test_mail_viewer_render_is_project_scoped_and_read_only(isolated_env, monkeypatch):
+    settings = _rbac_settings(monkeypatch)
+    data = await _setup_test_data(settings)
+    async with get_session() as session:
+        from sqlalchemy import text
+
+        await session.execute(
+            text(
+                "INSERT INTO projects (slug, human_key, created_at) "
+                "VALUES ('hidden-proj', '/tmp/hidden-proj', datetime('now'))"
+            )
+        )
+        await session.commit()
+    cookies = await _ui_session_cookie(
+        settings,
+        username="viewer-render",
+        global_role=webauth.ROLE_MEMBER,
+        project_id=int(data["project_id"]),
+        project_role=webauth.PROJECT_ROLE_VIEWER,
+    )
+    app = build_http_app(settings, build_mcp_server())
+    message_id = int(data["message_ids"][0])
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        cookies=cookies,
+    ) as client:
+        unified = await client.get("/mail")
+        unified_api = await client.get("/mail/api/unified-inbox")
+        project = await client.get("/mail/test-proj")
+        hidden = await client.get("/mail/hidden-proj")
+        inbox = await client.get("/mail/test-proj/inbox/BlueLake")
+        message = await client.get(f"/mail/test-proj/message/{message_id}")
+        thread = await client.get("/mail/test-proj/thread/thread-1")
+        new_compose = await client.get("/mail/test-proj/overseer/compose")
+        reply_compose = await client.get(
+            "/mail/test-proj/overseer/compose",
+            params={"reply_to": message_id},
+        )
+        archive = await client.get("/mail/archive/guide")
+
+    assert unified.status_code == 200
+    assert "test-proj" in unified.text
+    assert "hidden-proj" not in unified.text
+    assert unified_api.status_code == 200
+    assert {item["can_reply"] for item in unified_api.json()["messages"]} == {False}
+    assert hidden.status_code == 404
+    assert project.status_code == 200
+    assert 'aria-label="Send high-priority message as Human Overseer"' not in project.text
+    assert 'aria-label="Retire agent"' not in project.text
+    assert "Archive Project" not in project.text
+    assert inbox.status_code == 200
+    assert 'aria-label="Mark All Read"' not in inbox.text
+    assert '@change="toggleSelection(item.id)"' not in inbox.text
+    assert message.status_code == 200
+    assert 'data-tippy-content="Reply to this message as the Human Overseer"' not in message.text
+    assert thread.status_code == 200
+    assert "/overseer/compose?reply_to=" not in thread.text
+    assert new_compose.status_code == 403
+    assert reply_compose.status_code == 403
+    assert archive.status_code == 200
+    assert "Repository Location" not in archive.text
+
+
+@pytest.mark.asyncio
+async def test_mail_operator_render_exposes_reply_only(isolated_env, monkeypatch):
+    settings = _rbac_settings(monkeypatch)
+    data = await _setup_test_data(settings)
+    cookies = await _ui_session_cookie(
+        settings,
+        username="operator-render",
+        global_role=webauth.ROLE_MEMBER,
+        project_id=int(data["project_id"]),
+        project_role=webauth.PROJECT_ROLE_OPERATOR,
+    )
+    app = build_http_app(settings, build_mcp_server())
+    message_id = int(data["message_ids"][0])
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        cookies=cookies,
+    ) as client:
+        unified_api = await client.get("/mail/api/unified-inbox")
+        project = await client.get("/mail/test-proj")
+        message = await client.get(f"/mail/test-proj/message/{message_id}")
+        thread = await client.get("/mail/test-proj/thread/thread-1")
+        new_compose = await client.get("/mail/test-proj/overseer/compose")
+        reply_compose = await client.get(
+            "/mail/test-proj/overseer/compose",
+            params={"reply_to": message_id},
+        )
+        csrf_headers = {
+            "Origin": "http://test",
+            "Referer": "http://test/mail/test-proj",
+            "Host": "test",
+        }
+        forbidden_new_message = await client.post(
+            "/mail/test-proj/overseer/send",
+            json={
+                "recipients": ["BlueLake"],
+                "subject": "Operator must not compose",
+                "body_md": "This request must be rejected.",
+            },
+            headers=csrf_headers,
+        )
+        sent_reply = await client.post(
+            "/mail/test-proj/overseer/reply",
+            json={
+                "reply_to": message_id,
+                "body_md": "Operator reply through the dedicated endpoint.",
+            },
+            headers=csrf_headers,
+        )
+
+    assert unified_api.status_code == 200
+    assert {item["can_reply"] for item in unified_api.json()["messages"]} == {True}
+    assert project.status_code == 200
+    assert 'aria-label="Send high-priority message as Human Overseer"' not in project.text
+    assert 'aria-label="Retire agent"' not in project.text
+    assert "Archive Project" not in project.text
+    assert message.status_code == 200
+    assert 'data-tippy-content="Reply to this message as the Human Overseer"' in message.text
+    assert thread.status_code == 200
+    assert f"/overseer/compose?reply_to={message_id}" in thread.text
+    assert new_compose.status_code == 403
+    assert reply_compose.status_code == 200
+    assert 'sendEndpoint: "/mail/test-proj/overseer/reply"' in reply_compose.text
+    assert "isReply: true" in reply_compose.text
+    assert forbidden_new_message.status_code == 403
+    assert sent_reply.status_code == 200
+    assert sent_reply.json()["recipients"] == ["BlueLake"]
 
 
 # =============================================================================
@@ -687,6 +912,7 @@ async def test_mail_overseer_compose(isolated_env):
         assert "text/html" in resp.headers.get("content-type", "")
         # Should have a form
         assert "<form" in resp.text.lower() or "form" in resp.text.lower()
+        assert 'sendEndpoint: "/mail/test-proj/overseer/send"' in resp.text
 
 
 @pytest.mark.asyncio
@@ -756,7 +982,7 @@ async def test_mail_overseer_local_reply_is_server_derived(isolated_env):
             params={"reply_to": original_id},
         )
         sent = await client.post(
-            "/mail/test-proj/overseer/send",
+            "/mail/test-proj/overseer/reply",
             json={
                 "reply_to": original_id,
                 "recipients": ["UntrustedOverride"],
@@ -768,6 +994,7 @@ async def test_mail_overseer_local_reply_is_server_derived(isolated_env):
 
     assert compose.status_code == 200
     assert f"replyTo: {original_id}" in compose.text
+    assert 'sendEndpoint: "/mail/test-proj/overseer/reply"' in compose.text
     assert 'selectedRecipients: ["BlueLake"]' in compose.text
     assert "Routing is locked to the original sender or recipients" in compose.text
     assert compose.text.count('readonly aria-readonly="true"') == 2
@@ -812,7 +1039,7 @@ async def test_mail_overseer_reply_subject_stays_within_composer_limit(isolated_
             params={"reply_to": original_id},
         )
         sent = await client.post(
-            "/mail/test-proj/overseer/send",
+            "/mail/test-proj/overseer/reply",
             json={
                 "reply_to": original_id,
                 "recipients": {"ignored": True},
@@ -863,7 +1090,7 @@ async def test_mail_overseer_follow_up_targets_original_recipients_not_itself(is
             params={"reply_to": original_id},
         )
         follow_up = await client.post(
-            "/mail/test-proj/overseer/send",
+            "/mail/test-proj/overseer/reply",
             json={
                 "reply_to": original_id,
                 "recipients": ["HumanOverseer"],
@@ -922,7 +1149,7 @@ async def test_mail_overseer_reply_fails_closed_for_cross_project_sender_collisi
             params={"reply_to": external_id},
         )
         sent = await client.post(
-            "/mail/test-proj/overseer/send",
+            "/mail/test-proj/overseer/reply",
             json={
                 "reply_to": external_id,
                 "recipients": ["BlueLake"],
@@ -965,7 +1192,7 @@ async def test_mail_overseer_reply_does_not_prefill_or_send_to_retired_original_
             params={"reply_to": original_id},
         )
         sent = await client.post(
-            "/mail/test-proj/overseer/send",
+            "/mail/test-proj/overseer/reply",
             json={"reply_to": original_id, "body_md": "Must not send."},
         )
 

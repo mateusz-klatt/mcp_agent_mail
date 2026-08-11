@@ -39,7 +39,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator, Iterable, Sequence, TypeVar, cast
 
 from filelock import SoftFileLock, Timeout
-from git import Actor, Repo
+from git import NULL_TREE, Actor, Repo
 from git.exc import GitCommandError
 from git.objects.tree import Tree
 from PIL import Image
@@ -3515,7 +3515,7 @@ async def get_commit_detail(
             diffs = parent.diff(commit, create_patch=True)
         else:
             # Initial commit - diff against empty tree
-            diffs = commit.diff(None, create_patch=True)
+            diffs = commit.diff(NULL_TREE, create_patch=True)
 
         # Build unified diff string
         diff_text = ""

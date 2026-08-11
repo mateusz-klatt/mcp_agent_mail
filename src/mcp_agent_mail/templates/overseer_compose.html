@@ -1,5 +1,10 @@
 {% extends "base.html" %}
 
+{% set is_reply = true if prefill and prefill.reply_to else false %}
+{% set can_reply = mail_ui_access.can_reply if mail_ui_access else not mail_ui_user %}
+{% set can_compose = mail_ui_access.can_compose if mail_ui_access else not mail_ui_user %}
+{% set can_send = can_reply if is_reply else can_compose %}
+
 {% block title %}Send Message — Human Overseer{% endblock %}
 
 {% block breadcrumbs %}
@@ -55,6 +60,7 @@
   </div>
 
   <!-- Main Composer Form -->
+  {% if can_send %}
   <form @submit.prevent="sendMessage()" class="space-y-6">
     <input type="hidden" name="reply_to" :value="replyTo || ''">
 
@@ -351,6 +357,11 @@ Please investigate the following:
       </button>
     </div>
   </form>
+  {% else %}
+  <div class="rounded-xl border border-amber-200 bg-amber-50 p-6 text-amber-900 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100" role="alert">
+    Your project role does not allow this messaging action.
+  </div>
+  {% endif %}
 
   <!-- Success/Error Toast -->
   <template x-if="showToast">
@@ -442,6 +453,8 @@ function overseerComposer() {
        literal — these values come from message bodies written by anyone. #}
     selectedRecipients: {{ (prefill.recipients if prefill else []) | tojson }},
     replyTo: {{ (prefill.reply_to if prefill else none) | tojson }},
+    isReply: {{ is_reply | tojson }},
+    sendEndpoint: {{ (('/mail/' ~ project.slug ~ '/overseer/reply') if is_reply else ('/mail/' ~ project.slug ~ '/overseer/send')) | tojson }},
     subject: {{ (prefill.subject if prefill else '') | tojson }},
     body: '',
     threadId: {{ (prefill.thread_id if prefill else '') | tojson }},
@@ -560,20 +573,24 @@ function overseerComposer() {
       this.sending = true;
 
       try {
-        // Use properly escaped project slug for URL safety
         const projectSlug = {{ project.slug | tojson }};
-        const response = await fetch(`/mail/${projectSlug}/overseer/send`, {
+        const payload = this.isReply
+          ? {
+              reply_to: this.replyTo,
+              body_md: this.body.trim(),
+            }
+          : {
+              recipients: this.selectedRecipients,
+              subject: this.subject.trim(),
+              body_md: this.body.trim(),
+              thread_id: this.threadId.trim() || null,
+            };
+        const response = await fetch(this.sendEndpoint, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({
-            recipients: this.selectedRecipients,
-            subject: this.subject.trim(),
-            body_md: this.body.trim(),
-            thread_id: this.threadId.trim() || null,
-            reply_to: this.replyTo,
-          })
+          body: JSON.stringify(payload)
         });
 
         const result = await response.json().catch(() => ({}));

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -18,6 +19,11 @@ def _utcnow_naive() -> datetime:
     offset-naive and offset-aware datetimes' errors in SQLAlchemy ORM evaluator.
     """
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _new_session_generation() -> str:
+    """Return an unpredictable identifier for one human account lifetime."""
+    return secrets.token_hex(32)
 
 
 class Project(SQLModel, table=True):
@@ -228,10 +234,12 @@ class UiUser(SQLModel, table=True):
     password in a browser. Conflating them would give every registered agent a
     way into the destructive UI routes.
 
-    ``session_epoch`` is bumped whenever the password changes or the account is
-    disabled. It is embedded in the signed session cookie and compared on every
-    request, so those actions revoke live sessions immediately without a
-    server-side session table (see :mod:`mcp_agent_mail.webauth`).
+    ``session_epoch`` is bumped whenever authentication or authorization state
+    changes. ``session_generation`` is immutable for one account lifetime and
+    changes when a deleted username is recreated. Both values are embedded in
+    the signed session cookie and compared on every request, so state changes
+    and account replacement revoke live sessions without a server-side session
+    table (see :mod:`mcp_agent_mail.webauth`).
     """
 
     __tablename__ = "ui_users"
@@ -239,11 +247,42 @@ class UiUser(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     username: str = Field(index=True, unique=True, max_length=64)
     password_hash: str = Field(max_length=256)
-    role: str = Field(default="viewer", max_length=16)  # admin | viewer
+    role: str = Field(default="member", max_length=16)
     disabled: bool = Field(default=False)
     session_epoch: int = Field(default=1)
+    session_generation: str = Field(default_factory=_new_session_generation, max_length=64)
     created_ts: datetime = Field(default_factory=_utcnow_naive)
     last_login_ts: Optional[datetime] = Field(default=None)
+
+
+class UiProjectAssignment(SQLModel, table=True):
+    """A human user's explicit role within one project.
+
+    Global administrators do not require assignment rows. A global member has
+    no project access unless a row exists, and the row's role determines whether
+    that access is read-only or permits operator actions.
+    """
+
+    __tablename__ = "ui_project_assignments"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "project_id",
+            name="uq_ui_project_assignment_user_project",
+        ),
+        Index(
+            "idx_ui_project_assignments_user_project",
+            "user_id",
+            "project_id",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="ui_users.id", ondelete="CASCADE", index=True)
+    project_id: int = Field(foreign_key="projects.id", ondelete="CASCADE", index=True)
+    role: str = Field(default="viewer", max_length=16)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+    updated_ts: datetime = Field(default_factory=_utcnow_naive)
 
 
 class ProjectSiblingSuggestion(SQLModel, table=True):

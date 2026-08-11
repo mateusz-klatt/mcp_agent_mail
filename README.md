@@ -387,9 +387,31 @@ uv run uvicorn mcp_agent_mail.http:create_app --factory --host 127.0.0.1 --port 
 ```
 
 Auth notes:
-- GET pages in the UI are not gated by the RBAC middleware (it classifies POSTed MCP calls only), but if you set a bearer token the separate BearerAuth middleware protects all routes by default.
-- For local dev, set `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=true` (and optionally `HTTP_BEARER_TOKEN`), so localhost can load the UI without headers.
-- Health endpoints are always open at `/health/*`.
+- Human access uses the `/mail/login` session cookie. Set a long random `MAIL_UI_SESSION_SECRET`, keep `MAIL_UI_AUTH_ENABLED=true`, and create the first admin explicitly with `mcp-agent-mail ui-users add <name> --role admin`.
+- `HTTP_BEARER_TOKEN` authenticates MCP and narrow service traffic; it does not log a human into `/mail`. With UI auth enabled, the only `/mail` bearer exception is `GET /mail/api/file-reservations?project=...`, which installed hooks use as a read-only service endpoint.
+- `MAIL_UI_AUTH_ENABLED=false` is an open test/development mode with no human project boundary. Do not use it as a production reverse-proxy handoff.
+- Health endpoints remain open at `/health/*`.
+
+### Human users and project roles
+
+Human authorization is deny-by-default and separates a user's global role from their project assignments:
+
+- `admin` is global and may view every project, start new Human Overseer messages, manage lifecycle state, and perform destructive UI actions.
+- `member` has no project access until assigned. A `viewer` assignment grants read-only access to one project. An `operator` assignment adds Reply for messages in that project, but does not grant the new-message composer or other mutations.
+- Unified inbox, counts, project lists, message APIs, event streams, and archive views are scoped to the projects the signed-in user may read. Inaccessible projects return no UI data and cannot be inferred from lists.
+
+Manage access with the CLI:
+
+```bash
+mcp-agent-mail ui-users add alice --role member
+mcp-agent-mail ui-users grant alice project-slug --role viewer
+mcp-agent-mail ui-users grant alice /owner/repo --role operator
+mcp-agent-mail ui-users access alice
+mcp-agent-mail ui-users revoke alice project-slug
+mcp-agent-mail ui-users role alice admin
+```
+
+Project arguments resolve by slug or canonical human key/path. Grants are never created automatically.
 
 ### Routes and what you can do
 
@@ -397,7 +419,7 @@ Auth notes:
   - Shows a unified, reverse-chronological inbox of recent messages across all projects with excerpts, relative timestamps, sender/recipients, and project badges.
   - Below the inbox, lists all projects (slug, human name, created time) with sibling suggestions.
   - Suggests **likely sibling projects** when two slugs appear to be parts of the same product (e.g., backend vs. frontend). Suggestions are ranked with heuristics and, when `LLM_ENABLED=true`, an LLM pass across key docs (`README.md`, `AGENTS.md`, etc.).
-  - Humans can **Confirm Link** or **Dismiss** suggestions from the dashboard. Confirmed siblings become highlighted badges but *do not* automatically authorize cross-project messaging; agents must still establish `AgentLink` approvals via `request_contact`/`respond_contact`.
+  - Admins can **Confirm Link** or **Dismiss** suggestions from the dashboard. Confirmed siblings become highlighted badges but *do not* automatically authorize either human project access or cross-project messaging; human assignments remain explicit, and agents must still establish `AgentLink` approvals via `request_contact`/`respond_contact`.
 
 - `/mail/projects` (Projects index)
   - Dedicated projects list view; click a project to drill in.
@@ -438,7 +460,7 @@ Auth notes:
 
 Sometimes a human operator needs to guide or redirect agents directly, whether to handle an urgent issue, provide clarification, or adjust priorities. The **Human Overseer** feature provides a web-based message composer that lets humans send high-priority messages to any combination of agents in a project.
 
-**Access:** Click the prominent **"Send Message"** button (with the Overseer badge) in the header of any project view (`/mail/{project}`), or navigate directly to `/mail/{project}/overseer/compose`.
+**Access:** Admins may click the prominent **"Send Message"** button in any project view or navigate directly to `/mail/{project}/overseer/compose`. Members never receive arbitrary compose access. A member with an `operator` assignment may use **Reply** on a message in that assigned project; routing, subject, and thread are locked to the original conversation. A `viewer` assignment is read-only.
 
 #### What Makes Overseer Messages Special
 
@@ -551,7 +573,7 @@ Agents can reply to overseer messages just like any other message, continuing th
 - **Storage**: Overseer messages are stored identically to agent-to-agent messages (Git + SQLite)
 - **Git History**: Fully auditable; message appears in `messages/YYYY/MM/{id}.md` with commit history
 - **Thread Continuity**: Can be part of existing threads or start new ones
-- **No Authentication Bypass**: The overseer compose form still requires proper HTTP server authentication (if enabled)
+- **No Authentication Bypass**: the composer requires a signed-in human session and the required project capability. A static service bearer cannot open or submit it.
 
 #### Design Philosophy
 
@@ -658,13 +680,13 @@ Once messages exist, visit `/mail`, click your project, then open an agent inbox
 ### Security considerations
 
 - HTML sanitization: Only a conservative set of tags/attributes are allowed; CSS is filtered. Links are limited to http/https/mailto/data.
-- Auth: Use bearer token or JWT when exposing beyond localhost. For local dev, enable localhost bypass as noted above.
+- Auth: Use bearer/JWT protection for MCP traffic and signed human sessions for `/mail`. Keep `MAIL_UI_AUTH_ENABLED=true` outside isolated test/development environments.
 - Rate limiting (optional): Token-bucket limiter can be enabled; UI GET requests are light and unaffected by POST limits.
 
 ### Troubleshooting the UI
 
-- Blank page or 401 on localhost: Either unset `HTTP_BEARER_TOKEN` or set `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=true`.
-- No projects listed: Create one with `ensure_project`.
+- Login unavailable or 503: set a long random `MAIL_UI_SESSION_SECRET`, restart the server, and create an admin with `mcp-agent-mail ui-users add <name> --role admin`.
+- No projects listed for a member: grant an explicit assignment with `mcp-agent-mail ui-users grant <name> <project> --role viewer` (or `operator`). Creating a project does not grant human access.
 - Empty inbox: Verify recipient names match exactly and messages were sent to that agent.
 - Search returns nothing: Try simpler terms or the LIKE fallback (toggle scope/body).
 
@@ -2070,8 +2092,13 @@ Common variables you may set:
 | `HTTP_CORS_ALLOW_CREDENTIALS` | `false` | Allow credentials on CORS |
 | `HTTP_CORS_ALLOW_METHODS` | `*` | CSV of allowed methods or `*` |
 | `HTTP_CORS_ALLOW_HEADERS` | `*` | CSV of allowed headers or `*` |
-| `HTTP_BEARER_TOKEN` |  | Static bearer token (only when JWT disabled) |
-| `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED` | `true` | Allow localhost requests without auth (dev convenience) |
+| `HTTP_BEARER_TOKEN` |  | Static MCP/service bearer; not a human `/mail` login |
+| `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED` | `true` | Allow local MCP transport requests without auth; does not bypass human UI sessions |
+| `MAIL_UI_AUTH_ENABLED` | `true` | Require human session authentication and project-scoped UI authorization; disable only for isolated test/development use |
+| `MAIL_UI_SESSION_SECRET` |  | Required secret used to sign human viewer sessions when UI auth is enabled |
+| `MAIL_UI_COOKIE_SECURE` | environment-dependent | Send the human session cookie only over HTTPS in production |
+| `MAIL_UI_COOKIE_NAME` | `agent_mail_session` | Human viewer session cookie name |
+| `MAIL_UI_SESSION_TTL_SECONDS` | `1209600` | Human viewer session lifetime in seconds |
 | `HTTP_OTEL_ENABLED` | `false` | Enable OpenTelemetry instrumentation |
 | `OTEL_SERVICE_NAME` | `mcp-agent-mail` | Service name for telemetry |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` |  | OTLP exporter endpoint URL |
@@ -2189,7 +2216,8 @@ This section has been removed to keep the README focused. See API Quick Referenc
   - HTTP-only (Streamable HTTP). Place behind a reverse proxy (e.g., NGINX) with TLS termination for production
 - Auth
   - Optional JWT (HS*/JWKS) via HTTP middleware; enable with `HTTP_JWT_ENABLED=true`
-  - Static bearer token (`HTTP_BEARER_TOKEN`) is independent of JWT; when set, BearerAuth protects all routes (including UI). You may use it alone or together with JWT.
+  - Static bearer token (`HTTP_BEARER_TOKEN`) is independent of JWT and authenticates MCP/service requests. It does not authorize the human `/mail` UI when `MAIL_UI_AUTH_ENABLED=true`; the only `/mail` exception is the read-only hook endpoint `GET /mail/api/file-reservations?project=...`.
+  - Human UI requests use signed session cookies plus global `admin` or project-scoped `viewer`/`operator` assignments. Members without an assignment cannot see that project.
   - When JWKS is configured (`HTTP_JWT_JWKS_URL`), incoming JWTs must include a matching `kid` header; tokens without `kid` or with unknown `kid` are rejected
   - Starter RBAC (reader vs writer) using role configuration; see `HTTP_RBAC_*` settings
   - Bearer-only RBAC note: when JWT is disabled, requests use `HTTP_RBAC_DEFAULT_ROLE` (default `reader`). That means non-localhost tool calls are read-only unless you set `HTTP_RBAC_DEFAULT_ROLE=writer`, disable RBAC (`HTTP_RBAC_ENABLED=false`), or switch to JWT roles. Localhost requests with `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=true` are auto-elevated to writer.

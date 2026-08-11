@@ -65,9 +65,10 @@
        by 45. That collision is now removed at its own end (see the panel), so
        the wrap is safe.
 
-       On >= sm nothing changes: there is room, so it never wraps. The base
-       navigation is 112 px below lg and 64 px at lg+, so the sticky offset
-       follows the same breakpoint instead of sliding underneath it. -->
+       The controls still wrap at sm/md and at the narrow end of lg; only xl
+       has the original one-row height. The base navigation is 112 px below lg
+       and 64 px at lg+, so both dimensions need their measured breakpoint
+       offsets instead of sliding underneath one another. -->
   <div class="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 px-6 py-4 flex flex-wrap items-center gap-4 sticky top-28 lg:top-16 shadow-sm transition-all duration-300"
        :class="isFullscreen ? 'z-[60]' : 'z-10'">
     <!-- Search Bar -->
@@ -177,11 +178,12 @@
        x-transition:leave="transition ease-in duration-150"
        x-transition:leave-start="opacity-100 translate-y-0"
        x-transition:leave-end="opacity-0 -translate-y-2"
-       {# Measured clearances below the responsive header + sticky search bar:
-          mobile 112 + 141 = 253 px, sm 112 + 83 = 195 px, md 112 + 141 =
-          253 px, and lg 64 + 83 = 147 px. The next available Tailwind offsets
-          leave 19/13/19/13 px instead of allowing sticky surfaces to overlap. #}
-       class="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 px-6 py-4 sticky top-[17rem] sm:top-52 md:top-[17rem] lg:top-40 transition-all duration-300"
+       {# Production Chromium measurements below the responsive header + sticky
+          search bar: 390/430/640 = 112 + 143 = 255 px, md = 112 + 147 =
+          259 px, lg = 64 + 123 = 187 px, and xl = 64 + 87 = 151 px.
+          The controls keep wrapping at both sm and lg; treating those widths
+          as their next wider shape hid 47 px at 640 and 27 px at 1024. #}
+       class="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 px-6 py-4 sticky top-[17rem] lg:top-48 xl:top-40 transition-all duration-300"
        :class="isFullscreen ? 'z-[60]' : 'z-10'">
     <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
       <!-- Project Filter -->
@@ -257,7 +259,7 @@
 
   <!-- Gmail-style Split Pane Layout -->
   <div class="flex overflow-hidden mb-8 transition-all duration-300"
-       :class="isFullscreen ? 'fixed inset-0 top-[18rem] lg:top-48 z-50 max-h-none min-h-0' : 'max-h-[500px] md:max-h-[650px] lg:max-h-[750px] min-h-[400px] md:min-h-[550px] lg:min-h-[650px]'">
+       :class="isFullscreen ? 'fixed inset-0 top-[18.5rem] lg:top-56 xl:top-48 z-50 max-h-none min-h-0' : 'max-h-[500px] md:max-h-[650px] lg:max-h-[750px] min-h-[400px] md:min-h-[550px] lg:min-h-[650px]'">
 
     <!-- Left Pane: Message List -->
     <aside :class="viewMode === 'split' ? 'w-full md:w-2/5 lg:w-1/3 border-r border-slate-200 dark:border-slate-700' : 'w-full'"

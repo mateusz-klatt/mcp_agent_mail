@@ -477,8 +477,10 @@ async def test_mail_unified_inbox_html(isolated_env):
         assert ':aria-expanded="sortOpen"' in resp.text
         assert '@keydown.space.prevent="handleMessageClick(msg)"' in resp.text
         assert "sticky top-28 lg:top-16" in resp.text
-        assert "sticky top-[17rem] sm:top-52 md:top-[17rem] lg:top-40" in resp.text
-        assert "fixed inset-0 top-[18rem] lg:top-48 z-50" in resp.text
+        assert (
+            "sticky top-[17rem] lg:top-48 xl:top-40" in resp.text
+        )
+        assert "fixed inset-0 top-[18.5rem] lg:top-56 xl:top-48 z-50" in resp.text
         assert "isFullscreen ? 'z-[60]' : 'z-10'" in resp.text
 
 

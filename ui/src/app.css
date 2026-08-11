@@ -157,6 +157,18 @@ select {
   text-align: right;
 }
 
+.locale-hint[data-state="loadError"],
+.locale-hint[data-state="saveError"],
+.locale-hint[data-state="unauthorized"] {
+  color: #ffd8c2;
+  font-weight: 700;
+}
+
+.topbar-controls select:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+
 .topbar-controls label,
 .role-card label {
   align-items: center;

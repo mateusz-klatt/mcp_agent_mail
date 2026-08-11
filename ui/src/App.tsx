@@ -1,7 +1,13 @@
-import { type ChangeEvent, useState } from "react";
+import { type ChangeEvent, useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import { supportedLocales, type SupportedLocale } from "./i18n";
+import i18n, { supportedLocales, type SupportedLocale } from "./i18n";
+import {
+  loadPreferences,
+  mailLoginUrl,
+  PreferencesHttpError,
+  saveUiLocale,
+} from "./preferences";
 import "./app.css";
 
 type ViewerRole = "admin" | "operator" | "viewer";
@@ -28,14 +34,105 @@ const visibleProjectCount: Record<ViewerRole, number> = {
   viewer: 2,
 };
 
-export function App() {
-  const { i18n, t } = useTranslation();
-  const [role, setRole] = useState<ViewerRole>("admin");
+type PreferenceStatus =
+  | "loading"
+  | "saved"
+  | "saving"
+  | "loadError"
+  | "saveError"
+  | "unauthorized";
 
-  const handleLocaleChange = (event: ChangeEvent<HTMLSelectElement>) => {
-    const locale = event.target.value as SupportedLocale;
-    document.documentElement.lang = locale;
-    void i18n.changeLanguage(locale);
+const preferenceStatusKey: Record<PreferenceStatus, string> = {
+  loading: "localeStatus.loading",
+  saved: "localeStatus.saved",
+  saving: "localeStatus.saving",
+  loadError: "localeStatus.loadError",
+  saveError: "localeStatus.saveError",
+  unauthorized: "localeStatus.unauthorized",
+};
+
+interface AppProps {
+  onUnauthorized?: (loginUrl: string) => void;
+  navigateTo?: (url: string) => void;
+}
+
+const defaultNavigate = window.location.assign.bind(window.location);
+
+export function App({
+  onUnauthorized,
+  navigateTo = defaultNavigate,
+}: AppProps = {}) {
+  const { t } = useTranslation();
+  const [role, setRole] = useState<ViewerRole>("admin");
+  const [locale, setLocale] = useState<SupportedLocale>("en");
+  const [preferenceStatus, setPreferenceStatus] =
+    useState<PreferenceStatus>("loading");
+
+  const applyLocale = useCallback(
+    async (nextLocale: SupportedLocale) => {
+      await i18n.changeLanguage(nextLocale);
+      setLocale(nextLocale);
+      document.documentElement.lang = nextLocale;
+    },
+    [],
+  );
+
+  const redirectUnauthorized = useCallback(() => {
+    const loginUrl = mailLoginUrl(window.location);
+    if (onUnauthorized !== undefined) {
+      onUnauthorized(loginUrl);
+      return;
+    }
+    navigateTo(loginUrl);
+  }, [navigateTo, onUnauthorized]);
+
+  const isUnauthorized = useCallback(
+    (error: unknown) => {
+      if (error instanceof PreferencesHttpError && error.status === 401) {
+        redirectUnauthorized();
+        return true;
+      }
+      return false;
+    },
+    [redirectUnauthorized],
+  );
+
+  useEffect(() => {
+    void loadPreferences()
+      .then(async (preferences) => {
+        await applyLocale(preferences.effective.ui_locale);
+        setPreferenceStatus("saved");
+      })
+      .catch(async (error: unknown) => {
+        if (isUnauthorized(error)) {
+          setPreferenceStatus("unauthorized");
+          return;
+        }
+        await applyLocale("en");
+        setPreferenceStatus("loadError");
+      });
+  }, [applyLocale, isUnauthorized]);
+
+  const handleLocaleChange = async (event: ChangeEvent<HTMLSelectElement>) => {
+    const nextLocale = event.target.value as SupportedLocale;
+    if (preferenceStatus === "loadError") {
+      await applyLocale(nextLocale);
+      return;
+    }
+    const previousLocale = locale;
+    setPreferenceStatus("saving");
+    try {
+      const preferences = await saveUiLocale(nextLocale);
+      await applyLocale(preferences.effective.ui_locale);
+      setPreferenceStatus("saved");
+    } catch (error) {
+      await applyLocale(previousLocale);
+      if (isUnauthorized(error)) {
+        setPreferenceStatus("unauthorized");
+        return;
+      }
+      setPreferenceStatus("saveError");
+    }
   };
 
   const handleRoleChange = (event: ChangeEvent<HTMLSelectElement>) => {
@@ -66,9 +163,12 @@ export function App() {
               <span>{t("language")}</span>
               <select
                 aria-label={t("language")}
-                aria-describedby="locale-preview-hint"
-                value={i18n.language}
+                aria-describedby="locale-preference-status"
+                value={locale}
                 onChange={handleLocaleChange}
+                disabled={["loading", "saving", "unauthorized"].includes(
+                  preferenceStatus,
+                )}
               >
                 {supportedLocales.map((locale) => (
                   <option key={locale} value={locale}>
@@ -77,8 +177,14 @@ export function App() {
                 ))}
               </select>
             </label>
-            <small id="locale-preview-hint" className="locale-hint">
-              {t("localePreviewHint")}
+            <small
+              id="locale-preference-status"
+              className="locale-hint"
+              data-state={preferenceStatus}
+              role="status"
+              aria-live="polite"
+            >
+              {t(preferenceStatusKey[preferenceStatus])}
             </small>
           </div>
         </div>

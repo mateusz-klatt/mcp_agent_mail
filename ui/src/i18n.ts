@@ -13,7 +13,14 @@ const resources = {
       readOnly: "Read-only preview",
       navigation: "Primary navigation",
       language: "Language",
-      localePreviewHint: "Visual preview · preference is not saved yet",
+      localeStatus: {
+        loading: "Loading your saved language…",
+        saved: "Language saved for your account",
+        saving: "Saving language…",
+        loadError: "Could not load your saved language. Language changes are preview-only.",
+        saveError: "Could not save your language. Your previous language is still active.",
+        unauthorized: "Your session expired. Redirecting to sign in.",
+      },
       role: "Demo role",
       nav: {
         projects: "Projects",
@@ -68,7 +75,14 @@ const resources = {
       readOnly: "Podgląd tylko do odczytu",
       navigation: "Główna nawigacja",
       language: "Język",
-      localePreviewHint: "Podgląd wizualny · wybór nie jest jeszcze zapisywany",
+      localeStatus: {
+        loading: "Wczytywanie zapisanego języka…",
+        saved: "Język zapisany na Twoim koncie",
+        saving: "Zapisywanie języka…",
+        loadError: "Nie udało się wczytać zapisanego języka. Zmiany języka są tylko podglądem.",
+        saveError: "Nie udało się zapisać języka. Poprzedni język nadal jest aktywny.",
+        unauthorized: "Sesja wygasła. Przekierowujemy do logowania.",
+      },
       role: "Rola demonstracyjna",
       nav: {
         projects: "Projekty",

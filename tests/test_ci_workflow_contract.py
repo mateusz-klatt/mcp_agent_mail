@@ -130,9 +130,10 @@ def test_sonar_uses_ubuntu_gate_while_portability_remains_required() -> None:
     assert any("tests/benchmarks/bench_*.py" in line for line in ubuntu)
     assert "          name: coverage-${{ github.sha }}" in ubuntu
     assert not any("coverage-${{ github.sha }}" in line for line in portability)
-    assert "    needs: build-and-test" in sonar
+    assert "    needs: [build-and-test, frontend]" in sonar
     assert not any("portability" in line for line in sonar)
     assert "        needs.build-and-test.result == 'success' &&" in sonar
+    assert "        needs.frontend.result == 'success' &&" in sonar
 
 
 def test_reusable_sonar_caller_grants_requested_permissions() -> None:

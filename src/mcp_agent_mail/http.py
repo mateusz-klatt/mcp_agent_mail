@@ -16,7 +16,7 @@ import threading
 from collections.abc import MutableMapping
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, TypedDict, cast
 
 import structlog
 import uvicorn
@@ -27,7 +27,8 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from git import NULL_TREE
 from markupsafe import Markup, escape as escape_markup
-from sqlalchemy import text
+from pydantic import BaseModel, ConfigDict, field_validator
+from sqlalchemy import text, update
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -847,12 +848,61 @@ def _localhost_bypass_allowed(request: Request, *, allow_localhost: bool) -> boo
 _MAIL_LOGIN_PATH = "/mail/login"
 _MAIL_LOGOUT_PATH = "/mail/logout"
 _MAIL_FILE_RESERVATIONS_API_PATH = "/mail/api/file-reservations"
+_MAIL_PREFERENCES_API_PATH = "/mail/api/v1/me/preferences"
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _OVERSEER_REPLY_PATH_RE = re.compile(r"^/mail/[^/]+/overseer/reply$")
 _mail_ui_template_user: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
     "mail_ui_template_user",
     default=None,
 )
+
+MailUiLocale = Literal["en", "pl"]
+
+
+class MailUiSessionPrincipal(TypedDict):
+    """Internal identity facts revalidated by every self-service handler."""
+
+    id: int
+    username: str
+    role: webauth.UiUserRole
+    session_epoch: int
+    session_generation: str
+
+
+class MailUiStoredPreferences(BaseModel):
+    """Language preferences persisted on one human UI account."""
+
+    preferred_ui_locale: MailUiLocale
+    preferred_correspondence_locale: MailUiLocale | None
+
+
+class MailUiEffectivePreferences(BaseModel):
+    """Resolved languages after applying the correspondence inheritance rule."""
+
+    ui_locale: MailUiLocale
+    correspondence_locale: MailUiLocale
+
+
+class MailUiPreferencesResponse(BaseModel):
+    """Stored and resolved preferences for the authenticated human."""
+
+    stored: MailUiStoredPreferences
+    effective: MailUiEffectivePreferences
+
+
+class MailUiPreferencesPatch(BaseModel):
+    """Partial self-service update for the authenticated human's languages."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    preferred_ui_locale: MailUiLocale = "en"
+    preferred_correspondence_locale: MailUiLocale | None = None
+
+    @field_validator("preferred_ui_locale", "preferred_correspondence_locale", mode="before")
+    @classmethod
+    def canonicalize_locale(cls, value: object) -> object:
+        """Canonicalize human-entered locale tags before the closed-set check."""
+        return value.strip().casefold() if isinstance(value, str) else value
 
 # Login brute-force throttle, keyed by client address and normalized username. scrypt already caps an
 # attacker at roughly 20 guesses/second/core, but that is still ~1.7M/day against
@@ -1013,7 +1063,11 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
                 return JSONResponse(
                     {"detail": "Cross-origin request rejected"}, status_code=status.HTTP_403_FORBIDDEN
                 )
-            if user["role"] != webauth.ROLE_ADMIN and not _OVERSEER_REPLY_PATH_RE.fullmatch(path):
+            if (
+                user["role"] != webauth.ROLE_ADMIN
+                and path != _MAIL_PREFERENCES_API_PATH
+                and not _OVERSEER_REPLY_PATH_RE.fullmatch(path)
+            ):
                 return JSONResponse(
                     {"detail": "Forbidden: this action requires the admin role"},
                     status_code=status.HTTP_403_FORBIDDEN,
@@ -1022,7 +1076,9 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
         request.state.mail_ui_authenticated = True
         request.state.mail_ui_user = user
         template_user = {
-            **user,
+            "id": user["id"],
+            "username": user["username"],
+            "role": user["role"],
             "is_admin": user["role"] == webauth.ROLE_ADMIN,
         }
         token = _mail_ui_template_user.set(template_user)
@@ -1032,7 +1088,11 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
             _mail_ui_template_user.reset(token)
 
 
-async def _load_session_user(token: str, *, settings: Settings) -> "dict[str, Any] | None":
+async def _load_session_user(
+    token: str,
+    *,
+    settings: Settings,
+) -> MailUiSessionPrincipal | None:
     """Resolve a session cookie to a live, enabled user row, or ``None``.
 
     Re-reads the database on every request rather than trusting the cookie's
@@ -1069,7 +1129,13 @@ async def _load_session_user(token: str, *, settings: Settings) -> "dict[str, An
             role = webauth.normalize_ui_user_role(row.role)
             if role is None or row.id is None:
                 return None
-            return {"id": int(row.id), "username": row.username, "role": role}
+            return {
+                "id": int(row.id),
+                "username": row.username,
+                "role": role,
+                "session_epoch": int(row.session_epoch),
+                "session_generation": row.session_generation,
+            }
     except Exception:
         # A database hiccup must not be an authentication bypass.
         structlog.get_logger("mail_ui").warning("mail_ui.session_lookup_failed", exc_info=True)
@@ -1108,7 +1174,7 @@ async def _resolve_mail_project(
     return None
 
 
-def _mail_ui_request_user(request: Request) -> dict[str, Any] | None:
+def _mail_ui_request_user(request: Request) -> MailUiSessionPrincipal | None:
     """Return the authenticated human principal stored by the mail middleware.
 
     Args:
@@ -1118,7 +1184,88 @@ def _mail_ui_request_user(request: Request) -> dict[str, Any] | None:
         The normalized principal, or ``None`` outside authenticated UI mode.
     """
     user = getattr(request.state, "mail_ui_user", None)
-    return user if isinstance(user, dict) else None
+    return cast(MailUiSessionPrincipal, user) if isinstance(user, dict) else None
+
+
+def _mail_ui_preferences_response(
+    *,
+    preferred_ui_locale: MailUiLocale,
+    preferred_correspondence_locale: MailUiLocale | None,
+) -> MailUiPreferencesResponse:
+    """Build the stable stored/effective language-preference response."""
+    return MailUiPreferencesResponse(
+        stored=MailUiStoredPreferences(
+            preferred_ui_locale=preferred_ui_locale,
+            preferred_correspondence_locale=preferred_correspondence_locale,
+        ),
+        effective=MailUiEffectivePreferences(
+            ui_locale=preferred_ui_locale,
+            correspondence_locale=preferred_correspondence_locale or preferred_ui_locale,
+        ),
+    )
+
+
+def _mail_ui_preferences_principal(request: Request) -> MailUiSessionPrincipal:
+    """Require the authenticated internal human principal for a self route."""
+    principal = _mail_ui_request_user(request)
+    if principal is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User preferences require an authenticated Mail UI session.",
+        )
+    return principal
+
+
+async def _mail_ui_preferences_user(
+    request: Request,
+    session: AsyncSession,
+) -> Any:
+    """Revalidate all cookie-bound identity facts before reading account state."""
+    from sqlmodel import select
+
+    from .models import UiUser
+
+    principal = _mail_ui_preferences_principal(request)
+    result = await session.execute(
+        select(UiUser)
+        .where(UiUser.id == principal["id"])
+        .where(UiUser.username == principal["username"])
+        .where(UiUser.session_epoch == principal["session_epoch"])
+        .where(UiUser.session_generation == principal["session_generation"])
+        .where(UiUser.disabled == False)  # noqa: E712
+    )
+    row = result.scalars().first()
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authenticated Mail UI session is no longer current.",
+        )
+    return row
+
+
+async def _mail_ui_preferences_cas_update(
+    session: AsyncSession,
+    *,
+    principal: MailUiSessionPrincipal,
+    values: dict[str, Any],
+) -> bool:
+    """Update the same account lifetime only, even if its primary key was reused."""
+    from .models import UiUser
+
+    result = await session.execute(
+        update(UiUser)
+        .where(cast(Any, UiUser.id == principal["id"]))
+        .where(cast(Any, UiUser.username == principal["username"]))
+        .where(cast(Any, UiUser.session_epoch == principal["session_epoch"]))
+        .where(cast(Any, UiUser.session_generation == principal["session_generation"]))
+        .where(cast(Any, UiUser.disabled == False))  # noqa: E712
+        .values(**values)
+    )
+    if int(getattr(result, "rowcount", 0) or 0) != 1:
+        await session.rollback()
+        return False
+    await session.commit()
+    return True
 
 
 def _mail_ui_request_is_admin(*, settings: Settings, request: Request) -> bool:
@@ -3334,6 +3481,75 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 # Reduce payload size when polling for message updates only
                 payload["projects"] = []
             return JSONResponse(payload)
+
+        def _preferences_response_for_user(row: Any) -> MailUiPreferencesResponse:
+            """Render a row whose locale integrity is enforced by the schema."""
+            return _mail_ui_preferences_response(
+                preferred_ui_locale=cast(MailUiLocale, row.preferred_ui_locale),
+                preferred_correspondence_locale=cast(
+                    MailUiLocale | None,
+                    row.preferred_correspondence_locale,
+                ),
+            )
+
+        @fastapi_app.get(
+            _MAIL_PREFERENCES_API_PATH,
+            response_model=MailUiPreferencesResponse,
+        )
+        async def mail_ui_preferences_get(request: Request) -> MailUiPreferencesResponse:
+            """Return stored and effective languages for the signed-in human."""
+            await ensure_schema()
+            async with get_session() as session:
+                row = await _mail_ui_preferences_user(request, session)
+                return _preferences_response_for_user(row)
+
+        @fastapi_app.patch(
+            _MAIL_PREFERENCES_API_PATH,
+            response_model=MailUiPreferencesResponse,
+        )
+        async def mail_ui_preferences_patch(
+            request: Request,
+            preferences: MailUiPreferencesPatch,
+        ) -> MailUiPreferencesResponse:
+            """Partially update only the signed-in human's language preferences."""
+            if not webauth.same_origin(
+                request.headers.get("origin", ""),
+                request.headers.get("referer", ""),
+                request.headers.get("host", ""),
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Cross-origin request rejected",
+                )
+
+            await ensure_schema()
+            async with get_session() as session:
+                row = await _mail_ui_preferences_user(request, session)
+            changed_fields = preferences.model_fields_set
+            values: dict[str, Any] = {}
+            if "preferred_ui_locale" in changed_fields:
+                values["preferred_ui_locale"] = preferences.preferred_ui_locale
+            if "preferred_correspondence_locale" in changed_fields:
+                values["preferred_correspondence_locale"] = (
+                    preferences.preferred_correspondence_locale
+                )
+
+            if values:
+                principal = _mail_ui_preferences_principal(request)
+                async with get_session() as session:
+                    updated = await _mail_ui_preferences_cas_update(
+                        session,
+                        principal=principal,
+                        values=values,
+                    )
+                if not updated:
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Authenticated Mail UI session is no longer current.",
+                    )
+                async with get_session() as session:
+                    row = await _mail_ui_preferences_user(request, session)
+            return _preferences_response_for_user(row)
 
         @fastapi_app.post("/mail/api/delete-messages", response_class=JSONResponse)
         async def delete_messages_api(request: Request) -> JSONResponse:
@@ -5817,13 +6033,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             repo = None
             try:
                 repo = await asyncio.to_thread(_open_git_repo, repo_root)
-                commit = await get_commit_detail(repo, sha)
                 if not _mail_ui_request_is_admin(settings=settings, request=request):
                     projects = await _visible_archive_projects(request)
                     prefixes = tuple(f"projects/{project['slug']}/" for project in projects)
                     scoped = await _filter_archive_commits_to_prefixes(
                         repo,
-                        [{"sha": str(commit.get("sha", sha))}],
+                        [{"sha": sha}],
                         prefixes,
                     )
                     if not scoped:
@@ -5832,6 +6047,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                             status_code=404,
                             message="Commit not found",
                         )
+                commit = await get_commit_detail(repo, sha)
                 return await _render("archive_commit.html", commit=commit)
             except ValueError:
                 # Validation errors (bad SHA, etc.)
@@ -6142,13 +6358,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         pass
 
     # Keep the auto-generated /openapi.json focused on the real API contract.
-    # The browser-facing SSR mail UI (and its UI-backing JSON helpers) all live
-    # under the `/mail` prefix; they are registered for humans, not as part of
-    # the documented API surface, so we filter them out of the schema. The
-    # routes stay fully registered and functional — they are only omitted from
-    # the OpenAPI document. Using a custom app.openapi() (rather than
-    # include_in_schema=False on ~33 decorators) keeps this in one place and
-    # automatically covers any future /mail/* routes.
+    # The browser-facing SSR mail UI and its legacy JSON helpers live under the
+    # `/mail` prefix; they are registered for humans, not as part of the typed
+    # API contract. The versioned self-service API is the deliberate exception:
+    # React clients generate types from it, so its request and response schemas
+    # must remain visible while every legacy `/mail` route stays hidden.
     from fastapi.openapi.utils import get_openapi as _get_openapi
 
     def _custom_openapi() -> dict[str, Any]:
@@ -6166,7 +6380,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             schema["paths"] = {
                 path: item
                 for path, item in paths.items()
-                if not (path == "/mail" or path.startswith("/mail/"))
+                if path == _MAIL_PREFERENCES_API_PATH
+                or not (path == "/mail" or path.startswith("/mail/"))
             }
         fastapi_app.openapi_schema = schema
         return schema

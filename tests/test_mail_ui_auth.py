@@ -29,8 +29,9 @@ import pytest
 from authlib.jose import jwt
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
-from mcp_agent_mail import config as _config, http as http_module, webauth
+from mcp_agent_mail import config as _config, db as db_module, http as http_module, webauth
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.http import build_http_app
@@ -391,6 +392,465 @@ class TestMailUiSession:
         assert read.status_code == 200
         assert write.status_code == 403
         assert "admin" in write.json()["detail"]
+
+
+class TestMailUiPreferences:
+    """Per-human locale state stays self-only, canonical, and migration-safe."""
+
+    def test_custom_openapi_exposes_only_the_typed_preferences_api(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """Codegen sees GET/PATCH schemas without publishing legacy mail routes."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+
+        schema = app.openapi()
+        mail_paths = {
+            path: item
+            for path, item in schema["paths"].items()
+            if path == "/mail" or path.startswith("/mail/")
+        }
+
+        assert set(mail_paths) == {"/mail/api/v1/me/preferences"}
+        operations = mail_paths["/mail/api/v1/me/preferences"]
+        assert set(operations) == {"get", "patch"}
+        assert operations["patch"]["requestBody"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/MailUiPreferencesPatch"
+        }
+        for method in ("get", "patch"):
+            assert operations[method]["responses"]["200"]["content"]["application/json"][
+                "schema"
+            ] == {"$ref": "#/components/schemas/MailUiPreferencesResponse"}
+        assert schema["components"]["schemas"]["MailUiPreferencesPatch"][
+            "additionalProperties"
+        ] is False
+        assert "/mail/api/unified-inbox" not in schema["paths"]
+
+    @pytest.mark.asyncio
+    async def test_schema_defaults_and_locale_guards_are_idempotent(
+        self,
+        isolated_env,
+    ):
+        """Raw inserts get the DB default and rerunning startup DDL remains safe."""
+        await ensure_schema()
+        engine = db_module.get_engine()
+        async with engine.begin() as connection:
+            await connection.run_sync(db_module._setup_fts)
+            await connection.run_sync(db_module._setup_fts)
+
+        async with get_session() as session:
+            await session.execute(
+                text(
+                    "INSERT INTO ui_users "
+                    "(username, password_hash, role, disabled, session_epoch, "
+                    "session_generation, created_ts) "
+                    "VALUES ('raw-defaults', 'unused', 'member', 0, 1, "
+                    "'generation', datetime('now'))"
+                )
+            )
+            await session.commit()
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT preferred_ui_locale, preferred_correspondence_locale "
+                        "FROM ui_users WHERE username = 'raw-defaults'"
+                    )
+                )
+            ).one()
+            columns = {
+                str(column[1]): column
+                for column in (
+                    await session.execute(text("PRAGMA table_info(ui_users)"))
+                ).fetchall()
+            }
+
+        assert tuple(row) == ("en", None)
+        assert int(columns["preferred_ui_locale"][3]) == 1
+        assert str(columns["preferred_ui_locale"][4]).strip("'") == "en"
+        assert int(columns["preferred_correspondence_locale"][3]) == 0
+
+        async with get_session() as session:
+            with pytest.raises(IntegrityError, match="invalid preferred_ui_locale"):
+                await session.execute(
+                    text(
+                        "UPDATE ui_users SET preferred_ui_locale = 'fr' "
+                        "WHERE username = 'raw-defaults'"
+                    )
+                )
+
+    @pytest.mark.asyncio
+    async def test_get_returns_stored_and_effective_defaults(self, isolated_env, monkeypatch):
+        """A member sees only their account defaults and correspondence inherits UI."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        epoch = await _make_user("preferences-member", role=webauth.ROLE_MEMBER)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("preferences-member", epoch),
+        ) as client:
+            response = await client.get("/mail/api/v1/me/preferences")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "stored": {
+                "preferred_ui_locale": "en",
+                "preferred_correspondence_locale": None,
+            },
+            "effective": {
+                "ui_locale": "en",
+                "correspondence_locale": "en",
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_patch_is_partial_canonicalized_and_self_only(self, isolated_env, monkeypatch):
+        """One member can update only their row; null correspondence means inherit."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        epoch = await _make_user("preferences-owner", role=webauth.ROLE_MEMBER)
+        await _make_user("preferences-other", role=webauth.ROLE_MEMBER)
+        headers = {
+            "Origin": "http://test",
+            "Referer": "http://test/",
+            "Host": "test",
+        }
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("preferences-owner", epoch),
+        ) as client:
+            both = await client.patch(
+                "/mail/api/v1/me/preferences",
+                json={
+                    "preferred_ui_locale": " PL ",
+                    "preferred_correspondence_locale": " EN ",
+                },
+                headers=headers,
+            )
+            inherited = await client.patch(
+                "/mail/api/v1/me/preferences",
+                json={"preferred_correspondence_locale": None},
+                headers=headers,
+            )
+
+        assert both.status_code == 200
+        assert both.json() == {
+            "stored": {
+                "preferred_ui_locale": "pl",
+                "preferred_correspondence_locale": "en",
+            },
+            "effective": {
+                "ui_locale": "pl",
+                "correspondence_locale": "en",
+            },
+        }
+        assert inherited.status_code == 200
+        assert inherited.json() == {
+            "stored": {
+                "preferred_ui_locale": "pl",
+                "preferred_correspondence_locale": None,
+            },
+            "effective": {
+                "ui_locale": "pl",
+                "correspondence_locale": "pl",
+            },
+        }
+
+        async with get_session() as session:
+            rows = (
+                await session.execute(
+                    text(
+                        "SELECT username, preferred_ui_locale, "
+                        "preferred_correspondence_locale FROM ui_users "
+                        "ORDER BY username"
+                    )
+                )
+            ).fetchall()
+        assert [tuple(row) for row in rows] == [
+            ("preferences-other", "en", None),
+            ("preferences-owner", "pl", None),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_patch_rejects_null_ui_unknown_locale_and_extra_fields(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """Invalid patches fail before touching the stored account."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        epoch = await _make_user("preferences-validation", role=webauth.ROLE_MEMBER)
+        headers = {
+            "Origin": "http://test",
+            "Referer": "http://test/",
+            "Host": "test",
+        }
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("preferences-validation", epoch),
+        ) as client:
+            responses = [
+                await client.patch(
+                    "/mail/api/v1/me/preferences",
+                    json=payload,
+                    headers=headers,
+                )
+                for payload in (
+                    {"preferred_ui_locale": None},
+                    {"preferred_ui_locale": "fr"},
+                    {"preferred_ui_locale": "pl", "username": "someone-else"},
+                )
+            ]
+            unchanged = await client.get("/mail/api/v1/me/preferences")
+
+        assert [response.status_code for response in responses] == [422, 422, 422]
+        assert unchanged.json()["stored"] == {
+            "preferred_ui_locale": "en",
+            "preferred_correspondence_locale": None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_patch_rejects_cross_origin(self, isolated_env, monkeypatch):
+        """The self-only write keeps the same-origin boundary used by every UI mutation."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        epoch = await _make_user("preferences-origin", role=webauth.ROLE_MEMBER)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("preferences-origin", epoch),
+        ) as client:
+            rejected = await client.patch(
+                "/mail/api/v1/me/preferences",
+                json={"preferred_ui_locale": "pl"},
+                headers={
+                    "Origin": "https://evil.example",
+                    "Referer": "https://evil.example/",
+                    "Host": "test",
+                },
+            )
+            unchanged = await client.get("/mail/api/v1/me/preferences")
+
+        assert rejected.status_code == 403
+        assert unchanged.json()["stored"]["preferred_ui_locale"] == "en"
+
+    @pytest.mark.asyncio
+    async def test_get_revalidates_epoch_after_middleware_authentication(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """An epoch bump in the middleware-to-handler gap invalidates the read."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        epoch = await _make_user("preferences-epoch-race", role=webauth.ROLE_MEMBER)
+        original = http_module._mail_ui_preferences_user
+        raced = False
+
+        async def bump_epoch_before_read(request, session):
+            nonlocal raced
+            if not raced:
+                raced = True
+                async with get_session() as competing_session:
+                    await competing_session.execute(
+                        text(
+                            "UPDATE ui_users SET session_epoch = session_epoch + 1 "
+                            "WHERE username = 'preferences-epoch-race'"
+                        )
+                    )
+                    await competing_session.commit()
+            return await original(request, session)
+
+        monkeypatch.setattr(http_module, "_mail_ui_preferences_user", bump_epoch_before_read)
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("preferences-epoch-race", epoch),
+        ) as client:
+            response = await client.get("/mail/api/v1/me/preferences")
+
+        assert raced is True
+        assert response.status_code == 401
+        assert "no longer current" in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_patch_cas_cannot_modify_recreated_account_with_reused_primary_key(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """A replacement committed after revalidation is excluded by generation CAS."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        username = "preferences-recreated-race"
+        epoch = await _make_user(username, role=webauth.ROLE_MEMBER)
+        user_id = await _user_id(username)
+        original = http_module._mail_ui_preferences_cas_update
+        replacement_generation = "replacement-generation"
+        raced = False
+
+        async def replace_before_cas(session, *, principal, values):
+            nonlocal raced
+            if not raced:
+                raced = True
+                async with get_session() as competing_session:
+                    await competing_session.execute(
+                        text("DELETE FROM ui_users WHERE id = :user_id"),
+                        {"user_id": user_id},
+                    )
+                    await competing_session.execute(
+                        text(
+                            "INSERT INTO ui_users "
+                            "(id, username, password_hash, role, disabled, session_epoch, "
+                            "session_generation, preferred_ui_locale, "
+                            "preferred_correspondence_locale, created_ts) "
+                            "VALUES (:user_id, :username, 'replacement-password', 'member', "
+                            "0, :epoch, :generation, 'en', NULL, datetime('now'))"
+                        ),
+                        {
+                            "user_id": user_id,
+                            "username": username,
+                            "epoch": epoch,
+                            "generation": replacement_generation,
+                        },
+                    )
+                    await competing_session.commit()
+            return await original(session, principal=principal, values=values)
+
+        monkeypatch.setattr(
+            http_module,
+            "_mail_ui_preferences_cas_update",
+            replace_before_cas,
+        )
+        headers = {
+            "Origin": "http://test",
+            "Referer": "http://test/",
+            "Host": "test",
+        }
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie(username, epoch),
+        ) as client:
+            response = await client.patch(
+                "/mail/api/v1/me/preferences",
+                json={"preferred_ui_locale": "pl"},
+                headers=headers,
+            )
+
+        async with get_session() as session:
+            replacement = (
+                await session.execute(
+                    text(
+                        "SELECT session_generation, preferred_ui_locale "
+                        "FROM ui_users WHERE id = :user_id"
+                    ),
+                    {"user_id": user_id},
+                )
+            ).one()
+
+        assert raced is True
+        assert response.status_code == 401
+        assert tuple(replacement) == (replacement_generation, "en")
+
+    @pytest.mark.asyncio
+    async def test_patch_cas_rejects_epoch_bump_after_revalidation(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """An epoch bump immediately before CAS prevents the stale preference write."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        username = "preferences-patch-epoch-race"
+        epoch = await _make_user(username, role=webauth.ROLE_MEMBER)
+        original = http_module._mail_ui_preferences_cas_update
+        raced = False
+
+        async def bump_epoch_before_cas(session, *, principal, values):
+            nonlocal raced
+            if not raced:
+                raced = True
+                async with get_session() as competing_session:
+                    await competing_session.execute(
+                        text(
+                            "UPDATE ui_users SET session_epoch = session_epoch + 1 "
+                            "WHERE username = :username"
+                        ),
+                        {"username": username},
+                    )
+                    await competing_session.commit()
+            return await original(session, principal=principal, values=values)
+
+        monkeypatch.setattr(
+            http_module,
+            "_mail_ui_preferences_cas_update",
+            bump_epoch_before_cas,
+        )
+        headers = {
+            "Origin": "http://test",
+            "Referer": "http://test/",
+            "Host": "test",
+        }
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie(username, epoch),
+        ) as client:
+            response = await client.patch(
+                "/mail/api/v1/me/preferences",
+                json={"preferred_ui_locale": "pl"},
+                headers=headers,
+            )
+
+        async with get_session() as session:
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT session_epoch, preferred_ui_locale "
+                        "FROM ui_users WHERE username = :username"
+                    ),
+                    {"username": username},
+                )
+            ).one()
+
+        assert raced is True
+        assert response.status_code == 401
+        assert tuple(row) == (epoch + 1, "en")
+
+    @pytest.mark.asyncio
+    async def test_auth_disabled_mode_has_no_implicit_self(self, isolated_env, monkeypatch):
+        """Development bearer access cannot be mistaken for a human preference owner."""
+        _settings, app = _build(
+            monkeypatch,
+            MAIL_UI_AUTH_ENABLED="false",
+            MAIL_UI_SESSION_SECRET="",
+        )
+        await ensure_schema()
+        headers = {
+            "Authorization": f"Bearer {BEARER}",
+            "Origin": "http://test",
+            "Referer": "http://test/",
+            "Host": "test",
+        }
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            read = await client.get(
+                "/mail/api/v1/me/preferences",
+                headers={"Authorization": f"Bearer {BEARER}"},
+            )
+            write = await client.patch(
+                "/mail/api/v1/me/preferences",
+                json={"preferred_ui_locale": "pl"},
+                headers=headers,
+            )
+
+        assert read.status_code == 401
+        assert write.status_code == 401
 
 
 class TestMailUiRbacSurface:
@@ -890,6 +1350,7 @@ class TestMailUiRbacSurface:
             "/mail": "aggregate-scoped",
             "/mail/events": "aggregate-scoped",
             "/mail/api/unified-inbox": "aggregate-scoped",
+            "/mail/api/v1/me/preferences": "self-only",
             "/mail/projects": "aggregate-scoped",
             "/mail/unified-inbox": "aggregate-scoped",
             "/mail/api/locks": "admin-only",
@@ -930,4 +1391,5 @@ class TestMailUiRbacSurface:
             "project-guarded",
             "project-role-guarded",
             "project-query-guarded",
+            "self-only",
         }

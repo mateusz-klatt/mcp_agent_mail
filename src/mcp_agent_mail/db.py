@@ -960,6 +960,8 @@ def _setup_fts(connection: Any) -> None:
         "ALTER TABLE agents ADD COLUMN display_name VARCHAR(128) DEFAULT NULL",
         "ALTER TABLE agents ADD COLUMN notify_sound VARCHAR(32) DEFAULT NULL",
         "ALTER TABLE ui_users ADD COLUMN session_generation VARCHAR(64) DEFAULT NULL",
+        "ALTER TABLE ui_users ADD COLUMN preferred_ui_locale VARCHAR(2) NOT NULL DEFAULT 'en'",
+        "ALTER TABLE ui_users ADD COLUMN preferred_correspondence_locale VARCHAR(2) DEFAULT NULL",
     ]:
         with suppress(Exception):  # Column already exists — safe to ignore
             connection.exec_driver_sql(migration_sql)
@@ -978,6 +980,50 @@ def _setup_fts(connection: Any) -> None:
         UPDATE ui_users
         SET role = 'member', session_epoch = session_epoch + 1
         WHERE role = 'viewer'
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        UPDATE ui_users
+        SET preferred_ui_locale = CASE
+            WHEN lower(trim(COALESCE(preferred_ui_locale, ''))) IN ('en', 'pl')
+                THEN lower(trim(preferred_ui_locale))
+            ELSE 'en'
+        END,
+        preferred_correspondence_locale = CASE
+            WHEN preferred_correspondence_locale IS NULL THEN NULL
+            WHEN lower(trim(preferred_correspondence_locale)) IN ('en', 'pl')
+                THEN lower(trim(preferred_correspondence_locale))
+            ELSE NULL
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS ui_users_locale_guard_bi
+        BEFORE INSERT ON ui_users
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid preferred_ui_locale')
+            WHERE new.preferred_ui_locale IS NULL
+               OR new.preferred_ui_locale NOT IN ('en', 'pl');
+            SELECT RAISE(ABORT, 'invalid preferred_correspondence_locale')
+            WHERE new.preferred_correspondence_locale IS NOT NULL
+              AND new.preferred_correspondence_locale NOT IN ('en', 'pl');
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS ui_users_locale_guard_bu
+        BEFORE UPDATE OF preferred_ui_locale, preferred_correspondence_locale ON ui_users
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid preferred_ui_locale')
+            WHERE new.preferred_ui_locale IS NULL
+               OR new.preferred_ui_locale NOT IN ('en', 'pl');
+            SELECT RAISE(ABORT, 'invalid preferred_correspondence_locale')
+            WHERE new.preferred_correspondence_locale IS NOT NULL
+              AND new.preferred_correspondence_locale NOT IN ('en', 'pl');
+        END
         """
     )
     generation_rows = connection.exec_driver_sql(

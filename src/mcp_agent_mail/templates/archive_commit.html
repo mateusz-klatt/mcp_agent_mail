@@ -178,6 +178,12 @@
       </h3>
     </div>
 
+    {% if commit.diff_truncated %}
+      <div role="status" class="border-b border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200 sm:px-8">
+        The diff preview exceeded {{ commit.diff_limit_bytes }} bytes. Only complete file sections that fit within the preview limit are shown.
+      </div>
+    {% endif %}
+
     <div class="p-4 sm:p-8">
       <div id="diff-viewer" class="overflow-x-auto rounded-xl border-2 border-slate-200 dark:border-slate-700"></div>
     </div>

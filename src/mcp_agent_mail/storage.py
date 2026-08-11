@@ -25,6 +25,7 @@ import os
 import random
 import re
 import shutil
+import subprocess
 import sys
 import threading as _threading
 import time
@@ -39,7 +40,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator, Iterable, Sequence, TypeVar, cast
 
 from filelock import SoftFileLock, Timeout
-from git import NULL_TREE, Actor, Repo
+from git import NULL_TREE, Actor, Git, Repo
 from git.exc import GitCommandError
 from git.objects.tree import Tree
 from PIL import Image
@@ -3506,19 +3507,22 @@ async def get_commit_detail(
         # Validate SHA format (basic check)
         if not sha or not (7 <= len(sha) <= 40) or not all(c in "0123456789abcdef" for c in sha.lower()):
             raise ValueError("Invalid commit SHA format")
+        if max_diff_size < 0:
+            raise ValueError("max_diff_size must be non-negative")
 
         commit = repo.commit(sha)
 
         # Get parent for diff (use empty tree if initial commit)
         if commit.parents:
             parent = commit.parents[0]
-            diffs = parent.diff(commit, create_patch=True)
+            diffs = parent.diff(commit)
         else:
             # Initial commit - diff against empty tree
-            diffs = commit.diff(NULL_TREE, create_patch=True)
+            diffs = commit.diff(NULL_TREE)
 
-        # Build unified diff string
-        diff_text = ""
+        # Build file metadata from GitPython's structured diff.  ``Diff.diff``
+        # contains only hunk bodies, without the ``diff --git`` / file headers
+        # required by unified-diff consumers such as Diff2Html.
         changed_files = []
 
         for diff in diffs:
@@ -3543,17 +3547,115 @@ async def get_commit_detail(
                 "b_path": b_path,
             })
 
-            # Get diff text with size limit
-            if diff.diff:
-                diff_bytes = diff.diff
-                if isinstance(diff_bytes, bytes):
-                    decoded_diff = diff_bytes.decode("utf-8", errors="replace")
-                else:
-                    decoded_diff = str(diff_bytes)
-                if len(diff_text) + len(decoded_diff) > max_diff_size:
-                    diff_text += "\n\n[... Diff truncated - exceeds size limit ...]\n"
-                    break
-                diff_text += decoded_diff
+        # Read at most ``max_diff_size + 1`` bytes from Git.  This bounds the
+        # Python process even for hostile or accidentally enormous archive
+        # commits, while still retaining the full headers Diff2Html requires.
+        git_executable = Git.GIT_PYTHON_GIT_EXECUTABLE or "git"
+        command: list[str] = [git_executable, "--no-pager"]
+        if commit.parents:
+            command.extend([
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "--binary",
+                parent.hexsha,
+                commit.hexsha,
+            ])
+        else:
+            command.extend([
+                "show",
+                "--format=",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "--binary",
+                commit.hexsha,
+            ])
+
+        process: subprocess.Popen[bytes] = subprocess.Popen(
+            command,
+            cwd=str(repo.working_tree_dir or repo.git_dir),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+        )
+        if process.stdout is None:  # pragma: no cover - guaranteed by PIPE
+            process.kill()
+            raise RuntimeError("Git diff stdout pipe was not created")
+        raw_diff_buffer = bytearray()
+        while len(raw_diff_buffer) <= max_diff_size:
+            chunk = process.stdout.read(
+                min(64 * 1024, max_diff_size + 1 - len(raw_diff_buffer))
+            )
+            if not chunk:
+                break
+            raw_diff_buffer.extend(chunk)
+        raw_diff = bytes(raw_diff_buffer)
+        diff_truncated = len(raw_diff) > max_diff_size
+        if diff_truncated:
+            process.kill()
+        remaining_stdout, stderr = process.communicate()
+        if not diff_truncated:
+            raw_diff += remaining_stdout
+        if not diff_truncated and process.returncode:
+            raise GitCommandError(
+                command,
+                process.returncode,
+                stderr=stderr.decode("utf-8", errors="replace"),
+            )
+
+        if diff_truncated:
+            bounded_diff = raw_diff[:max_diff_size]
+            section_starts = [
+                match.start()
+                for match in re.finditer(rb"(?m)^diff --git ", bounded_diff)
+            ]
+            # Only complete file sections are safe to hand to Diff2Html.  The
+            # final captured section is necessarily incomplete because Git had
+            # more output than the byte limit, so omit it.  A separate UI flag
+            # makes the truncation explicit even when no section fits.
+            bounded_diff = (
+                bounded_diff[:section_starts[-1]]
+                if len(section_starts) >= 2
+                else b""
+            )
+        else:
+            bounded_diff = raw_diff
+
+        # Replacement characters expand invalid source bytes to three UTF-8
+        # bytes.  Apply the public byte limit again to the final response
+        # representation, one complete file section at a time, so the bound is
+        # strict without handing Diff2Html a partial header or hunk.
+        complete_section_starts = [
+            match.start()
+            for match in re.finditer(rb"(?m)^diff --git ", bounded_diff)
+        ]
+        if complete_section_starts:
+            complete_sections = [
+                bounded_diff[0 if index == 0 else start : end]
+                for index, (start, end) in enumerate(
+                    zip(
+                        complete_section_starts,
+                        [*complete_section_starts[1:], len(bounded_diff)],
+                        strict=True,
+                    )
+                )
+            ]
+        else:
+            complete_sections = [bounded_diff] if bounded_diff else []
+
+        decoded_sections: list[str] = []
+        decoded_size = 0
+        for section in complete_sections:
+            decoded_section = section.decode("utf-8", errors="replace")
+            section_size = len(decoded_section.encode("utf-8"))
+            if decoded_size + section_size > max_diff_size:
+                diff_truncated = True
+                break
+            decoded_sections.append(decoded_section)
+            decoded_size += section_size
+        diff_text = "".join(decoded_sections)
 
         # Parse commit body into message and trailers
         message_str = _ensure_str(commit.message)
@@ -3634,6 +3736,8 @@ async def get_commit_detail(
             "trailers": trailers,
             "files_changed": changed_files,
             "diff": diff_text,
+            "diff_truncated": diff_truncated,
+            "diff_limit_bytes": max_diff_size,
             "stats": {
                 "files": len(commit.stats.files),
                 "insertions": commit.stats.total["insertions"],

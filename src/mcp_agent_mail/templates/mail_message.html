@@ -56,7 +56,7 @@
     <!-- Subject -->
     <div class="mb-6">
       <div class="flex items-start justify-between gap-4 mb-3">
-        <h1 class="text-2xl sm:text-3xl font-bold text-slate-900 dark:text-white break-words">
+        <h1 class="min-w-0 flex-1 text-2xl sm:text-3xl font-bold text-slate-900 dark:text-white break-words [overflow-wrap:anywhere]">
           {{ message.subject }}
         </h1>
 
@@ -197,12 +197,12 @@
         Copy Link
       </button>
     </div>
-    <div class="prose prose-slate dark:prose-invert max-w-none">
+    <div class="prose prose-slate dark:prose-invert max-w-none min-w-0 break-words [overflow-wrap:anywhere]">
       {% if message.body_html %}
         <!-- SECURITY: Using | safe assumes backend properly sanitizes HTML to prevent XSS -->
-        <div id="message-body">{{ message.body_html | safe }}</div>
+        <div id="message-body" class="min-w-0">{{ message.body_html | safe }}</div>
       {% else %}
-        <div id="message-body" class="markdown-content"></div>
+        <div id="message-body" class="markdown-content min-w-0"></div>
         <script>
           // Render markdown on client side for better security and features
           document.addEventListener('DOMContentLoaded', () => {

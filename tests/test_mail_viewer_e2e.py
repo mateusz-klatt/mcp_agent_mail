@@ -478,10 +478,29 @@ async def test_mail_unified_inbox_html(isolated_env):
         assert '@keydown.space.prevent="handleMessageClick(msg)"' in resp.text
         assert "sticky top-28 lg:top-16" in resp.text
         assert (
-            "sticky top-[17rem] lg:top-48 xl:top-40" in resp.text
+            "fixed inset-x-0 top-[18.5rem] lg:top-56 xl:top-48 z-[60]"
+            in resp.text
+        )
+        assert (
+            "sticky top-[17rem] lg:top-48 z-10" in resp.text
         )
         assert "fixed inset-0 top-[18.5rem] lg:top-56 xl:top-48 z-50" in resp.text
-        assert "isFullscreen ? 'z-[60]' : 'z-10'" in resp.text
+        for field_id in (
+            "unified-filter-project",
+            "unified-filter-sender",
+            "unified-filter-recipient",
+            "unified-filter-importance",
+            "unified-filter-thread",
+        ):
+            assert f'for="{field_id}"' in resp.text
+            assert f'id="{field_id}"' in resp.text
+        assert 'id="unified-search"' in resp.text
+        assert 'name="query"' in resp.text
+        assert 'id="project-filter"' in resp.text
+        assert 'name="project_filter"' in resp.text
+        assert 'x-data="unifiedInboxManager()" x-init="init()"' not in resp.text
+        assert "destroy() {" in resp.text
+        assert "this._keydownHandler = null;" in resp.text
 
 
 @pytest.mark.asyncio
@@ -798,6 +817,14 @@ async def test_mail_message_detail(isolated_env):
         assert "Test Message" in resp.text or "message" in resp.text.lower()
         assert "<time datetime=" in resp.text
         assert "inline-flex min-h-[44px] items-center gap-2" in resp.text
+        assert (
+            "min-w-0 flex-1 text-2xl sm:text-3xl font-bold text-slate-900 "
+            "dark:text-white break-words [overflow-wrap:anywhere]" in resp.text
+        )
+        assert (
+            "prose prose-slate dark:prose-invert max-w-none min-w-0 break-words "
+            "[overflow-wrap:anywhere]" in resp.text
+        )
 
 
 @pytest.mark.asyncio

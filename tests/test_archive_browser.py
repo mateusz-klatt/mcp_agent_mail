@@ -15,7 +15,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 
-from mcp_agent_mail import config as _config, webauth
+from mcp_agent_mail import config as _config, http as http_module, webauth
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.http import build_http_app
@@ -305,6 +305,18 @@ async def test_member_archive_routes_hide_unassigned_and_mixed_scope_commits(
         text=True,
     )
     rename_sha = _get_git_head_sha(root)
+    detail_calls: list[str] = []
+    original_get_commit_detail = http_module.get_commit_detail
+
+    async def tracked_get_commit_detail(repo, requested_sha, max_diff_size=5 * 1024 * 1024):
+        detail_calls.append(requested_sha)
+        return await original_get_commit_detail(
+            repo,
+            requested_sha,
+            max_diff_size=max_diff_size,
+        )
+
+    monkeypatch.setattr(http_module, "get_commit_detail", tracked_get_commit_detail)
     app = build_http_app(settings, build_mcp_server())
 
     async with AsyncClient(
@@ -340,6 +352,7 @@ async def test_member_archive_routes_hide_unassigned_and_mixed_scope_commits(
     assert mixed_commit.status_code == 404
     assert rename_commit.status_code == 404
     assert "HIDDEN-RENAME-SENTINEL" not in rename_commit.text
+    assert detail_calls == [visible_sha]
     visible_paths_result = await asyncio.to_thread(
         subprocess.run,
         ["git", "show", "--name-only", "--format=", visible_sha],
@@ -549,6 +562,15 @@ async def test_archive_commit_detail(isolated_env):
         assert "text/html" in resp.headers.get("content-type", "")
         body = resp.text
         assert "diff2html-ui.min.js" in body
+        detail = await get_commit_detail(
+            (await ensure_archive(settings, data["project_slug"])).repo,
+            data["head_sha"],
+        )
+        assert detail["files_changed"]
+        assert detail["diff"].startswith("diff --git ")
+        assert "\n--- " in detail["diff"]
+        assert "\n+++ " in detail["diff"]
+        assert "diff --git " in body
         assert "new Diff2HtmlUI(targetElement, diffString, configuration)" in body
         assert "diff2htmlUi.draw()" in body
         assert "Diff2Html.html(" not in body
@@ -558,6 +580,104 @@ async def test_archive_commit_detail(isolated_env):
         back_action = body.split('data-archive-action="back"', 1)[1].split("</button>", 1)[0]
         assert "min-h-[44px]" in copy_action
         assert "min-h-[44px]" in back_action
+
+
+@pytest.mark.asyncio
+async def test_archive_commit_diff_is_bounded_utf8_safe_and_explicitly_truncated(
+    isolated_env,
+    monkeypatch,
+):
+    """Large/non-UTF8 patches stay bounded and tell the viewer what was omitted."""
+    settings = _config.get_settings()
+    data = await _setup_archive_with_commits(settings)
+    root = Path(settings.storage.root).expanduser().resolve()
+    project_messages = root / "projects" / data["project_slug"] / "messages"
+    invalid_path = project_messages / "a-invalid-utf8.txt"
+    large_path = project_messages / "z-large-preview.txt"
+    invalid_path.write_bytes(b"small file\n\xff\xfe invalid utf8\n")
+    large_path.write_bytes((b"Z" * 16_384) + b"\n")
+    await asyncio.to_thread(
+        subprocess.run,
+        ["git", "add", invalid_path.relative_to(root), large_path.relative_to(root)],
+        cwd=root,
+        check=True,
+    )
+    await asyncio.to_thread(
+        subprocess.run,
+        ["git", "commit", "-m", "archive: bounded non-UTF8 preview"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    sha = _get_git_head_sha(root)
+    assert sha is not None
+
+    archive = await ensure_archive(settings, data["project_slug"])
+    detail = await get_commit_detail(archive.repo, sha, max_diff_size=512)
+    assert detail["diff_truncated"] is True
+    assert detail["diff_limit_bytes"] == 512
+    assert len(detail["diff"].encode("utf-8")) <= 512
+    assert "a-invalid-utf8.txt" in detail["diff"]
+    assert "\ufffd\ufffd invalid utf8" in detail["diff"]
+    assert "z-large-preview.txt" not in detail["diff"]
+    assert detail["diff"].startswith("diff --git ")
+
+    expansion_path = project_messages / "only-invalid-expansion.txt"
+    expansion_path.write_bytes((b"\xff" * 180) + b"\n")
+    await asyncio.to_thread(
+        subprocess.run,
+        ["git", "add", expansion_path.relative_to(root)],
+        cwd=root,
+        check=True,
+    )
+    await asyncio.to_thread(
+        subprocess.run,
+        ["git", "commit", "-m", "archive: invalid byte expansion"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    expansion_sha = _get_git_head_sha(root)
+    assert expansion_sha is not None
+    raw_expansion = await asyncio.to_thread(
+        subprocess.run,
+        ["git", "diff", "--no-ext-diff", "--no-textconv", sha, expansion_sha],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    raw_limit = len(raw_expansion.stdout)
+    expansion_detail = await get_commit_detail(
+        archive.repo,
+        expansion_sha,
+        max_diff_size=raw_limit,
+    )
+    assert expansion_detail["diff_truncated"] is True
+    assert len(expansion_detail["diff"].encode("utf-8")) <= raw_limit
+
+    original_get_commit_detail = http_module.get_commit_detail
+
+    async def bounded_detail(repo, requested_sha, max_diff_size=5 * 1024 * 1024):
+        del max_diff_size
+        return await original_get_commit_detail(
+            repo,
+            requested_sha,
+            max_diff_size=raw_limit,
+        )
+
+    monkeypatch.setattr(http_module, "get_commit_detail", bounded_detail)
+    app = build_http_app(settings, build_mcp_server())
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(f"/mail/archive/commit/{expansion_sha}")
+
+    assert response.status_code == 200
+    assert f"The diff preview exceeded {raw_limit} bytes" in response.text
+    assert "Only complete file sections" in response.text
 
 
 @pytest.mark.asyncio

@@ -6,7 +6,7 @@ import secrets
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import Column, Index, UniqueConstraint
+from sqlalchemy import CheckConstraint, Column, Index, String, UniqueConstraint
 from sqlalchemy.types import JSON
 from sqlmodel import Field, SQLModel
 
@@ -243,6 +243,17 @@ class UiUser(SQLModel, table=True):
     """
 
     __tablename__ = "ui_users"
+    __table_args__ = (
+        CheckConstraint(
+            "preferred_ui_locale IN ('en', 'pl')",
+            name="ck_ui_users_preferred_ui_locale",
+        ),
+        CheckConstraint(
+            "preferred_correspondence_locale IS NULL "
+            "OR preferred_correspondence_locale IN ('en', 'pl')",
+            name="ck_ui_users_preferred_correspondence_locale",
+        ),
+    )
 
     id: Optional[int] = Field(default=None, primary_key=True)
     username: str = Field(index=True, unique=True, max_length=64)
@@ -251,6 +262,14 @@ class UiUser(SQLModel, table=True):
     disabled: bool = Field(default=False)
     session_epoch: int = Field(default=1)
     session_generation: str = Field(default_factory=_new_session_generation, max_length=64)
+    preferred_ui_locale: str = Field(
+        default="en",
+        sa_column=Column(String(2), nullable=False, server_default="en"),
+    )
+    preferred_correspondence_locale: Optional[str] = Field(
+        default=None,
+        sa_column=Column(String(2), nullable=True),
+    )
     created_ts: datetime = Field(default_factory=_utcnow_naive)
     last_login_ts: Optional[datetime] = Field(default=None)
 

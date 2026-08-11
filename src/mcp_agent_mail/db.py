@@ -1019,6 +1019,20 @@ def _setup_fts(connection: Any) -> None:
     )
     connection.exec_driver_sql(
         """
+        CREATE TRIGGER IF NOT EXISTS ui_users_identity_collision_guard_bi
+        BEFORE INSERT ON ui_users
+        BEGIN
+            SELECT RAISE(ABORT, 'ui_users identity collision')
+            WHERE EXISTS (
+                SELECT 1
+                FROM ui_users
+                WHERE id = new.id OR username = new.username
+            );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
         CREATE TRIGGER IF NOT EXISTS ui_users_locale_guard_bi
         BEFORE INSERT ON ui_users
         BEGIN
@@ -1095,6 +1109,20 @@ def _setup_fts(connection: Any) -> None:
             "UPDATE projects SET project_generation = ? WHERE id = ?",
             (secrets.token_hex(32), int(project_generation_row[0])),
         )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS projects_identity_collision_guard_bi
+        BEFORE INSERT ON projects
+        BEGIN
+            SELECT RAISE(ABORT, 'projects identity collision')
+            WHERE EXISTS (
+                SELECT 1
+                FROM projects
+                WHERE id = new.id OR slug = new.slug
+            );
+        END
+        """
+    )
     connection.exec_driver_sql(
         """
         CREATE TRIGGER IF NOT EXISTS projects_generation_guard_bi

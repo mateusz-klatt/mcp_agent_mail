@@ -4,6 +4,7 @@ import asyncio
 import os
 import sqlite3
 from collections.abc import Coroutine
+from contextlib import closing
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
@@ -1105,6 +1106,234 @@ def test_project_generation_migrates_and_is_immutable(isolated_env) -> None:
     assert isinstance(raw_generation, str) and len(raw_generation) == 64
     assert raw_generation != migrated_generation
     assert migrated_again == migrated_generation
+
+
+@pytest.mark.parametrize("entity", ["project", "ui-user"])
+@pytest.mark.parametrize("collision_kind", ["primary-key", "unique-key"])
+@pytest.mark.parametrize(
+    "replacement_syntax",
+    ["insert-or-replace", "replace"],
+)
+@pytest.mark.parametrize("recursive_triggers", [False, True], ids=["recursive-off", "recursive-on"])
+def test_identity_collision_guards_block_replace_before_assignment_transplant(
+    isolated_env,
+    entity: str,
+    collision_kind: str,
+    replacement_syntax: str,
+    recursive_triggers: bool,
+) -> None:
+    ids = _run_database(_seed_users_and_projects())
+    database_path = _database_path()
+
+    if replacement_syntax == "insert-or-replace":
+        project_statement = (
+            "INSERT OR REPLACE INTO projects "
+            "(id, slug, human_key, project_generation, created_at) "
+            "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)"
+        )
+        user_statement = (
+            "INSERT OR REPLACE INTO ui_users "
+            "(id, username, password_hash, role, disabled, session_epoch, "
+            "session_generation, display_name, profile_revision, preferred_ui_locale, "
+            "preferred_correspondence_locale, created_ts, last_login_ts) "
+            "VALUES (?, ?, 'replacement-hash', 'member', 0, 77, ?, NULL, 1, "
+            "'en', NULL, CURRENT_TIMESTAMP, NULL)"
+        )
+    else:
+        project_statement = (
+            "REPLACE INTO projects "
+            "(id, slug, human_key, project_generation, created_at) "
+            "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)"
+        )
+        user_statement = (
+            "REPLACE INTO ui_users "
+            "(id, username, password_hash, role, disabled, session_epoch, "
+            "session_generation, display_name, profile_revision, preferred_ui_locale, "
+            "preferred_correspondence_locale, created_ts, last_login_ts) "
+            "VALUES (?, ?, 'replacement-hash', 'member', 0, 77, ?, NULL, 1, "
+            "'en', NULL, CURRENT_TIMESTAMP, NULL)"
+        )
+
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.execute(
+            """
+            INSERT INTO ui_project_assignments
+                (user_id, project_id, role, created_ts, updated_ts)
+            VALUES (?, ?, 'viewer', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (ids["member"], ids["backend"]),
+        )
+        connection.commit()
+        connection.execute(
+            "PRAGMA recursive_triggers=ON"
+            if recursive_triggers
+            else "PRAGMA recursive_triggers=OFF"
+        )
+        assert connection.execute("PRAGMA recursive_triggers").fetchone() == (
+            int(recursive_triggers),
+        )
+
+        project_before = connection.execute(
+            "SELECT id, slug, human_key, project_generation FROM projects WHERE id = ?",
+            (ids["backend"],),
+        ).fetchone()
+        user_before = connection.execute(
+            "SELECT id, username, password_hash, session_epoch, session_generation "
+            "FROM ui_users WHERE id = ?",
+            (ids["member"],),
+        ).fetchone()
+        assignment_before = connection.execute(
+            "SELECT user_id, project_id, role FROM ui_project_assignments"
+        ).fetchall()
+
+        if entity == "project":
+            replacement_id = (
+                ids["backend"] if collision_kind == "primary-key" else 9_000_001
+            )
+            replacement_slug = (
+                "hostile-project" if collision_kind == "primary-key" else "backend"
+            )
+            with pytest.raises(sqlite3.IntegrityError, match="projects identity collision"):
+                connection.execute(
+                    project_statement,
+                    (
+                        replacement_id,
+                        replacement_slug,
+                        "/hostile/project",
+                        "e" * 64,
+                    ),
+                )
+        else:
+            replacement_id = (
+                ids["member"] if collision_kind == "primary-key" else 9_000_001
+            )
+            replacement_username = (
+                "hostile-user" if collision_kind == "primary-key" else "member"
+            )
+            with pytest.raises(sqlite3.IntegrityError, match="ui_users identity collision"):
+                connection.execute(
+                    user_statement,
+                    (replacement_id, replacement_username, "e" * 64),
+                )
+        connection.rollback()
+
+        assert connection.execute(
+            "SELECT id, slug, human_key, project_generation FROM projects WHERE id = ?",
+            (ids["backend"],),
+        ).fetchone() == project_before
+        assert connection.execute(
+            "SELECT id, username, password_hash, session_epoch, session_generation "
+            "FROM ui_users WHERE id = ?",
+            (ids["member"],),
+        ).fetchone() == user_before
+        assert connection.execute(
+            "SELECT user_id, project_id, role FROM ui_project_assignments"
+        ).fetchall() == assignment_before
+
+        if entity == "project":
+            connection.execute(
+                project_statement,
+                (9_000_002, "control-project", "/control/project", "d" * 64),
+            )
+            control_identity = connection.execute(
+                "SELECT id, slug, project_generation FROM projects WHERE id = 9000002"
+            ).fetchone()
+            assert control_identity == (9_000_002, "control-project", "d" * 64)
+        else:
+            connection.execute(
+                user_statement,
+                (9_000_002, "control-user", "d" * 64),
+            )
+            control_identity = connection.execute(
+                "SELECT id, username, session_generation FROM ui_users WHERE id = 9000002"
+            ).fetchone()
+            assert control_identity == (9_000_002, "control-user", "d" * 64)
+        connection.commit()
+
+        assert connection.execute(
+            "SELECT user_id, project_id, role FROM ui_project_assignments"
+        ).fetchall() == assignment_before
+
+
+@pytest.mark.parametrize("entity", ["project", "ui-user"])
+@pytest.mark.parametrize("recursive_triggers", [False, True], ids=["recursive-off", "recursive-on"])
+def test_identity_collision_guards_allow_explicit_recreation_as_fresh_lifetime(
+    isolated_env,
+    entity: str,
+    recursive_triggers: bool,
+) -> None:
+    ids = _run_database(_seed_users_and_projects())
+    member, _assignments = _run_database(_user_and_assignments("member"))
+    backend = _run_database(_project_by_id(ids["backend"]))
+    database_path = _database_path()
+    replacement_generation = "c" * 64
+
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.execute(
+            "PRAGMA recursive_triggers=ON"
+            if recursive_triggers
+            else "PRAGMA recursive_triggers=OFF"
+        )
+        if entity == "project":
+            connection.execute("DELETE FROM projects WHERE id = ?", (ids["backend"],))
+            connection.execute(
+                "INSERT INTO projects "
+                "(id, slug, human_key, project_generation, created_at) "
+                "VALUES (?, 'backend', '/example/recreated', ?, CURRENT_TIMESTAMP)",
+                (ids["backend"], replacement_generation),
+            )
+        else:
+            connection.execute("DELETE FROM ui_users WHERE id = ?", (ids["member"],))
+            connection.execute(
+                """
+                INSERT INTO ui_users (
+                    id, username, password_hash, role, disabled, session_epoch,
+                    session_generation, display_name, profile_revision,
+                    preferred_ui_locale, preferred_correspondence_locale,
+                    created_ts, last_login_ts
+                ) VALUES (?, 'member', 'replacement-hash', 'member', 0, 10, ?, NULL, 1,
+                          'en', NULL, CURRENT_TIMESTAMP, NULL)
+                """,
+                (ids["member"], replacement_generation),
+            )
+        connection.commit()
+
+    if entity == "project":
+        recreated_project = _run_database(_project_by_id(ids["backend"]))
+        assert recreated_project.project_generation == replacement_generation
+        assert recreated_project.project_generation != backend.project_generation
+        with pytest.raises(UiAccessMutationError) as stale_project:
+            _run_database(
+                _mutate_access(
+                    actor_user_id=None,
+                    actor_account_generation=None,
+                    expected_actor_session_epoch=None,
+                    trusted_cli_actor=True,
+                    target_user_id=ids["member"],
+                    project_id=ids["backend"],
+                    expected_project_generation=backend.project_generation,
+                    role="viewer",
+                    expected_access_version=member.session_epoch,
+                    account_generation=member.session_generation,
+                )
+            )
+        assert stale_project.value.code == "project_recreated"
+    else:
+        recreated_user, assignments = _run_database(_user_and_assignments("member"))
+        assert recreated_user.session_generation == replacement_generation
+        assert recreated_user.session_generation != member.session_generation
+        assert assignments == []
+        with pytest.raises(UiProfileMutationError) as stale_account:
+            _run_database(
+                _mutate_display_name(
+                    target_user_id=ids["member"],
+                    account_generation=member.session_generation,
+                    expected_session_epoch=member.session_epoch,
+                    expected_profile_revision=member.profile_revision,
+                    display_name="Must not persist",
+                )
+            )
+        assert stale_account.value.code == "account_recreated"
 
 
 def test_project_delete_recreate_same_id_rejects_stale_assignment_request(

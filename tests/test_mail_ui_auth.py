@@ -573,10 +573,7 @@ def _install_react_dist(monkeypatch, tmp_path: Path) -> Path:
         "window.Alpine = { start() {} };\n",
         encoding="utf-8",
     )
-    (assets_root / "legacy.css").write_text(
-        "[x-cloak] { display: none !important; }\n",
-        encoding="utf-8",
-    )
+    (assets_root / "legacy.css").write_bytes(b"[x-cloak] { display: none !important; }\n")
     monkeypatch.setattr(http_module, "_mail_react_dist_root", lambda: dist_root)
     return dist_root
 

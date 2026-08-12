@@ -17,6 +17,7 @@ import contextlib
 import os
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -97,6 +98,20 @@ class TestServerConfiguration:
         server = build_mcp_server()
         app = build_http_app(settings, server)
         assert app is not None
+
+    def test_production_proxy_trust_is_confined_to_sanitizing_loopback_ingress(self):
+        """Production may trust all proxy peers only behind its fixed Apache boundary."""
+        repository_root = Path(__file__).resolve().parents[1]
+        compose = (repository_root / "compose.prod.yaml").read_text(encoding="utf-8")
+        apache = (repository_root / "deploy/apache-vhost.example.conf").read_text(
+            encoding="utf-8"
+        )
+
+        assert '- "127.0.0.1:8765:8765"' in compose
+        assert 'HTTP_FORWARDED_ALLOW_IPS: "*"' in compose
+        assert 'RequestHeader unset X-Forwarded-Proto' in apache
+        assert 'RequestHeader set X-Forwarded-Proto "https"' in apache
+        assert 'ProxyPass        "/" "http://127.0.0.1:8765/"' in apache
 
     @pytest.mark.asyncio
     async def test_retention_quota_report_offloads_scan(self, isolated_env, monkeypatch):

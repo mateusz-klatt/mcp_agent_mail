@@ -42,6 +42,7 @@ class HttpSettings:
     host: str
     port: int
     path: str
+    forwarded_allow_ips: str
     bearer_token: str | None
     # Basic per-IP limiter (legacy/simple)
     rate_limit_enabled: bool
@@ -409,6 +410,10 @@ def _build_settings() -> Settings:
         host=decouple_config("HTTP_HOST", default="127.0.0.1"),
         port=_i("HTTP_PORT", default=8765),
         path=decouple_config("HTTP_PATH", default="/api/"),
+        forwarded_allow_ips=(
+            decouple_config("HTTP_FORWARDED_ALLOW_IPS", default="127.0.0.1").strip()
+            or "127.0.0.1"
+        ),
         bearer_token=decouple_config("HTTP_BEARER_TOKEN", default="") or None,
         rate_limit_enabled=_b("HTTP_RATE_LIMIT_ENABLED", default=False),
         rate_limit_per_minute=_i("HTTP_RATE_LIMIT_PER_MINUTE", default=60),

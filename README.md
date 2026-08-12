@@ -2096,6 +2096,7 @@ Common variables you may set:
 | `HTTP_HOST` | `127.0.0.1` | Bind host for HTTP transport |
 | `HTTP_PORT` | `8765` | Bind port for HTTP transport |
 | `HTTP_PATH` | `/mcp/` | Preferred MCP endpoint mount path (`/api` and `/mcp` aliases are also mounted) |
+| `HTTP_FORWARDED_ALLOW_IPS` | `127.0.0.1` | Proxy IPs/networks whose forwarded scheme/client headers Uvicorn may trust; `*` is safe only when a sanitizing proxy is the sole ingress |
 | `HTTP_JWT_ENABLED` | `false` | Enable JWT validation middleware |
 | `HTTP_JWT_SECRET` |  | HMAC secret for HS* algorithms (dev) |
 | `HTTP_JWT_JWKS_URL` |  | JWKS URL for public key verification |
@@ -2469,7 +2470,7 @@ Operations teams can follow `docs/operations_alignment_checklist.md`, which link
 > `-w`/`--workers` to any command below breaks this. Scale by running more
 > instances behind the proxy, each with its own store.
 
-- **Direct uvicorn**: `uvicorn mcp_agent_mail.http:create_app --factory --host 0.0.0.0 --port 8765`
+- **Direct uvicorn**: `uvicorn mcp_agent_mail.http:create_app --factory --host 0.0.0.0 --port 8765`. This lower-level entrypoint reads Uvicorn's `FORWARDED_ALLOW_IPS`, so set it to the same trusted proxy list as `HTTP_FORWARDED_ALLOW_IPS` when running behind TLS termination.
 - **Python module**: `python -m mcp_agent_mail.http --host 0.0.0.0 --port 8765`
 - **Gunicorn**: `gunicorn -c deploy/gunicorn.conf.py mcp_agent_mail.http:create_app --factory` — the config pins `workers = 1`; do not override it
 - **Docker**: `docker compose up --build`

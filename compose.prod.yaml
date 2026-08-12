@@ -34,6 +34,14 @@ services:
       HTTP_HOST: "0.0.0.0"    # inside the container only; the port bind above confines it
       HTTP_PORT: "8765"
 
+      # Apache is the sole ingress and strips/replaces X-Forwarded-* before
+      # proxying to this loopback-only published port. The container sees the
+      # Docker bridge gateway rather than 127.0.0.1, so Uvicorn's localhost-only
+      # default would ignore Apache's X-Forwarded-Proto=https. Trusting every
+      # peer is safe only within this single-service, loopback-confined topology;
+      # it restores the external HTTPS scheme used by the Mail UI CSRF check.
+      HTTP_FORWARDED_ALLOW_IPS: "*"
+
       # MUST stay "/api/". build_http_app always mounts a "/mcp" alias, and per #250
       # (ec835d2) "/mcp" gets the STATEFUL app *unless* /mcp is itself the configured
       # base — an explicit HTTP_PATH=/mcp/ would silently downgrade it to stateless.

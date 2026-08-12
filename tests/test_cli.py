@@ -565,17 +565,27 @@ def test_cli_serve_http_uses_settings(isolated_env, monkeypatch):
     runner = CliRunner()
     call_args: dict[str, Any] = {}
 
-    def fake_uvicorn_run(app, host, port, log_level="info"):
+    def fake_uvicorn_run(
+        app,
+        host,
+        port,
+        log_level="info",
+        forwarded_allow_ips="127.0.0.1",
+    ):
         call_args["app"] = app
         call_args["host"] = host
         call_args["port"] = port
         call_args["log_level"] = log_level
+        call_args["forwarded_allow_ips"] = forwarded_allow_ips
 
+    monkeypatch.setenv("HTTP_FORWARDED_ALLOW_IPS", "172.19.0.1")
+    clear_settings_cache()
     monkeypatch.setattr("uvicorn.run", fake_uvicorn_run)
     result = runner.invoke(app, ["serve-http"])
     assert result.exit_code == 0
     assert call_args["host"] == "127.0.0.1"
     assert call_args["port"] == 8765
+    assert call_args["forwarded_allow_ips"] == "172.19.0.1"
 
 
 def test_cli_config_set_port_clears_cached_settings(tmp_path, monkeypatch):

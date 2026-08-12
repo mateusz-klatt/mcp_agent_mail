@@ -26,12 +26,14 @@ import contextlib
 import time
 from dataclasses import replace
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from authlib.jose import jwt
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from mcp_agent_mail import (
     config as _config,
@@ -1548,6 +1550,58 @@ class TestMailUiPreferences:
             ("preferences-other", "en", None),
             ("preferences-owner", "pl", None),
         ]
+
+    @pytest.mark.asyncio
+    async def test_patch_accepts_https_origin_from_trusted_container_proxy(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """A trusted Docker-gateway proxy must restore HTTPS before the CSRF check."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        epoch = await _make_user("preferences-proxied", role=webauth.ROLE_MEMBER)
+        default_proxy_app = ProxyHeadersMiddleware(app, trusted_hosts="127.0.0.1")
+        proxied_app = ProxyHeadersMiddleware(app, trusted_hosts="*")
+
+        async with AsyncClient(
+            transport=ASGITransport(
+                app=cast(Any, default_proxy_app),
+                client=("172.19.0.1", 43112),
+            ),
+            base_url="http://hermes.klatt.ie",
+            cookies=await _cookie("preferences-proxied", epoch),
+        ) as client:
+            rejected = await client.patch(
+                "/mail/api/v1/me/preferences",
+                json={"preferred_ui_locale": "pl"},
+                headers={
+                    "Origin": "https://hermes.klatt.ie",
+                    "Referer": "https://hermes.klatt.ie/mail/v2/",
+                    "X-Forwarded-Proto": "https",
+                },
+            )
+
+        async with AsyncClient(
+            transport=ASGITransport(
+                app=cast(Any, proxied_app),
+                client=("172.19.0.1", 43112),
+            ),
+            base_url="http://hermes.klatt.ie",
+            cookies=await _cookie("preferences-proxied", epoch),
+        ) as client:
+            response = await client.patch(
+                "/mail/api/v1/me/preferences",
+                json={"preferred_ui_locale": "pl"},
+                headers={
+                    "Origin": "https://hermes.klatt.ie",
+                    "Referer": "https://hermes.klatt.ie/mail/v2/",
+                    "X-Forwarded-Proto": "https",
+                },
+            )
+
+        assert rejected.status_code == 403
+        assert response.status_code == 200
+        assert response.json()["stored"]["preferred_ui_locale"] == "pl"
 
     @pytest.mark.asyncio
     async def test_patch_rejects_null_ui_unknown_locale_and_extra_fields(

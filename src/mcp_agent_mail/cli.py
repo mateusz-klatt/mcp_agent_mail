@@ -1963,6 +1963,8 @@ def serve_http(
         _kwargs: dict[str, Any] = {"host": resolved_host, "port": resolved_port, "log_level": "info"}
         if "ws" in _sig.parameters:
             _kwargs["ws"] = "none"
+        if "forwarded_allow_ips" in _sig.parameters:
+            _kwargs["forwarded_allow_ips"] = effective_settings.http.forwarded_allow_ips
         uvicorn.run(app, **_kwargs)
     finally:
         server_lock.release()

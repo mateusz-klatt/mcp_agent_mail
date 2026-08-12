@@ -32,12 +32,16 @@ def test_http_module_main_invokes_uvicorn(isolated_env, monkeypatch):
     # Verify http.main uses settings + argparse defaults to run uvicorn
     from mcp_agent_mail import http as http_mod
 
+    monkeypatch.setenv("HTTP_FORWARDED_ALLOW_IPS", "127.0.0.1")
+    with contextlib.suppress(Exception):
+        _config.clear_settings_cache()
     captured: dict[str, Any] = {}
 
-    def fake_run(app, host, port, log_level="info"):
+    def fake_run(app, host, port, log_level="info", forwarded_allow_ips="127.0.0.1"):
         captured["host"] = host
         captured["port"] = port
         captured["log_level"] = log_level
+        captured["forwarded_allow_ips"] = forwarded_allow_ips
 
     monkeypatch.setattr("uvicorn.run", fake_run)
     # Simulate no CLI args beyond program name
@@ -46,6 +50,7 @@ def test_http_module_main_invokes_uvicorn(isolated_env, monkeypatch):
     http_mod.main()
     assert captured["host"] == _config.get_settings().http.host
     assert captured["port"] == _config.get_settings().http.port
+    assert captured["forwarded_allow_ips"] == "127.0.0.1"
 
 
 def test_llm_env_bridge_and_callbacks(monkeypatch):
@@ -90,4 +95,3 @@ def test_llm_env_bridge_and_callbacks(monkeypatch):
     out = asyncio.run(llm_mod.complete_system_user("sys", "user"))
     # content may vary by stub path; assert at least model populated
     assert isinstance(out.model, str) and len(out.model) > 0
-

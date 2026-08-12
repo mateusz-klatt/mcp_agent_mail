@@ -8280,6 +8280,8 @@ def main() -> None:
     _kwargs: dict[str, Any] = {"host": host, "port": port, "log_level": args.log_level}
     if "ws" in _sig.parameters:
         _kwargs["ws"] = "none"
+    if "forwarded_allow_ips" in _sig.parameters:
+        _kwargs["forwarded_allow_ips"] = settings.http.forwarded_allow_ips
     uvicorn.run(app, **_kwargs)
 
 

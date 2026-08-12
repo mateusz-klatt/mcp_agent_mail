@@ -1207,7 +1207,13 @@ exec /usr/bin/sleep "$@"
         check=False,
         capture_output=True,
         text=True,
-        timeout=5,
+        # Git-for-Windows starts several MSYS/native processes here (bash,
+        # git, curl, jq and the fixture helpers).  Five seconds was tight
+        # enough for a loaded hosted runner to kill the immediate ``event``
+        # case even though all seven slower parameters in the same job passed.
+        # Keep a bounded deadline without turning Windows process start-up into
+        # a production watcher failure.
+        timeout=30 if os.name == "nt" else 10,
     )
 
     assert result.returncode == 0, result.stderr

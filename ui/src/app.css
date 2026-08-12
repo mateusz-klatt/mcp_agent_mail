@@ -85,6 +85,9 @@ select {
   top: 0.75rem;
   left: 0.75rem;
   z-index: 100;
+  display: inline-flex;
+  min-height: 46px;
+  align-items: center;
   transform: translateY(-180%);
   border-radius: 8px;
   padding: 0.75rem 1rem;

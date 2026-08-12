@@ -3059,7 +3059,7 @@ def _read_exact_message_delivery_file(
 def _write_message_delivery_attempt_sync(path: Path, document_bytes: bytes) -> None:
     """Create one complete read-only attempt without overwriting another try."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-    file_descriptor = os.open(path, flags, 0o644)
+    file_descriptor = os.open(path, flags, 0o600)
     try:
         view = memoryview(document_bytes)
         written = 0
@@ -3069,12 +3069,12 @@ def _write_message_delivery_attempt_sync(path: Path, document_bytes: bytes) -> N
                 raise OSError("message delivery attempt write made no progress")
             written += count
         try:
-            os.fchmod(file_descriptor, 0o444)
+            os.fchmod(file_descriptor, 0o400)
         except (AttributeError, OSError):
             # Windows exposes its read-only file attribute through chmod but
             # may not implement fchmod. Publication must fail if neither
             # mechanism can make the hard-linked inode non-writable.
-            path.chmod(0o444)
+            path.chmod(0o400)
         os.fsync(file_descriptor)
     finally:
         os.close(file_descriptor)

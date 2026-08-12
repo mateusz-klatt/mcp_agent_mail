@@ -1220,8 +1220,10 @@ async def test_pending_alias_and_final_document_are_read_only(isolated_env: Any)
     delivery_dir = archive.root / "message_deliveries"
     final_path = delivery_dir / f"{DELIVERY_ID}.md"
     pending_path = next(delivery_dir.glob("*.pending"))
-    assert stat.S_IMODE(final_path.stat().st_mode) & 0o222 == 0
-    assert stat.S_IMODE(pending_path.stat().st_mode) & 0o222 == 0
+    final_mode = stat.S_IMODE(final_path.stat().st_mode)
+    pending_mode = stat.S_IMODE(pending_path.stat().st_mode)
+    assert final_mode & 0o222 == 0
+    assert pending_mode & 0o222 == 0
     if os.name == "nt" or os.geteuid() != 0:
         with pytest.raises(PermissionError):
             pending_path.write_bytes(b"mutated")
@@ -1241,3 +1243,29 @@ async def test_pending_alias_and_final_document_are_read_only(isolated_env: Any)
         )
         assert attempt.returncode != 0
     assert final_path.read_bytes() == document
+
+
+def test_attempt_permissions_are_owner_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_create_modes: list[int] = []
+    requested_final_modes: list[int] = []
+    original_open = os.open
+    original_fchmod = os.fchmod
+
+    def recording_open(path: Path, flags: int, mode: int = 0o777) -> int:
+        requested_create_modes.append(mode)
+        return original_open(path, flags, mode)
+
+    def recording_fchmod(file_descriptor: int, mode: int) -> None:
+        requested_final_modes.append(mode)
+        original_fchmod(file_descriptor, mode)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    monkeypatch.setattr(os, "fchmod", recording_fchmod)
+
+    _write_message_delivery_attempt_sync(tmp_path / "attempt.pending", _document())
+
+    assert requested_create_modes == [stat.S_IRUSR | stat.S_IWUSR]
+    assert requested_final_modes == [stat.S_IRUSR]

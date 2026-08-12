@@ -34,6 +34,7 @@ async def test_summarize_threads_without_llm_path(isolated_env, monkeypatch):
                 "subject": "Thread 1 msg",
                 "body_md": "- TODO one",
                 "thread_id": "T-1",
+                "idempotency_key": "summary-llm-off-t1",
             },
         )
         await client.call_tool(
@@ -45,6 +46,7 @@ async def test_summarize_threads_without_llm_path(isolated_env, monkeypatch):
                 "subject": "Thread 2 msg",
                 "body_md": "- ACTION go",
                 "thread_id": "T-2",
+                "idempotency_key": "summary-llm-off-t2",
             },
         )
 
@@ -55,5 +57,4 @@ async def test_summarize_threads_without_llm_path(isolated_env, monkeypatch):
         )
         data = res.data
         assert data.get("threads") and data.get("aggregate") is not None
-
 

@@ -274,9 +274,10 @@ class TestDisasterRecoveryE2E:
                     "subject": "[DR-TEST] Initial planning message",
                     "body_md": "Starting the disaster recovery test scenario.",
                     "importance": "high",
+                    "idempotency_key": "disaster-recovery-initial",
                 },
             )
-            thread_id = msg1.data["deliveries"][0]["payload"]["id"]
+            thread_id = msg1.data["deliveries"][0]["message"]["id"]
 
             # Reply to create thread
             await client.call_tool(
@@ -287,6 +288,7 @@ class TestDisasterRecoveryE2E:
                     "sender_name": agent2_name,
                     "sender_token": agent2_token,
                     "body_md": "Acknowledged. Ready for testing.",
+                    "idempotency_key": "disaster-recovery-reply",
                 },
             )
 
@@ -331,6 +333,7 @@ class TestDisasterRecoveryE2E:
                         "subject": f"[DR-TEST] Progress update {i + 1}",
                         "body_md": f"Progress report #{i + 1} for disaster recovery test.",
                         "thread_id": str(thread_id),
+                        "idempotency_key": f"disaster-recovery-progress-{i}",
                     },
                 )
 
@@ -520,6 +523,7 @@ class TestArchiveIntegrity:
                     "to": [agent.data["name"]],
                     "subject": "Integrity test message",
                     "body_md": "Testing archive integrity.",
+                    "idempotency_key": "archive-integrity-message",
                 },
             )
 
@@ -590,6 +594,7 @@ class TestPartialRecovery:
                     "to": [agent_name],
                     "subject": "Pre-wipe message",
                     "body_md": "This should survive the restore.",
+                    "idempotency_key": "empty-restore-pre-wipe",
                 },
             )
 
@@ -666,6 +671,7 @@ class TestMultipleArchives:
                     "to": [agent_name],
                     "subject": "First message",
                     "body_md": "Initial state.",
+                    "idempotency_key": "multi-archive-first",
                 },
             )
             await client.call_tool(
@@ -677,6 +683,7 @@ class TestMultipleArchives:
                     "to": [agent_name],
                     "subject": "Second message",
                     "body_md": "Still first archive state.",
+                    "idempotency_key": "multi-archive-second",
                 },
             )
 
@@ -696,6 +703,7 @@ class TestMultipleArchives:
                     "to": [agent_name],
                     "subject": "Third message",
                     "body_md": "Second archive state.",
+                    "idempotency_key": "multi-archive-third",
                 },
             )
 
@@ -763,7 +771,7 @@ class TestStorageRepoIntegrity:
             )
             agent_name = agent.data["name"]
 
-            # Send message (creates inbox/outbox artifacts)
+            # Send message (creates one immutable message-delivery artifact)
             await client.call_tool(
                 "send_message",
                 {
@@ -772,6 +780,7 @@ class TestStorageRepoIntegrity:
                     "to": [agent_name],
                     "subject": "Git archive test",
                     "body_md": "Testing Git archive integrity.",
+                    "idempotency_key": "git-archive-integrity-message",
                 },
             )
 

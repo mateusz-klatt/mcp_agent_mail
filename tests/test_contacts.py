@@ -36,6 +36,7 @@ async def test_contact_policy_block_all_blocks_direct_message(isolated_env):
                     "to": ["BlueLake"],
                     "subject": "Hello",
                     "body_md": "test",
+                    "idempotency_key": "contacts-block-all",
                 },
             )
         assert "Recipient is not accepting messages" in str(excinfo.value)
@@ -68,10 +69,11 @@ async def test_contacts_only_requires_approval_then_allows(isolated_env):
                 "to": ["BlueLake"],
                 "subject": "Ping",
                 "body_md": "x",
+                "idempotency_key": "contacts-auto-approval-first",
             },
         )
         deliveries_first = first.data.get("deliveries") or []
-        assert deliveries_first and deliveries_first[0]["payload"]["subject"] == "Ping"
+        assert deliveries_first and deliveries_first[0]["message"]["subject"] == "Ping"
 
         ok = await client.call_tool(
             "send_message",
@@ -81,10 +83,11 @@ async def test_contacts_only_requires_approval_then_allows(isolated_env):
                 "to": ["BlueLake"],
                 "subject": "AfterApproval",
                 "body_md": "y",
+                "idempotency_key": "contacts-after-approval",
             },
         )
         deliveries = ok.data.get("deliveries") or []
-        assert deliveries and deliveries[0]["payload"]["subject"] == "AfterApproval"
+        assert deliveries and deliveries[0]["message"]["subject"] == "AfterApproval"
 
 
 @pytest.mark.asyncio
@@ -132,10 +135,11 @@ async def test_contact_auto_allows_recent_overlapping_file_reservations(isolated
                 "to": ["BlueLake"],
                 "subject": "OverlapOK",
                 "body_md": "z",
+                "idempotency_key": "contacts-reservation-overlap",
             },
         )
         deliveries = ok.data.get("deliveries") or []
-        assert deliveries and deliveries[0]["payload"]["subject"] == "OverlapOK"
+        assert deliveries and deliveries[0]["message"]["subject"] == "OverlapOK"
 
 
 @pytest.mark.asyncio
@@ -177,6 +181,7 @@ async def test_cross_project_contact_handshake_routes_message(isolated_env):
                 "to": ["project:Frontend#BlueLake"],
                 "subject": "CrossProject",
                 "body_md": "hello",
+                "idempotency_key": "contacts-cross-project",
             },
         )
         deliveries = ok.data.get("deliveries") or []

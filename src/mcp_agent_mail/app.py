@@ -54,14 +54,32 @@ from .db import (
     start_query_tracking,
     stop_query_tracking,
 )
+from .delivery import (
+    DeliveryActorSnapshot,
+    DeliveryAgentSnapshot,
+    DeliveryPurpose,
+    DeliveryProjectSnapshot,
+    DeliveryRecipientSnapshot,
+    MessageDeliveryIdempotencyConflictError,
+    MessageDeliveryNotFoundError,
+    MessageDeliveryProcessingResult,
+    MessageDeliveryRequest,
+    MessageDeliveryTerminalError,
+    MessageDeliveryValidationError,
+    accept_message_delivery,
+    emit_published_delivery_notifications,
+    get_message_delivery_status,
+    process_message_delivery,
+)
 from .guard import install_guard as install_guard_script, uninstall_guard as uninstall_guard_script
 from .llm import complete_system_user
-from .notify import hub
 from .models import (
     Agent,
     AgentLink,
     FileReservation,
     Message,
+    MessageDelivery,
+    MessageDeliveryRecipient,
     MessageRecipient,
     MessageSummary,
     Project,
@@ -80,15 +98,12 @@ from .storage import (
     commit_archive_path_deletions,
     commit_archive_subtree_deletion,
     delete_archive_tree_contents,
-    emit_notification_signal,
     ensure_archive,
     get_agent_reservation_archive_paths,
     get_identity_rename_tombstone,
     heal_archive_locks,
-    process_attachments,
     write_agent_profile,
     write_file_reservation_records,
-    write_message_bundle,
 )
 from .utils import (
     generate_agent_name,
@@ -1932,6 +1947,7 @@ def _agent_to_dict(agent: Agent) -> dict[str, Any]:
 def _message_to_dict(message: Message, include_body: bool = True) -> dict[str, Any]:
     data = {
         "id": message.id,
+        "delivery_id": message.delivery_id,
         "project_id": message.project_id,
         "sender_id": message.sender_id,
         "thread_id": message.thread_id,
@@ -1995,46 +2011,6 @@ def _apply_sender_identity(
             sender_project_slug,
             sender_name,
         )
-
-
-def _message_frontmatter(
-    message: Message,
-    project: Project,
-    sender: Agent,
-    sender_project: Project,
-    to_agents: Sequence[Agent],
-    cc_agents: Sequence[Agent],
-    bcc_agents: Sequence[Agent],
-    attachments: Sequence[dict[str, Any]],
-) -> dict[str, Any]:
-    data = {
-        "id": message.id,
-        "thread_id": message.thread_id,
-        "project": project.human_key,
-        "project_slug": project.slug,
-        "from": sender.name,
-        "to": [agent.name for agent in to_agents],
-        "cc": [agent.name for agent in cc_agents],
-        "bcc": [agent.name for agent in bcc_agents],
-        "subject": message.subject,
-        "importance": message.importance,
-        "ack_required": message.ack_required,
-        "created": _iso(message.created_ts),
-        "attachments": attachments,
-    }
-    # #188: persist the direct reply edge in the Git archive frontmatter too,
-    # but only for actual replies so top-level messages stay clean.
-    if message.reply_to is not None:
-        data["reply_to"] = message.reply_to
-    _apply_sender_identity(
-        data,
-        message_project_id=project.id,
-        sender_name=sender.name,
-        sender_project_id=sender_project.id,
-        sender_project_human_key=sender_project.human_key,
-        sender_project_slug=sender_project.slug,
-    )
-    return data
 
 
 def _normalize_git_remote(url: Optional[str]) -> Optional[str]:
@@ -3964,51 +3940,6 @@ async def _get_agents_batch_lenient(project: Project, names: Sequence[str]) -> d
     return resolved
 
 
-async def _create_message(
-    project: Project,
-    sender: Agent,
-    subject: str,
-    body_md: str,
-    recipients: Sequence[tuple[Agent, str]],
-    importance: str,
-    ack_required: bool,
-    thread_id: Optional[str],
-    attachments: Sequence[dict[str, Any]],
-    topic: Optional[str] = None,
-    reply_to: Optional[int] = None,
-) -> Message:
-    if project.id is None:
-        raise ValueError("Project must have an id before creating messages.")
-    if sender.id is None:
-        raise ValueError("Sender must have an id before sending messages.")
-    await ensure_schema()
-    async with get_session() as session:
-        message = Message(
-            project_id=project.id,
-            sender_id=sender.id,
-            subject=subject,
-            body_md=body_md,
-            importance=importance,
-            ack_required=ack_required,
-            thread_id=thread_id,
-            topic=topic,
-            reply_to=reply_to,
-            attachments=list(attachments),
-        )
-        session.add(message)
-        await session.flush()
-        assert message.id is not None
-        for recipient, kind in recipients:
-            assert recipient.id is not None
-            entry = MessageRecipient(message_id=message.id, agent_id=recipient.id, kind=kind)
-            session.add(entry)
-        sender.last_active_ts = _naive_utc()
-        session.add(sender)
-        await session.commit()
-        await session.refresh(message)
-    return message
-
-
 async def _create_file_reservation(
     project: Project,
     agent: Agent,
@@ -4758,57 +4689,34 @@ async def _list_outbox(
     return messages
 
 
-def _canonical_relpath_for_message(project: Project, message: Message, archive: ProjectArchive) -> str | None:
-    """Resolve the canonical repo-relative path for a message markdown file.
-
-    Supports both legacy filenames ("<id>.md") and the new descriptive pattern
-    ("<ISO>__<subject-slug>__<id>.md"). Returns a path relative to the archive
-    Git repo root, or None if no matching file is found.
-    """
-    ts = _ensure_utc(message.created_ts)
-    if ts is None:
-        return None
-    y = ts.strftime("%Y")
-    m = ts.strftime("%m")
-    project_root = archive.root
-    base_dir = project_root / "messages" / y / m
-    id_str = str(message.id)
-
-    candidates: list[Path] = []
-    try:
-        if base_dir.is_dir():
-            # New filename pattern with ISO + subject slug + id suffix
-            candidates.extend(base_dir.glob(f"*__*__{id_str}.md"))
-            # Legacy filename pattern (id only)
-            legacy = base_dir / f"{id_str}.md"
-            if legacy.exists():
-                candidates.append(legacy)
-    except Exception:
-        return None
-
-    if not candidates:
-        return None
-    # Prefer lexicographically last (ISO prefix sorts ascending)
-    selected = sorted(candidates)[-1]
-    try:
-        return selected.relative_to(archive.repo_root).as_posix()
-    except Exception:
-        return None
-
-
 async def _commit_info_for_message(settings: Settings, project: Project, message: Message) -> dict[str, Any] | None:
-    """Fetch commit metadata for the canonical message file (hexsha, summary, authored_ts, stats)."""
-    archive = await ensure_archive(settings, project.slug)
-    relpath = _canonical_relpath_for_message(project, message, archive)
-    if not relpath:
+    """Fetch commit metadata from the message's immutable delivery receipt."""
+    if message.id is None or message.delivery_id is None:
         return None
+    async with get_session() as session:
+        delivery = await session.get(MessageDelivery, message.delivery_id)
+    if (
+        delivery is None
+        or delivery.state != "published"
+        or delivery.message_id != message.id
+        or delivery.project_id != project.id
+        or delivery.project_generation_snapshot != project.project_generation
+        or delivery.archive_relative_path is None
+        or delivery.archive_commit_sha is None
+    ):
+        return None
+
+    archive = await ensure_archive(settings, project.slug)
+    relpath = delivery.archive_relative_path
+    commit_sha = delivery.archive_commit_sha
 
     def _lookup() -> dict[str, Any] | None:
         try:
-            commit = next(archive.repo.iter_commits(paths=[relpath], max_count=1))
-        except StopIteration:
+            commit = archive.repo.commit(commit_sha)
+        except Exception:
             return None
         data: dict[str, Any] = {
+            "delivery_id": delivery.id,
             "hexsha": commit.hexsha[:12],
             "summary": commit.summary,
             "authored_ts": _iso(datetime.fromtimestamp(commit.authored_date, tz=timezone.utc)),
@@ -4955,6 +4863,7 @@ async def _get_thread_external_participants(
                 sender_project_alias.id,
                 sender_project_alias.human_key,
                 sender_project_alias.slug,
+                sender_project_alias.project_generation,
             )
             .select_from(Message)
             .join(sender_alias, cast(Any, Message.sender_id == sender_alias.id))
@@ -4969,7 +4878,13 @@ async def _get_thread_external_participants(
         rows = (await session.execute(stmt)).all()
 
     participants: dict[tuple[int, str], tuple[Project, str]] = {}
-    for sender_name, sender_project_id, sender_project_human_key, sender_project_slug in rows:
+    for (
+        sender_name,
+        sender_project_id,
+        sender_project_human_key,
+        sender_project_slug,
+        sender_project_generation,
+    ) in rows:
         if not sender_name or sender_project_id is None or sender_project_id == project.id:
             continue
         participants[(int(sender_project_id), sender_name.lower())] = (
@@ -4977,6 +4892,7 @@ async def _get_thread_external_participants(
                 id=int(sender_project_id),
                 human_key=sender_project_human_key or sender_project_slug or "",
                 slug=sender_project_slug or "",
+                project_generation=sender_project_generation,
             ),
             sender_name,
         )
@@ -5707,6 +5623,66 @@ def build_mcp_server() -> FastMCP:
             data={"product_key": product_key, "agent_name": agent_name, "token_param": token_param},
         )
 
+    def _project_delivery_snapshot(project: Project) -> DeliveryProjectSnapshot:
+        if project.id is None or not project.project_generation:
+            raise RuntimeError("Project lifetime is incomplete.")
+        return DeliveryProjectSnapshot(
+            project_id=project.id,
+            slug=project.slug,
+            generation=project.project_generation,
+        )
+
+    def _agent_delivery_snapshot(
+        agent: Agent,
+        source_project: Project,
+    ) -> DeliveryAgentSnapshot:
+        if agent.id is None or not agent.agent_generation:
+            raise RuntimeError("Agent lifetime is incomplete.")
+        return DeliveryAgentSnapshot(
+            agent_id=agent.id,
+            name=agent.name,
+            generation=agent.agent_generation,
+            project=_project_delivery_snapshot(source_project),
+        )
+
+    def _delivery_status_payload(
+        result: MessageDeliveryProcessingResult,
+        *,
+        reused: bool | None,
+        request_sha256: str,
+        document_sha256: str,
+    ) -> dict[str, Any]:
+        payload = {
+            "id": result.delivery_id,
+            "status": result.status,
+            "message_id": result.message_id,
+            "commit_sha": result.commit_sha,
+            "next_attempt_ts": (
+                _iso(result.next_attempt_ts)
+                if result.next_attempt_ts is not None
+                else None
+            ),
+            "error": result.error,
+            "request_sha256": request_sha256,
+            "document_sha256": document_sha256,
+        }
+        if reused is not None:
+            payload["reused"] = reused
+        return payload
+
+    def _internal_delivery_idempotency_key(
+        event_name: str,
+        payload: dict[str, Any],
+    ) -> str:
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        return f"internal:{event_name}:{hashlib.sha256(canonical).hexdigest()}"
+
     async def _deliver_message(
         ctx: Context,
         tool_name: str,
@@ -5722,300 +5698,167 @@ def build_mcp_server() -> FastMCP:
         importance: str,
         ack_required: bool,
         thread_id: Optional[str],
+        idempotency_key: str,
         topic: Optional[str] = None,
         reply_to: Optional[int] = None,
+        purpose: DeliveryPurpose = "message",
     ) -> dict[str, Any]:
-        # Re-fetch settings at call time so tests that mutate env + clear cache take effect
-        settings = get_settings()
+        """Accept, publish, and finalize one immutable message delivery."""
+        if attachment_paths is not None or convert_images_override is not None:
+            raise ToolExecutionError(
+                "ATTACHMENTS_NOT_SUPPORTED",
+                "attachment_paths and convert_images are disabled until attachments "
+                "have a bounded canonical inline representation.",
+                recoverable=True,
+                data={
+                    "attachment_paths_provided": attachment_paths is not None,
+                    "convert_images_provided": convert_images_override is not None,
+                },
+            )
         if not to_names and not cc_names and not bcc_names:
-            raise ValueError("At least one recipient must be specified.")
-        def _unique(items: Sequence[str]) -> list[str]:
-            seen: set[str] = set()
-            ordered: list[str] = []
-            for item in items:
-                if item not in seen:
-                    seen.add(item)
-                    ordered.append(item)
-            return ordered
+            raise ToolExecutionError(
+                "INVALID_ARGUMENT",
+                "At least one recipient must be specified.",
+                recoverable=True,
+                data={"argument": "to"},
+            )
 
-        to_names = _unique(to_names)
-        # Cross-list dedup with precedence to > cc > bcc (issue #190): the same
-        # agent appearing in multiple lists would otherwise produce duplicate
-        # MessageRecipient rows that collide on the (message_id, agent_id)
-        # primary key. Keep each recipient in their highest-priority list only.
-        _claimed: set[str] = set(to_names)
-        cc_names = [name for name in _unique(cc_names) if name not in _claimed]
-        _claimed.update(cc_names)
-        bcc_names = [name for name in _unique(bcc_names) if name not in _claimed]
+        # Resolve canonical identities first, then deduplicate by immutable row
+        # id. Name-only deduplication is insufficient because lookups are case
+        # insensitive and ``BlueLake``/``bluelake`` name the same agent.
         combined_names = [*to_names, *cc_names, *bcc_names]
         agent_map = await _get_agents_batch(project, combined_names)
-        to_agents = [agent_map[name] for name in to_names]
-        cc_agents = [agent_map[name] for name in cc_names]
-        bcc_agents = [agent_map[name] for name in bcc_names]
-        recipient_records: list[tuple[Agent, str]] = [(agent, "to") for agent in to_agents]
-        recipient_records.extend((agent, "cc") for agent in cc_agents)
-        recipient_records.extend((agent, "bcc") for agent in bcc_agents)
+        recipient_groups: dict[str, list[Agent]] = {"to": [], "cc": [], "bcc": []}
+        claimed_ids: set[int] = set()
+        for kind, names in (
+            ("to", to_names),
+            ("cc", cc_names),
+            ("bcc", bcc_names),
+        ):
+            for name in names:
+                agent = agent_map[name]
+                if agent.id is None:
+                    raise RuntimeError("Recipient lifetime is incomplete.")
+                if agent.id in claimed_ids:
+                    continue
+                claimed_ids.add(agent.id)
+                recipient_groups[kind].append(agent)
 
-        archive = await ensure_archive(settings, project.slug)
-        sender_project = project if sender.project_id == project.id else await _get_project_by_id(sender.project_id)
-        sender_is_local = sender_project.id == project.id
-        sender_archive_label = _sender_display_name(
-            message_project_id=project.id,
+        to_agents = recipient_groups["to"]
+        cc_agents = recipient_groups["cc"]
+        bcc_agents = recipient_groups["bcc"]
+        sender_project = (
+            project
+            if sender.project_id == project.id
+            else await _get_project_by_id(sender.project_id)
+        )
+        target_snapshot = _project_delivery_snapshot(project)
+        sender_snapshot = _agent_delivery_snapshot(sender, sender_project)
+        recipients = tuple(
+            DeliveryRecipientSnapshot(
+                kind=kind,
+                agent=_agent_delivery_snapshot(agent, project),
+            )
+            for kind, agents in (
+                ("to", to_agents),
+                ("cc", cc_agents),
+                ("bcc", bcc_agents),
+            )
+            for agent in agents
+        )
+
+        try:
+            acceptance = await accept_message_delivery(
+                MessageDeliveryRequest(
+                    target_project=target_snapshot,
+                    sender=sender_snapshot,
+                    actor=DeliveryActorSnapshot.agent(sender_snapshot),
+                    recipients=recipients,
+                    idempotency_key=idempotency_key,
+                    subject=subject,
+                    body_md=body_md,
+                    thread_id=thread_id,
+                    reply_to_message_id=reply_to,
+                    topic=topic,
+                    importance=importance,
+                    ack_required=ack_required,
+                    attachments=(),
+                    purpose=purpose,
+                )
+            )
+            processing = await process_message_delivery(acceptance.delivery_id)
+        except MessageDeliveryIdempotencyConflictError as exc:
+            raise ToolExecutionError(
+                "IDEMPOTENCY_CONFLICT",
+                str(exc),
+                recoverable=False,
+                data={"delivery_id": exc.delivery_id, "idempotency_key": idempotency_key},
+            ) from exc
+        except MessageDeliveryValidationError as exc:
+            raise ToolExecutionError(
+                exc.code.upper(),
+                str(exc),
+                recoverable=True,
+                data={"delivery_code": exc.code},
+            ) from exc
+        except (MessageDeliveryNotFoundError, MessageDeliveryTerminalError) as exc:
+            raise ToolExecutionError(
+                "DELIVERY_FAILED",
+                str(exc),
+                recoverable=False,
+            ) from exc
+
+        delivery_payload = _delivery_status_payload(
+            processing,
+            reused=acceptance.reused,
+            request_sha256=acceptance.request_sha256,
+            document_sha256=acceptance.document_sha256,
+        )
+        if processing.status != "published" or processing.message_id is None:
+            await ctx.info(
+                f"{tool_name}: delivery {processing.delivery_id} accepted with "
+                f"status={processing.status}; no message is visible yet."
+            )
+            return {"delivery": delivery_payload, "message": None}
+
+        async with get_session() as session:
+            message = await session.get(Message, processing.message_id)
+        if message is None or message.delivery_id != processing.delivery_id:
+            raise RuntimeError("Published delivery does not resolve to its bound message.")
+
+        message_payload = _message_to_dict(message)
+        message_payload.update(
+            {
+                "to": [agent.name for agent in to_agents],
+                "cc": [agent.name for agent in cc_agents],
+                "bcc": [agent.name for agent in bcc_agents],
+            }
+        )
+        _apply_sender_identity(
+            message_payload,
+            message_project_id=message.project_id,
             sender_name=sender.name,
             sender_project_id=sender_project.id,
+            sender_project_human_key=sender_project.human_key,
             sender_project_slug=sender_project.slug,
         )
-        convert_markdown = (
-            convert_images_override if convert_images_override is not None else settings.storage.convert_images
-        )
-        # Respect agent-level attachments policy override if set
-        embed_policy: str = "auto"
-        if getattr(sender, "attachments_policy", None) in {"inline", "file"}:
-            convert_markdown = True
-            embed_policy = sender.attachments_policy
 
-        payload: dict[str, Any] | None = None
-        notification_targets: list[str] = []
-        notification_message_meta: dict[str, Any] | None = None
-        message: Message | None = None
-        window_identity: WindowIdentity | None = None
-        _wi_uuid = getattr(settings, "window_identity_uuid", "") or ""
-        if _wi_uuid and _validate_window_uuid(_wi_uuid):
-            window_identity = await _get_window_identity(project, _wi_uuid)
-
-        async with _archive_write_lock(archive):
-            # Server-side file_reservations enforcement: block if conflicting active exclusive file_reservation exists
-            if settings.file_reservations_enforcement_enabled:
-                await _expire_stale_file_reservations(
-                    project.id or 0,
-                    archive=archive,
-                    archive_locked=True,
-                )
-                now_ts = datetime.now(timezone.utc)
-                y_dir = now_ts.strftime("%Y")
-                m_dir = now_ts.strftime("%m")
-                candidate_surfaces: list[str] = []
-                candidate_surfaces.append(f"messages/{y_dir}/{m_dir}/*.md")
-                if sender_is_local:
-                    candidate_surfaces.append(f"agents/{sender.name}/outbox/{y_dir}/{m_dir}/*.md")
-                for r in to_agents + cc_agents + bcc_agents:
-                    candidate_surfaces.append(f"agents/{r.name}/inbox/{y_dir}/{m_dir}/*.md")
-                if thread_id:
-                    candidate_surfaces.append(f"messages/threads/{thread_id}.md")
-                has_attachments = bool(attachment_paths) or (
-                    convert_markdown and ("![" in body_md or "data:image" in body_md)
-                )
-                if has_attachments:
-                    candidate_surfaces.append("attachments/**")
-
-                async with get_session() as session:
-                    rows = await session.execute(
-                        select(FileReservation, Agent.name)
-                        .join(Agent, cast(Any, FileReservation.agent_id) == Agent.id)
-                        .where(
-                            cast(Any, FileReservation.project_id) == project.id,
-                            cast(Any, FileReservation.released_ts).is_(None),
-                            cast(Any, FileReservation.expires_ts) > _naive_utc(now_ts),
-                        )
-                    )
-                    active_file_reservations: list[tuple[FileReservation, str]] = [
-                        (row[0], row[1]) for row in rows.all()
-                    ]
-
-                conflicts: list[dict[str, Any]] = []
-
-                archive_reservations = [
-                    (reservation, holder)
-                    for reservation, holder in active_file_reservations
-                    if _looks_like_archive_path(reservation.path_pattern)
-                ]
-                if not archive_reservations:
-                    conflicts = []
-                else:
-                    # Build union PathSpec for fast conflict pre-filtering
-                    union_spec = _build_reservation_union_spec(archive_reservations, sender.id, True)
-
-                    # Pre-compute which surfaces might conflict
-                    potentially_conflicting_surfaces: set[str] = set()
-                    if union_spec is not None:
-                        normalized_surfaces = [_normalize_pathspec_pattern(s) for s in candidate_surfaces]
-                        matching_normalized = set(union_spec.match_files(normalized_surfaces))
-                        for orig_surface, norm_surface in zip(candidate_surfaces, normalized_surfaces, strict=True):
-                            # `match_files` cannot catch reverse-glob conflicts (a candidate glob
-                            # enclosing an existing literal), so always defer globbed candidate
-                            # surfaces to the symmetric detailed check below. (#193)
-                            if norm_surface in matching_normalized or _contains_glob(norm_surface):
-                                potentially_conflicting_surfaces.add(orig_surface)
-                    else:
-                        potentially_conflicting_surfaces = set(candidate_surfaces)
-
-                    for surface in candidate_surfaces:
-                        if surface not in potentially_conflicting_surfaces:
-                            continue  # Fast path: no conflicts possible for this surface
-                        for file_reservation_record, holder_name in archive_reservations:
-                            if _file_reservations_conflict(file_reservation_record, surface, True, sender):
-                                conflicts.append({
-                                    "surface": surface,
-                                    "holder": holder_name,
-                                    "path_pattern": file_reservation_record.path_pattern,
-                                    "exclusive": file_reservation_record.exclusive,
-                                    "expires_ts": _iso(file_reservation_record.expires_ts),
-                                })
-                if conflicts:
-                    # Return a structured error payload that clients can surface directly
-                    return {
-                        "error": {
-                            "type": "FILE_RESERVATION_CONFLICT",
-                            "message": "Conflicting active file_reservations prevent message write.",
-                            "conflicts": conflicts,
-                        }
-                    }
-
-            processed_body, attachments_meta, attachment_files = await process_attachments(
-                archive,
-                body_md,
-                attachment_paths or [],
-                convert_markdown,
-                embed_policy=embed_policy,
-            )
-            # Fallback: if body contains inline data URI, reflect that in attachments meta for API parity
-            if not attachments_meta and ("data:image" in body_md):
-                attachments_meta.append({"type": "inline", "media_type": "image/webp"})
-            message = await _create_message(
-                project,
-                sender,
-                subject,
-                processed_body,
-                recipient_records,
-                importance,
-                ack_required,
-                thread_id,
-                attachments_meta,
-                topic=topic,
-                reply_to=reply_to,
-            )
-            frontmatter = _message_frontmatter(
-                message,
-                project,
-                sender,
-                sender_project,
-                to_agents,
-                cc_agents,
-                bcc_agents,
-                attachments_meta,
-            )
-            recipients_for_archive = [agent.name for agent in to_agents + cc_agents + bcc_agents]
-            payload = _message_to_dict(message)
-            payload.update(
-                {
-                    "to": [agent.name for agent in to_agents],
-                    "cc": [agent.name for agent in cc_agents],
-                    "bcc": [agent.name for agent in bcc_agents],
-                    "attachments": attachments_meta,
-                }
-            )
-            _apply_sender_identity(
-                payload,
-                message_project_id=message.project_id,
-                sender_name=sender.name,
-                sender_project_id=sender_project.id,
-                sender_project_human_key=sender_project.human_key,
-                sender_project_slug=sender_project.slug,
-            )
-            # Enrich payload with sender's window identity if available.
+        resolved_settings = get_settings()
+        window_uuid = getattr(resolved_settings, "window_identity_uuid", "") or ""
+        if window_uuid and _validate_window_uuid(window_uuid):
+            window_identity = await _get_window_identity(project, window_uuid)
             if window_identity is not None:
-                payload["window_id"] = window_identity.window_uuid
-                payload["window_display_name"] = window_identity.display_name
-            try:
-                await write_message_bundle(
-                    archive,
-                    frontmatter,
-                    processed_body,
-                    sender_archive_label,
-                    recipients_for_archive,
-                    attachment_files,
-                    sender_outbox_name=sender.name if sender_is_local else None,
-                )
-            except Exception:
-                # #180: _create_message already committed the message + recipient
-                # rows. If the archive write fails, roll them back so we never
-                # leave a committed DB row with no archive artifact (mirrors the
-                # #173 agent-registration compensation). Best-effort cleanup; the
-                # original archive error is always re-raised.
-                with suppress(Exception):
-                    async with get_session() as rollback_session:
-                        orphan_recipients = (
-                            await rollback_session.execute(
-                                select(MessageRecipient).where(
-                                    MessageRecipient.message_id == message.id
-                                )
-                            )
-                        ).scalars().all()
-                        for orphan_recipient in orphan_recipients:
-                            await rollback_session.delete(orphan_recipient)
-                        orphan_message = await rollback_session.get(Message, message.id)
-                        if orphan_message is not None:
-                            await rollback_session.delete(orphan_message)
-                        await rollback_session.commit()
-                raise
+                message_payload["window_id"] = window_identity.window_uuid
+                message_payload["window_display_name"] = window_identity.display_name
 
-            # Collect notification signals for post-lock emission.
-            if settings.notifications.enabled:
-                notification_message_meta = {
-                    "id": message.id,
-                    "from": sender.name,
-                    "subject": subject,
-                    "importance": importance,
-                }
-                if not sender_is_local:
-                    notification_message_meta["from_project"] = sender_project.human_key
-                # Signal to/cc recipients (not bcc - blind copies shouldn't trigger visible signals).
-                notification_targets = [agent.name for agent in to_agents + cc_agents]
-            # Wake anyone holding an /events subscription. Deliberately outside
-            # the block above, and with its own recipient list, because the two
-            # differ in ways that would each cost a delivered-but-unnoticed
-            # message:
-            #   * the filesystem signal is off by default, so gating this on it
-            #     would make instant delivery silently depend on an unrelated
-            #     setting;
-            #   * it drops BCC, correctly — blindness is between recipients.
-            #     But this channel is private to one agent, so withholding the
-            #     hint would leave a BCC'd recipient as the only one who never
-            #     learns their own mail arrived.
-            # Reached only after the archive write succeeded: the block above
-            # compensates a failed archive by deleting the row, and a wake for
-            # a message that no longer exists is worse than no wake at all.
-            instant_hint = {
-                "kind": "message",
-                "project": project.slug,
-                "id": message.id,
-            }
-            for target in to_agents + cc_agents + bcc_agents:
-                with suppress(Exception):
-                    hub.publish(project.slug, target.name, {**instant_hint, "agent": target.name})
-            # And the human's browser, which watches the project rather than a
-            # mailbox. Content-free by construction, so a viewer session learns
-            # only that it should refetch — never who a blind copy went to.
-            with suppress(Exception):
-                hub.publish_project(project.slug)
+        if processing.published_now:
+            await emit_published_delivery_notifications(processing.delivery_id)
 
-        if notification_message_meta is not None:
-            for target_name in notification_targets:
-                with suppress(Exception):
-                    await emit_notification_signal(
-                        settings,
-                        project.slug,
-                        target_name,
-                        notification_message_meta,
-                    )
-        if message is None:
-            raise RuntimeError("Message record was not created.")
         await ctx.info(
-            f"Message {message.id} created by {sender.name} (to {', '.join(recipients_for_archive)})"
+            f"{tool_name}: published message {message.id} from {sender.name} "
+            f"as delivery {processing.delivery_id}."
         )
-        if payload is None:
-            raise RuntimeError("Message payload was not generated.")
-        return payload
+        return {"delivery": delivery_payload, "message": message_payload}
 
     def _extract_delivery_error_payload(payload: Any) -> dict[str, Any] | None:
         if not isinstance(payload, dict):
@@ -6081,7 +5924,7 @@ def build_mcp_server() -> FastMCP:
         if error_payload is not None:
             delivery_errors.append(_with_delivery_project(error_payload, project))
             return
-        deliveries.append({"project": project.human_key, "payload": payload})
+        deliveries.append({"project": project.human_key, **payload})
 
     def _summarize_delivery_failures(
         delivery_errors: Sequence[dict[str, Any]],
@@ -6893,7 +6736,33 @@ def build_mcp_server() -> FastMCP:
 
         # Phase 1: Database cleanup in a single transaction
         # Order matters: delete from leaf tables first to respect foreign key constraints
-        async with get_session() as session:
+        async with get_immediate_session() as session:
+            delivery_history = (
+                await session.execute(
+                    select(MessageDelivery.id)
+                    .where(
+                        or_(
+                            cast(Any, MessageDelivery.project_id) == project_id,
+                            cast(Any, MessageDelivery.sender_project_id_snapshot)
+                            == project_id,
+                            and_(
+                                cast(Any, MessageDelivery.actor_kind) == "agent",
+                                cast(
+                                    Any,
+                                    MessageDelivery.actor_project_id_snapshot,
+                                )
+                                == project_id,
+                            ),
+                        )
+                    )
+                    .limit(1)
+                )
+            ).first()
+            if delivery_history is not None:
+                raise ValueError(
+                    "Project has immutable message delivery history and cannot be hard-deleted"
+                )
+
             # Collect all agent IDs in this project
             agent_rows = await session.execute(
                 select(Agent).where(cast(Any, Agent.project_id) == project_id)
@@ -7451,6 +7320,7 @@ def build_mcp_server() -> FastMCP:
         to: list[str],
         subject: str,
         body_md: str,
+        idempotency_key: str,
         cc: Optional[list[str]] = None,
         bcc: Optional[list[str]] = None,
         attachment_paths: Optional[list[str]] = None,
@@ -7465,7 +7335,7 @@ def build_mcp_server() -> FastMCP:
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """
-        Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.
+        Send one idempotent Markdown message through atomic delivery.
 
         Discovery
         ---------
@@ -7474,11 +7344,10 @@ def build_mcp_server() -> FastMCP:
 
         What this does
         --------------
-        - Stores message (and recipients) in the database; updates sender's activity
-        - Writes a canonical `.md` under `messages/YYYY/MM/`
-        - Writes sender outbox and per-recipient inbox copies
-        - Optionally converts referenced images to WebP and embeds small images inline
-        - Supports explicit attachments via `attachment_paths` in addition to inline references
+        - Accepts one immutable delivery intent under the required caller key
+        - Publishes one verified Git document for that delivery
+        - Makes the database message visible only after Git publication finalizes
+        - Returns a typed delivery status plus the published message, if available
 
         Parameters
         ----------
@@ -7491,14 +7360,18 @@ def build_mcp_server() -> FastMCP:
         subject : str
             Short subject line that will be visible in inbox/outbox and search results.
         body_md : str
-            GitHub-Flavored Markdown body. Image references can be file paths or data URIs.
+            GitHub-Flavored Markdown body.
+        idempotency_key : str
+            Required 1-128 character operation key. Retry the same key and payload
+            to recover the same delivery after an ambiguous disconnect.
         cc, bcc : Optional[list[str]]
             Additional recipients by name.
         attachment_paths : Optional[list[str]]
-            Extra file paths to include as attachments; will be converted to WebP and stored.
+            Reserved for a future canonical inline attachment representation. Any
+            supplied value currently fails before a delivery intent is accepted.
         convert_images : Optional[bool]
-            Overrides server default for image conversion/inlining. If None, server settings apply.
-            Note: sender attachments_policy "inline"/"file" always forces conversion/inlining.
+            Reserved for future canonical inline normalization. Any supplied value,
+            including false, currently fails before intent acceptance.
         importance : str
             One of {"low","normal","high","urgent"} (free form tolerated; used by filters).
         ack_required : bool
@@ -7536,7 +7409,7 @@ def build_mcp_server() -> FastMCP:
         -------
         dict
             {
-              "deliveries": [ { "project": str, "payload": { ... message payload ... } } ],
+              "deliveries": [ { "project": str, "delivery": {...}, "message": {...} | null } ],
               "count": int
             }
 
@@ -7544,7 +7417,7 @@ def build_mcp_server() -> FastMCP:
         ----------
         - If no recipients are given, the call fails.
         - Unknown recipient names fail fast; register them first.
-        - Non-absolute attachment paths are resolved relative to the project archive root.
+        - Pending/deferred deliveries have `message: null`; use `get_message_delivery`.
 
         Do / Don't
         ----------
@@ -7552,11 +7425,10 @@ def build_mcp_server() -> FastMCP:
         - Keep subjects concise and specific (aim for ≤ 80 characters).
         - Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.
         - Address only relevant recipients; use CC/BCC sparingly and intentionally.
-        - Prefer Markdown links; attach images only when they materially aid understanding. The server
-          auto-converts images to WebP and may inline small images depending on policy.
+        - Retry with exactly the same idempotency key and canonical payload.
 
         Don't:
-        - Send large, repeated binaries—reuse prior attachments via `attachment_paths` when possible.
+        - Supply attachment options until canonical inline normalization is available.
         - Change topics mid-thread—start a new thread for a new subject.
         - Broadcast to "all" agents unnecessarily—target just the agents who need to act.
 
@@ -7566,26 +7438,31 @@ def build_mcp_server() -> FastMCP:
         ```json
         {"jsonrpc":"2.0","id":"5","method":"tools/call","params":{"name":"send_message","arguments":{
           "project_key":"/abs/path/backend","sender_name":"GreenCastle","to":["BlueLake"],
-          "subject":"Plan for /api/users","body_md":"See below."
-        }}}
-        ```
-
-        2) Inline image (auto-convert to WebP and inline if small):
-        ```json
-        {"jsonrpc":"2.0","id":"6a","method":"tools/call","params":{"name":"send_message","arguments":{
-          "project_key":"/abs/path/backend","sender_name":"GreenCastle","to":["BlueLake"],
-          "subject":"Diagram","body_md":"![diagram](docs/flow.png)","convert_images":true
-        }}}
-        ```
-
-        3) Explicit attachments:
-        ```json
-        {"jsonrpc":"2.0","id":"6b","method":"tools/call","params":{"name":"send_message","arguments":{
-          "project_key":"/abs/path/backend","sender_name":"GreenCastle","to":["BlueLake"],
-          "subject":"Screenshots","body_md":"Please review.","attachment_paths":["shots/a.png","shots/b.png"]
+          "subject":"Plan for /api/users","body_md":"See below.",
+          "idempotency_key":"plan-users-2026-08-12-01"
         }}}
         ```
         """
+        idempotency_key = idempotency_key.strip()
+        if not idempotency_key or len(idempotency_key) > 128:
+            raise ToolExecutionError(
+                "INVALID_IDEMPOTENCY_KEY",
+                "idempotency_key must contain 1-128 non-whitespace characters.",
+                recoverable=True,
+                data={"argument": "idempotency_key"},
+            )
+        if attachment_paths is not None or convert_images is not None:
+            raise ToolExecutionError(
+                "ATTACHMENTS_NOT_SUPPORTED",
+                "attachment_paths and convert_images are disabled until attachments "
+                "have a bounded canonical inline representation.",
+                recoverable=True,
+                data={
+                    "attachment_paths_provided": attachment_paths is not None,
+                    "convert_images_provided": convert_images is not None,
+                },
+            )
+
         project = await _get_project_by_identifier(project_key)
 
         # Validate topic format if provided.
@@ -8639,6 +8516,7 @@ def build_mcp_server() -> FastMCP:
                 importance,
                 ack_required,
                 thread_id,
+                idempotency_key,
                 topic=topic,
             )
             _collect_delivery_result(deliveries, delivery_errors, project, payload_local)
@@ -8661,6 +8539,7 @@ def build_mcp_server() -> FastMCP:
                     importance,
                     ack_required,
                     thread_id,
+                    idempotency_key,
                     topic=topic,
                 )
                 _collect_delivery_result(deliveries, delivery_errors, p, payload_ext)
@@ -8679,12 +8558,124 @@ def build_mcp_server() -> FastMCP:
         result: dict[str, Any] = {"deliveries": deliveries, "count": len(deliveries), "verified_sender": verified_sender}
         if delivery_errors:
             result["delivery_errors"] = delivery_errors
-        # Back-compat: expose top-level attachments when a single local delivery exists
-        if len(deliveries) == 1:
-            payload = deliveries[0].get("payload") or {}
-            if isinstance(payload, dict) and "attachments" in payload:
-                result["attachments"] = payload.get("attachments")
         return result
+
+    @mcp.tool(name="get_message_delivery")
+    @_instrument_tool(
+        "get_message_delivery",
+        cluster=CLUSTER_MESSAGING,
+        capabilities={"messaging", "read"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def get_message_delivery(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        delivery_id: str,
+        retry_pending: bool = False,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Read an authorized delivery status and optionally retry due work.
+
+        The caller must be the exact sender lifetime or one of the exact target
+        recipient lifetimes. ``retry_pending`` is restricted to the sender; it
+        never creates a new intent and is safe after an ambiguous disconnect.
+        """
+        project = await _get_project_by_identifier(project_key)
+        agent = await _authenticate_agent(
+            ctx,
+            project,
+            agent_name,
+            registration_token,
+            token_param="registration_token",
+            action="get_message_delivery",
+        )
+        if agent.id is None:
+            raise RuntimeError("Authenticated agent lifetime is incomplete.")
+
+        async with get_session() as session:
+            delivery = await session.get(MessageDelivery, delivery_id)
+            sender_authorized = bool(
+                delivery is not None
+                and delivery.sender_id == agent.id
+                and delivery.sender_generation_snapshot == agent.agent_generation
+                and delivery.sender_project_id_snapshot == project.id
+                and delivery.sender_project_generation_snapshot
+                == project.project_generation
+            )
+            recipient_authorized = False
+            if (
+                delivery is not None
+                and delivery.project_id == project.id
+                and delivery.project_generation_snapshot == project.project_generation
+            ):
+                recipient_result = await session.execute(
+                    select(MessageDeliveryRecipient.delivery_id).where(
+                        cast(Any, MessageDeliveryRecipient.delivery_id == delivery.id),
+                        cast(Any, MessageDeliveryRecipient.agent_id == agent.id),
+                        cast(
+                            Any,
+                            MessageDeliveryRecipient.agent_generation_snapshot
+                            == agent.agent_generation,
+                        ),
+                        cast(
+                            Any,
+                            MessageDeliveryRecipient.project_id_snapshot == project.id,
+                        ),
+                    )
+                )
+                recipient_authorized = recipient_result.first() is not None
+
+            if delivery is None or not (sender_authorized or recipient_authorized):
+                raise ToolExecutionError(
+                    "NOT_FOUND",
+                    f"Message delivery '{delivery_id}' was not found.",
+                    recoverable=True,
+                    data={"delivery_id": delivery_id},
+                )
+            request_sha256 = delivery.request_sha256
+            document_sha256 = delivery.document_sha256
+            target_project = await session.get(Project, delivery.project_id)
+            if (
+                target_project is None
+                or target_project.project_generation
+                != delivery.project_generation_snapshot
+            ):
+                raise RuntimeError("Delivery target project lifetime is unavailable.")
+            target_project_key = target_project.human_key
+
+        if retry_pending:
+            if not sender_authorized:
+                raise ToolExecutionError(
+                    "FORBIDDEN",
+                    "Only the authenticated sender may retry a pending delivery.",
+                    recoverable=False,
+                )
+            processing = await process_message_delivery(delivery_id)
+            if processing.published_now:
+                await emit_published_delivery_notifications(delivery_id)
+        else:
+            processing = await get_message_delivery_status(delivery_id)
+
+        message_payload: dict[str, Any] | None = None
+        if processing.status == "published" and processing.message_id is not None:
+            async with get_session() as session:
+                message = await session.get(Message, processing.message_id)
+            if message is not None and message.delivery_id == delivery_id:
+                message_payload = _message_to_dict(message)
+
+        return {
+            "project": target_project_key,
+            "delivery": _delivery_status_payload(
+                processing,
+                reused=None,
+                request_sha256=request_sha256,
+                document_sha256=document_sha256,
+            ),
+            "message": message_payload,
+        }
 
     @mcp.tool(
         name="purge_old_messages",
@@ -8753,6 +8744,7 @@ def build_mcp_server() -> FastMCP:
         message_id: int,
         sender_name: str,
         body_md: str,
+        idempotency_key: str,
         to: Optional[list[str]] = None,
         cc: Optional[list[str]] = None,
         bcc: Optional[list[str]] = None,
@@ -8769,6 +8761,8 @@ def build_mcp_server() -> FastMCP:
         - `thread_id` is taken from the original message if present; otherwise, the original id is used
         - Subject is prefixed with `subject_prefix` if not already present
         - Defaults `to` to the original sender if not explicitly provided
+        - Uses an exact thread-scoped return route for external participants; it
+          never creates a reverse general-purpose contact approval
 
         Parameters
         ----------
@@ -8780,6 +8774,9 @@ def build_mcp_server() -> FastMCP:
             Your agent name (must be registered in the project).
         body_md : str
             Reply body in Markdown.
+        idempotency_key : str
+            Required 1-128 character operation key. Retry the same key and payload
+            to recover the same delivery.
         to, cc, bcc : Optional[list[str]]
             Recipients by agent name. If omitted, `to` defaults to original sender.
         subject_prefix : str
@@ -8796,12 +8793,13 @@ def build_mcp_server() -> FastMCP:
         Don't:
         - Change `thread_id` when continuing the same discussion.
         - Escalate to many recipients; prefer targeted replies and start a new thread for new topics.
-        - Attach large binaries in replies unless essential; reference prior attachments where possible.
+        - Attempt attachment mutation; replies accept the Markdown body only.
 
         Returns
         -------
         dict
-            Message payload including `thread_id` and `reply_to`.
+            Thread metadata plus ``deliveries[]`` entries shaped as
+            ``{project, delivery, message}``. Message is null until published.
 
         Examples
         --------
@@ -8812,7 +8810,8 @@ def build_mcp_server() -> FastMCP:
         ```json
         {"jsonrpc":"2.0","id":"6","method":"tools/call","params":{"name":"reply_message","arguments":{
           "project_key":"/abs/path/backend","message_id":1234,"sender_name":"BlueLake",
-          "body_md":"Questions about the migration plan...","sender_token":"<registration_token>"
+          "body_md":"Questions about the migration plan...",
+          "idempotency_key":"reply-1234-01","sender_token":"<registration_token>"
         }}}
         ```
 
@@ -8821,10 +8820,19 @@ def build_mcp_server() -> FastMCP:
         {"jsonrpc":"2.0","id":"6c","method":"tools/call","params":{"name":"reply_message","arguments":{
           "project_key":"/abs/path/backend","message_id":1234,"sender_name":"BlueLake",
           "body_md":"Looping ops.","to":["GreenCastle"],"cc":["RedCat"],"subject_prefix":"RE:",
-          "sender_token":"<registration_token>"
+          "idempotency_key":"reply-1234-02","sender_token":"<registration_token>"
         }}}
         ```
         """
+        idempotency_key = idempotency_key.strip()
+        if not idempotency_key or len(idempotency_key) > 128:
+            raise ToolExecutionError(
+                "INVALID_IDEMPOTENCY_KEY",
+                "idempotency_key must contain 1-128 non-whitespace characters.",
+                recoverable=True,
+                data={"argument": "idempotency_key"},
+            )
+
         project = await _get_project_by_identifier(project_key)
         sender = await _authenticate_agent(
             ctx,
@@ -9251,8 +9259,10 @@ def build_mcp_server() -> FastMCP:
                 importance=original.importance,
                 ack_required=original.ack_required,
                 thread_id=thread_key,
+                idempotency_key=idempotency_key,
                 topic=original.topic,
                 reply_to=original.id,
+                purpose="reply",
             )
             _collect_delivery_result(deliveries, delivery_errors, project, payload_local)
 
@@ -9274,8 +9284,10 @@ def build_mcp_server() -> FastMCP:
                     importance=original.importance,
                     ack_required=original.ack_required,
                     thread_id=thread_key,
+                    idempotency_key=idempotency_key,
                     topic=original.topic,
-                    reply_to=original.id,
+                    reply_to=None,
+                    purpose="reply",
                 )
                 _collect_delivery_result(deliveries, delivery_errors, target_project, payload_ext)
             except Exception as exc:
@@ -9297,18 +9309,14 @@ def build_mcp_server() -> FastMCP:
                 )
             return payload
 
-        base_payload = deliveries[0].get("payload") or {}
-        primary_payload = dict(base_payload) if isinstance(base_payload, dict) else {}
-        primary_payload.setdefault("thread_id", thread_key)
-        primary_payload["reply_to"] = message_id
-        primary_payload["deliveries"] = deliveries
-        primary_payload["count"] = len(deliveries)
+        primary_payload: dict[str, Any] = {
+            "thread_id": thread_key,
+            "reply_to": message_id,
+            "deliveries": deliveries,
+            "count": len(deliveries),
+        }
         if delivery_errors:
             primary_payload["delivery_errors"] = delivery_errors
-        if len(deliveries) == 1:
-            attachments = base_payload.get("attachments") if isinstance(base_payload, dict) else None
-            if attachments is not None:
-                primary_payload.setdefault("attachments", attachments)
         return primary_payload
 
     @mcp.tool(name="request_contact")
@@ -9440,9 +9448,9 @@ def build_mcp_server() -> FastMCP:
                 is_active_pending = previous_status == "pending" and (
                     link.expires_ts is None or link.expires_ts > naive_now
                 )
-                link.reason = reason
-                link.updated_ts = naive_now
                 if is_active_approved:
+                    link.reason = reason
+                    link.updated_ts = naive_now
                     result_status = "approved"
                     should_notify = False
                     if link.expires_ts is None:
@@ -9451,6 +9459,9 @@ def build_mcp_server() -> FastMCP:
                         link.expires_ts = max(link.expires_ts, exp)
                         result_expires = link.expires_ts
                 elif is_active_pending:
+                    # Keep the pending event's content and timestamp immutable.
+                    # Its timestamp is the deterministic delivery idempotency
+                    # component, so a retry cannot create a second intro intent.
                     result_status = "pending"
                     should_notify = False
                     if link.expires_ts is None:
@@ -9460,6 +9471,8 @@ def build_mcp_server() -> FastMCP:
                     result_expires = link.expires_ts
                 else:
                     link.status = "pending"
+                    link.reason = reason
+                    link.updated_ts = naive_now
                     link.expires_ts = exp
                     result_expires = exp
                     should_notify = previous_status != "pending" or not is_active_pending
@@ -9495,8 +9508,6 @@ def build_mcp_server() -> FastMCP:
                 if link is None:
                     raise
                 previous_status = link.status
-                link.reason = reason
-                link.updated_ts = naive_now
                 is_active_approved = previous_status == "approved" and (
                     link.expires_ts is None or link.expires_ts > naive_now
                 )
@@ -9504,6 +9515,8 @@ def build_mcp_server() -> FastMCP:
                     link.expires_ts is None or link.expires_ts > naive_now
                 )
                 if is_active_approved:
+                    link.reason = reason
+                    link.updated_ts = naive_now
                     result_status = "approved"
                     should_notify = False
                     if link.expires_ts is None:
@@ -9521,6 +9534,8 @@ def build_mcp_server() -> FastMCP:
                     result_expires = link.expires_ts
                 else:
                     link.status = "pending"
+                    link.reason = reason
+                    link.updated_ts = naive_now
                     link.expires_ts = exp
                     result_expires = exp
                     should_notify = previous_status != "pending" or not is_active_pending
@@ -9528,13 +9543,19 @@ def build_mcp_server() -> FastMCP:
                 await s.commit()
 
         subject = f"Contact request from {a.name}"
-        body = reason or f"{a.name} requests permission to contact {b.name}."
+        body = link.reason or f"{a.name} requests permission to contact {b.name}."
         if result_status == "pending" and not should_notify:
             should_notify = not await _contact_request_notification_exists(target_project, a, b)
 
         notification_message: dict[str, Any] | None = None
         notification_error: dict[str, Any] | None = None
         if result_status == "pending" and should_notify:
+            if link.id is None:
+                raise RuntimeError("Pending contact link has no durable identity.")
+            contact_event_key = (
+                f"contact-request:{link.id}:"
+                f"{link.updated_ts.isoformat(timespec='microseconds')}"
+            )
             # Send an intro message with ack_required.
             notification_payload = await _deliver_message(
                 ctx,
@@ -9551,6 +9572,8 @@ def build_mcp_server() -> FastMCP:
                 importance="normal",
                 ack_required=True,
                 thread_id=None,
+                idempotency_key=contact_event_key,
+                purpose="contact_request",
             )
             error_payload = _extract_delivery_error_payload(notification_payload)
             if error_payload is not None:
@@ -10754,10 +10777,15 @@ def build_mcp_server() -> FastMCP:
                 },
             )
 
+        # Resolve the source lifetime on every path. Alias inference and the
+        # same-project fast path used to be the only branches assigning this
+        # local, so an explicit cross-project handshake could approve contact
+        # and then fail while deriving the welcome idempotency key.
+        project = await _get_project_by_identifier(project_key)
+
         # Fast path: for same-project auto-accept handshakes (used heavily by send_message),
         # approve the AgentLink directly without generating extra "intro" messages.
         if auto_accept and not target_project_key and not (welcome_subject and welcome_body):
-            project = await _get_project_by_identifier(project_key)
             a = await _authenticate_agent(
                 ctx,
                 project,
@@ -10972,6 +11000,18 @@ def build_mcp_server() -> FastMCP:
                 try:
                     welcome_recipients = [real_target] if not target_project_key else [f"{real_target}@{target_project_key}"]
                     send_tool = cast(FunctionTool, cast(Any, send_message))
+                    welcome_idempotency_key = _internal_delivery_idempotency_key(
+                        "contact-welcome",
+                        {
+                            "source_project": project.human_key,
+                            "source_agent": real_requester,
+                            "target_project": welcome_project.human_key,
+                            "target_agent": real_target,
+                            "subject": welcome_subject,
+                            "body_md": welcome_body,
+                            "thread_id": thread_id,
+                        },
+                    )
                     send_tool_result = await send_tool.run(
                         {
                             "ctx": ctx,
@@ -10981,6 +11021,7 @@ def build_mcp_server() -> FastMCP:
                             "subject": welcome_subject,
                             "body_md": welcome_body,
                             "thread_id": thread_id,
+                            "idempotency_key": welcome_idempotency_key,
                             "sender_token": requester_registration_token,
                             "format": "json",
                         }
@@ -12438,6 +12479,16 @@ def build_mcp_server() -> FastMCP:
                 from fastmcp.tools.tool import FunctionTool
 
                 send_tool = cast(FunctionTool, cast(Any, send_message))
+                release_idempotency_key = _internal_delivery_idempotency_key(
+                    "file-reservation-release",
+                    {
+                        "project": project.human_key,
+                        "reservation_id": file_reservation_id,
+                        "released_ts": _iso(reservation.released_ts),
+                        "actor": actor.name,
+                        "holder": holder.name,
+                    },
+                )
                 send_tool_result = await send_tool.run(
                     {
                         "ctx": ctx,
@@ -12447,6 +12498,7 @@ def build_mcp_server() -> FastMCP:
                         "to": [holder.name],
                         "subject": f"[file-reservations] Released stale lock on {reservation.path_pattern}",
                         "body_md": "\n".join(body_lines),
+                        "idempotency_key": release_idempotency_key,
                         "format": "json",
                     }
                 )
@@ -13530,21 +13582,30 @@ def build_mcp_server() -> FastMCP:
                 "tools": [
                     {
                         "name": "send_message",
-                        "summary": "Deliver a new message with attachments, WebP conversion, and policy enforcement.",
+                        "summary": "Accept and publish an idempotent message through the atomic Git-to-database boundary.",
                         "use_when": "Starting new threads or broadcasting plans across projects.",
                         "related": ["reply_message", "request_contact"],
                         "expected_frequency": "Frequent—core write operation.",
                         "required_capabilities": ["messaging"],
-                        "usage_examples": [{"hint": "New plan", "sample": "send_message(project_key='backend', sender_name='GreenCastle', to=['BlueLake'], subject='Plan', body_md='...')"}],
+                        "usage_examples": [{"hint": "New plan", "sample": "send_message(project_key='backend', sender_name='GreenCastle', to=['BlueLake'], subject='Plan', body_md='...', idempotency_key='plan-01')"}],
                     },
                     {
                         "name": "reply_message",
-                        "summary": "Reply within an existing thread, inheriting flags and default recipients.",
+                        "summary": "Atomically reply within a thread, including exact cross-project return routes.",
                         "use_when": "Continuing discussions or acknowledging decisions.",
                         "related": ["send_message"],
                         "expected_frequency": "Frequent when collaborating inside a thread.",
                         "required_capabilities": ["messaging"],
-                        "usage_examples": [{"hint": "Thread reply", "sample": "reply_message(project_key='backend', message_id=42, sender_name='BlueLake', body_md='Got it!', sender_token='<sender token>')"}],
+                        "usage_examples": [{"hint": "Thread reply", "sample": "reply_message(project_key='backend', message_id=42, sender_name='BlueLake', body_md='Got it!', idempotency_key='reply-42-01', sender_token='<sender token>')"}],
+                    },
+                    {
+                        "name": "get_message_delivery",
+                        "summary": "Read an authorized delivery state and optionally retry due pending work.",
+                        "use_when": "Recovering after an ambiguous send/reply result or tracking a pending Git publication.",
+                        "related": ["send_message", "reply_message"],
+                        "expected_frequency": "After a pending/deferred response or network disconnect.",
+                        "required_capabilities": ["messaging", "read"],
+                        "usage_examples": [{"hint": "Recover", "sample": "get_message_delivery(project_key='backend', agent_name='GreenCastle', delivery_id='<uuid>', retry_pending=True)"}],
                     },
                     {
                         "name": "fetch_inbox",
@@ -13794,7 +13855,7 @@ def build_mcp_server() -> FastMCP:
             },
             "tools": {
                 "send_message": {
-                    "required": ["project_key", "sender_name", "to", "subject", "body_md"],
+                    "required": ["project_key", "sender_name", "to", "subject", "body_md", "idempotency_key"],
                     "optional": ["cc", "bcc", "attachment_paths", "convert_images", "importance", "ack_required", "thread_id", "auto_contact_if_blocked"],
                     "shapes": {
                         "to": "list[str]",
@@ -13802,7 +13863,13 @@ def build_mcp_server() -> FastMCP:
                         "bcc": "list[str] | str",
                         "importance": "low|normal|high|urgent",
                         "auto_contact_if_blocked": "bool",
+                        "attachment_paths": "reserved; any supplied value fails closed",
+                        "convert_images": "reserved; any supplied value fails closed",
                     },
+                },
+                "reply_message": {
+                    "required": ["project_key", "message_id", "sender_name", "body_md", "idempotency_key"],
+                    "optional": ["to", "cc", "bcc", "subject_prefix", "sender_token"],
                 },
                 "macro_contact_handshake": {
                     "required": ["project_key", "requester|agent_name", "target|to_agent"],

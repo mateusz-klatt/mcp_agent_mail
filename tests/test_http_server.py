@@ -545,7 +545,7 @@ class TestRequestLogging:
 
 @pytest.mark.usefixtures("open_mail_ui_gate")
 class TestHTTPLockScope:
-    """Regression tests for DB/archive lock ordering in HTTP routes.
+    """Regression tests for active and retired HTTP mutation boundaries.
 
     Scoped to this class rather than the module: three of its cases drive /mail
     routes and the rest do not, so switching the gate off file-wide would relax
@@ -553,7 +553,7 @@ class TestHTTPLockScope:
     """
 
     @pytest.mark.asyncio
-    async def test_overseer_send_is_held_before_archive_write(self, isolated_env, monkeypatch):
+    async def test_retired_overseer_send_never_reaches_archive_write(self, isolated_env, monkeypatch):
         import mcp_agent_mail.http as http_module
         import mcp_agent_mail.storage as storage_module
         from mcp_agent_mail.db import get_session as real_get_session
@@ -614,14 +614,12 @@ class TestHTTPLockScope:
                 },
             )
 
-        assert response.status_code == 503
-        assert response.json()["detail"] == (
-            "Human Overseer messaging is temporarily unavailable while atomic archive persistence is implemented"
-        )
+        assert response.status_code == 404
+        assert response.json() == {"detail": "Not Found"}
         assert archive_write_depths == []
 
     @pytest.mark.asyncio
-    async def test_delete_messages_archives_after_db_session_closes(self, isolated_env, monkeypatch):
+    async def test_retired_bulk_delete_never_mutates_db_or_archive(self, isolated_env, monkeypatch):
         import mcp_agent_mail.http as http_module
         from mcp_agent_mail.db import get_session as real_get_session
         from mcp_agent_mail.models import Agent, Message, MessageRecipient, Project
@@ -711,12 +709,14 @@ class TestHTTPLockScope:
                 json={"message_ids": [message.id]},
             )
 
-        assert response.status_code == 200
-        assert response.json()["deleted_count"] == 1
-        assert archive_depths == [0]
+        assert response.status_code == 404
+        assert response.json() == {"detail": "Not Found"}
+        assert archive_depths == []
+        async with real_get_session() as session:
+            assert await session.get(Message, message.id) is not None
 
     @pytest.mark.asyncio
-    async def test_inbox_delete_archives_after_db_session_closes(self, isolated_env, monkeypatch):
+    async def test_retired_inbox_delete_never_mutates_db_or_archive(self, isolated_env, monkeypatch):
         import mcp_agent_mail.http as http_module
         from mcp_agent_mail.db import get_session as real_get_session
         from mcp_agent_mail.models import Agent, Message, MessageRecipient, Project
@@ -806,9 +806,11 @@ class TestHTTPLockScope:
                 json={"message_ids": [message.id]},
             )
 
-        assert response.status_code == 200
-        assert response.json()["deleted_count"] == 1
-        assert archive_depths == [0]
+        assert response.status_code == 404
+        assert response.json() == {"detail": "Not Found"}
+        assert archive_depths == []
+        async with real_get_session() as session:
+            assert await session.get(Message, message.id) is not None
 
     @pytest.mark.asyncio
     async def test_ack_escalation_profile_archives_after_db_session_closes(self, isolated_env, monkeypatch):

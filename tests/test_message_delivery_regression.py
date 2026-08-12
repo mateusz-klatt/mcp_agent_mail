@@ -116,15 +116,16 @@ async def test_send_message_returns_delivery_info(isolated_env):
                 "to": [receiver],
                 "subject": "Test Message",
                 "body_md": "This is a test message body.",
+                "idempotency_key": "delivery-info-basic",
             },
         )
 
         assert result.data["count"] == 1
         assert len(result.data["deliveries"]) == 1
         delivery = result.data["deliveries"][0]
-        assert "payload" in delivery
-        assert delivery["payload"]["subject"] == "Test Message"
-        assert delivery["payload"]["from"] == sender
+        assert delivery["delivery"]["status"] == "published"
+        assert delivery["message"]["subject"] == "Test Message"
+        assert delivery["message"]["from"] == sender
 
 
 @pytest.mark.asyncio
@@ -143,6 +144,7 @@ async def test_send_message_self_send(isolated_env):
                 "to": [agent],
                 "subject": "Note to Self",
                 "body_md": "Remember this.",
+                "idempotency_key": "delivery-self-send",
             },
         )
 
@@ -177,13 +179,14 @@ async def test_send_message_message_id_returned(isolated_env):
                 "to": [receiver],
                 "subject": "ID Test",
                 "body_md": "Testing message ID.",
+                "idempotency_key": "delivery-message-id",
             },
         )
 
-        payload = result.data["deliveries"][0]["payload"]
-        assert "id" in payload
-        assert isinstance(payload["id"], int)
-        assert payload["id"] > 0
+        message = result.data["deliveries"][0]["message"]
+        assert "id" in message
+        assert isinstance(message["id"], int)
+        assert message["id"] > 0
 
 
 # ============================================================================
@@ -208,6 +211,7 @@ async def test_send_message_multiple_to_recipients(isolated_env):
                 "to": receivers,
                 "subject": "Broadcast",
                 "body_md": "Message to all.",
+                "idempotency_key": "delivery-multiple-to",
             },
         )
 
@@ -215,7 +219,7 @@ async def test_send_message_multiple_to_recipients(isolated_env):
         assert result.data["count"] == 1
         # But delivery should list all recipients
         delivery = result.data["deliveries"][0]
-        assert len(delivery["payload"]["to"]) == 3
+        assert len(delivery["message"]["to"]) == 3
 
         # Each recipient should have the message in their inbox
         for recv in receivers:
@@ -265,6 +269,7 @@ async def test_send_message_recipient_lookup_query_count(isolated_env):
                     "subject": "Query Count",
                     "body_md": "Benchmarking query count.",
                     "ack_required": True,
+                    "idempotency_key": "delivery-query-count",
                 },
             )
 
@@ -309,6 +314,7 @@ async def test_list_outbox_recipient_lookup_query_count(isolated_env):
                     "to": recipients,
                     "subject": f"Outbox Query {idx}",
                     "body_md": "Outbox query benchmark.",
+                    "idempotency_key": f"delivery-outbox-query:{idx}",
                 },
             )
 
@@ -344,14 +350,15 @@ async def test_send_message_with_cc_recipients(isolated_env):
                 "cc": cc_recvs,
                 "subject": "CC Test",
                 "body_md": "Message with CC.",
+                "idempotency_key": "delivery-cc",
             },
         )
 
         # 1 message delivered to 3 recipients (1 to + 2 cc)
         assert result.data["count"] == 1
         delivery = result.data["deliveries"][0]
-        assert len(delivery["payload"]["to"]) == 1
-        assert len(delivery["payload"]["cc"]) == 2
+        assert len(delivery["message"]["to"]) == 1
+        assert len(delivery["message"]["cc"]) == 2
 
         # All should receive the message
         for recv in [to_recv, *cc_recvs]:
@@ -382,14 +389,15 @@ async def test_send_message_with_bcc_recipients(isolated_env):
                 "bcc": [bcc_recv],
                 "subject": "BCC Test",
                 "body_md": "Message with BCC.",
+                "idempotency_key": "delivery-bcc",
             },
         )
 
         # 1 message delivered to 2 recipients (1 to + 1 bcc)
         assert result.data["count"] == 1
         delivery = result.data["deliveries"][0]
-        assert len(delivery["payload"]["to"]) == 1
-        assert len(delivery["payload"]["bcc"]) == 1
+        assert len(delivery["message"]["to"]) == 1
+        assert len(delivery["message"]["bcc"]) == 1
 
         # BCC recipient should receive the message
         bcc_inbox = await client.call_tool(
@@ -422,11 +430,12 @@ async def test_send_message_creates_thread_id(isolated_env):
                 "subject": "Thread Start",
                 "body_md": "Starting a thread.",
                 "thread_id": "THREAD-001",
+                "idempotency_key": "delivery-thread-create",
             },
         )
 
-        payload = result.data["deliveries"][0]["payload"]
-        assert payload["thread_id"] == "THREAD-001"
+        message = result.data["deliveries"][0]["message"]
+        assert message["thread_id"] == "THREAD-001"
 
 
 @pytest.mark.asyncio
@@ -447,6 +456,7 @@ async def test_send_message_continues_thread(isolated_env):
                 "subject": "Thread Message 1",
                 "body_md": "First message.",
                 "thread_id": "THREAD-002",
+                "idempotency_key": "delivery-thread-first",
             },
         )
 
@@ -460,11 +470,12 @@ async def test_send_message_continues_thread(isolated_env):
                 "subject": "Thread Message 2",
                 "body_md": "Second message.",
                 "thread_id": "THREAD-002",
+                "idempotency_key": "delivery-thread-second",
             },
         )
 
-        payload2 = result2.data["deliveries"][0]["payload"]
-        assert payload2["thread_id"] == "THREAD-002"
+        message2 = result2.data["deliveries"][0]["message"]
+        assert message2["thread_id"] == "THREAD-002"
 
 
 # ============================================================================
@@ -490,10 +501,11 @@ async def test_send_message_importance_levels(isolated_env):
                     "subject": f"Importance: {level}",
                     "body_md": f"Message with {level} importance.",
                     "importance": level,
+                    "idempotency_key": f"delivery-importance:{level}",
                 },
             )
-            payload = result.data["deliveries"][0]["payload"]
-            assert payload["importance"] == level
+            message = result.data["deliveries"][0]["message"]
+            assert message["importance"] == level
 
 
 @pytest.mark.asyncio
@@ -514,9 +526,10 @@ async def test_send_message_ack_required_flag(isolated_env):
                 "subject": "Needs Ack",
                 "body_md": "Please acknowledge.",
                 "ack_required": True,
+                "idempotency_key": "delivery-ack-required",
             },
         )
-        assert result_ack.data["deliveries"][0]["payload"]["ack_required"] is True
+        assert result_ack.data["deliveries"][0]["message"]["ack_required"] is True
 
         # With ack_required=False (default)
         result_no_ack = await client.call_tool(
@@ -528,9 +541,10 @@ async def test_send_message_ack_required_flag(isolated_env):
                 "subject": "No Ack Needed",
                 "body_md": "No acknowledgment needed.",
                 "ack_required": False,
+                "idempotency_key": "delivery-ack-not-required",
             },
         )
-        assert result_no_ack.data["deliveries"][0]["payload"]["ack_required"] is False
+        assert result_no_ack.data["deliveries"][0]["message"]["ack_required"] is False
 
 
 # ============================================================================
@@ -556,6 +570,7 @@ async def test_fetch_inbox_returns_messages(isolated_env):
                     "to": [receiver],
                     "subject": f"Message {i + 1}",
                     "body_md": f"Body {i + 1}",
+                    "idempotency_key": f"delivery-inbox:{i}",
                 },
             )
 
@@ -590,6 +605,7 @@ async def test_fetch_inbox_urgent_only_filter(isolated_env):
                 "subject": "Normal Message",
                 "body_md": "Normal importance.",
                 "importance": "normal",
+                "idempotency_key": "delivery-urgent-filter-normal",
             },
         )
         await client.call_tool(
@@ -601,6 +617,7 @@ async def test_fetch_inbox_urgent_only_filter(isolated_env):
                 "subject": "Urgent Message",
                 "body_md": "Urgent importance.",
                 "importance": "urgent",
+                "idempotency_key": "delivery-urgent-filter-urgent",
             },
         )
 
@@ -636,6 +653,7 @@ async def test_fetch_inbox_include_bodies(isolated_env):
                 "to": [receiver],
                 "subject": "Has Body",
                 "body_md": "This is the full message body content.",
+                "idempotency_key": "delivery-include-body",
             },
         )
 
@@ -690,9 +708,10 @@ async def test_reply_message_creates_thread_link(isolated_env):
                 "to": [agent_b],
                 "subject": "Original",
                 "body_md": "Original message.",
+                "idempotency_key": "delivery-reply-parent",
             },
         )
-        orig_id = orig.data["deliveries"][0]["payload"]["id"]
+        orig_id = orig.data["deliveries"][0]["message"]["id"]
 
         # Reply
         reply = await client.call_tool(
@@ -702,6 +721,7 @@ async def test_reply_message_creates_thread_link(isolated_env):
                 "message_id": orig_id,
                 "sender_name": agent_b,
                 "body_md": "This is my reply.",
+                "idempotency_key": "delivery-reply-child",
             },
         )
 
@@ -726,9 +746,10 @@ async def test_reply_message_prefixes_subject(isolated_env):
                 "to": [agent_b],
                 "subject": "Discussion",
                 "body_md": "Let's discuss.",
+                "idempotency_key": "delivery-prefix-parent",
             },
         )
-        orig_id = orig.data["deliveries"][0]["payload"]["id"]
+        orig_id = orig.data["deliveries"][0]["message"]["id"]
 
         reply = await client.call_tool(
             "reply_message",
@@ -737,11 +758,12 @@ async def test_reply_message_prefixes_subject(isolated_env):
                 "message_id": orig_id,
                 "sender_name": agent_b,
                 "body_md": "Sure!",
+                "idempotency_key": "delivery-prefix-child",
             },
         )
 
         delivery = reply.data["deliveries"][0]
-        subject = delivery["payload"]["subject"]
+        subject = delivery["message"]["subject"]
         assert subject.lower().startswith("re:")
 
 
@@ -766,9 +788,10 @@ async def test_mark_message_read_workflow(isolated_env):
                 "to": [receiver],
                 "subject": "Please Read",
                 "body_md": "Important message.",
+                "idempotency_key": "delivery-read-workflow",
             },
         )
-        msg_id = send_result.data["deliveries"][0]["payload"]["id"]
+        msg_id = send_result.data["deliveries"][0]["message"]["id"]
 
         # Mark as read
         read_result = await client.call_tool(
@@ -802,9 +825,10 @@ async def test_acknowledge_message_workflow(isolated_env):
                 "subject": "Needs Acknowledgment",
                 "body_md": "Please acknowledge.",
                 "ack_required": True,
+                "idempotency_key": "delivery-ack-workflow",
             },
         )
-        msg_id = send_result.data["deliveries"][0]["payload"]["id"]
+        msg_id = send_result.data["deliveries"][0]["message"]["id"]
 
         # Acknowledge
         ack_result = await client.call_tool(
@@ -839,9 +863,10 @@ async def test_read_and_ack_are_idempotent(isolated_env):
                 "subject": "Idempotent Test",
                 "body_md": "Test.",
                 "ack_required": True,
+                "idempotency_key": "delivery-read-ack-idempotent",
             },
         )
-        msg_id = send_result.data["deliveries"][0]["payload"]["id"]
+        msg_id = send_result.data["deliveries"][0]["message"]["id"]
 
         # First read
         read1 = await client.call_tool(
@@ -895,6 +920,7 @@ async def test_send_message_nonexistent_recipient_fails(isolated_env):
                     "to": ["SilentGlacier"],
                     "subject": "Error Test",
                     "body_md": "This should fail.",
+                    "idempotency_key": "delivery-missing-recipient",
                 },
             )
 
@@ -920,6 +946,7 @@ async def test_send_message_nonexistent_sender_fails(isolated_env):
                     "to": [receiver],
                     "subject": "Error Test",
                     "body_md": "This should fail.",
+                    "idempotency_key": "delivery-missing-sender",
                 },
             )
 
@@ -943,6 +970,7 @@ async def test_reply_to_nonexistent_message_fails(isolated_env):
                     "message_id": 999999,  # Non-existent
                     "sender_name": agent,
                     "body_md": "Reply to nothing.",
+                    "idempotency_key": "delivery-missing-reply-target",
                 },
             )
 

@@ -64,6 +64,15 @@ export const inboxResponse = {
   next_cursor: null,
 };
 
+export const deliveryResponse = {
+  id: "12345678-1234-4234-8234-123456789abc",
+  status: "published" as const,
+  reused: false,
+  message_id: 103,
+  commit_sha: "f".repeat(40),
+  next_attempt_ts: null,
+};
+
 export const messageDetail = {
   ...messageOne,
   body_md: "# Release\n\nAll checks passed. `<script>` remains plain text.",
@@ -220,5 +229,26 @@ export const server = setupServer(
       params.messageId === String(messageOne.id)
         ? HttpResponse.json(messageDetail)
         : HttpResponse.json({ detail: "not found" }, { status: 404 }),
+  ),
+  http.post("*/mail/api/v1/projects/:projectId/messages", () =>
+    HttpResponse.json(deliveryResponse),
+  ),
+  http.post(
+    "*/mail/api/v1/projects/:projectId/messages/:messageId/replies",
+    () => HttpResponse.json(deliveryResponse),
+  ),
+  http.get("*/mail/api/v1/deliveries/:deliveryId", ({ params }) =>
+    HttpResponse.json({
+      ...deliveryResponse,
+      id: String(params.deliveryId),
+      reused: true,
+    }),
+  ),
+  http.post("*/mail/api/v1/deliveries/:deliveryId/retry", ({ params }) =>
+    HttpResponse.json({
+      ...deliveryResponse,
+      id: String(params.deliveryId),
+      reused: true,
+    }),
   ),
 );

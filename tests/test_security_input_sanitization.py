@@ -444,6 +444,7 @@ class TestLargeInputHandling:
                         "to": ["MsgAgent"],
                         "subject": "Large message test",
                         "body_md": long_body,
+                        "idempotency_key": "security-large-message",
                     },
                 }),
             )
@@ -490,6 +491,7 @@ class TestLargeInputHandling:
                         "to": many_recipients,
                         "subject": "Many recipients test",
                         "body_md": "Test",
+                        "idempotency_key": "security-many-recipients",
                     },
                 }),
             )
@@ -672,7 +674,7 @@ class TestSpecialCharactersInIdentifiers:
                 "thread\x00evil",
             ]
 
-            for thread_id in special_thread_ids:
+            for index, thread_id in enumerate(special_thread_ids):
                 response = await client.post(
                     settings.http.path,
                     json=_rpc("tools/call", {
@@ -684,6 +686,7 @@ class TestSpecialCharactersInIdentifiers:
                             "subject": "Thread test",
                             "body_md": "Test",
                             "thread_id": thread_id,
+                            "idempotency_key": f"security-thread-id-{index}",
                         },
                     }),
                 )
@@ -755,6 +758,7 @@ class TestXSSPrevention:
                         "to": ["XSSAgent"],
                         "subject": "XSS Test",
                         "body_md": xss_body,
+                        "idempotency_key": "security-xss-body",
                     },
                 }),
             )

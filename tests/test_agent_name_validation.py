@@ -703,6 +703,7 @@ async def test_send_message_validates_recipient_names(isolated_env):
                     "to": ["SilentGlacier"],  # Valid format but doesn't exist
                     "subject": "Test",
                     "body_md": "Test message",
+                    "idempotency_key": "agent-name-missing-recipient",
                 },
             )
 
@@ -748,6 +749,7 @@ async def test_send_message_with_valid_agents(isolated_env):
                 "to": [recipient_name],
                 "subject": "Test Message",
                 "body_md": "Testing valid agent names",
+                "idempotency_key": "agent-name-valid-delivery",
             },
         )
 
@@ -797,6 +799,7 @@ async def test_send_message_preserves_canonical_recipient_for_to_cc_and_bcc(isol
                     **recipients,
                     "subject": f"Canonical recipient via {field}",
                     "body_md": "Regression coverage for canonical routing.",
+                    "idempotency_key": f"canonical-recipient-{field}",
                 },
             )
             assert result.data["count"] == 1
@@ -810,6 +813,7 @@ async def test_send_message_preserves_canonical_recipient_for_to_cc_and_bcc(isol
                     "to": [missing_name],
                     "subject": "Unknown canonical recipient",
                     "body_md": "This delivery must still fail at recipient lookup.",
+                    "idempotency_key": "canonical-recipient-missing",
                 },
             )
 
@@ -822,6 +826,7 @@ async def test_send_message_preserves_canonical_recipient_for_to_cc_and_bcc(isol
                     "to": [recipient_name],
                     "subject": "Unknown canonical sender",
                     "body_md": "This delivery must still fail at sender lookup.",
+                    "idempotency_key": "canonical-sender-missing",
                 },
             )
 

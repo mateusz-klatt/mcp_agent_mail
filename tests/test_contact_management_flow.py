@@ -357,30 +357,28 @@ async def test_contact_request_appears_in_inbox(isolated_env):
 
 
 @pytest.mark.asyncio
-async def test_request_contact_retries_notification_when_initial_delivery_fails(isolated_env):
-    """A pending request should retry its inbox notification if the first delivery was blocked."""
+async def test_request_contact_retries_pending_atomic_notification(
+    isolated_env,
+    monkeypatch,
+):
+    """A repeated pending request recovers the same durable notification intent."""
+    import mcp_agent_mail.delivery as delivery_service
+    from mcp_agent_mail.storage import MessageDeliveryPendingError
+
     server = build_mcp_server()
     async with Client(server) as client:
         project_key = "/test/contact/request-notify-retry"
         agent_a, agent_b = await setup_two_agents(client, project_key)
-        blocker = "RedStone"
-        inbox_pattern = f"agents/{agent_b}/inbox/*/*/*.md"
+        original_publisher = delivery_service.publish_message_delivery
 
-        await client.call_tool(
-            "register_agent",
-            {"project_key": project_key, "program": "test", "model": "test", "name": blocker},
+        async def transient_publisher(_archive, delivery_id, *_args, **_kwargs):
+            raise MessageDeliveryPendingError(delivery_id, "injected transient failure")
+
+        monkeypatch.setattr(
+            delivery_service,
+            "publish_message_delivery",
+            transient_publisher,
         )
-        reservation = await client.call_tool(
-            "file_reservation_paths",
-            {
-                "project_key": project_key,
-                "agent_name": blocker,
-                "paths": [inbox_pattern],
-                "ttl_seconds": 1800,
-                "exclusive": True,
-            },
-        )
-        assert reservation.data["granted"]
 
         first = await client.call_tool(
             "request_contact",
@@ -392,8 +390,10 @@ async def test_request_contact_retries_notification_when_initial_delivery_fails(
             },
         )
         assert first.data["status"] == "pending"
-        notification_error = first.data.get("notification_error") or {}
-        assert notification_error.get("type") == "FILE_RESERVATION_CONFLICT"
+        first_notification = first.data.get("notification_message") or {}
+        first_delivery = first_notification["delivery"]
+        assert first_delivery["status"] == "pending"
+        assert first_notification["message"] is None
 
         inbox_before = await client.call_tool(
             "fetch_inbox",
@@ -406,13 +406,25 @@ async def test_request_contact_retries_notification_when_initial_delivery_fails(
         items_before = get_inbox_items(inbox_before)
         assert not any(item.get("subject") == f"Contact request from {agent_a}" for item in items_before)
 
-        await client.call_tool(
-            "release_file_reservations",
-            {
-                "project_key": project_key,
-                "agent_name": blocker,
-                "paths": [inbox_pattern],
-            },
+        async with get_session() as session:
+            await session.execute(
+                text(
+                    "UPDATE message_deliveries "
+                    "SET next_attempt_ts = :due "
+                    "WHERE id = :delivery_id"
+                ),
+                {
+                    "due": (datetime.now(UTC) - timedelta(seconds=1)).replace(
+                        tzinfo=None
+                    ),
+                    "delivery_id": first_delivery["id"],
+                },
+            )
+            await session.commit()
+        monkeypatch.setattr(
+            delivery_service,
+            "publish_message_delivery",
+            original_publisher,
         )
 
         second = await client.call_tool(
@@ -426,7 +438,9 @@ async def test_request_contact_retries_notification_when_initial_delivery_fails(
         )
         assert second.data["status"] == "pending"
         notification_message = second.data.get("notification_message") or {}
-        assert notification_message.get("subject") == f"Contact request from {agent_a}"
+        assert notification_message["delivery"]["id"] == first_delivery["id"]
+        assert notification_message["delivery"]["status"] == "published"
+        assert notification_message["message"]["subject"] == f"Contact request from {agent_a}"
 
         inbox_after = await client.call_tool(
             "fetch_inbox",
@@ -530,7 +544,7 @@ async def test_request_contact_renotifies_after_pending_link_expires(isolated_en
         )
         assert second.data["status"] == "pending"
         notification_message = second.data.get("notification_message") or {}
-        assert notification_message.get("subject") == f"Contact request from {agent_a}"
+        assert notification_message["message"]["subject"] == f"Contact request from {agent_a}"
 
         inbox = await client.call_tool(
             "fetch_inbox",
@@ -778,6 +792,7 @@ async def test_approved_agent_can_message(isolated_env):
                 "to": [agent_b],
                 "subject": "Test after approval",
                 "body_md": "This should work!",
+                "idempotency_key": "contact-flow-approved-message",
             },
         )
 
@@ -885,6 +900,7 @@ async def test_denied_agent_message_blocked(isolated_env):
                     "to": [agent_b],
                     "subject": "Should be blocked",
                     "body_md": "This should not work",
+                    "idempotency_key": "contact-flow-denied-message",
                 },
             )
             # If it doesn't raise, check if message was actually delivered
@@ -939,6 +955,7 @@ async def test_policy_open_allows_all_messages(isolated_env):
                 "to": [agent_b],
                 "subject": "Open policy test",
                 "body_md": "Should work without contact approval",
+                "idempotency_key": "contact-flow-open-policy",
             },
         )
 
@@ -980,6 +997,7 @@ async def test_policy_contacts_only_requires_approval(isolated_env):
                     "to": [agent_b],
                     "subject": "Contacts only test",
                     "body_md": "Should require approval",
+                    "idempotency_key": "contact-flow-contacts-only",
                 },
             )
             # If delivered, implementation may have auto_contact_if_blocked
@@ -1013,25 +1031,16 @@ async def test_policy_block_all_blocks_everyone(isolated_env):
         policy = await get_agent_policy(project_id, agent_b)
         assert policy == "block_all"
 
-        # Even after approval, block_all should block
-        # First approve contact
-        await client.call_tool(
-            "request_contact",
-            {
-                "project_key": project_key,
-                "from_agent": agent_a,
-                "to_agent": agent_b,
-            },
-        )
-        await client.call_tool(
-            "respond_contact",
-            {
-                "project_key": project_key,
-                "to_agent": agent_b,
-                "from_agent": agent_a,
-                "accept": True,
-            },
-        )
+        # A block_all lifetime rejects even the contact-request notification.
+        with pytest.raises(Exception, match="not accepting messages"):
+            await client.call_tool(
+                "request_contact",
+                {
+                    "project_key": project_key,
+                    "from_agent": agent_a,
+                    "to_agent": agent_b,
+                },
+            )
 
         # Try to message - should still be blocked due to block_all policy
         try:
@@ -1043,6 +1052,7 @@ async def test_policy_block_all_blocks_everyone(isolated_env):
                     "to": [agent_b],
                     "subject": "Block all test",
                     "body_md": "Should be blocked",
+                    "idempotency_key": "contact-flow-block-all",
                 },
             )
             # If it succeeds, block_all may not be enforced at message level

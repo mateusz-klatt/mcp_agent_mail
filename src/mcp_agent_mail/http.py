@@ -8,6 +8,7 @@ import base64
 import binascii
 import contextlib
 import contextvars
+import functools
 import hmac
 import importlib
 import json
@@ -23,17 +24,17 @@ from typing import Annotated, Any, Literal, Protocol, TypedDict, cast
 import structlog
 import uvicorn
 from fastapi import FastAPI, HTTPException, Path as FastApiPath, Query, Request, status
-from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
+from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
-from fastapi.staticfiles import StaticFiles
 from git import NULL_TREE
 from markupsafe import Markup, escape as escape_markup
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
-from sqlalchemy import text, update
+from sqlalchemy import select, text, update
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import col
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.types import Receive, Scope, Send
 
@@ -51,9 +52,30 @@ from .app import (
 )
 from .config import Settings, get_settings
 from .db import ensure_schema, get_immediate_session, get_session
+from .delivery import (
+    DeliveryActorSnapshot,
+    DeliveryAgentSnapshot,
+    DeliveryProjectSnapshot,
+    DeliveryRecipientSnapshot,
+    MessageDeliveryAcceptance,
+    MessageDeliveryIdempotencyConflictError,
+    MessageDeliveryNotFoundError,
+    MessageDeliveryProcessingResult,
+    MessageDeliveryRequest,
+    MessageDeliveryServiceError,
+    MessageDeliveryValidationError,
+    accept_message_delivery,
+    emit_published_delivery_notifications,
+    get_message_delivery_status,
+    process_message_delivery,
+)
+from .models import Agent, Message, MessageDelivery, Project
 from .notify import KEEPALIVE_SECONDS, MAX_STREAM_SECONDS, hub
 from .storage import (
+    AsyncFileLock,
     ProjectArchive,
+    _commit_lock_path,
+    _to_thread_cancellation_safe,
     archive_write_lock,
     collect_lock_status,
     ensure_archive,
@@ -249,7 +271,8 @@ async def _delete_messages_from_archive(
     git_paths_removed: list[str] = []
     seen_git_paths: set[str] = set()
 
-    async with archive_write_lock(archive):
+    commit_lock_path = _commit_lock_path(archive.repo_root, [])
+    async with archive_write_lock(archive), AsyncFileLock(commit_lock_path):
         for mrow in messages_to_delete:
             msg_id = int(mrow[0])
             y_dir, m_dir, filename = _build_http_archive_message_filename(
@@ -282,23 +305,31 @@ async def _delete_messages_from_archive(
                     git_paths_removed.append(rel)
 
         if git_paths_removed:
-            actor_module = importlib.import_module("git")
-            actor_cls = actor_module.Actor
-            git_actor = actor_cls(
-                settings.storage.git_author_name,
-                settings.storage.git_author_email,
-            )
-            await asyncio.to_thread(
+            await _to_thread_cancellation_safe(
                 archive.repo.index.remove,
                 git_paths_removed,
                 working_tree=False,
             )
-            await asyncio.to_thread(
-                archive.repo.index.commit,
-                commit_message,
-                author=git_actor,
-                committer=git_actor,
-            )
+            literal_paths = [f":(literal){path}" for path in git_paths_removed]
+
+            def _commit_only_removed_paths() -> None:
+                with archive.repo.git.custom_environment(
+                    GIT_AUTHOR_NAME=settings.storage.git_author_name,
+                    GIT_AUTHOR_EMAIL=settings.storage.git_author_email,
+                    GIT_COMMITTER_NAME=settings.storage.git_author_name,
+                    GIT_COMMITTER_EMAIL=settings.storage.git_author_email,
+                ):
+                    archive.repo.git.commit(
+                        "--only",
+                        "--no-gpg-sign",
+                        "--no-verify",
+                        "-m",
+                        commit_message,
+                        "--",
+                        *literal_paths,
+                    )
+
+            await _to_thread_cancellation_safe(_commit_only_removed_paths)
 
     return len(git_paths_removed)
 
@@ -875,7 +906,7 @@ _MAIL_LEGACY_OVERSEER_UNAVAILABLE_DETAIL = (
 _MAIL_ACCOUNT_API_PATHS = frozenset(
     {_MAIL_PROFILE_API_PATH, _MAIL_PREFERENCES_API_PATH, _MAIL_PASSWORD_API_PATH}
 )
-_MAIL_REACT_BASE_PATH = "/mail/v2"
+_MAIL_REACT_BASE_PATH = "/mail"
 _MAIL_LOGIN_STYLESHEET_PATH = f"{_MAIL_REACT_BASE_PATH}/assets/legacy.css"
 _HERMES_FAVICON_PATH = "/favicon.ico"
 _HERMES_FAVICON_SVG = (
@@ -925,6 +956,15 @@ _MAIL_BODY_INLINE_IMAGE_PREFIXES: dict[str, Callable[[bytes], bool]] = {
 }
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _OVERSEER_REPLY_PATH_RE = re.compile(r"^/mail/[^/]+/overseer/reply$")
+_MAIL_API_REPLY_SHAPE_RE = re.compile(
+    r"^/mail/api/v1/projects/[^/]+/messages/[^/]+/replies$"
+)
+_MAIL_API_COMPOSE_SHAPE_RE = re.compile(
+    r"^/mail/api/v1/projects/[^/]+/messages$"
+)
+_MAIL_API_DELIVERY_SHAPE_RE = re.compile(
+    r"^/mail/api/v1/deliveries/[^/]+(?:/retry)?$"
+)
 _mail_ui_template_user: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
     "mail_ui_template_user",
     default=None,
@@ -960,10 +1000,40 @@ MailUiProjectRole = Literal["admin", "viewer", "operator"]
 MailUiImportance = Literal["low", "normal", "high", "urgent"]
 
 
+def _mail_ui_active_path(path: str) -> bool:
+    """Expose one human UI surface and the exact services it consumes."""
+    return (
+        path in {
+            "/mail",
+            "/mail/",
+            _MAIL_LOGIN_PATH,
+            _MAIL_LOGOUT_PATH,
+            "/mail/events",
+            _MAIL_FILE_RESERVATIONS_API_PATH,
+        }
+        or path.startswith("/mail/assets/")
+        or path == "/mail/api/v1"
+        or path.startswith("/mail/api/v1/")
+    )
+
+
 def _mail_ui_uses_typed_domain_errors(path: str) -> bool:
     """Whether authorization failures on ``path`` use stable ``detail.code``."""
-    return path in {_MAIL_PROFILE_API_PATH, _MAIL_ADMIN_ACCESS_API_PATH} or path.startswith(
-        "/mail/api/v1/admin/users/"
+    return (
+        path in {_MAIL_PROFILE_API_PATH, _MAIL_ADMIN_ACCESS_API_PATH}
+        or path.startswith("/mail/api/v1/admin/users/")
+        or bool(_MAIL_API_DELIVERY_SHAPE_RE.fullmatch(path))
+        or bool(_MAIL_API_COMPOSE_SHAPE_RE.fullmatch(path))
+        or bool(_MAIL_API_REPLY_SHAPE_RE.fullmatch(path))
+    )
+
+
+def _mail_ui_uses_typed_delivery_errors(path: str) -> bool:
+    """Whether ``path`` belongs to the generated delivery API contract."""
+    return bool(
+        _MAIL_API_DELIVERY_SHAPE_RE.fullmatch(path)
+        or _MAIL_API_COMPOSE_SHAPE_RE.fullmatch(path)
+        or _MAIL_API_REPLY_SHAPE_RE.fullmatch(path)
     )
 
 
@@ -1031,6 +1101,30 @@ class MailUiDomainOrValidationErrorResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     detail: MailUiDomainErrorDetail | list[dict[str, Any]]
+
+
+class MailUiDeliveryErrorDetail(BaseModel):
+    """Stable delivery refusal without persisted content or request values."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: str = Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_]*$")
+
+
+class MailUiDeliveryErrorResponse(BaseModel):
+    """FastAPI wrapper for one typed delivery-domain refusal."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    detail: MailUiDeliveryErrorDetail
+
+
+class MailUiDeliveryOrValidationErrorResponse(BaseModel):
+    """A delivery refusal or redacted FastAPI request-validation error."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    detail: MailUiDeliveryErrorDetail | list[dict[str, Any]]
 
 
 class MailUiProfileResponse(BaseModel):
@@ -1142,6 +1236,19 @@ _MAIL_UI_DOMAIN_MUTATION_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     status.HTTP_422_UNPROCESSABLE_CONTENT: {
         "model": MailUiDomainOrValidationErrorResponse
     },
+}
+_MAIL_UI_DELIVERY_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
+    status.HTTP_401_UNAUTHORIZED: {"model": MailUiDeliveryErrorResponse},
+    status.HTTP_403_FORBIDDEN: {"model": MailUiDeliveryErrorResponse},
+    status.HTTP_404_NOT_FOUND: {"model": MailUiDeliveryErrorResponse},
+    status.HTTP_409_CONFLICT: {"model": MailUiDeliveryErrorResponse},
+    status.HTTP_422_UNPROCESSABLE_CONTENT: {
+        "model": MailUiDeliveryOrValidationErrorResponse
+    },
+    status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": MailUiDeliveryErrorResponse},
+}
+_MAIL_UI_DELIVERY_MUTATION_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **_MAIL_UI_DELIVERY_ERROR_RESPONSES,
 }
 
 
@@ -1299,6 +1406,65 @@ class MailUiThreadResponse(BaseModel):
     next_cursor: str | None
 
 
+class MailUiComposeRequest(BaseModel):
+    """Strict, idempotent administrator-authored project message."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    idempotency_key: str = Field(min_length=1, max_length=128)
+    recipients: list[str] = Field(min_length=1, max_length=100)
+    subject: str = Field(min_length=1, max_length=200)
+    body_md: str = Field(min_length=1, max_length=50_000)
+    thread_id: str | None = Field(default=None, max_length=128)
+
+    @field_validator("idempotency_key", "subject", "body_md")
+    @classmethod
+    def require_non_whitespace(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Value must contain a non-whitespace character.")
+        return value
+
+    @field_validator("recipients")
+    @classmethod
+    def require_unique_recipient_names(cls, value: list[str]) -> list[str]:
+        if any(not name.strip() or len(name) > 128 for name in value):
+            raise ValueError("Recipients must be bounded non-whitespace names.")
+        if len(set(value)) != len(value):
+            raise ValueError("Recipients must be unique.")
+        return value
+
+
+class MailUiReplyRequest(BaseModel):
+    """Strict, idempotent reply body; routing is entirely server-derived."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    idempotency_key: str = Field(min_length=1, max_length=128)
+    body_md: str = Field(min_length=1, max_length=50_000)
+
+    @field_validator("idempotency_key", "body_md")
+    @classmethod
+    def require_non_whitespace(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Value must contain a non-whitespace character.")
+        return value
+
+
+class MailUiDeliveryResponse(BaseModel):
+    """One durable delivery outcome safe for browser polling."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    )
+    status: Literal["published", "pending", "quarantined", "busy", "deferred"]
+    reused: bool
+    message_id: int | None
+    commit_sha: str | None
+    next_attempt_ts: datetime | None
+
+
 _MAIL_UI_CURSOR_VERSION = 1
 _MAIL_UI_CURSOR_MAX_LENGTH = 512
 _MAIL_UI_CREATED_TS_KEY_SQL = (
@@ -1330,6 +1496,271 @@ def _mail_ui_datetime(value: Any) -> datetime:
     if result.tzinfo is None:
         result = result.replace(tzinfo=timezone.utc)
     return result.astimezone(timezone.utc)
+
+
+def _mail_ui_delivery_response(
+    acceptance: MessageDeliveryAcceptance,
+    processing: MessageDeliveryProcessingResult,
+) -> MailUiDeliveryResponse:
+    """Combine immutable acceptance facts with the latest processing outcome."""
+    return MailUiDeliveryResponse(
+        id=acceptance.delivery_id,
+        status=processing.status,
+        reused=acceptance.reused,
+        message_id=processing.message_id,
+        commit_sha=processing.commit_sha,
+        next_attempt_ts=processing.next_attempt_ts,
+    )
+
+
+def _mail_ui_delivery_status_response(
+    processing: MessageDeliveryProcessingResult,
+) -> MailUiDeliveryResponse:
+    """Render a status poll when no acceptance reuse flag exists."""
+    return MailUiDeliveryResponse(
+        id=processing.delivery_id,
+        status=processing.status,
+        reused=True,
+        message_id=processing.message_id,
+        commit_sha=processing.commit_sha,
+        next_attempt_ts=processing.next_attempt_ts,
+    )
+
+
+def _mail_ui_delivery_exception(exc: Exception) -> HTTPException:
+    """Translate delivery-domain refusals without exposing persisted content."""
+    if isinstance(exc, MessageDeliveryValidationError):
+        code = (
+            exc.code
+            if re.fullmatch(r"[a-z][a-z0-9_]{0,127}", exc.code)
+            else "delivery_failed"
+        )
+        if code in {
+            "ui_actor_lifetime_invalid",
+            "ui_actor_role_invalid",
+            "ui_actor_operator_required",
+            "ui_actor_admin_required",
+        }:
+            status_code = status.HTTP_403_FORBIDDEN
+        elif code.endswith("_lifetime_invalid") or code in {
+            "reply_route_invalid",
+            "cross_project_route_revoked",
+            "reply_target_invalid",
+            "recipient_blocked",
+        }:
+            status_code = status.HTTP_409_CONFLICT
+        else:
+            status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
+        return HTTPException(status_code=status_code, detail={"code": code})
+    if isinstance(exc, MessageDeliveryIdempotencyConflictError):
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "idempotency_conflict"},
+        )
+    if isinstance(exc, MessageDeliveryNotFoundError):
+        return HTTPException(status_code=404, detail={"code": "delivery_not_found"})
+    return HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail={"code": "delivery_failed"},
+    )
+
+
+def _mail_ui_delivery_http_exception(exc: HTTPException) -> HTTPException:
+    """Normalize access races into the advertised delivery error shape."""
+    if exc.status_code == status.HTTP_404_NOT_FOUND:
+        code = "project_not_found"
+    elif exc.status_code in {
+        status.HTTP_401_UNAUTHORIZED,
+        status.HTTP_403_FORBIDDEN,
+    }:
+        code = "actor_forbidden"
+    else:
+        return exc
+    return HTTPException(status_code=exc.status_code, detail={"code": code})
+
+
+def _mail_ui_typed_delivery_endpoint(
+    handler: Callable[..., Any],
+) -> Callable[..., Any]:
+    """Return stable typed failures without logging authored exception text."""
+    handler_name = getattr(handler, "__name__", type(handler).__name__)
+
+    @functools.wraps(handler)
+    async def wrapped(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await handler(*args, **kwargs)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                structlog.get_logger("mail_ui.delivery").error(
+                    "delivery_request_failed",
+                    handler=handler_name,
+                    exception_type=type(exc).__name__,
+                )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={"code": "delivery_failed"},
+            ) from None
+
+    return wrapped
+
+
+def _mail_ui_overseer_preamble(locale: MailUiLocale) -> str:
+    """Server-authored provenance and language advisory for human mail."""
+    return (
+        "---\n\n"
+        "MESSAGE FROM HUMAN OVERSEER\n\n"
+        "This message is from an authenticated human operator overseeing this "
+        "project. Prioritize the request below over the current task unless a "
+        "higher-priority instruction conflicts.\n\n"
+        f"{_mail_ui_correspondence_advisory(locale)}\n\n"
+        "---\n\n"
+    )
+
+
+async def _mail_ui_delivery_context(
+    *,
+    session: AsyncSession,
+    request: Request,
+    project_id: int,
+    compose: bool,
+) -> tuple[
+    DeliveryProjectSnapshot,
+    DeliveryAgentSnapshot,
+    DeliveryActorSnapshot,
+    MailUiLocale,
+]:
+    """Revalidate a human and resolve the immutable HumanOverseer mailbox."""
+    try:
+        principal = _mail_ui_preferences_principal(request)
+        user = await _mail_ui_preferences_user(request, session)
+        role = webauth.normalize_ui_user_role(user.role)
+        if role is None or role != principal["role"]:
+            raise HTTPException(status_code=401, detail={"code": "actor_forbidden"})
+        access = await _mail_ui_require_project_access(
+            settings=get_settings(),
+            request=request,
+            session=session,
+            project_id=project_id,
+            operate=not compose,
+        )
+    except HTTPException as exc:
+        raise _mail_ui_delivery_http_exception(exc) from None
+    if compose and not access["can_compose"]:
+        raise HTTPException(status_code=403, detail={"code": "actor_forbidden"})
+    project = await session.get(Project, project_id)
+    if project is None or project.id is None or project.archived_at is not None:
+        raise HTTPException(status_code=404, detail={"code": "project_not_found"})
+    sender_result = await session.execute(
+        select(Agent).where(
+            cast(Any, Agent.project_id == project_id),
+            cast(Any, Agent.name == "HumanOverseer"),
+        )
+    )
+    sender = sender_result.scalar_one_or_none()
+    if sender is None:
+        sender = Agent(
+            project_id=project_id,
+            name="HumanOverseer",
+            program="WebUI",
+            model="Human",
+            task_description="Authenticated human operator",
+            contact_policy="open",
+            attachments_policy="auto",
+        )
+        session.add(sender)
+        await session.flush()
+    if sender.id is None or sender.retired_at is not None:
+        raise HTTPException(status_code=409, detail={"code": "sender_unavailable"})
+    project_snapshot = DeliveryProjectSnapshot(
+        project_id=project_id,
+        slug=project.slug,
+        generation=project.project_generation,
+    )
+    sender_snapshot = DeliveryAgentSnapshot(
+        agent_id=int(sender.id),
+        name=sender.name,
+        generation=sender.agent_generation,
+        project=project_snapshot,
+    )
+    actor = DeliveryActorSnapshot.ui_user(
+        user_id=principal["id"],
+        username=principal["username"],
+        generation=principal["session_generation"],
+        epoch=principal["session_epoch"],
+        source_project=project_snapshot,
+    )
+    ui_locale = cast(MailUiLocale, user.preferred_ui_locale)
+    correspondence_locale = cast(
+        MailUiLocale,
+        user.preferred_correspondence_locale or ui_locale,
+    )
+    return project_snapshot, sender_snapshot, actor, correspondence_locale
+
+
+async def _mail_ui_delivery_recipient(
+    *,
+    session: AsyncSession,
+    agent: Agent,
+) -> DeliveryRecipientSnapshot:
+    """Build one live target-project agent snapshot for a durable request."""
+    project = await session.get(Project, agent.project_id)
+    if (
+        project is None
+        or project.id is None
+        or project.archived_at is not None
+        or agent.id is None
+        or agent.retired_at is not None
+    ):
+        raise HTTPException(status_code=409, detail={"code": "recipient_unavailable"})
+    return DeliveryRecipientSnapshot(
+        kind="to",
+        agent=DeliveryAgentSnapshot(
+            agent_id=int(agent.id),
+            name=agent.name,
+            generation=agent.agent_generation,
+            project=DeliveryProjectSnapshot(
+                project_id=int(project.id),
+                slug=project.slug,
+                generation=project.project_generation,
+            ),
+        ),
+    )
+
+
+async def _mail_ui_require_owned_delivery(
+    *,
+    request: Request,
+    delivery_id: str,
+) -> None:
+    """Hide every delivery outside the current human account lifetime."""
+    if (
+        re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            delivery_id,
+        )
+        is None
+    ):
+        raise HTTPException(status_code=404, detail={"code": "delivery_not_found"})
+    try:
+        principal = _mail_ui_preferences_principal(request)
+        async with get_session() as session:
+            await _mail_ui_preferences_user(request, session)
+            delivery = await session.get(MessageDelivery, delivery_id)
+    except HTTPException as exc:
+        raise _mail_ui_delivery_http_exception(exc) from None
+    if (
+        delivery is None
+        or delivery.actor_kind != "ui_user"
+        or delivery.actor_id != principal["id"]
+        or delivery.actor_generation_snapshot != principal["session_generation"]
+        or delivery.actor_epoch_snapshot != principal["session_epoch"]
+    ):
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "delivery_not_found"},
+        )
 
 
 def _mail_ui_importance(value: Any) -> MailUiImportance:
@@ -1577,7 +2008,7 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
         mcp_base = _normalized_http_base_path(self._settings.http.path)
         if path == "/" and mcp_base != "/":
             raw_query = cast(bytes, request.scope.get("query_string", b""))
-            location = f"{_MAIL_REACT_BASE_PATH}/"
+            location = _MAIL_REACT_BASE_PATH
             if raw_query:
                 location = f"{location}?{raw_query.decode('latin-1')}"
             return Response(
@@ -1606,6 +2037,12 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
         path = request.url.path
         if not (path == "/mail" or path.startswith("/mail/")):
             return await call_next(request)
+        if not _mail_ui_active_path(path):
+            return JSONResponse(
+                {"detail": "Not Found"},
+                status_code=status.HTTP_404_NOT_FOUND,
+                headers=_MAIL_REACT_INDEX_HEADERS,
+            )
         if request.method == "OPTIONS":
             return await call_next(request)
 
@@ -1710,6 +2147,11 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
                 user["role"] != webauth.ROLE_ADMIN
                 and path not in _MAIL_ACCOUNT_API_PATHS
                 and not _OVERSEER_REPLY_PATH_RE.fullmatch(path)
+                and not _MAIL_API_REPLY_SHAPE_RE.fullmatch(path)
+                and not (
+                    _MAIL_API_DELIVERY_SHAPE_RE.fullmatch(path)
+                    and path.endswith("/retry")
+                )
             ):
                 return JSONResponse(
                     {
@@ -1830,13 +2272,14 @@ async def _resolve_mail_project(
         identifier: Project slug or canonical human key from the URL.
 
     Returns:
-        ``(id, slug, human_key, archived_at)`` for one unambiguous project, or
-        ``None`` when no project or multiple human-key matches exist.
+        ``(id, slug, human_key, archived_at, project_generation)`` for one
+        unambiguous project, or ``None`` when no project or multiple human-key
+        matches exist.
     """
     rows = (
         await session.execute(
             text(
-                "SELECT id, slug, human_key, archived_at FROM projects "
+                "SELECT id, slug, human_key, archived_at, project_generation FROM projects "
                 "WHERE slug = :identifier OR human_key = :identifier ORDER BY id"
             ),
             {"identifier": identifier},
@@ -2468,43 +2911,165 @@ async def _mail_ui_stream_access_valid(
     settings: Settings,
     session_token: str,
     project_slug: str | None,
+    expected_principal: MailUiSessionPrincipal | None,
+    expected_project_id: int | None = None,
+    expected_project_generation: str | None = None,
 ) -> bool:
-    """Revalidate a streaming session and its current project assignments.
+    """Revalidate one exact account and project lifetime for an open stream.
 
     Args:
         settings: Active application settings.
         session_token: Signed browser session cookie captured at connection time.
         project_slug: Specific project slug, or ``None`` for any visible project.
+        expected_principal: Account-lifetime snapshot captured before subscribing.
+        expected_project_id: Project row id captured before subscribing.
+        expected_project_generation: Immutable project-lifetime generation.
 
     Returns:
-        ``True`` while the session remains live and its assignment still covers
-        the requested scope.
+        ``True`` only while the exact account lifetime remains live and its
+        assignment still covers the exact project lifetime. A deleted and
+        recreated username or project can therefore never inherit an already
+        open stream merely by reusing the same human-readable name.
     """
-    if not settings.mail_ui.enabled:
+    if settings.mail_ui.enabled:
+        user = await _load_session_user(session_token, settings=settings)
+        if user is None or expected_principal is None:
+            return False
+        if (
+            user["id"] != expected_principal["id"]
+            or user["username"] != expected_principal["username"]
+            or user["role"] != expected_principal["role"]
+            or user["session_epoch"] != expected_principal["session_epoch"]
+            or not hmac.compare_digest(
+                user["session_generation"],
+                expected_principal["session_generation"],
+            )
+        ):
+            return False
+    else:
+        user = expected_principal
+
+    if project_slug is None:
         return True
-    user = await _load_session_user(session_token, settings=settings)
-    if user is None:
+    if expected_project_id is None or expected_project_generation is None:
         return False
-    if user["role"] == webauth.ROLE_ADMIN:
-        return True
+
     async with get_session() as session:
-        params: dict[str, Any] = {"user_id": int(user["id"])}
-        project_filter = ""
-        if project_slug is not None:
-            project_filter = " AND p.slug = :project_slug"
-            params["project_slug"] = project_slug
+        project = (
+            await session.execute(
+                text(
+                    "SELECT id, project_generation FROM projects "
+                    "WHERE id = :project_id AND slug = :project_slug"
+                ),
+                {
+                    "project_id": expected_project_id,
+                    "project_slug": project_slug,
+                },
+            )
+        ).fetchone()
+        if (
+            project is None
+            or int(project[0]) != expected_project_id
+            or not hmac.compare_digest(
+                str(project[1]),
+                expected_project_generation,
+            )
+        ):
+            return False
+        if not settings.mail_ui.enabled or bool(
+            user and user["role"] == webauth.ROLE_ADMIN
+        ):
+            return True
+        if user is None:
+            return False
         rows = await session.execute(
             text(
-                "SELECT a.role FROM ui_project_assignments a "
-                "JOIN projects p ON p.id = a.project_id "
-                "WHERE a.user_id = :user_id" + project_filter
+                "SELECT role FROM ui_project_assignments "
+                "WHERE user_id = :user_id AND project_id = :project_id"
             ),
-            params,
+            {
+                "user_id": int(user["id"]),
+                "project_id": expected_project_id,
+            },
         )
         return any(
             webauth.project_role_allows_view(webauth.normalize_project_role(row[0]))
             for row in rows.fetchall()
         )
+
+
+async def _mail_ui_stream_project_lifetimes(
+    *,
+    settings: Settings,
+    request: Request,
+) -> dict[str, tuple[int, str]]:
+    """Snapshot every project lifetime visible when a wildcard stream opens."""
+    async with get_session() as session:
+        visible = await _mail_ui_visible_project_roles(
+            settings=settings,
+            request=request,
+            session=session,
+        )
+        predicate, params = _mail_ui_visible_project_predicate(
+            list(visible),
+            column="id",
+            parameter_prefix="stream_project",
+        )
+        rows = await session.execute(
+            text(
+                "SELECT id, slug, project_generation FROM projects "
+                f"WHERE {predicate}"
+            ),
+            params,
+        )
+    return {
+        str(row[1]): (int(row[0]), str(row[2]))
+        for row in rows.fetchall()
+    }
+
+
+async def _agent_stream_lifetime_valid(
+    *,
+    project_id: int,
+    project_slug: str,
+    project_generation: str,
+    agent_id: int,
+    agent_name: str,
+    agent_generation: str,
+    registration_token: str,
+) -> bool:
+    """Fail closed unless an agent stream still names the exact DB lifetime."""
+    try:
+        async with get_session() as session:
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT p.project_generation, p.archived_at, a.name, "
+                        "a.agent_generation, a.registration_token, a.retired_at "
+                        "FROM projects p JOIN agents a ON a.project_id = p.id "
+                        "WHERE p.id = :project_id AND p.slug = :project_slug "
+                        "AND a.id = :agent_id"
+                    ),
+                    {
+                        "project_id": project_id,
+                        "project_slug": project_slug,
+                        "agent_id": agent_id,
+                    },
+                )
+            ).fetchone()
+        return bool(
+            row is not None
+            and row[1] is None
+            and row[5] is None
+            and str(row[2]) == agent_name
+            and hmac.compare_digest(str(row[0]), project_generation)
+            and hmac.compare_digest(str(row[3]), agent_generation)
+            and bool(row[4])
+            and hmac.compare_digest(str(row[4]), registration_token)
+        )
+    except Exception:
+        # A failed lifetime lookup must close the channel, never preserve it.
+        return False
 
 
 class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
@@ -3457,25 +4022,37 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             row = (
                 await session.execute(
                     text(
-                        "SELECT a.name, a.registration_token, a.retired_at "
-                        "FROM agents a WHERE a.project_id = :pid AND lower(a.name) = lower(:a)"
+                        "SELECT a.id, a.name, a.registration_token, a.retired_at, "
+                        "a.agent_generation, p.slug, p.project_generation, p.archived_at "
+                        "FROM agents a JOIN projects p ON p.id = a.project_id "
+                        "WHERE a.project_id = :pid AND lower(a.name) = lower(:a)"
                     ),
                     {"pid": int(project_row[0]), "a": agent_name},
                 )
             ).fetchone()
 
-        if row is None or not row[1] or row[2] is not None:
+        if row is None or not row[2] or row[3] is not None or row[7] is not None:
             return unauthorized
         # compare_digest, not ==, so a caller cannot narrow the token by timing.
-        if not hmac.compare_digest(str(row[1]), token):
+        if not hmac.compare_digest(str(row[2]), token):
             return unauthorized
-        project_slug, canonical_agent = str(project_row[1]), str(row[0])
+        agent_id = int(row[0])
+        canonical_agent = str(row[1])
+        agent_generation = str(row[4])
+        project_slug = str(row[5])
+        project_generation = str(row[6])
+        project_id = int(project_row[0])
 
         # Subscribe BEFORE the client catches up, not after. The client's
         # contract is: connect, wait for `: ready`, pull the inbox, then wait.
         # Checking first and subscribing second would drop anything that
         # arrived in between — a lost wakeup with no trace on either side.
-        queue = hub.subscribe(project_slug, canonical_agent)
+        queue = hub.subscribe(
+            project_slug,
+            project_generation,
+            canonical_agent,
+            agent_generation,
+        )
 
         async def stream() -> Any:
             deadline = asyncio.get_running_loop().time() + MAX_STREAM_SECONDS
@@ -3491,8 +4068,28 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                             queue.get(), timeout=min(KEEPALIVE_SECONDS, remaining)
                         )
                     except asyncio.TimeoutError:
+                        if not await _agent_stream_lifetime_valid(
+                            project_id=project_id,
+                            project_slug=project_slug,
+                            project_generation=project_generation,
+                            agent_id=agent_id,
+                            agent_name=canonical_agent,
+                            agent_generation=agent_generation,
+                            registration_token=token,
+                        ):
+                            return
                         yield b": ping\n\n"
                         continue
+                    if not await _agent_stream_lifetime_valid(
+                        project_id=project_id,
+                        project_slug=project_slug,
+                        project_generation=project_generation,
+                        agent_id=agent_id,
+                        agent_name=canonical_agent,
+                        agent_generation=agent_generation,
+                        registration_token=token,
+                    ):
+                        return
                     # No `id:` line: that would advertise Last-Event-ID replay
                     # this stream does not have. The mailbox is the log.
                     yield f"data: {json.dumps(event, separators=(',', ':'))}\n\n".encode()
@@ -3501,7 +4098,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 # Must run on client disconnect too, or the hub accumulates
                 # queues for connections that are long gone and publishes into
                 # them forever.
-                hub.unsubscribe(project_slug, canonical_agent, queue)
+                hub.unsubscribe(
+                    project_slug,
+                    project_generation,
+                    canonical_agent,
+                    agent_generation,
+                    queue,
+                )
 
         return StreamingResponse(
             stream(),
@@ -4265,12 +4868,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         # ---------------------------------------------------------------
 
         def _safe_next(raw: str) -> str:
-            """Only allow same-site relative redirects.
+            """Redirect a successful sign-in only to the canonical React shell.
 
-            Without this, ``/mail/login?next=https://evil.example`` turns the
-            login form into an open redirect that phishes a freshly-authenticated
-            user straight off the site.
+            This prevents open redirects and keeps retired server-rendered/API
+            paths from becoming accidental post-login compatibility surfaces.
             """
+            from urllib.parse import urlsplit
+
             candidate = (raw or "").strip()
             if (
                 not candidate.startswith("/")
@@ -4278,6 +4882,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 or "\\" in candidate
                 or any(ord(character) < 32 or ord(character) == 127 for character in candidate)
             ):
+                return "/mail"
+            parsed = urlsplit(candidate)
+            if parsed.scheme or parsed.netloc or parsed.path != "/mail":
                 return "/mail"
             return candidate
 
@@ -4425,18 +5032,15 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 headers={**_MAIL_LEGACY_HTML_HEADERS, "Allow": "POST"},
             )
 
-        @fastapi_app.get("/mail", response_class=HTMLResponse)
-        async def mail_unified_inbox(request: Request) -> HTMLResponse:
-            """Unified inbox showing ALL messages across ALL projects (Gmail-style) + Projects below"""
-
-            payload = await _build_unified_inbox_payload(request=request)
-            return await _render(
-                "mail_unified_inbox.html",
-                messages=payload.get("messages", []),
-                projects=payload.get("projects", []),
-                agent_sounds=payload.get("agent_sounds", {}),
-                total_messages=payload.get("total_messages", 0),
-            )
+        @fastapi_app.api_route(
+            "/mail",
+            methods=["GET", "HEAD"],
+            response_class=HTMLResponse,
+            include_in_schema=False,
+        )
+        async def mail_react_index() -> FileResponse:
+            """Serve the sole authenticated human interface."""
+            return _mail_react_index_response()
 
         @fastapi_app.get("/mail/events")
         async def mail_events_stream(request: Request) -> Any:
@@ -4464,6 +5068,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             # nothing wider.
             project_key = (request.query_params.get("project") or "").strip()
             session_token = request.cookies.get(settings.mail_ui.cookie_name, "")
+            stream_principal = _mail_ui_request_user(request)
+            project_lifetimes: dict[str, tuple[int, str]]
             if project_key:
                 await ensure_schema()
                 async with get_session() as session:
@@ -4477,16 +5083,36 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         project_id=int(row[0]),
                     )
                 project_slug = str(row[1])
+                project_lifetimes = {
+                    project_slug: (int(row[0]), str(row[4])),
+                }
+                if not await _mail_ui_stream_access_valid(
+                    settings=settings,
+                    session_token=session_token,
+                    project_slug=project_slug,
+                    expected_principal=stream_principal,
+                    expected_project_id=int(row[0]),
+                    expected_project_generation=str(row[4]),
+                ):
+                    return JSONResponse({"detail": "Forbidden"}, status_code=403)
+                queue = hub.subscribe_project(project_slug, str(row[4]))
             else:
                 if not await _mail_ui_stream_access_valid(
                     settings=settings,
                     session_token=session_token,
                     project_slug=None,
+                    expected_principal=stream_principal,
                 ):
                     return JSONResponse({"detail": "Forbidden"}, status_code=403)
-                project_slug = hub.ANY_PROJECT
-
-            queue = hub.subscribe_project(project_slug)
+                project_slug = None
+                project_lifetimes = await _mail_ui_stream_project_lifetimes(
+                    settings=settings,
+                    request=request,
+                )
+                queue = hub.subscribe_projects(
+                    (slug, generation)
+                    for slug, (_project_id, generation) in project_lifetimes.items()
+                )
 
             async def stream() -> Any:
                 deadline = asyncio.get_running_loop().time() + MAX_STREAM_SECONDS
@@ -4501,29 +5127,57 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                 queue.get(), timeout=min(KEEPALIVE_SECONDS, remaining)
                             )
                         except asyncio.TimeoutError:
+                            keepalive_lifetime = (
+                                project_lifetimes.get(project_slug)
+                                if project_slug is not None
+                                else None
+                            )
                             if not await _mail_ui_stream_access_valid(
                                 settings=settings,
                                 session_token=session_token,
-                                project_slug=None if project_slug == hub.ANY_PROJECT else project_slug,
+                                project_slug=project_slug,
+                                expected_principal=stream_principal,
+                                expected_project_id=(
+                                    keepalive_lifetime[0]
+                                    if keepalive_lifetime is not None
+                                    else None
+                                ),
+                                expected_project_generation=(
+                                    keepalive_lifetime[1]
+                                    if keepalive_lifetime is not None
+                                    else None
+                                ),
                             ):
                                 return
                             yield b": ping\n\n"
                             continue
                         event_project = event.get("project") if isinstance(event, dict) else None
-                        event_scope = (
-                            str(event_project)
-                            if project_slug == hub.ANY_PROJECT and isinstance(event_project, str)
-                            else None if project_slug == hub.ANY_PROJECT else project_slug
-                        )
-                        if not await _mail_ui_stream_access_valid(
+                        if not isinstance(event_project, str):
+                            return
+                        event_scope = event_project if project_slug is None else project_slug
+                        expected_lifetime = project_lifetimes.get(event_scope)
+                        event_is_visible = await _mail_ui_stream_access_valid(
                             settings=settings,
                             session_token=session_token,
                             project_slug=event_scope,
-                        ):
-                            if project_slug == hub.ANY_PROJECT and await _mail_ui_stream_access_valid(
+                            expected_principal=stream_principal,
+                            expected_project_id=(
+                                expected_lifetime[0]
+                                if expected_lifetime is not None
+                                else None
+                            ),
+                            expected_project_generation=(
+                                expected_lifetime[1]
+                                if expected_lifetime is not None
+                                else None
+                            ),
+                        )
+                        if not event_is_visible:
+                            if project_slug is None and await _mail_ui_stream_access_valid(
                                 settings=settings,
                                 session_token=session_token,
                                 project_slug=None,
+                                expected_principal=stream_principal,
                             ):
                                 continue
                             return
@@ -4532,7 +5186,21 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         # reconnect after every message it displays.
                         yield f"data: {json.dumps(event, separators=(',', ':'))}\n\n".encode()
                 finally:
-                    hub.unsubscribe_project(project_slug, queue)
+                    if project_slug is None:
+                        hub.unsubscribe_projects(
+                            (
+                                (slug, generation)
+                                for slug, (_project_id, generation) in project_lifetimes.items()
+                            ),
+                            queue,
+                        )
+                    else:
+                        _project_id, project_generation = project_lifetimes[project_slug]
+                        hub.unsubscribe_project(
+                            project_slug,
+                            project_generation,
+                            queue,
+                        )
 
             return StreamingResponse(
                 stream(),
@@ -4767,6 +5435,189 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     request=request,
                     visible_roles=visible_roles,
                 )
+
+        @fastapi_app.post(
+            "/mail/api/v1/projects/{project_id}/messages",
+            response_model=MailUiDeliveryResponse,
+            responses=_MAIL_UI_DELIVERY_MUTATION_ERROR_RESPONSES,
+        )
+        @_mail_ui_typed_delivery_endpoint
+        async def mail_ui_compose_v1(
+            project_id: Annotated[int, FastApiPath(gt=0)],
+            request: Request,
+            message: MailUiComposeRequest,
+        ) -> MailUiDeliveryResponse:
+            """Accept one administrator-authored message as a durable intent."""
+            await ensure_schema()
+            async with get_immediate_session() as session:
+                project_snapshot, sender, actor, locale = await _mail_ui_delivery_context(
+                    session=session,
+                    request=request,
+                    project_id=project_id,
+                    compose=True,
+                )
+                recipient_rows = await session.execute(
+                    select(Agent).where(
+                        cast(Any, Agent.project_id == project_id),
+                        col(Agent.name).in_(message.recipients),
+                    )
+                )
+                agents_by_name = {
+                    agent.name: agent for agent in recipient_rows.scalars().all()
+                }
+                if set(agents_by_name) != set(message.recipients):
+                    raise HTTPException(
+                        status_code=422,
+                        detail={"code": "recipient_not_found"},
+                    )
+                recipients = tuple(
+                    [
+                        await _mail_ui_delivery_recipient(
+                            session=session,
+                            agent=agents_by_name[name],
+                        )
+                        for name in message.recipients
+                    ]
+                )
+                await session.commit()
+
+            delivery_request = MessageDeliveryRequest(
+                target_project=project_snapshot,
+                sender=sender,
+                actor=actor,
+                recipients=recipients,
+                idempotency_key=message.idempotency_key,
+                subject=message.subject,
+                body_md=_mail_ui_overseer_preamble(locale) + message.body_md,
+                purpose="message",
+                thread_id=message.thread_id,
+                importance="high",
+            )
+            try:
+                acceptance = await accept_message_delivery(delivery_request)
+                processing = await process_message_delivery(acceptance.delivery_id)
+            except MessageDeliveryServiceError as exc:
+                raise _mail_ui_delivery_exception(exc) from None
+            if processing.published_now:
+                await emit_published_delivery_notifications(processing.delivery_id)
+            return _mail_ui_delivery_response(acceptance, processing)
+
+        @fastapi_app.post(
+            "/mail/api/v1/projects/{project_id}/messages/{message_id}/replies",
+            response_model=MailUiDeliveryResponse,
+            responses=_MAIL_UI_DELIVERY_MUTATION_ERROR_RESPONSES,
+        )
+        @_mail_ui_typed_delivery_endpoint
+        async def mail_ui_reply_v1(
+            project_id: Annotated[int, FastApiPath(gt=0)],
+            message_id: Annotated[int, FastApiPath(gt=0)],
+            request: Request,
+            reply: MailUiReplyRequest,
+        ) -> MailUiDeliveryResponse:
+            """Reply through server-derived routing and immutable thread provenance."""
+            await ensure_schema()
+            async with get_immediate_session() as session:
+                source_project, sender, actor, locale = await _mail_ui_delivery_context(
+                    session=session,
+                    request=request,
+                    project_id=project_id,
+                    compose=False,
+                )
+                original = await session.get(Message, message_id)
+                if original is None or original.project_id != project_id:
+                    raise HTTPException(status_code=404, detail={"code": "message_not_found"})
+                recipient_agent = await session.get(Agent, original.sender_id)
+                if recipient_agent is None or recipient_agent.name == "HumanOverseer":
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"code": "reply_target_unavailable"},
+                    )
+                recipient = await _mail_ui_delivery_recipient(
+                    session=session,
+                    agent=recipient_agent,
+                )
+                target_project = recipient.agent.project
+                thread_id = original.thread_id or str(original.id)
+                original_subject = original.subject or ""
+                subject = (
+                    original_subject
+                    if original_subject.casefold().startswith("re:")
+                    else f"Re: {original_subject}"
+                )[:200]
+                reply_to_message_id = (
+                    message_id
+                    if target_project.project_id == source_project.project_id
+                    else None
+                )
+                await session.commit()
+
+            delivery_request = MessageDeliveryRequest(
+                target_project=target_project,
+                sender=sender,
+                actor=actor,
+                recipients=(recipient,),
+                idempotency_key=reply.idempotency_key,
+                subject=subject,
+                body_md=_mail_ui_overseer_preamble(locale) + reply.body_md,
+                purpose="reply",
+                thread_id=thread_id,
+                reply_to_message_id=reply_to_message_id,
+                importance="high",
+            )
+            try:
+                acceptance = await accept_message_delivery(delivery_request)
+                processing = await process_message_delivery(acceptance.delivery_id)
+            except MessageDeliveryServiceError as exc:
+                raise _mail_ui_delivery_exception(exc) from None
+            if processing.published_now:
+                await emit_published_delivery_notifications(processing.delivery_id)
+            return _mail_ui_delivery_response(acceptance, processing)
+
+        @fastapi_app.get(
+            "/mail/api/v1/deliveries/{delivery_id}",
+            response_model=MailUiDeliveryResponse,
+            responses=_MAIL_UI_DELIVERY_ERROR_RESPONSES,
+        )
+        @_mail_ui_typed_delivery_endpoint
+        async def mail_ui_delivery_status_v1(
+            delivery_id: str,
+            request: Request,
+        ) -> MailUiDeliveryResponse:
+            """Poll only a delivery owned by the current account lifetime."""
+            await ensure_schema()
+            await _mail_ui_require_owned_delivery(
+                request=request,
+                delivery_id=delivery_id,
+            )
+            try:
+                processing = await get_message_delivery_status(delivery_id)
+            except MessageDeliveryNotFoundError as exc:
+                raise _mail_ui_delivery_exception(exc) from None
+            return _mail_ui_delivery_status_response(processing)
+
+        @fastapi_app.post(
+            "/mail/api/v1/deliveries/{delivery_id}/retry",
+            response_model=MailUiDeliveryResponse,
+            responses=_MAIL_UI_DELIVERY_MUTATION_ERROR_RESPONSES,
+        )
+        @_mail_ui_typed_delivery_endpoint
+        async def mail_ui_delivery_retry_v1(
+            delivery_id: str,
+            request: Request,
+        ) -> MailUiDeliveryResponse:
+            """Retry one due delivery owned by the current account lifetime."""
+            await ensure_schema()
+            await _mail_ui_require_owned_delivery(
+                request=request,
+                delivery_id=delivery_id,
+            )
+            try:
+                processing = await process_message_delivery(delivery_id)
+            except MessageDeliveryServiceError as exc:
+                raise _mail_ui_delivery_exception(exc) from None
+            if processing.published_now:
+                await emit_published_delivery_notifications(processing.delivery_id)
+            return _mail_ui_delivery_status_response(processing)
 
         @fastapi_app.get(
             "/mail/api/v1/projects/{project_id}/threads/{thread_id}",
@@ -5548,13 +6399,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             )
 
         @fastapi_app.api_route(
-            "/mail/v2",
+            "/mail/",
             methods=["GET", "HEAD"],
             include_in_schema=False,
         )
         async def mail_react_slash_redirect(request: Request) -> Response:
-            """Canonicalize the React shell URL before the project-slug route."""
-            location = f"{_MAIL_REACT_BASE_PATH}/"
+            """Canonicalize the sole React shell URL."""
+            location = _MAIL_REACT_BASE_PATH
             if request.url.query:
                 location = f"{location}?{request.url.query}"
             return Response(
@@ -5563,16 +6414,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             )
 
         @fastapi_app.api_route(
-            "/mail/v2/",
-            methods=["GET", "HEAD"],
-            include_in_schema=False,
-        )
-        async def mail_react_index() -> FileResponse:
-            """Serve the authenticated React shell."""
-            return _mail_react_index_response()
-
-        @fastapi_app.api_route(
-            "/mail/v2/assets/{asset_path:path}",
+            "/mail/assets/{asset_path:path}",
             methods=["GET", "HEAD"],
             include_in_schema=False,
         )
@@ -5593,36 +6435,37 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 resolved_assets_root = (dist_root / "assets").resolve(strict=True)
             except (OSError, RuntimeError, ValueError):
                 resolved_assets_root = None
+            if asset_file is None or resolved_assets_root is None:
+                canonical_asset_path = None
+            else:
+                try:
+                    canonical_asset_path = asset_file.relative_to(
+                        resolved_assets_root
+                    ).as_posix()
+                except ValueError:
+                    canonical_asset_path = None
             if (
                 asset_file is None
                 or resolved_assets_root is None
                 or asset_file == resolved_assets_root
                 or not asset_file.is_relative_to(resolved_assets_root)
+                or canonical_asset_path != asset_path
             ):
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="React Mail UI asset not found.",
+                )
+            if canonical_asset_path == "legacy.js":
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail="React Mail UI asset not found.",
                 )
             asset_headers = (
                 _MAIL_REACT_LEGACY_ASSET_HEADERS
-                if asset_path in {"legacy.css", "legacy.js"}
+                if asset_path == "legacy.css"
                 else _MAIL_REACT_ASSET_HEADERS
             )
             return FileResponse(asset_file, headers=asset_headers)
-
-        @fastapi_app.api_route(
-            "/mail/v2/{spa_path:path}",
-            methods=["GET", "HEAD"],
-            include_in_schema=False,
-        )
-        async def mail_react_spa_fallback(spa_path: str) -> FileResponse:
-            """Return the shell for authenticated client-side deep links."""
-            if spa_path == "assets":
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="React Mail UI asset not found.",
-                )
-            return _mail_react_index_response()
 
         @fastapi_app.get("/mail/{project}", response_class=HTMLResponse)
         async def mail_project(
@@ -7245,6 +8088,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 message_id: int | None = None
                 valid_recipients: list[str] = []
                 project_slug = ""
+                project_generation = ""
                 project_human_key = ""
                 overseer_name = "HumanOverseer"
                 now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -7258,6 +8102,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     project_id = int(prow[0])
                     project_slug = prow[1]
                     project_human_key = prow[2]
+                    project_generation = str(prow[4])
 
                     # Revalidate the human and derive the effective locale after
                     # BEGIN IMMEDIATE. A revoked session or a changed preference
@@ -7328,13 +8173,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     recipient_params.update({f"name_{i}": name for i, name in enumerate(recipients)})
                     recipient_rows = await session.execute(
                         text(
-                            f"SELECT id, name, retired_at FROM agents "
+                            f"SELECT id, name, retired_at, agent_generation FROM agents "
                             f"WHERE project_id = :pid AND name IN ({placeholders})"
                         ),
                         recipient_params,
                     )
                     recipient_records = {
-                        str(row[1]): (int(row[0]), row[2])
+                        str(row[1]): (int(row[0]), row[2], str(row[3]))
                         for row in recipient_rows.fetchall()
                     }
                     missing_recipients = [name for name in recipients if name not in recipient_records]
@@ -7517,7 +8362,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     with contextlib.suppress(Exception):
                         hub.publish(
                             project_slug,
+                            project_generation,
                             _recipient,
+                            recipient_records[_recipient][2],
                             {
                                 "kind": "message",
                                 "project": project_slug,
@@ -7528,7 +8375,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 # The viewer too. Without this the one message type composed in
                 # the browser is the one the browser never sees arrive.
                 with contextlib.suppress(Exception):
-                    hub.publish_project(project_slug)
+                    hub.publish_project(project_slug, project_generation)
 
                 return JSONResponse({
                     "success": True,
@@ -8166,12 +9013,18 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         pass
 
     @fastapi_app.exception_handler(RequestValidationError)
-    async def _redact_mail_password_validation(
+    async def _redact_mail_ui_validation(
         request: Request,
         exc: RequestValidationError,
     ) -> Response:
-        """Keep invalid password values out of the typed API's 422 response."""
-        if request.url.path != _MAIL_PASSWORD_API_PATH:
+        """Keep secrets and authored mail content out of typed 422 responses."""
+        path = request.url.path
+        redact_input = (
+            path == _MAIL_PASSWORD_API_PATH
+            or bool(_MAIL_API_COMPOSE_SHAPE_RE.fullmatch(path))
+            or bool(_MAIL_API_REPLY_SHAPE_RE.fullmatch(path))
+        )
+        if not redact_input:
             return await request_validation_exception_handler(request, exc)
         detail = [
             {
@@ -8213,6 +9066,33 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 or path.startswith("/mail/api/v1/")
                 or not (path == "/mail" or path.startswith("/mail/"))
             }
+            security_scheme_name = "MailUiSession"
+            components = schema.setdefault("components", {})
+            if isinstance(components, dict):
+                security_schemes = components.setdefault("securitySchemes", {})
+                if isinstance(security_schemes, dict):
+                    security_schemes[security_scheme_name] = {
+                        "type": "apiKey",
+                        "in": "cookie",
+                        "name": settings.mail_ui.cookie_name,
+                    }
+            for path, path_item in schema["paths"].items():
+                if not path.startswith("/mail/api/v1/") or not isinstance(
+                    path_item, dict
+                ):
+                    continue
+                for method, operation in path_item.items():
+                    if method not in {
+                        "get",
+                        "post",
+                        "put",
+                        "patch",
+                        "delete",
+                        "options",
+                        "head",
+                    } or not isinstance(operation, dict):
+                        continue
+                    operation["security"] = [{security_scheme_name: []}]
         fastapi_app.openapi_schema = schema
         return schema
 
@@ -8220,40 +9100,6 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     # overriding the OpenAPI document); cast keeps the bound-method override
     # explicit for the type checker.
     cast(Any, fastapi_app).openapi = _custom_openapi
-
-    # Static web UI (SPA) routing support
-    def _resolve_web_root() -> Path | None:
-        candidates: list[Path] = []
-        with contextlib.suppress(Exception):
-            candidates.append(Path(__file__).resolve().parents[3] / "web")
-        candidates.append(Path.cwd() / "web")
-        for candidate in candidates:
-            try:
-                if candidate.exists() and (candidate / "index.html").exists():
-                    return candidate
-            except Exception:
-                continue
-        return None
-
-    web_root = _resolve_web_root()
-    if web_root is not None:
-        fastapi_app.mount("/", StaticFiles(directory=str(web_root), html=True), name="web")
-
-        def _is_api_path(path: str) -> bool:
-            if base_no_slash == "/":
-                return True
-            return path == base_no_slash or path.startswith(base_no_slash + "/")
-
-        def _should_spa_fallback(path: str) -> bool:
-            if _is_api_path(path):
-                return False
-            return not (path == "/mail" or path.startswith("/mail/"))
-
-        @fastapi_app.exception_handler(HTTPException)
-        async def spa_fallback(request: Request, exc: HTTPException):
-            if exc.status_code == status.HTTP_404_NOT_FOUND and _should_spa_fallback(request.url.path):
-                return FileResponse(web_root / "index.html")
-            return await http_exception_handler(request, exc)
 
     return fastapi_app
 

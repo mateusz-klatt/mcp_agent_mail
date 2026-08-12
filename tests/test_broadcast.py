@@ -97,11 +97,12 @@ async def test_broadcast_expands_to_all_agents(isolated_env):
                 "subject": "Hello everyone",
                 "body_md": "Broadcast test",
                 "broadcast": True,
+                "idempotency_key": "broadcast-all-agents",
             },
         )
         data = _get_data(result)
         assert "deliveries" in data, f"Expected deliveries in result: {data}"
-        payload = data["deliveries"][0]["payload"]
+        payload = data["deliveries"][0]["message"]
         # All 3 other agents should be recipients
         recipients = payload.get("to", [])
         assert len(recipients) == 3, f"Expected 3 recipients, got {len(recipients)}: {recipients}"
@@ -127,6 +128,7 @@ async def test_broadcast_with_explicit_recipients_errors(isolated_env):
                     "subject": "Should fail",
                     "body_md": "Error test",
                     "broadcast": True,
+                    "idempotency_key": "broadcast-explicit-recipient-error",
                 },
             )
 
@@ -148,10 +150,11 @@ async def test_broadcast_excludes_sender(isolated_env):
                 "subject": "Self-exclusion test",
                 "body_md": "Should not include sender",
                 "broadcast": True,
+                "idempotency_key": "broadcast-exclude-sender",
             },
         )
         data = _get_data(result)
-        payload = data["deliveries"][0]["payload"]
+        payload = data["deliveries"][0]["message"]
         assert sender not in payload["to"]
 
 
@@ -183,10 +186,11 @@ async def test_broadcast_respects_block_all_policy(isolated_env):
                 "subject": "Policy test",
                 "body_md": "Should skip blocked agent",
                 "broadcast": True,
+                "idempotency_key": "broadcast-skip-blocked",
             },
         )
         data = _get_data(result)
-        payload = data["deliveries"][0]["payload"]
+        payload = data["deliveries"][0]["message"]
         recipients = payload["to"]
         assert blocked_agent not in recipients, "block_all agent should be excluded"
         assert len(recipients) == 1, f"Expected 1 recipient (excluding sender + blocked), got {len(recipients)}"
@@ -210,6 +214,7 @@ async def test_broadcast_empty_project(isolated_env):
                 "subject": "Lonely broadcast",
                 "body_md": "No one to receive this",
                 "broadcast": True,
+                "idempotency_key": "broadcast-empty-project",
             },
         )
         # With no recipients, _deliver_message should not be called (no deliveries)
@@ -239,10 +244,11 @@ async def test_topic_stored_in_message(isolated_env):
                 "subject": "Architecture discussion",
                 "body_md": "Let's discuss",
                 "topic": "architecture",
+                "idempotency_key": "topic-store-architecture",
             },
         )
         data = _get_data(result)
-        payload = data["deliveries"][0]["payload"]
+        payload = data["deliveries"][0]["message"]
         assert payload.get("topic") == "architecture"
 
 
@@ -264,6 +270,7 @@ async def test_topic_filtering_inbox(isolated_env):
                 "subject": "Topic A",
                 "body_md": "Message about blockers",
                 "topic": "blockers",
+                "idempotency_key": "topic-filter-blockers",
             },
         )
         await client.call_tool(
@@ -275,6 +282,7 @@ async def test_topic_filtering_inbox(isolated_env):
                 "subject": "Topic B",
                 "body_md": "Message about releases",
                 "topic": "releases",
+                "idempotency_key": "topic-filter-releases",
             },
         )
         await client.call_tool(
@@ -285,6 +293,7 @@ async def test_topic_filtering_inbox(isolated_env):
                 "to": [receiver],
                 "subject": "No topic",
                 "body_md": "Regular message",
+                "idempotency_key": "topic-filter-none",
             },
         )
 
@@ -320,6 +329,7 @@ async def test_topic_filtering_empty(isolated_env):
                 "subject": "A message",
                 "body_md": "body",
                 "topic": "existing-topic",
+                "idempotency_key": "topic-filter-empty",
             },
         )
 
@@ -353,6 +363,7 @@ async def test_invalid_topic_rejected(isolated_env):
                     "subject": "Bad topic",
                     "body_md": "body",
                     "topic": "spaces not allowed",
+                    "idempotency_key": "topic-invalid-spaces",
                 },
             )
             # If no exception, check is_error flag or error in content
@@ -381,10 +392,11 @@ async def test_topic_allows_dotted_bead_ids(isolated_env):
                 "subject": "Child bead coordination",
                 "body_md": "Working on the child bead.",
                 "topic": "br-abc.1",
+                "idempotency_key": "topic-dotted-bead",
             },
         )
         data = _get_data(result)
-        payload = data["deliveries"][0]["payload"]
+        payload = data["deliveries"][0]["message"]
         assert payload.get("topic") == "br-abc.1"
 
 
@@ -409,6 +421,7 @@ async def test_topic_rejects_traversal_and_unsafe_shapes(isolated_env, bad_topic
                     "subject": "Bad topic",
                     "body_md": "body",
                     "topic": bad_topic,
+                    "idempotency_key": "topic-traversal-invalid",
                 },
             )
             assert getattr(result, "is_error", False) or "INVALID_TOPIC" in str(result), (
@@ -442,6 +455,7 @@ async def test_fetch_topic_tool(isolated_env):
                 "subject": "From agent 0",
                 "body_md": "First message",
                 "topic": "standup",
+                "idempotency_key": "fetch-topic-first-sender",
             },
         )
         await client.call_tool(
@@ -453,6 +467,7 @@ async def test_fetch_topic_tool(isolated_env):
                 "subject": "From agent 1",
                 "body_md": "Second message",
                 "topic": "standup",
+                "idempotency_key": "fetch-topic-second-sender",
             },
         )
         # Different topic (should not appear)
@@ -465,6 +480,7 @@ async def test_fetch_topic_tool(isolated_env):
                 "subject": "Different topic",
                 "body_md": "Not standup",
                 "topic": "other",
+                "idempotency_key": "fetch-topic-other",
             },
         )
 
@@ -500,10 +516,11 @@ async def test_broadcast_with_topic(isolated_env):
                 "body_md": "What are you working on?",
                 "broadcast": True,
                 "topic": "standup",
+                "idempotency_key": "broadcast-with-topic",
             },
         )
         data = _get_data(result)
-        payload = data["deliveries"][0]["payload"]
+        payload = data["deliveries"][0]["message"]
         assert payload.get("topic") == "standup"
         assert len(payload["to"]) == 2  # 3 agents minus sender
 

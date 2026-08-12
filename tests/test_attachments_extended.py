@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 from fastmcp import Client
+from fastmcp.exceptions import ToolError
 from PIL import Image
 
 from mcp_agent_mail import config as _config
@@ -32,7 +33,7 @@ def _allow_absolute_attachment_paths(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_attachments_keep_originals_and_manifest(isolated_env, monkeypatch):
+async def test_attachment_paths_fail_closed_without_artifacts(isolated_env, monkeypatch):
     monkeypatch.setenv("KEEP_ORIGINAL_IMAGES", "true")
     with contextlib.suppress(Exception):
         _config.clear_settings_cache()
@@ -48,29 +49,30 @@ async def test_attachments_keep_originals_and_manifest(isolated_env, monkeypatch
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
         )
-        res = await client.call_tool(
-            "send_message",
-            {
-                "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
-                "subject": "Orig",
-                "body_md": "see",
-                "attachment_paths": [str(img_path)],
-            },
-        )
-        assert res.data.get("deliveries")
-        # Check originals and manifest presence
+        with pytest.raises(ToolError, match="bounded canonical inline representation"):
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "Backend",
+                    "sender_name": "BlueLake",
+                    "to": ["BlueLake"],
+                    "subject": "Orig",
+                    "body_md": "see",
+                    "attachment_paths": [str(img_path)],
+                    "idempotency_key": "attachments-originals-disabled",
+                },
+            )
+        # Rejection happens before any attachment artifact is created.
         proj = storage_root / "projects" / "backend"
         manifests = list((proj / "attachments" / "_manifests").glob("*.json"))
-        assert manifests, "expected manifest json"
+        assert not manifests
         originals = list((proj / "attachments" / "originals").rglob("*.*"))
-        assert originals, "expected originals stored"
+        assert not originals
     img_path.unlink(missing_ok=True)
 
 
 @pytest.mark.asyncio
-async def test_attachment_inline_vs_file_threshold(isolated_env, monkeypatch):
+async def test_attachment_paths_fail_closed_independent_of_inline_threshold(isolated_env, monkeypatch):
     # Large threshold -> inline
     monkeypatch.setenv("INLINE_IMAGE_MAX_BYTES", "1048576")
     with contextlib.suppress(Exception):
@@ -87,37 +89,35 @@ async def test_attachment_inline_vs_file_threshold(isolated_env, monkeypatch):
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
         )
-        # Inline expected
-        r_inline = await client.call_tool(
-            "send_message",
-            {
-                "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
-                "subject": "Inline",
-                "body_md": "body",
-                "attachment_paths": [str(img_path)],
-            },
-        )
-        atts1 = (r_inline.data.get("deliveries") or [{}])[0].get("payload", {}).get("attachments", [])
-        assert any(a.get("type") == "inline" for a in atts1)
+        with pytest.raises(ToolError, match="bounded canonical inline representation"):
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "Backend",
+                    "sender_name": "BlueLake",
+                    "to": ["BlueLake"],
+                    "subject": "Inline",
+                    "body_md": "body",
+                    "attachment_paths": [str(img_path)],
+                    "idempotency_key": "attachments-large-inline-threshold",
+                },
+            )
 
         # Small threshold -> file
         monkeypatch.setenv("INLINE_IMAGE_MAX_BYTES", "1")
         with contextlib.suppress(Exception):
             _config.clear_settings_cache()
-        r_file = await client.call_tool(
-            "send_message",
-            {
-                "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
-                "subject": "File",
-                "body_md": "body",
-                "attachment_paths": [str(img_path)],
-            },
-        )
-        atts2 = (r_file.data.get("deliveries") or [{}])[0].get("payload", {}).get("attachments", [])
-        assert any(a.get("type") == "file" for a in atts2)
+        with pytest.raises(ToolError, match="bounded canonical inline representation"):
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "Backend",
+                    "sender_name": "BlueLake",
+                    "to": ["BlueLake"],
+                    "subject": "File",
+                    "body_md": "body",
+                    "attachment_paths": [str(img_path)],
+                    "idempotency_key": "attachments-small-inline-threshold",
+                },
+            )
     img_path.unlink(missing_ok=True)
-

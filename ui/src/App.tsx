@@ -8,6 +8,11 @@ import {
   useState,
 } from "react";
 import { useTranslation } from "react-i18next";
+import ReactMarkdown, {
+  type Components as MarkdownComponents,
+} from "react-markdown";
+import remarkBreaks from "remark-breaks";
+import remarkGfm from "remark-gfm";
 
 import i18n, { supportedLocales, type SupportedLocale } from "./i18n";
 import {
@@ -24,13 +29,18 @@ import {
   type MailUiProfile,
 } from "./account";
 import {
+  composeMessage,
   loadInbox,
   loadMessage,
   loadProjects,
   mailEventsEndpoint,
   MailHttpError,
   mailRouteHash,
+  markdownUrlTransform,
   parseMailRoute,
+  replyToMessage,
+  retryDelivery,
+  type DeliveryResult,
   type InboxMessage,
   type MailProject,
   type MailRoute,
@@ -49,19 +59,29 @@ import "./app.css";
 
 const mailNavigation = ["projects", "inbox"] as const;
 
-type ShellRoute = MailRoute | { view: "account" } | { view: "admin" };
-type NavigationItem = "projects" | "inbox" | "account" | "admin";
+const markdownRemarkPlugins = [remarkGfm, remarkBreaks];
+
+type ShellRoute =
+  | MailRoute
+  | { view: "compose" }
+  | { view: "account" }
+  | { view: "admin" };
+type NavigationItem = "projects" | "inbox" | "compose" | "account" | "admin";
 
 function parseShellRoute(hash: string): ShellRoute {
   const normalized = hash.replace(/^#/, "");
-  if (normalized === "account" || normalized === "admin") {
+  if (
+    normalized === "compose" ||
+    normalized === "account" ||
+    normalized === "admin"
+  ) {
     return { view: normalized };
   }
   return parseMailRoute(hash);
 }
 
 function shellRouteHash(route: ShellRoute): string {
-  return route.view === "account" || route.view === "admin"
+  return route.view === "compose" || route.view === "account" || route.view === "admin"
     ? `#${route.view}`
     : mailRouteHash(route);
 }
@@ -101,6 +121,13 @@ type EventSourceLike = Pick<
   "close" | "onerror" | "onmessage" | "onopen"
 >;
 
+type DeliveryFormStatus = "idle" | "sending" | "conflict" | "error";
+
+interface DeliveryAttempt {
+  fingerprint: string;
+  key: string;
+}
+
 interface AppProps {
   onUnauthorized?: (loginUrl: string) => void;
   navigateTo?: (url: string) => void;
@@ -109,6 +136,22 @@ interface AppProps {
 
 const defaultNavigate = window.location.assign.bind(window.location);
 const defaultCreateEventSource = (url: string) => new EventSource(url);
+
+function newIdempotencyKey(): string {
+  return `human-ui:${window.crypto.randomUUID()}`;
+}
+
+function idempotencyKeyFor(
+  attemptRef: { current: DeliveryAttempt | null },
+  fingerprint: string,
+): string {
+  if (attemptRef.current?.fingerprint === fingerprint) {
+    return attemptRef.current.key;
+  }
+  const key = newIdempotencyKey();
+  attemptRef.current = { fingerprint, key };
+  return key;
+}
 
 function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
@@ -131,6 +174,80 @@ export function App({
   createEventSource = defaultCreateEventSource,
 }: AppProps = {}) {
   const { t } = useTranslation();
+  const markdownComponents = useMemo<MarkdownComponents>(
+    () => ({
+      h1({ children }) {
+        return <h2>{children}</h2>;
+      },
+      h2({ children }) {
+        return <h3>{children}</h3>;
+      },
+      h3({ children }) {
+        return <h4>{children}</h4>;
+      },
+      h4({ children }) {
+        return <h5>{children}</h5>;
+      },
+      h5({ children }) {
+        return <h6>{children}</h6>;
+      },
+      h6({ children }) {
+        return <h6>{children}</h6>;
+      },
+      a({ href, children, title }) {
+        if (href === undefined) {
+          return <span className="markdown-rejected-link">{children}</span>;
+        }
+        return <a href={href} title={title}>{children}</a>;
+      },
+      img({ src, alt, title }) {
+        if (src === undefined) {
+          return <span className="markdown-image-alt">{alt}</span>;
+        }
+        return (
+          <img
+            src={src}
+            alt={alt}
+            title={title}
+            loading="lazy"
+            decoding="async"
+          />
+        );
+      },
+      input({ checked, disabled }) {
+        return (
+          <input
+            type="checkbox"
+            checked={checked}
+            disabled={disabled}
+            aria-label={t(
+              checked ? "markdown.completedTask" : "markdown.incompleteTask",
+            )}
+          />
+        );
+      },
+      pre({ children }) {
+        return (
+          <pre tabIndex={0} aria-label={t("markdown.codeBlock")}>
+            {children}
+          </pre>
+        );
+      },
+      table({ children }) {
+        return (
+          <div
+            className="markdown-table-scroll"
+            role="region"
+            aria-label={t("markdown.table")}
+            tabIndex={0}
+          >
+            <table>{children}</table>
+          </div>
+        );
+      },
+    }),
+    [t],
+  );
   const [locale, setLocale] = useState<SupportedLocale>("en");
   const [preferenceStatus, setPreferenceStatus] =
     useState<PreferenceStatus>("loading");
@@ -169,14 +286,32 @@ export function App({
     useState<PaginationStatus>("idle");
   const [detail, setDetail] = useState<MessageDetail | null>(null);
   const [detailStatus, setDetailStatus] = useState<DetailStatus>("idle");
+  const [composeProjectId, setComposeProjectId] = useState("");
+  const [composeRecipients, setComposeRecipients] = useState("");
+  const [composeSubject, setComposeSubject] = useState("");
+  const [composeBody, setComposeBody] = useState("");
+  const [composeThreadId, setComposeThreadId] = useState("");
+  const [composeStatus, setComposeStatus] =
+    useState<DeliveryFormStatus>("idle");
+  const [composeDelivery, setComposeDelivery] =
+    useState<DeliveryResult | null>(null);
+  const [replyBody, setReplyBody] = useState("");
+  const [replyStatus, setReplyStatus] =
+    useState<DeliveryFormStatus>("idle");
+  const [replyDelivery, setReplyDelivery] =
+    useState<DeliveryResult | null>(null);
   const [streamStatus, setStreamStatus] =
     useState<StreamStatus>("connecting");
   const [refreshVersion, setRefreshVersion] = useState(0);
   const redirectedRef = useRef(false);
   const paginationControllerRef = useRef<AbortController | null>(null);
   const detailRequestGenerationRef = useRef(0);
-  const mailRouteActive = mailNavigation.some((item) => route.view === item) ||
-    route.view === "message";
+  const composeAttemptRef = useRef<DeliveryAttempt | null>(null);
+  const replyAttemptRef = useRef<DeliveryAttempt | null>(null);
+  const mailRouteActive =
+    mailNavigation.some((item) => route.view === item) ||
+    route.view === "message" ||
+    route.view === "compose";
   const routeProjectId =
     route.view === "inbox" || route.view === "message" ? route.projectId : null;
   const routeMessageId = route.view === "message" ? route.messageId : null;
@@ -371,6 +506,13 @@ export function App({
     },
     [],
   );
+
+  useEffect(() => {
+    setReplyBody("");
+    setReplyStatus("idle");
+    setReplyDelivery(null);
+    replyAttemptRef.current = null;
+  }, [routeMessageId, routeProjectId]);
 
   useEffect(() => {
     void loadPreferences()
@@ -659,6 +801,126 @@ export function App({
     }
   };
 
+  const deliveryFailureStatus = (error: unknown): DeliveryFormStatus => {
+    if (error instanceof MailHttpError && error.status === 401) {
+      redirectUnauthorized();
+      return "error";
+    }
+    return error instanceof MailHttpError && error.status === 409
+      ? "conflict"
+      : "error";
+  };
+
+  const handleComposeSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const projectId = Number(composeProjectId);
+    const recipients = [
+      ...new Set(
+        composeRecipients
+          .split(",")
+          .map((name) => name.trim())
+          .filter((name) => name.length > 0),
+      ),
+    ];
+    if (!Number.isSafeInteger(projectId) || projectId < 1 || recipients.length === 0) {
+      setComposeStatus("error");
+      return;
+    }
+    const canonicalInput = {
+      projectId,
+      recipients,
+      subject: composeSubject,
+      body_md: composeBody,
+      thread_id: composeThreadId.trim() === "" ? null : composeThreadId.trim(),
+    };
+    const idempotencyKey = idempotencyKeyFor(
+      composeAttemptRef,
+      JSON.stringify(canonicalInput),
+    );
+    setComposeStatus("sending");
+    try {
+      const delivery = await composeMessage(projectId, {
+        idempotency_key: idempotencyKey,
+        recipients,
+        subject: composeSubject,
+        body_md: composeBody,
+        thread_id: canonicalInput.thread_id,
+      });
+      setComposeDelivery(delivery);
+      setComposeStatus("idle");
+      if (delivery.status === "published") {
+        setComposeRecipients("");
+        setComposeSubject("");
+        setComposeBody("");
+        setComposeThreadId("");
+        composeAttemptRef.current = null;
+        setRefreshVersion((version) => version + 1);
+      }
+    } catch (error) {
+      setComposeStatus(deliveryFailureStatus(error));
+    }
+  };
+
+  const handleReplySubmit = async (
+    event: FormEvent<HTMLFormElement>,
+    message: MessageDetail,
+  ) => {
+    event.preventDefault();
+    const canonicalInput = {
+      projectId: message.project_id,
+      messageId: message.id,
+      body_md: replyBody,
+    };
+    const idempotencyKey = idempotencyKeyFor(
+      replyAttemptRef,
+      JSON.stringify(canonicalInput),
+    );
+    setReplyStatus("sending");
+    try {
+      const delivery = await replyToMessage(message.project_id, message.id, {
+        idempotency_key: idempotencyKey,
+        body_md: replyBody,
+      });
+      setReplyDelivery(delivery);
+      setReplyStatus("idle");
+      if (delivery.status === "published") {
+        setReplyBody("");
+        replyAttemptRef.current = null;
+        setRefreshVersion((version) => version + 1);
+      }
+    } catch (error) {
+      setReplyStatus(deliveryFailureStatus(error));
+    }
+  };
+
+  const refreshComposeDelivery = async (deliveryId: string) => {
+    setComposeStatus("sending");
+    try {
+      const delivery = await retryDelivery(deliveryId);
+      setComposeDelivery(delivery);
+      setComposeStatus("idle");
+      if (delivery.status === "published") {
+        setRefreshVersion((version) => version + 1);
+      }
+    } catch (error) {
+      setComposeStatus(deliveryFailureStatus(error));
+    }
+  };
+
+  const refreshReplyDelivery = async (deliveryId: string) => {
+    setReplyStatus("sending");
+    try {
+      const delivery = await retryDelivery(deliveryId);
+      setReplyDelivery(delivery);
+      setReplyStatus("idle");
+      if (delivery.status === "published") {
+        setRefreshVersion((version) => version + 1);
+      }
+    } catch (error) {
+      setReplyStatus(deliveryFailureStatus(error));
+    }
+  };
+
   const projectNames = useMemo(
     () => new Map(projects.map((project) => [project.id, project.human_key])),
     [projects],
@@ -666,6 +928,7 @@ export function App({
   const navigationItems = useMemo<NavigationItem[]>(
     () => [
       ...mailNavigation,
+      ...(profile?.global_role === "admin" ? (["compose"] as const) : []),
       "account",
       ...(profile?.global_role === "admin" ? (["admin"] as const) : []),
     ],
@@ -723,6 +986,146 @@ export function App({
           ? t("message.unknownSize")
           : `${attachment.size_bytes.toLocaleString(locale)} B`,
     });
+
+  const deliveryFeedback = (
+    formStatus: DeliveryFormStatus,
+    delivery: DeliveryResult | null,
+    refresh: (deliveryId: string) => Promise<void>,
+  ) => {
+    if (formStatus === "sending") {
+      return <p className="form-status" role="status">{t("delivery.sending")}</p>;
+    }
+    if (formStatus === "conflict") {
+      return <p className="form-status state-error" role="alert">{t("delivery.conflict")}</p>;
+    }
+    if (formStatus === "error") {
+      return <p className="form-status state-error" role="alert">{t("delivery.error")}</p>;
+    }
+    if (delivery === null) {
+      return null;
+    }
+    const terminal = delivery.status === "published" || delivery.status === "quarantined";
+    return (
+      <div
+        className={`delivery-result delivery-${delivery.status}`}
+        role={delivery.status === "quarantined" ? "alert" : "status"}
+        aria-live="polite"
+      >
+        <strong>{t(`delivery.status.${delivery.status}`)}</strong>
+        <span>{t("delivery.reference", { id: delivery.id })}</span>
+        {!terminal ? (
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={() => void refresh(delivery.id)}
+          >
+            {t("delivery.checkStatus")}
+          </button>
+        ) : null}
+      </div>
+    );
+  };
+
+  const renderCompose = () => {
+    const profileIsAdmin = profile?.global_role === "admin";
+    const activeProjects = projects.filter((project) => project.archived_at === null);
+    return (
+      <section aria-labelledby="compose-heading">
+        <div className="page-heading">
+          <div>
+            <p className="eyebrow">{t("compose.eyebrow")}</p>
+            <h1 id="compose-heading">{t("compose.title")}</h1>
+            <p>{t("compose.hint")}</p>
+          </div>
+        </div>
+        {profileStatus === "loading" || projectsStatus === "loading" ? (
+          <p className="state-panel" role="status">{t("compose.loading")}</p>
+        ) : null}
+        {profileStatus === "ready" && !profileIsAdmin ? (
+          <p className="state-panel state-error" role="alert">{t("compose.forbidden")}</p>
+        ) : null}
+        {profileStatus === "error" || projectsStatus === "error" ? (
+          <p className="state-panel state-error" role="alert">{t("compose.loadError")}</p>
+        ) : null}
+        {profileStatus === "ready" && profileIsAdmin && projectsStatus === "ready" ? (
+          activeProjects.length === 0 ? (
+            <p className="state-panel">{t("compose.noProjects")}</p>
+          ) : (
+            <form className="delivery-form settings-card" onSubmit={handleComposeSubmit}>
+              <label htmlFor="compose-project">{t("compose.project")}</label>
+              <select
+                id="compose-project"
+                name="compose-project"
+                value={composeProjectId}
+                onChange={(event) => setComposeProjectId(event.target.value)}
+                required
+                disabled={composeStatus === "sending"}
+              >
+                <option value="">{t("compose.chooseProject")}</option>
+                {activeProjects.map((project) => (
+                  <option key={project.id} value={project.id}>{project.human_key}</option>
+                ))}
+              </select>
+              <label htmlFor="compose-recipients">{t("compose.recipients")}</label>
+              <input
+                id="compose-recipients"
+                name="compose-recipients"
+                value={composeRecipients}
+                onChange={(event) => setComposeRecipients(event.target.value)}
+                maxLength={12_899}
+                required
+                disabled={composeStatus === "sending"}
+                aria-describedby="compose-recipients-hint"
+              />
+              <small id="compose-recipients-hint">{t("compose.recipientsHint")}</small>
+              <label htmlFor="compose-subject">{t("compose.subject")}</label>
+              <input
+                id="compose-subject"
+                name="compose-subject"
+                value={composeSubject}
+                onChange={(event) => setComposeSubject(event.target.value)}
+                maxLength={200}
+                required
+                disabled={composeStatus === "sending"}
+              />
+              <label htmlFor="compose-thread">{t("compose.thread")}</label>
+              <input
+                id="compose-thread"
+                name="compose-thread"
+                value={composeThreadId}
+                onChange={(event) => setComposeThreadId(event.target.value)}
+                maxLength={128}
+                disabled={composeStatus === "sending"}
+              />
+              <label htmlFor="compose-body">{t("compose.body")}</label>
+              <textarea
+                id="compose-body"
+                name="compose-body"
+                value={composeBody}
+                onChange={(event) => setComposeBody(event.target.value)}
+                maxLength={50_000}
+                rows={12}
+                required
+                disabled={composeStatus === "sending"}
+              />
+              <button
+                type="submit"
+                className="primary-button"
+                disabled={composeStatus === "sending"}
+              >
+                {t("compose.send")}
+              </button>
+              {deliveryFeedback(
+                composeStatus,
+                composeDelivery,
+                refreshComposeDelivery,
+              )}
+            </form>
+          )
+        ) : null}
+      </section>
+    );
+  };
 
   const renderProjects = () => (
     <section aria-labelledby="projects-heading">
@@ -910,7 +1313,50 @@ export function App({
               <div><dt>{t("message.to")}</dt><dd>{currentDetail.to.length > 0 ? currentDetail.to.join(", ") : t("message.emptyRecipients")}</dd></div>
               <div><dt>{t("message.cc")}</dt><dd>{currentDetail.cc.length > 0 ? currentDetail.cc.join(", ") : t("message.emptyRecipients")}</dd></div>
             </dl>
-            <pre className="message-body">{currentDetail.body_md}</pre>
+            <div className="message-body">
+              <ReactMarkdown
+                remarkPlugins={markdownRemarkPlugins}
+                skipHtml
+                urlTransform={markdownUrlTransform}
+                components={markdownComponents}
+              >
+                {currentDetail.body_md}
+              </ReactMarkdown>
+            </div>
+            {currentDetail.can_reply ? (
+              <section className="reply-panel" aria-labelledby="reply-heading">
+                <h2 id="reply-heading">{t("reply.title")}</h2>
+                <p>{t("reply.hint")}</p>
+                <form
+                  className="delivery-form"
+                  onSubmit={(event) => void handleReplySubmit(event, currentDetail)}
+                >
+                  <label htmlFor="reply-body">{t("reply.body")}</label>
+                  <textarea
+                    id="reply-body"
+                    name="reply-body"
+                    value={replyBody}
+                    onChange={(event) => setReplyBody(event.target.value)}
+                    maxLength={50_000}
+                    rows={8}
+                    required
+                    disabled={replyStatus === "sending"}
+                  />
+                  <button
+                    type="submit"
+                    className="primary-button"
+                    disabled={replyStatus === "sending"}
+                  >
+                    {t("reply.send")}
+                  </button>
+                  {deliveryFeedback(
+                    replyStatus,
+                    replyDelivery,
+                    refreshReplyDelivery,
+                  )}
+                </form>
+              </section>
+            ) : null}
             {currentDetail.attachments.length > 0 ? (
               <section className="attachment-panel" aria-labelledby="attachments-heading">
                 <h2 id="attachments-heading">{t("message.attachments")}</h2>
@@ -1306,7 +1752,7 @@ export function App({
 
         <div className="topbar-controls">
           <span className="read-only-badge">
-            {t("mailboxReadOnly")}
+            {t("mailboxSecureDelivery")}
           </span>
           <div className="locale-control">
             <label>
@@ -1374,6 +1820,7 @@ export function App({
         <main id="main-content" className="content">
           {route.view === "projects" ? renderProjects() : null}
           {route.view === "inbox" ? renderInbox() : null}
+          {route.view === "compose" ? renderCompose() : null}
           {route.view === "message"
             ? renderMessage(route.projectId, route.messageId)
             : null}

@@ -24,6 +24,7 @@ async def test_bench_fetch_inbox(bench_factory):
                     "to": [harness.agent_name],
                     "subject": f"Inbox seed {i}",
                     "body_md": make_message_body(seed, i, message_size),
+                    "idempotency_key": f"benchmark-fetch-inbox-{i}",
                 },
             )
 

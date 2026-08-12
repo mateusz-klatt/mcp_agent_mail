@@ -140,9 +140,8 @@ async def test_http_readiness_endpoint(isolated_env):
 
 
 @pytest.mark.asyncio
-async def test_http_lock_status_endpoint(isolated_env, open_mail_ui_gate):
-    # The only case in this file that drives a /mail route, so the gate is stood
-    # aside here and nowhere else in the module.
+async def test_retired_http_lock_status_endpoint_is_not_exposed(isolated_env, open_mail_ui_gate):
+    # The legacy lock-inspection API is no longer part of the single React UI.
     server = build_mcp_server()
     settings = _config.get_settings()
     app = build_http_app(settings, server)
@@ -157,10 +156,5 @@ async def test_http_lock_status_endpoint(isolated_env, open_mail_ui_gate):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.get("/mail/api/locks")
-        assert resp.status_code == 200
-        payload = resp.json()
-        locks = payload.get("locks", [])
-        assert any(item.get("path") == str(lock_path) for item in locks)
-        entry = next(item for item in locks if item.get("path") == str(lock_path))
-        assert entry.get("metadata", {}).get("pid") == 999_999
-        assert entry.get("stale_suspected") is True
+        assert resp.status_code == 404
+        assert resp.json() == {"detail": "Not Found"}

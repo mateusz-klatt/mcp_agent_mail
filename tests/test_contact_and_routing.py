@@ -41,16 +41,17 @@ async def test_contact_auto_allow_same_thread(isolated_env):
                 "subject": "ThreadSeed",
                 "body_md": "seed",
                 "ack_required": True,
+                "idempotency_key": "contact-thread-seed",
             },
         )
         deliveries = first.data.get("deliveries") or []
-        thread_id = deliveries[0]["payload"].get("thread_id") or deliveries[0]["payload"].get("id")
+        thread_id = deliveries[0]["message"].get("thread_id") or deliveries[0]["message"].get("id")
         assert thread_id
 
         # Beta replies (becomes a sender on the same thread)
         # Use reply_message which preserves thread id
-        # Find the seed message id from storage by reading the response payload id
-        seed_id = deliveries[0]["payload"]["id"]
+        # Find the seed message id from the published response message.
+        seed_id = deliveries[0]["message"]["id"]
         rep = await client.call_tool(
             "reply_message",
             {
@@ -58,6 +59,7 @@ async def test_contact_auto_allow_same_thread(isolated_env):
                 "message_id": seed_id,
                 "sender_name": "BlueLake",
                 "body_md": "ack",
+                "idempotency_key": "contact-thread-reply",
             },
         )
         assert rep.data["deliveries"]
@@ -73,9 +75,10 @@ async def test_contact_auto_allow_same_thread(isolated_env):
                 "body_md": "details",
                 "thread_id": str(thread_id),
                 "ack_required": False,
+                "idempotency_key": "contact-thread-followup",
             },
         )
-        assert (third.data.get("deliveries") or [{}])[0].get("payload", {}).get("subject") == "Followup"
+        assert (third.data.get("deliveries") or [{}])[0].get("message", {}).get("subject") == "Followup"
         assert get_db_health_status()["pool"]["checked_out"] == 0
 
 
@@ -138,6 +141,7 @@ async def test_external_cross_project_routing(isolated_env):
                 "to": ["project:ops#Receiver"],
                 "subject": "Cross",
                 "body_md": "hello",
+                "idempotency_key": "routing-explicit-cross-project",
             },
         )
         deliveries = res.data.get("deliveries") or []
@@ -146,7 +150,7 @@ async def test_external_cross_project_routing(isolated_env):
 
         # Verify archive in Ops contains message file
         storage_root = Path(get_settings().storage.root).expanduser().resolve()
-        ops_dir = storage_root / "projects" / "ops" / "messages"
+        ops_dir = storage_root / "projects" / "ops" / "message_deliveries"
         assert any(ops_dir.rglob("*.md"))
 
 
@@ -227,6 +231,7 @@ async def test_bare_name_prefers_cross_project_over_local_shadow(isolated_env):
                 "to": ["Adama"],  # bare name — used to silently hit local shadow
                 "subject": "BareName",
                 "body_md": "should reach Servitor, not the local shadow",
+                "idempotency_key": "routing-bare-name-cross-project",
             },
         )
         deliveries = res.data.get("deliveries") or []
@@ -242,7 +247,7 @@ async def test_bare_name_prefers_cross_project_over_local_shadow(isolated_env):
         )
 
         storage_root = Path(get_settings().storage.root).expanduser().resolve()
-        servitor_dir = storage_root / "projects" / "servitor" / "messages"
+        servitor_dir = storage_root / "projects" / "servitor" / "message_deliveries"
         assert any(servitor_dir.rglob("*.md")), "no message archived in Servitor"
 
 
@@ -288,6 +293,7 @@ async def test_bare_name_prefers_local_when_no_cross_project_link(isolated_env):
                 "to": ["Recipient"],
                 "subject": "Local",
                 "body_md": "stays local",
+                "idempotency_key": "routing-bare-name-local",
             },
         )
         deliveries = res.data.get("deliveries") or []

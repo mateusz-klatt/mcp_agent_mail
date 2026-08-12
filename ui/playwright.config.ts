@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 const host = "127.0.0.1";
 const port = 4173;
-const baseURL = `http://${host}:${port}/mail/v2/`;
+const baseURL = `http://${host}:${port}/mail/`;
 
 export default defineConfig({
   testDir: "./e2e",

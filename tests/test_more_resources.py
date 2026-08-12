@@ -18,10 +18,17 @@ async def test_core_resources(isolated_env):
         )
         msg = await client.call_tool(
             "send_message",
-            {"project_key": "Backend", "sender_name": "BlueLake", "to": ["BlueLake"], "subject": "R1", "body_md": "b"},
+            {
+                "project_key": "Backend",
+                "sender_name": "BlueLake",
+                "to": ["BlueLake"],
+                "subject": "R1",
+                "body_md": "b",
+                "idempotency_key": "more-resources-r1",
+            },
         )
-        payload = (msg.data.get("deliveries") or [{}])[0].get("payload", {})
-        mid = payload.get("id") or 1
+        message = (msg.data.get("deliveries") or [{}])[0].get("message", {})
+        mid = message.get("id") or 1
         # config
         cfg = await client.read_resource("resource://config/environment")
         assert cfg

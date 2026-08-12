@@ -18,10 +18,16 @@ async def test_mailbox_with_commits_includes_commit_meta(isolated_env):
         )
         await client.call_tool(
             "send_message",
-            {"project_key": "Backend", "sender_name": "BlueLake", "to": ["BlueLake"], "subject": "C1", "body_md": "b"},
+            {
+                "project_key": "Backend",
+                "sender_name": "BlueLake",
+                "to": ["BlueLake"],
+                "subject": "C1",
+                "body_md": "b",
+                "idempotency_key": "mailbox-commits-seed",
+            },
         )
         blocks = await client.read_resource("resource://mailbox-with-commits/BlueLake?project=Backend&limit=5")
         assert blocks and blocks[0].text
         # Text is JSON; ensure it mentions commit key when present
         assert "messages" in blocks[0].text
-

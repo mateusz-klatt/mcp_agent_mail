@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from git.index.base import IndexFile
+from git.cmd import Git
 from sqlalchemy import select
 from sqlalchemy.sql import ColumnElement
 from typer.testing import CliRunner
@@ -21,7 +21,7 @@ from mcp_agent_mail import cli as cli_module
 from mcp_agent_mail.cli import app
 from mcp_agent_mail.config import clear_settings_cache, get_settings
 from mcp_agent_mail.db import ensure_schema, get_session
-from mcp_agent_mail.models import Agent, FileReservation, Project
+from mcp_agent_mail.models import Agent, FileReservation, MessageDelivery, Project
 from mcp_agent_mail.storage import (
     _commit as _archive_commit,
     commit_archive_subtree_deletion,
@@ -536,7 +536,7 @@ def test_projects_adopt_move_commit_holds_both_archive_locks(isolated_env, tmp_p
     active_locks: set[str] = set()
     observed_lock_sets: list[set[str]] = []
     original_archive_write_lock = cli_module.archive_write_lock
-    original_index_commit = IndexFile.commit
+    original_git_call_process = Git._call_process
 
     @asynccontextmanager
     async def tracking_archive_write_lock(archive, *args, **kwargs):
@@ -547,18 +547,112 @@ def test_projects_adopt_move_commit_holds_both_archive_locks(isolated_env, tmp_p
             finally:
                 active_locks.remove(archive.slug)
 
-    def tracking_index_commit(self, message, *args, **kwargs):
-        if message == "adopt: move legacy into canonical":
+    def tracking_git_call_process(self, method, *args, **kwargs):
+        if method == "commit" and "adopt: move legacy into canonical" in args:
             observed_lock_sets.append(set(active_locks))
-        return original_index_commit(self, message, *args, **kwargs)
+        return original_git_call_process(self, method, *args, **kwargs)
 
     monkeypatch.setattr("mcp_agent_mail.cli.archive_write_lock", tracking_archive_write_lock)
-    monkeypatch.setattr(IndexFile, "commit", tracking_index_commit)
+    monkeypatch.setattr(Git, "_call_process", tracking_git_call_process)
 
     result = runner.invoke(app, ["projects", "adopt", "legacy", "canonical", "--apply"])
 
     assert result.exit_code == 0
     assert observed_lock_sets == [{"legacy", "canonical"}]
+
+
+def test_projects_adopt_refuses_immutable_delivery_history_before_mutation(
+    isolated_env,
+    tmp_path,
+) -> None:
+    runner = CliRunner()
+    source_worktree, target_worktree = _init_projects_adopt_repo(tmp_path)
+    source_root, target_root, _, _ = _seed_projects_adopt_state(
+        source_worktree,
+        target_worktree,
+    )
+
+    async def _seed_delivery() -> tuple[str, int]:
+        async with get_session() as session:
+            source_project = (
+                await session.execute(
+                    select(Project).where(
+                        cast(ColumnElement[bool], Project.slug == "legacy")
+                    )
+                )
+            ).scalars().one()
+            sender = (
+                await session.execute(
+                    select(Agent).where(
+                        cast(
+                            ColumnElement[bool],
+                            Agent.project_id == source_project.id,
+                        ),
+                        cast(ColumnElement[bool], Agent.name == "BlueLake"),
+                    )
+                )
+            ).scalars().one()
+            assert source_project.id is not None
+            assert sender.id is not None
+            document = "immutable delivery\n"
+            delivery = MessageDelivery(
+                project_id=source_project.id,
+                project_slug_snapshot=source_project.slug,
+                project_generation_snapshot=source_project.project_generation,
+                sender_project_id_snapshot=source_project.id,
+                sender_project_slug_snapshot=source_project.slug,
+                sender_project_generation_snapshot=source_project.project_generation,
+                sender_id=sender.id,
+                sender_name_snapshot=sender.name,
+                sender_generation_snapshot=sender.agent_generation,
+                actor_kind="system",
+                actor_id=0,
+                actor_name_snapshot="system",
+                idempotency_key="adopt-refusal",
+                request_sha256="1" * 64,
+                subject="Immutable",
+                body_md="Immutable",
+                archive_document=document,
+                document_sha256=hashlib.sha256(document.encode()).hexdigest(),
+            )
+            session.add(delivery)
+            await session.commit()
+            return delivery.id, source_project.id
+
+    delivery_id, source_project_id = asyncio.run(_seed_delivery())
+    pending_path = source_root / "message_deliveries" / ".pending" / delivery_id
+    pending_path.parent.mkdir(parents=True, exist_ok=True)
+    pending_path.write_text("attempt\n", encoding="utf-8")
+
+    result = runner.invoke(app, ["projects", "adopt", "legacy", "canonical", "--apply"])
+
+    assert result.exit_code != 0
+    assert "immutable message delivery history" in result.output
+    assert (source_root / "messages" / "legacy-note.md").read_text(
+        encoding="utf-8"
+    ) == "legacy artifact\n"
+    assert not (target_root / "messages" / "legacy-note.md").exists()
+    assert pending_path.read_text(encoding="utf-8") == "attempt\n"
+
+    async def _verify_unchanged() -> tuple[int, int]:
+        async with get_session() as session:
+            delivery_count = (
+                await session.execute(
+                    select(MessageDelivery).where(
+                        cast(ColumnElement[bool], MessageDelivery.id == delivery_id)
+                    )
+                )
+            ).scalars().all()
+            sender = (
+                await session.execute(
+                    select(Agent).where(
+                        cast(ColumnElement[bool], Agent.name == "BlueLake")
+                    )
+                )
+            ).scalars().one()
+            return len(delivery_count), sender.project_id
+
+    assert asyncio.run(_verify_unchanged()) == (1, source_project_id)
 
 
 def test_cli_serve_http_uses_settings(isolated_env, monkeypatch):
@@ -961,6 +1055,101 @@ def test_cli_hard_delete_project_commits_archive_deletion(isolated_env):
     assert not project_root.exists()
     assert _git_output(repo_root, "ls-files", "--", project_relpath) == ""
     assert _git_output(repo_root, "status", "--porcelain") == ""
+
+
+def test_cli_hard_delete_project_refuses_immutable_delivery_before_mutation(
+    isolated_env,
+) -> None:
+    project_key = pkey("cli/delete-project-with-delivery")
+    registration_token = "project-delete-token"
+    _, project_root = _seed_hard_delete_cli_state(
+        project_key=project_key,
+        project_slug="cli-delete-project-with-delivery",
+        agent_name="BlueLake",
+        registration_token=registration_token,
+    )
+
+    async def _seed_delivery() -> str:
+        async with get_session() as session:
+            project = (
+                await session.execute(
+                    select(Project).where(
+                        cast(ColumnElement[bool], Project.human_key == project_key)
+                    )
+                )
+            ).scalars().one()
+            sender = (
+                await session.execute(
+                    select(Agent).where(
+                        cast(ColumnElement[bool], Agent.project_id == project.id),
+                        cast(ColumnElement[bool], Agent.name == "BlueLake"),
+                    )
+                )
+            ).scalars().one()
+            assert project.id is not None
+            assert sender.id is not None
+            document = "immutable CLI delivery\n"
+            delivery = MessageDelivery(
+                project_id=project.id,
+                project_slug_snapshot=project.slug,
+                project_generation_snapshot=project.project_generation,
+                sender_project_id_snapshot=project.id,
+                sender_project_slug_snapshot=project.slug,
+                sender_project_generation_snapshot=project.project_generation,
+                sender_id=sender.id,
+                sender_name_snapshot=sender.name,
+                sender_generation_snapshot=sender.agent_generation,
+                actor_kind="system",
+                actor_id=0,
+                actor_name_snapshot="system",
+                idempotency_key="cli-hard-delete-refusal",
+                request_sha256="1" * 64,
+                subject="Immutable",
+                body_md="Immutable",
+                archive_document=document,
+                document_sha256=hashlib.sha256(document.encode()).hexdigest(),
+            )
+            session.add(delivery)
+            await session.commit()
+            return delivery.id
+
+    delivery_id = asyncio.run(_seed_delivery())
+    profile = project_root / "agents" / "BlueLake" / "profile.json"
+    profile_before = profile.read_bytes()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "hard-delete-project",
+            project_key,
+            "--confirm",
+            "I UNDERSTAND",
+            "--token",
+            registration_token,
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "immutable message delivery history" in result.output
+    assert profile.read_bytes() == profile_before
+
+    async def _verify() -> tuple[str, int]:
+        async with get_session() as session:
+            delivery = await session.get(MessageDelivery, delivery_id)
+            project = (
+                await session.execute(
+                    select(Project).where(
+                        cast(ColumnElement[bool], Project.human_key == project_key)
+                    )
+                )
+            ).scalars().one()
+            assert delivery is not None
+            assert project.id is not None
+            return delivery.state, project.id
+
+    state, project_id = asyncio.run(_verify())
+    assert state == "pending"
+    assert project_id > 0
 
 
 def test_cli_hard_delete_project_reports_archive_setup_failure_after_db_delete(

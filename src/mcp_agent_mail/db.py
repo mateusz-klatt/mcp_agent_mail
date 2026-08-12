@@ -419,7 +419,7 @@ def _build_engine(settings: DatabaseSettings) -> AsyncEngine:
             reading and writing to the same database:
 
             - journal_mode=WAL: Write-Ahead Logging for concurrent reads during writes
-            - synchronous=NORMAL: 10x faster than FULL, WAL provides crash safety
+            - synchronous=FULL: durable commits across process, OS, and power failures
             - busy_timeout=60000: 60s wait for locks (handles checkpoint stalls)
             - wal_autocheckpoint=1000: Checkpoint every ~4MB to prevent WAL bloat
             - cache_size=-32768: 32MB page cache (negative = KB, positive = pages)
@@ -432,9 +432,10 @@ def _build_engine(settings: DatabaseSettings) -> AsyncEngine:
                 # This is persistent - only needs to be set once per database file
                 cursor.execute("PRAGMA journal_mode=WAL")
 
-                # Use NORMAL synchronous mode (safer than OFF, faster than FULL)
-                # With WAL mode, NORMAL provides durability without the FULL penalty
-                cursor.execute("PRAGMA synchronous=NORMAL")
+                # Delivery receipts cross the SQLite/Git durability boundary. FULL
+                # ensures a successful DB commit remains durable after an OS crash or
+                # power loss; NORMAL only guarantees application-crash durability.
+                cursor.execute("PRAGMA synchronous=FULL")
 
                 # Extended busy timeout (60 seconds) to handle:
                 # - WAL checkpoint blocking (can take seconds with large WAL)
@@ -954,6 +955,7 @@ def _setup_fts(connection: Any) -> None:
     # SQLite ALTER TABLE ADD COLUMN is idempotent-safe via try/except.
     for migration_sql in [
         "ALTER TABLE agents ADD COLUMN retired_at DATETIME DEFAULT NULL",
+        "ALTER TABLE agents ADD COLUMN agent_generation VARCHAR(64) DEFAULT NULL",
         "ALTER TABLE projects ADD COLUMN project_generation VARCHAR(64) DEFAULT NULL",
         "ALTER TABLE projects ADD COLUMN archived_at DATETIME DEFAULT NULL",
         "ALTER TABLE agents ADD COLUMN registration_token VARCHAR(64) DEFAULT NULL",
@@ -962,6 +964,7 @@ def _setup_fts(connection: Any) -> None:
         # round-trip through the DB (previously reply_to lived only in the
         # response payload and was lost on read).
         "ALTER TABLE messages ADD COLUMN reply_to INTEGER DEFAULT NULL",
+        "ALTER TABLE messages ADD COLUMN delivery_id VARCHAR(36) DEFAULT NULL",
         # Display alias. Additive and nullable, so an older database keeps
         # working and every agent simply has no alias until it sets one.
         "ALTER TABLE agents ADD COLUMN display_name VARCHAR(128) DEFAULT NULL",
@@ -981,16 +984,37 @@ def _setup_fts(connection: Any) -> None:
         with suppress(Exception):  # Column already exists — safe to ignore
             connection.exec_driver_sql(migration_sql)
 
+    # The delivery idempotency scope changed before this unshipped surface was
+    # enabled: a UI actor's mailbox-project lifetime is now part of its scope.
+    # Recreate the development index instead of preserving the obsolete shape.
+    connection.exec_driver_sql("DROP INDEX IF EXISTS uq_message_deliveries_idempotency")
+
     # Index migrations for newly added columns.
     # CREATE INDEX IF NOT EXISTS is natively idempotent in SQLite.
     for index_sql in [
         "CREATE INDEX IF NOT EXISTS ix_agents_registration_token ON agents (registration_token)",
         "CREATE INDEX IF NOT EXISTS idx_messages_project_topic ON messages (project_id, topic)",
         "CREATE INDEX IF NOT EXISTS ix_messages_reply_to ON messages (reply_to)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_delivery "
+        "ON messages (delivery_id) WHERE delivery_id IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS idx_ui_access_audit_target_created "
         "ON ui_access_audit_events (target_user_id, created_ts)",
         "CREATE INDEX IF NOT EXISTS idx_ui_access_audit_project_created "
         "ON ui_access_audit_events (project_id, created_ts)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_message_deliveries_idempotency "
+        "ON message_deliveries ("
+        "project_id, project_generation_snapshot, actor_kind, actor_id, "
+        "coalesce(actor_generation_snapshot, ''), "
+        "coalesce(actor_project_generation_snapshot, ''), idempotency_key)",
+        "CREATE INDEX IF NOT EXISTS idx_message_deliveries_due "
+        "ON message_deliveries (next_attempt_ts, lease_expires_ts) "
+        "WHERE state = 'pending'",
+        "CREATE INDEX IF NOT EXISTS idx_message_deliveries_project_created "
+        "ON message_deliveries (project_id, created_ts)",
+        "CREATE INDEX IF NOT EXISTS idx_message_deliveries_reply_pending "
+        "ON message_deliveries (reply_to_message_id, state)",
+        "CREATE INDEX IF NOT EXISTS idx_message_delivery_recipients_agent "
+        "ON message_delivery_recipients (agent_id, delivery_id)",
     ]:
         connection.exec_driver_sql(index_sql)
 
@@ -1027,6 +1051,21 @@ def _setup_fts(connection: Any) -> None:
                 SELECT 1
                 FROM ui_users
                 WHERE id = new.id OR username = new.username
+            );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS ui_users_identity_collision_guard_bu
+        BEFORE UPDATE OF id, username ON ui_users
+        BEGIN
+            SELECT RAISE(ABORT, 'ui_users identity collision')
+            WHERE EXISTS (
+                SELECT 1
+                FROM ui_users
+                WHERE id != old.id
+                  AND (id = new.id OR username = new.username)
             );
         END
         """
@@ -1097,6 +1136,36 @@ def _setup_fts(connection: Any) -> None:
             "UPDATE ui_users SET session_generation = ? WHERE id = ?",
             (secrets.token_hex(32), int(generation_row[0])),
         )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS ui_users_generation_guard_bi
+        BEFORE INSERT ON ui_users
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid session_generation')
+            WHERE new.session_generation IS NULL
+               OR length(new.session_generation) != 64
+               OR new.session_generation GLOB '*[^0-9a-f]*';
+            SELECT RAISE(ABORT, 'session_generation lifetime was already used')
+            WHERE EXISTS (
+                SELECT 1
+                FROM message_deliveries
+                WHERE actor_kind = 'ui_user'
+                  AND actor_id = new.id
+                  AND actor_generation_snapshot = new.session_generation
+            );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS ui_users_generation_guard_bu
+        BEFORE UPDATE OF session_generation ON ui_users
+        WHEN old.session_generation IS NOT new.session_generation
+        BEGIN
+            SELECT RAISE(ABORT, 'session_generation is immutable');
+        END
+        """
+    )
     project_generation_rows = connection.exec_driver_sql(
         """
         SELECT id
@@ -1109,6 +1178,145 @@ def _setup_fts(connection: Any) -> None:
             "UPDATE projects SET project_generation = ? WHERE id = ?",
             (secrets.token_hex(32), int(project_generation_row[0])),
         )
+    agent_generation_rows = connection.exec_driver_sql(
+        """
+        SELECT id
+        FROM agents
+        WHERE agent_generation IS NULL OR trim(agent_generation) = ''
+        """
+    ).fetchall()
+    for agent_generation_row in agent_generation_rows:
+        connection.exec_driver_sql(
+            "UPDATE agents SET agent_generation = ? WHERE id = ?",
+            (secrets.token_hex(32), int(agent_generation_row[0])),
+        )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS agents_identity_collision_guard_bi
+        BEFORE INSERT ON agents
+        BEGIN
+            SELECT RAISE(ABORT, 'agents identity collision')
+            WHERE EXISTS (
+                SELECT 1
+                FROM agents
+                WHERE id = new.id
+                   OR (project_id = new.project_id AND name = new.name)
+            );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS agents_identity_collision_guard_bu
+        BEFORE UPDATE OF id, project_id, name ON agents
+        BEGIN
+            SELECT RAISE(ABORT, 'agents identity collision')
+            WHERE EXISTS (
+                SELECT 1
+                FROM agents
+                WHERE id != old.id
+                  AND (
+                      id = new.id
+                      OR (project_id = new.project_id AND name = new.name)
+                  )
+            );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS agents_generation_guard_bi
+        BEFORE INSERT ON agents
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid agent_generation')
+            WHERE new.agent_generation IS NOT NULL
+              AND trim(new.agent_generation) != ''
+              AND (
+                  length(new.agent_generation) != 64
+                  OR new.agent_generation GLOB '*[^0-9a-f]*'
+              );
+            SELECT RAISE(ABORT, 'agent_generation lifetime was already used')
+            WHERE EXISTS (
+                SELECT 1
+                FROM message_deliveries
+                WHERE (
+                    sender_id = new.id
+                    AND sender_generation_snapshot = new.agent_generation
+                )
+                   OR (
+                    actor_kind = 'agent'
+                    AND actor_id = new.id
+                    AND actor_generation_snapshot = new.agent_generation
+                )
+                   OR EXISTS (
+                    SELECT 1
+                    FROM message_delivery_recipients
+                    WHERE delivery_id = message_deliveries.id
+                      AND agent_id = new.id
+                      AND agent_generation_snapshot = new.agent_generation
+                )
+            );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS agents_generation_guard_bu
+        BEFORE UPDATE OF agent_generation ON agents
+        WHEN old.agent_generation IS NOT new.agent_generation
+        BEGIN
+            SELECT RAISE(ABORT, 'agent_generation is immutable')
+            WHERE old.agent_generation IS NOT NULL
+              AND trim(old.agent_generation) != '';
+            SELECT RAISE(ABORT, 'invalid agent_generation')
+            WHERE new.agent_generation IS NULL
+               OR length(new.agent_generation) != 64
+               OR new.agent_generation GLOB '*[^0-9a-f]*';
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS agents_generation_ai
+        AFTER INSERT ON agents
+        WHEN new.agent_generation IS NULL OR trim(new.agent_generation) = ''
+        BEGIN
+            UPDATE agents
+            SET agent_generation = lower(hex(randomblob(32)))
+            WHERE id = new.id;
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS projects_slug_guard_bi
+        BEFORE INSERT ON projects
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid canonical project slug')
+            WHERE length(new.slug) < 1
+               OR length(new.slug) > 255
+               OR lower(new.slug) != new.slug
+               OR new.slug GLOB '*[^a-z0-9-]*'
+               OR substr(new.slug, 1, 1) NOT GLOB '[a-z0-9]'
+               OR substr(new.slug, -1, 1) NOT GLOB '[a-z0-9]';
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS projects_slug_guard_bu
+        BEFORE UPDATE OF slug ON projects
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid canonical project slug')
+            WHERE length(new.slug) < 1
+               OR length(new.slug) > 255
+               OR lower(new.slug) != new.slug
+               OR new.slug GLOB '*[^a-z0-9-]*'
+               OR substr(new.slug, 1, 1) NOT GLOB '[a-z0-9]'
+               OR substr(new.slug, -1, 1) NOT GLOB '[a-z0-9]';
+        END
+        """
+    )
     connection.exec_driver_sql(
         """
         CREATE TRIGGER IF NOT EXISTS projects_identity_collision_guard_bi
@@ -1119,6 +1327,20 @@ def _setup_fts(connection: Any) -> None:
                 SELECT 1
                 FROM projects
                 WHERE id = new.id OR slug = new.slug
+            );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS projects_identity_collision_guard_bu
+        BEFORE UPDATE OF id, slug ON projects
+        BEGIN
+            SELECT RAISE(ABORT, 'projects identity collision')
+            WHERE EXISTS (
+                SELECT 1
+                FROM projects
+                WHERE id != old.id AND (id = new.id OR slug = new.slug)
             );
         END
         """
@@ -1163,6 +1385,724 @@ def _setup_fts(connection: Any) -> None:
             UPDATE projects
             SET project_generation = lower(hex(randomblob(32)))
             WHERE id = new.id;
+        END
+        """
+    )
+    # Recreate the delivery triggers so an existing development database
+    # receives the same final invariants as a database created from scratch.
+    for delivery_trigger in (
+        "messages_identity_collision_guard_bi",
+        "messages_identity_collision_guard_bu",
+        "message_deliveries_guard_bi",
+        "message_deliveries_snapshots_bu",
+        "message_deliveries_receipt_bu",
+        "message_deliveries_lease_fence_bu",
+        "message_deliveries_terminal_bu",
+        "message_deliveries_transition_bu",
+        "message_deliveries_immutable_bd",
+        "message_delivery_recipients_guard_bi",
+        "message_delivery_recipients_immutable_bu",
+        "message_delivery_recipients_immutable_bd",
+        "message_deliveries_project_guard_bd",
+        "message_deliveries_project_guard_bu",
+        "message_deliveries_agent_pending_bd",
+        "message_deliveries_agent_pending_bu",
+        "message_deliveries_ui_user_pending_bd",
+        "message_deliveries_ui_user_pending_bu",
+        "message_deliveries_reply_target_pending_bd",
+        "message_deliveries_reply_target_pending_bu",
+        "message_deliveries_reply_target_pending_bi",
+    ):
+        connection.exec_driver_sql(f"DROP TRIGGER IF EXISTS {delivery_trigger}")
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS messages_identity_collision_guard_bi
+        BEFORE INSERT ON messages
+        BEGIN
+            SELECT RAISE(ABORT, 'messages identity collision')
+            WHERE EXISTS (
+                SELECT 1
+                FROM messages
+                WHERE id = new.id
+                   OR (
+                       new.delivery_id IS NOT NULL
+                       AND delivery_id = new.delivery_id
+                   )
+            );
+            SELECT RAISE(ABORT, 'message delivery binding mismatch')
+            WHERE new.delivery_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM message_deliveries
+                  WHERE id = new.delivery_id
+                    AND state = 'pending'
+                    AND message_id IS NULL
+                    AND project_id = new.project_id
+                    AND sender_id = new.sender_id
+              );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS messages_identity_collision_guard_bu
+        BEFORE UPDATE OF id, delivery_id ON messages
+        BEGIN
+            SELECT RAISE(ABORT, 'messages identity collision')
+            WHERE EXISTS (
+                SELECT 1
+                FROM messages
+                WHERE id != old.id
+                  AND (
+                      id = new.id
+                      OR (
+                          new.delivery_id IS NOT NULL
+                          AND delivery_id = new.delivery_id
+                      )
+                  )
+            );
+            SELECT RAISE(ABORT, 'message delivery binding mismatch')
+            WHERE old.delivery_id IS NOT new.delivery_id
+              AND new.delivery_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM message_deliveries
+                  WHERE id = new.delivery_id
+                    AND state = 'pending'
+                    AND message_id IS NULL
+                    AND project_id = new.project_id
+                    AND sender_id = new.sender_id
+              );
+            SELECT RAISE(ABORT, 'message delivery binding is immutable')
+            WHERE old.delivery_id IS NOT NULL
+              AND old.delivery_id IS NOT new.delivery_id;
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS message_deliveries_guard_bi
+        BEFORE INSERT ON message_deliveries
+        BEGIN
+            SELECT RAISE(ABORT, 'message delivery identity collision')
+            WHERE EXISTS (
+                SELECT 1
+                FROM message_deliveries
+                WHERE id = new.id
+                   OR (
+                       project_id = new.project_id
+                       AND project_generation_snapshot = new.project_generation_snapshot
+                       AND actor_kind = new.actor_kind
+                       AND actor_id = new.actor_id
+                       AND actor_generation_snapshot IS new.actor_generation_snapshot
+                       AND actor_project_generation_snapshot
+                           IS new.actor_project_generation_snapshot
+                       AND idempotency_key = new.idempotency_key
+                   )
+            );
+            SELECT RAISE(ABORT, 'message delivery must start pending')
+            WHERE new.state != 'pending';
+            SELECT RAISE(ABORT, 'message delivery project snapshot mismatch')
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM projects
+                WHERE id = new.project_id
+                  AND slug = new.project_slug_snapshot
+                  AND project_generation = new.project_generation_snapshot
+                  AND archived_at IS NULL
+            );
+            SELECT RAISE(ABORT, 'message delivery sender snapshot mismatch')
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM agents
+                WHERE id = new.sender_id
+                  AND project_id = new.sender_project_id_snapshot
+                  AND name = new.sender_name_snapshot
+                  AND agent_generation = new.sender_generation_snapshot
+                  AND retired_at IS NULL
+            );
+            SELECT RAISE(ABORT, 'message delivery sender project snapshot mismatch')
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM projects
+                WHERE id = new.sender_project_id_snapshot
+                  AND slug = new.sender_project_slug_snapshot
+                  AND project_generation = new.sender_project_generation_snapshot
+                  AND archived_at IS NULL
+            );
+            SELECT RAISE(ABORT, 'message delivery agent actor snapshot mismatch')
+            WHERE new.actor_kind = 'agent'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM agents
+                  WHERE id = new.actor_id
+                    AND project_id = new.actor_project_id_snapshot
+                    AND name = new.actor_name_snapshot
+                    AND agent_generation = new.actor_generation_snapshot
+                    AND retired_at IS NULL
+              );
+            SELECT RAISE(ABORT, 'message delivery agent actor project snapshot mismatch')
+            WHERE new.actor_kind = 'agent'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM projects
+                  WHERE id = new.actor_project_id_snapshot
+                    AND slug = new.actor_project_slug_snapshot
+                    AND project_generation = new.actor_project_generation_snapshot
+                    AND archived_at IS NULL
+              );
+            SELECT RAISE(ABORT, 'message delivery user actor project snapshot mismatch')
+            WHERE new.actor_kind = 'ui_user'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM projects
+                  WHERE id = new.actor_project_id_snapshot
+                    AND slug = new.actor_project_slug_snapshot
+                    AND project_generation = new.actor_project_generation_snapshot
+                    AND archived_at IS NULL
+              );
+            SELECT RAISE(ABORT, 'message delivery user actor snapshot mismatch')
+            WHERE new.actor_kind = 'ui_user'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM ui_users
+                  WHERE id = new.actor_id
+                    AND username = new.actor_name_snapshot
+                    AND session_generation = new.actor_generation_snapshot
+                    AND session_epoch = new.actor_epoch_snapshot
+                    AND disabled = 0
+              );
+            SELECT RAISE(ABORT, 'message delivery user actor is not authorized')
+            WHERE new.actor_kind = 'ui_user'
+              AND (
+                  new.delivery_kind = 'contact_request'
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM ui_users AS actor
+                      WHERE actor.id = new.actor_id
+                        AND actor.disabled = 0
+                        AND (
+                            (new.delivery_kind = 'message' AND actor.role = 'admin')
+                            OR (
+                                new.delivery_kind = 'reply'
+                                AND (
+                                    actor.role = 'admin'
+                                    OR (
+                                        actor.role = 'member'
+                                        AND EXISTS (
+                                            SELECT 1
+                                            FROM ui_project_assignments AS assignment
+                                            WHERE assignment.user_id = actor.id
+                                              AND assignment.project_id =
+                                                  new.actor_project_id_snapshot
+                                              AND assignment.role = 'operator'
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                  )
+              );
+            SELECT RAISE(ABORT, 'message delivery reply target mismatch')
+            WHERE new.reply_to_message_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM messages
+                  WHERE id = new.reply_to_message_id
+                    AND project_id = new.project_id
+              );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS message_deliveries_snapshots_bu
+        BEFORE UPDATE ON message_deliveries
+        WHEN old.id IS NOT new.id
+          OR old.delivery_kind IS NOT new.delivery_kind
+          OR old.project_id IS NOT new.project_id
+          OR old.project_slug_snapshot IS NOT new.project_slug_snapshot
+          OR old.project_generation_snapshot IS NOT new.project_generation_snapshot
+          OR old.sender_project_id_snapshot IS NOT new.sender_project_id_snapshot
+          OR old.sender_project_slug_snapshot IS NOT new.sender_project_slug_snapshot
+          OR old.sender_project_generation_snapshot IS NOT new.sender_project_generation_snapshot
+          OR old.sender_id IS NOT new.sender_id
+          OR old.sender_name_snapshot IS NOT new.sender_name_snapshot
+          OR old.sender_generation_snapshot IS NOT new.sender_generation_snapshot
+          OR old.actor_kind IS NOT new.actor_kind
+          OR old.actor_id IS NOT new.actor_id
+          OR old.actor_name_snapshot IS NOT new.actor_name_snapshot
+          OR old.actor_project_id_snapshot IS NOT new.actor_project_id_snapshot
+          OR old.actor_project_slug_snapshot IS NOT new.actor_project_slug_snapshot
+          OR old.actor_project_generation_snapshot IS NOT new.actor_project_generation_snapshot
+          OR old.actor_generation_snapshot IS NOT new.actor_generation_snapshot
+          OR old.actor_epoch_snapshot IS NOT new.actor_epoch_snapshot
+          OR old.idempotency_key IS NOT new.idempotency_key
+          OR old.request_sha256 IS NOT new.request_sha256
+          OR old.thread_id IS NOT new.thread_id
+          OR old.reply_to_message_id IS NOT new.reply_to_message_id
+          OR old.topic IS NOT new.topic
+          OR old.subject IS NOT new.subject
+          OR old.body_md IS NOT new.body_md
+          OR old.importance IS NOT new.importance
+          OR old.ack_required IS NOT new.ack_required
+          OR old.attachments IS NOT new.attachments
+          OR old.archive_document IS NOT new.archive_document
+          OR old.document_sha256 IS NOT new.document_sha256
+          OR old.created_ts IS NOT new.created_ts
+        BEGIN
+            SELECT RAISE(ABORT, 'message delivery snapshots are immutable');
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS message_deliveries_receipt_bu
+        BEFORE UPDATE OF archive_relative_path, archive_blob_sha, archive_commit_sha
+        ON message_deliveries
+        WHEN old.archive_relative_path IS NOT NULL
+          AND (
+              old.archive_relative_path IS NOT new.archive_relative_path
+              OR old.archive_blob_sha IS NOT new.archive_blob_sha
+              OR old.archive_commit_sha IS NOT new.archive_commit_sha
+          )
+        BEGIN
+            SELECT RAISE(ABORT, 'message delivery receipt is immutable');
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS message_deliveries_lease_fence_bu
+        BEFORE UPDATE ON message_deliveries
+        BEGIN
+            SELECT RAISE(ABORT, 'message delivery lease fence must advance on acquisition')
+            WHERE old.lease_token IS NOT new.lease_token
+              AND new.lease_token IS NOT NULL
+              AND new.lease_fence != old.lease_fence + 1;
+            SELECT RAISE(ABORT, 'message delivery lease fence changed without acquisition')
+            WHERE old.lease_token IS new.lease_token
+              AND new.lease_fence != old.lease_fence;
+            SELECT RAISE(ABORT, 'message delivery lease fence changed on release')
+            WHERE old.lease_token IS NOT NULL
+              AND new.lease_token IS NULL
+              AND new.lease_fence != old.lease_fence;
+            SELECT RAISE(ABORT, 'message delivery attempt count is not monotonic')
+            WHERE new.attempt_count < old.attempt_count
+               OR new.attempt_count > old.attempt_count + 1;
+            SELECT RAISE(ABORT, 'message delivery attempt must advance on acquisition')
+            WHERE old.lease_token IS NOT new.lease_token
+              AND new.lease_token IS NOT NULL
+              AND new.attempt_count != old.attempt_count + 1;
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS message_deliveries_terminal_bu
+        BEFORE UPDATE ON message_deliveries
+        WHEN old.state IN ('published', 'quarantined')
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal message delivery is immutable');
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS message_deliveries_transition_bu
+        BEFORE UPDATE OF state ON message_deliveries
+        WHEN old.state = 'pending'
+        BEGIN
+            SELECT RAISE(ABORT, 'illegal message delivery state transition')
+            WHERE new.state NOT IN ('pending', 'published', 'quarantined');
+            SELECT RAISE(ABORT, 'published delivery requires ordered recipients')
+            WHERE new.state = 'published'
+              AND (
+                  NOT EXISTS (
+                      SELECT 1
+                      FROM message_delivery_recipients
+                      WHERE delivery_id = old.id
+                  )
+                  OR (
+                      SELECT min(ordinal)
+                      FROM message_delivery_recipients
+                      WHERE delivery_id = old.id
+                  ) != 0
+                  OR (
+                      SELECT max(ordinal)
+                      FROM message_delivery_recipients
+                      WHERE delivery_id = old.id
+                  ) + 1 != (
+                      SELECT count(*)
+                      FROM message_delivery_recipients
+                      WHERE delivery_id = old.id
+                  )
+              );
+            SELECT RAISE(ABORT, 'published delivery message snapshot mismatch')
+            WHERE new.state = 'published'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM messages
+                  WHERE id = new.message_id
+                    AND delivery_id = old.id
+                    AND project_id = old.project_id
+                    AND sender_id = old.sender_id
+                    AND thread_id IS old.thread_id
+                    AND reply_to IS old.reply_to_message_id
+                    AND topic IS old.topic
+                    AND subject = old.subject
+                    AND body_md = old.body_md
+                    AND importance = old.importance
+                    AND ack_required = old.ack_required
+                    AND attachments = old.attachments
+                    AND created_ts = old.created_ts
+              );
+            SELECT RAISE(ABORT, 'published delivery recipient snapshot mismatch')
+            WHERE new.state = 'published'
+              AND (
+                  (
+                      SELECT count(*)
+                      FROM message_recipients
+                      WHERE message_id = new.message_id
+                  ) != (
+                      SELECT count(*)
+                      FROM message_delivery_recipients
+                      WHERE delivery_id = old.id
+                  )
+                  OR EXISTS (
+                      SELECT 1
+                      FROM message_delivery_recipients AS delivery_recipient
+                      WHERE delivery_recipient.delivery_id = old.id
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM message_recipients AS message_recipient
+                            WHERE message_recipient.message_id = new.message_id
+                              AND message_recipient.agent_id = delivery_recipient.agent_id
+                              AND message_recipient.kind = delivery_recipient.kind
+                        )
+                  )
+              );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS message_deliveries_immutable_bd
+        BEFORE DELETE ON message_deliveries
+        BEGIN
+            SELECT RAISE(ABORT, 'message deliveries are immutable');
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS message_delivery_recipients_guard_bi
+        BEFORE INSERT ON message_delivery_recipients
+        BEGIN
+            SELECT RAISE(ABORT, 'message delivery recipient identity collision')
+            WHERE EXISTS (
+                SELECT 1
+                FROM message_delivery_recipients
+                WHERE delivery_id = new.delivery_id
+                  AND (ordinal = new.ordinal OR agent_id = new.agent_id)
+            );
+            SELECT RAISE(ABORT, 'message delivery recipient parent is not pending')
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM message_deliveries
+                WHERE id = new.delivery_id
+                  AND state = 'pending'
+                  AND project_id = new.project_id_snapshot
+            );
+            SELECT RAISE(ABORT, 'message delivery recipient snapshot mismatch')
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM agents
+                WHERE id = new.agent_id
+                  AND project_id = new.project_id_snapshot
+                  AND name = new.agent_name_snapshot
+                  AND agent_generation = new.agent_generation_snapshot
+                  AND retired_at IS NULL
+                  AND contact_policy != 'block_all'
+            );
+            SELECT RAISE(ABORT, 'contact request requires exactly one to recipient')
+            WHERE EXISTS (
+                SELECT 1
+                FROM message_deliveries AS delivery
+                WHERE delivery.id = new.delivery_id
+                  AND delivery.delivery_kind = 'contact_request'
+                  AND (
+                      new.kind != 'to'
+                      OR EXISTS (
+                          SELECT 1
+                          FROM message_delivery_recipients AS existing_recipient
+                          WHERE existing_recipient.delivery_id = delivery.id
+                      )
+                  )
+            );
+            SELECT RAISE(ABORT, 'message delivery recipient route is not approved')
+            WHERE EXISTS (
+                SELECT 1
+                FROM message_deliveries AS delivery
+                WHERE delivery.id = new.delivery_id
+                  AND delivery.delivery_kind = 'message'
+                  AND delivery.sender_project_id_snapshot != new.project_id_snapshot
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM agent_links AS link
+                      WHERE link.a_project_id = delivery.sender_project_id_snapshot
+                        AND link.a_agent_id = delivery.sender_id
+                        AND link.b_project_id = new.project_id_snapshot
+                        AND link.b_agent_id = new.agent_id
+                        AND link.status = 'approved'
+                        AND (link.expires_ts IS NULL OR link.expires_ts > CURRENT_TIMESTAMP)
+                  )
+            );
+            SELECT RAISE(ABORT, 'contact request recipient route is not pending')
+            WHERE EXISTS (
+                SELECT 1
+                FROM message_deliveries AS delivery
+                WHERE delivery.id = new.delivery_id
+                  AND delivery.delivery_kind = 'contact_request'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM agent_links AS link
+                      WHERE link.a_project_id = delivery.sender_project_id_snapshot
+                        AND link.a_agent_id = delivery.sender_id
+                        AND link.b_project_id = new.project_id_snapshot
+                        AND link.b_agent_id = new.agent_id
+                        AND link.status = 'pending'
+                        AND (link.expires_ts IS NULL OR link.expires_ts > CURRENT_TIMESTAMP)
+                  )
+            );
+            SELECT RAISE(ABORT, 'reply recipient route is not approved')
+            WHERE EXISTS (
+                SELECT 1
+                FROM message_deliveries AS delivery
+                WHERE delivery.id = new.delivery_id
+                  AND delivery.delivery_kind = 'reply'
+                  AND delivery.sender_project_id_snapshot != new.project_id_snapshot
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM agent_links AS link
+                      WHERE link.a_project_id = delivery.sender_project_id_snapshot
+                        AND link.a_agent_id = delivery.sender_id
+                        AND link.b_project_id = new.project_id_snapshot
+                        AND link.b_agent_id = new.agent_id
+                        AND link.status = 'approved'
+                        AND (link.expires_ts IS NULL OR link.expires_ts > CURRENT_TIMESTAMP)
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM messages AS inbound
+                      LEFT JOIN message_recipients AS inbound_recipient
+                        ON inbound_recipient.message_id = inbound.id
+                      WHERE inbound.project_id = delivery.sender_project_id_snapshot
+                        AND inbound.sender_id = new.agent_id
+                        AND (
+                            delivery.actor_kind = 'ui_user'
+                            OR inbound_recipient.agent_id = delivery.sender_id
+                        )
+                        AND (
+                            inbound.thread_id = delivery.thread_id
+                            OR (
+                                inbound.thread_id IS NULL
+                                AND CAST(inbound.id AS TEXT) = delivery.thread_id
+                            )
+                        )
+                  )
+            );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS message_delivery_recipients_immutable_bu
+        BEFORE UPDATE ON message_delivery_recipients
+        BEGIN
+            SELECT RAISE(ABORT, 'message delivery recipients are immutable');
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS message_delivery_recipients_immutable_bd
+        BEFORE DELETE ON message_delivery_recipients
+        BEGIN
+            SELECT RAISE(ABORT, 'message delivery recipients are immutable');
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS message_deliveries_project_guard_bd
+        BEFORE DELETE ON projects
+        BEGIN
+            SELECT RAISE(ABORT, 'project has immutable message delivery history')
+            WHERE EXISTS (
+                SELECT 1
+                FROM message_deliveries
+                WHERE (
+                      project_id = old.id
+                      OR sender_project_id_snapshot = old.id
+                      OR (
+                          actor_kind = 'agent'
+                          AND actor_project_id_snapshot = old.id
+                      )
+                  )
+            );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS message_deliveries_project_guard_bu
+        BEFORE UPDATE OF id, slug ON projects
+        WHEN old.id IS NOT new.id OR old.slug IS NOT new.slug
+        BEGIN
+            SELECT RAISE(ABORT, 'project has immutable message delivery history')
+            WHERE EXISTS (
+                SELECT 1
+                FROM message_deliveries
+                WHERE (
+                      project_id = old.id
+                      OR sender_project_id_snapshot = old.id
+                      OR (
+                          actor_kind = 'agent'
+                          AND actor_project_id_snapshot = old.id
+                      )
+                  )
+            );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS message_deliveries_agent_pending_bd
+        BEFORE DELETE ON agents
+        BEGIN
+            SELECT RAISE(ABORT, 'agent has pending message delivery')
+            WHERE EXISTS (
+                SELECT 1
+                FROM message_deliveries
+                WHERE state = 'pending'
+                  AND (
+                      sender_id = old.id
+                      OR (actor_kind = 'agent' AND actor_id = old.id)
+                      OR EXISTS (
+                          SELECT 1
+                          FROM message_delivery_recipients
+                          WHERE delivery_id = message_deliveries.id
+                            AND agent_id = old.id
+                      )
+                  )
+            );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS message_deliveries_agent_pending_bu
+        BEFORE UPDATE OF id, project_id ON agents
+        WHEN old.id IS NOT new.id OR old.project_id IS NOT new.project_id
+        BEGIN
+            SELECT RAISE(ABORT, 'agent has pending message delivery')
+            WHERE EXISTS (
+                SELECT 1
+                FROM message_deliveries
+                WHERE state = 'pending'
+                  AND (
+                      sender_id = old.id
+                      OR (actor_kind = 'agent' AND actor_id = old.id)
+                      OR EXISTS (
+                          SELECT 1
+                          FROM message_delivery_recipients
+                          WHERE delivery_id = message_deliveries.id
+                            AND agent_id = old.id
+                      )
+                  )
+            );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS message_deliveries_ui_user_pending_bd
+        BEFORE DELETE ON ui_users
+        BEGIN
+            SELECT RAISE(ABORT, 'user has pending message delivery')
+            WHERE EXISTS (
+                SELECT 1
+                FROM message_deliveries
+                WHERE state = 'pending'
+                  AND actor_kind = 'ui_user'
+                  AND actor_id = old.id
+            );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS message_deliveries_ui_user_pending_bu
+        BEFORE UPDATE OF id ON ui_users
+        WHEN old.id IS NOT new.id
+        BEGIN
+            SELECT RAISE(ABORT, 'user has pending message delivery')
+            WHERE EXISTS (
+                SELECT 1
+                FROM message_deliveries
+                WHERE state = 'pending'
+                  AND actor_kind = 'ui_user'
+                  AND actor_id = old.id
+            );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS message_deliveries_reply_target_pending_bd
+        BEFORE DELETE ON messages
+        BEGIN
+            SELECT RAISE(ABORT, 'message is a pending delivery reply target')
+            WHERE EXISTS (
+                SELECT 1
+                FROM message_deliveries
+                WHERE state = 'pending'
+                  AND reply_to_message_id = old.id
+            );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS message_deliveries_reply_target_pending_bu
+        BEFORE UPDATE OF id, project_id ON messages
+        WHEN old.id IS NOT new.id OR old.project_id IS NOT new.project_id
+        BEGIN
+            SELECT RAISE(ABORT, 'message is a pending delivery reply target')
+            WHERE EXISTS (
+                SELECT 1
+                FROM message_deliveries
+                WHERE state = 'pending'
+                  AND reply_to_message_id = old.id
+            );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS message_deliveries_reply_target_pending_bi
+        BEFORE INSERT ON messages
+        BEGIN
+            SELECT RAISE(ABORT, 'message is a pending delivery reply target')
+            WHERE EXISTS (
+                SELECT 1
+                FROM messages
+                JOIN message_deliveries
+                  ON message_deliveries.reply_to_message_id = messages.id
+                WHERE messages.id = new.id
+                  AND message_deliveries.state = 'pending'
+            );
         END
         """
     )

@@ -21,7 +21,14 @@ async def test_outbox_resource_lists_sent_messages(isolated_env):
         )
         await client.call_tool(
             "send_message",
-            {"project_key": "Backend", "sender_name": "BlueLake", "to": ["BlueLake"], "subject": "OutboxTest", "body_md": "b"},
+            {
+                "project_key": "Backend",
+                "sender_name": "BlueLake",
+                "to": ["BlueLake"],
+                "subject": "OutboxTest",
+                "body_md": "b",
+                "idempotency_key": "outbox-claims-seed",
+            },
         )
         # Use mailbox resource to verify sent message visibility for the agent
         blocks = await client.read_resource("resource://mailbox/BlueLake?project=Backend&limit=10")
@@ -75,4 +82,3 @@ async def test_renew_file_reservations_extends_expiry_and_updates_artifact(isola
             return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc)
 
         assert _parse(data["expires_ts"]) >= _parse(after)
-

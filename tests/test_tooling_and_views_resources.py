@@ -44,6 +44,7 @@ async def test_ack_views_resources(isolated_env):
                 "subject": "AckReq",
                 "body_md": "x",
                 "ack_required": True,
+                "idempotency_key": "tooling-view-ack-required",
             },
         )
         # Views may be empty/non-empty; ensure they respond with JSON
@@ -57,5 +58,4 @@ async def test_ack_views_resources(isolated_env):
         ]:
             blocks = await client.read_resource(uri)
             assert blocks and isinstance(blocks[0].text, str)
-
 

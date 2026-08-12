@@ -2,7 +2,8 @@
 
 Concurrency Architecture:
 - Per-project archive locks (.archive.lock) serialize archive mutations
-- Per-project commit locks (.commit.lock) serialize git commit operations
+- One repository-global commit lock (.commit.lock) serializes every shared
+  Git index and HEAD mutation across all projects
 - Commit queue with batching reduces lock contention under high load
 - Adaptive retry with exponential backoff + jitter for transient failures
 
@@ -25,6 +26,7 @@ import os
 import random
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading as _threading
@@ -38,9 +40,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator, Iterable, Sequence, TypeVar, cast
+from uuid import UUID, uuid4
 
 from filelock import SoftFileLock, Timeout
-from git import NULL_TREE, Actor, Git, Repo
+from git import NULL_TREE, Git, Repo
 from git.exc import GitCommandError
 from git.objects.tree import Tree
 from PIL import Image
@@ -58,9 +61,58 @@ from .utils import (
 _logger = logging.getLogger(__name__)
 _IMAGE_PATTERN = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<path>[^)]+)\)")
 _SUBJECT_SLUG_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+_CANONICAL_PROJECT_SLUG_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,254}")
 IDENTITY_RENAMES_FILENAME = "identity_renames.json"
 IDENTITY_TOMBSTONES_DIRNAME = "identity_tombstones"
 _IDENTITY_RENAME_SCHEMA_VERSION = 1
+_MESSAGE_DELIVERY_PENDING_EXCLUDE = "/projects/*/message_deliveries/*.pending"
+
+def _is_reparse_or_symlink_stat(path_stat: os.stat_result) -> bool:
+    return stat.S_ISLNK(path_stat.st_mode) or bool(
+        getattr(path_stat, "st_file_attributes", 0)
+        & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    )
+
+
+def _validate_archive_directory_component_sync(directory: Path) -> None:
+    """Reject an existing symlink, reparse point, or non-directory component."""
+    try:
+        path_stat = directory.lstat()
+    except FileNotFoundError:
+        return
+    if _is_reparse_or_symlink_stat(path_stat) or not stat.S_ISDIR(path_stat.st_mode):
+        raise ValueError(
+            f"archive path component is not a regular directory: {directory}"
+        )
+
+
+def _validate_archive_directory_chain_sync(
+    repo_root: Path,
+    directories: Sequence[Path],
+) -> None:
+    """Validate exact lexical archive ancestors without resolving through links."""
+    _validate_archive_directory_component_sync(repo_root)
+    expected_parent = repo_root
+    for directory in directories:
+        if directory.parent != expected_parent:
+            raise ValueError("archive directory chain is not lexically canonical")
+        _validate_archive_directory_component_sync(directory)
+        expected_parent = directory
+
+
+def _ensure_message_delivery_pending_exclude_sync(repo: Repo) -> None:
+    """Keep abandoned immutable attempts out of Git status and packaging scans."""
+    exclude_path = Path(repo.git_dir) / "info" / "exclude"
+    exclude_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
+    if _MESSAGE_DELIVERY_PENDING_EXCLUDE in existing.splitlines():
+        return
+    with exclude_path.open("a", encoding="utf-8", newline="\n") as stream:
+        if existing and not existing.endswith("\n"):
+            stream.write("\n")
+        stream.write(_MESSAGE_DELIVERY_PENDING_EXCLUDE + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def _sanitize_backup_reason(reason: str) -> str:
@@ -409,6 +461,65 @@ class ProjectArchive:
     @property
     def attachments_dir(self) -> Path:
         return self.root / "attachments"
+
+
+@dataclass(frozen=True, slots=True)
+class MessageDeliveryPublication:
+    """Verified immutable Git publication for one durable delivery."""
+
+    relative_path: str
+    document_sha256: str
+    blob_sha: str
+    commit_sha: str
+    recovered: bool
+
+
+class MessageDeliveryPublicationError(RuntimeError):
+    """Base class for failures while publishing an immutable delivery."""
+
+
+class MessageDeliveryQuarantinedError(MessageDeliveryPublicationError):
+    """The delivery path exists but violates the immutable publication contract."""
+
+    def __init__(
+        self,
+        delivery_id: str,
+        relative_path: str,
+        reason: str,
+        *,
+        expected_sha256: str,
+        actual_sha256: str | None = None,
+    ) -> None:
+        super().__init__(
+            f"Message delivery {delivery_id} is quarantined at {relative_path}: {reason}"
+        )
+        self.delivery_id = delivery_id
+        self.relative_path = relative_path
+        self.reason = reason
+        self.expected_sha256 = expected_sha256
+        self.actual_sha256 = actual_sha256
+
+
+class MessageDeliveryWorkspaceConflictError(MessageDeliveryPublicationError):
+    """Foreign archive changes make an isolated one-path commit unsafe."""
+
+    def __init__(self, delivery_id: str, paths: Sequence[str]) -> None:
+        normalized_paths = tuple(sorted(set(paths)))
+        super().__init__(
+            f"Message delivery {delivery_id} cannot publish with foreign archive changes: "
+            + ", ".join(normalized_paths[:5])
+        )
+        self.delivery_id = delivery_id
+        self.paths = normalized_paths
+
+
+class MessageDeliveryPendingError(MessageDeliveryPublicationError):
+    """A retryable publication attempt did not reach a verified Git commit."""
+
+    def __init__(self, delivery_id: str, reason: str) -> None:
+        super().__init__(f"Message delivery {delivery_id} remains pending: {reason}")
+        self.delivery_id = delivery_id
+        self.reason = reason
 
 
 def delete_archive_tree_contents(root: Path) -> tuple[int, int]:
@@ -917,7 +1028,7 @@ class AsyncFileLock:
     - Metadata tracking (.owner.json) enables stale lock detection
     - Process-level asyncio.Lock prevents re-entrant acquisition
     - Adaptive retry with exponential backoff on acquisition failure
-    - Stale lock cleanup when owner process is dead or lock is too old
+    - Stale lock cleanup with live-owner protection for the global commit lock
 
     Adaptive Timeout Strategy:
     - Initial attempt uses short timeout (10% of total)
@@ -1016,6 +1127,12 @@ class AsyncFileLock:
         Returns True if the lock was successfully released (FD closed).
         If ``release()`` raises, falls back to ``_force_close_fd()``.
         """
+        # Remove this generation's sidecar while the lock pathname still
+        # excludes every successor. SoftFileLock.release() removes the lock
+        # pathname itself; touching either path after that handoff could delete
+        # a newly-acquired owner's lock or metadata.
+        with contextlib.suppress(Exception):
+            self._metadata_path.unlink(missing_ok=True)
         try:
             self._lock.release()
             return True
@@ -1027,6 +1144,42 @@ class AsyncFileLock:
             # Fallback: force-close the FD to prevent leak
             self._force_close_fd()
             return False
+
+    async def _acquire_file_lock_cancellation_safe(
+        self,
+        timeout_seconds: float | None,
+    ) -> None:
+        """Acquire in a worker and never abandon a late successful lock."""
+        if timeout_seconds is None:
+            worker = asyncio.create_task(_to_thread(self._lock.acquire))
+        else:
+            worker = asyncio.create_task(
+                _to_thread(self._lock.acquire, timeout_seconds)
+            )
+        cancellation = await _drain_archive_task_cancellation(worker)
+        try:
+            worker.result()
+        except Timeout:
+            if cancellation is not None:
+                raise cancellation from None
+            raise
+        if cancellation is None:
+            return
+        self._held = True
+        release_worker = asyncio.create_task(_to_thread(self._release_strict))
+        released, _release_cancellation = await _drain_archive_mutation_task(
+            release_worker
+        )
+        if not released:
+            force_close_worker = asyncio.create_task(_to_thread(self._force_close_fd))
+            await _drain_archive_mutation_task(force_close_worker)
+        self._held = False
+        raise cancellation
+
+    async def _write_lock_metadata_cancellation_safe(self) -> None:
+        """Finish metadata publication before allowing cancellation cleanup."""
+        worker = asyncio.create_task(_to_thread(self._write_metadata))
+        await _await_archive_mutation(worker)
 
     async def __aenter__(self) -> None:
         """Acquire the file lock with adaptive retry and stale lock detection.
@@ -1081,11 +1234,13 @@ class AsyncFileLock:
 
                 try:
                     if self._timeout <= 0:
-                        await _to_thread(self._lock.acquire)
+                        await self._acquire_file_lock_cancellation_safe(None)
                     else:
-                        await _to_thread(self._lock.acquire, per_attempt_timeout)
+                        await self._acquire_file_lock_cancellation_safe(
+                            per_attempt_timeout
+                        )
                     self._held = True
-                    await _to_thread(self._write_metadata)
+                    await self._write_lock_metadata_cancellation_safe()
 
                     # Log successful acquisition if it took retries
                     if attempt > 0:
@@ -1106,13 +1261,15 @@ class AsyncFileLock:
 
                     if remaining <= 0 or attempt >= self._max_retries:
                         # Final attempt failed - try one last stale cleanup
-                        cleaned = await _to_thread(self._cleanup_if_stale)
+                        cleaned = await _to_thread_cancellation_safe(
+                            self._cleanup_if_stale
+                        )
                         if cleaned:
                             # Stale lock was cleaned - try once more with short timeout
                             try:
-                                await _to_thread(self._lock.acquire, 1.0)
+                                await self._acquire_file_lock_cancellation_safe(1.0)
                                 self._held = True
-                                await _to_thread(self._write_metadata)
+                                await self._write_lock_metadata_cancellation_safe()
                                 _logger.info(
                                     "file_lock.acquired_after_stale_cleanup",
                                     extra={"path": str(self._path)},
@@ -1126,7 +1283,9 @@ class AsyncFileLock:
                         ) from None
 
                     # Check for stale lock before retrying
-                    cleaned = await _to_thread(self._cleanup_if_stale)
+                    cleaned = await _to_thread_cancellation_safe(
+                        self._cleanup_if_stale
+                    )
                     if cleaned:
                         _logger.info(
                             "file_lock.stale_cleaned",
@@ -1144,32 +1303,16 @@ class AsyncFileLock:
             # Best-effort cleanup on any failure (including cancellation) to avoid leaking
             # lock file handles and process-level locks.
             if self._held:
-                release_ok = False
                 task = asyncio.create_task(_to_thread(self._release_strict))
-                try:
-                    release_ok = await asyncio.shield(task)
-                except BaseException:
-                    with contextlib.suppress(Exception):
-                        release_ok = await task
+                release_ok, _cancellation = await _drain_archive_mutation_task(task)
                 if not release_ok:
                     # release_strict already force-closed the FD; force-close
                     # again as a safety net (idempotent)
-                    await _to_thread(self._force_close_fd)
+                    force_close_task = asyncio.create_task(
+                        _to_thread(self._force_close_fd)
+                    )
+                    await _drain_archive_mutation_task(force_close_task)
                 self._held = False
-                # Only unlink files if we confirmed the FD is closed (release
-                # succeeded or was force-closed).  This prevents unlinking a
-                # lock path while another process may have legitimately
-                # acquired it in between.
-                for cleanup_coro in (
-                    _to_thread(self._metadata_path.unlink, missing_ok=True),
-                    _to_thread(self._path.unlink, missing_ok=True),
-                ):
-                    task = asyncio.create_task(cleanup_coro)
-                    try:
-                        await asyncio.shield(task)
-                    except BaseException:
-                        with contextlib.suppress(Exception):
-                            await task
 
             if self._loop_key is not None:
                 _PROCESS_LOCK_OWNERS.pop(self._loop_key, None)
@@ -1188,15 +1331,21 @@ class AsyncFileLock:
     def _cleanup_if_stale(self) -> bool:
         """Remove lock and metadata when the lock is stale.
 
-        A lock is considered stale if EITHER:
-        1. Owner metadata proves the owning process no longer exists, OR
-        2. The lock age exceeds the stale timeout
+        A lock is normally considered stale if its owner is dead or its age
+        exceeds the timeout. The repository-global ``.commit.lock`` is stricter:
+        it is never auto-healed. Recovery of that shared Git boundary requires
+        an explicit offline operator action after proving no writer is active.
 
         Missing owner metadata by itself is not enough to declare the lock stale,
         because there is a small window between acquiring the lock file and
-        writing the sidecar metadata.
+        writing the sidecar metadata. Age alone must never break a global commit
+        lock under any metadata state: concurrent stale healers cannot safely
+        distinguish the dead generation they inspected from a successor that
+        acquired the same pathname before their unlink.
         """
         if not self._path.exists():
+            return False
+        if self._path.name == ".commit.lock":
             return False
         now = time.time()
         metadata: dict[str, Any] = {}
@@ -1221,20 +1370,23 @@ class AsyncFileLock:
             with contextlib.suppress(Exception):
                 age = now - self._path.stat().st_mtime
 
-        # Lock is stale if owner metadata proves the owner is gone OR if the
-        # lock file itself has aged beyond the configured stale timeout.
-        is_stale = False
-        if owner_alive is False or (self._stale_timeout > 0 and isinstance(age, (int, float)) and age >= self._stale_timeout):
-            is_stale = True
+        age_expired = (
+            self._stale_timeout > 0
+            and isinstance(age, (int, float))
+            and age >= self._stale_timeout
+        )
+        is_stale = owner_alive is False or age_expired
 
         if not is_stale:
             return False
 
-        # Clean up stale lock
-        with contextlib.suppress(Exception):
-            self._path.unlink(missing_ok=True)
+        # Remove the old sidecar before the lock pathname. Once the pathname is
+        # gone a successor may acquire immediately and create a new sidecar;
+        # no stale-cleaner writes or deletes are allowed after that handoff.
         with contextlib.suppress(Exception):
             self._metadata_path.unlink(missing_ok=True)
+        with contextlib.suppress(Exception):
+            self._path.unlink(missing_ok=True)
         return True
 
     def _write_metadata(self) -> None:
@@ -1246,37 +1398,26 @@ class AsyncFileLock:
         return None
 
     async def __aexit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object) -> None:
+        cancellation: asyncio.CancelledError | None = None
         if self._held:
             # Step 1: Release the lock (closes FD + unlinks lock file internally).
             # Use _release_strict so that if release() raises, the FD is still
             # force-closed, preventing the leaked-FD exhaustion bug (#116).
-            release_ok = False
             release_task = asyncio.create_task(_to_thread(self._release_strict))
-            try:
-                release_ok = await asyncio.shield(release_task)
-            except BaseException:
-                with contextlib.suppress(Exception):
-                    release_ok = await release_task
+            release_ok, cancellation = await _drain_archive_mutation_task(
+                release_task
+            )
             if not release_ok:
                 # Last resort: ensure FD is closed even if everything above failed
-                await _to_thread(self._force_close_fd)
-
-            # Step 2: Windows needs a short delay after close before unlink
-            if sys.platform == "win32":
-                await asyncio.sleep(0.01)
-
-            # Step 3: Clean up metadata file.  The lock file itself is already
-            # unlinked by SoftFileLock._release(); we only need to remove the
-            # metadata sidecar.  Redundant unlink of self._path is safe (missing_ok).
-            for cleanup_path in (self._metadata_path, self._path):
-                task = asyncio.create_task(
-                    _to_thread(cleanup_path.unlink, missing_ok=True)
+                force_close_task = asyncio.create_task(
+                    _to_thread(self._force_close_fd)
                 )
-                try:
-                    await asyncio.shield(task)
-                except BaseException:
-                    with contextlib.suppress(Exception):
-                        await task
+                _force_closed, force_close_cancellation = (
+                    await _drain_archive_mutation_task(force_close_task)
+                )
+                if cancellation is None:
+                    cancellation = force_close_cancellation
+
             self._held = False
 
         # Clean up process-level locks
@@ -1292,6 +1433,8 @@ class AsyncFileLock:
         ):
             _PROCESS_LOCKS.pop(self._loop_key, None)
         self._process_lock = None
+        if cancellation is not None:
+            raise cancellation
         self._loop_key = None
         return None
 
@@ -1348,17 +1491,66 @@ async def archive_write_lock(archive: ProjectArchive, *, timeout_seconds: float 
     finally:
         # Ensure lock release even under task cancellation (Python 3.14: CancelledError is BaseException).
         task = asyncio.create_task(lock.__aexit__(exc_type, exc, tb))
-        try:
-            await asyncio.shield(task)
-        except BaseException:
-            with contextlib.suppress(Exception):
-                await task
+        await _await_archive_mutation(task)
 
 
-T = TypeVar('T')
+T = TypeVar("T")
 
 async def _to_thread(func: Any, /, *args: Any, **kwargs: Any) -> Any:
     return await asyncio.to_thread(func, *args, **kwargs)
+
+
+async def _drain_archive_task_cancellation(
+    task: asyncio.Task[Any],
+) -> asyncio.CancelledError | None:
+    """Wait for one task despite repeated caller cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    current_task = asyncio.current_task()
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            if current_task is None or current_task.cancelling() == 0:
+                raise
+            if cancellation is None:
+                cancellation = exc
+            while current_task.cancelling():
+                current_task.uncancel()
+        except BaseException:
+            # A completed worker's own exception is observed through
+            # ``task.result()`` by the caller.  Do not confuse it with caller
+            # cancellation or abandon cleanup before the result is collected.
+            if not task.done():
+                raise
+            break
+    return cancellation
+
+
+async def _drain_archive_mutation_task(
+    task: asyncio.Task[T],
+) -> tuple[T, asyncio.CancelledError | None]:
+    """Finish one mutation task and return its result plus cancellation."""
+    cancellation = await _drain_archive_task_cancellation(task)
+    return task.result(), cancellation
+
+
+async def _await_archive_mutation(task: asyncio.Task[T]) -> T:
+    """Drain one archive mutation, then propagate caller cancellation."""
+    result, cancellation = await _drain_archive_mutation_task(task)
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
+async def _to_thread_cancellation_safe(
+    func: Any,
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Drain a sync worker before propagating cancellation to its caller."""
+    worker = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+    return await _await_archive_mutation(worker)
 
 
 def _expanduser_resolve_path(path: Path) -> Path:
@@ -1429,7 +1621,10 @@ def collect_lock_status(settings: Settings, project_slug: str | None = None) -> 
             if not lock_path.exists():
                 continue
             metadata_present = metadata_path.exists()
-            if lock_path.name != ".archive.lock" and not metadata_present:
+            if (
+                lock_path.name not in {".archive.lock", ".commit.lock"}
+                and not metadata_present
+            ):
                 continue
 
             info: dict[str, Any] = {
@@ -1437,7 +1632,13 @@ def collect_lock_status(settings: Settings, project_slug: str | None = None) -> 
                 "metadata_path": str(metadata_path) if metadata_present else None,
                 "status": "held",
                 "metadata_present": metadata_present,
-                "category": "archive" if lock_path.name == ".archive.lock" else "custom",
+                "category": (
+                    "archive"
+                    if lock_path.name == ".archive.lock"
+                    else "commit"
+                    if lock_path.name == ".commit.lock"
+                    else "custom"
+                ),
             }
 
             with contextlib.suppress(Exception):
@@ -1478,11 +1679,15 @@ def collect_lock_status(settings: Settings, project_slug: str | None = None) -> 
             stale_threshold = AsyncFileLock(lock_path)._stale_timeout
             info["stale_timeout_seconds"] = stale_threshold
             age_val = info.get("age_seconds")
-            # Lock is stale if owner metadata proves the owner is gone OR if the
-            # lock file age exceeds the configured stale timeout.
-            is_stale = False
-            if owner_alive is False or (stale_threshold > 0 and isinstance(age_val, (int, float)) and age_val >= stale_threshold):
-                is_stale = True
+            age_expired = (
+                stale_threshold > 0
+                and isinstance(age_val, (int, float))
+                and age_val >= stale_threshold
+            )
+            if lock_path.name == ".commit.lock":
+                is_stale = pid_int is not None and owner_alive is False
+            else:
+                is_stale = owner_alive is False or age_expired
             info["stale_suspected"] = is_stale
 
             summary["total"] += 1
@@ -1499,17 +1704,74 @@ def collect_lock_status(settings: Settings, project_slug: str | None = None) -> 
     return {"locks": locks, "summary": summary}
 
 
+def _mkdir_with_durable_parents_sync(directory: Path) -> None:
+    """Create a directory chain and persist every newly visible parent entry."""
+    missing: list[Path] = []
+    current = directory
+    while not current.exists():
+        missing.append(current)
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    for created in reversed(missing):
+        created.mkdir(exist_ok=True)
+        _fsync_message_delivery_directory_sync(created.parent)
+
+
 async def ensure_archive_root(settings: Settings) -> tuple[Path, Repo]:
     repo_root = await _to_thread(_expanduser_resolve_path, Path(settings.storage.root))
-    await _to_thread(repo_root.mkdir, parents=True, exist_ok=True)
+    await _to_thread(_mkdir_with_durable_parents_sync, repo_root)
     repo = await _ensure_repo(repo_root, settings)
     return repo_root, repo
 
 
+def _validate_project_archive_slug(slug: str) -> str:
+    if (
+        not isinstance(slug, str)
+        or _CANONICAL_PROJECT_SLUG_RE.fullmatch(slug) is None
+    ):
+        raise ValueError(
+            "project slug must be a canonical lowercase [a-z0-9][a-z0-9-]* "
+            "segment no longer than 255 characters"
+        )
+    return slug
+
+
 async def ensure_archive(settings: Settings, slug: str) -> ProjectArchive:
+    slug = _validate_project_archive_slug(slug)
+    lexical_repo_root = Path(settings.storage.root).expanduser().absolute()
+    lexical_projects_root = lexical_repo_root / "projects"
+    lexical_project_root = lexical_projects_root / slug
+    await _to_thread(
+        _validate_archive_directory_chain_sync,
+        lexical_repo_root,
+        (lexical_projects_root, lexical_project_root),
+    )
     repo_root, repo = await ensure_archive_root(settings)
-    project_root = repo_root / "projects" / slug
-    await _to_thread(project_root.mkdir, parents=True, exist_ok=True)
+    projects_root = repo_root / "projects"
+    project_root = projects_root / slug
+
+    def _create_project_archive_directories_sync() -> None:
+        _validate_archive_directory_chain_sync(
+            repo_root,
+            (projects_root, project_root),
+        )
+        projects_created = not projects_root.exists()
+        projects_root.mkdir(exist_ok=True)
+        _validate_archive_directory_chain_sync(repo_root, (projects_root,))
+        if projects_created:
+            _fsync_message_delivery_directory_sync(repo_root)
+        project_created = not project_root.exists()
+        project_root.mkdir(exist_ok=True)
+        _validate_archive_directory_chain_sync(
+            repo_root,
+            (projects_root, project_root),
+        )
+        if project_created:
+            _fsync_message_delivery_directory_sync(projects_root)
+
+    await _to_thread(_create_project_archive_directories_sync)
     return ProjectArchive(
         settings=settings,
         slug=slug,
@@ -1524,16 +1786,111 @@ async def ensure_archive(settings: Settings, slug: str) -> ProjectArchive:
 async def _open_repo_cancellation_safe(factory: Any, *args: Any) -> Repo:
     """Open a GitPython repo without losing the handle to late thread completion."""
     worker = asyncio.create_task(asyncio.to_thread(factory, *args))
+    repo, cancellation = await _drain_archive_mutation_task(worker)
+    if cancellation is None:
+        return repo
+    close_worker = asyncio.create_task(asyncio.to_thread(repo.close))
+    await _drain_archive_mutation_task(close_worker)
+    raise cancellation
+
+
+_ARCHIVE_ATTRIBUTES_BYTES = b"*.json text\n*.md text\n"
+
+
+def _ensure_archive_attributes_durable_sync(attributes_path: Path) -> None:
+    """Create the initial attributes file exactly once and persist its entry."""
+    if attributes_path.exists() or attributes_path.is_symlink():
+        if (
+            attributes_path.is_symlink()
+            or not attributes_path.is_file()
+            or attributes_path.read_bytes() != _ARCHIVE_ATTRIBUTES_BYTES
+        ):
+            raise RuntimeError(
+                "Archive initialization found a noncanonical .gitattributes file"
+            )
+        file_descriptor = os.open(attributes_path, os.O_RDONLY)
+        try:
+            os.fsync(file_descriptor)
+        finally:
+            os.close(file_descriptor)
+        return
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    file_descriptor = os.open(attributes_path, flags, 0o644)
     try:
-        return await asyncio.shield(worker)
-    except asyncio.CancelledError:
-        repo: Repo | None = None
-        with contextlib.suppress(BaseException):
-            repo = await worker
-        if repo is not None:
-            with contextlib.suppress(Exception):
-                repo.close()
-        raise
+        view = memoryview(_ARCHIVE_ATTRIBUTES_BYTES)
+        written = 0
+        while written < len(view):
+            count = os.write(file_descriptor, view[written:])
+            if count <= 0:
+                raise OSError("archive attributes write made no progress")
+            written += count
+        os.fsync(file_descriptor)
+    finally:
+        os.close(file_descriptor)
+    _fsync_message_delivery_directory_sync(attributes_path.parent)
+
+
+def _fsync_archive_initialization_tree_sync(root: Path) -> None:
+    """Persist Git initialization files and directory entries bottom-up."""
+    directories: list[Path] = []
+    for directory_name, child_directories, filenames in os.walk(
+        root,
+        topdown=True,
+        followlinks=False,
+    ):
+        directory = Path(directory_name)
+        directories.append(directory)
+        child_directories[:] = [
+            child
+            for child in child_directories
+            if not (directory / child).is_symlink()
+        ]
+        for filename in filenames:
+            path = directory / filename
+            if path.is_symlink() or not path.is_file():
+                continue
+            file_descriptor = os.open(
+                path,
+                os.O_RDONLY | getattr(os, "O_BINARY", 0),
+            )
+            try:
+                os.fsync(file_descriptor)
+            finally:
+                os.close(file_descriptor)
+    for directory in reversed(directories):
+        _fsync_message_delivery_directory_sync(directory)
+    _fsync_message_delivery_directory_sync(root.parent)
+
+
+def _initialize_archive_commit_sync(repo: Repo, settings: Settings) -> None:
+    """Create or recover the power-loss-durable archive root commit."""
+    attributes_path = Path(cast(str, repo.working_tree_dir)) / ".gitattributes"
+    _ensure_archive_attributes_durable_sync(attributes_path)
+    pathspec = ":(literal).gitattributes"
+    repo.git(c=_MESSAGE_DELIVERY_GIT_DURABILITY_CONFIG).add("--", pathspec)
+    with repo.git.custom_environment(
+        GIT_AUTHOR_NAME=settings.storage.git_author_name,
+        GIT_AUTHOR_EMAIL=settings.storage.git_author_email,
+        GIT_COMMITTER_NAME=settings.storage.git_author_name,
+        GIT_COMMITTER_EMAIL=settings.storage.git_author_email,
+    ):
+        try:
+            repo.git(c=_MESSAGE_DELIVERY_GIT_DURABILITY_CONFIG).commit(
+                "--only",
+                "--no-gpg-sign",
+                "--no-verify",
+                "-m",
+                "chore: initialize archive",
+                "--",
+                pathspec,
+            )
+        except GitCommandError:
+            if not repo.head.is_valid():
+                raise
+    committed_attributes = _git_blob_at_commit(repo.head.commit, ".gitattributes")
+    if committed_attributes is None or committed_attributes[0] != _ARCHIVE_ATTRIBUTES_BYTES:
+        raise RuntimeError("Archive initialization commit is missing exact attributes")
 
 
 async def _create_repo_for_cache(root: Path, settings: Settings, cache_key: str) -> Repo:
@@ -1547,29 +1904,43 @@ async def _create_repo_for_cache(root: Path, settings: Settings, cache_key: str)
         repo: Repo | None = None
         cached_repo = False
         try:
-            git_dir = root / ".git"
-            initialized = False
-            if await _to_thread(git_dir.exists):
-                repo = await _open_repo_cancellation_safe(Repo, str(root))
-            else:
-                repo = await _open_repo_cancellation_safe(Repo.init, str(root))
-                initialized = True
+            commit_lock_path = root / ".commit.lock"
+            async with AsyncFileLock(commit_lock_path):
+                git_dir = root / ".git"
+                if await _to_thread(git_dir.exists):
+                    repo = await _open_repo_cancellation_safe(Repo, str(root))
+                else:
+                    repo = await _open_repo_cancellation_safe(Repo.init, str(root))
 
-            try:
-                def _configure_repo() -> None:
-                    with repo.config_writer() as cw:
-                        cw.set_value("commit", "gpgsign", "false")
-                        cw.set_value("core", "autocrlf", "false")
+                try:
+                    def _configure_repo() -> None:
+                        with repo.config_writer() as cw:
+                            cw.set_value("commit", "gpgsign", "false")
+                            cw.set_value("core", "autocrlf", "false")
 
-                await _to_thread(_configure_repo)
-            except Exception:
-                pass
+                    await _to_thread_cancellation_safe(_configure_repo)
+                except Exception:
+                    pass
 
-            if initialized:
-                attributes_path = root / ".gitattributes"
-                if not await _to_thread(attributes_path.exists):
-                    await _write_text(attributes_path, "*.json text\n*.md text\n")
-                await _commit(repo, settings, "chore: initialize archive", [".gitattributes"])
+                await _to_thread_cancellation_safe(
+                    _ensure_message_delivery_pending_exclude_sync,
+                    repo,
+                )
+
+                if not repo.head.is_valid():
+                    await _to_thread_cancellation_safe(
+                        _initialize_archive_commit_sync,
+                        repo,
+                        settings,
+                    )
+                await _to_thread_cancellation_safe(
+                    _fsync_archive_initialization_tree_sync,
+                    root,
+                )
+            await _to_thread_cancellation_safe(
+                _fsync_message_delivery_directory_sync,
+                root,
+            )
 
             _REPO_CACHE.put(cache_key, repo)
             cached_repo = True
@@ -1807,6 +2178,20 @@ def _is_ephemeral_archive_path(path_value: str) -> bool:
             or name.endswith(".md.lock.owner.json")
         )
     ):
+        return True
+    if (
+        len(parts) == 4
+        and parts[0] == "projects"
+        and parts[2] == "message_deliveries"
+        and re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+            r"\.[1-9][0-9]*\.[0-9a-f]{32}\.pending",
+            name,
+        )
+    ):
+        # A killed delivery publisher intentionally leaves its unique attempt
+        # behind. Only the hard-linked final ``<delivery-id>.md`` is visible to
+        # Git or archive readers; attempts are never reused or cleaned up.
         return True
     return bool(re.fullmatch(r"\..+\.\d+\.\d+\.tmp", name))
 
@@ -2364,19 +2749,26 @@ def _apply_agent_archive_rename_sync(
     )
     if not archive.repo.is_dirty(index=True, working_tree=True):
         raise RuntimeError("Identity rename produced no staged archive changes")
-    actor = Actor(
-        archive.settings.storage.git_author_name,
-        archive.settings.storage.git_author_email,
-    )
     boundary_datetime = datetime.fromisoformat(boundary)
     git_boundary = f"{int(boundary_datetime.timestamp())} +0000"
-    commit = archive.repo.index.commit(
-        f"identity: rename {old_name} to {new_name}",
-        author=actor,
-        committer=actor,
-        author_date=git_boundary,
-        commit_date=git_boundary,
-    )
+    with archive.repo.git.custom_environment(
+        GIT_AUTHOR_NAME=archive.settings.storage.git_author_name,
+        GIT_AUTHOR_EMAIL=archive.settings.storage.git_author_email,
+        GIT_COMMITTER_NAME=archive.settings.storage.git_author_name,
+        GIT_COMMITTER_EMAIL=archive.settings.storage.git_author_email,
+        GIT_AUTHOR_DATE=git_boundary,
+        GIT_COMMITTER_DATE=git_boundary,
+    ):
+        archive.repo.git.commit(
+            "--only",
+            "--no-gpg-sign",
+            "--no-verify",
+            "-m",
+            f"identity: rename {old_name} to {new_name}",
+            "--",
+            f":(literal){relative_project_root}",
+        )
+    commit = archive.repo.head.commit
     dirty_after = _archive_dirty_paths_sync(archive)
     if dirty_after:
         raise RuntimeError(
@@ -2402,8 +2794,12 @@ async def migrate_agent_archive(
     renamed_at: str,
 ) -> dict[str, object]:
     """Move current identity artifacts and record one permanent audit commit."""
-    async with archive_write_lock(archive, timeout_seconds=1.0):
-        return await _to_thread(
+    commit_lock_path = _commit_lock_path(archive.repo_root, [])
+    async with (
+        archive_write_lock(archive, timeout_seconds=1.0),
+        AsyncFileLock(commit_lock_path),
+    ):
+        return await _to_thread_cancellation_safe(
             _apply_agent_archive_rename_sync,
             archive,
             old_name,
@@ -2465,6 +2861,581 @@ async def write_file_reservation_records(
 
 async def write_file_reservation_record(archive: ProjectArchive, file_reservation: dict[str, object]) -> None:
     await write_file_reservation_records(archive, [file_reservation])
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedMessageDeliveryCommit:
+    commit_sha: str
+    blob_sha: str
+
+
+_MESSAGE_DELIVERY_GIT_DURABILITY_CONFIG = [
+    "core.fsync=all",
+    "core.fsyncMethod=fsync",
+]
+
+
+def _validate_message_delivery_publication(
+    delivery_id: str,
+    document_bytes: bytes,
+    expected_sha256: str,
+    lease_fence: int,
+) -> tuple[str, str]:
+    """Validate every caller-controlled value before touching the filesystem."""
+    if not isinstance(delivery_id, str):
+        raise TypeError("delivery_id must be a canonical UUID string")
+    try:
+        canonical_delivery_id = str(UUID(delivery_id))
+    except (ValueError, AttributeError) as exc:
+        raise ValueError("delivery_id must be a canonical UUID string") from exc
+    if delivery_id != canonical_delivery_id:
+        raise ValueError("delivery_id must use the canonical lowercase UUID representation")
+    if type(document_bytes) is not bytes:
+        raise TypeError("document_bytes must be immutable bytes")
+    try:
+        document_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("message delivery documents must be valid UTF-8") from exc
+    if b"\r" in document_bytes:
+        raise ValueError("message delivery documents must use canonical LF line endings")
+    if not isinstance(expected_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
+        raise ValueError("expected_sha256 must be a lowercase SHA-256 hex digest")
+    actual_sha256 = hashlib.sha256(document_bytes).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            f"document SHA-256 mismatch: expected {expected_sha256}, calculated {actual_sha256}"
+        )
+    if isinstance(lease_fence, bool) or not isinstance(lease_fence, int) or lease_fence < 1:
+        raise ValueError("lease_fence must be an integer greater than or equal to 1")
+    return canonical_delivery_id, actual_sha256
+
+
+def _message_delivery_paths(
+    archive: ProjectArchive,
+    delivery_id: str,
+) -> tuple[Path, Path, str]:
+    canonical_slug = _validate_project_archive_slug(archive.slug)
+    repo_root = archive.repo_root
+    projects_root = repo_root / "projects"
+    expected_archive_root = projects_root / canonical_slug
+    if archive.root != expected_archive_root:
+        raise ValueError("project archive root does not match its canonical slug")
+    delivery_dir = expected_archive_root / "message_deliveries"
+    final_path = delivery_dir / f"{delivery_id}.md"
+    _validate_archive_directory_chain_sync(
+        repo_root,
+        (projects_root, expected_archive_root, delivery_dir),
+    )
+    relative_path = final_path.relative_to(repo_root).as_posix()
+    return delivery_dir, final_path, relative_path
+
+
+def _git_blob_at_commit(commit: Any, relative_path: str) -> tuple[bytes, str] | None:
+    try:
+        obj = commit.tree / relative_path
+    except KeyError:
+        return None
+    if getattr(obj, "type", None) != "blob":
+        return None
+    data = obj.data_stream.read()
+    if not isinstance(data, bytes):
+        data = bytes(data)
+    return data, str(obj.hexsha)
+
+
+def _verify_committed_message_delivery_sync(
+    repo: Repo,
+    delivery_id: str,
+    relative_path: str,
+    document_bytes: bytes,
+    document_sha256: str,
+) -> _VerifiedMessageDeliveryCommit | None:
+    """Verify the one commit that permanently introduced a delivery path."""
+    try:
+        head_commit = repo.head.commit
+    except (ValueError, TypeError):
+        return None
+    current_blob = _git_blob_at_commit(head_commit, relative_path)
+    if current_blob is None:
+        return None
+    current_bytes, _current_blob_sha = current_blob
+    current_sha256 = hashlib.sha256(current_bytes).hexdigest()
+    if current_bytes != document_bytes or current_sha256 != document_sha256:
+        raise MessageDeliveryQuarantinedError(
+            delivery_id,
+            relative_path,
+            "committed path contains different bytes",
+            expected_sha256=document_sha256,
+            actual_sha256=current_sha256,
+        )
+
+    literal_pathspec = f":(literal){relative_path}"
+    touching_commits = list(repo.iter_commits(paths=[literal_pathspec], max_count=2))
+    if len(touching_commits) != 1:
+        raise MessageDeliveryQuarantinedError(
+            delivery_id,
+            relative_path,
+            "immutable path was changed by more than one Git commit",
+            expected_sha256=document_sha256,
+            actual_sha256=current_sha256,
+        )
+    publication_commit = touching_commits[0]
+    if len(publication_commit.parents) != 1:
+        raise MessageDeliveryQuarantinedError(
+            delivery_id,
+            relative_path,
+            "publication commit does not have exactly one parent",
+            expected_sha256=document_sha256,
+            actual_sha256=current_sha256,
+        )
+    diff_output = repo.git.diff_tree(
+        "--root",
+        "--no-commit-id",
+        "--name-status",
+        "--no-renames",
+        "-r",
+        "-z",
+        publication_commit.hexsha,
+    )
+    diff_tokens = [value for value in diff_output.split("\0") if value]
+    if diff_tokens != ["A", relative_path]:
+        raise MessageDeliveryQuarantinedError(
+            delivery_id,
+            relative_path,
+            "publication commit parent diff is not exactly one added delivery artifact",
+            expected_sha256=document_sha256,
+            actual_sha256=current_sha256,
+        )
+    publication_blob = _git_blob_at_commit(publication_commit, relative_path)
+    if publication_blob is None:
+        raise MessageDeliveryQuarantinedError(
+            delivery_id,
+            relative_path,
+            "publication commit does not contain the delivery blob",
+            expected_sha256=document_sha256,
+        )
+    publication_bytes, publication_blob_sha = publication_blob
+    if publication_bytes != document_bytes:
+        publication_sha256 = hashlib.sha256(publication_bytes).hexdigest()
+        raise MessageDeliveryQuarantinedError(
+            delivery_id,
+            relative_path,
+            "publication commit blob does not match the expected document",
+            expected_sha256=document_sha256,
+            actual_sha256=publication_sha256,
+        )
+    return _VerifiedMessageDeliveryCommit(
+        commit_sha=publication_commit.hexsha,
+        blob_sha=publication_blob_sha,
+    )
+
+
+def _read_exact_message_delivery_file(
+    delivery_id: str,
+    path: Path,
+    relative_path: str,
+    document_bytes: bytes,
+    document_sha256: str,
+) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise MessageDeliveryQuarantinedError(
+            delivery_id,
+            relative_path,
+            "delivery path is not a regular file",
+            expected_sha256=document_sha256,
+        )
+    actual_bytes = path.read_bytes()
+    actual_sha256 = hashlib.sha256(actual_bytes).hexdigest()
+    if actual_bytes != document_bytes or actual_sha256 != document_sha256:
+        raise MessageDeliveryQuarantinedError(
+            delivery_id,
+            relative_path,
+            "working-tree path contains different bytes",
+            expected_sha256=document_sha256,
+            actual_sha256=actual_sha256,
+        )
+
+
+def _write_message_delivery_attempt_sync(path: Path, document_bytes: bytes) -> None:
+    """Create one complete read-only attempt without overwriting another try."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    file_descriptor = os.open(path, flags, 0o644)
+    try:
+        view = memoryview(document_bytes)
+        written = 0
+        while written < len(view):
+            count = os.write(file_descriptor, view[written:])
+            if count <= 0:
+                raise OSError("message delivery attempt write made no progress")
+            written += count
+        try:
+            os.fchmod(file_descriptor, 0o444)
+        except (AttributeError, OSError):
+            # Windows exposes its read-only file attribute through chmod but
+            # may not implement fchmod. Publication must fail if neither
+            # mechanism can make the hard-linked inode non-writable.
+            path.chmod(0o444)
+        os.fsync(file_descriptor)
+    finally:
+        os.close(file_descriptor)
+
+
+def _fsync_message_delivery_directory_sync(directory: Path) -> None:
+    """Persist a directory boundary on POSIX; best-effort on native Windows.
+
+    Production POSIX filesystems expose directory descriptors that can be
+    ``fsync``-ed, yielding the full power-loss contract. Win32 does not document
+    ``FlushFileBuffers`` for directory handles (it returns ``ACCESS_DENIED`` in
+    native verification), and a write-through timestamp update does not prove
+    persistence of an earlier mkdir/hard-link entry. Windows therefore retains
+    file, Git-object/ref, and SQLite durable flushes plus process/OS-crash
+    recovery, while sudden-power-loss persistence of directory entries remains
+    explicitly best-effort rather than using an undocumented fail-closed hack.
+    """
+    if os.name == "nt":
+        _validate_archive_directory_component_sync(directory)
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(directory, flags)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _publish_message_delivery_link_sync(
+    delivery_id: str,
+    delivery_dir: Path,
+    final_path: Path,
+    relative_path: str,
+    document_bytes: bytes,
+    document_sha256: str,
+    lease_fence: int,
+) -> Path:
+    """Publish one complete attempt via an exclusive same-filesystem hard link."""
+    archive_root = delivery_dir.parent
+    projects_root = archive_root.parent
+    repo_root = projects_root.parent
+    _validate_archive_directory_chain_sync(
+        repo_root,
+        (projects_root, archive_root, delivery_dir),
+    )
+    directory_existed = delivery_dir.exists()
+    delivery_dir.mkdir(exist_ok=True)
+    _validate_archive_directory_chain_sync(
+        repo_root,
+        (projects_root, archive_root, delivery_dir),
+    )
+    if not directory_existed:
+        _fsync_message_delivery_directory_sync(delivery_dir.parent)
+    attempt_path = delivery_dir / f"{delivery_id}.{lease_fence}.{uuid4().hex}.pending"
+    try:
+        _write_message_delivery_attempt_sync(attempt_path, document_bytes)
+    except OSError as exc:
+        raise MessageDeliveryPendingError(delivery_id, f"attempt write failed: {exc}") from exc
+    _read_exact_message_delivery_file(
+        delivery_id,
+        attempt_path,
+        relative_path,
+        document_bytes,
+        document_sha256,
+    )
+    try:
+        os.link(attempt_path, final_path)
+    except FileExistsError:
+        _read_exact_message_delivery_file(
+            delivery_id,
+            final_path,
+            relative_path,
+            document_bytes,
+            document_sha256,
+        )
+    except OSError as exc:
+        raise MessageDeliveryPendingError(
+            delivery_id,
+            f"atomic hard-link publication is unavailable: {exc}",
+        ) from exc
+
+    # Flush the published inode again through its canonical name, then persist
+    # the directory entry on platforms with directory-fsync support.
+    final_fd = os.open(final_path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    try:
+        os.fsync(final_fd)
+    finally:
+        os.close(final_fd)
+    _fsync_message_delivery_directory_sync(delivery_dir)
+    _read_exact_message_delivery_file(
+        delivery_id,
+        final_path,
+        relative_path,
+        document_bytes,
+        document_sha256,
+    )
+    return attempt_path
+
+
+def _message_delivery_index_entry_sync(
+    repo: Repo,
+    relative_path: str,
+) -> tuple[bytes, int, int] | None:
+    """Return the delivery path's one index entry without refreshing the index."""
+    matching = [
+        (stage, entry)
+        for (path, stage), entry in repo.index.entries.items()
+        if path == relative_path
+    ]
+    if not matching:
+        return None
+    if len(matching) != 1:
+        return (b"", -1, -1)
+    stage, entry = matching[0]
+    return entry.binsha, stage, entry.mode
+
+
+def _verify_staged_message_delivery_sync(
+    repo: Repo,
+    delivery_id: str,
+    relative_path: str,
+    document_bytes: bytes,
+    document_sha256: str,
+) -> None:
+    index_entry = _message_delivery_index_entry_sync(repo, relative_path)
+    if index_entry is None:
+        raise MessageDeliveryPendingError(delivery_id, "delivery path was not staged")
+    blob_sha, stage, mode = index_entry
+    if stage != 0 or mode & 0o170000 != 0o100000 or mode & 0o111:
+        raise MessageDeliveryQuarantinedError(
+            delivery_id,
+            relative_path,
+            "the caller index contains an unmerged or non-file delivery path "
+            f"(stage={stage}, mode={oct(mode)})",
+            expected_sha256=document_sha256,
+        )
+    staged_bytes = repo.odb.stream(blob_sha).read()
+    staged_sha256 = hashlib.sha256(staged_bytes).hexdigest()
+    if staged_bytes != document_bytes or staged_sha256 != document_sha256:
+        raise MessageDeliveryQuarantinedError(
+            delivery_id,
+            relative_path,
+            "staged delivery blob contains different bytes",
+            expected_sha256=document_sha256,
+            actual_sha256=staged_sha256,
+        )
+
+
+def _stage_message_delivery_sync(repo: Repo, relative_path: str) -> None:
+    repo.git(c=_MESSAGE_DELIVERY_GIT_DURABILITY_CONFIG).add(
+        "--chmod=-x",
+        "--",
+        f":(literal){relative_path}",
+    )
+
+
+def _commit_message_delivery_sync(
+    repo: Repo,
+    archive: ProjectArchive,
+    delivery_id: str,
+    relative_path: str,
+    document_sha256: str,
+) -> None:
+    commit_message = (
+        f"mail-delivery: publish {delivery_id}\n\n"
+        f"Delivery-ID: {delivery_id}\n"
+        f"Document-SHA256: {document_sha256}\n"
+    )
+    with repo.git.custom_environment(
+        GIT_AUTHOR_NAME=archive.settings.storage.git_author_name,
+        GIT_AUTHOR_EMAIL=archive.settings.storage.git_author_email,
+        GIT_COMMITTER_NAME=archive.settings.storage.git_author_name,
+        GIT_COMMITTER_EMAIL=archive.settings.storage.git_author_email,
+    ):
+        repo.git(c=_MESSAGE_DELIVERY_GIT_DURABILITY_CONFIG).commit(
+            "--only",
+            "--no-gpg-sign",
+            "--no-verify",
+            "-m",
+            commit_message,
+            "--",
+            f":(literal){relative_path}",
+        )
+
+
+def _publish_message_delivery_sync(
+    archive: ProjectArchive,
+    delivery_id: str,
+    document_bytes: bytes,
+    document_sha256: str,
+    lease_fence: int,
+    delivery_dir: Path,
+    final_path: Path,
+    relative_path: str,
+) -> MessageDeliveryPublication:
+    def _reconcile_committed() -> _VerifiedMessageDeliveryCommit | None:
+        with Repo(str(archive.repo_root)) as repo:
+            return _verify_committed_message_delivery_sync(
+                repo,
+                delivery_id,
+                relative_path,
+                document_bytes,
+                document_sha256,
+            )
+
+    with Repo(str(archive.repo_root)) as repo:
+        try:
+            _head_commit = repo.head.commit
+        except (ValueError, TypeError) as exc:
+            raise MessageDeliveryPendingError(
+                delivery_id,
+                "archive HEAD is unborn or unreadable",
+            ) from exc
+        if repo.head.is_detached:
+            raise MessageDeliveryPendingError(delivery_id, "archive HEAD is detached")
+
+        committed = _verify_committed_message_delivery_sync(
+            repo,
+            delivery_id,
+            relative_path,
+            document_bytes,
+            document_sha256,
+        )
+        if committed is not None:
+            if not final_path.exists() and not final_path.is_symlink():
+                raise MessageDeliveryQuarantinedError(
+                    delivery_id,
+                    relative_path,
+                    "committed delivery is missing from the working tree",
+                    expected_sha256=document_sha256,
+                )
+            _read_exact_message_delivery_file(
+                delivery_id,
+                final_path,
+                relative_path,
+                document_bytes,
+                document_sha256,
+            )
+            return MessageDeliveryPublication(
+                relative_path=relative_path,
+                document_sha256=document_sha256,
+                blob_sha=committed.blob_sha,
+                commit_sha=committed.commit_sha,
+                recovered=True,
+            )
+
+        if _message_delivery_index_entry_sync(repo, relative_path) is not None:
+            _verify_staged_message_delivery_sync(
+                repo,
+                delivery_id,
+                relative_path,
+                document_bytes,
+                document_sha256,
+            )
+        if final_path.exists() or final_path.is_symlink():
+            _read_exact_message_delivery_file(
+                delivery_id,
+                final_path,
+                relative_path,
+                document_bytes,
+                document_sha256,
+            )
+        else:
+            _publish_message_delivery_link_sync(
+                delivery_id,
+                delivery_dir,
+                final_path,
+                relative_path,
+                document_bytes,
+                document_sha256,
+                lease_fence,
+            )
+
+        try:
+            _stage_message_delivery_sync(repo, relative_path)
+        except Exception as exc:
+            raise MessageDeliveryPendingError(
+                delivery_id,
+                f"Git staging failed: {exc}",
+            ) from exc
+        _verify_staged_message_delivery_sync(
+            repo,
+            delivery_id,
+            relative_path,
+            document_bytes,
+            document_sha256,
+        )
+        try:
+            _commit_message_delivery_sync(
+                repo,
+                archive,
+                delivery_id,
+                relative_path,
+                document_sha256,
+            )
+        except Exception as exc:
+            recovered = _reconcile_committed()
+            if recovered is not None:
+                return MessageDeliveryPublication(
+                    relative_path=relative_path,
+                    document_sha256=document_sha256,
+                    blob_sha=recovered.blob_sha,
+                    commit_sha=recovered.commit_sha,
+                    recovered=True,
+                )
+            raise MessageDeliveryPendingError(delivery_id, f"Git commit failed: {exc}") from exc
+
+    verified = _reconcile_committed()
+    if verified is None:
+        raise MessageDeliveryPendingError(
+            delivery_id,
+            "Git commit returned without a verifiable delivery artifact",
+        )
+    return MessageDeliveryPublication(
+        relative_path=relative_path,
+        document_sha256=document_sha256,
+        blob_sha=verified.blob_sha,
+        commit_sha=verified.commit_sha,
+        recovered=False,
+    )
+
+
+async def publish_message_delivery(
+    archive: ProjectArchive,
+    delivery_id: str,
+    document_bytes: bytes,
+    expected_sha256: str,
+    *,
+    lease_fence: int,
+) -> MessageDeliveryPublication:
+    """Publish one immutable delivery document in one isolated Git commit.
+
+    The final path is ``projects/<slug>/message_deliveries/<delivery-id>.md``.
+    A complete fsynced attempt is hard-linked to that name with exclusive
+    create semantics, so a killed writer can leave only an invisible unique
+    ``.pending`` path, never a partial canonical document. Retries reconcile a
+    committed exact blob and never create a duplicate commit.
+    """
+    canonical_delivery_id, document_sha256 = _validate_message_delivery_publication(
+        delivery_id,
+        document_bytes,
+        expected_sha256,
+        lease_fence,
+    )
+    delivery_dir, final_path, relative_path = _message_delivery_paths(
+        archive,
+        canonical_delivery_id,
+    )
+    commit_lock_path = _commit_lock_path(archive.repo_root, [relative_path])
+    async with archive_write_lock(archive), AsyncFileLock(commit_lock_path):
+        return await _to_thread_cancellation_safe(
+            _publish_message_delivery_sync,
+            archive,
+            canonical_delivery_id,
+            document_bytes,
+            document_sha256,
+            lease_fence,
+            delivery_dir,
+            final_path,
+            relative_path,
+        )
 
 
 async def write_message_bundle(
@@ -2958,25 +3929,8 @@ async def _append_attachment_audit(archive: ProjectArchive, digest: str, event: 
 
 
 def _commit_lock_path(repo_root: Path, rel_paths: Sequence[str]) -> Path:
-    """Derive the commit lock path based on project-scoped rel_paths."""
-    if not rel_paths:
-        return repo_root / ".commit.lock"
-
-    project_slug: str | None = None
-    for rel_path in rel_paths:
-        parts = PurePosixPath(rel_path).parts
-        if len(parts) < 2 or parts[0] != "projects":
-            project_slug = None
-            break
-        slug = parts[1]
-        if project_slug is None:
-            project_slug = slug
-        elif project_slug != slug:
-            project_slug = None
-            break
-
-    if project_slug:
-        return repo_root / "projects" / project_slug / ".commit.lock"
+    """Serialize every shared-index/HEAD mutation in one archive repository."""
+    del rel_paths
     return repo_root / ".commit.lock"
 
 
@@ -3134,7 +4088,7 @@ async def commit_archive_path_deletions(
             repo.close()
 
     async with AsyncFileLock(commit_lock_path):
-        return await _to_thread(_commit_only)
+        return await _to_thread_cancellation_safe(_commit_only)
 
 
 async def commit_archive_subtree_deletion(
@@ -3172,40 +4126,62 @@ async def _commit_direct(
     if not rel_paths:
         return
 
-    actor = Actor(settings.storage.git_author_name, settings.storage.git_author_email)
     repo = Repo(str(repo_root))
     attempt_repo = repo  # May diverge from `repo` during EMFILE recovery
 
     def _perform_commit(target_repo: Repo) -> None:
         _normalize_archive_text_line_endings(repo_root, rel_paths)
-        target_repo.index.add(rel_paths)
-        if target_repo.is_dirty(index=True, working_tree=True):
-            # Append commit trailers with Agent and optional Thread if present in message text
-            trailers: list[str] = []
-            # Extract simple Agent/Thread heuristics from the message subject line
-            # Expected message formats include:
-            #   mail: <Agent> -> ... | <Subject>
-            #   file_reservation: <Agent> ...
-            try:
-                # Avoid duplicating trailers if already embedded
-                lower_msg = message.lower()
-                have_agent_line = "\nagent:" in lower_msg
-                if message.startswith("mail: ") and not have_agent_line:
-                    head = message[len("mail: ") :]
-                    agent_part = head.split("->", 1)[0].strip()
-                    if agent_part:
-                        trailers.append(f"Agent: {agent_part}")
-                elif message.startswith("file_reservation: ") and not have_agent_line:
-                    head = message[len("file_reservation: ") :]
-                    agent_part = head.split(" ", 1)[0].strip()
-                    if agent_part:
-                        trailers.append(f"Agent: {agent_part}")
-            except Exception:
-                pass
-            final_message = message
-            if trailers:
-                final_message = message + "\n\n" + "\n".join(trailers) + "\n"
-            target_repo.index.commit(final_message, author=actor, committer=actor)
+        literal_pathspecs = [f":(literal){path}" for path in rel_paths]
+        target_repo.git.add("--all", "--", *literal_pathspecs)
+        staged_paths = target_repo.git.diff(
+            "--cached",
+            "--name-only",
+            "--",
+            *literal_pathspecs,
+        )
+        if not staged_paths.strip():
+            return
+
+        # Append commit trailers with Agent and optional Thread if present in message text
+        trailers: list[str] = []
+        # Extract simple Agent/Thread heuristics from the message subject line
+        # Expected message formats include:
+        #   mail: <Agent> -> ... | <Subject>
+        #   file_reservation: <Agent> ...
+        try:
+            # Avoid duplicating trailers if already embedded
+            lower_msg = message.lower()
+            have_agent_line = "\nagent:" in lower_msg
+            if message.startswith("mail: ") and not have_agent_line:
+                head = message[len("mail: ") :]
+                agent_part = head.split("->", 1)[0].strip()
+                if agent_part:
+                    trailers.append(f"Agent: {agent_part}")
+            elif message.startswith("file_reservation: ") and not have_agent_line:
+                head = message[len("file_reservation: ") :]
+                agent_part = head.split(" ", 1)[0].strip()
+                if agent_part:
+                    trailers.append(f"Agent: {agent_part}")
+        except Exception:
+            pass
+        final_message = message
+        if trailers:
+            final_message = message + "\n\n" + "\n".join(trailers) + "\n"
+        with target_repo.git.custom_environment(
+            GIT_AUTHOR_NAME=settings.storage.git_author_name,
+            GIT_AUTHOR_EMAIL=settings.storage.git_author_email,
+            GIT_COMMITTER_NAME=settings.storage.git_author_name,
+            GIT_COMMITTER_EMAIL=settings.storage.git_author_email,
+        ):
+            target_repo.git.commit(
+                "--only",
+                "--no-gpg-sign",
+                "--no-verify",
+                "-m",
+                final_message,
+                "--",
+                *literal_pathspecs,
+            )
 
     commit_lock_path = _commit_lock_path(repo_root, rel_paths)
     await _to_thread(commit_lock_path.parent.mkdir, parents=True, exist_ok=True)
@@ -3222,7 +4198,7 @@ async def _commit_direct(
             # +2 to allow: normal retries + 1 potential EMFILE recovery + 1 last resort after stale lock clean
             for attempt in range(max(2, max_index_lock_retries + 2)):
                 try:
-                    await _to_thread(_perform_commit, attempt_repo)
+                    await _to_thread_cancellation_safe(_perform_commit, attempt_repo)
                     break
                 except OSError as exc:
                     # Handle EMFILE (too many open files)
@@ -3365,18 +4341,9 @@ async def heal_archive_locks(settings: Settings, project_slug: str | None = None
         lock_path = cast(Path, lock_path_item)
         summary["locks_scanned"] += 1
         try:
-            # Use the configured age-based stale threshold UNCONDITIONALLY,
-            # regardless of whether the .owner.json sidecar is present. The
-            # previous behaviour forced ``stale_timeout=0`` whenever metadata
-            # existed, which disabled the age path and made ``heal_archive_locks``
-            # remove a lock only when the owning PID was dead. That diverged from
-            # ``collect_lock_status`` (used by ``doctor check``), which always
-            # applies the age threshold — so a lock wedged by a still-alive but
-            # interrupted server (issue #166) was reported as stale by
-            # ``doctor check`` yet skipped by ``doctor repair`` ("No stale locks
-            # to heal"). Sharing one staleness definition keeps check and repair
-            # in agreement: a lock is healed if its owner is provably gone OR its
-            # age exceeds the threshold.
+            # Share the same rule as acquisition and ``collect_lock_status``.
+            # The global commit lock is reported but never auto-removed; its
+            # recovery is an explicit offline operator action.
             lock = AsyncFileLock(lock_path, timeout_seconds=0.0)
             removed = await _to_thread(lock._cleanup_if_stale)
             if removed:

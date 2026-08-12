@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import Iterable
 from typing import Any
 
 # Per connection, not per agent. Two sessions on one host share an identity, and
@@ -58,27 +59,63 @@ KEEPALIVE_SECONDS = _float_env("AGENT_MAIL_EVENTS_KEEPALIVE_SECONDS", 15.0)
 MAX_STREAM_SECONDS = _float_env("AGENT_MAIL_EVENTS_MAX_SECONDS", 3600.0)
 
 
-def _key(project: str, agent: str) -> tuple[str, str]:
-    return (project.strip().lower(), agent.strip().lower())
+def _key(
+    project: str,
+    project_generation: str,
+    agent: str,
+    agent_generation: str,
+) -> tuple[str, str, str, str]:
+    return (
+        project.strip().lower(),
+        project_generation,
+        agent.strip().lower(),
+        agent_generation,
+    )
+
+
+def _project_key(project: str, project_generation: str) -> tuple[str, str]:
+    return (project.strip().lower(), project_generation)
 
 
 class NotificationHub:
     """Routes hints to the connections currently listening for an agent."""
 
     def __init__(self) -> None:
-        self._subscribers: dict[tuple[str, str], set[asyncio.Queue[dict[str, Any]]]] = {}
-        self._project_subscribers: dict[str, set[asyncio.Queue[dict[str, Any]]]] = {}
+        self._subscribers: dict[
+            tuple[str, str, str, str],
+            set[asyncio.Queue[dict[str, Any]]],
+        ] = {}
+        self._project_subscribers: dict[
+            tuple[str, str],
+            set[asyncio.Queue[dict[str, Any]]],
+        ] = {}
 
-    def subscribe(self, project: str, agent: str) -> asyncio.Queue[dict[str, Any]]:
-        """Register a connection and hand back the queue it should read."""
+    def subscribe(
+        self,
+        project: str,
+        project_generation: str,
+        agent: str,
+        agent_generation: str,
+    ) -> asyncio.Queue[dict[str, Any]]:
+        """Register a connection for exactly one project and agent lifetime."""
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
-        self._subscribers.setdefault(_key(project, agent), set()).add(queue)
+        self._subscribers.setdefault(
+            _key(project, project_generation, agent, agent_generation),
+            set(),
+        ).add(queue)
         return queue
 
-    def unsubscribe(self, project: str, agent: str, queue: asyncio.Queue[dict[str, Any]]) -> None:
+    def unsubscribe(
+        self,
+        project: str,
+        project_generation: str,
+        agent: str,
+        agent_generation: str,
+        queue: asyncio.Queue[dict[str, Any]],
+    ) -> None:
         """Drop a connection. Must run in a `finally`, or the hub leaks queues
         for every client that ever disconnected and publishes into them forever."""
-        key = _key(project, agent)
+        key = _key(project, project_generation, agent, agent_generation)
         listeners = self._subscribers.get(key)
         if listeners is None:
             return
@@ -86,7 +123,14 @@ class NotificationHub:
         if not listeners:
             self._subscribers.pop(key, None)
 
-    def publish(self, project: str, agent: str, event: dict[str, Any]) -> int:
+    def publish(
+        self,
+        project: str,
+        project_generation: str,
+        agent: str,
+        agent_generation: str,
+        event: dict[str, Any],
+    ) -> int:
         """Offer a hint to every connection listening for this agent.
 
         Returns how many took it. Never raises and never blocks: this is called
@@ -95,7 +139,9 @@ class NotificationHub:
         than waited on — the client already has a wake pending, and the mailbox
         it will read is authoritative either way.
         """
-        listeners = self._subscribers.get(_key(project, agent))
+        listeners = self._subscribers.get(
+            _key(project, project_generation, agent, agent_generation)
+        )
         if not listeners:
             return 0
         delivered = 0
@@ -109,8 +155,19 @@ class NotificationHub:
             delivered += 1
         return delivered
 
-    def listener_count(self, project: str, agent: str) -> int:
-        return len(self._subscribers.get(_key(project, agent), ()))
+    def listener_count(
+        self,
+        project: str,
+        project_generation: str,
+        agent: str,
+        agent_generation: str,
+    ) -> int:
+        return len(
+            self._subscribers.get(
+                _key(project, project_generation, agent, agent_generation),
+                (),
+            )
+        )
 
     # ── project-wide watchers ────────────────────────────────────────────────
     #
@@ -126,27 +183,56 @@ class NotificationHub:
     # page needs in order to decide to refetch, and nothing a reader could not
     # already obtain by pressing F5 against the same session.
 
-    def subscribe_project(self, project: str) -> asyncio.Queue[dict[str, Any]]:
+    def subscribe_project(
+        self,
+        project: str,
+        project_generation: str,
+    ) -> asyncio.Queue[dict[str, Any]]:
+        """Subscribe to exactly one immutable project-row lifetime."""
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
-        self._project_subscribers.setdefault(project.strip().lower(), set()).add(queue)
+        self._project_subscribers.setdefault(
+            _project_key(project, project_generation),
+            set(),
+        ).add(queue)
         return queue
 
-    def unsubscribe_project(self, project: str, queue: asyncio.Queue[dict[str, Any]]) -> None:
-        key = project.strip().lower()
-        listeners = self._project_subscribers.get(key)
-        if listeners is None:
-            return
-        listeners.discard(queue)
-        if not listeners:
-            self._project_subscribers.pop(key, None)
+    def subscribe_projects(
+        self,
+        projects: Iterable[tuple[str, str]],
+    ) -> asyncio.Queue[dict[str, Any]]:
+        """Use one queue for an immutable snapshot of visible project lifetimes."""
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
+        for project, project_generation in projects:
+            self._project_subscribers.setdefault(
+                _project_key(project, project_generation),
+                set(),
+            ).add(queue)
+        return queue
 
-    # Watchers of no project in particular — the index and the unified inbox,
-    # which is where a person actually lands. Kept as a reserved key rather than
-    # a second registry, so one publish reaches both scopes and neither can
-    # drift from the other.
-    ANY_PROJECT = "*"
+    def unsubscribe_project(
+        self,
+        project: str,
+        project_generation: str,
+        queue: asyncio.Queue[dict[str, Any]],
+    ) -> None:
+        self.unsubscribe_projects(((project, project_generation),), queue)
 
-    def publish_project(self, project: str) -> int:
+    def unsubscribe_projects(
+        self,
+        projects: Iterable[tuple[str, str]],
+        queue: asyncio.Queue[dict[str, Any]],
+    ) -> None:
+        """Remove a shared queue from every exact project lifetime binding."""
+        for project, project_generation in projects:
+            key = _project_key(project, project_generation)
+            listeners = self._project_subscribers.get(key)
+            if listeners is None:
+                continue
+            listeners.discard(queue)
+            if not listeners:
+                self._project_subscribers.pop(key, None)
+
+    def publish_project(self, project: str, project_generation: str) -> int:
         """Tell project watchers that something changed. Nothing else.
 
         The frame is content-free on purpose. Carrying a message id or an
@@ -156,17 +242,22 @@ class NotificationHub:
         """
         event = {"kind": "changed", "project": project}
         delivered = 0
-        for key in (project.strip().lower(), self.ANY_PROJECT):
-            for queue in tuple(self._project_subscribers.get(key, ())):
-                try:
-                    queue.put_nowait(event)
-                except Exception:
-                    continue
-                delivered += 1
+        key = _project_key(project, project_generation)
+        for queue in tuple(self._project_subscribers.get(key, ())):
+            try:
+                queue.put_nowait(event)
+            except Exception:
+                continue
+            delivered += 1
         return delivered
 
-    def project_listener_count(self, project: str) -> int:
-        return len(self._project_subscribers.get(project.strip().lower(), ()))
+    def project_listener_count(self, project: str, project_generation: str) -> int:
+        return len(
+            self._project_subscribers.get(
+                _project_key(project, project_generation),
+                (),
+            )
+        )
 
 
 hub = NotificationHub()

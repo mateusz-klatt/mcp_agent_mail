@@ -517,9 +517,10 @@ async def test_message_read_persists_to_database(isolated_env):
                 "to": [receiver_name],
                 "subject": "Test Persistence",
                 "body_md": "Testing read persistence",
+                "idempotency_key": "session-read-persistence",
             },
         )
-        message_id = send_result.data["deliveries"][0]["payload"]["id"]
+        message_id = send_result.data["deliveries"][0]["message"]["id"]
 
         # Get receiver agent ID
         project_id = await get_project_id_by_human_key(pkey("test/session/read"))
@@ -585,9 +586,10 @@ async def test_message_acknowledge_persists_to_database(isolated_env):
                 "subject": "Ack Test",
                 "body_md": "Testing ack persistence",
                 "ack_required": True,
+                "idempotency_key": "session-ack-persistence",
             },
         )
-        message_id = send_result.data["deliveries"][0]["payload"]["id"]
+        message_id = send_result.data["deliveries"][0]["message"]["id"]
 
         # Get receiver agent ID
         project_id = await get_project_id_by_human_key(pkey("test/session/ack"))

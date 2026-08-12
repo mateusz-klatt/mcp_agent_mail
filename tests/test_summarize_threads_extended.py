@@ -33,6 +33,7 @@ async def test_summarize_threads_non_llm_mode_and_limit(isolated_env):
                         "subject": f"{tid}-{i}",
                         "body_md": f"body {tid} {i}",
                         "thread_id": tid,
+                        "idempotency_key": f"summary-extended-{tid}-{i}",
                     },
                 )
         # Use summarize_thread with comma-separated thread IDs for multi-thread mode
@@ -45,5 +46,4 @@ async def test_summarize_threads_non_llm_mode_and_limit(isolated_env):
         # Expect summaries for both thread ids
         tids = {t.get("thread_id") for t in data.get("threads")}
         assert {"T1", "T2"}.issubset(tids)
-
 

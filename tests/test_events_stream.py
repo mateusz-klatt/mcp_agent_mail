@@ -16,14 +16,18 @@ import json
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import text
 
-from mcp_agent_mail import config as _config
+from mcp_agent_mail import config as _config, http as http_module
 from mcp_agent_mail.app import build_mcp_server
+from mcp_agent_mail.db import get_session
 from mcp_agent_mail.http import build_http_app
 from mcp_agent_mail.notify import QUEUE_MAXSIZE, NotificationHub, hub
 
 TOKEN = "events-bearer"
 PROJECT = "/test/events"
+PROJECT_GENERATION = "a" * 64
+AGENT_GENERATION = "b" * 64
 HEADERS = {
     "Authorization": f"Bearer {TOKEN}",
     "Content-Type": "application/json",
@@ -40,10 +44,21 @@ def _rpc_tool(name: str, arguments: dict) -> dict:
     }
 
 
-async def _subscribed(slug: str, agent: str, count: int = 1) -> None:
+async def _subscribed(
+    slug: str,
+    project_generation: str,
+    agent: str,
+    agent_generation: str,
+    count: int = 1,
+) -> None:
     """Block until the hub has registered the expected live subscriptions."""
     for _ in range(500):
-        if hub.listener_count(slug, agent) >= count:
+        if hub.listener_count(
+            slug,
+            project_generation,
+            agent,
+            agent_generation,
+        ) >= count:
             return
         await asyncio.sleep(0.01)
     raise AssertionError(f"no subscription for {agent} after 5s")
@@ -62,65 +77,159 @@ class TestHub:
         be waiting and leave the other asleep on the same mailbox.
         """
         hub = NotificationHub()
-        first = hub.subscribe("proj", "agent-1")
-        second = hub.subscribe("proj", "agent-1")
+        first = hub.subscribe("proj", PROJECT_GENERATION, "agent-1", AGENT_GENERATION)
+        second = hub.subscribe("proj", PROJECT_GENERATION, "agent-1", AGENT_GENERATION)
 
-        assert hub.publish("proj", "agent-1", {"id": 7}) == 2
+        assert hub.publish(
+            "proj",
+            PROJECT_GENERATION,
+            "agent-1",
+            AGENT_GENERATION,
+            {"id": 7},
+        ) == 2
         assert first.get_nowait() == {"id": 7}
         assert second.get_nowait() == {"id": 7}
 
     def test_publish_is_scoped_to_project_and_agent(self):
         hub = NotificationHub()
-        mine = hub.subscribe("proj", "agent-1")
-        other_agent = hub.subscribe("proj", "agent-2")
-        other_project = hub.subscribe("other", "agent-1")
+        mine = hub.subscribe("proj", PROJECT_GENERATION, "agent-1", AGENT_GENERATION)
+        other_agent = hub.subscribe("proj", PROJECT_GENERATION, "agent-2", AGENT_GENERATION)
+        other_project = hub.subscribe("other", PROJECT_GENERATION, "agent-1", AGENT_GENERATION)
 
-        assert hub.publish("proj", "agent-1", {"id": 1}) == 1
+        assert hub.publish(
+            "proj",
+            PROJECT_GENERATION,
+            "agent-1",
+            AGENT_GENERATION,
+            {"id": 1},
+        ) == 1
         assert mine.qsize() == 1
         assert other_agent.qsize() == 0
         assert other_project.qsize() == 0
+
+    def test_recreated_project_or_agent_lifetime_cannot_reuse_old_subscription(self):
+        """Mutable slug/name reuse must not route a new lifetime into an old queue."""
+        hub = NotificationHub()
+        old = hub.subscribe(
+            "proj",
+            PROJECT_GENERATION,
+            "agent-1",
+            AGENT_GENERATION,
+        )
+
+        assert hub.publish(
+            "proj",
+            "c" * 64,
+            "agent-1",
+            AGENT_GENERATION,
+            {"id": 8},
+        ) == 0
+        assert hub.publish(
+            "proj",
+            PROJECT_GENERATION,
+            "agent-1",
+            "d" * 64,
+            {"id": 9},
+        ) == 0
+        assert old.empty()
+
+    def test_recreated_project_lifetime_cannot_reuse_old_viewer_subscription(self):
+        """Project-wide browser hints use the immutable generation too."""
+        hub = NotificationHub()
+        old = hub.subscribe_project("proj", PROJECT_GENERATION)
+
+        assert hub.publish_project("proj", "c" * 64) == 0
+        assert old.empty()
+        assert hub.publish_project("proj", PROJECT_GENERATION) == 1
+        assert old.get_nowait() == {"kind": "changed", "project": "proj"}
 
     def test_keys_ignore_case_and_surrounding_space(self):
         """The endpoint resolves names case-insensitively, so the hub must
         agree — otherwise a subscriber registered under one spelling never
         receives a publish made under another."""
         hub = NotificationHub()
-        queue = hub.subscribe("Proj", " Agent-1 ")
-        assert hub.publish("proj", "AGENT-1", {"id": 2}) == 1
+        queue = hub.subscribe(
+            "Proj",
+            PROJECT_GENERATION,
+            " Agent-1 ",
+            AGENT_GENERATION,
+        )
+        assert hub.publish(
+            "proj",
+            PROJECT_GENERATION,
+            "AGENT-1",
+            AGENT_GENERATION,
+            {"id": 2},
+        ) == 1
         assert queue.qsize() == 1
 
     def test_unsubscribe_stops_delivery_and_drops_the_key(self):
         """Without this the hub grows a queue for every client that ever
         disconnected and publishes into them for the life of the process."""
         hub = NotificationHub()
-        queue = hub.subscribe("proj", "agent-1")
-        hub.unsubscribe("proj", "agent-1", queue)
+        queue = hub.subscribe("proj", PROJECT_GENERATION, "agent-1", AGENT_GENERATION)
+        hub.unsubscribe(
+            "proj",
+            PROJECT_GENERATION,
+            "agent-1",
+            AGENT_GENERATION,
+            queue,
+        )
 
-        assert hub.publish("proj", "agent-1", {"id": 3}) == 0
-        assert hub.listener_count("proj", "agent-1") == 0
+        assert hub.publish(
+            "proj",
+            PROJECT_GENERATION,
+            "agent-1",
+            AGENT_GENERATION,
+            {"id": 3},
+        ) == 0
+        assert hub.listener_count(
+            "proj",
+            PROJECT_GENERATION,
+            "agent-1",
+            AGENT_GENERATION,
+        ) == 0
         assert hub._subscribers == {}
 
     def test_unsubscribing_twice_is_harmless(self):
         """The stream's `finally` can run after the key is already gone."""
         hub = NotificationHub()
-        queue = hub.subscribe("proj", "agent-1")
-        hub.unsubscribe("proj", "agent-1", queue)
-        hub.unsubscribe("proj", "agent-1", queue)
+        queue = hub.subscribe("proj", PROJECT_GENERATION, "agent-1", AGENT_GENERATION)
+        hub.unsubscribe("proj", PROJECT_GENERATION, "agent-1", AGENT_GENERATION, queue)
+        hub.unsubscribe("proj", PROJECT_GENERATION, "agent-1", AGENT_GENERATION, queue)
 
     def test_full_queue_is_dropped_not_raised(self):
         """publish() runs inside message delivery. A notification problem must
         never turn a message that was stored and archived into an error."""
         hub = NotificationHub()
-        queue = hub.subscribe("proj", "agent-1")
+        queue = hub.subscribe("proj", PROJECT_GENERATION, "agent-1", AGENT_GENERATION)
         for _ in range(QUEUE_MAXSIZE):
-            hub.publish("proj", "agent-1", {"id": 0})
+            hub.publish(
+                "proj",
+                PROJECT_GENERATION,
+                "agent-1",
+                AGENT_GENERATION,
+                {"id": 0},
+            )
         assert queue.full()
 
-        assert hub.publish("proj", "agent-1", {"id": 99}) == 0
+        assert hub.publish(
+            "proj",
+            PROJECT_GENERATION,
+            "agent-1",
+            AGENT_GENERATION,
+            {"id": 99},
+        ) == 0
         assert queue.qsize() == QUEUE_MAXSIZE
 
     def test_publish_with_no_listeners_is_a_no_op(self):
-        assert NotificationHub().publish("proj", "nobody", {"id": 1}) == 0
+        assert NotificationHub().publish(
+            "proj",
+            PROJECT_GENERATION,
+            "nobody",
+            AGENT_GENERATION,
+            {"id": 1},
+        ) == 0
 
 
 def _build(monkeypatch):
@@ -205,7 +314,23 @@ class TestTransport:
                 {"project_key": PROJECT, "name": name, "program": "probe", "model": "probe"},
             ),
         )
-        return json.loads(_text(response))
+        registered = json.loads(_text(response))
+        async with get_session() as session:
+            lifetime = (
+                await session.execute(
+                    text(
+                        "SELECT p.project_generation, a.agent_generation "
+                        "FROM projects p JOIN agents a ON a.project_id = p.id "
+                        "WHERE p.slug = :slug AND a.name = :name"
+                    ),
+                    {"slug": self.slug, "name": name},
+                )
+            ).one()
+        self.project_generation = str(lifetime[0])
+        if not hasattr(self, "agent_generations"):
+            self.agent_generations = {}
+        self.agent_generations[name] = str(lifetime[1])
+        return registered
 
     @pytest.mark.asyncio
     async def test_ready_then_a_real_message_then_the_same_message_in_the_inbox(
@@ -251,7 +376,12 @@ class TestTransport:
             # race the subscription and pass for the wrong reason. The hub's own
             # registry is the signal that the subscription is live; frame
             # ordering is asserted after the stream completes.
-            await _subscribed(self.slug, "box-1")
+            await _subscribed(
+                self.slug,
+                self.project_generation,
+                "box-1",
+                self.agent_generations["box-1"],
+            )
 
             sent = await client.post(
                 settings.http.path,
@@ -265,14 +395,15 @@ class TestTransport:
                         "to": ["box-1"],
                         "subject": "wake me",
                         "body_md": "body",
+                        "idempotency_key": "events-wake-self",
                     },
                 ),
             )
             # send_message answers {count, deliveries, verified_sender, …}; the
-            # stored message sits inside the first delivery's payload. Reading
+            # stored message sits inside the first delivery's message. Reading
             # a top-level "id" here silently produced a KeyError rather than a
             # wrong answer, which is the good kind of failure.
-            sent_id = json.loads(_text(sent))["deliveries"][0]["payload"]["id"]
+            sent_id = json.loads(_text(sent))["deliveries"][0]["message"]["id"]
             await asyncio.wait_for(listener, timeout=10)
 
             assert frames[0].startswith(": ready"), f"ready must come first: {frames}"
@@ -321,7 +452,12 @@ class TestTransport:
                             return
 
             listener = asyncio.create_task(listen())
-            await _subscribed(self.slug, "hidden-1")
+            await _subscribed(
+                self.slug,
+                self.project_generation,
+                "hidden-1",
+                self.agent_generations["hidden-1"],
+            )
 
             await client.post(
                 settings.http.path,
@@ -336,6 +472,7 @@ class TestTransport:
                         "bcc": ["hidden-1"],
                         "subject": "quietly",
                         "body_md": "body",
+                        "idempotency_key": "events-bcc-wake",
                     },
                 ),
             )
@@ -371,7 +508,13 @@ class TestTransport:
                             return
 
             listeners = [asyncio.create_task(listen(0)), asyncio.create_task(listen(1))]
-            await _subscribed(self.slug, "box-1", count=2)
+            await _subscribed(
+                self.slug,
+                self.project_generation,
+                "box-1",
+                self.agent_generations["box-1"],
+                count=2,
+            )
 
             await client.post(
                 settings.http.path,
@@ -385,9 +528,116 @@ class TestTransport:
                         "to": ["box-1"],
                         "subject": "both",
                         "body_md": "body",
+                        "idempotency_key": "events-two-connections",
                     },
                 ),
             )
             await asyncio.wait_for(asyncio.gather(*listeners), timeout=10)
             for slot, got in enumerate(seen):
                 assert any(f.startswith("data: ") for f in got), f"listener {slot} not woken: {got}"
+
+    @pytest.mark.asyncio
+    async def test_open_stream_cannot_cross_delete_recreate_lifetime(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """A new row reusing ids, slug, and name cannot wake the old stream."""
+        monkeypatch.setattr(http_module, "KEEPALIVE_SECONDS", 0.005)
+        monkeypatch.setattr(http_module, "MAX_STREAM_SECONDS", 0.05)
+        settings, app = _build(monkeypatch)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            old = await self._register(client, settings.http.path, "box-1")
+            old_project_generation = self.project_generation
+            old_agent_generation = self.agent_generations["box-1"]
+            frames: list[str] = []
+
+            async def listen() -> None:
+                async with client.stream(
+                    "GET",
+                    "/events",
+                    params={"project": PROJECT, "agent": "box-1"},
+                    headers={
+                        **HEADERS,
+                        "X-Agent-Mail-Registration-Token": old["registration_token"],
+                    },
+                ) as response:
+                    assert response.status_code == 200
+                    async for line in response.aiter_lines():
+                        if line.strip():
+                            frames.append(line)
+
+            listener = asyncio.create_task(listen())
+            await _subscribed(
+                self.slug,
+                old_project_generation,
+                "box-1",
+                old_agent_generation,
+            )
+
+            replacement_project_generation = "c" * 64
+            replacement_agent_generation = "d" * 64
+            async with get_session() as session:
+                await session.execute(
+                    text("DELETE FROM agents WHERE id = :agent_id"),
+                    {"agent_id": int(old["id"])},
+                )
+                await session.execute(
+                    text("DELETE FROM projects WHERE id = :project_id"),
+                    {"project_id": int(old["project_id"])},
+                )
+                await session.execute(
+                    text(
+                        "INSERT INTO projects "
+                        "(id, slug, human_key, project_generation, created_at) "
+                        "VALUES (:id, :slug, :human_key, :generation, datetime('now'))"
+                    ),
+                    {
+                        "id": int(old["project_id"]),
+                        "slug": self.slug,
+                        "human_key": PROJECT,
+                        "generation": replacement_project_generation,
+                    },
+                )
+                await session.execute(
+                    text(
+                        "INSERT INTO agents "
+                        "(id, project_id, name, agent_generation, program, model, "
+                        "task_description, inception_ts, last_active_ts, "
+                        "attachments_policy, contact_policy, registration_token) "
+                        "VALUES (:id, :project_id, 'box-1', :generation, 'probe', "
+                        "'probe', 'replacement', datetime('now'), datetime('now'), "
+                        "'auto', 'auto', :token)"
+                    ),
+                    {
+                        "id": int(old["id"]),
+                        "project_id": int(old["project_id"]),
+                        "generation": replacement_agent_generation,
+                        "token": "replacement-registration-token",
+                    },
+                )
+                await session.commit()
+
+            assert hub.publish(
+                self.slug,
+                replacement_project_generation,
+                "box-1",
+                replacement_agent_generation,
+                {
+                    "kind": "message",
+                    "project": self.slug,
+                    "agent": "box-1",
+                    "id": 999,
+                },
+            ) == 0
+            await asyncio.wait_for(listener, timeout=2)
+
+        assert frames[0] == ": ready"
+        assert not any(frame.startswith("data: ") for frame in frames)
+        assert hub.listener_count(
+            self.slug,
+            old_project_generation,
+            "box-1",
+            old_agent_generation,
+        ) == 0

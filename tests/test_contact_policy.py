@@ -42,6 +42,7 @@ async def test_contact_blocked_and_contacts_only(isolated_env, monkeypatch):
                     "to": ["BlueLake"],
                     "subject": "Hi",
                     "body_md": "ping",
+                    "idempotency_key": "contact-policy-block-all",
                 },
             )
         assert "Recipient is not accepting messages" in str(excinfo.value)
@@ -59,10 +60,11 @@ async def test_contact_blocked_and_contacts_only(isolated_env, monkeypatch):
                 "to": ["BlueLake"],
                 "subject": "Hi",
                 "body_md": "ping",
+                "idempotency_key": "contact-policy-contacts-only",
             },
         )
         deliveries = r2.data.get("deliveries") or []
-        assert deliveries and deliveries[0]["payload"]["subject"] == "Hi"
+        assert deliveries and deliveries[0]["message"]["subject"] == "Hi"
 
 
 @pytest.mark.asyncio
@@ -119,6 +121,7 @@ async def test_contact_auto_allows_file_reservation_overlap(isolated_env, monkey
                 "to": ["BlueLake"],
                 "subject": "Heuristic",
                 "body_md": "file reservations overlap allows",
+                "idempotency_key": "contact-policy-reservation-overlap",
             },
         )
         assert ok.data.get("deliveries")
@@ -162,6 +165,7 @@ async def test_cross_project_contact_and_delivery(isolated_env):
                 "to": ["project:Frontend#BlueLake"],
                 "subject": "XProj",
                 "body_md": "hello",
+                "idempotency_key": "contact-policy-cross-project",
             },
         )
         deliveries = sent.data.get("deliveries") or []
@@ -325,7 +329,7 @@ async def test_macro_contact_handshake_cross_project_welcome(isolated_env):
         )
 
         welcome = res.data.get("welcome_message") or {}
-        assert welcome.get("deliveries")
+        assert welcome.get("deliveries"), res.data.get("welcome_error")
 
         inbox_blocks = await client.read_resource("resource://inbox/BlueLake?project=/data/projects/frontend&limit=10")
         raw = inbox_blocks[0].text if inbox_blocks else "{}"
@@ -455,7 +459,7 @@ async def test_macro_contact_handshake_reuses_existing_approval_without_target_a
         assert res.data["response"]["status"] == "approved"
         assert "response_error" not in res.data
         welcome = res.data["welcome_message"] or {}
-        assert welcome.get("deliveries")
+        assert welcome.get("deliveries"), res.data.get("welcome_error")
 
     async with Client(server) as recipient_client:
         inbox = await recipient_client.call_tool(
@@ -576,6 +580,7 @@ async def test_send_message_supports_at_address(isolated_env):
                 "to": [f"PinkDog@{frontend_slug}"],
                 "subject": "AT Route",
                 "body_md": "hello",
+                "idempotency_key": "contact-policy-at-address",
             },
         )
         deliveries = response.data.get("deliveries") or []

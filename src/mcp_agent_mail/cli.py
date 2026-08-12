@@ -60,6 +60,7 @@ from .app import (
 from .config import clear_settings_cache, get_settings
 from .db import (
     ensure_schema,
+    get_immediate_session,
     get_session,
     get_sqlite_sidecar_paths,
     reset_database_state,
@@ -71,6 +72,7 @@ from .models import (
     AgentLink,
     FileReservation,
     Message,
+    MessageDelivery,
     MessageRecipient,
     MessageSummary,
     Product,
@@ -5187,7 +5189,40 @@ def hard_delete_project(
         deleted_counts: dict[str, int] = {}
 
         # Phase 1: Database cleanup in a single transaction
-        async with get_session() as session:
+        async with get_immediate_session() as session:
+            delivery_history = (
+                await session.execute(
+                    select(MessageDelivery.id)
+                    .where(
+                        _sa_or(
+                            cast(
+                                ColumnElement[bool],
+                                MessageDelivery.project_id == project_id,
+                            ),
+                            cast(
+                                ColumnElement[bool],
+                                MessageDelivery.sender_project_id_snapshot == project_id,
+                            ),
+                            and_(
+                                cast(
+                                    ColumnElement[bool],
+                                    MessageDelivery.actor_kind == "agent",
+                                ),
+                                cast(
+                                    ColumnElement[bool],
+                                    MessageDelivery.actor_project_id_snapshot == project_id,
+                                ),
+                            ),
+                        )
+                    )
+                    .limit(1)
+                )
+            ).first()
+            if delivery_history is not None:
+                raise ValueError(
+                    "Project has immutable message delivery history and cannot be hard-deleted"
+                )
+
             # Collect all agent IDs
             agent_rows = await session.execute(
                 select(Agent).where(cast(Any, Agent.project_id) == project_id)
@@ -6375,107 +6410,202 @@ def projects_adopt(
     async def _apply() -> None:
         if src.id is None or dst.id is None:
             raise typer.BadParameter("Projects must be persisted (id not null).")
-        # Detect agent name conflicts
         await ensure_schema()
-        async with get_session() as session:
+        # Hold a reserved SQLite write lock from the delivery-history preflight
+        # through the final DB re-key. A delivery accepted after a plain read
+        # could otherwise make the archive move partially succeed before the
+        # pending-lifetime guards reject the DB update.
+        async with get_immediate_session() as session:
             src_agents = [row[0] for row in (await session.execute(select(Agent.name).where(cast(ColumnElement[bool], Agent.project_id == src.id)))).all()]
             dst_agents = [row[0] for row in (await session.execute(select(Agent.name).where(cast(ColumnElement[bool], Agent.project_id == dst.id)))).all()]
             dup = sorted(set(src_agents).intersection(set(dst_agents)))
             if dup:
                 raise typer.BadParameter(f"Agent name conflicts in target project: {', '.join(dup)}")
-        # Move Git artifacts
-        settings = get_settings()
-        # local import to minimize top-level churn and keep ordering stable
-        from git import Actor
-
-        from .storage import (
-            AsyncFileLock as _AsyncFileLock,
-            _commit as _archive_commit,
-            _commit_lock_path as _commit_lock_path,
-        )
-
-        async def _commit_archive_move(
-            *,
-            add_relpaths: Sequence[str],
-            remove_relpaths: Sequence[str],
-            message: str,
-        ) -> None:
-            combined_relpaths = [*remove_relpaths, *add_relpaths]
-            if not combined_relpaths:
-                return
-            actor = Actor(settings.storage.git_author_name, settings.storage.git_author_email)
-            commit_lock_path = _commit_lock_path(dst_archive.repo_root, combined_relpaths)
-            async with _AsyncFileLock(commit_lock_path):
-                if remove_relpaths:
-                    await asyncio.to_thread(
-                        dst_archive.repo.git.rm,
-                        "--cached",
-                        "--ignore-unmatch",
-                        "--",
-                        *remove_relpaths,
+            delivery_history = (
+                await session.execute(
+                    select(MessageDelivery.id)
+                    .where(
+                        _sa_or(
+                            cast(ColumnElement[bool], MessageDelivery.project_id == src.id),
+                            cast(
+                                ColumnElement[bool],
+                                MessageDelivery.sender_project_id_snapshot == src.id,
+                            ),
+                            and_(
+                                cast(
+                                    ColumnElement[bool],
+                                    MessageDelivery.actor_kind == "agent",
+                                ),
+                                cast(
+                                    ColumnElement[bool],
+                                    MessageDelivery.actor_project_id_snapshot == src.id,
+                                ),
+                            ),
+                        )
                     )
-                if add_relpaths:
-                    await asyncio.to_thread(dst_archive.repo.index.add, list(add_relpaths))
-                if await asyncio.to_thread(dst_archive.repo.is_dirty, index=True, working_tree=True):
-                    await asyncio.to_thread(
-                        dst_archive.repo.index.commit,
-                        message,
-                        author=actor,
-                        committer=actor,
-                    )
+                    .limit(1)
+                )
+            ).first()
+            if delivery_history is not None:
+                raise typer.BadParameter(
+                    "Source project has immutable message delivery history and cannot be adopted"
+                )
 
-        lock_order = tuple(sorted((src_archive, dst_archive), key=lambda archive: str(archive.lock_path)))
-        async with archive_write_lock(lock_order[0]), archive_write_lock(lock_order[1]):
-            move_candidates: list[tuple[Path, Path]] = []
-            collisions: list[str] = []
-            for path_item in sorted(src_archive.root.rglob("*"), key=str):
-                # rglob returns Path objects at runtime; cast for type checker
-                path = cast(Path, path_item)
-                if not path.is_file():
-                    continue
-                if path.name.endswith(".lock") or path.name.endswith(".lock.owner.json"):
-                    continue
-                rel_from_root = path.relative_to(src_archive.root)
-                dest_path = dst_archive.root / rel_from_root
-                if await asyncio.to_thread(dest_path.exists):
-                    collisions.append(rel_from_root.as_posix())
-                    continue
-                move_candidates.append((path, dest_path))
-            if collisions:
-                preview = ", ".join(collisions[:5])
-                suffix = f" (+{len(collisions) - 5} more)" if len(collisions) > 5 else ""
-                raise typer.BadParameter(f"Target archive already contains conflicting paths: {preview}{suffix}")
-
-            moved_relpaths: list[str] = []
-            removed_relpaths: list[str] = []
-            for source_path, dest_path in move_candidates:
-                await asyncio.to_thread(dest_path.parent.mkdir, parents=True, exist_ok=True)
-                await asyncio.to_thread(source_path.replace, dest_path)
-                moved_relpaths.append(dest_path.relative_to(dst_archive.repo_root).as_posix())
-                removed_relpaths.append(source_path.relative_to(src_archive.repo_root).as_posix())
-
-            await _commit_archive_move(
-                add_relpaths=moved_relpaths,
-                remove_relpaths=removed_relpaths,
-                message=f"adopt: move {src.slug} into {dst.slug}",
+            settings = get_settings()
+            from .storage import (
+                AsyncFileLock as _AsyncFileLock,
+                _commit as _archive_commit,
+                _commit_lock_path as _commit_lock_path,
+                _to_thread_cancellation_safe as _to_thread_cancellation_safe,
             )
 
-            # Write aliases.json under target while the same archive surfaces stay locked.
-            aliases_path = dst_archive.root / "aliases.json"
-            try:
-                existing: dict[str, Any] = {}
-                if await asyncio.to_thread(aliases_path.exists):
-                    existing = json.loads(await asyncio.to_thread(aliases_path.read_text, encoding="utf-8"))
-                former = set(existing.get("former_slugs", []))
-                former.add(src.slug)
-                existing["former_slugs"] = sorted(former)
-                await asyncio.to_thread(aliases_path.write_text, json.dumps(existing, indent=2), "utf-8")
-                rel_alias = aliases_path.relative_to(dst_archive.repo_root).as_posix()
-                await _archive_commit(dst_archive.repo, settings, f"adopt: record alias for {src.slug}", [rel_alias])
-            except Exception as exc:
-                console.print(f"[yellow]Warning: failed to write aliases.json: {exc}[/]")
-        # Re-key database rows (agents, messages, file_reservations)
-        async with get_session() as session:
+            async def _commit_archive_move(
+                *,
+                add_relpaths: Sequence[str],
+                remove_relpaths: Sequence[str],
+                message: str,
+            ) -> None:
+                combined_relpaths = [*remove_relpaths, *add_relpaths]
+                if not combined_relpaths:
+                    return
+                commit_lock_path = _commit_lock_path(
+                    dst_archive.repo_root,
+                    combined_relpaths,
+                )
+                async with _AsyncFileLock(commit_lock_path):
+                    if remove_relpaths:
+                        await _to_thread_cancellation_safe(
+                            dst_archive.repo.git.rm,
+                            "--cached",
+                            "--ignore-unmatch",
+                            "--",
+                            *remove_relpaths,
+                        )
+                    if add_relpaths:
+                        await _to_thread_cancellation_safe(
+                            dst_archive.repo.index.add,
+                            list(add_relpaths),
+                        )
+                    literal_paths = [
+                        f":(literal){path}" for path in combined_relpaths
+                    ]
+
+                    def _commit_only_moved_paths() -> None:
+                        with dst_archive.repo.git.custom_environment(
+                            GIT_AUTHOR_NAME=settings.storage.git_author_name,
+                            GIT_AUTHOR_EMAIL=settings.storage.git_author_email,
+                            GIT_COMMITTER_NAME=settings.storage.git_author_name,
+                            GIT_COMMITTER_EMAIL=settings.storage.git_author_email,
+                        ):
+                            dst_archive.repo.git.commit(
+                                "--only",
+                                "--no-gpg-sign",
+                                "--no-verify",
+                                "-m",
+                                message,
+                                "--",
+                                *literal_paths,
+                            )
+
+                    await _to_thread_cancellation_safe(_commit_only_moved_paths)
+
+            lock_order = tuple(
+                sorted(
+                    (src_archive, dst_archive),
+                    key=lambda archive: str(archive.lock_path),
+                )
+            )
+            async with (
+                archive_write_lock(lock_order[0]),
+                archive_write_lock(lock_order[1]),
+            ):
+                move_candidates: list[tuple[Path, Path]] = []
+                collisions: list[str] = []
+                for path_item in sorted(src_archive.root.rglob("*"), key=str):
+                    path = cast(Path, path_item)
+                    if not path.is_file():
+                        continue
+                    if path.name.endswith(".lock") or path.name.endswith(
+                        ".lock.owner.json"
+                    ):
+                        continue
+                    rel_from_root = path.relative_to(src_archive.root)
+                    if rel_from_root.parts[0] == "message_deliveries":
+                        raise typer.BadParameter(
+                            "Source project contains immutable message delivery artifacts "
+                            "and cannot be adopted"
+                        )
+                    dest_path = dst_archive.root / rel_from_root
+                    if await asyncio.to_thread(dest_path.exists):
+                        collisions.append(rel_from_root.as_posix())
+                        continue
+                    move_candidates.append((path, dest_path))
+                if collisions:
+                    preview = ", ".join(collisions[:5])
+                    suffix = (
+                        f" (+{len(collisions) - 5} more)"
+                        if len(collisions) > 5
+                        else ""
+                    )
+                    raise typer.BadParameter(
+                        "Target archive already contains conflicting paths: "
+                        f"{preview}{suffix}"
+                    )
+
+                moved_relpaths: list[str] = []
+                removed_relpaths: list[str] = []
+                for source_path, dest_path in move_candidates:
+                    await asyncio.to_thread(
+                        dest_path.parent.mkdir,
+                        parents=True,
+                        exist_ok=True,
+                    )
+                    await asyncio.to_thread(source_path.replace, dest_path)
+                    moved_relpaths.append(
+                        dest_path.relative_to(dst_archive.repo_root).as_posix()
+                    )
+                    removed_relpaths.append(
+                        source_path.relative_to(src_archive.repo_root).as_posix()
+                    )
+
+                await _commit_archive_move(
+                    add_relpaths=moved_relpaths,
+                    remove_relpaths=removed_relpaths,
+                    message=f"adopt: move {src.slug} into {dst.slug}",
+                )
+
+                aliases_path = dst_archive.root / "aliases.json"
+                try:
+                    existing: dict[str, Any] = {}
+                    if await asyncio.to_thread(aliases_path.exists):
+                        existing = json.loads(
+                            await asyncio.to_thread(
+                                aliases_path.read_text,
+                                encoding="utf-8",
+                            )
+                        )
+                    former = set(existing.get("former_slugs", []))
+                    former.add(src.slug)
+                    existing["former_slugs"] = sorted(former)
+                    await asyncio.to_thread(
+                        aliases_path.write_text,
+                        json.dumps(existing, indent=2),
+                        "utf-8",
+                    )
+                    rel_alias = aliases_path.relative_to(
+                        dst_archive.repo_root
+                    ).as_posix()
+                    await _archive_commit(
+                        dst_archive.repo,
+                        settings,
+                        f"adopt: record alias for {src.slug}",
+                        [rel_alias],
+                    )
+                except Exception as exc:
+                    console.print(
+                        f"[yellow]Warning: failed to write aliases.json: {exc}[/]"
+                    )
+
             from sqlalchemy import update as _update  # local import to avoid top-of-file churn
             await session.execute(_update(Agent).where(cast(ColumnElement[bool], Agent.project_id == src.id)).values(project_id=dst.id))
             await session.execute(_update(Message).where(cast(ColumnElement[bool], Message.project_id == src.id)).values(project_id=dst.id))

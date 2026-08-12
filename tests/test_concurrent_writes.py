@@ -111,6 +111,7 @@ async def test_concurrent_message_sends(isolated_env):
                 "to": [recipient],
                 "subject": subject,
                 "body_md": f"Message from {sender} to {recipient}",
+                "idempotency_key": f"concurrent-send:{subject}",
             },
         )
         return result
@@ -152,6 +153,7 @@ async def test_concurrent_messages_to_same_thread(isolated_env):
                 "subject": f"Thread Message {message_num}",
                 "body_md": f"Message {message_num} from {sender}",
                 "thread_id": "shared-thread-1",
+                "idempotency_key": f"concurrent-thread:{message_num}",
             },
         )
         return result
@@ -304,6 +306,7 @@ async def test_concurrent_inbox_fetches(isolated_env):
                     "to": [data["agents"][0]],
                     "subject": f"Test Message {i}",
                     "body_md": f"Body {i}",
+                    "idempotency_key": f"concurrent-inbox-seed:{i}",
                 },
             )
 
@@ -349,6 +352,7 @@ async def test_concurrent_inbox_fetch_during_message_send(isolated_env):
                 "to": [data["agents"][0]],
                 "subject": f"Concurrent Send {i}",
                 "body_md": f"Body {i}",
+                "idempotency_key": f"concurrent-inbox-live:{i}",
             },
         )
 
@@ -608,14 +612,14 @@ async def test_message_bundle_commit_message_is_terse(isolated_env):
 # =============================================================================
 
 
-def test_commit_lock_path_scopes_to_project(tmp_path: Path) -> None:
+def test_commit_lock_path_is_repo_global_for_single_project_paths(tmp_path: Path) -> None:
     repo_root = tmp_path
     rel_paths = [
         "projects/alpha/agents/GreenLake/profile.json",
         "projects/alpha/messages/2026/01/msg.md",
     ]
     lock_path = _commit_lock_path(repo_root, rel_paths)
-    assert lock_path == repo_root / "projects" / "alpha" / ".commit.lock"
+    assert lock_path == repo_root / ".commit.lock"
 
 
 def test_commit_lock_path_falls_back_for_mixed_paths(tmp_path: Path) -> None:
@@ -629,10 +633,31 @@ def test_commit_lock_path_falls_back_for_mixed_paths(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_commit_lock_paths_do_not_block_across_projects(tmp_path: Path) -> None:
+async def test_commit_lock_serializes_across_projects(tmp_path: Path) -> None:
     repo_root = tmp_path
     lock_a = _commit_lock_path(repo_root, ["projects/alpha/messages/2026/01/a.md"])
     lock_b = _commit_lock_path(repo_root, ["projects/beta/messages/2026/01/b.md"])
 
-    async with AsyncFileLock(lock_a, timeout_seconds=0.5), AsyncFileLock(lock_b, timeout_seconds=0.5):
-        assert lock_a != lock_b
+    assert lock_a == lock_b == repo_root / ".commit.lock"
+    first_acquired = asyncio.Event()
+    release_first = asyncio.Event()
+    second_acquired = asyncio.Event()
+
+    async def hold_first() -> None:
+        async with AsyncFileLock(lock_a, timeout_seconds=1.0):
+            first_acquired.set()
+            await release_first.wait()
+
+    async def acquire_second() -> None:
+        await first_acquired.wait()
+        async with AsyncFileLock(lock_b, timeout_seconds=1.0):
+            second_acquired.set()
+
+    first_task = asyncio.create_task(hold_first())
+    second_task = asyncio.create_task(acquire_second())
+    await first_acquired.wait()
+    await asyncio.sleep(0.05)
+    assert not second_acquired.is_set()
+    release_first.set()
+    await asyncio.gather(first_task, second_task)
+    assert second_acquired.is_set()

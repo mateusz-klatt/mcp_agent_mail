@@ -32,9 +32,9 @@ from fastmcp import Client
 from sqlalchemy import text
 from sqlmodel import select
 
-from mcp_agent_mail import app as app_module, config as _config
+from mcp_agent_mail import app as app_module, config as _config, delivery as delivery_module
 from mcp_agent_mail.app import build_mcp_server
-from mcp_agent_mail.db import ensure_schema, get_session
+from mcp_agent_mail.db import ensure_schema, get_immediate_session, get_session
 from mcp_agent_mail.models import Agent
 
 # ============================================================================
@@ -194,6 +194,7 @@ class TestConcurrentMessageSending:
                         "to": [recipient],
                         "subject": f"Message from agent {sender_idx}",
                         "body_md": f"Hello from {sender} to {recipient}!",
+                        "idempotency_key": f"concurrent-ring-{sender_idx}",
                     },
                 )
                 return {"sender_idx": sender_idx, "result": result.data}
@@ -245,6 +246,7 @@ class TestConcurrentMessageSending:
                         "to": [recipient_name],
                         "subject": f"Concurrent message {sender_idx}",
                         "body_md": f"Message body {sender_idx}",
+                        "idempotency_key": f"concurrent-same-recipient-{sender_idx}",
                     },
                 )
                 return result.data
@@ -424,6 +426,7 @@ class TestConcurrentInboxFetches:
                         "to": [recipient],
                         "subject": f"Test message {i}",
                         "body_md": "Test body",
+                        "idempotency_key": f"concurrent-inbox-seed-{i}",
                     },
                 )
 
@@ -474,6 +477,7 @@ class TestConcurrentInboxFetches:
                         "to": [agent_name],
                         "subject": f"Self message {i}",
                         "body_md": "Self message body",
+                        "idempotency_key": f"concurrent-rapid-fetch-seed-{i}",
                     },
                 )
 
@@ -580,7 +584,7 @@ class TestConcurrentArchiveWrites:
             expected_subjects = [f"Unique subject {i:04d}" for i in range(num_messages)]
 
             async def send_msg(idx: int) -> str:
-                await client.call_tool(
+                result = await client.call_tool(
                     "send_message",
                     {
                         "project_key": project_key,
@@ -588,9 +592,16 @@ class TestConcurrentArchiveWrites:
                         "to": [recipient_name],
                         "subject": expected_subjects[idx],
                         "body_md": f"Body for message {idx}",
+                        "idempotency_key": f"concurrent-integrity-{idx}",
                     },
                 )
-                return expected_subjects[idx]
+                deliveries = result.data.get("deliveries") or []
+                if deliveries and all(
+                    delivery.get("delivery", {}).get("status") == "published"
+                    for delivery in deliveries
+                ):
+                    return expected_subjects[idx]
+                return ""
 
             results = await asyncio.gather(
                 *[send_msg(i) for i in range(num_messages)],
@@ -601,7 +612,7 @@ class TestConcurrentArchiveWrites:
             # The key test is: messages that succeeded have data integrity.
             successful_subjects = []
             for _i, r in enumerate(results):
-                if not isinstance(r, Exception):
+                if not isinstance(r, Exception) and r:
                     successful_subjects.append(r)
 
             # At least 70% should succeed
@@ -629,13 +640,13 @@ class TestNoDeadlocks:
     """Test that concurrent operations don't cause deadlocks."""
 
     @pytest.mark.asyncio
-    async def test_send_message_emits_notifications_after_releasing_archive_lock(
+    async def test_send_message_emits_content_free_notifications_after_db_snapshot(
         self,
         isolated_env,
         monkeypatch,
         tmp_path,
     ):
-        """Notification signal writes must not run inside the archive critical section."""
+        """A slow mutable-name signal never holds DB serialization or old content."""
         monkeypatch.setenv("NOTIFICATIONS_ENABLED", "true")
         monkeypatch.setenv("NOTIFICATIONS_SIGNALS_DIR", str(tmp_path / "signals"))
         _config.clear_settings_cache()
@@ -649,28 +660,24 @@ class TestNoDeadlocks:
             sender_name = await setup_agent(client, project_key, "sender")
             recipient_name = await setup_agent(client, project_key, "recipient")
 
-            original_archive_write_lock = app_module._archive_write_lock
-            archive_lock_depth = 0
-
-            @asynccontextmanager
-            async def tracking_archive_write_lock(*args: Any, **kwargs: Any):
-                nonlocal archive_lock_depth
-                async with original_archive_write_lock(*args, **kwargs):
-                    archive_lock_depth += 1
-                    try:
-                        yield
-                    finally:
-                        archive_lock_depth -= 1
-
             notification_calls: list[dict[str, Any]] = []
 
-            async def tracking_emit_notification_signal(*args: Any, **kwargs: Any) -> bool:
-                notification_calls.append({"held_depth": archive_lock_depth})
-                assert archive_lock_depth == 0
+            async def tracking_emit_notification_signal(
+                _settings: Any,
+                _project_slug: str,
+                _agent_name: str,
+                metadata: Any,
+            ) -> bool:
+                async with get_immediate_session() as session:
+                    await session.commit()
+                notification_calls.append({"metadata": metadata})
                 return True
 
-            monkeypatch.setattr(app_module, "_archive_write_lock", tracking_archive_write_lock)
-            monkeypatch.setattr(app_module, "emit_notification_signal", tracking_emit_notification_signal)
+            monkeypatch.setattr(
+                delivery_module,
+                "emit_notification_signal",
+                tracking_emit_notification_signal,
+            )
 
             result = await client.call_tool(
                 "send_message",
@@ -680,12 +687,13 @@ class TestNoDeadlocks:
                     "to": [recipient_name],
                     "subject": "Notification lock scope",
                     "body_md": "hello",
+                    "idempotency_key": "concurrent-notification-lock-scope",
                 },
             )
 
         assert result.data["count"] == 1
         assert notification_calls
-        assert all(call["held_depth"] == 0 for call in notification_calls)
+        assert all(call["metadata"] is None for call in notification_calls)
 
     @pytest.mark.asyncio
     async def test_file_reservation_git_probe_happens_before_archive_lock(
@@ -777,6 +785,7 @@ class TestNoDeadlocks:
                         "to": [recipient],
                         "subject": f"Mixed op message {idx}",
                         "body_md": "Body",
+                        "idempotency_key": f"concurrent-mixed-{idx}",
                     },
                 )
                 return ("send", idx)
@@ -868,7 +877,7 @@ class TestNoDeadlocks:
                     recipient_idx = (agent_idx + j + 1) % num_agents
                     recipient = agent_names[recipient_idx]
                     subject = f"Stress-{agent_idx}-{j}"
-                    await client.call_tool(
+                    result = await client.call_tool(
                         "send_message",
                         {
                             "project_key": project_key,
@@ -876,9 +885,15 @@ class TestNoDeadlocks:
                             "to": [recipient],
                             "subject": subject,
                             "body_md": f"Stress test message from {sender}",
+                            "idempotency_key": f"concurrent-stress-{agent_idx}-{j}",
                         },
                     )
-                    sent_subjects.append(subject)
+                    deliveries = result.data.get("deliveries") or []
+                    if deliveries and all(
+                        delivery.get("delivery", {}).get("status") == "published"
+                        for delivery in deliveries
+                    ):
+                        sent_subjects.append(subject)
                 return sent_subjects
 
             # All agents work concurrently
@@ -1062,9 +1077,10 @@ class TestRaceConditions:
                     "to": [reader],
                     "subject": "Mark read test",
                     "body_md": "Test body",
+                    "idempotency_key": "concurrent-mark-read-seed",
                 },
             )
-            msg_id = send_result.data["deliveries"][0]["payload"]["id"]
+            msg_id = send_result.data["deliveries"][0]["message"]["id"]
 
             # Concurrently try to mark it read
             async def mark_read():
@@ -1111,9 +1127,10 @@ class TestRaceConditions:
                     "subject": "Ack test",
                     "body_md": "Test body",
                     "ack_required": True,
+                    "idempotency_key": "concurrent-ack-seed",
                 },
             )
-            msg_id = send_result.data["deliveries"][0]["payload"]["id"]
+            msg_id = send_result.data["deliveries"][0]["message"]["id"]
 
             # Concurrently try to acknowledge
             async def ack_msg():

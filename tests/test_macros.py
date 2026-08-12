@@ -44,7 +44,15 @@ async def test_macro_prepare_thread(isolated_env):
         )
         m1 = await client.call_tool(
             "send_message",
-            {"project_key": "Backend", "sender_name": "BlueLake", "to": ["BlueLake"], "subject": "T", "body_md": "b", "thread_id": "TKT-1"},
+            {
+                "project_key": "Backend",
+                "sender_name": "BlueLake",
+                "to": ["BlueLake"],
+                "subject": "T",
+                "body_md": "b",
+                "thread_id": "TKT-1",
+                "idempotency_key": "macro-prepare-thread-seed",
+            },
         )
         _ = m1.data
         prep = await client.call_tool(
@@ -119,4 +127,3 @@ async def test_renew_file_reservations_extends_expiry(isolated_env):
             },
         )
         assert r.data.get("renewed", 0) >= 1
-

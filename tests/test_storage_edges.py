@@ -64,11 +64,12 @@ async def test_data_uri_embed_without_conversion(isolated_env, monkeypatch):
                 "to": ["BlueLake"],
                 "subject": "InlineImg",
                 "body_md": body,
-                "convert_images": False,
+                "idempotency_key": "storage-inline-data-uri",
             },
         )
-        attachments = (res.data.get("deliveries") or [{}])[0].get("payload", {}).get("attachments") or []
-        assert any(att.get("type") == "inline" for att in attachments)
+        message = (res.data.get("deliveries") or [{}])[0].get("message", {})
+        assert message.get("body_md") == body
+        assert message.get("attachments") == []
 
 
 @pytest.mark.asyncio
@@ -101,6 +102,7 @@ async def test_missing_file_path_in_markdown_and_originals_toggle(isolated_env, 
                 "to": ["GreenCastle"],
                 "subject": "MissingPath",
                 "body_md": f"![x]({image_path})",
+                "idempotency_key": "storage-missing-markdown-path-originals-off",
             },
         )
         assert res.data.get("deliveries")
@@ -130,6 +132,7 @@ async def test_missing_file_path_in_markdown_and_originals_toggle(isolated_env, 
                 "to": ["GreenCastle"],
                 "subject": "MissingPath2",
                 "body_md": f"![x]({image_path})",
+                "idempotency_key": "storage-missing-markdown-path-originals-on",
             },
         )
         assert res2.data.get("deliveries")
@@ -172,6 +175,7 @@ async def test_create_and_list_diagnostic_backups(isolated_env):
                 "to": ["BlueLake"],
                 "subject": "Backup Seed",
                 "body_md": "seed archive repo",
+                "idempotency_key": "storage-backup-seed",
             },
         )
         assert res.data.get("deliveries")
@@ -203,6 +207,7 @@ async def test_restore_from_backup_stages_bundle_inside_storage_root(isolated_en
                 "to": ["BlueLake"],
                 "subject": "Restore Seed",
                 "body_md": "seed archive repo",
+                "idempotency_key": "storage-restore-seed",
             },
         )
         assert res.data.get("deliveries")
@@ -214,7 +219,7 @@ async def test_restore_from_backup_stages_bundle_inside_storage_root(isolated_en
     assert len(result["bundles_restored"]) == 1
 
     archive = await ensure_archive(settings, "backend")
-    assert (archive.root / "messages").exists()
+    assert (archive.root / "message_deliveries").exists()
 
 
 @pytest.mark.asyncio
@@ -1210,14 +1215,8 @@ async def test_legacy_sha1_blob_readable_alongside_sha256(isolated_env):
 
 
 @pytest.mark.asyncio
-async def test_store_image_sha256_via_mcp_send_message(isolated_env, monkeypatch):
-    """End-to-end: send_message with an image attachment produces a SHA256 path.
-
-    Verifies the full MCP → _store_image pipeline: the attachment metadata
-    returned in the delivery payload must carry a 64-char digest under the
-    ``sha1`` key (compat field name).  We enable ALLOW_ABSOLUTE_ATTACHMENT_PATHS
-    so that the absolute image path in the markdown body is resolved and stored.
-    """
+async def test_mcp_send_message_preserves_markdown_image_without_normalization(isolated_env, monkeypatch):
+    """Markdown image syntax remains body text until inline normalization exists."""
     monkeypatch.setenv("ALLOW_ABSOLUTE_ATTACHMENT_PATHS", "true")
     from mcp_agent_mail import config as _conf
     _conf.clear_settings_cache()
@@ -1240,6 +1239,7 @@ async def test_store_image_sha256_via_mcp_send_message(isolated_env, monkeypatch
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
         )
         agent_name = reg.data.get("name", "BlueLake")
+        body_md = f"![img]({img_path})"
         res = await client.call_tool(
             "send_message",
             {
@@ -1247,26 +1247,14 @@ async def test_store_image_sha256_via_mcp_send_message(isolated_env, monkeypatch
                 "sender_name": agent_name,
                 "to": [agent_name],
                 "subject": "SHA256 path test",
-                "body_md": f"![img]({img_path})",
+                "body_md": body_md,
+                "idempotency_key": "storage-markdown-image-preserved",
             },
         )
         deliveries = res.data.get("deliveries") or []
         assert deliveries, "at least one delivery expected"
-        attachments = deliveries[0].get("payload", {}).get("attachments") or []
-        assert attachments, "attachment must be present in delivery"
-
-        att = attachments[0]
-        digest = att.get("sha1")
-        assert digest is not None, "attachment metadata must include 'sha1' field"
-        assert len(digest) == 64, (
-            f"digest in attachment metadata must be 64-char SHA256, got {len(digest)}: {digest!r}"
-        )
-
-        # For file-type attachments, also verify the .webp exists on disk.
-        if att.get("type") == "file":
-            att_path = att.get("path")
-            assert att_path, "file attachment must have a 'path' field"
-            full_path = storage_root / att_path
-            assert full_path.exists(), f"webp at {att_path} not found on disk"
+        message = deliveries[0].get("message", {})
+        assert message.get("body_md") == body_md
+        assert message.get("attachments") == []
 
     img_path.unlink(missing_ok=True)

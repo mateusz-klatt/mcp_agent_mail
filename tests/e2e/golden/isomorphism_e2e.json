@@ -8,17 +8,28 @@
       "updated": 1
     },
     "cross_send": {
-      "attachments": [],
       "count": 1,
       "deliveries": [
         {
-          "payload": {
+          "delivery": {
+            "commit_sha": "<delivery_commit_sha>",
+            "document_sha256": "<delivery_document_sha256>",
+            "error": null,
+            "id": "<delivery-6>",
+            "message_id": 6,
+            "next_attempt_ts": null,
+            "request_sha256": "<delivery_request_sha256>",
+            "reused": false,
+            "status": "published"
+          },
+          "message": {
             "ack_required": false,
             "attachments": [],
             "bcc": [],
             "body_md": "approved path",
             "cc": [],
             "created_ts": "2025-01-01T00:03:26+00:00",
+            "delivery_id": "<delivery-6>",
             "from": "BlueLake",
             "from_address": "project:alpha#BlueLake",
             "from_project": "/alpha",
@@ -56,27 +67,41 @@
       "from": "BlueLake",
       "from_project": "/alpha",
       "notification_message": {
-        "ack_required": true,
-        "attachments": [],
-        "bcc": [],
-        "body_md": "deny-case",
-        "cc": [],
-        "created_ts": "2025-01-01T00:16:11+00:00",
-        "from": "BlueLake",
-        "from_address": "project:alpha#BlueLake",
-        "from_project": "/alpha",
-        "from_project_slug": "alpha",
-        "id": 5,
-        "importance": "normal",
-        "project_id": 2,
-        "reply_to": null,
-        "sender_id": 1,
-        "subject": "Contact request from BlueLake",
-        "thread_id": null,
-        "to": [
-          "JadePond"
-        ],
-        "topic": null
+        "delivery": {
+          "commit_sha": "<delivery_commit_sha>",
+          "document_sha256": "<delivery_document_sha256>",
+          "error": null,
+          "id": "<delivery-5>",
+          "message_id": 5,
+          "next_attempt_ts": null,
+          "request_sha256": "<delivery_request_sha256>",
+          "reused": false,
+          "status": "published"
+        },
+        "message": {
+          "ack_required": true,
+          "attachments": [],
+          "bcc": [],
+          "body_md": "deny-case",
+          "cc": [],
+          "created_ts": "2025-01-01T00:16:11+00:00",
+          "delivery_id": "<delivery-5>",
+          "from": "BlueLake",
+          "from_address": "project:alpha#BlueLake",
+          "from_project": "/alpha",
+          "from_project_slug": "alpha",
+          "id": 5,
+          "importance": "normal",
+          "project_id": 2,
+          "reply_to": null,
+          "sender_id": 1,
+          "subject": "Contact request from BlueLake",
+          "thread_id": null,
+          "to": [
+            "JadePond"
+          ],
+          "topic": null
+        }
       },
       "status": "pending",
       "to": "JadePond",
@@ -109,27 +134,41 @@
       "from": "BlueLake",
       "from_project": "/alpha",
       "notification_message": {
-        "ack_required": true,
-        "attachments": [],
-        "bcc": [],
-        "body_md": "e2e",
-        "cc": [],
-        "created_ts": "2025-01-01T00:16:12+00:00",
-        "from": "BlueLake",
-        "from_address": "project:alpha#BlueLake",
-        "from_project": "/alpha",
-        "from_project_slug": "alpha",
-        "id": 4,
-        "importance": "normal",
-        "project_id": 2,
-        "reply_to": null,
-        "sender_id": 1,
-        "subject": "Contact request from BlueLake",
-        "thread_id": null,
-        "to": [
-          "PurpleBear"
-        ],
-        "topic": null
+        "delivery": {
+          "commit_sha": "<delivery_commit_sha>",
+          "document_sha256": "<delivery_document_sha256>",
+          "error": null,
+          "id": "<delivery-4>",
+          "message_id": 4,
+          "next_attempt_ts": null,
+          "request_sha256": "<delivery_request_sha256>",
+          "reused": false,
+          "status": "published"
+        },
+        "message": {
+          "ack_required": true,
+          "attachments": [],
+          "bcc": [],
+          "body_md": "e2e",
+          "cc": [],
+          "created_ts": "2025-01-01T00:16:12+00:00",
+          "delivery_id": "<delivery-4>",
+          "from": "BlueLake",
+          "from_address": "project:alpha#BlueLake",
+          "from_project": "/alpha",
+          "from_project_slug": "alpha",
+          "id": 4,
+          "importance": "normal",
+          "project_id": 2,
+          "reply_to": null,
+          "sender_id": 1,
+          "subject": "Contact request from BlueLake",
+          "thread_id": null,
+          "to": [
+            "PurpleBear"
+          ],
+          "topic": null
+        }
       },
       "status": "pending",
       "to": "PurpleBear",
@@ -411,32 +450,10 @@
     "fetch_inbox": [
       {
         "ack_required": true,
-        "attachments": [
-          {
-            "media_type": "image/png",
-            "type": "inline"
-          },
-          {
-            "bytes": 68,
-            "data_base64": "UklGRjwAAABXRUJQVlA4IDAAAADQAQCdASoEAAQAAUAmJaACdLoB+AADsAD+8ut//NgVzXPv9//S4P0uD9Lg/9KQAAA=",
-            "height": 4,
-            "media_type": "image/webp",
-            "sha1": "77845f63cbd1ecb93e10fbaff7e657044d25d59f0586905c9bdbddeb2c477309",
-            "type": "inline",
-            "width": 4
-          },
-          {
-            "bytes": 116,
-            "data_base64": "UklGRmwAAABXRUJQVlA4IGAAAAAwBwCdASqAAIAAPm02mUmkIyKhIIgAgA2JaW7hdJlwH4AfgAABPbYi8yr89sReIKjntiLxBUc9sReIKjntiLxBT0AA/v3xB//+0shCuv+g1//9ehwuyvxCYaOpSAAAAAA=",
-            "height": 128,
-            "media_type": "image/webp",
-            "sha1": "327bd2315e0114040d4734fe73647863f77aeaab1ee0d486474302bb001fb586",
-            "type": "inline",
-            "width": 128
-          }
-        ],
+        "attachments": [],
         "body_md": "Launch kickoff\n\n![inline](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=)\n",
         "created_ts": "2025-01-01T00:03:21+00:00",
+        "delivery_id": "<delivery-1>",
         "from": "BlueLake",
         "id": 1,
         "importance": "normal",
@@ -453,6 +470,7 @@
         "attachments": [],
         "body_md": "Follow up details",
         "created_ts": "2025-01-01T00:03:22+00:00",
+        "delivery_id": "<delivery-2>",
         "from": "BlueLake",
         "id": 2,
         "importance": "normal",
@@ -472,31 +490,29 @@
       "messages": [
         {
           "ack_required": true,
-          "attachments": [
-            {
-              "media_type": "image/png",
-              "type": "inline"
+          "attachments": [],
+          "commit": {
+            "authored_ts": "<commit_authored_ts>",
+            "deletions": 0,
+            "delivery_id": "<delivery-1>",
+            "diff_summary": {
+              "excerpt": [
+                "+---json",
+                "<delivery_document_header>",
+                "+---",
+                "+",
+                "+Launch kickoff",
+                "+",
+                "+![inline](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=)"
+              ],
+              "hunks": 1
             },
-            {
-              "bytes": 68,
-              "data_base64": "UklGRjwAAABXRUJQVlA4IDAAAADQAQCdASoEAAQAAUAmJaACdLoB+AADsAD+8ut//NgVzXPv9//S4P0uD9Lg/9KQAAA=",
-              "height": 4,
-              "media_type": "image/webp",
-              "sha1": "77845f63cbd1ecb93e10fbaff7e657044d25d59f0586905c9bdbddeb2c477309",
-              "type": "inline",
-              "width": 4
-            },
-            {
-              "bytes": 116,
-              "data_base64": "UklGRmwAAABXRUJQVlA4IGAAAAAwBwCdASqAAIAAPm02mUmkIyKhIIgAgA2JaW7hdJlwH4AfgAABPbYi8yr89sReIKjntiLxBUc9sReIKjntiLxBT0AA/v3xB//+0shCuv+g1//9ehwuyvxCYaOpSAAAAAA=",
-              "height": 128,
-              "media_type": "image/webp",
-              "sha1": "327bd2315e0114040d4734fe73647863f77aeaab1ee0d486474302bb001fb586",
-              "type": "inline",
-              "width": 128
-            }
-          ],
+            "hexsha": "<commit_hexsha>",
+            "insertions": 7,
+            "summary": "mail-delivery: publish <delivery-1>"
+          },
           "created_ts": "2025-01-01T00:03:21+00:00",
+          "delivery_id": "<delivery-1>",
           "from": "BlueLake",
           "id": 1,
           "importance": "normal",
@@ -511,7 +527,26 @@
         {
           "ack_required": false,
           "attachments": [],
+          "commit": {
+            "authored_ts": "<commit_authored_ts>",
+            "deletions": 0,
+            "delivery_id": "<delivery-2>",
+            "diff_summary": {
+              "excerpt": [
+                "+---json",
+                "<delivery_document_header>",
+                "+---",
+                "+",
+                "+Follow up details"
+              ],
+              "hunks": 1
+            },
+            "hexsha": "<commit_hexsha>",
+            "insertions": 5,
+            "summary": "mail-delivery: publish <delivery-2>"
+          },
           "created_ts": "2025-01-01T00:03:22+00:00",
+          "delivery_id": "<delivery-2>",
           "from": "BlueLake",
           "id": 2,
           "importance": "normal",
@@ -532,37 +567,35 @@
       "messages": [
         {
           "ack_required": true,
-          "attachments": [
-            {
-              "media_type": "image/png",
-              "type": "inline"
-            },
-            {
-              "bytes": 68,
-              "data_base64": "UklGRjwAAABXRUJQVlA4IDAAAADQAQCdASoEAAQAAUAmJaACdLoB+AADsAD+8ut//NgVzXPv9//S4P0uD9Lg/9KQAAA=",
-              "height": 4,
-              "media_type": "image/webp",
-              "sha1": "77845f63cbd1ecb93e10fbaff7e657044d25d59f0586905c9bdbddeb2c477309",
-              "type": "inline",
-              "width": 4
-            },
-            {
-              "bytes": 116,
-              "data_base64": "UklGRmwAAABXRUJQVlA4IGAAAAAwBwCdASqAAIAAPm02mUmkIyKhIIgAgA2JaW7hdJlwH4AfgAABPbYi8yr89sReIKjntiLxBUc9sReIKjntiLxBT0AA/v3xB//+0shCuv+g1//9ehwuyvxCYaOpSAAAAAA=",
-              "height": 128,
-              "media_type": "image/webp",
-              "sha1": "327bd2315e0114040d4734fe73647863f77aeaab1ee0d486474302bb001fb586",
-              "type": "inline",
-              "width": 128
-            }
-          ],
+          "attachments": [],
           "bcc": [
             "StormyCanyon"
           ],
           "cc": [
             "GreenCastle"
           ],
+          "commit": {
+            "authored_ts": "<commit_authored_ts>",
+            "deletions": 0,
+            "delivery_id": "<delivery-1>",
+            "diff_summary": {
+              "excerpt": [
+                "+---json",
+                "<delivery_document_header>",
+                "+---",
+                "+",
+                "+Launch kickoff",
+                "+",
+                "+![inline](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=)"
+              ],
+              "hunks": 1
+            },
+            "hexsha": "<commit_hexsha>",
+            "insertions": 7,
+            "summary": "mail-delivery: publish <delivery-1>"
+          },
           "created_ts": "2025-01-01T00:03:21+00:00",
+          "delivery_id": "<delivery-1>",
           "from": "BlueLake",
           "id": 1,
           "importance": "normal",
@@ -581,7 +614,26 @@
           "attachments": [],
           "bcc": [],
           "cc": [],
+          "commit": {
+            "authored_ts": "<commit_authored_ts>",
+            "deletions": 0,
+            "delivery_id": "<delivery-2>",
+            "diff_summary": {
+              "excerpt": [
+                "+---json",
+                "<delivery_document_header>",
+                "+---",
+                "+",
+                "+Follow up details"
+              ],
+              "hunks": 1
+            },
+            "hexsha": "<commit_hexsha>",
+            "insertions": 5,
+            "summary": "mail-delivery: publish <delivery-2>"
+          },
           "created_ts": "2025-01-01T00:03:22+00:00",
+          "delivery_id": "<delivery-2>",
           "from": "BlueLake",
           "id": 2,
           "importance": "normal",
@@ -605,6 +657,7 @@
       "attachments": [],
       "body_md": "beta side",
       "created_ts": "2025-01-01T00:03:23+00:00",
+      "delivery_id": "<delivery-3>",
       "from": "PurpleBear",
       "id": 3,
       "importance": "normal",
@@ -620,6 +673,7 @@
       "attachments": [],
       "body_md": "Follow up details",
       "created_ts": "2025-01-01T00:03:22+00:00",
+      "delivery_id": "<delivery-2>",
       "from": "BlueLake",
       "id": 2,
       "importance": "normal",
@@ -632,32 +686,10 @@
     },
     "message": {
       "ack_required": true,
-      "attachments": [
-        {
-          "media_type": "image/png",
-          "type": "inline"
-        },
-        {
-          "bytes": 68,
-          "data_base64": "UklGRjwAAABXRUJQVlA4IDAAAADQAQCdASoEAAQAAUAmJaACdLoB+AADsAD+8ut//NgVzXPv9//S4P0uD9Lg/9KQAAA=",
-          "height": 4,
-          "media_type": "image/webp",
-          "sha1": "77845f63cbd1ecb93e10fbaff7e657044d25d59f0586905c9bdbddeb2c477309",
-          "type": "inline",
-          "width": 4
-        },
-        {
-          "bytes": 116,
-          "data_base64": "UklGRmwAAABXRUJQVlA4IGAAAAAwBwCdASqAAIAAPm02mUmkIyKhIIgAgA2JaW7hdJlwH4AfgAABPbYi8yr89sReIKjntiLxBUc9sReIKjntiLxBT0AA/v3xB//+0shCuv+g1//9ehwuyvxCYaOpSAAAAAA=",
-          "height": 128,
-          "media_type": "image/webp",
-          "sha1": "327bd2315e0114040d4734fe73647863f77aeaab1ee0d486474302bb001fb586",
-          "type": "inline",
-          "width": 128
-        }
-      ],
+      "attachments": [],
       "body_md": "Launch kickoff\n\n![inline](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=)\n",
       "created_ts": "2025-01-01T00:03:21+00:00",
+      "delivery_id": "<delivery-1>",
       "from": "BlueLake",
       "id": 1,
       "importance": "normal",
@@ -676,6 +708,7 @@
         "attachments": [],
         "body_md": "beta side",
         "created_ts": "2025-01-01T00:03:23+00:00",
+        "delivery_id": "<delivery-3>",
         "from": "PurpleBear",
         "id": 3,
         "importance": "normal",
@@ -777,28 +810,7 @@
     }
   },
   "search": {
-    "http_fts": {
-      "has_snippet_block": true,
-      "hits_badge_count": 0,
-      "mark_count": 1,
-      "subject_count": 17,
-      "subjects_sample": [
-        "Multiple AI Assistants",
-        "Coordinate & Communicate",
-        "Prevent Conflicts"
-      ]
-    },
-    "http_like_fallback": {
-      "has_snippet_block": false,
-      "hits_badge_count": 0,
-      "mark_count": 0,
-      "subject_count": 16,
-      "subjects_sample": [
-        "Multiple AI Assistants",
-        "Coordinate & Communicate",
-        "Prevent Conflicts"
-      ]
-    },
+    "legacy_http_status": 404,
     "tool_results": {
       "result": [
         {

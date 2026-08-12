@@ -38,6 +38,7 @@ async def test_bench_summarize_thread(bench_factory):
                     "subject": f"Thread update {i}",
                     "body_md": f"Action item {i}: {make_message_body(seed, i, message_size)}",
                     "thread_id": thread_id,
+                    "idempotency_key": f"benchmark-summarize-{i}",
                 },
             )
 

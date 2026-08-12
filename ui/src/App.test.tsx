@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -19,16 +19,24 @@ import {
 } from "./account";
 import i18n from "./i18n";
 import {
+  composeMessage,
   inboxPageSize,
   isCanonicalInlineRasterImageSource,
+  isSafeMarkdownLinkTarget,
+  loadDeliveryStatus,
   loadInbox,
   loadMessage,
   loadProjects,
+  MailHttpError,
   mailRouteHash,
+  markdownUrlTransform,
   parseInboxPage,
+  parseDeliveryResult,
   parseMailRoute,
   parseMessageDetail,
   parseProjects,
+  replyToMessage,
+  retryDelivery,
 } from "./mail";
 import {
   loadPreferences,
@@ -41,6 +49,7 @@ import {
   adminProjects,
   adminUser,
   disabledUser,
+  deliveryResponse,
   inboxResponse,
   memberProfile,
   memberUser,
@@ -56,7 +65,7 @@ import {
 
 const preferencesUrl = "*/mail/api/v1/me/preferences";
 
-describe("legacy Markdown image boundary", () => {
+describe("Markdown resource boundaries", () => {
   const inline = (mime: string, raw: string) =>
     `data:image/${mime};base64,${window.btoa(raw)}`;
 
@@ -92,6 +101,219 @@ describe("legacy Markdown image boundary", () => {
     ["wrong WebP marker", inline("webp", "RIFFxxxxNOPErest")],
   ])("rejects %s", (_label, source) => {
     expect(isCanonicalInlineRasterImageSource(source)).toBe(false);
+  });
+
+  it.each([
+    ["HTTP", "http://example.test/path"],
+    ["HTTPS", "HTTPS://example.test/path"],
+    ["mailto", "mailto:operator@example.test"],
+    ["root-relative", "/mail/inbox"],
+    ["path-relative", "../messages/101"],
+    ["query-relative", "?project=11"],
+    ["percent-encoded Polish", "https://example.test/Wroc%C5%82aw"],
+    ["percent-encoded CJK", "https://example.test/%E8%B7%AF%E5%BE%84"],
+    ["percent-encoded emoji", "https://example.test/%F0%9F%94%90"],
+    ["encoded percent sign", "https://example.test/100%25"],
+    ["double-encoded Polish", "https://example.test/Wroc%25C5%2582aw"],
+  ])("accepts a safe %s link target", (_label, target) => {
+    expect(isSafeMarkdownLinkTarget(target)).toBe(true);
+  });
+
+  it.each([
+    ["empty target", ""],
+    ["surrounding whitespace", " https://example.test"],
+    ["literal control character", "https://example.test/\u0001probe"],
+    ["encoded control character", "mailto:test@example.test?subject=%0aBcc"],
+    ["encoded C1 control character", "https://example.test/%C2%85probe"],
+    ["double-encoded control character", "https://example.test/%250aprobe"],
+    ["double-encoded C1 control character", "https://example.test/%25C2%2585probe"],
+    ["malformed percent escape", "https://example.test/%probe"],
+    ["fragment target", "#checkpoint"],
+    ["relative target with fragment", "/mail/#account"],
+    ["protocol-relative target", "//tracker.invalid/path"],
+    ["backslash target", "\\tracker.invalid/path"],
+    ["JavaScript", "javascript:alert(1)"],
+    ["data", "data:text/html,unsafe"],
+    ["blob", "blob:https://example.test/id"],
+  ])("rejects a %s link target", (_label, target) => {
+    expect(isSafeMarkdownLinkTarget(target)).toBe(false);
+  });
+
+  it("fails closed for every transformed URL attribute", () => {
+    const png = inline("png", "\x89PNG\r\n\x1a\nrest");
+
+    expect(markdownUrlTransform(png, "src")).toBe(png);
+    expect(markdownUrlTransform("https://tracker.invalid/pixel", "src"))
+      .toBeUndefined();
+    expect(markdownUrlTransform("https://example.test", "href")).toBe(
+      "https://example.test",
+    );
+    expect(markdownUrlTransform("javascript:alert(1)", "href"))
+      .toBeUndefined();
+    expect(markdownUrlTransform("#checkpoint", "href")).toBeUndefined();
+    expect(markdownUrlTransform("https://example.test", "cite"))
+      .toBeUndefined();
+  });
+});
+
+describe("Durable mail client", () => {
+  it("parses and sends the exact compose, reply, and status contracts", async () => {
+    const requests: Array<{ method: string; path: string; body: unknown }> = [];
+    server.use(
+      http.post("*/mail/api/v1/projects/:projectId/messages", async ({ request }) => {
+        requests.push({
+          method: request.method,
+          path: new URL(request.url).pathname,
+          body: await request.json(),
+        });
+        return HttpResponse.json(deliveryResponse);
+      }),
+      http.post(
+        "*/mail/api/v1/projects/:projectId/messages/:messageId/replies",
+        async ({ request }) => {
+          requests.push({
+            method: request.method,
+            path: new URL(request.url).pathname,
+            body: await request.json(),
+          });
+          return HttpResponse.json(deliveryResponse);
+        },
+      ),
+      http.get("*/mail/api/v1/deliveries/:deliveryId", ({ request }) => {
+        requests.push({
+          method: request.method,
+          path: new URL(request.url).pathname,
+          body: null,
+        });
+        return HttpResponse.json({ ...deliveryResponse, reused: true });
+      }),
+      http.post("*/mail/api/v1/deliveries/:deliveryId/retry", ({ request }) => {
+        requests.push({
+          method: request.method,
+          path: new URL(request.url).pathname,
+          body: {},
+        });
+        return HttpResponse.json({ ...deliveryResponse, reused: true });
+      }),
+    );
+
+    await expect(
+      composeMessage(projectOne.id, {
+        idempotency_key: "compose-key",
+        recipients: ["GreenDog"],
+        subject: "Subject",
+        body_md: "Body",
+        thread_id: null,
+      }),
+    ).resolves.toEqual(deliveryResponse);
+    await expect(
+      replyToMessage(projectOne.id, messageOne.id, {
+        idempotency_key: "reply-key",
+        body_md: "Reply",
+      }),
+    ).resolves.toEqual(deliveryResponse);
+    await expect(loadDeliveryStatus(deliveryResponse.id)).resolves.toEqual({
+      ...deliveryResponse,
+      reused: true,
+    });
+    await expect(retryDelivery(deliveryResponse.id)).resolves.toEqual({
+      ...deliveryResponse,
+      reused: true,
+    });
+    expect(requests).toEqual([
+      {
+        method: "POST",
+        path: `/mail/api/v1/projects/${projectOne.id}/messages`,
+        body: {
+          idempotency_key: "compose-key",
+          recipients: ["GreenDog"],
+          subject: "Subject",
+          body_md: "Body",
+          thread_id: null,
+        },
+      },
+      {
+        method: "POST",
+        path: `/mail/api/v1/projects/${projectOne.id}/messages/${messageOne.id}/replies`,
+        body: { idempotency_key: "reply-key", body_md: "Reply" },
+      },
+      {
+        method: "GET",
+        path: `/mail/api/v1/deliveries/${deliveryResponse.id}`,
+        body: null,
+      },
+      {
+        method: "POST",
+        path: `/mail/api/v1/deliveries/${deliveryResponse.id}/retry`,
+        body: {},
+      },
+    ]);
+  });
+
+  it.each([
+    [{ ...deliveryResponse, id: "bad" }],
+    [{ ...deliveryResponse, status: "lost" }],
+    [{ ...deliveryResponse, reused: "yes" }],
+    [{ ...deliveryResponse, message_id: 0 }],
+    [{ ...deliveryResponse, commit_sha: "bad" }],
+    [{ ...deliveryResponse, next_attempt_ts: "bad" }],
+    [{ ...deliveryResponse, debug: true }],
+  ])("rejects a malformed durable response %#", (payload) => {
+    expect(() => parseDeliveryResult(payload)).toThrow(TypeError);
+  });
+
+  it("rejects invalid route identities before sending", () => {
+    expect(() =>
+      composeMessage(0, {
+        idempotency_key: "key",
+        recipients: ["Agent"],
+        subject: "Subject",
+        body_md: "Body",
+        thread_id: null,
+      }),
+    ).toThrow(TypeError);
+    expect(() =>
+      replyToMessage(projectOne.id, 0, {
+        idempotency_key: "key",
+        body_md: "Body",
+      }),
+    ).toThrow(TypeError);
+    expect(() => loadDeliveryStatus("not-a-delivery")).toThrow(TypeError);
+    expect(() => retryDelivery("not-a-delivery")).toThrow(TypeError);
+  });
+
+  it("keeps typed error codes without trusting an invalid proxy body", async () => {
+    server.use(
+      http.post("*/mail/api/v1/projects/:projectId/messages", () =>
+        HttpResponse.json(
+          { detail: { code: "idempotency_conflict" } },
+          { status: 409 },
+        ),
+      ),
+      http.post(
+        "*/mail/api/v1/projects/:projectId/messages/:messageId/replies",
+        () => new HttpResponse("upstream unavailable", { status: 503 }),
+      ),
+    );
+    const composeFailure = await composeMessage(projectOne.id, {
+      idempotency_key: "key",
+      recipients: ["GreenDog"],
+      subject: "Subject",
+      body_md: "Body",
+      thread_id: null,
+    }).catch((error: unknown) => error);
+    const replyFailure = await replyToMessage(projectOne.id, messageOne.id, {
+      idempotency_key: "key",
+      body_md: "Body",
+    }).catch((error: unknown) => error);
+
+    expect(composeFailure).toBeInstanceOf(MailHttpError);
+    expect(composeFailure).toMatchObject({
+      status: 409,
+      code: "idempotency_conflict",
+    });
+    expect(replyFailure).toBeInstanceOf(MailHttpError);
+    expect(replyFailure).toMatchObject({ status: 503, code: null });
   });
 });
 
@@ -129,7 +351,7 @@ class FakeEventSource {
 
 describe("Hermes landing shell", () => {
   beforeEach(async () => {
-    window.history.replaceState({}, "", "/mail/v2/");
+    window.history.replaceState({}, "", "/mail/");
     document.documentElement.lang = "en";
     await i18n.changeLanguage("en");
     FakeEventSource.instances = [];
@@ -148,13 +370,14 @@ describe("Hermes landing shell", () => {
 
     expect(await screen.findByRole("heading", { name: "Inbox" })).toBeVisible();
     expect(await screen.findByText(messageOne.subject)).toBeVisible();
-    expect(screen.getByText("Mailbox read-only")).toBeVisible();
+    expect(screen.getByText("Durable delivery")).toBeVisible();
     const navigation = screen.getByRole("navigation", { name: "Primary navigation" });
     const links = within(navigation).getAllByRole("link");
-    expect(links).toHaveLength(4);
+    expect(links).toHaveLength(5);
     expect(links.map((link) => link.textContent)).toEqual([
       "Projects",
       "Inbox",
+      "Compose",
       "Account",
       "Administration",
     ]);
@@ -183,7 +406,7 @@ describe("Hermes landing shell", () => {
 
   it("opens a real project inbox from the projects view", async () => {
     const user = userEvent.setup();
-    window.history.replaceState({}, "", "/mail/v2/#projects");
+    window.history.replaceState({}, "", "/mail/#projects");
     render(<App />);
     await waitForEnglishPreferences();
 
@@ -200,6 +423,317 @@ describe("Hermes landing shell", () => {
     expect(screen.getByLabelText("Filter by project")).toHaveValue(
       String(projectOne.id),
     );
+  });
+
+  it("composes an idempotent durable message from the administrator route", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/mail/#compose");
+    let requestBody: unknown;
+    server.use(
+      http.post("*/mail/api/v1/projects/:projectId/messages", async ({ request }) => {
+        requestBody = await request.json();
+        return HttpResponse.json(deliveryResponse);
+      }),
+    );
+    render(<App />);
+    await waitForEnglishPreferences();
+
+    expect(await screen.findByRole("heading", { name: "Compose" })).toBeVisible();
+    await user.selectOptions(screen.getByLabelText("Project"), String(projectOne.id));
+    await user.type(screen.getByLabelText("Recipients"), "GreenDog, BlueLake");
+    await user.type(screen.getByLabelText("Subject"), "Review the release");
+    await user.type(screen.getByLabelText("Thread ID (optional)"), "release-2026");
+    await user.type(screen.getByLabelText("Message in Markdown"), "**Proceed** after UAT.");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+
+    expect(await screen.findByText("Published exactly once.")).toBeVisible();
+    expect(screen.getByText(`Delivery reference: ${deliveryResponse.id}`)).toBeVisible();
+    expect(requestBody).toEqual({
+      idempotency_key: expect.stringMatching(/^human-ui:/u),
+      recipients: ["GreenDog", "BlueLake"],
+      subject: "Review the release",
+      body_md: "**Proceed** after UAT.",
+      thread_id: "release-2026",
+    });
+    expect(screen.getByLabelText("Recipients")).toHaveValue("");
+    expect(screen.getByLabelText("Subject")).toHaveValue("");
+    expect(screen.getByLabelText("Message in Markdown")).toHaveValue("");
+  });
+
+  it("replies with only human text while Hermes derives routing", async () => {
+    const user = userEvent.setup();
+    let requestBody: unknown;
+    server.use(
+      http.post(
+        "*/mail/api/v1/projects/:projectId/messages/:messageId/replies",
+        async ({ request }) => {
+          requestBody = await request.json();
+          return HttpResponse.json(deliveryResponse);
+        },
+      ),
+    );
+    render(<App />);
+    await user.click(
+      await screen.findByRole("link", {
+        name: new RegExp(`Open message.*${messageOne.subject}`),
+      }),
+    );
+    await user.type(await screen.findByLabelText("Reply in Markdown"), "Approved.");
+    await user.click(screen.getByRole("button", { name: "Send reply" }));
+
+    expect(await screen.findByText("Published exactly once.")).toBeVisible();
+    expect(requestBody).toEqual({
+      idempotency_key: expect.stringMatching(/^human-ui:/u),
+      body_md: "Approved.",
+    });
+    expect(screen.getByLabelText("Reply in Markdown")).toHaveValue("");
+  });
+
+  it("reuses the same compose key through conflict and failed or pending polls", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/mail/#compose");
+    const keys: string[] = [];
+    let writes = 0;
+    let polls = 0;
+    server.use(
+      http.post("*/mail/api/v1/projects/:projectId/messages", async ({ request }) => {
+        writes += 1;
+        const body = (await request.json()) as { idempotency_key: string };
+        keys.push(body.idempotency_key);
+        return writes === 1
+          ? HttpResponse.json(
+              { detail: { code: "idempotency_conflict" } },
+              { status: 409 },
+            )
+          : HttpResponse.json({
+              ...deliveryResponse,
+              status: "pending",
+              message_id: null,
+              commit_sha: null,
+              next_attempt_ts: "2026-08-12T20:30:00Z",
+            });
+      }),
+      http.post("*/mail/api/v1/deliveries/:deliveryId/retry", () => {
+        polls += 1;
+        if (polls === 1) {
+          return HttpResponse.json(
+            { detail: "private delivery failure" },
+            { status: 503 },
+          );
+        }
+        if (polls === 2) {
+          return HttpResponse.json({
+            ...deliveryResponse,
+            status: "pending",
+            message_id: null,
+            commit_sha: null,
+            next_attempt_ts: "2026-08-12T20:31:00Z",
+            reused: true,
+          });
+        }
+        return HttpResponse.json({ ...deliveryResponse, reused: true });
+      }),
+    );
+    render(<App />);
+    await waitForEnglishPreferences();
+    await user.selectOptions(screen.getByLabelText("Project"), String(projectOne.id));
+    await user.type(screen.getByLabelText("Recipients"), "GreenDog");
+    await user.type(screen.getByLabelText("Subject"), "Retry safely");
+    await user.type(screen.getByLabelText("Message in Markdown"), "Keep this text.");
+
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    expect(await screen.findByText(/conflicts with an earlier request/)).toBeVisible();
+    expect(screen.getByLabelText("Message in Markdown")).toHaveValue("Keep this text.");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    expect(await screen.findByText("Accepted and waiting to publish.")).toBeVisible();
+    expect(keys).toHaveLength(2);
+    expect(keys[1]).toBe(keys[0]);
+
+    await user.click(screen.getByRole("button", { name: "Check status" }));
+    expect(await screen.findByText(/could not be submitted/)).toBeVisible();
+    expect(screen.queryByText("private delivery failure")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Message in Markdown")).toHaveValue("Keep this text.");
+
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    expect(await screen.findByText("Accepted and waiting to publish.")).toBeVisible();
+    expect(keys).toHaveLength(3);
+    expect(new Set(keys)).toEqual(new Set([keys[0]]));
+
+    await user.click(screen.getByRole("button", { name: "Check status" }));
+    await waitFor(() => expect(polls).toBe(2));
+    expect(screen.getByText("Accepted and waiting to publish.")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Check status" })).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "Check status" }));
+    expect(await screen.findByText("Published exactly once.")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Check status" })).not.toBeInTheDocument();
+  });
+
+  it("keeps a reply idempotent through submission and status failures", async () => {
+    const user = userEvent.setup();
+    const keys: string[] = [];
+    let writes = 0;
+    let polls = 0;
+    server.use(
+      http.post(
+        "*/mail/api/v1/projects/:projectId/messages/:messageId/replies",
+        async ({ request }) => {
+          writes += 1;
+          const body = (await request.json()) as { idempotency_key: string };
+          keys.push(body.idempotency_key);
+          if (writes === 1) {
+            return HttpResponse.json(
+              { detail: "private reply failure" },
+              { status: 503 },
+            );
+          }
+          return HttpResponse.json({
+            ...deliveryResponse,
+            status: "pending",
+            message_id: null,
+            commit_sha: null,
+            next_attempt_ts: "2026-08-12T20:32:00Z",
+          });
+        },
+      ),
+      http.post("*/mail/api/v1/deliveries/:deliveryId/retry", () => {
+        polls += 1;
+        if (polls === 1) {
+          return HttpResponse.json(
+            { detail: "private status failure" },
+            { status: 503 },
+          );
+        }
+        if (polls === 2) {
+          return HttpResponse.json({
+            ...deliveryResponse,
+            status: "pending",
+            message_id: null,
+            commit_sha: null,
+            next_attempt_ts: "2026-08-12T20:33:00Z",
+            reused: true,
+          });
+        }
+        return HttpResponse.json({ ...deliveryResponse, reused: true });
+      }),
+    );
+    render(<App />);
+    await user.click(
+      await screen.findByRole("link", {
+        name: new RegExp(`Open message.*${messageOne.subject}`),
+      }),
+    );
+    await user.type(await screen.findByLabelText("Reply in Markdown"), "Keep this reply.");
+
+    await user.click(screen.getByRole("button", { name: "Send reply" }));
+    expect(await screen.findByText(/could not be submitted/)).toBeVisible();
+    expect(screen.queryByText("private reply failure")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Reply in Markdown")).toHaveValue("Keep this reply.");
+
+    await user.click(screen.getByRole("button", { name: "Send reply" }));
+    expect(await screen.findByText("Accepted and waiting to publish.")).toBeVisible();
+    expect(keys).toHaveLength(2);
+    expect(keys[1]).toBe(keys[0]);
+
+    await user.click(screen.getByRole("button", { name: "Check status" }));
+    expect(await screen.findByText(/could not be submitted/)).toBeVisible();
+    expect(screen.queryByText("private status failure")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Send reply" }));
+    expect(await screen.findByText("Accepted and waiting to publish.")).toBeVisible();
+    expect(new Set(keys)).toEqual(new Set([keys[0]]));
+
+    await user.click(screen.getByRole("button", { name: "Check status" }));
+    await waitFor(() => expect(polls).toBe(2));
+    expect(screen.getByText("Accepted and waiting to publish.")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Check status" }));
+    expect(await screen.findByText("Published exactly once.")).toBeVisible();
+    expect(screen.getByLabelText("Reply in Markdown")).toHaveValue("Keep this reply.");
+  });
+
+  it("renders compose initialization failures and an empty active-project set", async () => {
+    window.history.replaceState({}, "", "/mail/#compose");
+    server.use(
+      http.get("*/mail/api/v1/me/profile", () =>
+        HttpResponse.json({ detail: "private profile failure" }, { status: 500 }),
+      ),
+    );
+    const failed = render(<App />);
+    expect(await screen.findByText(/could not be loaded/)).toBeVisible();
+    expect(screen.queryByText("private profile failure")).not.toBeInTheDocument();
+    failed.unmount();
+
+    server.use(
+      http.get("*/mail/api/v1/me/profile", () => HttpResponse.json(adminProfile)),
+      http.get("*/mail/api/v1/projects", () =>
+        HttpResponse.json({
+          items: [projectTwo],
+          total: 1,
+        }),
+      ),
+    );
+    render(<App />);
+    expect(
+      await screen.findByText("There are no active projects available for compose."),
+    ).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Send message" })).not.toBeInTheDocument();
+  });
+
+  it("fails compose validation and preserves text on server or session errors", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/mail/#compose");
+    const onUnauthorized = vi.fn();
+    server.use(
+      http.post("*/mail/api/v1/projects/:projectId/messages", () =>
+        HttpResponse.json({ detail: { code: "actor_forbidden" } }, { status: 401 }),
+      ),
+    );
+    render(<App onUnauthorized={onUnauthorized} />);
+    await waitForEnglishPreferences();
+    const form = screen.getByRole("button", { name: "Send message" }).closest("form");
+    expect(form).not.toBeNull();
+    fireEvent.submit(form!);
+    expect(await screen.findByText(/could not be submitted/)).toBeVisible();
+
+    await user.selectOptions(screen.getByLabelText("Project"), String(projectOne.id));
+    await user.type(screen.getByLabelText("Recipients"), "GreenDog");
+    await user.type(screen.getByLabelText("Subject"), "Stay put");
+    await user.type(screen.getByLabelText("Message in Markdown"), "Unsaved text");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(onUnauthorized).toHaveBeenCalledOnce());
+    expect(screen.getByLabelText("Message in Markdown")).toHaveValue("Unsaved text");
+  });
+
+  it("renders quarantine and hides compose from a non-administrator", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/mail/#compose");
+    server.use(
+      http.post("*/mail/api/v1/projects/:projectId/messages", () =>
+        HttpResponse.json({
+          ...deliveryResponse,
+          status: "quarantined",
+          message_id: null,
+          commit_sha: null,
+        }),
+      ),
+    );
+    const adminView = render(<App />);
+    await waitForEnglishPreferences();
+    await user.selectOptions(screen.getByLabelText("Project"), String(projectOne.id));
+    await user.type(screen.getByLabelText("Recipients"), "GreenDog");
+    await user.type(screen.getByLabelText("Subject"), "Quarantine");
+    await user.type(screen.getByLabelText("Message in Markdown"), "Review me");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    expect(await screen.findByText(/quarantined for manual review/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Check status" })).not.toBeInTheDocument();
+    adminView.unmount();
+
+    server.use(
+      http.get("*/mail/api/v1/me/profile", () => HttpResponse.json(memberProfile)),
+    );
+    render(<App />);
+    expect(await screen.findByText(/Administrator access is required/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Send message" })).not.toBeInTheDocument();
   });
 
   it("loads a stored Polish UI locale while keeping correspondence independent", async () => {
@@ -285,7 +819,7 @@ describe("Hermes landing shell", () => {
   });
 
   it("calls the injected login callback on an unauthorized preference read", async () => {
-    window.history.replaceState({}, "", "/mail/v2/?project=mail#inbox");
+    window.history.replaceState({}, "", "/mail/?project=mail#inbox");
     const onUnauthorized = vi.fn();
     server.use(
       http.get(preferencesUrl, () =>
@@ -297,7 +831,7 @@ describe("Hermes landing shell", () => {
 
     await waitFor(() =>
       expect(onUnauthorized).toHaveBeenCalledWith(
-        "/mail/login?next=%2Fmail%2Fv2%2F%3Fproject%3Dmail%23inbox",
+        "/mail/login?next=%2Fmail%2F%3Fproject%3Dmail%23inbox",
       ),
     );
     expect(screen.getByRole("status")).toHaveTextContent(
@@ -307,7 +841,7 @@ describe("Hermes landing shell", () => {
   });
 
   it("uses same-tab login navigation when no unauthorized callback is supplied", async () => {
-    window.history.replaceState({}, "", "/mail/v2/#projects");
+    window.history.replaceState({}, "", "/mail/#projects");
     const navigateTo = vi.fn();
     server.use(
       http.get(preferencesUrl, () =>
@@ -319,7 +853,7 @@ describe("Hermes landing shell", () => {
 
     await waitFor(() =>
       expect(navigateTo).toHaveBeenCalledWith(
-        "/mail/login?next=%2Fmail%2Fv2%2F%23projects",
+        "/mail/login?next=%2Fmail%2F%23projects",
       ),
     );
   });
@@ -467,7 +1001,7 @@ describe("Hermes landing shell", () => {
     expect(() => parsePreferences(payload)).toThrow(TypeError);
   });
 
-  it("opens a real message detail and keeps Markdown as plain text", async () => {
+  it("opens a real message detail and renders Markdown without raw HTML", async () => {
     const user = userEvent.setup();
     render(<App />);
 
@@ -478,11 +1012,10 @@ describe("Hermes landing shell", () => {
     );
 
     expect(
-      await screen.findByRole("heading", { name: messageOne.subject }),
+      await screen.findByRole("heading", { name: messageOne.subject, level: 1 }),
     ).toBeVisible();
-    expect(document.querySelector(".message-body")).toHaveTextContent(
-      "# Release All checks passed. `<script>` remains plain text.",
-    );
+    expect(screen.getByRole("heading", { name: "Release", level: 2 })).toBeVisible();
+    expect(screen.getByText("<script>", { selector: "code" })).toBeVisible();
     expect(document.querySelector(".message-body script")).not.toBeInTheDocument();
     expect(screen.getByText("codex-wsl-home-1")).toBeVisible();
     expect(screen.getByText("2 attachments")).toBeVisible();
@@ -496,6 +1029,145 @@ describe("Hermes landing shell", () => {
       "href",
       `#inbox?project=${projectOne.id}`,
     );
+  });
+
+  it("renders GFM as accessible React elements behind fail-closed URLs", async () => {
+    const user = userEvent.setup();
+    const png = `data:image/png;base64,${window.btoa("\x89PNG\r\n\x1a\nrest")}`;
+    const body = [
+      "# Delivery report",
+      "## Nested evidence",
+      "### Validation details",
+      "#### Parser outcome",
+      "##### Boundary note",
+      "###### Terminal note",
+      "**Strong result** and ~~retired path~~.",
+      "- [x] Reviewed\n- [ ] Pending",
+      "First line\nSecond line",
+      "> Audited quote",
+      "| Identifier | Result |\n| --- | --- |\n| HERMES-101 | Passed |",
+      "```ts\nconst delivered = true;\n```",
+      "[Safe HTTPS](https://example.test/report) [safe mail](mailto:ops@example.test) [safe Polish](https://example.test/Wrocław) [safe relative](../messages/101)",
+      "[blocked fragment](#delivery-report) [blocked routed fragment](/mail/#account) [blocked JavaScript](javascript:alert%281%29)",
+      `![inline proof](${png})`,
+      "![remote tracker](https://tracker.invalid/pixel.png)",
+      "<script>window.__markdownExecuted = true</script>",
+      '<img src="/mail/logout" alt="raw image" onerror="window.__markdownExecuted = true">',
+    ].join("\n\n");
+    server.use(
+      http.get("*/mail/api/v1/projects/:projectId/messages/:messageId", () =>
+        HttpResponse.json({ ...messageDetail, body_md: body }),
+      ),
+    );
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole("link", {
+        name: new RegExp(`Open message.*${messageOne.subject}`),
+      }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "Delivery report", level: 2 }),
+    ).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Nested evidence", level: 3 }))
+      .toBeVisible();
+    expect(screen.getByRole("heading", { name: "Validation details", level: 4 }))
+      .toBeVisible();
+    expect(screen.getByRole("heading", { name: "Parser outcome", level: 5 }))
+      .toBeVisible();
+    expect(screen.getByRole("heading", { name: "Boundary note", level: 6 }))
+      .toBeVisible();
+    expect(screen.getByRole("heading", { name: "Terminal note", level: 6 }))
+      .toBeVisible();
+    expect(screen.getByText("Strong result", { selector: "strong" })).toBeVisible();
+    expect(screen.getByText("retired path", { selector: "del" })).toBeVisible();
+    const completedTask = screen.getByRole("checkbox", { name: "Completed task" });
+    const incompleteTask = screen.getByRole("checkbox", { name: "Incomplete task" });
+    expect(completedTask).toBeChecked();
+    expect(completedTask).toBeDisabled();
+    expect(completedTask.closest("li")).toHaveTextContent("Reviewed");
+    expect(incompleteTask).not.toBeChecked();
+    expect(incompleteTask).toBeDisabled();
+    expect(incompleteTask.closest("li")).toHaveTextContent("Pending");
+    expect(document.querySelector(".message-body p br")).toBeInTheDocument();
+    expect(screen.getByText("Audited quote").closest("blockquote")).not.toBeNull();
+    expect(screen.getByRole("region", { name: "Markdown table" })).toHaveAttribute(
+      "tabindex",
+      "0",
+    );
+    expect(screen.getByRole("cell", { name: "HERMES-101" })).toBeVisible();
+    expect(screen.getByRole("cell", { name: "Passed" })).toBeVisible();
+    expect(screen.getByLabelText("Code block")).toHaveAttribute("tabindex", "0");
+    expect(screen.getByText("const delivered = true;", { selector: "code" }))
+      .toBeVisible();
+    expect(screen.getByRole("link", { name: "Safe HTTPS" })).toHaveAttribute(
+      "href",
+      "https://example.test/report",
+    );
+    expect(screen.getByRole("link", { name: "safe mail" })).toHaveAttribute(
+      "href",
+      "mailto:ops@example.test",
+    );
+    expect(screen.getByRole("link", { name: "safe Polish" })).toHaveAttribute(
+      "href",
+      "https://example.test/Wroc%C5%82aw",
+    );
+    expect(screen.getByRole("link", { name: "safe relative" })).toHaveAttribute(
+      "href",
+      "../messages/101",
+    );
+    expect(screen.getByText("blocked fragment").closest("a")).toBeNull();
+    expect(screen.getByText("blocked routed fragment").closest("a")).toBeNull();
+    expect(screen.getByText("blocked JavaScript").closest("a")).toBeNull();
+    expect(screen.getByRole("img", { name: "inline proof" })).toHaveAttribute(
+      "src",
+      png,
+    );
+    expect(screen.getByText("remote tracker", { exact: true })).toHaveClass(
+      "markdown-image-alt",
+    );
+    expect(document.querySelectorAll(".message-body img")).toHaveLength(1);
+    expect(document.querySelector(".message-body script")).not.toBeInTheDocument();
+    expect(document.querySelector(".message-body [onerror]")).not.toBeInTheDocument();
+    expect(document.querySelector(".message-body [onclick]")).not.toBeInTheDocument();
+    expect(screen.queryByText("raw image")).not.toBeInTheDocument();
+  });
+
+  it("localizes Markdown accessibility labels with the saved Polish UI locale", async () => {
+    window.history.replaceState(
+      {},
+      "",
+      `/mail/#message/${projectOne.id}/${messageOne.id}`,
+    );
+    server.use(
+      http.get(preferencesUrl, () =>
+        HttpResponse.json(preferencesResponse("pl")),
+      ),
+      http.get("*/mail/api/v1/projects/:projectId/messages/:messageId", () =>
+        HttpResponse.json({
+          ...messageDetail,
+          body_md: [
+            "- [x] Gotowe",
+            "- [ ] Oczekuje",
+            "| Kontrola | Wynik |\n| --- | --- |\n| Nazwy | Poprawne |",
+            "```text\nlokalizacja\n```",
+          ].join("\n\n"),
+        }),
+      ),
+    );
+    render(<App />);
+
+    expect(
+      await screen.findByRole("checkbox", { name: "Ukończone zadanie" }),
+    ).toBeChecked();
+    expect(
+      screen.getByRole("checkbox", { name: "Nieukończone zadanie" }),
+    ).not.toBeChecked();
+    expect(screen.getByRole("region", { name: "Tabela Markdown" })).toBeVisible();
+    expect(screen.getByLabelText("Blok kodu")).toBeVisible();
+    expect(screen.queryByLabelText("Markdown table")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Code block")).not.toBeInTheDocument();
   });
 
   it.each([
@@ -524,7 +1196,7 @@ describe("Hermes landing shell", () => {
     window.history.replaceState(
       {},
       "",
-      `/mail/v2/#message/${projectTwo.id}/${messageTwo.id}`,
+      `/mail/#message/${projectTwo.id}/${messageTwo.id}`,
     );
     server.use(
       http.get("*/mail/api/v1/projects/:projectId/messages/:messageId", () =>
@@ -551,7 +1223,7 @@ describe("Hermes landing shell", () => {
     window.history.replaceState(
       {},
       "",
-      `/mail/v2/#message/${projectTwo.id}/${messageTwo.id}`,
+      `/mail/#message/${projectTwo.id}/${messageTwo.id}`,
     );
     server.use(
       http.get("*/mail/api/v1/projects/:projectId/messages/:messageId", () =>
@@ -600,7 +1272,7 @@ describe("Hermes landing shell", () => {
       window.history.replaceState(
         {},
         "",
-        `/mail/v2/#message/${projectOne.id}/${messageOne.id}`,
+        `/mail/#message/${projectOne.id}/${messageOne.id}`,
       );
       server.use(
         http.get(
@@ -627,7 +1299,7 @@ describe("Hermes landing shell", () => {
         window.history.replaceState(
           {},
           "",
-          `/mail/v2/#message/${projectTwo.id}/${messageTwo.id}`,
+          `/mail/#message/${projectTwo.id}/${messageTwo.id}`,
         );
         window.dispatchEvent(new HashChangeEvent("hashchange"));
       });
@@ -663,7 +1335,7 @@ describe("Hermes landing shell", () => {
     window.history.replaceState(
       {},
       "",
-      `/mail/v2/#message/${projectOne.id}/${messageOne.id}`,
+      `/mail/#message/${projectOne.id}/${messageOne.id}`,
     );
     server.use(
       http.get("*/mail/api/v1/inbox", ({ request }) => {
@@ -806,7 +1478,7 @@ describe("Hermes landing shell", () => {
     window.history.replaceState(
       {},
       "",
-      `/mail/v2/#message/${projectOne.id}/9999`,
+      `/mail/#message/${projectOne.id}/9999`,
     );
     server.use(
       http.get("*/mail/api/v1/inbox", () => HttpResponse.json(inboxResponse)),
@@ -821,7 +1493,7 @@ describe("Hermes landing shell", () => {
 
   it("renders honest empty project and inbox states", async () => {
     const user = userEvent.setup();
-    window.history.replaceState({}, "", "/mail/v2/#projects");
+    window.history.replaceState({}, "", "/mail/#projects");
     server.use(
       http.get("*/mail/api/v1/projects", () =>
         HttpResponse.json({ items: [], total: 0 }),
@@ -897,7 +1569,7 @@ describe("Hermes landing shell", () => {
     window.history.replaceState(
       {},
       "",
-      `/mail/v2/#inbox?project=${projectOne.id}`,
+      `/mail/#inbox?project=${projectOne.id}`,
     );
     server.use(
       http.get("*/mail/api/v1/projects", () =>
@@ -911,7 +1583,7 @@ describe("Hermes landing shell", () => {
 
     await waitFor(() => expect(onUnauthorized).toHaveBeenCalledOnce());
     expect(onUnauthorized).toHaveBeenCalledWith(
-      `/mail/login?next=%2Fmail%2Fv2%2F%23inbox%3Fproject%3D${projectOne.id}`,
+      `/mail/login?next=%2Fmail%2F%23inbox%3Fproject%3D${projectOne.id}`,
     );
     expect(screen.getAllByText("Your session expired. Redirecting to sign in.")).not.toHaveLength(0);
   });
@@ -1104,7 +1776,7 @@ describe("Hermes landing shell", () => {
     window.history.replaceState(
       {},
       "",
-      `/mail/v2/#message/${projectOne.id}/${messageOne.id}`,
+      `/mail/#message/${projectOne.id}/${messageOne.id}`,
     );
     const pendingFetch = vi.spyOn(globalThis, "fetch").mockImplementation(
       (_input, init) =>
@@ -1126,7 +1798,7 @@ describe("Hermes landing shell", () => {
     window.history.replaceState(
       {},
       "",
-      `/mail/v2/#inbox?project=${projectOne.id}`,
+      `/mail/#inbox?project=${projectOne.id}`,
     );
     render(<App />);
     const filter = await screen.findByLabelText("Filter by project");
@@ -1141,7 +1813,7 @@ describe("Hermes landing shell", () => {
   });
 
   it("renders project error and unauthorized states on the projects route", async () => {
-    window.history.replaceState({}, "", "/mail/v2/#projects");
+    window.history.replaceState({}, "", "/mail/#projects");
     server.use(
       http.get("*/mail/api/v1/projects", () =>
         HttpResponse.json({ detail: "private" }, { status: 500 }),
@@ -1233,7 +1905,7 @@ describe("Hermes landing shell", () => {
     window.history.replaceState(
       {},
       "",
-      `/mail/v2/#message/${sparseDetail.project_id}/${sparseDetail.id}`,
+      `/mail/#message/${sparseDetail.project_id}/${sparseDetail.id}`,
     );
     server.use(
       http.get("*/mail/api/v1/projects", () =>
@@ -1260,7 +1932,7 @@ describe("Hermes landing shell", () => {
     window.history.replaceState(
       {},
       "",
-      `/mail/v2/#message/${projectOne.id}/${messageOne.id}`,
+      `/mail/#message/${projectOne.id}/${messageOne.id}`,
     );
     server.use(
       http.get("*/mail/api/v1/projects/:projectId/messages/:messageId", () =>
@@ -1296,7 +1968,7 @@ describe("Hermes landing shell", () => {
   });
 
   it("renders Account from real profile data without opening inbox transport", async () => {
-    window.history.replaceState({}, "", "/mail/v2/#account");
+    window.history.replaceState({}, "", "/mail/#account");
     let mailReads = 0;
     const sourceFactory = vi.fn(() => new FakeEventSource("/mail/events"));
     server.use(
@@ -1339,7 +2011,7 @@ describe("Hermes landing shell", () => {
 
   it("saves and clears the display name with profile compare-and-swap", async () => {
     const user = userEvent.setup();
-    window.history.replaceState({}, "", "/mail/v2/#account");
+    window.history.replaceState({}, "", "/mail/#account");
     const requests: Array<{ request: Request; body: unknown }> = [];
     server.use(
       http.patch("*/mail/api/v1/me/profile", async ({ request }) => {
@@ -1387,7 +2059,7 @@ describe("Hermes landing shell", () => {
 
   it("refreshes a conflicting display-name revision and keeps errors generic", async () => {
     const user = userEvent.setup();
-    window.history.replaceState({}, "", "/mail/v2/#account");
+    window.history.replaceState({}, "", "/mail/#account");
     let profileReads = 0;
     server.use(
       http.get("*/mail/api/v1/me/profile", () => {
@@ -1428,7 +2100,7 @@ describe("Hermes landing shell", () => {
 
   it("persists both Account language choices without coupling them", async () => {
     const user = userEvent.setup();
-    window.history.replaceState({}, "", "/mail/v2/#account");
+    window.history.replaceState({}, "", "/mail/#account");
     const bodies: unknown[] = [];
     server.use(
       http.patch(preferencesUrl, async ({ request }) => {
@@ -1465,7 +2137,7 @@ describe("Hermes landing shell", () => {
 
   it("validates and changes a password without echoing secrets", async () => {
     const user = userEvent.setup();
-    window.history.replaceState({}, "", "/mail/v2/#account");
+    window.history.replaceState({}, "", "/mail/#account");
     let capturedRequest: Request | undefined;
     let capturedBody: unknown;
     server.use(
@@ -1517,7 +2189,7 @@ describe("Hermes landing shell", () => {
 
   it("shows generic password failures and a distinct rate-limit message", async () => {
     const user = userEvent.setup();
-    window.history.replaceState({}, "", "/mail/v2/#account");
+    window.history.replaceState({}, "", "/mail/#account");
     server.use(
       http.patch("*/mail/api/v1/me/password", () =>
         HttpResponse.json({ detail: "Current password is incorrect." }, { status: 400 }),
@@ -1546,7 +2218,7 @@ describe("Hermes landing shell", () => {
   });
 
   it("fails closed for a member deep-linking to Administration", async () => {
-    window.history.replaceState({}, "", "/mail/v2/#admin");
+    window.history.replaceState({}, "", "/mail/#admin");
     let adminReads = 0;
     let inboxReads = 0;
     server.use(
@@ -1573,7 +2245,7 @@ describe("Hermes landing shell", () => {
 
   it("manages member assignments pessimistically, including archived projects", async () => {
     const user = userEvent.setup();
-    window.history.replaceState({}, "", "/mail/v2/#admin");
+    window.history.replaceState({}, "", "/mail/#admin");
     const requests: Array<{ request: Request; body: unknown }> = [];
     let releaseRequest: () => void = () => undefined;
     const gate = new Promise<void>((resolve) => {
@@ -1636,7 +2308,7 @@ describe("Hermes landing shell", () => {
 
   it("refreshes the full access snapshot after an assignment conflict", async () => {
     const user = userEvent.setup();
-    window.history.replaceState({}, "", "/mail/v2/#admin");
+    window.history.replaceState({}, "", "/mail/#admin");
     let adminReads = 0;
     server.use(
       http.get("*/mail/api/v1/admin/access", () => {
@@ -1674,7 +2346,7 @@ describe("Hermes landing shell", () => {
 
   it("keeps administrator and disabled targets read-only", async () => {
     const user = userEvent.setup();
-    window.history.replaceState({}, "", "/mail/v2/#admin");
+    window.history.replaceState({}, "", "/mail/#admin");
     render(<App />);
     const adminSelect = await screen.findByLabelText(`Access to ${projectOne.human_key}`);
     expect(adminSelect).toBeDisabled();
@@ -1684,7 +2356,7 @@ describe("Hermes landing shell", () => {
   });
 
   it("renders honest Administration loading failures and empty snapshots", async () => {
-    window.history.replaceState({}, "", "/mail/v2/#admin");
+    window.history.replaceState({}, "", "/mail/#admin");
     server.use(
       http.get("*/mail/api/v1/admin/access", () =>
         HttpResponse.json({ detail: "private query" }, { status: 500 }),
@@ -1977,7 +2649,7 @@ describe("Hermes landing shell", () => {
   ])(
     "renders a safe %s profile failure for HTTP %s",
     async (view, status, expected) => {
-      window.history.replaceState({}, "", `/mail/v2/#${view}`);
+      window.history.replaceState({}, "", `/mail/#${view}`);
       const onUnauthorized = vi.fn();
       server.use(
         http.get("*/mail/api/v1/me/profile", () =>
@@ -1992,7 +2664,7 @@ describe("Hermes landing shell", () => {
   );
 
   it("aborts pending profile and Administration reads on unmount", async () => {
-    window.history.replaceState({}, "", "/mail/v2/#account");
+    window.history.replaceState({}, "", "/mail/#account");
     let profileStarted = false;
     server.use(
       http.get("*/mail/api/v1/me/profile", async ({ request }) => {
@@ -2010,7 +2682,7 @@ describe("Hermes landing shell", () => {
     profileView.unmount();
     await act(async () => Promise.resolve());
 
-    window.history.replaceState({}, "", "/mail/v2/#admin");
+    window.history.replaceState({}, "", "/mail/#admin");
     let adminStarted = false;
     server.use(
       http.get("*/mail/api/v1/me/profile", () => HttpResponse.json(adminProfile)),
@@ -2031,7 +2703,7 @@ describe("Hermes landing shell", () => {
   });
 
   it("redirects when the Administration snapshot loses authorization", async () => {
-    window.history.replaceState({}, "", "/mail/v2/#admin");
+    window.history.replaceState({}, "", "/mail/#admin");
     const onUnauthorized = vi.fn();
     server.use(
       http.get("*/mail/api/v1/admin/access", () =>
@@ -2047,7 +2719,7 @@ describe("Hermes landing shell", () => {
 
   it("saves correspondence inheritance and reports generic write errors", async () => {
     const user = userEvent.setup();
-    window.history.replaceState({}, "", "/mail/v2/#account");
+    window.history.replaceState({}, "", "/mail/#account");
     const bodies: unknown[] = [];
     server.use(
       http.patch(preferencesUrl, async ({ request }) => {
@@ -2083,7 +2755,7 @@ describe("Hermes landing shell", () => {
 
   it("redirects on unauthorized correspondence, profile, and password writes", async () => {
     const user = userEvent.setup();
-    window.history.replaceState({}, "", "/mail/v2/#account");
+    window.history.replaceState({}, "", "/mail/#account");
     const onUnauthorized = vi.fn();
     server.use(
       http.patch(preferencesUrl, () =>
@@ -2125,7 +2797,7 @@ describe("Hermes landing shell", () => {
 
   it("handles an authorization loss while refreshing a profile conflict", async () => {
     const user = userEvent.setup();
-    window.history.replaceState({}, "", "/mail/v2/#account");
+    window.history.replaceState({}, "", "/mail/#account");
     const onUnauthorized = vi.fn();
     let profileReads = 0;
     server.use(
@@ -2146,7 +2818,7 @@ describe("Hermes landing shell", () => {
 
   it("reports assignment failures and redirects on authorization loss", async () => {
     const user = userEvent.setup();
-    window.history.replaceState({}, "", "/mail/v2/#admin");
+    window.history.replaceState({}, "", "/mail/#admin");
     server.use(
       http.put("*/mail/api/v1/admin/users/:userId/projects/:projectId", () =>
         HttpResponse.json({ detail: "private failure" }, { status: 500 }),
@@ -2181,7 +2853,7 @@ describe("Hermes landing shell", () => {
     "handles HTTP %s while refreshing a conflicting assignment",
     async (refreshStatus) => {
       const user = userEvent.setup();
-      window.history.replaceState({}, "", "/mail/v2/#admin");
+      window.history.replaceState({}, "", "/mail/#admin");
       const onUnauthorized = vi.fn();
       let adminReads = 0;
       server.use(
@@ -2211,7 +2883,7 @@ describe("Hermes landing shell", () => {
 
   it("revokes access and keeps the selected user across an Administration reload", async () => {
     const user = userEvent.setup();
-    window.history.replaceState({}, "", "/mail/v2/#admin");
+    window.history.replaceState({}, "", "/mail/#admin");
     render(<App />);
     await user.click(await screen.findByRole("button", { name: /Operator One/ }));
     const select = screen.getByLabelText(`Access to ${projectOne.human_key}`);
@@ -2225,7 +2897,7 @@ describe("Hermes landing shell", () => {
   });
 
   it("shows an empty project list for a selected member", async () => {
-    window.history.replaceState({}, "", "/mail/v2/#admin");
+    window.history.replaceState({}, "", "/mail/#admin");
     server.use(
       http.get("*/mail/api/v1/admin/access", () =>
         HttpResponse.json({ users: [memberUser], projects: [] }),
@@ -2237,7 +2909,7 @@ describe("Hermes landing shell", () => {
 
   it("renders and conflict-refreshes an explicitly empty display name", async () => {
     const user = userEvent.setup();
-    window.history.replaceState({}, "", "/mail/v2/#account");
+    window.history.replaceState({}, "", "/mail/#account");
     let profileReads = 0;
     server.use(
       http.get("*/mail/api/v1/me/profile", () => {
@@ -2263,7 +2935,7 @@ describe("Hermes landing shell", () => {
 
   it("shows a generic error when a profile conflict cannot be refreshed", async () => {
     const user = userEvent.setup();
-    window.history.replaceState({}, "", "/mail/v2/#account");
+    window.history.replaceState({}, "", "/mail/#account");
     let profileReads = 0;
     server.use(
       http.get("*/mail/api/v1/me/profile", () => {
@@ -2283,7 +2955,7 @@ describe("Hermes landing shell", () => {
   });
 
   it("ignores an aborted Administration snapshot without replacing the page", async () => {
-    window.history.replaceState({}, "", "/mail/v2/#admin");
+    window.history.replaceState({}, "", "/mail/#admin");
     const originalFetch = globalThis.fetch;
     vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
       const url =
@@ -2308,7 +2980,7 @@ describe("Hermes landing shell", () => {
     "selects a safe fallback after the current account disappears on conflict",
     async (refreshedUsers, expectedText) => {
       const user = userEvent.setup();
-      window.history.replaceState({}, "", "/mail/v2/#admin");
+      window.history.replaceState({}, "", "/mail/#admin");
       let adminReads = 0;
       server.use(
         http.get("*/mail/api/v1/admin/access", () => {

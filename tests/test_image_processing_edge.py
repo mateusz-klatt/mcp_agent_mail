@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 from fastmcp import Client
+from fastmcp.exceptions import ToolError
 from PIL import Image
 
 from mcp_agent_mail import config as _config
@@ -55,8 +56,7 @@ def _allow_absolute_attachment_paths(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_corrupt_image_file_gracefully_fails(isolated_env):
-    """Test that corrupt image files are rejected with clear error."""
-    from fastmcp.exceptions import ToolError
+    """Corrupt image paths remain opaque Markdown until normalization exists."""
 
     storage_root = Path(get_settings().storage.root).expanduser().resolve()
     corrupt_path = storage_root.parent / "corrupt.png"
@@ -69,27 +69,27 @@ async def test_corrupt_image_file_gracefully_fails(isolated_env):
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
         )
-        # Server rejects corrupt images with an error
-        with pytest.raises(ToolError) as exc_info:
-            await client.call_tool(
-                "send_message",
-                {
-                    "project_key": "Backend",
-                    "sender_name": "BlueLake",
-                    "to": ["BlueLake"],
-                    "subject": "Corrupt Image",
-                    "body_md": f"![img]({corrupt_path})",
-                },
-            )
-        # Error should mention image identification
-        assert "cannot identify image" in str(exc_info.value).lower()
+        body_md = f"![img]({corrupt_path})"
+        res = await client.call_tool(
+            "send_message",
+            {
+                "project_key": "Backend",
+                "sender_name": "BlueLake",
+                "to": ["BlueLake"],
+                "subject": "Corrupt Image",
+                "body_md": body_md,
+                "idempotency_key": "image-edge-corrupt",
+            },
+        )
+        message = (res.data.get("deliveries") or [{}])[0].get("message", {})
+        assert message.get("body_md") == body_md
+        assert message.get("attachments") == []
     corrupt_path.unlink(missing_ok=True)
 
 
 @pytest.mark.asyncio
 async def test_zero_byte_image_file(isolated_env):
-    """Test that zero-byte image files are rejected with error."""
-    from fastmcp.exceptions import ToolError
+    """Zero-byte image paths remain opaque Markdown until normalization exists."""
 
     storage_root = Path(get_settings().storage.root).expanduser().resolve()
     empty_path = storage_root.parent / "empty.png"
@@ -102,26 +102,27 @@ async def test_zero_byte_image_file(isolated_env):
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
         )
-        # Empty images are rejected
-        with pytest.raises(ToolError) as exc_info:
-            await client.call_tool(
-                "send_message",
-                {
-                    "project_key": "Backend",
-                    "sender_name": "BlueLake",
-                    "to": ["BlueLake"],
-                    "subject": "Empty Image",
-                    "body_md": f"![img]({empty_path})",
-                },
-            )
-        assert "cannot identify image" in str(exc_info.value).lower()
+        body_md = f"![img]({empty_path})"
+        res = await client.call_tool(
+            "send_message",
+            {
+                "project_key": "Backend",
+                "sender_name": "BlueLake",
+                "to": ["BlueLake"],
+                "subject": "Empty Image",
+                "body_md": body_md,
+                "idempotency_key": "image-edge-empty",
+            },
+        )
+        message = (res.data.get("deliveries") or [{}])[0].get("message", {})
+        assert message.get("body_md") == body_md
+        assert message.get("attachments") == []
     empty_path.unlink(missing_ok=True)
 
 
 @pytest.mark.asyncio
 async def test_truncated_png_header_only(isolated_env):
-    """Test image file with only a PNG header but no data is rejected."""
-    from fastmcp.exceptions import ToolError
+    """Truncated image paths remain opaque Markdown until normalization exists."""
 
     storage_root = Path(get_settings().storage.root).expanduser().resolve()
     truncated_path = storage_root.parent / "truncated.png"
@@ -135,19 +136,21 @@ async def test_truncated_png_header_only(isolated_env):
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
         )
-        # Truncated PNG is rejected
-        with pytest.raises(ToolError) as exc_info:
-            await client.call_tool(
-                "send_message",
-                {
-                    "project_key": "Backend",
-                    "sender_name": "BlueLake",
-                    "to": ["BlueLake"],
-                    "subject": "Truncated PNG",
-                    "body_md": f"![img]({truncated_path})",
-                },
-            )
-        assert "cannot identify image" in str(exc_info.value).lower()
+        body_md = f"![img]({truncated_path})"
+        res = await client.call_tool(
+            "send_message",
+            {
+                "project_key": "Backend",
+                "sender_name": "BlueLake",
+                "to": ["BlueLake"],
+                "subject": "Truncated PNG",
+                "body_md": body_md,
+                "idempotency_key": "image-edge-truncated",
+            },
+        )
+        message = (res.data.get("deliveries") or [{}])[0].get("message", {})
+        assert message.get("body_md") == body_md
+        assert message.get("attachments") == []
     truncated_path.unlink(missing_ok=True)
 
 
@@ -182,6 +185,7 @@ async def test_palette_mode_image(isolated_env):
                 "to": ["BlueLake"],
                 "subject": "Palette Image",
                 "body_md": f"![img]({palette_path})",
+                "idempotency_key": "image-edge-palette",
             },
         )
         assert res.data.get("deliveries")
@@ -213,12 +217,12 @@ async def test_la_mode_image(isolated_env):
                 "to": ["BlueLake"],
                 "subject": "LA Image",
                 "body_md": f"![img]({la_path})",
+                "idempotency_key": "image-edge-la",
             },
         )
         assert res.data.get("deliveries")
-        # Check that attachment was processed (should be RGBA after conversion)
-        attachments = (res.data.get("deliveries") or [{}])[0].get("payload", {}).get("attachments", [])
-        assert len(attachments) > 0
+        message = (res.data.get("deliveries") or [{}])[0].get("message", {})
+        assert message.get("attachments") == []
     la_path.unlink(missing_ok=True)
 
 
@@ -247,6 +251,7 @@ async def test_rgba_mode_image_preserves_alpha(isolated_env):
                 "to": ["BlueLake"],
                 "subject": "RGBA Image",
                 "body_md": f"![img]({rgba_path})",
+                "idempotency_key": "image-edge-rgba",
             },
         )
         assert res.data.get("deliveries")
@@ -278,6 +283,7 @@ async def test_grayscale_mode_image(isolated_env):
                 "to": ["BlueLake"],
                 "subject": "Grayscale Image",
                 "body_md": f"![img]({gray_path})",
+                "idempotency_key": "image-edge-grayscale",
             },
         )
         assert res.data.get("deliveries")
@@ -309,6 +315,7 @@ async def test_1bit_mode_image(isolated_env):
                 "to": ["BlueLake"],
                 "subject": "1-bit Image",
                 "body_md": f"![img]({bw_path})",
+                "idempotency_key": "image-edge-1bit",
             },
         )
         assert res.data.get("deliveries")
@@ -336,19 +343,19 @@ async def test_malformed_data_uri_missing_comma(isolated_env, monkeypatch):
         )
         # Malformed: no comma after base64
         body = "![img](data:image/pngbase64ABC123)"
-        res = await client.call_tool(
-            "send_message",
-            {
-                "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
-                "subject": "Malformed URI",
-                "body_md": body,
-                "convert_images": False,
-            },
-        )
-        # Should not crash
-        assert res is not None
+        with pytest.raises(ToolError, match="bounded canonical inline representation"):
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "Backend",
+                    "sender_name": "BlueLake",
+                    "to": ["BlueLake"],
+                    "subject": "Malformed URI",
+                    "body_md": body,
+                    "convert_images": False,
+                    "idempotency_key": "image-edge-malformed-uri",
+                },
+            )
 
 
 @pytest.mark.asyncio
@@ -366,18 +373,19 @@ async def test_data_uri_empty_base64(isolated_env, monkeypatch):
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
         )
         body = "![img](data:image/png;base64,)"
-        res = await client.call_tool(
-            "send_message",
-            {
-                "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
-                "subject": "Empty Base64",
-                "body_md": body,
-                "convert_images": False,
-            },
-        )
-        assert res is not None
+        with pytest.raises(ToolError, match="bounded canonical inline representation"):
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "Backend",
+                    "sender_name": "BlueLake",
+                    "to": ["BlueLake"],
+                    "subject": "Empty Base64",
+                    "body_md": body,
+                    "convert_images": False,
+                    "idempotency_key": "image-edge-empty-base64",
+                },
+            )
 
 
 @pytest.mark.asyncio
@@ -395,18 +403,19 @@ async def test_data_uri_invalid_base64(isolated_env, monkeypatch):
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
         )
         body = "![img](data:image/png;base64,!!!not-valid-base64!!!)"
-        res = await client.call_tool(
-            "send_message",
-            {
-                "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
-                "subject": "Invalid Base64",
-                "body_md": body,
-                "convert_images": False,
-            },
-        )
-        assert res is not None
+        with pytest.raises(ToolError, match="bounded canonical inline representation"):
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "Backend",
+                    "sender_name": "BlueLake",
+                    "to": ["BlueLake"],
+                    "subject": "Invalid Base64",
+                    "body_md": body,
+                    "convert_images": False,
+                    "idempotency_key": "image-edge-invalid-base64",
+                },
+            )
 
 
 @pytest.mark.asyncio
@@ -425,22 +434,19 @@ async def test_data_uri_unusual_media_type(isolated_env, monkeypatch):
         )
         payload = base64.b64encode(b"fake").decode()
         body = f"![img](data:image/x-custom-format;base64,{payload})"
-        res = await client.call_tool(
-            "send_message",
-            {
-                "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
-                "subject": "Unusual Media Type",
-                "body_md": body,
-                "convert_images": False,
-            },
-        )
-        attachments = (res.data.get("deliveries") or [{}])[0].get("payload", {}).get("attachments", [])
-        # Should preserve the unusual media type
-        inline_atts = [a for a in attachments if a.get("type") == "inline"]
-        assert len(inline_atts) > 0
-        assert inline_atts[0].get("media_type") == "image/x-custom-format"
+        with pytest.raises(ToolError, match="bounded canonical inline representation"):
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "Backend",
+                    "sender_name": "BlueLake",
+                    "to": ["BlueLake"],
+                    "subject": "Unusual Media Type",
+                    "body_md": body,
+                    "convert_images": False,
+                    "idempotency_key": "image-edge-unusual-media",
+                },
+            )
 
 
 # =============================================================================
@@ -475,6 +481,7 @@ async def test_image_without_extension(isolated_env):
                 "to": ["BlueLake"],
                 "subject": "No Extension",
                 "body_md": f"![img]({no_ext_path})",
+                "idempotency_key": "image-edge-no-extension",
             },
         )
         assert res.data.get("deliveries")
@@ -508,6 +515,7 @@ async def test_image_wrong_extension(isolated_env):
                 "to": ["BlueLake"],
                 "subject": "Wrong Extension",
                 "body_md": f"![img]({wrong_ext_path})",
+                "idempotency_key": "image-edge-wrong-extension",
             },
         )
         # Pillow should detect the actual format
@@ -539,6 +547,7 @@ async def test_image_uppercase_extension(isolated_env):
                 "to": ["BlueLake"],
                 "subject": "Uppercase Extension",
                 "body_md": f"![img]({upper_path})",
+                "idempotency_key": "image-edge-uppercase-extension",
             },
         )
         assert res.data.get("deliveries")
@@ -578,11 +587,13 @@ async def test_multiple_images_in_body(isolated_env):
                 "to": ["BlueLake"],
                 "subject": "Multiple Images",
                 "body_md": body,
+                "idempotency_key": "image-edge-multiple",
             },
         )
         assert res.data.get("deliveries")
-        attachments = (res.data.get("deliveries") or [{}])[0].get("payload", {}).get("attachments", [])
-        assert len(attachments) == 3
+        message = (res.data.get("deliveries") or [{}])[0].get("message", {})
+        assert message.get("body_md") == body
+        assert message.get("attachments") == []
 
     for p in img_paths:
         p.unlink(missing_ok=True)
@@ -590,8 +601,7 @@ async def test_multiple_images_in_body(isolated_env):
 
 @pytest.mark.asyncio
 async def test_mixed_valid_and_invalid_images(isolated_env):
-    """Test handling of mix of valid and invalid images - server rejects on first invalid."""
-    from fastmcp.exceptions import ToolError
+    """Mixed image paths remain opaque Markdown until normalization exists."""
 
     storage_root = Path(get_settings().storage.root).expanduser().resolve()
 
@@ -612,20 +622,20 @@ async def test_mixed_valid_and_invalid_images(isolated_env):
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
         )
         body = f"![valid]({valid_path})\n![invalid]({invalid_path})\n![missing]({missing_path})"
-        # Server rejects when it encounters an invalid image
-        with pytest.raises(ToolError) as exc_info:
-            await client.call_tool(
-                "send_message",
-                {
-                    "project_key": "Backend",
-                    "sender_name": "BlueLake",
-                    "to": ["BlueLake"],
-                    "subject": "Mixed Images",
-                    "body_md": body,
-                },
-            )
-        # Error should indicate image identification failure
-        assert "cannot identify image" in str(exc_info.value).lower()
+        res = await client.call_tool(
+            "send_message",
+            {
+                "project_key": "Backend",
+                "sender_name": "BlueLake",
+                "to": ["BlueLake"],
+                "subject": "Mixed Images",
+                "body_md": body,
+                "idempotency_key": "image-edge-mixed",
+            },
+        )
+        message = (res.data.get("deliveries") or [{}])[0].get("message", {})
+        assert message.get("body_md") == body
+        assert message.get("attachments") == []
 
     valid_path.unlink(missing_ok=True)
     invalid_path.unlink(missing_ok=True)
@@ -653,18 +663,19 @@ async def test_attachment_path_with_spaces(isolated_env):
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
         )
-        res = await client.call_tool(
-            "send_message",
-            {
-                "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
-                "subject": "Spaced Path",
-                "body_md": "check attachment",
-                "attachment_paths": [str(spaced_path)],
-            },
-        )
-        assert res.data.get("deliveries")
+        with pytest.raises(ToolError, match="bounded canonical inline representation"):
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "Backend",
+                    "sender_name": "BlueLake",
+                    "to": ["BlueLake"],
+                    "subject": "Spaced Path",
+                    "body_md": "check attachment",
+                    "attachment_paths": [str(spaced_path)],
+                    "idempotency_key": "image-edge-spaced-attachment",
+                },
+            )
 
     spaced_path.unlink(missing_ok=True)
     spaced_path.parent.rmdir()
@@ -686,18 +697,19 @@ async def test_attachment_path_unicode(isolated_env):
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
         )
-        res = await client.call_tool(
-            "send_message",
-            {
-                "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
-                "subject": "Unicode Path",
-                "body_md": "check attachment",
-                "attachment_paths": [str(unicode_path)],
-            },
-        )
-        assert res.data.get("deliveries")
+        with pytest.raises(ToolError, match="bounded canonical inline representation"):
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "Backend",
+                    "sender_name": "BlueLake",
+                    "to": ["BlueLake"],
+                    "subject": "Unicode Path",
+                    "body_md": "check attachment",
+                    "attachment_paths": [str(unicode_path)],
+                    "idempotency_key": "image-edge-unicode-attachment",
+                },
+            )
 
     unicode_path.unlink(missing_ok=True)
 
@@ -733,6 +745,7 @@ async def test_attachment_symlink(isolated_env, tmp_path):
                 "to": ["BlueLake"],
                 "subject": "Symlink Attachment",
                 "body_md": f"![img]({link_path})",
+                "idempotency_key": "image-edge-symlink-markdown",
             },
         )
         assert res.data.get("deliveries")
@@ -770,13 +783,12 @@ async def test_gif_image_conversion(isolated_env):
                 "to": ["BlueLake"],
                 "subject": "GIF Image",
                 "body_md": f"![img]({gif_path})",
+                "idempotency_key": "image-edge-gif",
             },
         )
         assert res.data.get("deliveries")
-        attachments = (res.data.get("deliveries") or [{}])[0].get("payload", {}).get("attachments", [])
-        # Should be converted to webp
-        if attachments:
-            assert attachments[0].get("media_type") == "image/webp"
+        message = (res.data.get("deliveries") or [{}])[0].get("message", {})
+        assert message.get("attachments") == []
 
     gif_path.unlink(missing_ok=True)
 
@@ -805,6 +817,7 @@ async def test_bmp_image_conversion(isolated_env):
                 "to": ["BlueLake"],
                 "subject": "BMP Image",
                 "body_md": f"![img]({bmp_path})",
+                "idempotency_key": "image-edge-bmp",
             },
         )
         assert res.data.get("deliveries")
@@ -836,6 +849,7 @@ async def test_jpeg_image_conversion(isolated_env):
                 "to": ["BlueLake"],
                 "subject": "JPEG Image",
                 "body_md": f"![img]({jpeg_path})",
+                "idempotency_key": "image-edge-jpeg",
             },
         )
         assert res.data.get("deliveries")
@@ -872,13 +886,12 @@ async def test_single_pixel_image(isolated_env):
                 "to": ["BlueLake"],
                 "subject": "Tiny Image",
                 "body_md": f"![img]({tiny_path})",
+                "idempotency_key": "image-edge-single-pixel",
             },
         )
         assert res.data.get("deliveries")
-        attachments = (res.data.get("deliveries") or [{}])[0].get("payload", {}).get("attachments", [])
-        if attachments:
-            assert attachments[0].get("width") == 1
-            assert attachments[0].get("height") == 1
+        message = (res.data.get("deliveries") or [{}])[0].get("message", {})
+        assert message.get("attachments") == []
 
     tiny_path.unlink(missing_ok=True)
 
@@ -913,12 +926,11 @@ async def test_moderately_large_image(isolated_env, monkeypatch):
                 "to": ["BlueLake"],
                 "subject": "Large Image",
                 "body_md": f"![img]({large_path})",
+                "idempotency_key": "image-edge-large",
             },
         )
         assert res.data.get("deliveries")
-        attachments = (res.data.get("deliveries") or [{}])[0].get("payload", {}).get("attachments", [])
-        # Should be stored as file, not inline
-        if attachments:
-            assert attachments[0].get("type") == "file"
+        message = (res.data.get("deliveries") or [{}])[0].get("message", {})
+        assert message.get("attachments") == []
 
     large_path.unlink(missing_ok=True)

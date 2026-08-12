@@ -53,6 +53,7 @@ async def test_summarize_threads_llm_refinement(isolated_env, monkeypatch):
                     "subject": f"Msg in {tid}",
                     "body_md": "body",
                     "thread_id": tid,
+                    "idempotency_key": f"summary-llm-on-{tid}",
                 },
             )
 
@@ -66,4 +67,3 @@ async def test_summarize_threads_llm_refinement(isolated_env, monkeypatch):
         # Ensure LLM-refined aggregate keys present
         agg = payload.get("aggregate") or {}
         assert agg.get("action_items") == ["A"]
-

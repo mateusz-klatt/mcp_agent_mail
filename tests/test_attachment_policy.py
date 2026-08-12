@@ -12,7 +12,7 @@ from tests.keys import pkey
 
 
 @pytest.mark.asyncio
-async def test_attachment_policy_override_inline(isolated_env, tmp_path: Path, monkeypatch):
+async def test_attachment_policy_does_not_normalize_inline_markdown(isolated_env, tmp_path: Path, monkeypatch):
     # Ensure images are small enough to inline
     monkeypatch.setenv("INLINE_IMAGE_MAX_BYTES", "1048576")
     with contextlib.suppress(Exception):
@@ -30,9 +30,16 @@ async def test_attachment_policy_override_inline(isolated_env, tmp_path: Path, m
         body = "Here is an image ![pic](data:image/webp;base64,AAECAwQ=)"
         res = await client.call_tool(
             "send_message",
-            {"project_key": pkey("backend"), "sender_name": "BlueLake", "to": ["BlueLake"], "subject": "Inline", "body_md": body},
+            {
+                "project_key": pkey("backend"),
+                "sender_name": "BlueLake",
+                "to": ["BlueLake"],
+                "subject": "Inline",
+                "body_md": body,
+                "idempotency_key": "attachment-policy-inline-markdown",
+            },
         )
-        data = res.data
-        assert any(att.get("type") == "inline" for att in data.get("attachments", []))
-
+        message = (res.data.get("deliveries") or [{}])[0].get("message", {})
+        assert message.get("body_md") == body
+        assert message.get("attachments") == []
 

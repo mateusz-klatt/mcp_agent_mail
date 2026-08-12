@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import secrets
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -31,8 +32,28 @@ def _new_project_generation() -> str:
     return secrets.token_hex(32)
 
 
+def _new_agent_generation() -> str:
+    """Return an unpredictable identifier for one agent-row lifetime."""
+    return secrets.token_hex(32)
+
+
+def _new_delivery_id() -> str:
+    """Return a canonical UUID for one durable message-delivery intent."""
+    return str(uuid.uuid4())
+
+
 class Project(SQLModel, table=True):
     __tablename__ = "projects"
+    __table_args__ = (
+        CheckConstraint(
+            "length(slug) BETWEEN 1 AND 255 "
+            "AND lower(slug) = slug "
+            "AND slug NOT GLOB '*[^a-z0-9-]*' "
+            "AND substr(slug, 1, 1) GLOB '[a-z0-9]' "
+            "AND substr(slug, -1, 1) GLOB '[a-z0-9]'",
+            name="ck_projects_canonical_slug",
+        ),
+    )
 
     id: Optional[int] = Field(default=None, primary_key=True)
     slug: str = Field(index=True, unique=True, max_length=255)
@@ -81,6 +102,14 @@ class Agent(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     project_id: int = Field(foreign_key="projects.id", index=True)
     name: str = Field(index=True, max_length=128)
+    agent_generation: str = Field(
+        default_factory=_new_agent_generation,
+        sa_column=Column(
+            String(64),
+            nullable=False,
+            server_default=text("(lower(hex(randomblob(32))))"),
+        ),
+    )
     program: str = Field(max_length=128)
     model: str = Field(max_length=128)
     task_description: str = Field(default="", max_length=2048)
@@ -130,6 +159,12 @@ class Message(SQLModel, table=True):
         Index("idx_messages_project_created", "project_id", "created_ts"),
         Index("idx_messages_project_sender_created", "project_id", "sender_id", "created_ts"),
         Index("idx_messages_project_topic", "project_id", "topic"),
+        Index(
+            "uq_messages_delivery",
+            "delivery_id",
+            unique=True,
+            sqlite_where=text("delivery_id IS NOT NULL"),
+        ),
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -150,6 +185,275 @@ class Message(SQLModel, table=True):
         default_factory=list,
         sa_column=Column(JSON, nullable=False, server_default="[]"),
     )
+    # Durable delivery lifetime, unlike the reusable SQLite integer row id.
+    # Legacy/imported messages have no delivery identity.
+    delivery_id: Optional[str] = Field(default=None, max_length=36)
+
+
+class MessageDelivery(SQLModel, table=True):
+    """Durable, immutable intent for publishing one message archive bundle."""
+
+    __tablename__ = "message_deliveries"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('pending', 'published', 'quarantined')",
+            name="ck_message_deliveries_state",
+        ),
+        CheckConstraint(
+            "delivery_kind IN ('message', 'reply', 'contact_request')",
+            name="ck_message_deliveries_kind",
+        ),
+        CheckConstraint(
+            "(delivery_kind != 'contact_request' OR actor_kind = 'agent') "
+            "AND (delivery_kind != 'reply' "
+            "     OR (actor_kind IN ('agent', 'ui_user') "
+            "         AND thread_id IS NOT NULL "
+            "         AND length(trim(thread_id)) > 0))",
+            name="ck_message_deliveries_kind_shape",
+        ),
+        CheckConstraint(
+            "length(id) = 36 "
+            "AND substr(id, 9, 1) = '-' "
+            "AND substr(id, 14, 1) = '-' "
+            "AND substr(id, 19, 1) = '-' "
+            "AND substr(id, 24, 1) = '-' "
+            "AND lower(id) = id "
+            "AND length(replace(id, '-', '')) = 32 "
+            "AND replace(id, '-', '') NOT GLOB '*[^0-9a-f]*'",
+            name="ck_message_deliveries_uuid",
+        ),
+        CheckConstraint(
+            "length(project_generation_snapshot) = 64 "
+            "AND project_generation_snapshot NOT GLOB '*[^0-9a-f]*' "
+            "AND length(sender_project_generation_snapshot) = 64 "
+            "AND sender_project_generation_snapshot NOT GLOB '*[^0-9a-f]*' "
+            "AND length(sender_generation_snapshot) = 64 "
+            "AND sender_generation_snapshot NOT GLOB '*[^0-9a-f]*' "
+            "AND (actor_project_generation_snapshot IS NULL "
+            "     OR (length(actor_project_generation_snapshot) = 64 "
+            "         AND actor_project_generation_snapshot NOT GLOB '*[^0-9a-f]*')) "
+            "AND (actor_generation_snapshot IS NULL "
+            "     OR (length(actor_generation_snapshot) = 64 "
+            "         AND actor_generation_snapshot NOT GLOB '*[^0-9a-f]*'))",
+            name="ck_message_deliveries_identity_generations",
+        ),
+        CheckConstraint(
+            "actor_kind IN ('agent', 'ui_user', 'system') "
+            "AND ((actor_kind = 'agent' "
+            "      AND actor_id > 0 "
+            "      AND actor_project_id_snapshot > 0 "
+            "      AND actor_project_slug_snapshot IS NOT NULL "
+            "      AND actor_project_generation_snapshot IS NOT NULL "
+            "      AND actor_generation_snapshot IS NOT NULL "
+            "      AND actor_id = sender_id "
+            "      AND actor_name_snapshot = sender_name_snapshot "
+            "      AND actor_project_id_snapshot = sender_project_id_snapshot "
+            "      AND actor_project_slug_snapshot = sender_project_slug_snapshot "
+            "      AND actor_project_generation_snapshot = sender_project_generation_snapshot "
+            "      AND actor_generation_snapshot = sender_generation_snapshot "
+            "      AND actor_epoch_snapshot IS NULL) "
+            " OR  (actor_kind = 'ui_user' "
+            "      AND actor_id > 0 "
+            "      AND actor_project_id_snapshot > 0 "
+            "      AND actor_project_slug_snapshot IS NOT NULL "
+            "      AND actor_project_generation_snapshot IS NOT NULL "
+            "      AND actor_project_id_snapshot = sender_project_id_snapshot "
+            "      AND actor_project_slug_snapshot = sender_project_slug_snapshot "
+            "      AND actor_project_generation_snapshot = sender_project_generation_snapshot "
+            "      AND actor_generation_snapshot IS NOT NULL "
+            "      AND actor_epoch_snapshot >= 1) "
+            " OR  (actor_kind = 'system' "
+            "      AND actor_id = 0 "
+            "      AND actor_name_snapshot = 'system' "
+            "      AND actor_project_id_snapshot IS NULL "
+            "      AND actor_project_slug_snapshot IS NULL "
+            "      AND actor_project_generation_snapshot IS NULL "
+            "      AND actor_generation_snapshot IS NULL "
+            "      AND actor_epoch_snapshot IS NULL))",
+            name="ck_message_deliveries_actor_provenance",
+        ),
+        CheckConstraint(
+            "length(trim(idempotency_key)) > 0 "
+            "AND length(request_sha256) = 64 "
+            "AND request_sha256 NOT GLOB '*[^0-9a-f]*'",
+            name="ck_message_deliveries_idempotency",
+        ),
+        CheckConstraint(
+            "length(archive_document) > 0 "
+            "AND length(document_sha256) = 64 "
+            "AND document_sha256 NOT GLOB '*[^0-9a-f]*'",
+            name="ck_message_deliveries_archive_hash",
+        ),
+        CheckConstraint(
+            "lease_fence >= 0 AND attempt_count >= 0 AND backoff_seconds >= 0 "
+            "AND ((lease_token IS NULL AND lease_expires_ts IS NULL) "
+            "     OR (lease_token IS NOT NULL "
+            "         AND length(trim(lease_token)) > 0 "
+            "         AND lease_fence >= 1 "
+            "         AND lease_expires_ts IS NOT NULL))",
+            name="ck_message_deliveries_lease",
+        ),
+        CheckConstraint(
+            "(state = 'pending' "
+            " AND message_id IS NULL "
+            " AND published_ts IS NULL "
+            " AND quarantined_ts IS NULL "
+            " AND quarantine_reason IS NULL "
+            " AND next_attempt_ts IS NOT NULL) "
+            "OR (state = 'published' "
+            " AND message_id IS NOT NULL "
+            " AND published_ts IS NOT NULL "
+            " AND archive_commit_sha IS NOT NULL "
+            " AND archive_relative_path IS NOT NULL "
+            " AND archive_blob_sha IS NOT NULL "
+            " AND quarantined_ts IS NULL "
+            " AND quarantine_reason IS NULL "
+            " AND next_attempt_ts IS NULL "
+            " AND lease_token IS NULL "
+            " AND lease_expires_ts IS NULL) "
+            "OR (state = 'quarantined' "
+            " AND message_id IS NULL "
+            " AND published_ts IS NULL "
+            " AND quarantined_ts IS NOT NULL "
+            " AND quarantine_reason IS NOT NULL "
+            " AND length(trim(quarantine_reason)) > 0 "
+            " AND next_attempt_ts IS NULL "
+            " AND lease_token IS NULL "
+            " AND lease_expires_ts IS NULL)",
+            name="ck_message_deliveries_state_fields",
+        ),
+        CheckConstraint(
+            "(archive_relative_path IS NULL "
+            " AND archive_blob_sha IS NULL "
+            " AND archive_commit_sha IS NULL) "
+            "OR (archive_commit_sha IS NOT NULL "
+            "    AND length(archive_commit_sha) IN (40, 64) "
+            "    AND archive_commit_sha NOT GLOB '*[^0-9a-f]*' "
+            "    AND archive_relative_path IS NOT NULL "
+            "    AND archive_relative_path = "
+            "        'projects/' || project_slug_snapshot || "
+            "        '/message_deliveries/' || id || '.md' "
+            "    AND archive_blob_sha IS NOT NULL "
+            "    AND length(archive_blob_sha) IN (40, 64) "
+            "    AND archive_blob_sha NOT GLOB '*[^0-9a-f]*')",
+            name="ck_message_deliveries_receipt",
+        ),
+        Index(
+            "uq_message_deliveries_idempotency",
+            "project_id",
+            "project_generation_snapshot",
+            "actor_kind",
+            "actor_id",
+            text("coalesce(actor_generation_snapshot, '')"),
+            text("coalesce(actor_project_generation_snapshot, '')"),
+            "idempotency_key",
+            unique=True,
+        ),
+        Index(
+            "idx_message_deliveries_due",
+            "next_attempt_ts",
+            "lease_expires_ts",
+            sqlite_where=text("state = 'pending'"),
+        ),
+        Index(
+            "idx_message_deliveries_project_created",
+            "project_id",
+            "created_ts",
+        ),
+        Index(
+            "idx_message_deliveries_reply_pending",
+            "reply_to_message_id",
+            "state",
+        ),
+    )
+
+    id: str = Field(default_factory=_new_delivery_id, primary_key=True, max_length=36)
+    state: str = Field(default="pending", max_length=16)
+    delivery_kind: str = Field(default="message", max_length=32)
+    project_id: int
+    project_slug_snapshot: str = Field(max_length=255)
+    project_generation_snapshot: str = Field(max_length=64)
+    sender_project_id_snapshot: int
+    sender_project_slug_snapshot: str = Field(max_length=255)
+    sender_project_generation_snapshot: str = Field(max_length=64)
+    sender_id: int
+    sender_name_snapshot: str = Field(max_length=128)
+    sender_generation_snapshot: str = Field(max_length=64)
+    actor_kind: str = Field(max_length=16)
+    actor_id: int = Field(default=0)
+    actor_name_snapshot: str = Field(max_length=128)
+    actor_project_id_snapshot: Optional[int] = Field(default=None)
+    actor_project_slug_snapshot: Optional[str] = Field(default=None, max_length=255)
+    actor_project_generation_snapshot: Optional[str] = Field(default=None, max_length=64)
+    actor_generation_snapshot: Optional[str] = Field(default=None, max_length=64)
+    actor_epoch_snapshot: Optional[int] = Field(default=None)
+    idempotency_key: str = Field(max_length=128)
+    request_sha256: str = Field(max_length=64)
+    thread_id: Optional[str] = Field(default=None, max_length=128)
+    reply_to_message_id: Optional[int] = Field(default=None)
+    topic: Optional[str] = Field(default=None, max_length=64)
+    subject: str = Field(max_length=512)
+    body_md: str
+    importance: str = Field(default="normal", max_length=16)
+    ack_required: bool = Field(default=False)
+    attachments: list[dict[str, Any]] = Field(
+        default_factory=list,
+        sa_column=Column(JSON, nullable=False, server_default="[]"),
+    )
+    archive_document: str
+    document_sha256: str = Field(max_length=64)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+    lease_token: Optional[str] = Field(default=None, max_length=128)
+    lease_fence: int = Field(default=0)
+    lease_expires_ts: Optional[datetime] = Field(default=None)
+    attempt_count: int = Field(default=0)
+    backoff_seconds: int = Field(default=0)
+    next_attempt_ts: Optional[datetime] = Field(default_factory=_utcnow_naive)
+    last_attempt_ts: Optional[datetime] = Field(default=None)
+    last_error: Optional[str] = Field(default=None)
+    archive_relative_path: Optional[str] = Field(default=None, max_length=1024)
+    archive_blob_sha: Optional[str] = Field(default=None, max_length=64)
+    archive_commit_sha: Optional[str] = Field(default=None, max_length=64)
+    message_id: Optional[int] = Field(default=None)
+    published_ts: Optional[datetime] = Field(default=None)
+    quarantined_ts: Optional[datetime] = Field(default=None)
+    quarantine_reason: Optional[str] = Field(default=None)
+
+
+class MessageDeliveryRecipient(SQLModel, table=True):
+    """Ordered recipient identity snapshot owned by a delivery intent."""
+
+    __tablename__ = "message_delivery_recipients"
+    __table_args__ = (
+        CheckConstraint("ordinal >= 0", name="ck_message_delivery_recipients_ordinal"),
+        CheckConstraint(
+            "kind IN ('to', 'cc', 'bcc')",
+            name="ck_message_delivery_recipients_kind",
+        ),
+        CheckConstraint(
+            "length(agent_generation_snapshot) = 64 "
+            "AND agent_generation_snapshot NOT GLOB '*[^0-9a-f]*'",
+            name="ck_message_delivery_recipients_generation",
+        ),
+        UniqueConstraint(
+            "delivery_id",
+            "agent_id",
+            name="uq_message_delivery_recipients_agent",
+        ),
+        Index(
+            "idx_message_delivery_recipients_agent",
+            "agent_id",
+            "delivery_id",
+        ),
+    )
+
+    delivery_id: str = Field(foreign_key="message_deliveries.id", primary_key=True, max_length=36)
+    ordinal: int = Field(primary_key=True)
+    kind: str = Field(max_length=8)
+    agent_id: int
+    agent_name_snapshot: str = Field(max_length=128)
+    agent_generation_snapshot: str = Field(max_length=64)
+    project_id_snapshot: int
 
 
 class FileReservation(SQLModel, table=True):

@@ -68,7 +68,7 @@ LEGACY_CSP = (
 
 # A route the gate protects and that renders without any project existing, so a
 # failure here is the gate's answer and not a missing fixture.
-GUARDED = "/mail/archive/guide"
+GUARDED = "/mail/api/v1/projects"
 PROFILE_PATH = "/mail/api/v1/me/profile"
 PASSWORD_PATH = "/mail/api/v1/me/password"
 ADMIN_ACCESS_PATH = "/mail/api/v1/admin/access"
@@ -77,9 +77,6 @@ SAME_ORIGIN_HEADERS = {
     "Referer": "http://test/",
     "Host": "test",
 }
-OVERSEER_UNAVAILABLE_DETAIL = (
-    "Human Overseer messaging is temporarily unavailable while atomic archive persistence is implemented"
-)
 
 
 def _build(monkeypatch, **env: str):
@@ -211,7 +208,7 @@ class TestPublicRootAndFavicon:
             "static-bearer": {"Authorization": f"Bearer {BEARER}"},
             "jwt": {"Authorization": f"Bearer {jwt_token}"},
         }
-        raw_query = "next=%2Fmail%2Fv2%2Fsettings&plus=a+b&empty=&flag"
+        raw_query = "next=%2Fmail%23settings&plus=a+b&empty=&flag"
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             for caller, headers in callers.items():
@@ -226,7 +223,7 @@ class TestPublicRootAndFavicon:
                     "referrer-policy": "no-referrer",
                     "x-content-type-options": "nosniff",
                     "x-frame-options": "DENY",
-                    "location": f"/mail/v2/?{raw_query}",
+                    "location": f"/mail?{raw_query}",
                     "content-length": "0",
                 }
                 assert root.status_code == 307, caller
@@ -557,8 +554,8 @@ def _install_react_dist(monkeypatch, tmp_path: Path) -> Path:
     assets_root.mkdir(parents=True)
     (dist_root / "index.html").write_text(
         "<!doctype html><title>Hermes React shell marker</title>"
-        '<script type="module" src="/mail/v2/assets/index-test.js"></script>'
-        '<link rel="stylesheet" href="/mail/v2/assets/index-test.css">',
+        '<script type="module" src="/mail/assets/index-test.js"></script>'
+        '<link rel="stylesheet" href="/mail/assets/index-test.css">',
         encoding="utf-8",
     )
     (assets_root / "index-test.js").write_text(
@@ -860,10 +857,10 @@ class TestMailInlineImagePolicy:
 
 
 class TestMailReactShell:
-    """The Vite shell is session-gated, non-cacheable, and path-contained."""
+    """The React cutover has one shell URL and one contained asset namespace."""
 
     @pytest.mark.asyncio
-    async def test_authenticated_base_redirects_to_canonical_slash_and_keeps_query(
+    async def test_authenticated_trailing_slash_redirects_to_canonical_mail_and_keeps_query(
         self,
         isolated_env,
         monkeypatch,
@@ -878,15 +875,20 @@ class TestMailReactShell:
             base_url="http://test",
             cookies=await _cookie("react-redirect-admin", epoch),
         ) as client:
-            response = await client.get("/mail/v2?tab=projects")
+            responses = [
+                await client.get("/mail/?tab=projects"),
+                await client.head("/mail/?tab=projects"),
+            ]
 
-        assert response.status_code == 307
-        assert response.headers["location"] == "/mail/v2/?tab=projects"
-        assert response.headers["Cache-Control"] == "no-store, no-transform"
-        assert response.headers["Content-Security-Policy"] == REACT_CSP
-        assert response.headers["Referrer-Policy"] == "no-referrer"
-        assert response.headers["X-Content-Type-Options"] == "nosniff"
-        assert response.headers["X-Frame-Options"] == "DENY"
+        for response in responses:
+            assert response.status_code == 307
+            assert response.headers["location"] == "/mail?tab=projects"
+            assert response.headers["Cache-Control"] == "no-store, no-transform"
+            assert response.headers["Content-Security-Policy"] == REACT_CSP
+            assert response.headers["Referrer-Policy"] == "no-referrer"
+            assert response.headers["X-Content-Type-Options"] == "nosniff"
+            assert response.headers["X-Frame-Options"] == "DENY"
+            assert response.content == b""
 
     @pytest.mark.asyncio
     async def test_anonymous_navigation_redirects_to_login_with_exact_next(
@@ -903,13 +905,13 @@ class TestMailReactShell:
             base_url="http://test",
         ) as client:
             response = await client.get(
-                "/mail/v2/?tab=inbox&filter=high",
+                "/mail?tab=inbox&filter=high",
                 headers={"Accept": "text/html"},
             )
 
         assert response.status_code == 303
         assert response.headers["location"] == (
-            "/mail/login?next=%2Fmail%2Fv2%2F%3Ftab%3Dinbox%26filter%3Dhigh"
+            "/mail/login?next=%2Fmail%3Ftab%3Dinbox%26filter%3Dhigh"
         )
         assert response.headers["Cache-Control"] == "no-store, no-transform"
         assert response.headers["Content-Security-Policy"] == LEGACY_CSP
@@ -962,14 +964,14 @@ class TestMailReactShell:
             base_url="http://test",
             cookies=await _cookie(username, epoch),
         ) as client:
-            response = await client.get("/mail/v2/")
+            response = await client.get("/mail")
 
         assert response.status_code == 200
         assert "Hermes React shell marker" in response.text
         assert "Project not found" not in response.text
 
     @pytest.mark.asyncio
-    async def test_root_and_deep_link_serve_non_cacheable_csp_protected_index(
+    async def test_canonical_root_serves_non_cacheable_csp_protected_index(
         self,
         isolated_env,
         monkeypatch,
@@ -983,14 +985,10 @@ class TestMailReactShell:
             base_url="http://test",
             cookies=await _cookie("react-deep-admin", epoch),
         ) as client:
-            root = await client.get("/mail/v2/")
-            root_head = await client.head("/mail/v2/")
-            deep = await client.get("/mail/v2/settings/profile?tab=password")
-            deep_head = await client.head(
-                "/mail/v2/settings/profile?tab=password"
-            )
+            root = await client.get("/mail")
+            root_head = await client.head("/mail")
 
-        for response in (root, root_head, deep, deep_head):
+        for response in (root, root_head):
             assert response.status_code == 200
             assert response.headers["Cache-Control"] == "no-store, no-transform"
             assert response.headers["Content-Security-Policy"] == REACT_CSP
@@ -998,13 +996,11 @@ class TestMailReactShell:
             assert response.headers["X-Content-Type-Options"] == "nosniff"
             assert response.headers["X-Frame-Options"] == "DENY"
             assert response.headers["Content-Type"].startswith("text/html")
-        for response in (root, deep):
-            assert "Hermes React shell marker" in response.text
-        for response in (root_head, deep_head):
-            assert response.content == b""
+        assert "Hermes React shell marker" in root.text
+        assert root_head.content == b""
 
     @pytest.mark.asyncio
-    async def test_legacy_html_is_non_transformable_and_blocks_external_resources(
+    async def test_login_is_public_and_uses_the_canonical_asset_namespace(
         self,
         isolated_env,
         monkeypatch,
@@ -1019,13 +1015,13 @@ class TestMailReactShell:
         ) as anonymous_client:
             login = await anonymous_client.get("/mail/login")
             login_stylesheet = await anonymous_client.get(
-                "/mail/v2/assets/legacy.css"
+                "/mail/assets/legacy.css"
             )
             login_stylesheet_head = await anonymous_client.head(
-                "/mail/v2/assets/legacy.css"
+                "/mail/assets/legacy.css"
             )
             protected_runtime = await anonymous_client.get(
-                "/mail/v2/assets/legacy.js"
+                "/mail/assets/legacy.js"
             )
         async with AsyncClient(
             transport=ASGITransport(app=app),
@@ -1034,13 +1030,19 @@ class TestMailReactShell:
         ) as authenticated_client:
             inbox = await authenticated_client.get("/mail")
 
-        for response in (login, inbox):
-            assert response.status_code == 200
-            assert response.headers["Cache-Control"] == "no-store, no-transform"
-            assert response.headers["Content-Security-Policy"] == LEGACY_CSP
-            assert response.headers["Referrer-Policy"] == "no-referrer"
-            assert response.headers["X-Content-Type-Options"] == "nosniff"
-            assert response.headers["X-Frame-Options"] == "DENY"
+        assert login.status_code == 200
+        assert login.headers["Cache-Control"] == "no-store, no-transform"
+        assert login.headers["Content-Security-Policy"] == LEGACY_CSP
+        assert login.headers["Referrer-Policy"] == "no-referrer"
+        assert login.headers["X-Content-Type-Options"] == "nosniff"
+        assert login.headers["X-Frame-Options"] == "DENY"
+        assert 'href="/mail/assets/legacy.css"' in login.text
+        assert "/mail/v2" not in login.text
+
+        assert inbox.status_code == 200
+        assert inbox.headers["Cache-Control"] == "no-store, no-transform"
+        assert inbox.headers["Content-Security-Policy"] == REACT_CSP
+        assert "Hermes React shell marker" in inbox.text
 
         assert login_stylesheet.status_code == 200
         assert login_stylesheet_head.status_code == 200
@@ -1068,16 +1070,19 @@ class TestMailReactShell:
             base_url="http://test",
             cookies=await _cookie("react-assets-admin", epoch),
         ) as client:
-            javascript = await client.get("/mail/v2/assets/index-test.js")
-            stylesheet = await client.get("/mail/v2/assets/index-test.css")
-            legacy_javascript = await client.get("/mail/v2/assets/legacy.js")
-            legacy_stylesheet = await client.get("/mail/v2/assets/legacy.css")
-            missing = await client.get("/mail/v2/assets/not-built.js")
-            bare_namespace = await client.get("/mail/v2/assets")
-            encoded_namespace = await client.get("/mail/v2/%61ssets")
-            directory = await client.get("/mail/v2/assets/")
+            javascript = await client.get("/mail/assets/index-test.js")
+            stylesheet = await client.get("/mail/assets/index-test.css")
+            legacy_javascript = await client.get("/mail/assets/legacy.js")
+            aliased_legacy_javascript = await client.get(
+                "/mail/assets/%2e%2flegacy.js"
+            )
+            legacy_stylesheet = await client.get("/mail/assets/legacy.css")
+            missing = await client.get("/mail/assets/not-built.js")
+            bare_namespace = await client.get("/mail/assets")
+            encoded_namespace = await client.get("/mail/%61ssets")
+            directory = await client.get("/mail/assets/")
             traversal = await client.get(
-                "/mail/v2/assets/%2e%2e%2findex.html",
+                "/mail/assets/%2e%2e%2findex.html",
             )
 
         immutable = "public, max-age=31536000, immutable, no-transform"
@@ -1090,10 +1095,11 @@ class TestMailReactShell:
         assert stylesheet.status_code == 200
         assert stylesheet.headers["Cache-Control"] == immutable
         assert stylesheet.headers["Content-Type"].startswith("text/css")
-        for response in (legacy_javascript, legacy_stylesheet):
-            assert response.status_code == 200
-            assert response.headers["Cache-Control"] == "no-cache, no-transform"
-            assert response.headers["X-Content-Type-Options"] == "nosniff"
+        assert legacy_javascript.status_code == 404
+        assert aliased_legacy_javascript.status_code == 404
+        assert legacy_stylesheet.status_code == 200
+        assert legacy_stylesheet.headers["Cache-Control"] == "no-cache, no-transform"
+        assert legacy_stylesheet.headers["X-Content-Type-Options"] == "nosniff"
         assert missing.status_code == 404
         for response in (bare_namespace, encoded_namespace, directory):
             assert response.status_code == 404
@@ -1133,9 +1139,9 @@ class TestMailReactShell:
             base_url="http://test",
             cookies=await _cookie("react-symlink-admin", epoch),
         ) as client:
-            file_escape = await client.get("/mail/v2/assets/outside-file.js")
+            file_escape = await client.get("/mail/assets/outside-file.js")
             directory_escape = await client.get(
-                "/mail/v2/assets/outside-directory/secret.js",
+                "/mail/assets/outside-directory/secret.js",
             )
 
         for response in (file_escape, directory_escape):
@@ -1160,14 +1166,132 @@ class TestMailReactShell:
             base_url="http://test",
             cookies=await _cookie("react-missing-admin", epoch),
         ) as client:
-            root = await client.get("/mail/v2/")
-            deep = await client.get("/mail/v2/settings")
-            asset = await client.get("/mail/v2/assets/index-missing.js")
+            root = await client.get("/mail")
+            asset = await client.get("/mail/assets/index-missing.js")
+            trailing_slash = await client.get("/mail/")
+            retired = await client.get("/mail/v2")
 
-        for response in (root, deep, asset):
+        for response in (root, asset):
             assert response.status_code == 503
             assert response.json() == {"detail": "React Mail UI build is unavailable."}
         assert "Project not found" not in root.text
+        assert trailing_slash.status_code == 307
+        assert trailing_slash.headers["location"] == "/mail"
+        assert retired.status_code == 404
+        assert "React Mail UI build is unavailable." not in retired.text
+
+    @pytest.mark.asyncio
+    async def test_versioned_and_legacy_html_routes_are_retired_with_404(
+        self,
+        isolated_env,
+        monkeypatch,
+        tmp_path,
+    ):
+        _install_react_dist(monkeypatch, tmp_path)
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        project_id, message_id = await _seed_project(
+            "react-cutover-project",
+            subject="Legacy route sentinel",
+            agent_name="CutoverAgent",
+            sound="soft",
+        )
+        epoch = await _make_user("react-cutover-admin")
+        legacy_get_paths = [
+            "/mail/v2",
+            "/mail/v2/",
+            "/mail/v2/settings",
+            "/mail/v2/assets/index-test.js",
+            "/mail/projects",
+            "/mail/unified-inbox",
+            "/mail/react-cutover-project",
+            "/mail/react-cutover-project/inbox/CutoverAgent",
+            f"/mail/react-cutover-project/message/{message_id}",
+            f"/mail/react-cutover-project/thread/{message_id}",
+            "/mail/react-cutover-project/search?q=sentinel",
+            "/mail/react-cutover-project/file_reservations",
+            "/mail/react-cutover-project/attachments",
+            "/mail/react-cutover-project/overseer/compose",
+            "/mail/archive/guide",
+            "/mail/archive/activity",
+            "/mail/archive/commit/deadbeef",
+            "/mail/archive/timeline",
+            "/mail/archive/browser",
+            "/mail/archive/browser/react-cutover-project/file?path=index.html",
+            "/mail/archive/browser/react-cutover-project/download?path=index.html",
+            "/mail/archive/network",
+            "/mail/archive/time-travel",
+            "/mail/archive/time-travel/snapshot",
+            "/mail/api/unified-inbox",
+            "/mail/api/locks",
+            "/mail/api/projects/react-cutover-project/agents",
+        ]
+        legacy_post_paths = [
+            "/mail/api/delete-messages",
+            "/mail/api/retire-agent",
+            "/mail/api/unretire-agent",
+            "/mail/api/archive-project",
+            "/mail/api/unarchive-project",
+            f"/mail/api/projects/{project_id}/siblings/{project_id}",
+            "/mail/react-cutover-project/inbox/CutoverAgent/mark-read",
+            "/mail/react-cutover-project/inbox/CutoverAgent/mark-all-read",
+            "/mail/react-cutover-project/inbox/CutoverAgent/delete-messages",
+            "/mail/react-cutover-project/overseer/send",
+            "/mail/react-cutover-project/overseer/reply",
+        ]
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("react-cutover-admin", epoch),
+        ) as client:
+            get_responses = [await client.get(path) for path in legacy_get_paths]
+            post_responses = [
+                await client.post(path, headers=SAME_ORIGIN_HEADERS)
+                for path in legacy_post_paths
+            ]
+
+        for path, response in zip(
+            [*legacy_get_paths, *legacy_post_paths],
+            [*get_responses, *post_responses],
+            strict=True,
+        ):
+            assert response.status_code == 404, path
+            assert "Hermes React shell marker" not in response.text, path
+
+    @pytest.mark.asyncio
+    async def test_retired_namespaces_are_404_before_authentication(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        retired_paths = [
+            "/mail/v2",
+            "/mail/projects",
+            "/mail/archive/guide",
+            "/mail/api/unified-inbox",
+        ]
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            anonymous = [await client.get(path) for path in retired_paths]
+            service_bearer = [
+                await client.get(
+                    path,
+                    headers={"Authorization": f"Bearer {BEARER}"},
+                )
+                for path in retired_paths
+            ]
+
+        for path, response in zip(
+            [*retired_paths, *retired_paths],
+            [*anonymous, *service_bearer],
+            strict=True,
+        ):
+            assert response.status_code == 404, path
+            assert response.json() == {"detail": "Not Found"}, path
 
     @pytest.mark.asyncio
     async def test_versioned_account_apis_are_never_captured_by_the_spa(
@@ -1226,9 +1350,22 @@ class TestMailUiPreferences:
             "/mail/api/v1/me/preferences",
             "/mail/api/v1/me/profile",
             "/mail/api/v1/projects",
+            "/mail/api/v1/deliveries/{delivery_id}",
+            "/mail/api/v1/deliveries/{delivery_id}/retry",
+            "/mail/api/v1/projects/{project_id}/messages",
             "/mail/api/v1/projects/{project_id}/messages/{message_id}",
+            "/mail/api/v1/projects/{project_id}/messages/{message_id}/replies",
             "/mail/api/v1/projects/{project_id}/threads/{thread_id}",
         }
+        assert schema["components"]["securitySchemes"]["MailUiSession"] == {
+            "type": "apiKey",
+            "in": "cookie",
+            "name": _settings.mail_ui.cookie_name,
+        }
+        for path_item in mail_paths.values():
+            for method, operation in path_item.items():
+                if method in {"get", "post", "put", "patch", "delete"}:
+                    assert operation["security"] == [{"MailUiSession": []}]
         operations = mail_paths["/mail/api/v1/me/preferences"]
         assert set(operations) == {"get", "patch"}
         assert operations["patch"]["requestBody"]["content"]["application/json"]["schema"] == {
@@ -1354,6 +1491,69 @@ class TestMailUiPreferences:
                 "application/json"
             ]["schema"] == {"$ref": f"#/components/schemas/{model_name}"}
 
+        delivery_status = mail_paths["/mail/api/v1/deliveries/{delivery_id}"]
+        assert set(delivery_status) == {"get"}
+        assert delivery_status["get"]["responses"]["200"]["content"][
+            "application/json"
+        ]["schema"] == {"$ref": "#/components/schemas/MailUiDeliveryResponse"}
+        for status_code in ("401", "403", "404", "409", "500"):
+            assert delivery_status["get"]["responses"][status_code]["content"][
+                "application/json"
+            ]["schema"] == {
+                "$ref": "#/components/schemas/MailUiDeliveryErrorResponse"
+            }
+        assert delivery_status["get"]["responses"]["422"]["content"][
+            "application/json"
+        ]["schema"] == {
+            "$ref": "#/components/schemas/MailUiDeliveryOrValidationErrorResponse"
+        }
+        delivery_retry = mail_paths[
+            "/mail/api/v1/deliveries/{delivery_id}/retry"
+        ]
+        assert set(delivery_retry) == {"post"}
+        assert delivery_retry["post"]["responses"]["200"]["content"][
+            "application/json"
+        ]["schema"] == {"$ref": "#/components/schemas/MailUiDeliveryResponse"}
+        assert delivery_retry["post"]["responses"]["422"]["content"][
+            "application/json"
+        ]["schema"] == {
+            "$ref": "#/components/schemas/MailUiDeliveryOrValidationErrorResponse"
+        }
+        compose_operation = mail_paths[
+            "/mail/api/v1/projects/{project_id}/messages"
+        ]
+        assert set(compose_operation) == {"post"}
+        assert compose_operation["post"]["requestBody"]["content"][
+            "application/json"
+        ]["schema"] == {"$ref": "#/components/schemas/MailUiComposeRequest"}
+        assert compose_operation["post"]["responses"]["200"]["content"][
+            "application/json"
+        ]["schema"] == {"$ref": "#/components/schemas/MailUiDeliveryResponse"}
+        assert compose_operation["post"]["responses"]["422"]["content"][
+            "application/json"
+        ]["schema"] == {
+            "$ref": "#/components/schemas/MailUiDeliveryOrValidationErrorResponse"
+        }
+        reply_operation = mail_paths[
+            "/mail/api/v1/projects/{project_id}/messages/{message_id}/replies"
+        ]
+        assert set(reply_operation) == {"post"}
+        assert reply_operation["post"]["requestBody"]["content"][
+            "application/json"
+        ]["schema"] == {"$ref": "#/components/schemas/MailUiReplyRequest"}
+        assert reply_operation["post"]["responses"]["200"]["content"][
+            "application/json"
+        ]["schema"] == {"$ref": "#/components/schemas/MailUiDeliveryResponse"}
+        assert reply_operation["post"]["responses"]["422"]["content"][
+            "application/json"
+        ]["schema"] == {
+            "$ref": "#/components/schemas/MailUiDeliveryOrValidationErrorResponse"
+        }
+        for request_schema_name in ("MailUiComposeRequest", "MailUiReplyRequest"):
+            assert schema["components"]["schemas"][request_schema_name][
+                "additionalProperties"
+            ] is False
+
         summary_properties = set(
             schema["components"]["schemas"]["MailUiMessageSummary"]["properties"]
         )
@@ -1418,8 +1618,9 @@ class TestMailUiPreferences:
                     "(username, password_hash, role, disabled, session_epoch, "
                     "session_generation, created_ts) "
                     "VALUES ('raw-defaults', 'unused', 'member', 0, 1, "
-                    "'generation', datetime('now'))"
-                )
+                    ":session_generation, datetime('now'))"
+                ),
+                {"session_generation": "a" * 64},
             )
             await session.commit()
             row = (
@@ -1573,7 +1774,7 @@ class TestMailUiPreferences:
                 json={"preferred_ui_locale": "pl"},
                 headers={
                     "Origin": "https://hermes.klatt.ie",
-                    "Referer": "https://hermes.klatt.ie/mail/v2/",
+                    "Referer": "https://hermes.klatt.ie/mail/",
                     "X-Forwarded-Proto": "https",
                 },
             )
@@ -1591,7 +1792,7 @@ class TestMailUiPreferences:
                 json={"preferred_ui_locale": "pl"},
                 headers={
                     "Origin": "https://hermes.klatt.ie",
-                    "Referer": "https://hermes.klatt.ie/mail/v2/",
+                    "Referer": "https://hermes.klatt.ie/mail/",
                     "X-Forwarded-Proto": "https",
                 },
             )
@@ -1716,7 +1917,7 @@ class TestMailUiPreferences:
         epoch = await _make_user(username, role=webauth.ROLE_MEMBER)
         user_id = await _user_id(username)
         original = http_module._mail_ui_preferences_cas_update
-        replacement_generation = "replacement-generation"
+        replacement_generation = "b" * 64
         raced = False
 
         async def replace_before_cas(session, *, principal, values):
@@ -3125,7 +3326,7 @@ class TestMailUiPasswordChange:
         requested_password = "requested password for old account"
         epoch = await _make_user(username, password=current_password)
         user_id = await _user_id(username)
-        replacement_generation = "replacement-password-generation"
+        replacement_generation = "c" * 64
         replacement_hash = webauth.hash_password(replacement_password)
         original = http_module._mail_ui_password_cas_update
 
@@ -3391,7 +3592,8 @@ class TestMailUiRbacSurface:
             )
 
         assert reservations.status_code == 200
-        assert mailbox.status_code == 401
+        assert mailbox.status_code == 404
+        assert mailbox.json() == {"detail": "Not Found"}
         assert wrong_token.status_code == 401
 
     @pytest.mark.asyncio
@@ -3455,12 +3657,14 @@ class TestMailUiRbacSurface:
         assert response.status_code == 200
 
     @pytest.mark.asyncio
-    async def test_member_aggregates_filter_counts_messages_projects_sounds_and_siblings(
+    async def test_typed_member_aggregates_filter_messages_and_projects_while_legacy_is_404(
         self,
         isolated_env,
         monkeypatch,
+        tmp_path,
     ):
-        """Every aggregate payload is derived only from assigned projects."""
+        """Typed aggregates stay scoped while every retired aggregate is 404."""
+        _install_react_dist(monkeypatch, tmp_path)
         _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
         visible_id, _visible_message = await _seed_project(
             "visible-project",
@@ -3493,31 +3697,50 @@ class TestMailUiRbacSurface:
             base_url="http://test",
             cookies=await _cookie("scoped-member", epoch),
         ) as client:
-            payload_response = await client.get("/mail/api/unified-inbox", params={"include_projects": "true"})
+            inbox_response = await client.get("/mail/api/v1/inbox")
+            projects_response = await client.get("/mail/api/v1/projects")
             root_page = await client.get("/mail")
             legacy_page = await client.get("/mail/unified-inbox")
             projects_page = await client.get("/mail/projects")
+            legacy_api = await client.get(
+                "/mail/api/unified-inbox",
+                params={"include_projects": "true"},
+            )
 
-        payload = payload_response.json()
-        assert payload_response.status_code == 200
-        assert payload_response.headers["Cache-Control"] == "no-store"
-        assert payload["total_messages"] == 1
-        assert [message["subject"] for message in payload["messages"]] == ["VISIBLE-SUBJECT"]
-        assert payload["messages"][0]["can_reply"] is False
-        assert [project["slug"] for project in payload["projects"]] == ["visible-project"]
-        assert payload["agent_sounds"] == {"VisibleAgent": "high"}
-        for response in (root_page, legacy_page, projects_page):
-            assert response.status_code == 200
-            assert "HIDDEN-SUBJECT" not in response.text
-            assert "hidden-project" not in response.text
+        inbox = inbox_response.json()
+        assert inbox_response.status_code == 200
+        assert inbox_response.headers["Cache-Control"] == "no-store"
+        assert inbox["total"] == 1
+        assert [message["subject"] for message in inbox["items"]] == [
+            "VISIBLE-SUBJECT"
+        ]
+        assert inbox["items"][0]["can_reply"] is False
+
+        projects = projects_response.json()
+        assert projects_response.status_code == 200
+        assert projects_response.headers["Cache-Control"] == "no-store"
+        assert projects["total"] == 1
+        assert [project["slug"] for project in projects["items"]] == [
+            "visible-project"
+        ]
+
+        assert root_page.status_code == 200
+        assert root_page.headers["Content-Security-Policy"] == REACT_CSP
+        assert "HIDDEN-SUBJECT" not in root_page.text
+        assert "hidden-project" not in root_page.text
+        for response in (legacy_page, projects_page, legacy_api):
+            assert response.status_code == 404
+            assert response.json() == {"detail": "Not Found"}
 
     @pytest.mark.asyncio
-    async def test_only_admin_requests_refresh_cross_project_sibling_profiles(
+    async def test_cutover_shell_and_typed_projects_never_refresh_sibling_profiles(
         self,
         isolated_env,
         monkeypatch,
+        tmp_path,
     ):
-        """A member read cannot trigger global profiling, writes, or LLM cost."""
+        """Read-only React surfaces never trigger profiling, writes, or LLM cost."""
+        _install_react_dist(monkeypatch, tmp_path)
         _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
         project_id, _message_id = await _seed_project(
             "sibling-refresh-project",
@@ -3540,10 +3763,12 @@ class TestMailUiRbacSurface:
             cookies=await _cookie("sibling-member", member_epoch),
         ) as member_client:
             member_root = await member_client.get("/mail")
-            member_projects = await member_client.get("/mail/projects")
+            member_projects = await member_client.get("/mail/api/v1/projects")
+            member_legacy_projects = await member_client.get("/mail/projects")
 
         assert member_root.status_code == 200
         assert member_projects.status_code == 200
+        assert member_legacy_projects.status_code == 404
         assert refresh_calls == []
 
         async with AsyncClient(
@@ -3552,11 +3777,13 @@ class TestMailUiRbacSurface:
             cookies=await _cookie("sibling-admin", admin_epoch),
         ) as admin_client:
             admin_root = await admin_client.get("/mail")
-            admin_projects = await admin_client.get("/mail/projects")
+            admin_projects = await admin_client.get("/mail/api/v1/projects")
+            admin_legacy_projects = await admin_client.get("/mail/projects")
 
         assert admin_root.status_code == 200
         assert admin_projects.status_code == 200
-        assert len(refresh_calls) == 2
+        assert admin_legacy_projects.status_code == 404
+        assert refresh_calls == []
 
     @pytest.mark.asyncio
     async def test_missing_assignment_is_404_and_viewer_cannot_reply(
@@ -3564,7 +3791,7 @@ class TestMailUiRbacSurface:
         isolated_env,
         monkeypatch,
     ):
-        """Invisible projects are 404 while an insufficient visible role is 403."""
+        """All retired project pages are 404 regardless of former visibility."""
         _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
         visible_id, visible_message = await _seed_project(
             "viewer-project",
@@ -3609,16 +3836,18 @@ class TestMailUiRbacSurface:
             )
 
         assert all(response.status_code == 404 for response in hidden_responses)
-        assert compose.status_code == 403
-        assert reply.status_code == 403
+        assert compose.status_code == 404
+        assert compose.json() == {"detail": "Not Found"}
+        assert reply.status_code == 404
+        assert reply.json() == {"detail": "Not Found"}
 
     @pytest.mark.asyncio
-    async def test_operator_reply_metadata_remains_while_legacy_mutations_are_unavailable(
+    async def test_operator_reply_metadata_uses_typed_api_while_legacy_routes_are_404(
         self,
         isolated_env,
         monkeypatch,
     ):
-        """Reply authorization metadata survives while the unsafe legacy writer is held."""
+        """Typed metadata survives while every retired writer fails closed."""
         _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
         collision_id, _collision_message = await _seed_project(
             "operator-collision",
@@ -3661,7 +3890,7 @@ class TestMailUiRbacSurface:
                 params={"reply_to": message_id},
             )
             compose_new = await client.get("/mail/operator-project/overseer/compose")
-            unified_inbox = await client.get("/mail/api/unified-inbox")
+            typed_inbox = await client.get("/mail/api/v1/inbox")
             arbitrary_send = await client.post(
                 "/mail/operator-project/overseer/send",
                 json={"recipients": ["OperatorAgent"], "subject": "No", "body_md": "No"},
@@ -3680,17 +3909,19 @@ class TestMailUiRbacSurface:
                 headers=headers,
             )
 
-        assert compose_reply.status_code == 503
-        assert compose_reply.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
-        assert compose_new.status_code == 403
-        assert unified_inbox.status_code == 200
+        assert compose_reply.status_code == 404
+        assert compose_reply.json() == {"detail": "Not Found"}
+        assert compose_new.status_code == 404
+        assert compose_new.json() == {"detail": "Not Found"}
+        assert typed_inbox.status_code == 200
         operator_message = next(
-            item for item in unified_inbox.json()["messages"] if item["id"] == message_id
+            item for item in typed_inbox.json()["items"] if item["id"] == message_id
         )
         assert operator_message["can_reply"] is True
-        assert arbitrary_send.status_code == 403
-        assert reply.status_code == 503
-        assert reply.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
+        assert arbitrary_send.status_code == 404
+        assert arbitrary_send.json() == {"detail": "Not Found"}
+        assert reply.status_code == 404
+        assert reply.json() == {"detail": "Not Found"}
 
     @pytest.mark.asyncio
     async def test_legacy_overseer_hold_precedes_database_and_archive_writes(
@@ -3698,7 +3929,7 @@ class TestMailUiRbacSurface:
         isolated_env,
         monkeypatch,
     ):
-        """Both legacy POST routes fail before either persistence layer is touched."""
+        """Retired POST routes return 404 before either persistence layer is touched."""
         from mcp_agent_mail import storage as storage_module
 
         _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
@@ -3748,10 +3979,10 @@ class TestMailUiRbacSurface:
                 headers=SAME_ORIGIN_HEADERS,
             )
 
-        assert send_response.status_code == 503
-        assert send_response.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
-        assert reply_response.status_code == 503
-        assert reply_response.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
+        assert send_response.status_code == 404
+        assert send_response.json() == {"detail": "Not Found"}
+        assert reply_response.status_code == 404
+        assert reply_response.json() == {"detail": "Not Found"}
         assert archive_write_calls == 0
         async with get_session() as session:
             after_count = int(
@@ -3836,8 +4067,12 @@ class TestMailUiRbacSurface:
             revalidations.append(kwargs["project_slug"])
             return await original_revalidate(**kwargs)
 
-        monkeypatch.setattr(http_module.hub, "subscribe_project", lambda _slug: queue)
-        monkeypatch.setattr(http_module.hub, "unsubscribe_project", lambda _slug, _queue: None)
+        monkeypatch.setattr(http_module.hub, "subscribe_projects", lambda _projects: queue)
+        monkeypatch.setattr(
+            http_module.hub,
+            "unsubscribe_projects",
+            lambda _projects, _queue: None,
+        )
         monkeypatch.setattr(http_module, "MAX_STREAM_SECONDS", 0.03)
         monkeypatch.setattr(http_module, "KEEPALIVE_SECONDS", 0.005)
         monkeypatch.setattr(http_module, "_mail_ui_stream_access_valid", observed_revalidate)
@@ -3862,47 +4097,46 @@ class TestMailUiRbacSurface:
         classification = {
             "/mail/login": "public-session",
             "/mail/logout": "public-method-denied",
-            "/mail": "aggregate-scoped",
+            "/mail": "canonical-shell",
+            "/mail/": "canonical-slash-redirect",
+            "/mail/assets/{asset_path:path}": "session-static-asset",
             "/mail/events": "aggregate-scoped",
-            "/mail/api/unified-inbox": "aggregate-scoped",
+            "/mail/api/unified-inbox": "retired-404",
             "/mail/api/v1/inbox": "aggregate-scoped",
             "/mail/api/v1/admin/access": "admin-only",
             "/mail/api/v1/me/profile": "self-only",
             "/mail/api/v1/me/preferences": "self-only",
             "/mail/api/v1/projects": "aggregate-scoped",
+            "/mail/api/v1/deliveries/{delivery_id}": "self-only",
             "/mail/api/v1/projects/{project_id}/messages/{message_id}": (
                 "project-guarded"
             ),
             "/mail/api/v1/projects/{project_id}/threads/{thread_id}": (
                 "project-guarded"
             ),
-            "/mail/projects": "aggregate-scoped",
-            "/mail/unified-inbox": "aggregate-scoped",
-            "/mail/v2": "session-shell",
-            "/mail/v2/": "session-shell",
-            "/mail/v2/assets/{asset_path:path}": "session-static-asset",
-            "/mail/v2/{spa_path:path}": "session-shell",
-            "/mail/api/locks": "admin-only",
+            "/mail/projects": "retired-404",
+            "/mail/unified-inbox": "retired-404",
+            "/mail/api/locks": "retired-404",
             "/mail/api/file-reservations": "service-or-project-scoped",
-            "/mail/{project}": "project-guarded",
-            "/mail/{project}/inbox/{agent}": "project-guarded",
-            "/mail/{project}/message/{mid}": "project-guarded",
-            "/mail/{project}/thread/{thread_id}": "project-guarded",
-            "/mail/{project}/search": "project-guarded",
-            "/mail/{project}/file_reservations": "project-guarded",
-            "/mail/{project}/attachments": "project-guarded",
-            "/mail/{project}/overseer/compose": "project-role-guarded",
-            "/mail/archive/guide": "aggregate-scoped",
-            "/mail/archive/activity": "aggregate-scoped",
-            "/mail/archive/commit/{sha}": "aggregate-scoped",
-            "/mail/archive/timeline": "project-query-guarded",
-            "/mail/archive/browser": "project-query-guarded",
-            "/mail/archive/browser/{project}/file": "project-guarded",
-            "/mail/archive/browser/{project}/download": "project-guarded",
-            "/mail/archive/network": "project-query-guarded",
-            "/mail/api/projects/{project}/agents": "project-guarded",
-            "/mail/archive/time-travel": "aggregate-scoped",
-            "/mail/archive/time-travel/snapshot": "project-query-guarded",
+            "/mail/{project}": "retired-404",
+            "/mail/{project}/inbox/{agent}": "retired-404",
+            "/mail/{project}/message/{mid}": "retired-404",
+            "/mail/{project}/thread/{thread_id}": "retired-404",
+            "/mail/{project}/search": "retired-404",
+            "/mail/{project}/file_reservations": "retired-404",
+            "/mail/{project}/attachments": "retired-404",
+            "/mail/{project}/overseer/compose": "retired-404",
+            "/mail/archive/guide": "retired-404",
+            "/mail/archive/activity": "retired-404",
+            "/mail/archive/commit/{sha}": "retired-404",
+            "/mail/archive/timeline": "retired-404",
+            "/mail/archive/browser": "retired-404",
+            "/mail/archive/browser/{project}/file": "retired-404",
+            "/mail/archive/browser/{project}/download": "retired-404",
+            "/mail/archive/network": "retired-404",
+            "/mail/api/projects/{project}/agents": "retired-404",
+            "/mail/archive/time-travel": "retired-404",
+            "/mail/archive/time-travel/snapshot": "retired-404",
         }
         actual = {
             route.path
@@ -3922,8 +4156,10 @@ class TestMailUiRbacSurface:
             "project-role-guarded",
             "project-query-guarded",
             "self-only",
-            "session-shell",
+            "canonical-shell",
+            "canonical-slash-redirect",
             "session-static-asset",
+            "retired-404",
         }
 
 
@@ -4289,3 +4525,451 @@ class TestMailUiV1ReadApi:
         for response in [*malformed, *invalid_limits]:
             assert response.status_code == 422
             assert response.headers["Cache-Control"] == "no-store"
+
+
+class TestMailUiV1DeliveryApi:
+    """Human writes enter the same durable, idempotent delivery state machine."""
+
+    @pytest.mark.asyncio
+    async def test_authored_delivery_validation_never_reflects_request_values(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        project_id, message_id = await _seed_project(
+            "api-v1-validation-redaction",
+            subject="Validation source",
+            agent_name="ValidationTarget",
+            sound="soft",
+        )
+        epoch = await _make_user("validation-redaction-admin")
+        secret_body = "do-not-reflect-this-authored-body"
+        secret_key = "do-not-reflect-this-idempotency-key"
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("validation-redaction-admin", epoch),
+        ) as client:
+            compose = await client.post(
+                f"/mail/api/v1/projects/{project_id}/messages",
+                json={
+                    "idempotency_key": secret_key,
+                    "recipients": ["ValidationTarget"],
+                    "subject": "Valid subject",
+                    "body_md": secret_body,
+                    "unexpected": secret_body,
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            reply = await client.post(
+                f"/mail/api/v1/projects/{project_id}/messages/{message_id}/replies",
+                json={
+                    "idempotency_key": secret_key,
+                    "body_md": secret_body,
+                    "unexpected": secret_body,
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            malformed_reply_path = await client.post(
+                "/mail/api/v1/projects/not-an-id/messages/0/replies",
+                json={
+                    "idempotency_key": secret_key,
+                    "body_md": secret_body,
+                    "unexpected": secret_body,
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            malformed_compose_path = await client.post(
+                "/mail/api/v1/projects/not-an-id/messages",
+                json={
+                    "idempotency_key": secret_key,
+                    "recipients": ["ValidationTarget"],
+                    "subject": "Valid subject",
+                    "body_md": secret_body,
+                    "unexpected": secret_body,
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+
+        for response in (
+            compose,
+            reply,
+            malformed_reply_path,
+            malformed_compose_path,
+        ):
+            assert response.status_code == 422
+            assert response.headers["Cache-Control"] == "no-store"
+            assert secret_body not in response.text
+            assert secret_key not in response.text
+            for error in response.json()["detail"]:
+                assert set(error) <= {"type", "loc", "msg"}
+
+    @pytest.mark.asyncio
+    async def test_delivery_access_and_internal_failures_keep_typed_safe_shape(
+        self,
+        isolated_env,
+        monkeypatch,
+        caplog,
+        capsys,
+    ):
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        epoch = await _make_user("delivery-failure-admin")
+        payload = {
+            "idempotency_key": "typed-failure-1",
+            "recipients": ["Nobody"],
+            "subject": "Never persisted",
+            "body_md": "Never persisted.",
+        }
+        secret = "do-not-log-this-authored-exception"
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("delivery-failure-admin", epoch),
+        ) as client:
+            missing = await client.post(
+                "/mail/api/v1/projects/999999/messages",
+                json=payload,
+                headers=SAME_ORIGIN_HEADERS,
+            )
+
+            async def fail_acceptance(_request: Any):
+                raise RuntimeError(secret)
+
+            project_id, _message_id = await _seed_project(
+                "typed-internal-failure",
+                subject="Existing message",
+                agent_name="FailureTarget",
+                sound="soft",
+            )
+            original_preferences_user = http_module._mail_ui_preferences_user
+
+            async def stale_preferences_user(*_args: Any, **_kwargs: Any):
+                raise http_module.HTTPException(
+                    status_code=401,
+                    detail=secret,
+                )
+
+            monkeypatch.setattr(
+                http_module,
+                "_mail_ui_preferences_user",
+                stale_preferences_user,
+            )
+            revoked = await client.post(
+                f"/mail/api/v1/projects/{project_id}/messages",
+                json={**payload, "recipients": ["FailureTarget"]},
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            monkeypatch.setattr(
+                http_module,
+                "_mail_ui_preferences_user",
+                original_preferences_user,
+            )
+            monkeypatch.setattr(
+                http_module,
+                "accept_message_delivery",
+                fail_acceptance,
+            )
+            failed = await client.post(
+                f"/mail/api/v1/projects/{project_id}/messages",
+                json={**payload, "recipients": ["FailureTarget"]},
+                headers=SAME_ORIGIN_HEADERS,
+            )
+
+        captured = capsys.readouterr()
+        assert missing.status_code == 404
+        assert missing.json() == {"detail": {"code": "project_not_found"}}
+        assert revoked.status_code == 401
+        assert revoked.json() == {"detail": {"code": "actor_forbidden"}}
+        assert failed.status_code == 500
+        assert failed.json() == {"detail": {"code": "delivery_failed"}}
+        assert secret not in failed.text
+        assert secret not in caplog.text
+        assert secret not in captured.out
+        assert secret not in captured.err
+
+    @pytest.mark.asyncio
+    async def test_admin_compose_is_published_once_and_status_is_account_scoped(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        project_id, _message_id = await _seed_project(
+            "api-v1-compose",
+            subject="Existing message",
+            agent_name="ComposeTarget",
+            sound="soft",
+        )
+        admin_epoch = await _make_user("compose-admin")
+        other_epoch = await _make_user("compose-other")
+        notified: list[str] = []
+
+        async def record_notification(delivery_id: str) -> None:
+            notified.append(delivery_id)
+
+        monkeypatch.setattr(
+            http_module,
+            "emit_published_delivery_notifications",
+            record_notification,
+        )
+        payload = {
+            "idempotency_key": "web-compose-1",
+            "recipients": ["ComposeTarget"],
+            "subject": "Durable human request",
+            "body_md": "Please inspect the deploy.",
+            "thread_id": "human-thread-1",
+        }
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("compose-admin", admin_epoch),
+        ) as client:
+            first = await client.post(
+                f"/mail/api/v1/projects/{project_id}/messages",
+                json=payload,
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            repeated = await client.post(
+                f"/mail/api/v1/projects/{project_id}/messages",
+                json=payload,
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            conflict = await client.post(
+                f"/mail/api/v1/projects/{project_id}/messages",
+                json={**payload, "body_md": "A different request."},
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            own_status = await client.get(
+                f"/mail/api/v1/deliveries/{first.json()['id']}"
+            )
+            retried = await client.post(
+                f"/mail/api/v1/deliveries/{first.json()['id']}/retry",
+                json={},
+                headers=SAME_ORIGIN_HEADERS,
+            )
+
+        assert first.status_code == repeated.status_code == 200
+        assert first.json()["status"] == "published"
+        assert first.json()["reused"] is False
+        assert repeated.json() == {**first.json(), "reused": True}
+        assert conflict.status_code == 409
+        assert conflict.json() == {"detail": {"code": "idempotency_conflict"}}
+        assert own_status.status_code == 200
+        assert own_status.json() == {**first.json(), "reused": True}
+        assert retried.status_code == 200
+        assert retried.json() == {**first.json(), "reused": True}
+        assert "error" not in first.json()
+        for response in (first, repeated, conflict, own_status, retried):
+            assert response.headers["Cache-Control"] == "no-store"
+
+        async with get_session() as session:
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT m.body_md, sender.name, COUNT(*) OVER () "
+                        "FROM messages m JOIN agents sender ON sender.id = m.sender_id "
+                        "WHERE m.delivery_id = :delivery_id"
+                    ),
+                    {"delivery_id": first.json()["id"]},
+                )
+            ).one()
+            delivery_count = int(
+                (
+                    await session.execute(
+                        text(
+                            "SELECT COUNT(*) FROM message_deliveries "
+                            "WHERE idempotency_key = 'web-compose-1'"
+                        )
+                    )
+                ).scalar_one()
+            )
+        assert row[1] == "HumanOverseer"
+        assert "MESSAGE FROM HUMAN OVERSEER" in str(row[0])
+        assert str(row[0]).endswith("Please inspect the deploy.")
+        assert int(row[2]) == delivery_count == 1
+        assert notified == [first.json()["id"]]
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("compose-other", other_epoch),
+        ) as other:
+            hidden = await other.get(
+                f"/mail/api/v1/deliveries/{first.json()['id']}"
+            )
+            hidden_retry = await other.post(
+                f"/mail/api/v1/deliveries/{first.json()['id']}/retry",
+                json={},
+                headers=SAME_ORIGIN_HEADERS,
+            )
+        assert hidden.status_code == 404
+        assert hidden.json() == {"detail": {"code": "delivery_not_found"}}
+        assert hidden_retry.status_code == 404
+        assert hidden_retry.json() == {"detail": {"code": "delivery_not_found"}}
+
+    @pytest.mark.asyncio
+    async def test_pending_compose_notifies_once_when_retry_publishes(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        project_id, _message_id = await _seed_project(
+            "api-v1-retry-notification",
+            subject="Existing message",
+            agent_name="RetryTarget",
+            sound="soft",
+        )
+        epoch = await _make_user("retry-notification-admin")
+        real_process = http_module.process_message_delivery
+        deferred_once = False
+
+        async def defer_first_processing(delivery_id: str):
+            nonlocal deferred_once
+            if not deferred_once:
+                deferred_once = True
+                return http_module.MessageDeliveryProcessingResult(
+                    delivery_id=delivery_id,
+                    status="pending",
+                )
+            return await real_process(delivery_id)
+
+        notified: list[str] = []
+
+        async def record_notification(delivery_id: str) -> None:
+            notified.append(delivery_id)
+
+        monkeypatch.setattr(
+            http_module,
+            "process_message_delivery",
+            defer_first_processing,
+        )
+        monkeypatch.setattr(
+            http_module,
+            "emit_published_delivery_notifications",
+            record_notification,
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("retry-notification-admin", epoch),
+        ) as client:
+            accepted = await client.post(
+                f"/mail/api/v1/projects/{project_id}/messages",
+                json={
+                    "idempotency_key": "web-retry-notification-1",
+                    "recipients": ["RetryTarget"],
+                    "subject": "Retry this durable intent",
+                    "body_md": "Publish on retry.",
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            retried = await client.post(
+                f"/mail/api/v1/deliveries/{accepted.json()['id']}/retry",
+                json={},
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            replay = await client.post(
+                f"/mail/api/v1/deliveries/{accepted.json()['id']}/retry",
+                json={},
+                headers=SAME_ORIGIN_HEADERS,
+            )
+
+        assert accepted.status_code == 200
+        assert accepted.json()["status"] == "pending"
+        assert retried.status_code == replay.status_code == 200
+        assert retried.json()["status"] == replay.json()["status"] == "published"
+        assert notified == [accepted.json()["id"]]
+
+    @pytest.mark.asyncio
+    async def test_operator_reply_is_server_routed_and_viewer_or_foreign_origin_fail(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        project_id, message_id = await _seed_project(
+            "api-v1-reply",
+            subject="Need a human answer",
+            agent_name="ReplyTarget",
+            sound="high",
+        )
+        operator_epoch = await _make_user(
+            "reply-operator",
+            role=webauth.ROLE_MEMBER,
+        )
+        viewer_epoch = await _make_user("reply-viewer", role=webauth.ROLE_MEMBER)
+        await _assign("reply-operator", project_id, webauth.PROJECT_ROLE_OPERATOR)
+        await _assign("reply-viewer", project_id, webauth.PROJECT_ROLE_VIEWER)
+        path = f"/mail/api/v1/projects/{project_id}/messages/{message_id}/replies"
+        payload = {"idempotency_key": "web-reply-1", "body_md": "Approved."}
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("reply-operator", operator_epoch),
+        ) as operator:
+            response = await operator.post(
+                path,
+                json=payload,
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            foreign = await operator.post(
+                path,
+                json={**payload, "idempotency_key": "foreign-origin"},
+                headers={"Origin": "https://evil.example", "Host": "test"},
+            )
+            retry = await operator.post(
+                f"/mail/api/v1/deliveries/{response.json()['id']}/retry",
+                json={},
+                headers=SAME_ORIGIN_HEADERS,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "published"
+        assert response.json()["message_id"] is not None
+        assert retry.status_code == 200
+        assert retry.json()["status"] == "published"
+        assert foreign.status_code == 403
+        assert foreign.json() == {"detail": {"code": "actor_forbidden"}}
+
+        async with get_session() as session:
+            routed = (
+                await session.execute(
+                    text(
+                        "SELECT m.project_id, m.thread_id, m.reply_to, m.subject, "
+                        "sender.name, recipient.name "
+                        "FROM messages m "
+                        "JOIN agents sender ON sender.id = m.sender_id "
+                        "JOIN message_recipients mr ON mr.message_id = m.id "
+                        "JOIN agents recipient ON recipient.id = mr.agent_id "
+                        "WHERE m.delivery_id = :delivery_id"
+                    ),
+                    {"delivery_id": response.json()["id"]},
+                )
+            ).one()
+        assert tuple(routed) == (
+            project_id,
+            str(message_id),
+            message_id,
+            "Re: Need a human answer",
+            "HumanOverseer",
+            "ReplyTarget",
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("reply-viewer", viewer_epoch),
+        ) as viewer:
+            denied = await viewer.post(
+                path,
+                json={**payload, "idempotency_key": "viewer-denied"},
+                headers=SAME_ORIGIN_HEADERS,
+            )
+        assert denied.status_code == 403
+        assert denied.json() == {"detail": {"code": "actor_forbidden"}}

@@ -73,14 +73,21 @@ async def test_reply_message_inherits_thread_and_subject_prefix(isolated_env):
                 "to": ["BlueLake"],
                 "subject": "Plan",
                 "body_md": "body",
+                "idempotency_key": "semantics-reply-parent",
             },
         )
-        msg = (m1.data.get("deliveries") or [{}])[0].get("payload", {})
+        msg = (m1.data.get("deliveries") or [{}])[0].get("message", {})
         orig_id = int(msg.get("id"))
         # Reply
         r = await client.call_tool(
             "reply_message",
-            {"project_key": "Backend", "message_id": orig_id, "sender_name": "BlueLake", "body_md": "ack"},
+            {
+                "project_key": "Backend",
+                "message_id": orig_id,
+                "sender_name": "BlueLake",
+                "body_md": "ack",
+                "idempotency_key": "semantics-reply-child",
+            },
         )
         rdata = r.data
         expected_thread = msg.get("thread_id") or str(orig_id)
@@ -89,7 +96,7 @@ async def test_reply_message_inherits_thread_and_subject_prefix(isolated_env):
         # Subject on delivery payload should be prefixed
         deliveries = rdata.get("deliveries") or []
         assert deliveries
-        subj = deliveries[0].get("payload", {}).get("subject", "")
+        subj = deliveries[0].get("message", {}).get("subject", "")
         assert subj.lower().startswith("re:")
 
 
@@ -110,9 +117,10 @@ async def test_reply_message_explicit_empty_to_does_not_restore_default_recipien
                 "to": ["BlueLake"],
                 "subject": "Plan",
                 "body_md": "body",
+                "idempotency_key": "semantics-empty-reply-parent",
             },
         )
-        original_payload = (original.data.get("deliveries") or [{}])[0].get("payload", {})
+        original_payload = (original.data.get("deliveries") or [{}])[0].get("message", {})
         original_id = int(original_payload["id"])
 
         reply = await client.call_tool(
@@ -123,6 +131,7 @@ async def test_reply_message_explicit_empty_to_does_not_restore_default_recipien
                 "sender_name": "BlueLake",
                 "to": [],
                 "body_md": "no recipients on purpose",
+                "idempotency_key": "semantics-empty-reply-child",
             },
         )
         assert reply.data["count"] == 0
@@ -153,9 +162,10 @@ async def test_mark_read_then_ack_updates_state(isolated_env):
                 "subject": "AckPlease",
                 "body_md": "hello",
                 "ack_required": True,
+                "idempotency_key": "semantics-mark-read-seed",
             },
         )
-        msg = (m1.data.get("deliveries") or [{}])[0].get("payload", {})
+        msg = (m1.data.get("deliveries") or [{}])[0].get("message", {})
         mid = int(msg.get("id"))
 
         mr = await client.call_tool(
@@ -195,9 +205,10 @@ async def test_acknowledge_idempotent_multiple_calls(isolated_env):
                 "subject": "AckTwice",
                 "body_md": "hello",
                 "ack_required": True,
+                "idempotency_key": "semantics-ack-twice-seed",
             },
         )
-        msg = (m1.data.get("deliveries") or [{}])[0].get("payload", {})
+        msg = (m1.data.get("deliveries") or [{}])[0].get("message", {})
         mid = int(msg.get("id"))
 
         first = await client.call_tool(
@@ -237,6 +248,7 @@ async def test_send_message_requires_sender_token_across_sessions(isolated_env):
                     "to": ["GreenCastle"],
                     "subject": "Forged",
                     "body_md": "This should fail",
+                    "idempotency_key": "security-spoof-forged",
                 },
             )
         assert "sender_token" in str(exc_info.value)
@@ -251,6 +263,7 @@ async def test_send_message_requires_sender_token_across_sessions(isolated_env):
                     "to": ["GreenCastle"],
                     "subject": "Legit",
                     "body_md": "This should succeed",
+                    "idempotency_key": "security-spoof-legit",
                 },
         )
     assert result.data["verified_sender"] is True
@@ -286,6 +299,7 @@ async def test_send_message_auto_contact_requests_pending_approval_without_targe
                     "subject": "Need approval",
                     "body_md": "please let me in",
                     "auto_contact_if_blocked": True,
+                    "idempotency_key": "security-auto-contact-pending",
                 },
             )
         assert "Pending contact requests were created for: BlueLake" in str(exc_info.value)
@@ -344,6 +358,7 @@ async def test_send_message_explicit_false_disables_local_auto_contact(isolated_
                     "subject": "No auto contact",
                     "body_md": "stay blocked",
                     "auto_contact_if_blocked": False,
+                    "idempotency_key": "security-auto-contact-disabled",
                 },
             )
 
@@ -396,6 +411,7 @@ async def test_send_message_auto_contact_auto_approves_when_target_is_authentica
                 "subject": "Auto approved",
                 "body_md": "same session works",
                 "auto_contact_if_blocked": True,
+                "idempotency_key": "security-auto-contact-approved",
             },
         )
         assert result.data["count"] == 1
@@ -441,6 +457,7 @@ async def test_send_message_auto_contact_requests_cross_project_approval_without
                     "subject": "Need cross-project approval",
                     "body_md": "please link us",
                     "auto_contact_if_blocked": True,
+                    "idempotency_key": "security-auto-contact-xproj-pending",
                 },
             )
         assert "pending external contact requests were created for BlueLake@/security/auto-contact-xproj-frontend" in str(exc_info.value)
@@ -500,6 +517,7 @@ async def test_send_message_explicit_false_disables_cross_project_auto_contact(i
                     "subject": "No external auto contact",
                     "body_md": "stay blocked",
                     "auto_contact_if_blocked": False,
+                    "idempotency_key": "security-auto-contact-xproj-disabled",
                 },
             )
 
@@ -554,6 +572,7 @@ async def test_send_message_cross_project_auto_contact_preserves_recipient_kind(
                 "subject": "Cross-project BCC",
                 "body_md": "recipient kind must survive auto-approval",
                 "auto_contact_if_blocked": True,
+                "idempotency_key": "security-auto-contact-kind-bcc",
             },
         )
         assert result.data["count"] == 2
@@ -603,9 +622,10 @@ async def test_reply_message_enforces_local_contact_policy_for_new_recipient(iso
                 "to": ["GreenCastle"],
                 "subject": "Seed",
                 "body_md": "start thread",
+                "idempotency_key": "reply-contact-policy-seed",
             },
         )
-        seed_id = (seed.data.get("deliveries") or [])[0]["payload"]["id"]
+        seed_id = (seed.data.get("deliveries") or [])[0]["message"]["id"]
 
         with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
@@ -616,6 +636,7 @@ async def test_reply_message_enforces_local_contact_policy_for_new_recipient(iso
                     "sender_name": "GreenCastle",
                     "to": ["PurpleBear"],
                     "body_md": "looping in a new recipient",
+                    "idempotency_key": "reply-contact-policy-blocked",
                 },
             )
         assert "Contact approval required for recipients: PurpleBear" in str(exc_info.value)
@@ -659,6 +680,7 @@ async def test_send_message_rejects_expired_local_approved_contact(isolated_env)
                     "subject": "Stale approval",
                     "body_md": "expired approvals must not authorize delivery",
                     "auto_contact_if_blocked": False,
+                    "idempotency_key": "send-expired-local",
                 },
             )
         assert "Contact approval required for recipients: BlueLake" in str(exc_info.value)
@@ -704,9 +726,10 @@ async def test_reply_message_rejects_expired_local_approved_contact(isolated_env
                 "to": ["GreenCastle"],
                 "subject": "Seed",
                 "body_md": "start thread before reply check",
+                "idempotency_key": "reply-expired-local-seed",
             },
         )
-        seed_id = (seed.data.get("deliveries") or [])[0]["payload"]["id"]
+        seed_id = (seed.data.get("deliveries") or [])[0]["message"]["id"]
 
         with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
@@ -717,6 +740,7 @@ async def test_reply_message_rejects_expired_local_approved_contact(isolated_env
                     "sender_name": "GreenCastle",
                     "to": ["PurpleBear"],
                     "body_md": "expired approvals must not authorize replies",
+                    "idempotency_key": "reply-expired-local-child",
                 },
             )
         assert "Contact approval required for recipients: PurpleBear" in str(exc_info.value)
@@ -767,6 +791,7 @@ async def test_send_message_rejects_expired_cross_project_approved_contact(isola
                     "subject": "Expired external approval",
                     "body_md": "stale external approvals must not route mail",
                     "auto_contact_if_blocked": False,
+                    "idempotency_key": "send-expired-cross-project",
                 },
             )
         assert f"external recipients missing approved contact links: {receiver_name} @ /security/send-expired-ops" in str(
@@ -818,9 +843,10 @@ async def test_reply_message_supports_agent_at_project_external_address(isolated
                 "to": ["GreenCastle"],
                 "subject": "Seed",
                 "body_md": "start thread",
+                "idempotency_key": "reply-at-project-seed",
             },
         )
-        seed_id = (seed.data.get("deliveries") or [])[0]["payload"]["id"]
+        seed_id = (seed.data.get("deliveries") or [])[0]["message"]["id"]
 
         reply = await client.call_tool(
             "reply_message",
@@ -830,6 +856,7 @@ async def test_reply_message_supports_agent_at_project_external_address(isolated
                 "sender_name": "GreenCastle",
                 "to": [f"{ops_name}@/security/reply-xproj-ops"],
                 "body_md": "routing externally from a reply",
+                "idempotency_key": "reply-at-project-child",
             },
         )
         assert any(delivery["project"] == pkey("security/reply-xproj-ops") for delivery in reply.data["deliveries"])
@@ -890,10 +917,11 @@ async def test_cross_project_sender_identity_does_not_collide_with_same_name_loc
                 "subject": "Cross-project origin",
                 "body_md": "hello from the real backend sender",
                 "thread_id": "XPROJ-IDENTITY-1",
+                "idempotency_key": "cross-project-origin",
             },
         )
         ext_delivery = next(delivery for delivery in sent.data["deliveries"] if delivery["project"] == ops_key)
-        ext_payload = ext_delivery["payload"]
+        ext_payload = ext_delivery["message"]
         ext_message_id = ext_payload["id"]
 
         inbox = await client.call_tool(
@@ -933,6 +961,7 @@ async def test_cross_project_sender_identity_does_not_collide_with_same_name_loc
                     "sender_token": receiver_token,
                     "to": ["GreenCastle"],
                     "body_md": "trying to loop in the local lookalike",
+                    "idempotency_key": "cross-project-local-lookalike-reply",
                 },
             )
         assert "Contact approval required for recipients: GreenCastle" in str(exc_info.value)
@@ -945,17 +974,18 @@ async def test_cross_project_sender_identity_does_not_collide_with_same_name_loc
                 "sender_name": "BlueLake",
                 "sender_token": receiver_token,
                 "body_md": "replying to the actual external sender",
+                "idempotency_key": "cross-project-actual-sender-reply",
             },
         )
         backend_delivery = next(delivery for delivery in reply.data["deliveries"] if delivery["project"] == backend_key)
-        backend_payload = backend_delivery["payload"]
+        backend_payload = backend_delivery["message"]
         assert backend_payload["from"] == "BlueLake"
         assert backend_payload["from_project"] == ops_key
         assert get_db_health_status()["pool"]["checked_out"] == 0
 
 
 @pytest.mark.asyncio
-async def test_send_message_does_not_count_external_delivery_errors_as_success(isolated_env):
+async def test_send_message_does_not_write_legacy_mailbox_artifacts(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
         backend_key = "/security/send-partial-backend"
@@ -1010,21 +1040,26 @@ async def test_send_message_does_not_count_external_delivery_errors_as_success(i
                 "sender_name": "GreenCastle",
                 "sender_token": sender.data["registration_token"],
                 "to": ["GreenCastle", f"{receiver_name}@{ops_key}"],
-                "subject": "Partial delivery",
-                "body_md": "one local write, one blocked external write",
+                "subject": "Atomic multi-project delivery",
+                "body_md": "legacy mailbox reservations do not govern immutable delivery",
+                "idempotency_key": "send-partial-external",
             },
         )
 
-        assert sent.data["count"] == 1
-        assert [delivery["project"] for delivery in sent.data["deliveries"]] == [backend_key]
-        delivery_errors = sent.data.get("delivery_errors") or []
-        assert len(delivery_errors) == 1
-        assert delivery_errors[0]["type"] == "FILE_RESERVATION_CONFLICT"
-        assert delivery_errors[0]["project"] == ops_key
+        assert sent.data["count"] == 2
+        assert {delivery["project"] for delivery in sent.data["deliveries"]} == {
+            backend_key,
+            ops_key,
+        }
+        assert not sent.data.get("delivery_errors")
+        assert all(
+            delivery["delivery"]["status"] == "published"
+            for delivery in sent.data["deliveries"]
+        )
 
 
 @pytest.mark.asyncio
-async def test_reply_message_surfaces_external_delivery_failures(isolated_env):
+async def test_reply_message_does_not_write_legacy_mailbox_artifacts(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
         backend_key = "/security/reply-failure-backend"
@@ -1069,12 +1104,13 @@ async def test_reply_message_surfaces_external_delivery_failures(isolated_env):
                 "to": [f"{receiver_name}@{ops_key}"],
                 "subject": "Seed external thread",
                 "body_md": "start the thread externally",
+                "idempotency_key": "reply-failure-seed",
             },
         )
         ops_delivery = next(
             delivery for delivery in (seed.data.get("deliveries") or []) if delivery["project"] == ops_key
         )
-        ops_message_id = ops_delivery["payload"]["id"]
+        ops_message_id = ops_delivery["message"]["id"]
 
         reservation = await client.call_tool(
             "file_reservation_paths",
@@ -1095,14 +1131,15 @@ async def test_reply_message_surfaces_external_delivery_failures(isolated_env):
                 "message_id": ops_message_id,
                 "sender_name": receiver_name,
                 "sender_token": receiver.data["registration_token"],
-                "body_md": "this cross-project reply should be blocked by the reservation",
+                "body_md": "this reply uses the immutable delivery document",
+                "idempotency_key": "reply-failure-child",
             },
         )
 
-        assert reply.data["count"] == 0
-        error = reply.data.get("error") or {}
-        assert error["type"] == "FILE_RESERVATION_CONFLICT"
-        assert error["project"] == backend_key
+        assert reply.data["count"] == 1
+        assert reply.data["deliveries"][0]["project"] == backend_key
+        assert reply.data["deliveries"][0]["delivery"]["status"] == "published"
+        assert not reply.data.get("delivery_errors")
 
 
 @pytest.mark.asyncio
@@ -1150,6 +1187,7 @@ async def test_search_and_summarize_thread_respect_recipient_visibility(isolated
                 "subject": "Private plan",
                 "body_md": "ultra-secret launch sequence",
                 "thread_id": "SEC-THREAD-1",
+                "idempotency_key": "private-thread-bcc",
             },
         )
 
@@ -1207,13 +1245,16 @@ async def test_search_and_summarize_thread_respect_recipient_visibility(isolated
 
 
 @pytest.mark.asyncio
-async def test_send_message_rolls_back_db_row_when_archive_write_fails(isolated_env, monkeypatch):
-    """#180: a failed archive write after the message row is committed must roll
-    the row (and its recipients) back, not orphan a committed DB row."""
+async def test_send_message_keeps_db_invisible_when_archive_publish_is_pending(
+    isolated_env,
+    monkeypatch,
+):
+    """A transient Git failure keeps the durable intent but exposes no message."""
     from sqlalchemy import func, select as sa_select
 
-    import mcp_agent_mail.app as app_module
-    from mcp_agent_mail.models import Message, MessageRecipient
+    import mcp_agent_mail.delivery as delivery_service
+    from mcp_agent_mail.models import Message, MessageDelivery, MessageRecipient
+    from mcp_agent_mail.storage import MessageDeliveryPendingError
 
     server = build_mcp_server()
     async with Client(server) as client:
@@ -1223,22 +1264,25 @@ async def test_send_message_rolls_back_db_row_when_archive_write_fails(isolated_
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
         )
 
-        async def _boom(*_args, **_kwargs):
-            raise RuntimeError("simulated archive write failure")
+        async def _boom(_archive, delivery_id, *_args, **_kwargs):
+            raise MessageDeliveryPendingError(delivery_id, "simulated archive publish failure")
 
-        monkeypatch.setattr(app_module, "write_message_bundle", _boom)
+        monkeypatch.setattr(delivery_service, "publish_message_delivery", _boom)
 
-        with pytest.raises(ToolError):
-            await client.call_tool(
-                "send_message",
-                {
-                    "project_key": "Backend",
-                    "sender_name": "BlueLake",
-                    "to": ["BlueLake"],
-                    "subject": "Plan",
-                    "body_md": "body",
-                },
-            )
+        result = await client.call_tool(
+            "send_message",
+            {
+                "project_key": "Backend",
+                "sender_name": "BlueLake",
+                "to": ["BlueLake"],
+                "subject": "Plan",
+                "body_md": "body",
+                "idempotency_key": "archive-publish-pending",
+            },
+        )
+        delivery = result.data["deliveries"][0]
+        assert delivery["delivery"]["status"] == "pending"
+        assert delivery["message"] is None
 
         async with get_session() as session:
             msg_count = (
@@ -1247,5 +1291,9 @@ async def test_send_message_rolls_back_db_row_when_archive_write_fails(isolated_
             rec_count = (
                 await session.execute(sa_select(func.count()).select_from(MessageRecipient))
             ).scalar_one()
-        assert msg_count == 0, "orphaned Message row left after archive write failure (#180)"
-        assert rec_count == 0, "orphaned MessageRecipient rows left after archive failure (#180)"
+            delivery_count = (
+                await session.execute(sa_select(func.count()).select_from(MessageDelivery))
+            ).scalar_one()
+        assert msg_count == 0
+        assert rec_count == 0
+        assert delivery_count == 1

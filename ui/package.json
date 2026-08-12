@@ -33,6 +33,9 @@
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "react-i18next": "17.0.11",
+    "react-markdown": "10.1.0",
+    "remark-breaks": "4.0.0",
+    "remark-gfm": "4.0.1",
     "tippy.js": "6.3.7",
     "vis-network": "9.1.13"
   },

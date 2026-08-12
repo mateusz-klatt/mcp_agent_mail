@@ -24,6 +24,7 @@ Reference: mcp_agent_mail-mj0
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import subprocess
 
@@ -35,7 +36,7 @@ from sqlmodel import select
 from mcp_agent_mail import app as app_module
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import get_session
-from mcp_agent_mail.models import Agent, FileReservation, Project
+from mcp_agent_mail.models import Agent, FileReservation, MessageDelivery, Project
 from tests.keys import pkey
 
 
@@ -186,6 +187,7 @@ async def test_send_message_nonexistent_agent(isolated_env):
                     "to": ["SomeRecipient"],
                     "subject": "Test",
                     "body_md": "Body",
+                    "idempotency_key": "invalid-missing-sender",
                 },
             )
             pytest.fail("Should reject non-existent sender")
@@ -215,6 +217,7 @@ async def test_send_message_nonexistent_recipient(isolated_env):
                     "to": ["NonExistentRecipient"],
                     "subject": "Test",
                     "body_md": "Body",
+                    "idempotency_key": "invalid-missing-recipient",
                 },
             )
             pytest.fail("Should reject non-existent recipient")
@@ -305,6 +308,7 @@ async def test_send_message_empty_recipients(isolated_env):
                     "to": [],
                     "subject": "Test",
                     "body_md": "Body",
+                    "idempotency_key": "invalid-empty-recipients",
                 },
             )
         assert "recipient" in str(exc_info.value).lower()
@@ -388,6 +392,98 @@ async def test_hard_delete_project_removes_archive_tree(isolated_env, tmp_path, 
     assert _git(archive_repo_root, "ls-files", "--", archive_relpath) == ""
     assert _git(archive_repo_root, "status", "--porcelain") == ""
     assert commit_saw_lock
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_project_refuses_immutable_delivery_before_any_mutation(
+    isolated_env,
+    tmp_path,
+) -> None:
+    server = build_mcp_server()
+    project_key = pkey("immutable/delivery-project")
+    async with Client(server) as client:
+        project_result = await client.call_tool(
+            "ensure_project",
+            {"human_key": project_key},
+        )
+        project_payload = project_result.data.get("project") or project_result.data
+        slug = project_payload["slug"]
+        agent_result = await client.call_tool(
+            "register_agent",
+            {"project_key": project_key, "program": "test", "model": "test"},
+        )
+        agent_name = agent_result.data["name"]
+        registration_token = agent_result.data["registration_token"]
+
+    document = "immutable delivery evidence\n"
+    async with get_session() as session:
+        project = (
+            await session.execute(select(Project).where(Project.human_key == project_key))
+        ).scalars().one()
+        agent = (
+            await session.execute(
+                select(Agent).where(
+                    Agent.project_id == project.id,
+                    Agent.name == agent_name,
+                )
+            )
+        ).scalars().one()
+        assert project.id is not None
+        assert agent.id is not None
+        session.add(
+            MessageDelivery(
+                project_id=project.id,
+                project_slug_snapshot=project.slug,
+                project_generation_snapshot=project.project_generation,
+                sender_project_id_snapshot=project.id,
+                sender_project_slug_snapshot=project.slug,
+                sender_project_generation_snapshot=project.project_generation,
+                sender_id=agent.id,
+                sender_name_snapshot=agent.name,
+                sender_generation_snapshot=agent.agent_generation,
+                actor_kind="agent",
+                actor_id=agent.id,
+                actor_name_snapshot=agent.name,
+                actor_project_id_snapshot=project.id,
+                actor_project_slug_snapshot=project.slug,
+                actor_project_generation_snapshot=project.project_generation,
+                actor_generation_snapshot=agent.agent_generation,
+                idempotency_key="hard-delete-refusal",
+                request_sha256="1" * 64,
+                subject="Immutable",
+                body_md="Immutable",
+                archive_document=document,
+                document_sha256=hashlib.sha256(document.encode()).hexdigest(),
+            )
+        )
+        await session.commit()
+
+    sentinel = tmp_path / "storage" / "projects" / slug / "messages" / "sentinel.md"
+    sentinel.parent.mkdir(parents=True, exist_ok=True)
+    sentinel.write_text("must remain\n", encoding="utf-8")
+
+    async with Client(server) as client:
+        with pytest.raises(ToolError, match="immutable message delivery history"):
+            await client.call_tool(
+                "hard_delete_project",
+                {
+                    "project_key": project_key,
+                    "confirmation": "I UNDERSTAND",
+                    "registration_token": registration_token,
+                },
+            )
+
+    async with get_session() as session:
+        assert (
+            await session.execute(select(Project).where(Project.human_key == project_key))
+        ).scalars().one().slug == slug
+        assert (
+            await session.execute(select(Agent).where(Agent.name == agent_name))
+        ).scalars().one().project_id is not None
+        assert (
+            await session.execute(select(MessageDelivery))
+        ).scalars().one().state == "pending"
+    assert sentinel.read_text(encoding="utf-8") == "must remain\n"
 
 
 @pytest.mark.asyncio
@@ -645,6 +741,7 @@ async def test_send_message_empty_subject(isolated_env):
                     "to": [sender_name],
                     "subject": "",
                     "body_md": "Body",
+                    "idempotency_key": "invalid-empty-subject",
                 },
             )
             # If allowed, message should still be sent
@@ -960,6 +1057,7 @@ async def test_reply_message_nonexistent_original(isolated_env):
                     "message_id": 999999,  # Non-existent
                     "sender_name": agent_name,
                     "body_md": "Reply body",
+                    "idempotency_key": "invalid-missing-reply-target",
                 },
             )
             pytest.fail("Should fail for non-existent original message")

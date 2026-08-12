@@ -33,10 +33,11 @@ async def test_reply_preserves_thread_and_subject_prefix(isolated_env):
                 "to": ["BlueLake"],
                 "subject": "Plan",
                 "body_md": "body",
+                "idempotency_key": "reply-thread-parent",
             },
         )
         delivery = (orig.data.get("deliveries") or [])[0]
-        mid = delivery["payload"]["id"]
+        mid = delivery["message"]["id"]
 
         rep = await client.call_tool(
             "reply_message",
@@ -45,6 +46,7 @@ async def test_reply_preserves_thread_and_subject_prefix(isolated_env):
                 "message_id": mid,
                 "sender_name": "BlueLake",
                 "body_md": "ack",
+                "idempotency_key": "reply-thread-first",
             },
         )
         # Ensure thread continuity and deliveries present
@@ -60,6 +62,7 @@ async def test_reply_preserves_thread_and_subject_prefix(isolated_env):
                 "sender_name": "BlueLake",
                 "body_md": "second",
                 "subject_prefix": "Re:",
+                "idempotency_key": "reply-thread-second",
             },
         )
         assert rep2.data.get("deliveries")
@@ -103,11 +106,12 @@ async def test_reply_to_round_trips_through_db(isolated_env):
                 "to": ["BlueLake"],
                 "subject": "Plan",
                 "body_md": "body",
+                "idempotency_key": "reply-edge-parent",
             },
         )
-        original_id = orig.data["deliveries"][0]["payload"]["id"]
+        original_id = orig.data["deliveries"][0]["message"]["id"]
         # The original (top-level) message must have a NULL reply_to.
-        assert orig.data["deliveries"][0]["payload"].get("reply_to") is None
+        assert orig.data["deliveries"][0]["message"].get("reply_to") is None
 
         rep = await client.call_tool(
             "reply_message",
@@ -116,12 +120,13 @@ async def test_reply_to_round_trips_through_db(isolated_env):
                 "message_id": original_id,
                 "sender_name": "BlueLake",
                 "body_md": "ack",
+                "idempotency_key": "reply-edge-child",
             },
         )
         # Response reflects the reply edge.
         assert rep.data["reply_to"] == original_id
-        reply_id = rep.data["deliveries"][0]["payload"]["id"]
-        assert rep.data["deliveries"][0]["payload"]["reply_to"] == original_id
+        reply_id = rep.data["deliveries"][0]["message"]["id"]
+        assert rep.data["deliveries"][0]["message"]["reply_to"] == original_id
 
         # The reply edge must be PERSISTED, not reconstructed only in the payload.
         async with get_session() as session:
@@ -134,5 +139,4 @@ async def test_reply_to_round_trips_through_db(isolated_env):
                 await session.execute(sa_select(Message).where(cast(Any, Message.id) == original_id))
             ).scalars().one()
             assert original.reply_to is None, "top-level message must have NULL reply_to (#188)"
-
 

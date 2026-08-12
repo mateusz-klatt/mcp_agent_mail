@@ -101,6 +101,7 @@ async def test_alias_is_not_an_address(isolated_env):
                     "subject": "s",
                     "body_md": "b",
                     "sender_token": second["registration_token"],
+                    "idempotency_key": "display-name-not-addressable",
                 },
             )
         assert "Kitchen" in str(excinfo.value)

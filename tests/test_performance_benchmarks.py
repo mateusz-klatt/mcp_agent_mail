@@ -793,6 +793,7 @@ class TestMessageSendLatency:
                         "to": [agent_name],
                         "subject": f"Benchmark message {i}",
                         "body_md": f"Benchmark message {i} for latency testing.",
+                        "idempotency_key": f"performance-send-latency-{i}",
                     },
                 )
                 elapsed_ms = (time.perf_counter() - start) * 1000
@@ -860,6 +861,7 @@ class TestInboxFetchLatency:
                         "to": [agent_name],
                         "subject": f"Message {i}",
                         "body_md": f"Content for message {i}",
+                        "idempotency_key": f"performance-inbox-seed-{i}",
                     },
                 )
 
@@ -938,6 +940,7 @@ class TestSearchLatency:
                         "to": [agent_name],
                         "subject": f"Report {keyword} {i}",
                         "body_md": f"This is a {keyword} report number {i}.",
+                        "idempotency_key": f"performance-search-seed-{i}",
                     },
                 )
 
@@ -1133,6 +1136,7 @@ class TestPerformanceSummary:
                         "to": [agent_name],
                         "subject": f"Summary test {i}",
                         "body_md": "Quick benchmark",
+                        "idempotency_key": f"performance-summary-{i}",
                     },
                 )
                 latencies.append((time.perf_counter() - start) * 1000)

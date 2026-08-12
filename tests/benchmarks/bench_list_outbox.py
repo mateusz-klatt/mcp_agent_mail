@@ -40,6 +40,7 @@ async def test_bench_list_outbox(bench_factory):
                     "to": [recipient_names[i % len(recipient_names)]],
                     "subject": f"Outbox seed {i}",
                     "body_md": make_message_body(seed, i, message_size),
+                    "idempotency_key": f"benchmark-list-outbox-{i}",
                 },
             )
 

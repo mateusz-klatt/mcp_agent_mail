@@ -187,6 +187,7 @@ async def test_agents_resource_shows_unread_count(isolated_env):
                     "to": [receiver_name],
                     "subject": f"Message {i}",
                     "body_md": "Test body",
+                    "idempotency_key": f"agents-unread-{i}",
                 },
             )
 
@@ -229,6 +230,7 @@ async def test_inbox_resource_returns_messages(isolated_env):
                 "to": [agent_name],
                 "subject": "Test Inbox Message",
                 "body_md": "This is a test message body",
+                "idempotency_key": "inbox-resource-message",
             },
         )
 
@@ -269,6 +271,7 @@ async def test_inbox_resource_with_limit_param(isolated_env):
                     "to": [agent_name],
                     "subject": f"Message {i}",
                     "body_md": "Body",
+                    "idempotency_key": f"inbox-limit-{i}",
                 },
             )
 
@@ -302,6 +305,7 @@ async def test_inbox_resource_with_include_bodies(isolated_env):
                 "to": [agent_name],
                 "subject": "Body Test",
                 "body_md": "This body should appear",
+                "idempotency_key": "inbox-body-message",
             },
         )
 
@@ -350,6 +354,7 @@ async def test_outbox_resource_returns_sent_messages(isolated_env):
                 "to": [receiver_name],
                 "subject": "Outbox Test Message",
                 "body_md": "Sent from outbox test",
+                "idempotency_key": "outbox-resource-message",
             },
         )
 
@@ -396,6 +401,7 @@ async def test_outbox_resource_with_limit(isolated_env):
                     "to": [receiver_name],
                     "subject": f"Outbox {i}",
                     "body_md": "Test",
+                    "idempotency_key": f"outbox-limit-{i}",
                 },
             )
 
@@ -436,6 +442,7 @@ async def test_thread_resource_returns_thread_messages(isolated_env):
                 "subject": "Thread Test",
                 "body_md": "Initial message",
                 "thread_id": "TEST-THREAD-001",
+                "idempotency_key": "thread-resource-initial",
             },
         )
 
@@ -449,6 +456,7 @@ async def test_thread_resource_returns_thread_messages(isolated_env):
                 "subject": "Re: Thread Test",
                 "body_md": "Reply message",
                 "thread_id": "TEST-THREAD-001",
+                "idempotency_key": "thread-resource-reply",
             },
         )
 
@@ -484,6 +492,7 @@ async def test_thread_resource_with_message_id(isolated_env):
                 "to": [agent_name],
                 "subject": "Message ID Thread",
                 "body_md": "Test body",
+                "idempotency_key": "thread-id-message",
             },
         )
 
@@ -491,7 +500,7 @@ async def test_thread_resource_with_message_id(isolated_env):
         deliveries = result.data.get("deliveries", [])
         msg_id = 1
         if deliveries:
-            msg_id = deliveries[0].get("payload", {}).get("id", 1)
+            msg_id = deliveries[0].get("message", {}).get("id", 1)
 
         # Read thread by message ID
         blocks = await client.read_resource(f"resource://thread/{msg_id}?project=ThreadId")
@@ -523,6 +532,7 @@ async def test_thread_resource_with_include_bodies(isolated_env):
                 "subject": "Thread Bodies",
                 "body_md": "Include this body content",
                 "thread_id": "BODY-THREAD",
+                "idempotency_key": "thread-body-message",
             },
         )
 
@@ -581,6 +591,7 @@ async def test_thread_resource_only_returns_visible_messages(isolated_env):
                 "subject": "Private thread",
                 "body_md": "Classified body",
                 "thread_id": "THREAD-PRIVATE-1",
+                "idempotency_key": "thread-private-message",
             },
         )
 
@@ -622,9 +633,10 @@ async def test_message_resource_requires_project(isolated_env):
                 "to": [agent_name],
                 "subject": "Needs project",
                 "body_md": "body",
+                "idempotency_key": "message-resource-project-scope",
             },
         )
-        message_id = (result.data.get("deliveries") or [{}])[0].get("payload", {}).get("id")
+        message_id = (result.data.get("deliveries") or [{}])[0].get("message", {}).get("id")
 
         with pytest.raises(Exception, match="project"):
             await client.read_resource(f"resource://message/{message_id}")
@@ -650,6 +662,7 @@ async def test_thread_resource_requires_project(isolated_env):
                 "subject": "Needs project",
                 "body_md": "body",
                 "thread_id": "THREAD-REQ-1",
+                "idempotency_key": "thread-resource-project-scope",
             },
         )
 

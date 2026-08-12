@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-import re
 import uuid
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
@@ -13,6 +12,7 @@ from typing import Any
 import httpx
 import pytest
 from fastmcp import Client
+from fastmcp.exceptions import ToolError
 from rich.table import Table
 from sqlalchemy import text
 
@@ -75,18 +75,6 @@ def _parse_resource_json(blocks: list[Any]) -> dict[str, Any]:
     assert blocks, "expected resource blocks"
     text_payload = blocks[0].text or ""
     return json.loads(text_payload)
-
-
-def _parse_search_html(html: str) -> dict[str, Any]:
-    subjects = re.findall(r"<h4[^>]*>(.*?)</h4>", html, flags=re.S)
-    subjects = [re.sub(r"<[^>]+>", "", s).strip() for s in subjects]
-    return {
-        "subject_count": len(subjects),
-        "subjects_sample": subjects[:3],
-        "mark_count": html.count("<mark>"),
-        "hits_badge_count": len(re.findall(r">\\s*\\d+\\s+match(?:es)?\\s*<", html)),
-        "has_snippet_block": "line-clamp-2" in html,
-    }
 
 
 def _cache_hit_ratio() -> float:
@@ -167,6 +155,65 @@ def _scrub_commit_meta(payload: dict[str, Any]) -> None:
             commit["hexsha"] = "<commit_hexsha>"
         if "authored_ts" in commit:
             commit["authored_ts"] = "<commit_authored_ts>"
+        diff_summary = commit.get("diff_summary")
+        excerpt = diff_summary.get("excerpt") if isinstance(diff_summary, dict) else None
+        if isinstance(excerpt, list):
+            diff_summary["excerpt"] = [
+                "<delivery_document_header>"
+                if isinstance(line, str) and line.startswith('+{"actor":')
+                else line
+                for line in excerpt
+            ]
+
+
+def _scrub_delivery_meta(payload: Any) -> None:
+    """Stabilize opaque receipt identities while preserving typed structure."""
+    delivery_ids: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            delivery_id = value.get("delivery_id")
+            if isinstance(delivery_id, str) and delivery_id not in delivery_ids:
+                delivery_ids.append(delivery_id)
+            delivery = value.get("delivery")
+            if isinstance(delivery, dict):
+                receipt_id = delivery.get("id")
+                if isinstance(receipt_id, str) and receipt_id not in delivery_ids:
+                    delivery_ids.append(receipt_id)
+            for nested in value.values():
+                collect(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                collect(nested)
+
+    collect(payload)
+    replacements = {
+        delivery_id: f"<delivery-{index}>"
+        for index, delivery_id in enumerate(delivery_ids, start=1)
+    }
+
+    def scrub(value: Any, *, parent_key: str | None = None) -> Any:
+        if isinstance(value, dict):
+            for key, nested in list(value.items()):
+                if (key == "delivery_id" and isinstance(nested, str)) or (parent_key == "delivery" and key == "id" and isinstance(nested, str)):
+                    value[key] = replacements.get(nested, nested)
+                elif parent_key == "delivery" and key == "commit_sha":
+                    value[key] = "<delivery_commit_sha>"
+                elif parent_key == "delivery" and key == "request_sha256":
+                    value[key] = "<delivery_request_sha256>"
+                elif parent_key == "delivery" and key == "document_sha256":
+                    value[key] = "<delivery_document_sha256>"
+                else:
+                    value[key] = scrub(nested, parent_key=key)
+            return value
+        if isinstance(value, list):
+            return [scrub(nested, parent_key=parent_key) for nested in value]
+        if isinstance(value, str):
+            for delivery_id, token in replacements.items():
+                value = value.replace(delivery_id, token)
+        return value
+
+    scrub(payload)
 
 
 def _coerce_list(payload: Any) -> list[Any]:
@@ -363,25 +410,29 @@ async def test_isomorphism_e2e_suite(
         small_path.write_bytes(base64.b64decode(SMALL_PNG_BASE64))
         large_path.write_bytes(base64.b64decode(LARGE_PNG_BASE64))
         body_md = "Launch kickoff\n\n![inline](data:image/png;base64,{})\n".format(INLINE_PNG_BASE64)
-        send_result = _tool_data(
+        launch_request = {
+            "project_key": alpha_key,
+            "sender_name": "BlueLake",
+            "to": ["RedStone"],
+            "cc": ["GreenCastle"],
+            "bcc": ["StormyCanyon"],
+            "subject": "Launch Plan",
+            "body_md": body_md,
+            "ack_required": True,
+            "thread_id": "THREAD-1",
+            "idempotency_key": "isomorphism-launch-plan",
+        }
+        with pytest.raises(ToolError, match="bounded canonical inline representation"):
             await client.call_tool(
                 "send_message",
                 {
-                    "project_key": alpha_key,
-                    "sender_name": "BlueLake",
-                    "to": ["RedStone"],
-                    "cc": ["GreenCastle"],
-                    "bcc": ["StormyCanyon"],
-                    "subject": "Launch Plan",
-                    "body_md": body_md,
+                    **launch_request,
                     "attachment_paths": [str(small_path), str(large_path)],
                     "convert_images": True,
-                    "ack_required": True,
-                    "thread_id": "THREAD-1",
                 },
             )
-        )
-        message_id = int((send_result.get("deliveries") or [{}])[0].get("payload", {}).get("id"))
+        send_result = _tool_data(await client.call_tool("send_message", launch_request))
+        message_id = int((send_result.get("deliveries") or [{}])[0].get("message", {}).get("id"))
 
         send_followup = _tool_data(
             await client.call_tool(
@@ -393,10 +444,11 @@ async def test_isomorphism_e2e_suite(
                     "subject": "Follow Up",
                     "body_md": "Follow up details",
                     "thread_id": "THREAD-1",
+                    "idempotency_key": "isomorphism-follow-up",
                 },
             )
         )
-        followup_id = int((send_followup.get("deliveries") or [{}])[0].get("payload", {}).get("id"))
+        followup_id = int((send_followup.get("deliveries") or [{}])[0].get("message", {}).get("id"))
 
         await client.call_tool("mark_message_read", {"project_key": alpha_key, "agent_name": "RedStone", "message_id": message_id})
         await client.call_tool("acknowledge_message", {"project_key": alpha_key, "agent_name": "RedStone", "message_id": message_id})
@@ -411,10 +463,11 @@ async def test_isomorphism_e2e_suite(
                     "subject": "Beta Hello",
                     "body_md": "beta side",
                     "thread_id": "THREAD-1",
+                    "idempotency_key": "isomorphism-beta-hello",
                 },
             )
         )
-        beta_message_id = int((beta_message.get("deliveries") or [{}])[0].get("payload", {}).get("id"))
+        beta_message_id = int((beta_message.get("deliveries") or [{}])[0].get("message", {}).get("id"))
         phases.append(
             {
                 "phase": "messaging",
@@ -582,6 +635,7 @@ async def test_isomorphism_e2e_suite(
                     "to": [f"PurpleBear@{beta_key}"],
                     "subject": "Cross Project",
                     "body_md": "approved path",
+                    "idempotency_key": "isomorphism-cross-project",
                 },
             )
         )
@@ -595,6 +649,7 @@ async def test_isomorphism_e2e_suite(
                     "to": [f"JadePond@{beta_key}"],
                     "subject": "Should Fail",
                     "body_md": "blocked path",
+                    "idempotency_key": "isomorphism-cross-project-denied",
                 },
             )
         except ToolExecutionError as exc:
@@ -690,34 +745,20 @@ async def test_isomorphism_e2e_suite(
             await client.call_tool("search_messages", {"project_key": alpha_key, "query": "Launch", "limit": 5})
         )
 
-        # HTTP search: FTS then fallback by dropping the FTS table.
+        # The legacy HTML mailbox was removed at canonical cutover. Search is
+        # exposed only through MCP tools/resources and the React HTTP surface.
         app = build_http_app(get_settings(), server=server)
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as http_client:
-            fts_resp = await http_client.get(f"/mail/{alpha_key}", params={"q": "Launch"})
-            fts_html = fts_resp.text
-            fts_summary = _parse_search_html(fts_html)
-
-        async with get_session() as session:
-            await session.execute(text("DROP TABLE IF EXISTS fts_messages"))
-            await session.commit()
-
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as http_client:
-            like_resp = await http_client.get(f"/mail/{alpha_key}", params={"q": "\"Launch"})
-            like_html = like_resp.text
-            like_summary = _parse_search_html(like_html)
+            legacy_mailbox = await http_client.get(f"/mail/{alpha_key}", params={"q": "Launch"})
+        assert legacy_mailbox.status_code == 404
         phases.append(
             {
                 "phase": "search",
-                "fts": fts_summary,
-                "like_fallback": like_summary,
+                "mcp_result_count": len(search_tool),
+                "legacy_http_status": legacy_mailbox.status_code,
             }
         )
-
-        if fts_summary["hits_badge_count"] > 0:
-            assert fts_summary["mark_count"] > 0
-        assert like_summary["mark_count"] == 0
-        assert like_summary["hits_badge_count"] == 0
 
         phase2_metrics = {
             "pathspec_cache": {
@@ -729,15 +770,14 @@ async def test_isomorphism_e2e_suite(
                 "project": phase2_project,
                 "commit_delta": phase2_commit_delta,
             },
-            "snippet_metrics": {
-                "fts": fts_summary,
-                "like_fallback": like_summary,
+            "canonical_http_cutover": {
+                "legacy_mailbox_status": legacy_mailbox.status_code,
             },
         }
         phases.append({"phase": "phase2_verification", "metrics": phase2_metrics})
         write_log("phase2_verification", phase2_metrics)
 
-        # Recreate FTS tables/triggers so later snapshot scrubbing succeeds.
+        # Reset the isolated database before later snapshot scrubbing.
         reset_database_state()
         await ensure_schema()
 
@@ -924,15 +964,23 @@ async def test_isomorphism_e2e_suite(
     # a nested notification_message added after this scrubbing was written).
     for _obj in (request_contact, approve_contact, deny_request):
         _nm = _obj.get("notification_message") if isinstance(_obj, dict) else None
-        if isinstance(_nm, dict) and _nm.get("created_ts") and _obj.get("to") in contact_index:
-            _nm["created_ts"] = _iso_at(base_time, offset_seconds=970 + contact_index[_obj["to"]])
+        _nm_message = _nm.get("message") if isinstance(_nm, dict) else None
+        if (
+            isinstance(_nm_message, dict)
+            and _nm_message.get("created_ts")
+            and _obj.get("to") in contact_index
+        ):
+            _nm_message["created_ts"] = _iso_at(
+                base_time,
+                offset_seconds=970 + contact_index[_obj["to"]],
+            )
 
     cross_deliveries = cross_send.get("deliveries") if isinstance(cross_send, dict) else None
     if isinstance(cross_deliveries, list) and cross_deliveries:
-        payload = cross_deliveries[0].get("payload", {}) if isinstance(cross_deliveries[0], dict) else {}
-        message_id = payload.get("id")
+        message = cross_deliveries[0].get("message", {}) if isinstance(cross_deliveries[0], dict) else {}
+        message_id = message.get("id")
         if isinstance(message_id, int):
-            payload["created_ts"] = _iso_at(base_time, offset_seconds=200 + message_id)
+            message["created_ts"] = _iso_at(base_time, offset_seconds=200 + message_id)
 
     replacements = [
         (str(bundle_root), "<bundle_root>"),
@@ -965,8 +1013,7 @@ async def test_isomorphism_e2e_suite(
         },
         "search": {
             "tool_results": search_tool,
-            "http_fts": fts_summary,
-            "http_like_fallback": like_summary,
+            "legacy_http_status": legacy_mailbox.status_code,
         },
         "file_reservations": {
             "initial_reservation": reservation,
@@ -1006,6 +1053,7 @@ async def test_isomorphism_e2e_suite(
             },
         },
     }
+    _scrub_delivery_meta(result)
 
     update = os.getenv("E2E_UPDATE", "") == "1"
     assert_matches_golden(

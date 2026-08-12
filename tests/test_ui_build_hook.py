@@ -32,11 +32,11 @@ def _write_valid_dist(dist_root: Path, *, repository_root: Path) -> None:
     assets.mkdir(parents=True, exist_ok=True)
     (dist_root / "index.html").write_text(
         '<!doctype html><link rel="icon" href="/favicon.ico" type="image/svg+xml" sizes="any">'
-        '<script type="module" src="/mail/v2/assets/index-test.js"></script>'
-        '<link rel="stylesheet" href="/mail/v2/assets/index-test.css">',
+        '<script type="module" src="/mail/assets/index-test.js"></script>'
+        '<link rel="stylesheet" href="/mail/assets/index-test.css">',
         encoding="utf-8",
     )
-    for name in ("index-test.js", "index-test.css", "legacy.js", "legacy.css"):
+    for name in ("index-test.js", "index-test.css", "legacy.css"):
         (assets / name).write_text(f"/* {name} */\n", encoding="utf-8")
     (dist_root / hatch_build._BUILD_MANIFEST).write_text(
         json.dumps(
@@ -263,7 +263,7 @@ def test_finalize_revalidates_staged_ui_before_cleanup(
     hook.initialize("standard", build_data)
     artifact_path = tmp_path / "artifact.whl"
     _write_ui_archive(artifact_path, dist_root=dist_root, target_name="wheel")
-    (dist_root / "assets" / "legacy.js").write_text("tampered\n", encoding="utf-8")
+    (dist_root / "assets" / "legacy.css").write_text("tampered\n", encoding="utf-8")
 
     with pytest.raises(hatch_build.HermesUiBuildError, match="do not match"):
         hook.finalize("standard", build_data, str(artifact_path))
@@ -296,7 +296,7 @@ def test_completed_artifact_must_match_every_validated_ui_byte(
         mutated_path,
         dist_root=dist_root,
         target_name=target_name,
-        mutate_relative="assets/legacy.js",
+        mutate_relative="assets/legacy.css",
     )
     with pytest.raises(hatch_build.HermesUiBuildError, match="do not match"):
         hatch_build._validate_artifact_ui(
@@ -428,12 +428,26 @@ def test_generated_dist_rejects_missing_index_asset(tmp_path: Path) -> None:
     dist_root = tmp_path / "dist"
     _write_valid_dist(dist_root, repository_root=REPOSITORY_ROOT)
     (dist_root / "index.html").write_text(
-        '<script type="module" src="/mail/v2/assets/missing.js"></script>'
-        '<link rel="stylesheet" href="/mail/v2/assets/index-test.css">',
+        '<script type="module" src="/mail/assets/missing.js"></script>'
+        '<link rel="stylesheet" href="/mail/assets/index-test.css">',
         encoding="utf-8",
     )
 
     with pytest.raises(hatch_build.HermesUiBuildError, match="missing build asset"):
+        hatch_build._validate_dist(dist_root, repository_root=REPOSITORY_ROOT)
+
+
+def test_generated_dist_rejects_unreferenced_or_legacy_runtime_files(
+    tmp_path: Path,
+) -> None:
+    dist_root = tmp_path / "dist"
+    _write_valid_dist(dist_root, repository_root=REPOSITORY_ROOT)
+    (dist_root / "assets" / "legacy.js").write_text(
+        "window.unexpected = true;\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(hatch_build.HermesUiBuildError, match="unexpected file"):
         hatch_build._validate_dist(dist_root, repository_root=REPOSITORY_ROOT)
 
 
@@ -445,8 +459,8 @@ def test_generated_dist_rejects_duplicate_html_attributes_before_resolution(
     index = dist_root / "index.html"
     index.write_text(
         index.read_text(encoding="utf-8").replace(
-            'src="/mail/v2/assets/index-test.js"',
-            'src="https://cdn.invalid/app.js" src="/mail/v2/assets/index-test.js"',
+            'src="/mail/assets/index-test.js"',
+            'src="https://cdn.invalid/app.js" src="/mail/assets/index-test.js"',
         ),
         encoding="utf-8",
     )
@@ -458,10 +472,10 @@ def test_generated_dist_rejects_duplicate_html_attributes_before_resolution(
 @pytest.mark.parametrize(
     "unexpected_markup",
     [
-        '<link rel="preload" href="/mail/v2/assets/index-test.js" as="script">',
+        '<link rel="preload" href="/mail/assets/index-test.js" as="script">',
         '<link rel="icon" href="/favicon.ico">',
-        '<script type="module" src="/mail/v2/assets/index-test.js"></script>',
-        '<script src="/mail/v2/assets/legacy.js"></script>',
+        '<script type="module" src="/mail/assets/index-test.js"></script>',
+        '<script src="/mail/assets/legacy.js"></script>',
     ],
 )
 def test_generated_dist_rejects_extraneous_script_and_link_elements(
@@ -651,11 +665,11 @@ def test_node_build_environment_drops_host_injection_variables(
             assets.mkdir(parents=True)
             (dist_root / "index.html").write_text(
                 '<link rel="icon" href="/favicon.ico" type="image/svg+xml" sizes="any">'
-                '<script type="module" src="/mail/v2/assets/index-test.js"></script>'
-                '<link rel="stylesheet" href="/mail/v2/assets/index-test.css">',
+                '<script type="module" src="/mail/assets/index-test.js"></script>'
+                '<link rel="stylesheet" href="/mail/assets/index-test.css">',
                 encoding="utf-8",
             )
-            for name in ("index-test.js", "index-test.css", "legacy.js", "legacy.css"):
+            for name in ("index-test.js", "index-test.css", "legacy.css"):
                 (assets / name).write_text(f"/* {name} */\n", encoding="utf-8")
         return ""
 

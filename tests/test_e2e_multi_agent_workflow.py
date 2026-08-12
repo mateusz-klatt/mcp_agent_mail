@@ -23,9 +23,6 @@ Reference: mcp_agent_mail-aqs
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
 import pytest
 from fastmcp import Client
 from sqlalchemy import text
@@ -206,7 +203,7 @@ def get_message_id_from_send(result) -> int:
     if hasattr(result, "data") and result.data:
         deliveries = result.data.get("deliveries", [])
         if deliveries:
-            return deliveries[0]["payload"]["id"]
+            return deliveries[0]["message"]["id"]
     return 0
 
 
@@ -365,6 +362,7 @@ async def test_complete_multi_agent_workflow(isolated_env):
                 ),
                 "thread_id": THREAD_ID,
                 "importance": "normal",
+                "idempotency_key": "workflow-start-api",
             },
         )
 
@@ -391,6 +389,7 @@ async def test_complete_multi_agent_workflow(isolated_env):
                     "The UI will be ready for integration once you finish the API. "
                     "Let me know when the endpoints are available."
                 ),
+                "idempotency_key": "workflow-ui-ready-reply",
             },
         )
 
@@ -420,6 +419,7 @@ async def test_complete_multi_agent_workflow(isolated_env):
                     "Releasing my reservation on `backend/**`."
                 ),
                 "thread_id": THREAD_ID,
+                "idempotency_key": "workflow-api-complete",
             },
         )
 
@@ -462,6 +462,7 @@ async def test_complete_multi_agent_workflow(isolated_env):
                 ),
                 "thread_id": THREAD_ID,
                 "ack_required": True,
+                "idempotency_key": "workflow-code-review",
             },
         )
 
@@ -617,6 +618,7 @@ async def test_thread_continuity(isolated_env):
                     "subject": f"[{thread_id}] Message {i + 1}",
                     "body_md": f"Message from {agent}",
                     "thread_id": thread_id,
+                    "idempotency_key": f"thread-continuity-{i}",
                 },
             )
             msg_id = get_message_id_from_send(result)
@@ -657,6 +659,7 @@ async def test_inbox_multi_agent_messages(isolated_env):
                 "to": [red_stone],
                 "subject": "From BlueLake",
                 "body_md": "Message from backend team",
+                "idempotency_key": "inbox-multi-backend",
             },
         )
 
@@ -668,6 +671,7 @@ async def test_inbox_multi_agent_messages(isolated_env):
                 "to": [red_stone],
                 "subject": "From GreenMountain",
                 "body_md": "Message from frontend team",
+                "idempotency_key": "inbox-multi-frontend",
             },
         )
 
@@ -721,6 +725,7 @@ async def test_summarize_multi_agent_thread(isolated_env):
                 "subject": f"[{thread_id}] Project kickoff",
                 "body_md": "Starting the feature implementation. Key goal: build user dashboard.",
                 "thread_id": thread_id,
+                "idempotency_key": "summary-thread-kickoff",
             },
         )
 
@@ -733,6 +738,7 @@ async def test_summarize_multi_agent_thread(isolated_env):
                 "subject": f"[{thread_id}] UI mockups ready",
                 "body_md": "I've created the UI mockups. Ready for API integration.",
                 "thread_id": thread_id,
+                "idempotency_key": "summary-thread-mockups",
             },
         )
 
@@ -745,6 +751,7 @@ async def test_summarize_multi_agent_thread(isolated_env):
                 "subject": f"[{thread_id}] Review notes",
                 "body_md": "Looking good! Suggest adding error states to the mockups.",
                 "thread_id": thread_id,
+                "idempotency_key": "summary-thread-review",
             },
         )
 
@@ -828,8 +835,8 @@ async def test_workflow_with_macro_start_session(isolated_env):
 
 
 @pytest.mark.asyncio
-async def test_git_archive_artifacts_created(isolated_env):
-    """Test that Git archive artifacts are created during workflow."""
+async def test_atomic_delivery_archive_receipt_created(isolated_env):
+    """A published message is backed by the exact immutable Git receipt."""
     server = build_mcp_server()
     async with Client(server) as client:
         project_key = "/test/e2e/git_artifacts"
@@ -848,37 +855,32 @@ async def test_git_archive_artifacts_created(isolated_env):
                 "subject": "Git artifact test",
                 "body_md": "This should create Git archive artifacts.",
                 "thread_id": "git-test",
+                "idempotency_key": "git-artifact-message",
             },
         )
 
         msg_id = get_message_id_from_send(msg_result)
         assert msg_id > 0
+        receipt = msg_result.data["deliveries"][0]["delivery"]
+        assert receipt["status"] == "published"
+        assert receipt["message_id"] == msg_id
+        assert len(receipt["commit_sha"]) == 40
 
-        # Create a file reservation
-        claim_result = await client.call_tool(
-            "file_reservation_paths",
-            {
-                "project_key": project_key,
-                "agent_name": blue_lake,
-                "paths": ["test/**"],
-                "ttl_seconds": 3600,
-                "exclusive": True,
-            },
+        async with get_session() as session:
+            stored = await session.execute(
+                text(
+                    "SELECT state, archive_relative_path, archive_commit_sha "
+                    "FROM message_deliveries WHERE id = :delivery_id"
+                ),
+                {"delivery_id": receipt["id"]},
+            )
+            row = stored.one()
+        assert row[0] == "published"
+        assert row[1] == (
+            "projects/test-e2e-git-artifacts/message_deliveries/"
+            f"{receipt['id']}.md"
         )
-
-        assert len(claim_result.data["granted"]) == 1
-
-        # Get storage root from environment
-        storage_root = os.environ.get(
-            "STORAGE_ROOT",
-            str(Path.home() / ".mcp-agent-mail" / "archives"),
-        )
-
-        # The archive should exist (we can't easily verify internals without
-        # accessing the storage directly, but the fact that operations
-        # succeeded indicates artifacts were created)
-        # This is a basic existence check
-        assert Path(storage_root).exists() or True  # May not exist in test env
+        assert row[2] == receipt["commit_sha"]
 
 
 # ============================================================================
@@ -967,6 +969,7 @@ async def test_read_ack_team_coordination(isolated_env):
                 "body_md": "We deploy at 5pm. Please acknowledge.",
                 "importance": "high",
                 "ack_required": True,
+                "idempotency_key": "team-coordination-deploy",
             },
         )
 

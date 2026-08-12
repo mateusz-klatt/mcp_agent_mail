@@ -48,8 +48,64 @@ export function isCanonicalInlineRasterImageSource(source: string): boolean {
   return false;
 }
 
+const markdownLinkSchemes = new Set(["http", "https", "mailto"]);
+// The control range is intentional: browser URL parsing strips some of these
+// characters before protocol handling, so they must fail closed here.
+// eslint-disable-next-line no-control-regex
+const markdownControlCharacters = /[\u0000-\u001f\u007f-\u009f]/u;
+const markdownEncodedControlCharacters =
+  /%(?:0[0-9a-f]|1[0-9a-f]|7f)|%c2%(?:8[0-9a-f]|9[0-9a-f])/iu;
+const markdownScheme = /^([a-z][a-z0-9+.-]*):/iu;
+
+function hasUnsafeMarkdownLinkEncoding(target: string): boolean {
+  try {
+    const decoded = decodeURIComponent(target);
+    return (
+      markdownControlCharacters.test(decoded) ||
+      markdownEncodedControlCharacters.test(decoded)
+    );
+  } catch {
+    return true;
+  }
+}
+
+export function isSafeMarkdownLinkTarget(target: string): boolean {
+  if (
+    target.length === 0 ||
+    target !== target.trim() ||
+    hasUnsafeMarkdownLinkEncoding(target) ||
+    target.includes("#") ||
+    target.startsWith("//") ||
+    target.startsWith("\\")
+  ) {
+    return false;
+  }
+
+  const scheme = markdownScheme.exec(target)?.[1]?.toLowerCase();
+  return scheme === undefined || markdownLinkSchemes.has(scheme);
+}
+
+export function markdownUrlTransform(
+  url: string,
+  key: string,
+): string | undefined {
+  if (key === "src") {
+    return isCanonicalInlineRasterImageSource(url) ? url : undefined;
+  }
+  if (key === "href") {
+    return isSafeMarkdownLinkTarget(url) ? url : undefined;
+  }
+  return undefined;
+}
+
 export type AccessRole = "admin" | "operator" | "viewer";
 export type Importance = "low" | "normal" | "high" | "urgent";
+export type DeliveryStatus =
+  | "published"
+  | "pending"
+  | "quarantined"
+  | "busy"
+  | "deferred";
 
 export interface MailProject {
   id: number;
@@ -101,6 +157,28 @@ export interface MessageDetail extends InboxMessage {
   attachments: MessageAttachment[];
 }
 
+export interface DeliveryResult {
+  id: string;
+  status: DeliveryStatus;
+  reused: boolean;
+  message_id: number | null;
+  commit_sha: string | null;
+  next_attempt_ts: string | null;
+}
+
+export interface ComposeMessageInput {
+  idempotency_key: string;
+  recipients: string[];
+  subject: string;
+  body_md: string;
+  thread_id: string | null;
+}
+
+export interface ReplyMessageInput {
+  idempotency_key: string;
+  body_md: string;
+}
+
 export type MailRoute =
   | { view: "projects" }
   | { view: "inbox"; projectId: number | null }
@@ -116,7 +194,10 @@ interface InboxOptions extends FetchOptions {
 }
 
 export class MailHttpError extends Error {
-  constructor(readonly status: number) {
+  constructor(
+    readonly status: number,
+    readonly code: string | null = null,
+  ) {
     super(`Mail request failed with HTTP ${status}.`);
     this.name = "MailHttpError";
   }
@@ -206,6 +287,19 @@ function accessRole(value: unknown): AccessRole {
 function importance(value: unknown): Importance {
   if (value !== "low" && value !== "normal" && value !== "high" && value !== "urgent") {
     throw new TypeError("Invalid message importance.");
+  }
+  return value;
+}
+
+function deliveryStatus(value: unknown): DeliveryStatus {
+  if (
+    value !== "published" &&
+    value !== "pending" &&
+    value !== "quarantined" &&
+    value !== "busy" &&
+    value !== "deferred"
+  ) {
+    throw new TypeError("Invalid delivery status.");
   }
   return value;
 }
@@ -350,6 +444,54 @@ export function parseMessageDetail(payload: unknown): MessageDetail {
   };
 }
 
+export function parseDeliveryResult(payload: unknown): DeliveryResult {
+  const candidate = exactRecord(payload, "delivery response", [
+    "id",
+    "status",
+    "reused",
+    "message_id",
+    "commit_sha",
+    "next_attempt_ts",
+  ]);
+  const id = stringValue(candidate.id, "delivery id");
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(
+      id,
+    )
+  ) {
+    throw new TypeError("Invalid delivery id.");
+  }
+  const commitSha = nullableString(candidate.commit_sha, "delivery commit");
+  if (commitSha !== null && !/^[0-9a-f]{40}$/u.test(commitSha)) {
+    throw new TypeError("Invalid delivery commit.");
+  }
+  return {
+    id,
+    status: deliveryStatus(candidate.status),
+    reused: booleanValue(candidate.reused, "delivery reuse flag"),
+    message_id: nullablePositiveInteger(candidate.message_id, "delivery message id"),
+    commit_sha: commitSha,
+    next_attempt_ts: nullableTimestamp(
+      candidate.next_attempt_ts,
+      "delivery next attempt timestamp",
+    ),
+  };
+}
+
+async function mailHttpError(response: Response): Promise<MailHttpError> {
+  let code: string | null = null;
+  try {
+    const payload = record(await response.json(), "mail error");
+    const detail = payload.detail;
+    if (isRecord(detail) && typeof detail.code === "string") {
+      code = detail.code;
+    }
+  } catch {
+    // Status remains authoritative when a proxy or server returns no JSON.
+  }
+  return new MailHttpError(response.status, code);
+}
+
 async function mailRequest<T>(
   endpoint: string,
   parser: (payload: unknown) => T,
@@ -363,7 +505,7 @@ async function mailRequest<T>(
     signal: options.signal,
   });
   if (!response.ok) {
-    throw new MailHttpError(response.status);
+    throw await mailHttpError(response);
   }
   return parser(await response.json());
 }
@@ -393,6 +535,86 @@ export function loadMessage(
     `/mail/api/v1/projects/${projectId}/messages/${messageId}`,
     parseMessageDetail,
     options,
+  );
+}
+
+async function mailMutationRequest<T>(
+  endpoint: string,
+  body: unknown,
+  parser: (payload: unknown) => T,
+): Promise<T> {
+  const response = await fetch(new URL(endpoint, window.location.origin), {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw await mailHttpError(response);
+  }
+  return parser(await response.json());
+}
+
+export function composeMessage(
+  projectId: number,
+  input: ComposeMessageInput,
+): Promise<DeliveryResult> {
+  positiveInteger(projectId, "compose project id");
+  return mailMutationRequest(
+    `/mail/api/v1/projects/${projectId}/messages`,
+    input,
+    parseDeliveryResult,
+  );
+}
+
+export function replyToMessage(
+  projectId: number,
+  messageId: number,
+  input: ReplyMessageInput,
+): Promise<DeliveryResult> {
+  positiveInteger(projectId, "reply project id");
+  positiveInteger(messageId, "reply message id");
+  return mailMutationRequest(
+    `/mail/api/v1/projects/${projectId}/messages/${messageId}/replies`,
+    input,
+    parseDeliveryResult,
+  );
+}
+
+export function loadDeliveryStatus(
+  deliveryId: string,
+  options: FetchOptions = {},
+): Promise<DeliveryResult> {
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(
+      deliveryId,
+    )
+  ) {
+    throw new TypeError("Invalid delivery id.");
+  }
+  return mailRequest(
+    `/mail/api/v1/deliveries/${deliveryId}`,
+    parseDeliveryResult,
+    options,
+  );
+}
+
+export function retryDelivery(deliveryId: string): Promise<DeliveryResult> {
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(
+      deliveryId,
+    )
+  ) {
+    throw new TypeError("Invalid delivery id.");
+  }
+  return mailMutationRequest(
+    `/mail/api/v1/deliveries/${deliveryId}/retry`,
+    {},
+    parseDeliveryResult,
   );
 }
 

@@ -183,6 +183,7 @@ class TestQueryCountIntegration:
                         "to": [agent_name],
                         "subject": "CI Query Count Test",
                         "body_md": "Testing query count for CI regression.",
+                        "idempotency_key": "ci-query-count-send-message",
                     },
                 )
 
@@ -224,6 +225,7 @@ class TestQueryCountIntegration:
                         "to": [agent_name],
                         "subject": f"Message {i}",
                         "body_md": f"Content {i}",
+                        "idempotency_key": f"ci-query-count-inbox-{i}",
                     },
                 )
 
@@ -276,6 +278,7 @@ class TestQueryCountIntegration:
                         "to": [agent_name],
                         "subject": f"Outbox test {i}",
                         "body_md": f"Content {i}",
+                        "idempotency_key": f"ci-query-count-outbox-{i}",
                     },
                 )
 

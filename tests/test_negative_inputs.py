@@ -19,7 +19,14 @@ async def test_invalid_project_or_agent_errors(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         res2 = await client.call_tool_mcp(
             "send_message",
-            {"project_key": "Backend", "sender_name": "Ghost", "to": ["Ghost"], "subject": "x", "body_md": "y"},
+            {
+                "project_key": "Backend",
+                "sender_name": "Ghost",
+                "to": ["Ghost"],
+                "subject": "x",
+                "body_md": "y",
+                "idempotency_key": "negative-unknown-sender",
+            },
         )
         # Should be error due to unknown agent
         assert res2.isError is True
@@ -45,6 +52,7 @@ async def test_unknown_recipient_reports_structured_error(isolated_env):
                     "to": ["BlueLake"],
                     "subject": "Hello",
                     "body_md": "testing unknown recipient",
+                    "idempotency_key": "negative-unknown-recipient-raising",
                 },
             )
 
@@ -58,6 +66,7 @@ async def test_unknown_recipient_reports_structured_error(isolated_env):
                 "to": ["BlueLake"],
                 "subject": "Hello",
                 "body_md": "testing unknown recipient",
+                "idempotency_key": "negative-unknown-recipient-mcp",
             },
         )
         if res.isError:
@@ -82,7 +91,8 @@ async def test_unknown_recipient_reports_structured_error(isolated_env):
                 "to": ["blue-lake"],
                 "subject": "Hello again",
                 "body_md": "now routed",
+                "idempotency_key": "negative-sanitized-recipient",
             },
         )
         deliveries = success.data.get("deliveries") or []
-        assert deliveries and deliveries[0].get("payload", {}).get("subject") == "Hello again"
+        assert deliveries and deliveries[0].get("message", {}).get("subject") == "Hello again"

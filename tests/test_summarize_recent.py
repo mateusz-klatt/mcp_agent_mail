@@ -115,6 +115,7 @@ async def test_summarize_single_thread(isolated_env):
                     "subject": f"Thread msg {i}",
                     "body_md": f"- Point {i}\n- TODO item {i}",
                     "thread_id": "T1",
+                    "idempotency_key": f"summary-single-{i}",
                 },
             )
 
@@ -161,6 +162,7 @@ async def test_summarize_multiple_threads(isolated_env):
                 "subject": "T1 msg",
                 "body_md": "- Working on auth",
                 "thread_id": "T1",
+                "idempotency_key": "summary-multi-t1",
             },
         )
         # Thread T2
@@ -173,6 +175,7 @@ async def test_summarize_multiple_threads(isolated_env):
                 "subject": "T2 msg",
                 "body_md": "- Fixing tests",
                 "thread_id": "T2",
+                "idempotency_key": "summary-multi-t2",
             },
         )
 
@@ -212,6 +215,7 @@ async def test_summarize_stores_in_db(isolated_env):
                 "to": [names[1]],
                 "subject": "Store test",
                 "body_md": "- Data point",
+                "idempotency_key": "summary-store",
             },
         )
 
@@ -262,6 +266,7 @@ async def test_summarize_idempotent(isolated_env):
                 "to": [names[1]],
                 "subject": "Idempotency test",
                 "body_md": "body",
+                "idempotency_key": "summary-idempotent-seed",
             },
         )
 
@@ -312,6 +317,7 @@ async def test_fetch_summary_limit(isolated_env):
                 "to": [names[1]],
                 "subject": "Limit test",
                 "body_md": "body",
+                "idempotency_key": "summary-limit-seed",
             },
         )
 
@@ -405,6 +411,7 @@ async def test_summarize_with_llm_mock(isolated_env, monkeypatch):
                 "to": [names[1]],
                 "subject": "LLM test msg",
                 "body_md": "- Implementing auth\n- TODO: deploy",
+                "idempotency_key": "summary-llm-seed",
             },
         )
 

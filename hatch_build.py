@@ -463,21 +463,34 @@ def _validate_dist(dist_root: Path, *, repository_root: Path) -> None:
     required = (
         dist_root / "index.html",
         dist_root / "assets" / "legacy.css",
-        dist_root / "assets" / "legacy.js",
         dist_root / _BUILD_MANIFEST,
     )
     if any(not path.is_file() or path.is_symlink() or path.stat().st_size == 0 for path in required):
-        raise HermesUiBuildError("Hermes UI output is missing index.html, legacy assets, or its build manifest.")
+        raise HermesUiBuildError("Hermes UI output is missing index.html, login styles, or its build manifest.")
 
     javascript = list((dist_root / "assets").glob("index-*.js"))
     stylesheets = list((dist_root / "assets").glob("index-*.css"))
     if len(javascript) != 1 or len(stylesheets) != 1:
         raise HermesUiBuildError("Hermes UI output must contain one fingerprinted React script and stylesheet.")
+    allowed_files = {
+        "index.html",
+        _BUILD_MANIFEST,
+        "assets/legacy.css",
+        javascript[0].relative_to(dist_root).as_posix(),
+        stylesheets[0].relative_to(dist_root).as_posix(),
+    }
     for candidate in dist_root.rglob("*"):
         if candidate.is_symlink() or (candidate.exists() and not (candidate.is_dir() or candidate.is_file())):
             raise HermesUiBuildError(f"Hermes UI output contains an unsupported filesystem entry: {candidate}")
         if candidate.is_file() and candidate.stat().st_size == 0:
             raise HermesUiBuildError(f"Hermes UI output contains an empty file: {candidate}")
+        if (
+            candidate.is_file()
+            and candidate.relative_to(dist_root).as_posix() not in allowed_files
+        ):
+            raise HermesUiBuildError(
+                f"Hermes UI output contains an unexpected file: {candidate}"
+            )
 
     index_text = required[0].read_text(encoding="utf-8")
     collector = _EntryPointReferenceCollector()
@@ -543,7 +556,7 @@ def _validate_dist(dist_root: Path, *, repository_root: Path) -> None:
         reference = attributes[expected_attribute]
         if reference is None:
             raise HermesUiBuildError(f"Hermes UI entry point contains an empty runtime reference: {tag}")
-        prefix = "/mail/v2/assets/"
+        prefix = "/mail/assets/"
         if not reference.startswith(prefix) or any(
             character in reference for character in ("\\", ":", "?", "#", "%")
         ):

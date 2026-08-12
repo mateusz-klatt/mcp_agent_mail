@@ -33,9 +33,10 @@ async def test_views_ack_required_and_ack_overdue_resources(isolated_env):
                 "subject": "NeedsAck",
                 "body_md": "hello",
                 "ack_required": True,
+                "idempotency_key": "resource-mailbox-needs-ack",
             },
         )
-        msg = (m1.data.get("deliveries") or [{}])[0].get("payload", {})
+        msg = (m1.data.get("deliveries") or [{}])[0].get("message", {})
         mid = int(msg.get("id"))
 
         # ack-required view should include it
@@ -80,6 +81,7 @@ async def test_mailbox_and_mailbox_with_commits(isolated_env):
                 "to": ["BlueLake"],
                 "subject": "CommitMeta",
                 "body_md": "body",
+                "idempotency_key": "resource-mailbox-commit-meta",
             },
         )
 
@@ -109,10 +111,11 @@ async def test_outbox_and_message_resource(isolated_env):
                 "to": ["GreenCastle"],
                 "subject": "OutboxMsg",
                 "body_md": "B",
+                "idempotency_key": "resource-mailbox-outbox",
             },
         )
-        payload = (m.data.get("deliveries") or [{}])[0].get("payload", {})
-        mid = payload.get("id")
+        message = (m.data.get("deliveries") or [{}])[0].get("message", {})
+        mid = message.get("id")
 
         # Outbox should list it
         blocks = await client.read_resource("resource://outbox/GreenCastle?project=Backend&limit=5")
@@ -121,5 +124,3 @@ async def test_outbox_and_message_resource(isolated_env):
         # Message resource returns full payload with body
         blocks2 = await client.read_resource(f"resource://message/{mid}?project=Backend")
         assert blocks2 and "OutboxMsg" in (blocks2[0].text or "")
-
-

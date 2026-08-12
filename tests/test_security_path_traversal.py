@@ -330,11 +330,12 @@ class TestAttachmentPathTraversal:
                         "body_md": "Test message",
                         "attachment_paths": ["../../../nonexistent.bin"],
                         "convert_images": False,
+                        "idempotency_key": "security-traversal-attachment",
                     },
                 )
-            # Verify the error is a safe rejection (either traversal blocked or file missing)
+            # Attachments fail closed before any delivery intent is accepted.
             err = str(exc_info.value).lower()
-            assert ("directory traversal" in err) or ("no such file" in err) or ("not found" in err)
+            assert "bounded canonical inline representation" in err
 
     @pytest.mark.asyncio
     async def test_attachment_markdown_image_traversal_handled(self, isolated_env, monkeypatch):
@@ -366,7 +367,7 @@ class TestAttachmentPathTraversal:
                     "to": ["RedStone"],
                     "subject": "Test traversal in body",
                     "body_md": "Check ![image](../../../etc/passwd)",
-                    "convert_images": False,
+                    "idempotency_key": "security-markdown-traversal-body",
                 },
             )
             # Message should be sent (body text is just text)
@@ -408,9 +409,10 @@ class TestAttachmentPathTraversal:
                         "body_md": "Should be rejected",
                         "attachment_paths": [str(secret_file.resolve())],
                         "convert_images": False,
+                        "idempotency_key": "security-absolute-attachment",
                     },
                 )
-        assert "absolute attachment paths are disabled" in str(exc_info.value).lower()
+        assert "bounded canonical inline representation" in str(exc_info.value).lower()
 
 
 # ============================================================================
@@ -505,6 +507,7 @@ class TestPathTraversalIntegration:
                     "to": ["BlueLake"],
                     "subject": "Path test",
                     "body_md": "Check file at ../../../etc/passwd",
+                    "idempotency_key": "security-project-path-body",
                 },
             )
             assert msg_result.data.get("deliveries") is not None

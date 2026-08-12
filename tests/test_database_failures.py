@@ -521,8 +521,8 @@ class TestSQLiteConfiguration:
         assert timeout == 60000
 
     @pytest.mark.asyncio
-    async def test_synchronous_mode_normal(self, isolated_env):
-        """SQLite synchronous mode is set to NORMAL for performance."""
+    async def test_synchronous_mode_full(self, isolated_env):
+        """SQLite commits are durable across OS crashes and power loss."""
         await ensure_schema()
 
         engine = get_engine()
@@ -533,5 +533,5 @@ class TestSQLiteConfiguration:
             assert result is not None
             sync_mode = result[0]
 
-        # 1 = NORMAL
-        assert sync_mode == 1
+        # 2 = FULL
+        assert sync_mode == 2

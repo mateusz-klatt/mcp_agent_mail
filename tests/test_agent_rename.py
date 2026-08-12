@@ -17,7 +17,7 @@ from typing import Any, cast
 import pytest
 from click import unstyle
 from fastmcp import Client
-from git.index.base import IndexFile
+from git import Git
 from sqlalchemy import func, select as _sa_select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.sql import ColumnElement
@@ -1193,15 +1193,22 @@ def test_rename_agent_retries_after_index_was_staged(
     monkeypatch,
 ) -> None:
     seeded = _seed()
-    original_commit = IndexFile.commit
+    original_call_process = Git._call_process
     interrupted = False
 
-    def fail_before_commit(self: IndexFile, *args: Any, **kwargs: Any) -> Any:
+    def fail_before_commit(
+        git: Git,
+        method: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
         nonlocal interrupted
-        interrupted = True
-        raise RuntimeError("injected after staging")
+        if method == "commit":
+            interrupted = True
+            raise RuntimeError("injected after staging")
+        return original_call_process(git, method, *args, **kwargs)
 
-    monkeypatch.setattr(IndexFile, "commit", fail_before_commit)
+    monkeypatch.setattr(Git, "_call_process", fail_before_commit)
     first = CliRunner().invoke(
         app,
         [
@@ -1219,7 +1226,7 @@ def test_rename_agent_retries_after_index_was_staged(
     assert "injected after staging" in first.output
     assert _git(seeded.repo_root, "rev-parse", "HEAD") == seeded.seed_commit
 
-    monkeypatch.setattr(IndexFile, "commit", original_commit)
+    monkeypatch.setattr(Git, "_call_process", original_call_process)
     retry = CliRunner().invoke(
         app,
         [

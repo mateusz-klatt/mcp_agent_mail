@@ -376,10 +376,10 @@ async def test_message_recipient_timestamp_updates(isolated_env):
                 "subject": "Datetime Test",
                 "body_md": "Testing datetime handling",
                 "ack_required": True,
+                "idempotency_key": "datetime-message",
             },
         )
-        # send_message returns {"deliveries": [{"project": ..., "payload": {...}}], "count": N}
-        message_id = send_result.data["deliveries"][0]["payload"]["id"]
+        message_id = send_result.data["deliveries"][0]["message"]["id"]
 
         # Mark as read - sets read_ts
         read_result = await client.call_tool(

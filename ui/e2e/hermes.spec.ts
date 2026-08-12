@@ -11,6 +11,7 @@ import type {
   MailUiProfile,
 } from "../src/account";
 import type {
+  DeliveryResult,
   InboxMessage,
   InboxPage,
   MailProject,
@@ -56,12 +57,45 @@ const message: MessageDetail = {
 
 const accountGeneration = "b".repeat(64);
 const projectGeneration = "d".repeat(64);
+const deliveryId = "01234567-89ab-4cde-8f01-23456789abcd";
+const publishedDelivery: DeliveryResult = {
+  id: deliveryId,
+  status: "published",
+  reused: false,
+  message_id: 202,
+  commit_sha: "e".repeat(40),
+  next_attempt_ts: null,
+};
+const pendingDelivery: DeliveryResult = {
+  id: deliveryId,
+  status: "pending",
+  reused: false,
+  message_id: null,
+  commit_sha: null,
+  next_attempt_ts: "2026-08-12T20:30:00Z",
+};
+
+type StubActorRole = "admin" | "operator";
+
+interface LocalStubOptions {
+  actorRole?: StubActorRole;
+  composeResult?: DeliveryResult;
+  replyResult?: DeliveryResult;
+  retryResult?: DeliveryResult;
+}
+
+interface TypedWrite {
+  method: "POST";
+  path: string;
+  body: unknown;
+}
 
 interface StubState {
   preferences: MailUiPreferences;
   profile: MailUiProfile;
   admin: AdminAccessSnapshot;
   passwordChanges: number;
+  typedWrites: TypedWrite[];
   externalRequests: string[];
   browserErrors: string[];
 }
@@ -79,7 +113,13 @@ function isExternal(urlText: string): boolean {
   );
 }
 
-async function installLocalStub(page: Page): Promise<StubState> {
+async function installLocalStub(
+  page: Page,
+  messageDetail: MessageDetail = message,
+  options: LocalStubOptions = {},
+): Promise<StubState> {
+  const actorRole = options.actorRole ?? "admin";
+  const assignedProject: MailProject = { ...project, role: actorRole };
   const state: StubState = {
     preferences: {
       stored: {
@@ -92,7 +132,7 @@ async function installLocalStub(page: Page): Promise<StubState> {
       id: 1,
       username: "mateusz",
       display_name: "Mateusz",
-      global_role: "admin",
+      global_role: actorRole === "admin" ? "admin" : "member",
       profile_revision: 3,
     },
     admin: {
@@ -129,6 +169,7 @@ async function installLocalStub(page: Page): Promise<StubState> {
       ],
     },
     passwordChanges: 0,
+    typedWrites: [],
     externalRequests: [],
     browserErrors: [],
   };
@@ -254,7 +295,7 @@ async function installLocalStub(page: Page): Promise<StubState> {
     }
 
     if (path === "/mail/api/v1/projects" && method === "GET") {
-      return json(route, { items: [project], total: 1 });
+      return json(route, { items: [assignedProject], total: 1 });
     }
 
     if (path === "/mail/api/v1/inbox" && method === "GET") {
@@ -267,10 +308,35 @@ async function installLocalStub(page: Page): Promise<StubState> {
     }
 
     if (
-      path === `/mail/api/v1/projects/${project.id}/messages/${message.id}` &&
+      path ===
+        `/mail/api/v1/projects/${project.id}/messages/${messageDetail.id}` &&
       method === "GET"
     ) {
-      return json(route, message);
+      return json(route, messageDetail);
+    }
+
+    const replyMatch = path.match(
+      /^\/mail\/api\/v1\/projects\/(\d+)\/messages\/(\d+)\/replies$/,
+    );
+    if (replyMatch !== null && method === "POST") {
+      state.typedWrites.push({ method, path, body: request.postDataJSON() });
+      return json(route, options.replyResult ?? publishedDelivery);
+    }
+
+    const composeMatch = path.match(
+      /^\/mail\/api\/v1\/projects\/(\d+)\/messages$/,
+    );
+    if (composeMatch !== null && method === "POST") {
+      state.typedWrites.push({ method, path, body: request.postDataJSON() });
+      return json(route, options.composeResult ?? publishedDelivery);
+    }
+
+    const retryMatch = path.match(
+      /^\/mail\/api\/v1\/deliveries\/([0-9a-f-]+)\/retry$/,
+    );
+    if (retryMatch !== null && method === "POST") {
+      state.typedWrites.push({ method, path, body: request.postDataJSON() });
+      return json(route, options.retryResult ?? publishedDelivery);
     }
 
     return json(route, { detail: `Unexpected local stub request: ${method} ${path}` }, 404);
@@ -293,12 +359,19 @@ async function expectMobileLayout(page: Page): Promise<void> {
         const target = element as HTMLElement;
         const rect = target.getBoundingClientRect();
         const style = getComputedStyle(target);
+        const disabled =
+          target instanceof HTMLButtonElement ||
+          target instanceof HTMLInputElement ||
+          target instanceof HTMLSelectElement ||
+          target instanceof HTMLTextAreaElement
+            ? target.disabled
+            : false;
         const rendered =
           style.display !== "none" &&
           style.visibility !== "hidden" &&
           rect.width > 0 &&
           rect.height > 0;
-        return rendered && (rect.width < 44 || rect.height < 44)
+        return rendered && !disabled && (rect.width < 44 || rect.height < 44)
           ? [{
               label: target.getAttribute("aria-label") ?? target.textContent?.trim() ?? target.tagName,
               width: Math.round(rect.width * 10) / 10,
@@ -308,6 +381,90 @@ async function expectMobileLayout(page: Page): Promise<void> {
       }),
     );
   expect(undersizedTargets).toEqual([]);
+}
+
+test("administrator composes through the typed delivery API", async ({ page }) => {
+  const state = await installLocalStub(page);
+  await page.goto("#compose");
+
+  await expect(page.getByRole("heading", { name: "Compose", level: 1 })).toBeVisible();
+  await page.getByLabel("Project").selectOption(String(project.id));
+  await page.getByLabel("Recipients").fill("GreenDog, BlueLake");
+  await page.getByLabel("Subject").fill("Review the release");
+  await page.getByLabel("Thread ID (optional)").fill("release-2026");
+  await page.getByLabel("Message in Markdown").fill("**Proceed** after UAT.");
+  await expectMobileLayout(page);
+
+  await page.getByRole("button", { name: "Send message" }).click();
+
+  await expect(page.getByText("Published exactly once.")).toBeVisible();
+  await expect(page.getByText(`Delivery reference: ${deliveryId}`)).toBeVisible();
+  expect(state.typedWrites).toEqual([
+    {
+      method: "POST",
+      path: `/mail/api/v1/projects/${project.id}/messages`,
+      body: {
+        idempotency_key: expect.stringMatching(/^human-ui:/u),
+        recipients: ["GreenDog", "BlueLake"],
+        subject: "Review the release",
+        body_md: "**Proceed** after UAT.",
+        thread_id: "release-2026",
+      },
+    },
+  ]);
+  await expect(page.getByLabel("Recipients")).toHaveValue("");
+  await expect(page.getByLabel("Subject")).toHaveValue("");
+  await expect(page.getByLabel("Message in Markdown")).toHaveValue("");
+  await expectMobileLayout(page);
+  expect(state.externalRequests).toEqual([]);
+  expect(state.browserErrors).toEqual([]);
+});
+
+for (const actorRole of ["admin", "operator"] as const) {
+  test(`${actorRole} replies through typed delivery writes`, async ({ page }) => {
+    const requiresRetry = actorRole === "admin";
+    const state = await installLocalStub(page, message, {
+      actorRole,
+      replyResult: requiresRetry ? pendingDelivery : publishedDelivery,
+      retryResult: publishedDelivery,
+    });
+    await page.goto(`#message/${project.id}/${message.id}`);
+
+    await expect(
+      page.getByRole("heading", { name: message.subject, level: 1 }),
+    ).toBeVisible();
+    await page.getByLabel("Reply in Markdown").fill(`Approved by ${actorRole}.`);
+    await expectMobileLayout(page);
+    await page.getByRole("button", { name: "Send reply" }).click();
+
+    if (requiresRetry) {
+      await expect(page.getByText("Accepted and waiting to publish.")).toBeVisible();
+      await expectMobileLayout(page);
+      await page.getByRole("button", { name: "Check status" }).click();
+    }
+
+    await expect(page.getByText("Published exactly once.")).toBeVisible();
+    await expect(page.getByText(`Delivery reference: ${deliveryId}`)).toBeVisible();
+    expect(state.typedWrites[0]).toEqual({
+      method: "POST",
+      path: `/mail/api/v1/projects/${project.id}/messages/${message.id}/replies`,
+      body: {
+        idempotency_key: expect.stringMatching(/^human-ui:/u),
+        body_md: `Approved by ${actorRole}.`,
+      },
+    });
+    if (requiresRetry) {
+      expect(state.typedWrites[1]).toEqual({
+        method: "POST",
+        path: `/mail/api/v1/deliveries/${deliveryId}/retry`,
+        body: {},
+      });
+    }
+    expect(state.typedWrites).toHaveLength(requiresRetry ? 2 : 1);
+    await expectMobileLayout(page);
+    expect(state.externalRequests).toEqual([]);
+    expect(state.browserErrors).toEqual([]);
+  });
 }
 
 test("account, admin, inbox, and detail remain mobile-safe and keyboard-operable", async ({
@@ -370,52 +527,199 @@ test("account, admin, inbox, and detail remain mobile-safe and keyboard-operable
   expect(state.browserErrors).toEqual([]);
 });
 
-test("legacy Markdown sanitizer cannot create active resource requests", async ({ page }) => {
-  await installLocalStub(page);
-  const resourceRequests: string[] = [];
+test("renders GFM while Markdown resources and raw HTML stay inert", async ({ page }) => {
+  const canonicalPng =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+  const oversizedPng =
+    `data:image/png;base64,${"A".repeat(Math.ceil((2 * 1024 * 1024) / 3) * 4 + 1)}`;
+  const hostileDetail: MessageDetail = {
+    ...message,
+    body_md: [
+      "# Markdown delivery",
+      "## Nested evidence",
+      "### Validation details",
+      "#### Parser outcome",
+      "##### Boundary note",
+      "###### Terminal note",
+      "**Strong result** and ~~retired path~~.",
+      "- [x] Reviewed\n- [ ] Pending",
+      "First line\nSecond line",
+      "> Audited quote",
+      "| Identifier | A deliberately long result column that must scroll inside the labelled table |\n| --- | --- |\n| HERMES-101 | Passed without widening the mobile document viewport |",
+      "```ts\nconst immutableDelivery = true; const deliberatelyLongCodeLine = 'scroll inside the focusable code block';\n```",
+      "[safe HTTPS](https://example.test/report) [safe mail](mailto:ops@example.test) [safe Polish](https://example.test/Wrocław) [safe relative](../messages/101)",
+      "[blocked fragment](#markdown-delivery) [blocked routed fragment](/mail/#account) [blocked JavaScript](javascript:alert%281%29) [blocked data](data:text/html,unsafe) [blocked blob](blob:https://example.test/id) [blocked control](https://example.test/%0Aprobe)",
+      `![inline proof](${canonicalPng})`,
+      "![remote tracker](https://tracker.invalid/pixel.png?markdown-probe=remote)",
+      "![protocol tracker](//tracker.invalid/pixel.png?markdown-probe=protocol-relative)",
+      "![same origin tracker](/mail/logout?markdown-probe=same-origin)",
+      "![relative tracker](relative.png?markdown-probe=relative)",
+      "![blob tracker](blob:http://127.0.0.1/markdown-probe-blob)",
+      "![SVG tracker](data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=)",
+      `![oversized tracker](${oversizedPng})`,
+      "![MIME mismatch](data:image/png;base64,R0lGODlhcmVzdA==)",
+      '<script>window.__markdownXss = "script"</script>',
+      '<svg onload="window.__markdownXss = \'svg\'"><image href="/mail/events?markdown-probe=svg"></image></svg>',
+      '<img src="/mail/logout?markdown-probe=raw-image" alt="raw image" onerror="window.__markdownXss = \'image\'">',
+      '<div onclick="window.__markdownXss = \'event\'" style="background-image:url(/mail/logout?markdown-probe=style)">raw event element</div>',
+    ].join("\n\n"),
+  };
+  const networkImageRequests: string[] = [];
+  const probeRequests: string[] = [];
   page.on("request", (request) => {
-    if (request.url().includes("markdown-probe")) {
-      resourceRequests.push(request.url());
+    const url = request.url();
+    if (
+      request.resourceType() === "image" &&
+      (url.startsWith("http:") || url.startsWith("https:") || url.startsWith("blob:"))
+    ) {
+      networkImageRequests.push(url);
+    }
+    if (url.includes("markdown-probe")) {
+      probeRequests.push(url);
     }
   });
-  await page.goto("#inbox");
-  await page.addScriptTag({ url: "/mail/v2/assets/legacy.js" });
-  await page.waitForFunction(() => "DOMPurify" in window);
+  const state = await installLocalStub(page, hostileDetail);
 
-  const result = await page.evaluate(() => {
-    const purifier = (
-      window as unknown as Window & { DOMPurify: { sanitize: (input: string) => string } }
-    ).DOMPurify;
-    const hostile = [
-      '<img src="/mail/events?markdown-probe=img">',
-      '<svg><image href="/mail/events?markdown-probe=svg-image"></image></svg>',
-      '<svg><feImage href="/mail/events?markdown-probe=svg-filter"></feImage></svg>',
-      '<picture><source srcset="/mail/logout?markdown-probe=source"></picture>',
-      '<video poster="/mail/logout?markdown-probe=poster"></video>',
-      '<audio src="/mail/logout?markdown-probe=audio"></audio>',
-      '<input type="image" src="/mail/logout?markdown-probe=input">',
-      '<div style="background-image:url(/mail/logout?markdown-probe=css)">styled</div>',
-      '<img alt="inline" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=">',
-    ].join("");
-    const sanitized = purifier.sanitize(hostile);
-    const container = document.createElement("div");
-    container.id = "legacy-sanitizer-probe";
-    container.innerHTML = sanitized;
-    document.body.append(container);
-    return {
-      dangerousElements: container.querySelectorAll(
-        "svg, image, feImage, picture, source, video, audio, input, [style]",
-      ).length,
-      imageSources: Array.from(container.querySelectorAll("img"), (image) =>
-        image.getAttribute("src"),
-      ),
-    };
-  });
+  await page.goto(`#message/${project.id}/${message.id}`);
 
-  await page.waitForTimeout(100);
-  expect(result.dangerousElements).toBe(0);
-  expect(result.imageSources).toEqual([
-    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+  await expect(
+    page.getByRole("heading", { name: message.subject, level: 1 }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Markdown delivery", level: 2 }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Nested evidence", level: 3 }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Validation details", level: 4 }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Parser outcome", level: 5 }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Boundary note", level: 6 }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Terminal note", level: 6 }),
+  ).toBeVisible();
+  await expect(page.getByText("Strong result", { exact: true })).toBeVisible();
+  await expect(page.locator("del", { hasText: "retired path" })).toBeVisible();
+  await expect(
+    page.getByRole("checkbox", { name: "Completed task" }),
+  ).toBeChecked();
+  await expect(
+    page.getByRole("checkbox", { name: "Completed task" }),
+  ).toBeDisabled();
+  await expect(
+    page.getByRole("checkbox", { name: "Incomplete task" }),
+  ).not.toBeChecked();
+  await expect(
+    page.getByRole("checkbox", { name: "Incomplete task" }),
+  ).toBeDisabled();
+  await expect(page.locator(".message-body p br")).toHaveCount(1);
+  await expect(page.locator("blockquote", { hasText: "Audited quote" })).toBeVisible();
+
+  const tableRegion = page.getByRole("region", { name: "Markdown table" });
+  await expect(tableRegion).toHaveAttribute("tabindex", "0");
+  await tableRegion.focus();
+  await expect(tableRegion).toBeFocused();
+  const tableDimensions = await tableRegion.evaluate((element) => ({
+    clientWidth: element.clientWidth,
+    scrollWidth: element.scrollWidth,
+    parentClientWidth: element.parentElement?.clientWidth ?? 0,
+  }));
+  expect(tableDimensions.scrollWidth).toBeGreaterThan(tableDimensions.clientWidth);
+
+  const codeBlock = page.getByLabel("Code block");
+  await expect(codeBlock).toHaveAttribute("tabindex", "0");
+  await codeBlock.focus();
+  await expect(codeBlock).toBeFocused();
+  const codeDimensions = await codeBlock.evaluate((element) => ({
+    clientWidth: element.clientWidth,
+    scrollWidth: element.scrollWidth,
+  }));
+  expect(codeDimensions.scrollWidth).toBeGreaterThan(codeDimensions.clientWidth);
+
+  await expect(page.getByRole("link", { name: "safe HTTPS" })).toHaveAttribute(
+    "href",
+    "https://example.test/report",
+  );
+  await expect(page.getByRole("link", { name: "safe mail" })).toHaveAttribute(
+    "href",
+    "mailto:ops@example.test",
+  );
+  await expect(page.getByRole("link", { name: "safe Polish" })).toHaveAttribute(
+    "href",
+    "https://example.test/Wroc%C5%82aw",
+  );
+  await expect(page.getByRole("link", { name: "safe relative" })).toHaveAttribute(
+    "href",
+    "../messages/101",
+  );
+  for (const name of [
+    "blocked fragment",
+    "blocked routed fragment",
+    "blocked JavaScript",
+    "blocked data",
+    "blocked blob",
+    "blocked control",
+  ]) {
+    await expect(page.getByText(name, { exact: true })).toBeVisible();
+    await expect(page.getByRole("link", { name })).toHaveCount(0);
+  }
+  const messageRouteHash = await page.evaluate(() => window.location.hash);
+  await page.getByText("blocked fragment", { exact: true }).click();
+  expect(await page.evaluate(() => window.location.hash)).toBe(messageRouteHash);
+  await page.getByText("blocked routed fragment", { exact: true }).click();
+  expect(await page.evaluate(() => window.location.hash)).toBe(messageRouteHash);
+
+  await expect(page.getByRole("img", { name: "inline proof" })).toHaveAttribute(
+    "src",
+    canonicalPng,
+  );
+  await expect(page.locator(".message-body img")).toHaveCount(1);
+  await expect(page.locator(".markdown-image-alt")).toHaveText([
+    "remote tracker",
+    "protocol tracker",
+    "same origin tracker",
+    "relative tracker",
+    "blob tracker",
+    "SVG tracker",
+    "oversized tracker",
+    "MIME mismatch",
   ]);
-  expect(resourceRequests).toEqual([]);
+  await expect(
+    page.locator(
+      ".message-body script, .message-body svg, .message-body [onload], .message-body [onerror], .message-body [onclick], .message-body [style]",
+    ),
+  ).toHaveCount(0);
+  await expect(page.getByText("raw image", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("raw event element", { exact: true })).toHaveCount(0);
+  expect(await page.evaluate(() => "__markdownXss" in window)).toBe(false);
+
+  await expectMobileLayout(page);
+  expect(networkImageRequests).toEqual([]);
+  expect(probeRequests).toEqual([]);
+  expect(state.externalRequests).toEqual([]);
+  expect(state.browserErrors).toEqual([]);
+});
+
+test("loads shell resources only from the canonical asset namespace", async ({ page }) => {
+  const assetRequests: string[] = [];
+  page.on("request", (request) => {
+    if (["script", "stylesheet"].includes(request.resourceType())) {
+      assetRequests.push(new URL(request.url()).pathname);
+    }
+  });
+  const state = await installLocalStub(page);
+
+  await page.goto("#inbox");
+  await expect(page.getByRole("heading", { name: "Inbox", level: 1 })).toBeVisible();
+
+  expect(assetRequests.length).toBeGreaterThanOrEqual(2);
+  expect(assetRequests.every((path) => path.startsWith("/mail/assets/"))).toBe(true);
+  expect(assetRequests.some((path) => path.startsWith("/mail/v2/"))).toBe(false);
+  expect(state.externalRequests).toEqual([]);
+  expect(state.browserErrors).toEqual([]);
 });

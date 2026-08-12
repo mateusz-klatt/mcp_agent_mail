@@ -26,6 +26,7 @@ async def test_bench_search_messages(bench_factory):
                     "to": [harness.agent_name],
                     "subject": f"{keyword} report {i}",
                     "body_md": f"{keyword} :: {make_message_body(seed, i, message_size)}",
+                    "idempotency_key": f"benchmark-search-{i}",
                 },
             )
 

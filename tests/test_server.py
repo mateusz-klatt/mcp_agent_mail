@@ -9,7 +9,6 @@ import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from git import Repo
-from PIL import Image
 from rich.console import Console, Group
 from rich.panel import Panel
 from rich.syntax import Syntax
@@ -60,12 +59,15 @@ async def test_messaging_flow(isolated_env):
                 "to": ["BlueLake"],
                 "subject": "Test",
                 "body_md": "hello",
+                "idempotency_key": "server-messaging-flow",
             },
         )
         # New response shape: deliveries list
         deliveries = message.data.get("deliveries") or []
         assert isinstance(deliveries, list)
-        assert deliveries and deliveries[0]["payload"]["subject"] == "Test"
+        assert deliveries and deliveries[0]["delivery"]["status"] == "published"
+        assert deliveries[0]["message"]["subject"] == "Test"
+        assert deliveries[0]["delivery"]["message_id"] == deliveries[0]["message"]["id"]
 
         inbox = await client.call_tool(
             "fetch_inbox",
@@ -87,20 +89,22 @@ async def test_messaging_flow(isolated_env):
         storage_root = Path(get_settings().storage.root).expanduser().resolve()
         profile = storage_root / "projects" / "backend" / "agents" / "BlueLake" / "profile.json"
         assert profile.exists()
-        message_file = next(iter((storage_root / "projects" / "backend" / "messages").rglob("*.md")))
+        delivery_id = deliveries[0]["delivery"]["id"]
+        message_file = (
+            storage_root
+            / "projects"
+            / "backend"
+            / "message_deliveries"
+            / f"{delivery_id}.md"
+        )
+        assert message_file.exists()
         assert "Test" in message_file.read_text()
         repo = Repo(str(storage_root))
-        # The subject has to survive into the commit, and the commit is what
-        # someone reads in `git log` months later. It is no longer embedded as
-        # JSON: storage.py builds `mail: <sender> -> <recipients> | <subject>`,
-        # documented at storage.py:2152 and relied on there to derive trailers.
-        # Asserting on the header line rather than a substring anywhere keeps
-        # this failing if the subject is dropped — "Test" alone would also be
-        # satisfied by the body, which repeats the tool name and project.
         commit_message = str(repo.head.commit.message)
         header = commit_message.splitlines()[0]
-        assert header.startswith("mail: ")
-        assert header.endswith("| Test")
+        assert header == f"mail-delivery: publish {delivery_id}"
+        assert f"Delivery-ID: {delivery_id}" in commit_message
+        assert repo.head.commit.hexsha == deliveries[0]["delivery"]["commit_sha"]
 
 
 @pytest.mark.asyncio
@@ -825,7 +829,7 @@ async def test_build_slot_conflicts_respect_both_requester_and_holder_exclusivit
 
 
 @pytest.mark.asyncio
-async def test_file_reservation_enforcement_blocks_message_on_overlap(isolated_env):
+async def test_legacy_mailbox_reservation_does_not_block_atomic_delivery(isolated_env):
     server = build_mcp_server()
 
     async with Client(server) as client:
@@ -849,7 +853,7 @@ async def test_file_reservation_enforcement_blocks_message_on_overlap(isolated_e
             },
         )
 
-        # Beta reserves Alpha's inbox surface exclusively (overlap by pattern)
+        # Legacy mailbox paths are no longer message publication targets.
         reservation = await client.call_tool(
             "file_reservation_paths",
             {
@@ -862,30 +866,22 @@ async def test_file_reservation_enforcement_blocks_message_on_overlap(isolated_e
         )
         assert reservation.data["granted"]
 
-        # Alpha tries to send a message to Alpha (self), which writes to agents/Alpha/inbox/YYYY/MM/...
-        # Expect FILE_RESERVATION_CONFLICT error payload
+        # The immutable publisher writes one message_deliveries/<id>.md receipt,
+        # so a stale reservation over the removed inbox bundle cannot gate it.
         resp = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
                 "sender_name": "GreenCastle",
                 "to": ["GreenCastle"],
-                "subject": "Blocked",
+                "subject": "Atomic delivery",
                 "body_md": "hello",
+                "idempotency_key": "legacy-mailbox-reservation-active",
             },
         )
-        # Client surfaces tool errors via structured_content when error JSON is raised
-        sc = resp.structured_content
-        # Depending on client wrapper, this may be in error or result; be flexible
-        payload = sc.get("error") or sc.get("result") or {}
-        # If result was returned, it must include error shape; otherwise, use data if available
-        if not payload and hasattr(resp, "data"):
-            payload = getattr(resp, "data", {})
-        # Ensure error type and conflicts present
-        assert isinstance(payload, dict)
-        assert payload.get("type") == "FILE_RESERVATION_CONFLICT" or payload.get("error", {}).get("type") == "FILE_RESERVATION_CONFLICT"
-        conflicts = payload.get("conflicts") or payload.get("error", {}).get("conflicts")
-        assert conflicts and isinstance(conflicts, list)
+        delivery = resp.data["deliveries"][0]
+        assert delivery["delivery"]["status"] == "published"
+        assert delivery["message"]["subject"] == "Atomic delivery"
 
 
 @pytest.mark.asyncio
@@ -1042,7 +1038,7 @@ async def test_force_release_file_reservation_expired_is_noop(isolated_env):
 
 
 @pytest.mark.asyncio
-async def test_force_release_file_reservation_reports_notification_failure(isolated_env, monkeypatch):
+async def test_force_release_notification_ignores_legacy_mailbox_reservation(isolated_env, monkeypatch):
     monkeypatch.setenv("FILE_RESERVATION_INACTIVITY_SECONDS", "3600")
     monkeypatch.setenv("FILE_RESERVATION_ACTIVITY_GRACE_SECONDS", "120")
     clear_settings_cache()
@@ -1121,9 +1117,8 @@ async def test_force_release_file_reservation_reports_notification_failure(isola
                 },
             )
             assert force.data["released"] == 1
-            assert force.data["reservation"]["notified"] is False
-            notification_error = force.data["reservation"].get("notification_error") or {}
-            assert notification_error.get("type") == "FILE_RESERVATION_CONFLICT"
+            assert force.data["reservation"]["notified"] is True
+            assert force.data["reservation"].get("notification_error") is None
 
             inbox = await client.call_tool(
                 "fetch_inbox",
@@ -1133,7 +1128,7 @@ async def test_force_release_file_reservation_reports_notification_failure(isola
                 },
             )
             messages = inbox.structured_content.get("result", [])
-            assert not any("Released stale lock" in msg["subject"] for msg in messages)
+            assert any("Released stale lock" in msg["subject"] for msg in messages)
     finally:
         clear_settings_cache()
 
@@ -1301,6 +1296,7 @@ async def test_search_and_summarize(isolated_env):
                 "to": ["BlueLake"],
                 "subject": "Plan",
                 "body_md": "- TODO: implement FTS\n- ACTION: review file reservations",
+                "idempotency_key": "search-and-summarize-plan",
             },
         )
         search = await client.call_tool(
@@ -1323,18 +1319,7 @@ async def test_search_and_summarize(isolated_env):
 
 
 @pytest.mark.asyncio
-async def test_attachment_conversion(isolated_env, monkeypatch):
-    monkeypatch.setenv("ALLOW_ABSOLUTE_ATTACHMENT_PATHS", "true")
-    from mcp_agent_mail import config as _config
-
-    with contextlib.suppress(Exception):
-        _config.clear_settings_cache()
-
-    storage_root = Path(get_settings().storage.root).expanduser().resolve()
-    image_path = storage_root.parent / "temp.png"
-    image = Image.new("RGB", (2, 2), color=(255, 0, 0))
-    image.save(image_path)
-
+async def test_attachment_paths_fail_closed_before_delivery_intent(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
@@ -1347,50 +1332,44 @@ async def test_attachment_conversion(isolated_env, monkeypatch):
                 "name": "OrangeMountain",
             },
         )
-        result = await client.call_tool(
-            "send_message",
-            {
-                "project_key": "Backend",
-                "sender_name": "OrangeMountain",
-                "to": ["OrangeMountain"],
-                "subject": "Image",
-                "body_md": "Here is an image ![pic](%s)" % image_path,
-                "attachment_paths": [str(image_path)],
-            },
-        )
-        attachments = (result.data.get("deliveries") or [{}])[0].get("payload", {}).get("attachments")
-        assert attachments
-        project_root = storage_root / "projects" / "backend"
-        attachment_files = list((project_root / "attachments").rglob("*.webp"))
-        assert attachment_files
-    image_path.unlink(missing_ok=True)
+        with pytest.raises(
+            Exception,
+            match="attachment_paths and convert_images are disabled",
+        ):
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "Backend",
+                    "sender_name": "OrangeMountain",
+                    "to": ["OrangeMountain"],
+                    "subject": "Reserved attachment surface",
+                    "body_md": "The request must fail before reading this path.",
+                    "attachment_paths": ["missing.png"],
+                    "idempotency_key": "attachment-paths-rejected",
+                },
+            )
+
+    async with get_session() as session:
+        count = await session.scalar(text("SELECT COUNT(*) FROM message_deliveries"))
+    assert count == 0
 
 
 @pytest.mark.asyncio
-async def test_attachment_conversion_offloads_absolute_path_resolution(isolated_env, monkeypatch):
-    monkeypatch.setenv("ALLOW_ABSOLUTE_ATTACHMENT_PATHS", "true")
-    from mcp_agent_mail import config as _config, storage as _storage
+async def test_attachment_rejection_precedes_path_resolution(isolated_env, monkeypatch):
+    from mcp_agent_mail import storage as _storage
 
-    with contextlib.suppress(Exception):
-        _config.clear_settings_cache()
-
-    storage_root = Path(get_settings().storage.root).expanduser().resolve()
-    image_path = storage_root.parent / "temp-offload.png"
-    image = Image.new("RGB", (2, 2), color=(0, 0, 255))
-    image.save(image_path)
-
-    main_thread = threading.main_thread()
+    attachment_path = Path("/reserved/never-resolve.png")
     original_resolve = _storage._expanduser_resolve_path
     seen_resolve = 0
 
-    def checked_resolve(path: Path) -> Path:
+    def forbidden_resolve(path: Path) -> Path:
         nonlocal seen_resolve
-        if path == image_path:
+        if path == attachment_path:
             seen_resolve += 1
-            assert threading.current_thread() is not main_thread
+            raise AssertionError(f"reserved attachment path was resolved: {path}")
         return original_resolve(path)
 
-    monkeypatch.setattr(_storage, "_expanduser_resolve_path", checked_resolve)
+    monkeypatch.setattr(_storage, "_expanduser_resolve_path", forbidden_resolve)
 
     server = build_mcp_server()
     async with Client(server) as client:
@@ -1404,22 +1383,24 @@ async def test_attachment_conversion_offloads_absolute_path_resolution(isolated_
                 "name": "BlueStone",
             },
         )
-        result = await client.call_tool(
-            "send_message",
-            {
-                "project_key": "Backend",
-                "sender_name": "BlueStone",
-                "to": ["BlueStone"],
-                "subject": "Image Offload",
-                "body_md": f"Here is an image ![pic]({image_path})",
-                "attachment_paths": [str(image_path)],
-            },
-        )
+        with pytest.raises(
+            Exception,
+            match="attachment_paths and convert_images are disabled",
+        ):
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "Backend",
+                    "sender_name": "BlueStone",
+                    "to": ["BlueStone"],
+                    "subject": "No path resolution",
+                    "body_md": "Reserved attachment input.",
+                    "attachment_paths": [str(attachment_path)],
+                    "idempotency_key": "attachment-resolution-rejected",
+                },
+            )
 
-    attachments = (result.data.get("deliveries") or [{}])[0].get("payload", {}).get("attachments")
-    assert attachments
-    assert seen_resolve >= 1
-    image_path.unlink(missing_ok=True)
+    assert seen_resolve == 0
 
 
 @pytest.mark.asyncio
@@ -1454,23 +1435,18 @@ async def test_rich_logger_does_not_throw(isolated_env, monkeypatch):
                 "to": ["PinkDog"],
                 "subject": "Rich",
                 "body_md": "hello",
+                "idempotency_key": "rich-logger-message",
             },
         )
 
 
 @pytest.mark.asyncio
-async def test_server_level_attachment_policy_override(isolated_env, monkeypatch):
-    # Force server to convert images regardless of agent policy
+async def test_server_level_attachment_policy_does_not_mutate_markdown(isolated_env, monkeypatch):
+    # The legacy server switch cannot re-enable the reserved attachment API.
     monkeypatch.setenv("CONVERT_IMAGES", "true")
-    monkeypatch.setenv("ALLOW_ABSOLUTE_ATTACHMENT_PATHS", "true")
     from mcp_agent_mail import config as _config
     with contextlib.suppress(Exception):
         _config.clear_settings_cache()
-
-    storage_root = Path(get_settings().storage.root).expanduser().resolve()
-    image_path = storage_root.parent / "temp2.png"
-    image = Image.new("RGB", (2, 2), color=(0, 255, 0))
-    image.save(image_path)
 
     server = build_mcp_server()
     async with Client(server) as client:
@@ -1491,20 +1467,21 @@ async def test_server_level_attachment_policy_override(isolated_env, monkeypatch
                 "project_key": "Backend",
                 "sender_name": "WhiteCat",
                 "to": ["WhiteCat"],
-                "subject": "ServerOverride",
-                "body_md": "Here ![pic](%s)" % image_path,
-                "attachment_paths": [str(image_path)],
-                # Do not set convert_images; rely on server default
+                "subject": "Markdown remains source",
+                "body_md": "Here ![pic](local-reference.png)",
+                "idempotency_key": "server-attachment-policy-ignored",
             },
         )
-        attachments = (result.data.get("deliveries") or [{}])[0].get("payload", {}).get("attachments")
-        assert attachments and any(att.get("type") in {"file", "inline"} for att in attachments)
-    image_path.unlink(missing_ok=True)
+        published = result.data["deliveries"][0]
+        assert published["delivery"]["status"] == "published"
+        assert published["message"]["attachments"] == []
+        assert published["message"]["body_md"] == "Here ![pic](local-reference.png)"
 
 
 @pytest.mark.asyncio
-async def test_file_reservation_conflict_ttl_transition_allows_after_expiry(isolated_env, monkeypatch):
-    # Ensure enforcement is enabled
+async def test_atomic_replay_is_stable_across_legacy_reservation_expiry(isolated_env, monkeypatch):
+    # Even the legacy enforcement switch cannot make removed mailbox paths
+    # part of the immutable delivery write set.
     monkeypatch.setenv("FILE_RESERVATIONS_ENFORCEMENT_ENABLED", "true")
     from mcp_agent_mail import config as _config
     with contextlib.suppress(Exception):
@@ -1531,7 +1508,7 @@ async def test_file_reservation_conflict_ttl_transition_allows_after_expiry(isol
                 "name": "BlueLake",
             },
         )
-        # Beta reserves Alpha inbox surface.
+        # Beta reserves the removed per-agent inbox surface.
         reservation = await client.call_tool(
             "file_reservation_paths",
             {
@@ -1544,22 +1521,20 @@ async def test_file_reservation_conflict_ttl_transition_allows_after_expiry(isol
         )
         assert reservation.data["granted"]
 
-        # Immediately blocked
+        # Publication succeeds while the obsolete reservation is active.
         resp = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
                 "sender_name": "GreenCastle",
                 "to": ["GreenCastle"],
-                "subject": "BlockedNow",
+                "subject": "Stable replay",
                 "body_md": "hello",
+                "idempotency_key": "legacy-mailbox-reservation-replay",
             },
         )
-        payload = resp.structured_content.get("error") or resp.structured_content.get("result") or {}
-        if not payload and hasattr(resp, "data"):
-            payload = getattr(resp, "data", {})
-        assert isinstance(payload, dict)
-        assert payload.get("type") == "FILE_RESERVATION_CONFLICT" or payload.get("error", {}).get("type") == "FILE_RESERVATION_CONFLICT"
+        first = resp.data["deliveries"][0]
+        assert first["delivery"]["status"] == "published"
 
         reservation_id = reservation.data["granted"][0]["id"]
         async with get_session() as session:
@@ -1570,20 +1545,24 @@ async def test_file_reservation_conflict_ttl_transition_allows_after_expiry(isol
             session.add(reservation_row)
             await session.commit()
 
-        # Retry after the persisted TTL has elapsed.
+        # Replaying the same operation after the reservation expires reuses the
+        # exact delivery and visible Message row.
         resp2 = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
                 "sender_name": "GreenCastle",
                 "to": ["GreenCastle"],
-                "subject": "AllowedAfterTTL",
+                "subject": "Stable replay",
                 "body_md": "hello",
+                "idempotency_key": "legacy-mailbox-reservation-replay",
             },
         )
         deliveries = resp2.data.get("deliveries") or []
         assert deliveries, resp2.data
-        assert deliveries[0]["payload"]["subject"] == "AllowedAfterTTL"
+        assert deliveries[0]["delivery"]["id"] == first["delivery"]["id"]
+        assert deliveries[0]["delivery"]["reused"] is True
+        assert deliveries[0]["message"]["id"] == first["message"]["id"]
 
 
 @pytest.mark.asyncio

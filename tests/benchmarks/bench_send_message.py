@@ -23,6 +23,7 @@ async def test_bench_send_message(bench_factory):
                     "to": [harness.agent_name],
                     "subject": f"Benchmark message {i}",
                     "body_md": make_message_body(seed, i, message_size),
+                    "idempotency_key": f"benchmark-send-message-{i}",
                 },
             )
 

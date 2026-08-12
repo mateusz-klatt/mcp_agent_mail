@@ -42,6 +42,7 @@ async def test_tooling_directory_and_metrics_populate(isolated_env):
                 "to": [agent_name],
                 "subject": "Ping",
                 "body_md": "x",
+                "idempotency_key": "tooling-resources-ping",
             },
         )
         # Directory

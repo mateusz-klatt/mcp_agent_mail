@@ -394,27 +394,25 @@ Auth notes:
 
 ### Hermes React interface
 
-The responsive interface is served at `/mail/v2/`. It uses the same signed human
-session and server-side authorization rules as the legacy views; hiding a control
-in React is never treated as an authorization boundary. All production JavaScript,
-CSS, fonts, icons, and images are served from the same origin.
+The responsive interface is served at `/mail`. It uses the signed human session
+and server-side authorization rules; hiding a control in React is never treated
+as an authorization boundary. All production JavaScript, CSS, fonts, icons, and
+images are served from the same origin.
 
-- `/mail/v2/#inbox` shows the real, project-scoped inbox and message detail views.
-- `/mail/v2/#projects` lists only projects visible to the signed-in human.
-- `/mail/v2/#account` lets every human choose a display name, select English or
+- `/mail#inbox` shows the real, project-scoped inbox and message detail views.
+- `/mail#projects` lists only projects visible to the signed-in human.
+- `/mail#account` lets every human choose a display name, select English or
   Polish for the interface, set an optional correspondence-language preference,
   and rotate their own password. The correspondence preference is an advisory
   hint for agents replying to that human, not a project-wide instruction.
-- `/mail/v2/#admin` is visible only to global admins. It assigns or revokes
+- `/mail#admin` is visible only to global admins. It assigns or revokes
   `viewer` and `operator` access per human and project. Global admins remain
   global and do not receive per-project assignments.
 
-The server-rendered `/mail` interface remains only for the bounded migration
-period. After React reaches feature parity and passes production UAT, React will
-move to `/mail` and the legacy interface plus `/mail/v2` migration path will be
-removed. They are not permanent compatibility surfaces. Agents and hooks
-continue to use MCP and the documented service endpoints; mounting Hermes does
-not replace or intercept the configured MCP transport path.
+There is one human interface. The former server-rendered routes and the
+versioned `/mail/v2` path return 404; they are not compatibility surfaces.
+Agents and hooks continue to use MCP and the documented service endpoints;
+mounting Hermes does not replace or intercept the configured MCP transport path.
 
 ### Building distributable browser assets
 

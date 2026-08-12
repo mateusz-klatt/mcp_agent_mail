@@ -77,11 +77,12 @@ async def _send(client, project_key: str, sender: str, to: list[str], subject: s
         "to": to,
         "subject": subject,
         "body_md": "x",
+        "idempotency_key": f"unread:{subject}:{topic or 'none'}",
     }
     if topic is not None:
         payload["topic"] = topic
     res = await client.call_tool("send_message", payload)
-    return int(_data(res)["deliveries"][0]["payload"]["id"])
+    return int(_data(res)["deliveries"][0]["message"]["id"])
 
 
 # ---------------------------------------------------------------------------

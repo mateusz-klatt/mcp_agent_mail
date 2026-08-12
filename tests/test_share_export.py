@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import tarfile
@@ -450,6 +451,28 @@ def test_copy_viewer_assets_is_self_contained_and_air_gapped(
     )
 
 
+def test_checksum_verified_viewer_assets_are_not_rewritten_by_git() -> None:
+    """Windows checkout must preserve the exact bytes pinned in the manifest."""
+    repository_root = Path(__file__).resolve().parents[1]
+    asset_paths = [
+        "src/mcp_agent_mail/viewer_assets/coi-serviceworker.js",
+        "src/mcp_agent_mail/viewer_assets/vendor/alpine.min.js",
+        "src/mcp_agent_mail/viewer_assets/vendor/lucide.min.js",
+    ]
+
+    result = subprocess.run(
+        ["git", "check-attr", "text", "--", *asset_paths],
+        cwd=repository_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout.splitlines() == [
+        f"{asset_path}: text: unset" for asset_path in asset_paths
+    ]
+
+
 def test_wheel_and_sdist_exclude_repository_only_clusterize(tmp_path: Path) -> None:
     """Built Python distributions must never contain the retained GPL sources."""
     repository_root = Path(__file__).resolve().parents[1]
@@ -457,8 +480,6 @@ def test_wheel_and_sdist_exclude_repository_only_clusterize(tmp_path: Path) -> N
         [
             "uv",
             "build",
-            "--wheel",
-            "--sdist",
             "--no-progress",
             "--no-create-gitignore",
             "--out-dir",
@@ -488,6 +509,40 @@ def test_wheel_and_sdist_exclude_repository_only_clusterize(tmp_path: Path) -> N
             name.endswith("viewer_assets/third_party_licenses.txt")
             for name in normalized
         )
+        assert any(name.endswith("ui_dist/index.html") for name in normalized)
+        assert any(name.endswith("ui_dist/.hermes-ui-build.json") for name in normalized)
+
+    no_node_path = tmp_path / "no-node-path"
+    no_node_path.mkdir()
+    wheel_from_sdist = tmp_path / "wheel-from-sdist"
+    clean_environment = os.environ.copy()
+    clean_environment["PATH"] = str(no_node_path)
+    result = subprocess.run(
+        [
+            str(Path(shutil.which("uv") or "uv")),
+            "build",
+            "--wheel",
+            "--no-progress",
+            "--no-create-gitignore",
+            "--out-dir",
+            str(wheel_from_sdist),
+            str(sdist),
+        ],
+        cwd=repository_root,
+        env=clean_environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    node_free_wheel = next(wheel_from_sdist.glob("*.whl"))
+    assert node_free_wheel.is_file()
+    with ZipFile(node_free_wheel) as archive:
+        node_free_names = [name.lower() for name in archive.namelist()]
+    assert any(name.endswith("ui_dist/index.html") for name in node_free_names)
+    assert any(
+        name.endswith("ui_dist/.hermes-ui-build.json") for name in node_free_names
+    )
 
 
 def test_detect_hosting_hints_uses_output_dir_repo_when_cwd_elsewhere(

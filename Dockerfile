@@ -65,23 +65,59 @@ RUN git init -q /build/toon_rust && \
     strip /tru
 
 # --------------------------------------------------------------------------
-# Stage 2: build the React mail viewer.
+# Stage 2: build the exact validated browser artifact used by Python packages.
 #
-# Node and npm are intentionally confined to this builder. The final runtime
-# receives only Vite's static output and remains a Python-only image.
+# Node and npm are intentionally confined to this builder. The custom Hatch
+# hook compiles in an isolated temporary directory, writes a per-file hash
+# manifest, validates every entry-point reference, and embeds that same tree in
+# a wheel. The extraction below copies only the validated ui_dist members.
 # --------------------------------------------------------------------------
-FROM node:22.22.2-bookworm-slim AS ui-builder
+FROM ghcr.io/astral-sh/uv:0.11.2 AS uv-bin
+FROM node:22.22.2-bookworm-slim AS node-runtime
+FROM python:3.14-slim AS ui-builder
 
-WORKDIR /ui
+COPY --from=uv-bin /uv /uvx /usr/local/bin/
+COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-runtime /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 
-# Install the exact locked dependency graph before copying application sources
-# so dependency installation remains cacheable across frontend-only edits.
-COPY ui/package*.json ./
-RUN npm ci --ignore-scripts
+ENV SOURCE_DATE_EPOCH=0
+WORKDIR /build
+COPY pyproject.toml uv.lock README.md hatch_build.py ./
+COPY ui ./ui
+COPY src/mcp_agent_mail/__init__.py ./src/mcp_agent_mail/__init__.py
+COPY src/mcp_agent_mail/templates ./src/mcp_agent_mail/templates
+COPY src/mcp_agent_mail/viewer_assets/index.html ./src/mcp_agent_mail/viewer_assets/index.html
 
-COPY ui/eslint.config.js ui/index.html ui/tsconfig.json ui/vite.config.ts ./
-COPY ui/src ./src
-RUN npm run build
+RUN uv build --wheel --no-progress --no-create-gitignore --out-dir /artifacts && \
+    python - <<'PY'
+from pathlib import Path, PurePosixPath
+from shutil import copyfileobj
+from zipfile import ZipFile
+
+wheels = list(Path("/artifacts").glob("*.whl"))
+if len(wheels) != 1:
+    raise RuntimeError(f"Expected one Hermes wheel, found {len(wheels)}")
+prefix = PurePosixPath("mcp_agent_mail/ui_dist")
+output = Path("/ui/dist")
+with ZipFile(wheels[0]) as archive:
+    members = [
+        info
+        for info in archive.infolist()
+        if PurePosixPath(info.filename).is_relative_to(prefix) and not info.is_dir()
+    ]
+    if not members:
+        raise RuntimeError("The Hermes wheel does not contain ui_dist")
+    for info in members:
+        relative = PurePosixPath(info.filename).relative_to(prefix)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise RuntimeError(f"Unsafe ui_dist wheel member: {info.filename}")
+        target = output.joinpath(*relative.parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with archive.open(info) as source, target.open("xb") as destination:
+            copyfileobj(source, destination)
+if not (output / "index.html").is_file() or not (output / ".hermes-ui-build.json").is_file():
+    raise RuntimeError("Validated Hermes index or build manifest is missing")
+PY
 
 # --------------------------------------------------------------------------
 # Stage 3: Python application runtime.
@@ -98,7 +134,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rm -rf /var/lib/apt/lists/*
 
 # Install uv to a shared path so it remains available after USER switch
-RUN curl -LsSf https://astral.sh/uv/install.sh | UV_UNMANAGED_INSTALL=/usr/local/bin sh
+COPY --from=uv-bin /uv /uvx /usr/local/bin/
 
 # Install the TOON encoder built in stage 1 so `format='toon'` requests are
 # served by the real toon_rust encoder rather than silently falling back to
@@ -108,20 +144,21 @@ COPY --from=tru-builder /tru /usr/local/bin/tru
 
 WORKDIR /app
 
-# Copy project metadata and sync deps first for better caching.
+# Copy locked project metadata and sync deps first for better caching.
 # README.md is required by hatchling since pyproject.toml references it.
-COPY pyproject.toml README.md ./
+COPY pyproject.toml uv.lock README.md hatch_build.py ./
 # Install runtime deps only — the project itself (hatchling wheel from
 # src/mcp_agent_mail) can't be built yet because src/ isn't present, so defer
 # its install with --no-install-project to keep this dependency layer cached.
-RUN uv sync --no-dev --no-install-project
+RUN uv sync --frozen --no-dev --no-install-project
 
 # Copy source, then install the project itself now that src/ exists.
 COPY src ./src
-RUN uv sync --no-dev
+RUN uv sync --frozen --no-dev
 
 # Copy the frontend only after the Python project has been installed, so no
 # source-copy or project-install step can replace the production assets.
+RUN test ! -e ./src/mcp_agent_mail/ui_dist
 COPY --from=ui-builder /ui/dist ./src/mcp_agent_mail/ui_dist
 
 # Defaults suitable for container

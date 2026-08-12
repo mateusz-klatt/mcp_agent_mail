@@ -8,3 +8,4 @@
 # differ from their index hash, and share_export raises ShareExportError before
 # producing anything. Treat them as opaque bytes, because that is what they are.
 src/mcp_agent_mail/viewer_assets/vendor/** -text
+src/mcp_agent_mail/viewer_assets/coi-serviceworker.js -text

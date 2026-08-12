@@ -5,7 +5,7 @@ Tests all /mail/* endpoints to ensure proper rendering and functionality.
 
 from __future__ import annotations
 
-import asyncio
+import base64
 import contextlib
 import time
 from html.parser import HTMLParser
@@ -15,11 +15,14 @@ from httpx import ASGITransport, AsyncClient
 
 from mcp_agent_mail import config as _config, webauth
 from mcp_agent_mail.app import build_mcp_server
-from mcp_agent_mail.db import ensure_schema, get_immediate_session, get_session
+from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.http import build_http_app
 from mcp_agent_mail.storage import ensure_archive, write_agent_profile
 
 MAIL_UI_TEST_SECRET = "mail-viewer-rbac-session-secret-0123456789"
+OVERSEER_UNAVAILABLE_DETAIL = (
+    "Human Overseer messaging is temporarily unavailable while atomic archive persistence is implemented"
+)
 
 
 class _NestedAnchorDetector(HTMLParser):
@@ -39,6 +42,21 @@ class _NestedAnchorDetector(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         if tag == "a" and self.anchor_depth > 0:
             self.anchor_depth -= 1
+
+
+class _ImageSourceCollector(HTMLParser):
+    """Collect image sources from server-rendered markup."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sources: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "img":
+            return
+        for name, value in attrs:
+            if name == "src" and value is not None:
+                self.sources.append(value)
 
 
 def _has_nested_anchor(html: str) -> bool:
@@ -307,8 +325,8 @@ async def test_mail_admin_render_keeps_all_existing_controls(isolated_env, monke
     assert '@change="toggleSelection(item.id)"' in inbox.text
     assert message.status_code == 200
     assert 'data-tippy-content="Reply to this message as the Human Overseer"' in message.text
-    assert compose.status_code == 200
-    assert 'sendEndpoint: "/mail/test-proj/overseer/send"' in compose.text
+    assert compose.status_code == 503
+    assert compose.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
 
 
 @pytest.mark.asyncio
@@ -439,12 +457,10 @@ async def test_mail_operator_render_exposes_reply_only(isolated_env, monkeypatch
     assert thread.status_code == 200
     assert f"/overseer/compose?reply_to={message_id}" in thread.text
     assert new_compose.status_code == 403
-    assert reply_compose.status_code == 200
-    assert 'sendEndpoint: "/mail/test-proj/overseer/reply"' in reply_compose.text
-    assert "isReply: true" in reply_compose.text
+    assert reply_compose.status_code == 503
     assert forbidden_new_message.status_code == 403
-    assert sent_reply.status_code == 200
-    assert sent_reply.json()["recipients"] == ["BlueLake"]
+    assert sent_reply.status_code == 503
+    assert sent_reply.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
 
 
 # =============================================================================
@@ -473,6 +489,9 @@ async def test_mail_unified_inbox_html(isolated_env):
         assert 'class="flex min-h-[44px] min-w-[44px] shrink-0 items-center gap-3 group"' in resp.text
         assert 'id="global-header-controls" class="ml-auto flex shrink-0 items-center gap-1 sm:gap-2 lg:gap-3"' in resp.text
         assert "min-h-[44px] min-w-[44px]" in resp.text
+        assert '<form action="/mail/logout" method="post" class="shrink-0">' in resp.text
+        assert 'type="submit"' in resp.text
+        assert 'aria-label="Sign out"' in resp.text
         assert ":aria-label=\"'Sort messages: ' +" in resp.text
         assert ':aria-expanded="sortOpen"' in resp.text
         assert '@keydown.space.prevent="handleMessageClick(msg)"' in resp.text
@@ -828,6 +847,58 @@ async def test_mail_message_detail(isolated_env):
 
 
 @pytest.mark.asyncio
+async def test_mail_message_remote_images_are_not_active_resources(isolated_env):
+    """Agent-authored Markdown cannot make a human browser call a remote pixel."""
+    settings = _config.get_settings()
+    server = build_mcp_server()
+    app = build_http_app(settings, server)
+    data = await _setup_test_data(settings)
+    message_id = data["message_ids"][0]
+    inline_png = "data:image/png;base64," + base64.b64encode(
+        b"\x89PNG\r\n\x1a\nrest"
+    ).decode("ascii")
+
+    async with get_session() as session:
+        from sqlalchemy import text
+
+        await session.execute(
+            text("UPDATE messages SET body_md = :body WHERE id = :message_id"),
+            {
+                "message_id": message_id,
+                "body": (
+                    "![remote](https://tracker.example/pixel.png) "
+                    "![protocol-relative](//tracker.example/pixel.png) "
+                    "![backslash](/\\tracker.example/markdown.png) "
+                    '<img src="/\\tracker.example/raw.png" alt="raw backslash"> '
+                    '<img src="/&#9;/tracker.example/tab.png" alt="raw tab"> '
+                    '<img src="/&#10;/tracker.example/lf.png" alt="raw newline"> '
+                    '<img src="/&#13;/tracker.example/cr.png" alt="raw carriage return"> '
+                    '<img src="/%5Ctracker.example/encoded.png" alt="encoded backslash"> '
+                    "![local](/mail/static/local.png) "
+                    "![logout](/mail/logout) "
+                    f'![inline]({inline_png}) '
+                    "[ordinary link](https://docs.example/read)"
+                ),
+            },
+        )
+        await session.commit()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(f"/mail/test-proj/message/{message_id}")
+
+    collector = _ImageSourceCollector()
+    collector.feed(response.text)
+    assert response.status_code == 200
+    assert collector.sources == [inline_png]
+    assert all("tracker.example" not in source for source in collector.sources)
+    assert "img-src 'self' data: blob:" in response.headers["Content-Security-Policy"]
+    assert "https://docs.example/read" in response.text
+
+
+@pytest.mark.asyncio
 async def test_mail_message_and_thread_views_disambiguate_external_sender(isolated_env):
     """Dedicated HTML views should show the external sender's origin."""
     settings = _config.get_settings()
@@ -1035,7 +1106,7 @@ async def test_mail_attachments_view(isolated_env):
 
 @pytest.mark.asyncio
 async def test_mail_overseer_compose(isolated_env):
-    """Test GET /mail/{project}/overseer/compose returns compose form."""
+    """The legacy composer is unavailable and renders no active controls."""
     settings = _config.get_settings()
     server = build_mcp_server()
     app = build_http_app(settings, server)
@@ -1045,12 +1116,10 @@ async def test_mail_overseer_compose(isolated_env):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.get("/mail/test-proj/overseer/compose")
-        assert resp.status_code == 200
-        assert "text/html" in resp.headers.get("content-type", "")
-        # Should have a form
-        assert "<form" in resp.text.lower() or "form" in resp.text.lower()
-        assert 'sendEndpoint: "/mail/test-proj/overseer/send"' in resp.text
-        assert resp.text.count("inline-flex min-h-[44px] min-w-[44px] items-center justify-center") >= 7
+        assert resp.status_code == 503
+        assert resp.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
+        assert "<form" not in resp.text.lower()
+        assert "sendEndpoint" not in resp.text
 
 
 @pytest.mark.asyncio
@@ -1069,7 +1138,7 @@ async def test_mail_overseer_compose_unknown_project_is_not_found(isolated_env):
 
 
 @pytest.mark.asyncio
-async def test_mail_overseer_excludes_retired_agents_from_compose(isolated_env):
+async def test_mail_overseer_compose_hold_does_not_expose_retired_agents(isolated_env):
     settings = _config.get_settings()
     server = build_mcp_server()
     app = build_http_app(settings, server)
@@ -1100,18 +1169,23 @@ async def test_mail_overseer_excludes_retired_agents_from_compose(isolated_env):
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.get("/mail/test-proj/overseer/compose")
 
-    assert resp.status_code == 200
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
     assert 'value="BlueLake"' not in resp.text
-    assert 'value="GreenRiver"' in resp.text
+    assert 'value="GreenRiver"' not in resp.text
 
 
 @pytest.mark.asyncio
-async def test_mail_overseer_local_reply_is_server_derived(isolated_env):
+async def test_mail_overseer_hold_precedes_reply_derivation(isolated_env):
     settings = _config.get_settings()
     server = build_mcp_server()
     app = build_http_app(settings, server)
     data = await _setup_test_data(settings)
     original_id = int(data["message_ids"][0])
+    async with get_session() as session:
+        from sqlalchemy import text
+
+        before_count = int((await session.execute(text("SELECT COUNT(*) FROM messages"))).scalar_one())
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -1130,29 +1204,19 @@ async def test_mail_overseer_local_reply_is_server_derived(isolated_env):
             },
         )
 
-    assert compose.status_code == 200
-    assert f"replyTo: {original_id}" in compose.text
-    assert 'sendEndpoint: "/mail/test-proj/overseer/reply"' in compose.text
-    assert 'selectedRecipients: ["BlueLake"]' in compose.text
-    assert "Routing is locked to the original sender or recipients" in compose.text
-    assert compose.text.count('readonly aria-readonly="true"') == 2
-    assert "Array.isArray(result.recipients)" in compose.text
-    assert sent.status_code == 200
-    assert sent.json()["recipients"] == ["BlueLake"]
+    assert compose.status_code == 503
+    assert compose.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
+    assert sent.status_code == 503
+    assert sent.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
     async with get_session() as session:
         from sqlalchemy import text
 
-        row = (
-            await session.execute(
-                text("SELECT subject, thread_id, reply_to FROM messages WHERE id = :mid"),
-                {"mid": sent.json()["message_id"]},
-            )
-        ).one()
-    assert tuple(row) == ("Re: Test Message 1", "thread-1", original_id)
+        after_count = int((await session.execute(text("SELECT COUNT(*) FROM messages"))).scalar_one())
+    assert after_count == before_count
 
 
 @pytest.mark.asyncio
-async def test_mail_overseer_reply_subject_stays_within_composer_limit(isolated_env):
+async def test_mail_overseer_hold_does_not_mutate_original_subject(isolated_env):
     settings = _config.get_settings()
     server = build_mcp_server()
     app = build_http_app(settings, server)
@@ -1169,7 +1233,6 @@ async def test_mail_overseer_reply_subject_stays_within_composer_limit(isolated_
         )
         await session.commit()
 
-    expected_subject = f"Re: {original_subject}"[:200]
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         compose = await client.get(
@@ -1187,28 +1250,30 @@ async def test_mail_overseer_reply_subject_stays_within_composer_limit(isolated_
             },
         )
 
-    assert compose.status_code == 200
-    assert f'subject: "{expected_subject}"' in compose.text
-    assert sent.status_code == 200
+    assert compose.status_code == 503
+    assert compose.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
+    assert sent.status_code == 503
+    assert sent.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
     async with get_session() as session:
         from sqlalchemy import text
 
         stored_subject = (
             await session.execute(
                 text("SELECT subject FROM messages WHERE id = :mid"),
-                {"mid": sent.json()["message_id"]},
+                {"mid": original_id},
             )
         ).scalar_one()
-    assert stored_subject == expected_subject
+    assert stored_subject == original_subject
     assert len(stored_subject) == 200
 
 
 @pytest.mark.asyncio
-async def test_mail_overseer_follow_up_targets_original_recipients_not_itself(isolated_env):
+async def test_mail_overseer_hold_blocks_new_messages_and_follow_ups(isolated_env):
     settings = _config.get_settings()
     server = build_mcp_server()
     app = build_http_app(settings, server)
-    await _setup_test_data(settings)
+    data = await _setup_test_data(settings)
+    original_id = int(data["message_ids"][0])
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -1220,9 +1285,6 @@ async def test_mail_overseer_follow_up_targets_original_recipients_not_itself(is
                 "body_md": "First instruction.",
             },
         )
-        assert outbound.status_code == 200
-        original_id = int(outbound.json()["message_id"])
-
         compose = await client.get(
             "/mail/test-proj/overseer/compose",
             params={"reply_to": original_id},
@@ -1237,38 +1299,16 @@ async def test_mail_overseer_follow_up_targets_original_recipients_not_itself(is
             },
         )
 
-    assert compose.status_code == 200
-    assert "Reply as Human Overseer" in compose.text
-    assert 'selectedRecipients: ["BlueLake"]' in compose.text
-    assert follow_up.status_code == 200
-    assert follow_up.json()["recipients"] == ["BlueLake"]
-
-    async with get_session() as session:
-        from sqlalchemy import text
-
-        row = (
-            await session.execute(
-                text(
-                    "SELECT sender.name, recipient.name, m.subject, m.thread_id, m.reply_to "
-                    "FROM messages m JOIN agents sender ON sender.id = m.sender_id "
-                    "JOIN message_recipients mr ON mr.message_id = m.id "
-                    "JOIN agents recipient ON recipient.id = mr.agent_id "
-                    "WHERE m.id = :mid"
-                ),
-                {"mid": follow_up.json()["message_id"]},
-            )
-        ).one()
-    assert tuple(row) == (
-        "HumanOverseer",
-        "BlueLake",
-        "Re: Original operator request",
-        str(original_id),
-        original_id,
-    )
+    assert outbound.status_code == 503
+    assert outbound.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
+    assert compose.status_code == 503
+    assert compose.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
+    assert follow_up.status_code == 503
+    assert follow_up.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
 
 
 @pytest.mark.asyncio
-async def test_mail_overseer_reply_fails_closed_for_cross_project_sender_collision(isolated_env):
+async def test_mail_overseer_hold_precedes_cross_project_reply_resolution(isolated_env):
     settings = _config.get_settings()
     server = build_mcp_server()
     app = build_http_app(settings, server)
@@ -1296,10 +1336,10 @@ async def test_mail_overseer_reply_fails_closed_for_cross_project_sender_collisi
             },
         )
 
-    assert compose.status_code == 409
-    assert "Cannot reply to a cross-project sender" in compose.text
-    assert sent.status_code == 409
-    assert "cross-project sender" in sent.json()["detail"]
+    assert compose.status_code == 503
+    assert compose.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
+    assert sent.status_code == 503
+    assert sent.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
     async with get_session() as session:
         from sqlalchemy import text
 
@@ -1308,7 +1348,7 @@ async def test_mail_overseer_reply_fails_closed_for_cross_project_sender_collisi
 
 
 @pytest.mark.asyncio
-async def test_mail_overseer_reply_does_not_prefill_or_send_to_retired_original_sender(isolated_env):
+async def test_mail_overseer_hold_precedes_retired_sender_resolution(isolated_env):
     settings = _config.get_settings()
     server = build_mcp_server()
     app = build_http_app(settings, server)
@@ -1334,14 +1374,14 @@ async def test_mail_overseer_reply_does_not_prefill_or_send_to_retired_original_
             json={"reply_to": original_id, "body_md": "Must not send."},
         )
 
-    assert compose.status_code == 409
-    assert "Cannot reply to a retired sender" in compose.text
-    assert sent.status_code == 409
-    assert sent.json()["detail"] == "Cannot reply to a retired sender"
+    assert compose.status_code == 503
+    assert compose.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
+    assert sent.status_code == 503
+    assert sent.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
 
 
 @pytest.mark.asyncio
-async def test_mail_overseer_rejects_retired_recipient_without_writing_message(isolated_env):
+async def test_mail_overseer_hold_blocks_retired_recipient_before_writing_message(isolated_env):
     settings = _config.get_settings()
     server = build_mcp_server()
     app = build_http_app(settings, server)
@@ -1379,8 +1419,8 @@ async def test_mail_overseer_rejects_retired_recipient_without_writing_message(i
             },
         )
 
-    assert resp.status_code == 409
-    assert "retired recipients: BlueLake" in resp.json()["detail"]
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
     async with get_session() as session:
         from sqlalchemy import text
 
@@ -1389,53 +1429,44 @@ async def test_mail_overseer_rejects_retired_recipient_without_writing_message(i
 
 
 @pytest.mark.asyncio
-async def test_mail_overseer_retire_wins_concurrent_send_without_message_commit(
+async def test_mail_overseer_hold_never_opens_immediate_write_transaction(
     isolated_env,
     monkeypatch,
 ):
     from mcp_agent_mail import http as http_module
 
-    send_transaction_attempted = asyncio.Event()
+    immediate_session_calls = 0
 
-    @contextlib.asynccontextmanager
-    async def observed_send_session():
-        send_transaction_attempted.set()
-        async with get_immediate_session() as session:
-            yield session
+    def forbidden_immediate_session():
+        nonlocal immediate_session_calls
+        immediate_session_calls += 1
+        raise AssertionError("legacy overseer hold must precede the write transaction")
 
-    monkeypatch.setattr(http_module, "get_immediate_session", observed_send_session)
+    monkeypatch.setattr(http_module, "get_immediate_session", forbidden_immediate_session)
     settings = _config.get_settings()
     server = build_mcp_server()
     app = build_http_app(settings, server)
     await _setup_test_data(settings)
 
+    async with get_session() as session:
+        from sqlalchemy import text
+
+        before_count = int((await session.execute(text("SELECT COUNT(*) FROM messages"))).scalar_one())
+
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        async with get_immediate_session() as retire_session:
-            from sqlalchemy import text
+        response = await client.post(
+            "/mail/test-proj/overseer/send",
+            json={
+                "recipients": ["BlueLake"],
+                "subject": "Blocked send",
+                "body_md": "The write transaction must never open.",
+            },
+        )
 
-            before_count = int(
-                (await retire_session.execute(text("SELECT COUNT(*) FROM messages"))).scalar_one()
-            )
-            await retire_session.execute(
-                text("UPDATE agents SET retired_at = datetime('now') WHERE name = 'BlueLake'")
-            )
-            send_task = asyncio.create_task(
-                client.post(
-                    "/mail/test-proj/overseer/send",
-                    json={
-                        "recipients": ["BlueLake"],
-                        "subject": "Concurrent send",
-                        "body_md": "Retire already owns the write transaction.",
-                    },
-                )
-            )
-            await asyncio.wait_for(send_transaction_attempted.wait(), timeout=1)
-            assert not send_task.done()
-            await retire_session.commit()
-        response = await send_task
-
-    assert response.status_code == 409
+    assert response.status_code == 503
+    assert response.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
+    assert immediate_session_calls == 0
     async with get_session() as session:
         from sqlalchemy import text
 
@@ -1445,7 +1476,7 @@ async def test_mail_overseer_retire_wins_concurrent_send_without_message_commit(
 
 @pytest.mark.asyncio
 async def test_mail_overseer_send(isolated_env):
-    """Test POST /mail/{project}/overseer/send sends message."""
+    """The legacy send endpoint is held until archive writes are atomic."""
     settings = _config.get_settings()
     server = build_mcp_server()
     app = build_http_app(settings, server)
@@ -1454,7 +1485,6 @@ async def test_mail_overseer_send(isolated_env):
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        # Server expects JSON body
         resp = await client.post(
             "/mail/test-proj/overseer/send",
             json={
@@ -1463,13 +1493,13 @@ async def test_mail_overseer_send(isolated_env):
                 "body_md": "This is a test message from the human overseer.",
             },
         )
-        assert resp.status_code == 200
-        assert resp.json()["recipients"] == ["BlueLake"]
+        assert resp.status_code == 503
+        assert resp.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
 
 
 @pytest.mark.asyncio
-async def test_mail_overseer_send_missing_fields(isolated_env):
-    """Test overseer send with missing required fields."""
+async def test_mail_overseer_hold_precedes_request_body_parsing(isolated_env):
+    """Even malformed bodies cannot enter the dormant legacy implementation."""
     settings = _config.get_settings()
     server = build_mcp_server()
     app = build_http_app(settings, server)
@@ -1490,13 +1520,15 @@ async def test_mail_overseer_send_missing_fields(isolated_env):
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         for payload in invalid_payloads:
             response = await client.post("/mail/test-proj/overseer/send", json=payload)
-            assert response.status_code == 400, (payload, response.text)
+            assert response.status_code == 503, (payload, response.text)
+            assert response.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
         malformed = await client.post(
             "/mail/test-proj/overseer/send",
             content="{",
             headers={"content-type": "application/json"},
         )
-        assert malformed.status_code == 400
+        assert malformed.status_code == 503
+        assert malformed.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
 
 
 # =============================================================================

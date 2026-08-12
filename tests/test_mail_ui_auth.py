@@ -21,6 +21,7 @@ are how those decisions are observed, not the point.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import time
 from dataclasses import replace
@@ -32,7 +33,12 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
-from mcp_agent_mail import config as _config, db as db_module, http as http_module, webauth
+from mcp_agent_mail import (
+    config as _config,
+    db as db_module,
+    http as http_module,
+    webauth,
+)
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.http import build_http_app
@@ -46,16 +52,32 @@ EXPECTED_FAVICON_SVG = (
     b"</svg>\n"
 )
 FAVICON_LINK = '<link rel="icon" href="/favicon.ico" type="image/svg+xml" sizes="any" />'
+REACT_CSP = (
+    "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; "
+    "img-src 'self' data:; font-src 'self'; object-src 'none'; "
+    "base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+)
+LEGACY_CSP = (
+    "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
+    "style-src 'self' 'unsafe-inline'; connect-src 'self'; "
+    "img-src 'self' data: blob:; font-src 'self'; object-src 'none'; "
+    "base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+)
 
 # A route the gate protects and that renders without any project existing, so a
 # failure here is the gate's answer and not a missing fixture.
 GUARDED = "/mail/archive/guide"
+PROFILE_PATH = "/mail/api/v1/me/profile"
 PASSWORD_PATH = "/mail/api/v1/me/password"
+ADMIN_ACCESS_PATH = "/mail/api/v1/admin/access"
 SAME_ORIGIN_HEADERS = {
     "Origin": "http://test",
     "Referer": "http://test/",
     "Host": "test",
 }
+OVERSEER_UNAVAILABLE_DETAIL = (
+    "Human Overseer messaging is temporarily unavailable while atomic archive persistence is implemented"
+)
 
 
 def _build(monkeypatch, **env: str):
@@ -197,7 +219,11 @@ class TestPublicRootAndFavicon:
                 favicon_head = await client.head("/favicon.ico", headers=headers)
 
                 expected_root_headers = {
-                    "cache-control": "no-store",
+                    "cache-control": "no-store, no-transform",
+                    "content-security-policy": REACT_CSP,
+                    "referrer-policy": "no-referrer",
+                    "x-content-type-options": "nosniff",
+                    "x-frame-options": "DENY",
                     "location": f"/mail/v2/?{raw_query}",
                     "content-length": "0",
                 }
@@ -541,6 +567,14 @@ def _install_react_dist(monkeypatch, tmp_path: Path) -> Path:
         "html { color-scheme: dark; }\n",
         encoding="utf-8",
     )
+    (assets_root / "legacy.js").write_text(
+        "window.Alpine = { start() {} };\n",
+        encoding="utf-8",
+    )
+    (assets_root / "legacy.css").write_text(
+        "[x-cloak] { display: none !important; }\n",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(http_module, "_mail_react_dist_root", lambda: dist_root)
     return dist_root
 
@@ -647,6 +681,10 @@ class TestMailUiSession:
 
         assert response.status_code == 303
         assert response.headers["location"] == "/mail"
+        assert response.headers["Cache-Control"] == "no-store, no-transform"
+        assert response.headers["Content-Security-Policy"] == LEGACY_CSP
+        assert response.headers["Referrer-Policy"] == "no-referrer"
+        assert response.headers["X-Frame-Options"] == "DENY"
 
     @pytest.mark.asyncio
     async def test_a_member_may_read_aggregate_pages_but_not_administer(self, isolated_env, monkeypatch):
@@ -667,6 +705,159 @@ class TestMailUiSession:
         assert read.status_code == 200
         assert write.status_code == 403
         assert "admin" in write.json()["detail"]
+
+
+class TestMailUiLogout:
+    """Logout is an explicit same-origin POST, never a stored-image gadget."""
+
+    @pytest.mark.asyncio
+    async def test_get_and_head_are_method_denied_without_clearing_cookie(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        epoch = await _make_user("logout-method-admin")
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("logout-method-admin", epoch),
+        ) as client:
+            responses = [
+                await client.get("/mail/logout"),
+                await client.head("/mail/logout"),
+            ]
+
+        for response in responses:
+            assert response.status_code == 405
+            assert response.headers["Allow"] == "POST"
+            assert response.headers["Cache-Control"] == "no-store, no-transform"
+            assert response.headers["Content-Security-Policy"] == LEGACY_CSP
+            assert response.headers["Referrer-Policy"] == "no-referrer"
+            assert response.headers["X-Frame-Options"] == "DENY"
+            assert "set-cookie" not in response.headers
+        assert settings.mail_ui.cookie_name not in responses[0].cookies
+
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            pytest.param({}, id="missing-origin-and-referer"),
+            pytest.param(
+                {
+                    "Origin": "https://evil.example",
+                    "Referer": "https://evil.example/",
+                    "Host": "test",
+                },
+                id="foreign-origin",
+            ),
+            pytest.param(
+                {"Origin": "https://test", "Host": "test"},
+                id="cross-scheme-origin",
+            ),
+            pytest.param(
+                {"Origin": "not-a-url://test", "Host": "test"},
+                id="invalid-origin-scheme",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_rejected_post_never_clears_cookie(
+        self,
+        isolated_env,
+        monkeypatch,
+        headers: dict[str, str],
+    ):
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/mail/logout", headers=headers)
+
+        assert response.status_code == 403
+        assert response.json() == {"detail": "Cross-origin request rejected"}
+        assert response.headers["Cache-Control"] == "no-store, no-transform"
+        assert response.headers["Content-Security-Policy"] == LEGACY_CSP
+        assert "set-cookie" not in response.headers
+
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            pytest.param(
+                {"Origin": "http://test", "Host": "test"},
+                id="origin",
+            ),
+            pytest.param(
+                {"Referer": "http://test/mail", "Host": "test"},
+                id="referer-fallback",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_same_origin_post_clears_cookie_and_redirects(
+        self,
+        isolated_env,
+        monkeypatch,
+        headers: dict[str, str],
+    ):
+        settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/mail/logout", headers=headers)
+
+        assert response.status_code == 303
+        assert response.headers["Location"] == "/mail/login"
+        assert response.headers["Cache-Control"] == "no-store, no-transform"
+        assert response.headers["Content-Security-Policy"] == LEGACY_CSP
+        set_cookie = response.headers["set-cookie"].lower()
+        assert settings.mail_ui.cookie_name in set_cookie
+        assert "max-age=0" in set_cookie
+        assert "path=/mail" in set_cookie
+
+
+class TestMailInlineImagePolicy:
+    """Stored Markdown cannot initiate requests; only bounded raster bytes survive."""
+
+    @staticmethod
+    def _inline(mime: str, raw: bytes) -> str:
+        return f"data:image/{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+
+    @pytest.mark.parametrize(
+        ("mime", "raw"),
+        [
+            pytest.param("png", b"\x89PNG\r\n\x1a\nrest", id="png"),
+            pytest.param("jpeg", b"\xff\xd8\xffrest", id="jpeg"),
+            pytest.param("gif", b"GIF87arest", id="gif87a"),
+            pytest.param("gif", b"GIF89arest", id="gif89a"),
+            pytest.param("webp", b"RIFFxxxxWEBPrest", id="webp"),
+        ],
+    )
+    def test_accepts_canonical_bounded_raster_bytes(self, mime: str, raw: bytes):
+        assert http_module._mail_ui_inline_image_source_allowed(self._inline(mime, raw)) is True
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            pytest.param("", id="empty"),
+            pytest.param("/mail/logout", id="same-origin"),
+            pytest.param("relative.png", id="relative"),
+            pytest.param("blob:http://test/id", id="blob"),
+            pytest.param("https://tracker.invalid/pixel.png", id="remote"),
+            pytest.param("data:image/png;base64,%%%%", id="invalid-base64"),
+            pytest.param(" data:image/png;base64,iVBORw0KGgo=", id="whitespace"),
+            pytest.param("data:image/PNG;base64,iVBORw0KGgo=", id="uppercase-mime"),
+            pytest.param("data:image/png;base64,R0lGODlh", id="mime-mismatch"),
+            pytest.param("data:image/webp;base64,UklGRldFQlA=", id="short-webp"),
+            pytest.param("data:image/webp;base64,UklGRnh4eHhOT1BFcmVzdA==", id="wrong-webp-marker"),
+            pytest.param("data:image/gif;base64,R0lGODlheB==", id="noncanonical-base64"),
+            pytest.param(
+                "data:image/png;base64,"
+                + "A" * (((http_module._MAIL_BODY_INLINE_IMAGE_MAX_BYTES + 2) // 3) * 4 + 1),
+                id="oversized",
+            ),
+        ],
+    )
+    def test_rejects_unsafe_or_noncanonical_sources(self, source: str):
+        assert http_module._mail_ui_inline_image_source_allowed(source) is False
 
 
 class TestMailReactShell:
@@ -692,6 +883,11 @@ class TestMailReactShell:
 
         assert response.status_code == 307
         assert response.headers["location"] == "/mail/v2/?tab=projects"
+        assert response.headers["Cache-Control"] == "no-store, no-transform"
+        assert response.headers["Content-Security-Policy"] == REACT_CSP
+        assert response.headers["Referrer-Policy"] == "no-referrer"
+        assert response.headers["X-Content-Type-Options"] == "nosniff"
+        assert response.headers["X-Frame-Options"] == "DENY"
 
     @pytest.mark.asyncio
     async def test_anonymous_navigation_redirects_to_login_with_exact_next(
@@ -716,6 +912,11 @@ class TestMailReactShell:
         assert response.headers["location"] == (
             "/mail/login?next=%2Fmail%2Fv2%2F%3Ftab%3Dinbox%26filter%3Dhigh"
         )
+        assert response.headers["Cache-Control"] == "no-store, no-transform"
+        assert response.headers["Content-Security-Policy"] == LEGACY_CSP
+        assert response.headers["Referrer-Policy"] == "no-referrer"
+        assert response.headers["X-Content-Type-Options"] == "nosniff"
+        assert response.headers["X-Frame-Options"] == "DENY"
 
     @pytest.mark.parametrize(
         ("username", "global_role", "project_role"),
@@ -778,25 +979,79 @@ class TestMailReactShell:
         _install_react_dist(monkeypatch, tmp_path)
         _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
         epoch = await _make_user("react-deep-admin")
-        expected_csp = (
-            "default-src 'self'; connect-src 'self'; object-src 'none'; "
-            "base-uri 'none'; frame-ancestors 'none'"
-        )
-
         async with AsyncClient(
             transport=ASGITransport(app=app),
             base_url="http://test",
             cookies=await _cookie("react-deep-admin", epoch),
         ) as client:
             root = await client.get("/mail/v2/")
+            root_head = await client.head("/mail/v2/")
             deep = await client.get("/mail/v2/settings/profile?tab=password")
+            deep_head = await client.head(
+                "/mail/v2/settings/profile?tab=password"
+            )
 
-        for response in (root, deep):
+        for response in (root, root_head, deep, deep_head):
             assert response.status_code == 200
-            assert response.headers["Cache-Control"] == "no-store"
-            assert response.headers["Content-Security-Policy"] == expected_csp
+            assert response.headers["Cache-Control"] == "no-store, no-transform"
+            assert response.headers["Content-Security-Policy"] == REACT_CSP
+            assert response.headers["Referrer-Policy"] == "no-referrer"
+            assert response.headers["X-Content-Type-Options"] == "nosniff"
+            assert response.headers["X-Frame-Options"] == "DENY"
             assert response.headers["Content-Type"].startswith("text/html")
+        for response in (root, deep):
             assert "Hermes React shell marker" in response.text
+        for response in (root_head, deep_head):
+            assert response.content == b""
+
+    @pytest.mark.asyncio
+    async def test_legacy_html_is_non_transformable_and_blocks_external_resources(
+        self,
+        isolated_env,
+        monkeypatch,
+        tmp_path,
+    ):
+        _install_react_dist(monkeypatch, tmp_path)
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        epoch = await _make_user("legacy-airgap-admin")
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as anonymous_client:
+            login = await anonymous_client.get("/mail/login")
+            login_stylesheet = await anonymous_client.get(
+                "/mail/v2/assets/legacy.css"
+            )
+            login_stylesheet_head = await anonymous_client.head(
+                "/mail/v2/assets/legacy.css"
+            )
+            protected_runtime = await anonymous_client.get(
+                "/mail/v2/assets/legacy.js"
+            )
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("legacy-airgap-admin", epoch),
+        ) as authenticated_client:
+            inbox = await authenticated_client.get("/mail")
+
+        for response in (login, inbox):
+            assert response.status_code == 200
+            assert response.headers["Cache-Control"] == "no-store, no-transform"
+            assert response.headers["Content-Security-Policy"] == LEGACY_CSP
+            assert response.headers["Referrer-Policy"] == "no-referrer"
+            assert response.headers["X-Content-Type-Options"] == "nosniff"
+            assert response.headers["X-Frame-Options"] == "DENY"
+
+        assert login_stylesheet.status_code == 200
+        assert login_stylesheet_head.status_code == 200
+        for response in (login_stylesheet, login_stylesheet_head):
+            assert response.headers["Cache-Control"] == "no-cache, no-transform"
+            assert response.headers["Content-Type"].startswith("text/css")
+            assert response.headers["X-Content-Type-Options"] == "nosniff"
+        assert login_stylesheet.text == "[x-cloak] { display: none !important; }\n"
+        assert login_stylesheet_head.content == b""
+        assert protected_runtime.status_code == 401
 
     @pytest.mark.asyncio
     async def test_assets_are_typed_immutable_and_cannot_escape_assets_root(
@@ -816,6 +1071,8 @@ class TestMailReactShell:
         ) as client:
             javascript = await client.get("/mail/v2/assets/index-test.js")
             stylesheet = await client.get("/mail/v2/assets/index-test.css")
+            legacy_javascript = await client.get("/mail/v2/assets/legacy.js")
+            legacy_stylesheet = await client.get("/mail/v2/assets/legacy.css")
             missing = await client.get("/mail/v2/assets/not-built.js")
             bare_namespace = await client.get("/mail/v2/assets")
             encoded_namespace = await client.get("/mail/v2/%61ssets")
@@ -824,7 +1081,7 @@ class TestMailReactShell:
                 "/mail/v2/assets/%2e%2e%2findex.html",
             )
 
-        immutable = "public, max-age=31536000, immutable"
+        immutable = "public, max-age=31536000, immutable, no-transform"
         assert javascript.status_code == 200
         assert javascript.headers["Cache-Control"] == immutable
         assert javascript.headers["Content-Type"].split(";", 1)[0] in {
@@ -834,6 +1091,10 @@ class TestMailReactShell:
         assert stylesheet.status_code == 200
         assert stylesheet.headers["Cache-Control"] == immutable
         assert stylesheet.headers["Content-Type"].startswith("text/css")
+        for response in (legacy_javascript, legacy_stylesheet):
+            assert response.status_code == 200
+            assert response.headers["Cache-Control"] == "no-cache, no-transform"
+            assert response.headers["X-Content-Type-Options"] == "nosniff"
         assert missing.status_code == 404
         for response in (bare_namespace, encoded_namespace, directory):
             assert response.status_code == 404
@@ -943,12 +1204,12 @@ class TestMailReactShell:
 class TestMailUiPreferences:
     """Per-human locale state stays self-only, canonical, and migration-safe."""
 
-    def test_custom_openapi_exposes_only_the_typed_self_service_apis(
+    def test_custom_openapi_exposes_only_the_typed_v1_apis(
         self,
         isolated_env,
         monkeypatch,
     ):
-        """Codegen sees GET/PATCH schemas without publishing legacy mail routes."""
+        """Codegen sees typed React schemas without publishing legacy routes."""
         _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
 
         schema = app.openapi()
@@ -959,8 +1220,15 @@ class TestMailUiPreferences:
         }
 
         assert set(mail_paths) == {
+            "/mail/api/v1/admin/access",
+            "/mail/api/v1/admin/users/{target_user_id}/projects/{project_id}",
+            "/mail/api/v1/inbox",
             "/mail/api/v1/me/password",
             "/mail/api/v1/me/preferences",
+            "/mail/api/v1/me/profile",
+            "/mail/api/v1/projects",
+            "/mail/api/v1/projects/{project_id}/messages/{message_id}",
+            "/mail/api/v1/projects/{project_id}/threads/{thread_id}",
         }
         operations = mail_paths["/mail/api/v1/me/preferences"]
         assert set(operations) == {"get", "patch"}
@@ -1000,6 +1268,136 @@ class TestMailUiPreferences:
             "maxLength": 1024,
             "title": "New Password",
         }
+
+        profile_operations = mail_paths["/mail/api/v1/me/profile"]
+        assert set(profile_operations) == {"get", "patch"}
+        assert profile_operations["get"]["responses"]["200"]["content"][
+            "application/json"
+        ]["schema"] == {"$ref": "#/components/schemas/MailUiProfileResponse"}
+        assert profile_operations["patch"]["requestBody"]["content"][
+            "application/json"
+        ]["schema"] == {"$ref": "#/components/schemas/MailUiProfilePatch"}
+        assert profile_operations["patch"]["responses"]["200"]["content"][
+            "application/json"
+        ]["schema"] == {
+            "$ref": "#/components/schemas/MailUiProfileMutationResponse"
+        }
+
+        admin_access = mail_paths["/mail/api/v1/admin/access"]
+        assert set(admin_access) == {"get"}
+        assert admin_access["get"]["responses"]["200"]["content"][
+            "application/json"
+        ]["schema"] == {"$ref": "#/components/schemas/MailUiAdminAccessResponse"}
+        assignment_operations = mail_paths[
+            "/mail/api/v1/admin/users/{target_user_id}/projects/{project_id}"
+        ]
+        assert set(assignment_operations) == {"put"}
+        assert assignment_operations["put"]["requestBody"]["content"][
+            "application/json"
+        ]["schema"] == {"$ref": "#/components/schemas/MailUiAdminProjectAccessPut"}
+        assert assignment_operations["put"]["responses"]["200"]["content"][
+            "application/json"
+        ]["schema"] == {
+            "$ref": "#/components/schemas/MailUiAdminProjectAccessResponse"
+        }
+        assert assignment_operations["put"]["responses"]["409"]["content"][
+            "application/json"
+        ]["schema"] == {"$ref": "#/components/schemas/MailUiDomainErrorResponse"}
+        assert assignment_operations["put"]["responses"]["422"]["content"][
+            "application/json"
+        ]["schema"] == {
+            "$ref": "#/components/schemas/MailUiDomainOrValidationErrorResponse"
+        }
+        assert profile_operations["patch"]["responses"]["422"]["content"][
+            "application/json"
+        ]["schema"] == {
+            "$ref": "#/components/schemas/MailUiDomainOrValidationErrorResponse"
+        }
+
+        profile_schema = schema["components"]["schemas"]["MailUiProfileResponse"]
+        assert set(profile_schema["properties"]) == {
+            "id",
+            "username",
+            "display_name",
+            "global_role",
+            "profile_revision",
+        }
+        admin_user_schema = schema["components"]["schemas"]["MailUiAdminUserSummary"]
+        assert set(admin_user_schema["properties"]) == {
+            "id",
+            "username",
+            "display_name",
+            "disabled",
+            "global_role",
+            "account_generation",
+            "access_version",
+            "assignments",
+        }
+        assert not set(admin_user_schema["properties"]) & {
+            "password_hash",
+            "session_generation",
+            "last_login_ts",
+        }
+
+        typed_get_responses = {
+            "/mail/api/v1/projects": "MailUiProjectsResponse",
+            "/mail/api/v1/inbox": "MailUiInboxResponse",
+            "/mail/api/v1/projects/{project_id}/messages/{message_id}": (
+                "MailUiMessageDetail"
+            ),
+            "/mail/api/v1/projects/{project_id}/threads/{thread_id}": (
+                "MailUiThreadResponse"
+            ),
+        }
+        for path, model_name in typed_get_responses.items():
+            assert set(mail_paths[path]) == {"get"}
+            assert mail_paths[path]["get"]["responses"]["200"]["content"][
+                "application/json"
+            ]["schema"] == {"$ref": f"#/components/schemas/{model_name}"}
+
+        summary_properties = set(
+            schema["components"]["schemas"]["MailUiMessageSummary"]["properties"]
+        )
+        assert summary_properties == {
+            "id",
+            "project_id",
+            "project_slug",
+            "subject",
+            "sender",
+            "sender_name",
+            "sender_display_name",
+            "importance",
+            "ack_required",
+            "thread_id",
+            "reply_to",
+            "created_ts",
+            "can_reply",
+        }
+        assert not summary_properties & {
+            "body_md",
+            "to",
+            "cc",
+            "bcc",
+            "recipients",
+            "read",
+            "read_ts",
+        }
+        assert schema["components"]["schemas"]["MailUiMessageSummary"][
+            "properties"
+        ]["importance"]["enum"] == ["low", "normal", "high", "urgent"]
+        detail_properties = set(
+            schema["components"]["schemas"]["MailUiMessageDetail"]["properties"]
+        )
+        assert detail_properties == summary_properties | {
+            "body_md",
+            "to",
+            "cc",
+            "attachments",
+        }
+        assert "bcc" not in detail_properties
+        assert set(
+            schema["components"]["schemas"]["MailUiAttachmentMetadata"]["properties"]
+        ) == {"type", "media_type", "size_bytes"}
         assert "/mail/api/unified-inbox" not in schema["paths"]
 
     @pytest.mark.asyncio
@@ -1422,6 +1820,10 @@ class TestMailUiPreferences:
                 "/mail/api/v1/me/preferences",
                 headers={"Authorization": f"Bearer {BEARER}"},
             )
+            profile_read = await client.get(
+                PROFILE_PATH,
+                headers={"Authorization": f"Bearer {BEARER}"},
+            )
             write = await client.patch(
                 "/mail/api/v1/me/preferences",
                 json={"preferred_ui_locale": "pl"},
@@ -1435,11 +1837,446 @@ class TestMailUiPreferences:
                 },
                 headers=headers,
             )
+            profile_write = await client.patch(
+                PROFILE_PATH,
+                json={"display_name": "No owner", "expected_profile_revision": 1},
+                headers=headers,
+            )
 
         assert read.status_code == 401
+        assert profile_read.status_code == 401
+        assert profile_read.json() == {"detail": {"code": "actor_forbidden"}}
         assert write.status_code == 401
         assert password_write.status_code == 401
+        assert profile_write.status_code == 401
+        assert profile_write.json() == {"detail": {"code": "actor_forbidden"}}
         assert password_write.headers["Cache-Control"] == "no-store"
+        assert profile_write.headers["Cache-Control"] == "no-store"
+
+
+class TestMailUiProfile:
+    """Display-name self service is normalized, CAS guarded, and self-only."""
+
+    @pytest.mark.asyncio
+    async def test_get_and_patch_normalize_without_revoking_the_session(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        epoch = await _make_user("profile-owner", role=webauth.ROLE_MEMBER)
+        await _make_user("profile-other", role=webauth.ROLE_MEMBER)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("profile-owner", epoch),
+        ) as client:
+            before = await client.get(PROFILE_PATH)
+            changed = await client.patch(
+                PROFILE_PATH,
+                json={
+                    "display_name": "  Mateusz\t  Klatt  ",
+                    "expected_profile_revision": 1,
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            unchanged = await client.patch(
+                PROFILE_PATH,
+                json={
+                    "display_name": "Mateusz Klatt",
+                    "expected_profile_revision": 2,
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            after = await client.get(PROFILE_PATH)
+
+        assert before.status_code == 200
+        assert before.json() == {
+            "id": await _user_id("profile-owner"),
+            "username": "profile-owner",
+            "display_name": None,
+            "global_role": "member",
+            "profile_revision": 1,
+        }
+        assert changed.json() == {
+            "changed": True,
+            "display_name": "Mateusz Klatt",
+            "profile_revision": 2,
+        }
+        assert unchanged.json() == {
+            "changed": False,
+            "display_name": "Mateusz Klatt",
+            "profile_revision": 2,
+        }
+        assert after.json()["display_name"] == "Mateusz Klatt"
+        assert all(
+            response.headers["Cache-Control"] == "no-store"
+            for response in (before, changed, unchanged, after)
+        )
+        async with get_session() as session:
+            rows = (
+                await session.execute(
+                    text(
+                        "SELECT username, display_name, profile_revision, session_epoch "
+                        "FROM ui_users ORDER BY username"
+                    )
+                )
+            ).all()
+        assert [tuple(row) for row in rows] == [
+            ("profile-other", None, 1, 1),
+            ("profile-owner", "Mateusz Klatt", 2, epoch),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_patch_returns_stable_conflict_and_validation_codes(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        epoch = await _make_user("profile-conflict", role=webauth.ROLE_MEMBER)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("profile-conflict", epoch),
+        ) as client:
+            first = await client.patch(
+                PROFILE_PATH,
+                json={"display_name": "Alicja", "expected_profile_revision": 1},
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            stale = await client.patch(
+                PROFILE_PATH,
+                json={"display_name": "Alice", "expected_profile_revision": 1},
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            invalid = await client.patch(
+                PROFILE_PATH,
+                json={"display_name": "invalid\u0000name", "expected_profile_revision": 2},
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            extra = await client.patch(
+                PROFILE_PATH,
+                json={
+                    "display_name": "Alice",
+                    "expected_profile_revision": 2,
+                    "username": "someone-else",
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            cross_origin = await client.patch(
+                PROFILE_PATH,
+                json={"display_name": "Mallory", "expected_profile_revision": 2},
+                headers={"Origin": "https://evil.example", "Host": "test"},
+            )
+
+        assert first.status_code == 200
+        assert stale.status_code == 409
+        assert stale.json() == {"detail": {"code": "profile_revision_conflict"}}
+        assert invalid.status_code == 422
+        assert invalid.json() == {"detail": {"code": "invalid_display_name"}}
+        assert extra.status_code == 422
+        assert cross_origin.status_code == 403
+        assert cross_origin.json() == {"detail": {"code": "actor_forbidden"}}
+        assert all(
+            response.headers["Cache-Control"] == "no-store"
+            for response in (stale, invalid, extra, cross_origin)
+        )
+
+
+class TestMailUiAdminAccess:
+    """The admin matrix is least-privilege and drives atomic assignment CAS."""
+
+    @pytest.mark.asyncio
+    async def test_snapshot_and_assignment_lifecycle_are_typed_and_audited(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        admin_epoch = await _make_user("access-admin", role=webauth.ROLE_ADMIN)
+        member_epoch = await _make_user("access-member", role=webauth.ROLE_MEMBER)
+        project_id, _message_id = await _seed_project(
+            "access-project",
+            subject="Access target",
+            agent_name="AccessAgent",
+            sound="soft",
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("access-admin", admin_epoch),
+        ) as client:
+            snapshot = await client.get(ADMIN_ACCESS_PATH)
+            payload = snapshot.json()
+            member = next(item for item in payload["users"] if item["username"] == "access-member")
+            project = next(item for item in payload["projects"] if item["id"] == project_id)
+            assignment_path = (
+                f"/mail/api/v1/admin/users/{member['id']}/projects/{project_id}"
+            )
+            grant = await client.put(
+                assignment_path,
+                json={
+                    "role": "viewer",
+                    "expected_access_version": member["access_version"],
+                    "account_generation": member["account_generation"],
+                    "expected_project_generation": project["project_generation"],
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            no_op = await client.put(
+                assignment_path,
+                json={
+                    "role": "viewer",
+                    "expected_access_version": grant.json()["access_version"],
+                    "account_generation": member["account_generation"],
+                    "expected_project_generation": project["project_generation"],
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            replace_role = await client.put(
+                assignment_path,
+                json={
+                    "role": "operator",
+                    "expected_access_version": no_op.json()["access_version"],
+                    "account_generation": member["account_generation"],
+                    "expected_project_generation": project["project_generation"],
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            revoke = await client.put(
+                assignment_path,
+                json={
+                    "role": None,
+                    "expected_access_version": replace_role.json()["access_version"],
+                    "account_generation": member["account_generation"],
+                    "expected_project_generation": project["project_generation"],
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+
+        assert snapshot.status_code == 200
+        assert snapshot.headers["Cache-Control"] == "no-store"
+        assert set(payload) == {"users", "projects"}
+        assert set(member) == {
+            "id",
+            "username",
+            "display_name",
+            "disabled",
+            "global_role",
+            "account_generation",
+            "access_version",
+            "assignments",
+        }
+        assert not set(member) & {"password_hash", "session_generation", "last_login_ts"}
+        assert grant.json() == {
+            "changed": True,
+            "role": "viewer",
+            "access_version": member_epoch + 1,
+        }
+        assert no_op.json() == {
+            "changed": False,
+            "role": "viewer",
+            "access_version": member_epoch + 1,
+        }
+        assert replace_role.json() == {
+            "changed": True,
+            "role": "operator",
+            "access_version": member_epoch + 2,
+        }
+        assert revoke.json() == {
+            "changed": True,
+            "role": None,
+            "access_version": member_epoch + 3,
+        }
+        assert all(
+            response.headers["Cache-Control"] == "no-store"
+            for response in (grant, no_op, replace_role, revoke)
+        )
+        async with get_session() as session:
+            assignment_count = int(
+                (
+                    await session.execute(
+                        text(
+                            "SELECT COUNT(*) FROM ui_project_assignments "
+                            "WHERE user_id = :user_id AND project_id = :project_id"
+                        ),
+                        {"user_id": member["id"], "project_id": project_id},
+                    )
+                ).scalar_one()
+            )
+            audit_rows = (
+                await session.execute(
+                    text(
+                        "SELECT actor_user_id, target_epoch_before, target_epoch_after, "
+                        "old_role, new_role FROM ui_access_audit_events "
+                        "WHERE target_user_id = :user_id ORDER BY id"
+                    ),
+                    {"user_id": member["id"]},
+                )
+            ).all()
+        assert assignment_count == 0
+        assert [tuple(row)[1:] for row in audit_rows] == [
+            (member_epoch, member_epoch + 1, None, "viewer"),
+            (member_epoch + 1, member_epoch + 2, "viewer", "operator"),
+            (member_epoch + 2, member_epoch + 3, "operator", None),
+        ]
+        assert {int(row[0]) for row in audit_rows} == {await _user_id("access-admin")}
+
+    @pytest.mark.asyncio
+    async def test_member_auth_disabled_and_stale_cas_fail_closed(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        admin_epoch = await _make_user("access-errors-admin", role=webauth.ROLE_ADMIN)
+        member_epoch = await _make_user("access-errors-member", role=webauth.ROLE_MEMBER)
+        project_id, _message_id = await _seed_project(
+            "access-errors-project",
+            subject="Access errors target",
+            agent_name="AccessErrorsAgent",
+            sound="click",
+        )
+        member_cookies = await _cookie("access-errors-member", member_epoch)
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=member_cookies,
+        ) as member_client:
+            member_get = await member_client.get(ADMIN_ACCESS_PATH)
+            member_put = await member_client.put(
+                f"/mail/api/v1/admin/users/{await _user_id('access-errors-member')}"
+                f"/projects/{project_id}",
+                json={},
+                headers=SAME_ORIGIN_HEADERS,
+            )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("access-errors-admin", admin_epoch),
+        ) as admin_client:
+            snapshot = (await admin_client.get(ADMIN_ACCESS_PATH)).json()
+            target = next(
+                item for item in snapshot["users"] if item["username"] == "access-errors-member"
+            )
+            project = next(item for item in snapshot["projects"] if item["id"] == project_id)
+            stale = await admin_client.put(
+                f"/mail/api/v1/admin/users/{target['id']}/projects/{project_id}",
+                json={
+                    "role": "viewer",
+                    "expected_access_version": target["access_version"] + 1,
+                    "account_generation": target["account_generation"],
+                    "expected_project_generation": project["project_generation"],
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            injected_actor = await admin_client.put(
+                f"/mail/api/v1/admin/users/{target['id']}/projects/{project_id}",
+                json={
+                    "role": "viewer",
+                    "expected_access_version": target["access_version"],
+                    "account_generation": target["account_generation"],
+                    "expected_project_generation": project["project_generation"],
+                    "actor_user_id": target["id"],
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            cross_origin = await admin_client.put(
+                f"/mail/api/v1/admin/users/{target['id']}/projects/{project_id}",
+                json={
+                    "role": "viewer",
+                    "expected_access_version": target["access_version"],
+                    "account_generation": target["account_generation"],
+                    "expected_project_generation": project["project_generation"],
+                },
+                headers={"Origin": "https://evil.example", "Host": "test"},
+            )
+
+        assert member_get.status_code == 403
+        assert member_get.json() == {"detail": {"code": "actor_forbidden"}}
+        assert member_put.status_code == 403
+        assert member_put.json() == {"detail": {"code": "actor_forbidden"}}
+        assert stale.status_code == 409
+        assert stale.json() == {"detail": {"code": "access_version_conflict"}}
+        assert injected_actor.status_code == 422
+        assert cross_origin.status_code == 403
+        assert cross_origin.json() == {"detail": {"code": "actor_forbidden"}}
+        assert all(
+            response.headers["Cache-Control"] == "no-store"
+            for response in (member_get, member_put, stale, injected_actor, cross_origin)
+        )
+
+        _settings, auth_disabled_app = _build(
+            monkeypatch,
+            MAIL_UI_AUTH_ENABLED="false",
+            MAIL_UI_SESSION_SECRET="",
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=auth_disabled_app),
+            base_url="http://test",
+        ) as client:
+            auth_disabled = await client.get(
+                ADMIN_ACCESS_PATH,
+                headers={"Authorization": f"Bearer {BEARER}"},
+            )
+        assert auth_disabled.status_code == 401
+        assert auth_disabled.json() == {"detail": {"code": "actor_forbidden"}}
+        assert auth_disabled.headers["Cache-Control"] == "no-store"
+
+    @pytest.mark.asyncio
+    async def test_snapshot_revalidates_admin_after_middleware_race(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """A concurrent demotion cannot reuse a stale middleware admin claim."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        admin_epoch = await _make_user("snapshot-race-admin", role=webauth.ROLE_ADMIN)
+        admin_id = await _user_id("snapshot-race-admin")
+        await _seed_project(
+            "snapshot-race-secret",
+            subject="Must not leak",
+            agent_name="SnapshotRaceAgent",
+            sound="high",
+        )
+
+        original_revalidate = http_module._mail_ui_preferences_user
+        raced = False
+
+        async def demote_before_revalidation(request, session):
+            nonlocal raced
+            if not raced:
+                raced = True
+                async with get_session() as writer:
+                    await writer.execute(
+                        text("UPDATE ui_users SET role = 'member' WHERE id = :user_id"),
+                        {"user_id": admin_id},
+                    )
+                    await writer.commit()
+            return await original_revalidate(request, session)
+
+        monkeypatch.setattr(
+            http_module,
+            "_mail_ui_preferences_user",
+            demote_before_revalidation,
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("snapshot-race-admin", admin_epoch),
+        ) as client:
+            response = await client.get(ADMIN_ACCESS_PATH)
+
+        assert raced is True
+        assert response.status_code == 403
+        assert response.json() == {"detail": {"code": "actor_forbidden"}}
+        assert response.headers["Cache-Control"] == "no-store"
+        assert "snapshot-race-secret" not in response.text
 
 
 class TestMailUiPasswordChange:
@@ -2466,6 +3303,10 @@ class TestMailUiRbacSurface:
         assert all(response.status_code == 401 for response in failures)
         assert blocked.status_code == 429
         assert healthy.status_code == 303
+        assert healthy.headers["Cache-Control"] == "no-store, no-transform"
+        assert healthy.headers["Content-Security-Policy"] == LEGACY_CSP
+        assert healthy.headers["Referrer-Policy"] == "no-referrer"
+        assert healthy.headers["X-Frame-Options"] == "DENY"
 
     @pytest.mark.asyncio
     async def test_static_bearer_is_limited_to_file_reservation_reads(
@@ -2608,6 +3449,7 @@ class TestMailUiRbacSurface:
 
         payload = payload_response.json()
         assert payload_response.status_code == 200
+        assert payload_response.headers["Cache-Control"] == "no-store"
         assert payload["total_messages"] == 1
         assert [message["subject"] for message in payload["messages"]] == ["VISIBLE-SUBJECT"]
         assert payload["messages"][0]["can_reply"] is False
@@ -2720,12 +3562,12 @@ class TestMailUiRbacSurface:
         assert reply.status_code == 403
 
     @pytest.mark.asyncio
-    async def test_operator_can_only_use_the_server_derived_reply_endpoint(
+    async def test_operator_reply_metadata_remains_while_legacy_mutations_are_unavailable(
         self,
         isolated_env,
         monkeypatch,
     ):
-        """Operators may reply inside assignments but cannot compose arbitrary mail."""
+        """Reply authorization metadata survives while the unsafe legacy writer is held."""
         _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
         collision_id, _collision_message = await _seed_project(
             "operator-collision",
@@ -2747,6 +3589,15 @@ class TestMailUiRbacSurface:
         )
         epoch = await _make_user("project-operator", role=webauth.ROLE_MEMBER)
         await _assign("project-operator", project_id, webauth.PROJECT_ROLE_OPERATOR)
+        async with get_session() as session:
+            await session.execute(
+                text(
+                    "UPDATE ui_users SET preferred_ui_locale = 'pl', "
+                    "preferred_correspondence_locale = NULL "
+                    "WHERE username = 'project-operator'"
+                )
+            )
+            await session.commit()
         headers = {"Origin": "http://test", "Referer": "http://test/", "Host": "test"}
 
         async with AsyncClient(
@@ -2759,6 +3610,7 @@ class TestMailUiRbacSurface:
                 params={"reply_to": message_id},
             )
             compose_new = await client.get("/mail/operator-project/overseer/compose")
+            unified_inbox = await client.get("/mail/api/unified-inbox")
             arbitrary_send = await client.post(
                 "/mail/operator-project/overseer/send",
                 json={"recipients": ["OperatorAgent"], "subject": "No", "body_md": "No"},
@@ -2772,15 +3624,94 @@ class TestMailUiRbacSurface:
                     "recipients": ["Ignored"],
                     "subject": "Ignored",
                     "thread_id": "ignored",
+                    "preferred_correspondence_locale": "en",
                 },
                 headers=headers,
             )
 
-        assert compose_reply.status_code == 200
+        assert compose_reply.status_code == 503
+        assert compose_reply.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
         assert compose_new.status_code == 403
+        assert unified_inbox.status_code == 200
+        operator_message = next(
+            item for item in unified_inbox.json()["messages"] if item["id"] == message_id
+        )
+        assert operator_message["can_reply"] is True
         assert arbitrary_send.status_code == 403
-        assert reply.status_code == 200
-        assert reply.json()["recipients"] == ["OperatorAgent"]
+        assert reply.status_code == 503
+        assert reply.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
+
+    @pytest.mark.asyncio
+    async def test_legacy_overseer_hold_precedes_database_and_archive_writes(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """Both legacy POST routes fail before either persistence layer is touched."""
+        from mcp_agent_mail import storage as storage_module
+
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        project_id, message_id = await _seed_project(
+            "operator-revocation-race",
+            subject="Revocation target",
+            agent_name="RevocationAgent",
+            sound="high",
+        )
+        epoch = await _make_user("legacy-overseer-admin", role=webauth.ROLE_ADMIN)
+        archive_write_calls = 0
+
+        async def forbidden_archive_write(*args, **kwargs):
+            del args, kwargs
+            nonlocal archive_write_calls
+            archive_write_calls += 1
+            raise AssertionError("legacy overseer hold must precede archive persistence")
+
+        monkeypatch.setattr(storage_module, "write_message_bundle", forbidden_archive_write)
+        async with get_session() as session:
+            before_count = int(
+                (
+                    await session.execute(
+                        text("SELECT COUNT(*) FROM messages WHERE project_id = :project_id"),
+                        {"project_id": project_id},
+                    )
+                ).scalar_one()
+            )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("legacy-overseer-admin", epoch),
+        ) as client:
+            send_response = await client.post(
+                "/mail/operator-revocation-race/overseer/send",
+                json={
+                    "recipients": ["RevocationAgent"],
+                    "subject": "Must not be sent",
+                    "body_md": "Must not be sent",
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            reply_response = await client.post(
+                "/mail/operator-revocation-race/overseer/reply",
+                json={"reply_to": message_id, "body_md": "Must not be sent"},
+                headers=SAME_ORIGIN_HEADERS,
+            )
+
+        assert send_response.status_code == 503
+        assert send_response.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
+        assert reply_response.status_code == 503
+        assert reply_response.json()["detail"] == OVERSEER_UNAVAILABLE_DETAIL
+        assert archive_write_calls == 0
+        async with get_session() as session:
+            after_count = int(
+                (
+                    await session.execute(
+                        text("SELECT COUNT(*) FROM messages WHERE project_id = :project_id"),
+                        {"project_id": project_id},
+                    )
+                ).scalar_one()
+            )
+        assert after_count == before_count
 
     @pytest.mark.asyncio
     async def test_ambiguous_human_project_key_fails_closed(
@@ -2879,11 +3810,21 @@ class TestMailUiRbacSurface:
         _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
         classification = {
             "/mail/login": "public-session",
-            "/mail/logout": "public-session",
+            "/mail/logout": "public-method-denied",
             "/mail": "aggregate-scoped",
             "/mail/events": "aggregate-scoped",
             "/mail/api/unified-inbox": "aggregate-scoped",
+            "/mail/api/v1/inbox": "aggregate-scoped",
+            "/mail/api/v1/admin/access": "admin-only",
+            "/mail/api/v1/me/profile": "self-only",
             "/mail/api/v1/me/preferences": "self-only",
+            "/mail/api/v1/projects": "aggregate-scoped",
+            "/mail/api/v1/projects/{project_id}/messages/{message_id}": (
+                "project-guarded"
+            ),
+            "/mail/api/v1/projects/{project_id}/threads/{thread_id}": (
+                "project-guarded"
+            ),
             "/mail/projects": "aggregate-scoped",
             "/mail/unified-inbox": "aggregate-scoped",
             "/mail/v2": "session-shell",
@@ -2922,6 +3863,7 @@ class TestMailUiRbacSurface:
         assert actual == set(classification)
         assert set(classification.values()) <= {
             "public-session",
+            "public-method-denied",
             "aggregate-scoped",
             "admin-only",
             "service-or-project-scoped",
@@ -2932,3 +3874,367 @@ class TestMailUiRbacSurface:
             "session-shell",
             "session-static-asset",
         }
+
+
+class TestMailUiV1ReadApi:
+    """The React read API is typed, project-scoped, and privacy-minimal."""
+
+    @pytest.mark.asyncio
+    async def test_visibility_summary_detail_and_bcc_contract(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        visible_id, visible_message_id = await _seed_project(
+            "api-v1-visible",
+            subject="Visible body must stay out of the list",
+            agent_name="VisibleSender",
+            sound="high",
+        )
+        hidden_id, hidden_message_id = await _seed_project(
+            "api-v1-hidden",
+            subject="Hidden project message",
+            agent_name="HiddenSender",
+            sound="low",
+        )
+        epoch = await _make_user("api-v1-viewer", role=webauth.ROLE_MEMBER)
+        await _assign("api-v1-viewer", visible_id, webauth.PROJECT_ROLE_VIEWER)
+
+        async with get_session() as session:
+            hidden_sender_id = int(
+                (
+                    await session.execute(
+                        text(
+                            "SELECT id FROM agents "
+                            "WHERE project_id = :project_id AND name = 'HiddenSender'"
+                        ),
+                        {"project_id": hidden_id},
+                    )
+                ).scalar_one()
+            )
+            recipient_ids: dict[str, int] = {}
+            for name in ("ToAgent", "CcAgent", "BlindAgent"):
+                recipient_ids[name] = int(
+                    (
+                        await session.execute(
+                            text(
+                                "INSERT INTO agents "
+                                "(project_id, name, program, model, task_description, "
+                                "inception_ts, last_active_ts, attachments_policy, contact_policy) "
+                                "VALUES (:project_id, :name, 'test', 'test', 'recipient', "
+                                "datetime('now'), datetime('now'), 'auto', 'open') "
+                                "RETURNING id"
+                            ),
+                            {"project_id": visible_id, "name": name},
+                        )
+                    ).scalar_one()
+                )
+            await session.execute(
+                text(
+                    "UPDATE messages SET thread_id = 'api-v1-thread', "
+                    "importance = 'legacy-free-form', attachments = :attachments "
+                    "WHERE id = :message_id"
+                ),
+                {
+                    "message_id": visible_message_id,
+                    "attachments": (
+                        '[{"type":"file","media_type":"text/plain","bytes":42,'
+                        '"path":"private/archive.txt","url":"https://tracker.invalid",'
+                        '"data_uri":"data:text/plain;base64,c2VjcmV0"}]'
+                    ),
+                },
+            )
+            for kind, name in (
+                ("to", "ToAgent"),
+                ("cc", "CcAgent"),
+                ("bcc", "BlindAgent"),
+            ):
+                await session.execute(
+                    text(
+                        "INSERT INTO message_recipients (message_id, agent_id, kind) "
+                        "VALUES (:message_id, :agent_id, :kind)"
+                    ),
+                    {
+                        "message_id": visible_message_id,
+                        "agent_id": recipient_ids[name],
+                        "kind": kind,
+                    },
+                )
+            cross_project_message_id = int(
+                (
+                    await session.execute(
+                        text(
+                            "INSERT INTO messages "
+                            "(project_id, sender_id, thread_id, subject, body_md, importance, "
+                            "ack_required, created_ts, attachments) "
+                            "VALUES (:project_id, :sender_id, 'api-v1-thread', :subject, :body, "
+                            "'high', 1, '2030-01-01 00:00:00.000000', '[]') RETURNING id"
+                        ),
+                        {
+                            "project_id": visible_id,
+                            "sender_id": hidden_sender_id,
+                            "subject": "Cross-project sender",
+                            "body": "Visible message, invisible sender project.",
+                        },
+                    )
+                ).scalar_one()
+            )
+            await session.commit()
+
+        cookie = await _cookie("api-v1-viewer", epoch)
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=cookie,
+        ) as client:
+            projects = await client.get("/mail/api/v1/projects")
+            inbox = await client.get("/mail/api/v1/inbox")
+            visible_detail = await client.get(
+                f"/mail/api/v1/projects/{visible_id}/messages/{visible_message_id}"
+            )
+            cross_detail = await client.get(
+                f"/mail/api/v1/projects/{visible_id}/messages/{cross_project_message_id}"
+            )
+            thread = await client.get(
+                f"/mail/api/v1/projects/{visible_id}/threads/api-v1-thread"
+            )
+            hidden_inbox = await client.get(
+                "/mail/api/v1/inbox",
+                params={"project_id": hidden_id},
+            )
+            hidden_detail = await client.get(
+                f"/mail/api/v1/projects/{hidden_id}/messages/{hidden_message_id}"
+            )
+            missing_detail = await client.get(
+                f"/mail/api/v1/projects/{visible_id}/messages/999999999"
+            )
+            missing_thread = await client.get(
+                f"/mail/api/v1/projects/{visible_id}/threads/not-a-thread"
+            )
+
+        assert projects.status_code == 200
+        assert projects.json() == {
+            "items": [
+                {
+                    "id": visible_id,
+                    "slug": "api-v1-visible",
+                    "human_key": "/api-v1-visible",
+                    "created_at": projects.json()["items"][0]["created_at"],
+                    "archived_at": None,
+                    "role": "viewer",
+                    "can_reply": False,
+                }
+            ],
+            "total": 1,
+        }
+        assert "/api-v1-hidden" not in projects.text
+
+        assert inbox.status_code == 200
+        inbox_payload = inbox.json()
+        assert inbox_payload["total"] == 2
+        assert inbox_payload["next_cursor"] is None
+        assert {item["project_id"] for item in inbox_payload["items"]} == {visible_id}
+        summary_keys = {
+            "id",
+            "project_id",
+            "project_slug",
+            "subject",
+            "sender",
+            "sender_name",
+            "sender_display_name",
+            "importance",
+            "ack_required",
+            "thread_id",
+            "reply_to",
+            "created_ts",
+            "can_reply",
+        }
+        assert all(set(item) == summary_keys for item in inbox_payload["items"])
+        assert all(item["can_reply"] is False for item in inbox_payload["items"])
+        cross_summary = next(
+            item for item in inbox_payload["items"] if item["id"] == cross_project_message_id
+        )
+        assert cross_summary["sender"] == "HiddenSender@api-v1-hidden"
+        assert cross_summary["sender_name"] == "HiddenSender"
+        assert "/api-v1-hidden" not in inbox.text
+        assert all(
+            not set(item) & {"body_md", "recipients", "read", "read_ts", "bcc"}
+            for item in inbox_payload["items"]
+        )
+        assert "Body for Visible body must stay out of the list" not in inbox.text
+        assert "BlindAgent" not in inbox.text
+
+        assert visible_detail.status_code == 200
+        detail_payload = visible_detail.json()
+        assert detail_payload["body_md"] == "Body for Visible body must stay out of the list"
+        assert detail_payload["importance"] == "normal"
+        assert detail_payload["to"] == ["ToAgent"]
+        assert detail_payload["cc"] == ["CcAgent"]
+        assert detail_payload["attachments"] == [
+            {"type": "file", "media_type": "text/plain", "size_bytes": 42}
+        ]
+        assert "BlindAgent" not in visible_detail.text
+        for forbidden in ("bcc", "private/archive.txt", "tracker.invalid", "data_uri"):
+            assert forbidden not in visible_detail.text
+        assert cross_detail.status_code == 200
+        assert "/api-v1-hidden" not in cross_detail.text
+        assert thread.status_code == 200
+        assert thread.json()["total"] == 2
+        assert "BlindAgent" not in thread.text
+        assert "bcc" not in thread.text
+
+        for response in (
+            projects,
+            inbox,
+            visible_detail,
+            cross_detail,
+            thread,
+            hidden_inbox,
+            hidden_detail,
+            missing_detail,
+            missing_thread,
+        ):
+            assert response.headers["Cache-Control"] == "no-store"
+        assert hidden_inbox.status_code == 404
+        assert hidden_detail.status_code == 404
+        assert missing_detail.status_code == 404
+        assert missing_thread.status_code == 404
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as anonymous:
+            unauthorized = await anonymous.get("/mail/api/v1/projects")
+        assert unauthorized.status_code == 401
+        assert unauthorized.headers["Cache-Control"] == "no-store"
+
+    @pytest.mark.asyncio
+    async def test_same_timestamp_keyset_pagination_is_stable_and_validated(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        project_id, first_message_id = await _seed_project(
+            "api-v1-pagination",
+            subject="Page item 0",
+            agent_name="PageSender",
+            sound="soft",
+        )
+        async with get_session() as session:
+            sender_id = int(
+                (
+                    await session.execute(
+                        text(
+                            "SELECT id FROM agents "
+                            "WHERE project_id = :project_id AND name = 'PageSender'"
+                        ),
+                        {"project_id": project_id},
+                    )
+                ).scalar_one()
+            )
+            await session.execute(
+                text(
+                    "UPDATE messages SET thread_id = 'stable-thread', "
+                    "created_ts = '2040-02-03 04:05:06.000000' WHERE id = :message_id"
+                ),
+                {"message_id": first_message_id},
+            )
+            for index in range(1, 5):
+                await session.execute(
+                    text(
+                        "INSERT INTO messages "
+                        "(project_id, sender_id, thread_id, subject, body_md, importance, "
+                        "ack_required, created_ts, attachments) "
+                        "VALUES (:project_id, :sender_id, 'stable-thread', :subject, :body, "
+                        "'normal', 0, :created_ts, '[]')"
+                    ),
+                    {
+                        "project_id": project_id,
+                        "sender_id": sender_id,
+                        "subject": f"Page item {index}",
+                        "body": f"Body {index}",
+                        # The highest id deliberately uses the fraction-less
+                        # raw-SQL form.  It represents the same instant as the
+                        # fixed-width values and must therefore win by id, not
+                        # sort behind them because its string is shorter.
+                        "created_ts": (
+                            "2040-02-03 04:05:06"
+                            if index == 4
+                            else "2040-02-03 04:05:06.000000"
+                        ),
+                    },
+                )
+            await session.commit()
+
+        epoch = await _make_user("api-v1-pagination-admin")
+        cookie = await _cookie("api-v1-pagination-admin", epoch)
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=cookie,
+        ) as client:
+            first = await client.get(
+                "/mail/api/v1/inbox",
+                params={"project_id": project_id, "limit": 2},
+            )
+            repeated = await client.get(
+                "/mail/api/v1/inbox",
+                params={"project_id": project_id, "limit": 2},
+            )
+            second = await client.get(
+                "/mail/api/v1/inbox",
+                params={
+                    "project_id": project_id,
+                    "limit": 2,
+                    "cursor": first.json()["next_cursor"],
+                },
+            )
+            third = await client.get(
+                "/mail/api/v1/inbox",
+                params={
+                    "project_id": project_id,
+                    "limit": 2,
+                    "cursor": second.json()["next_cursor"],
+                },
+            )
+            thread_first = await client.get(
+                f"/mail/api/v1/projects/{project_id}/threads/stable-thread",
+                params={"limit": 2},
+            )
+            thread_second = await client.get(
+                f"/mail/api/v1/projects/{project_id}/threads/stable-thread",
+                params={"limit": 2, "cursor": thread_first.json()["next_cursor"]},
+            )
+            malformed = [
+                await client.get("/mail/api/v1/inbox", params={"cursor": cursor})
+                for cursor in ("not-base64!", "e30", "W10")
+            ]
+            invalid_limits = [
+                await client.get("/mail/api/v1/inbox", params={"limit": value})
+                for value in (0, 101)
+            ]
+
+        assert first.status_code == 200
+        assert repeated.json() == first.json()
+        pages = [first.json(), second.json(), third.json()]
+        assert [page["total"] for page in pages] == [5, 5, 5]
+        assert [len(page["items"]) for page in pages] == [2, 2, 1]
+        assert pages[0]["next_cursor"] is not None
+        assert pages[1]["next_cursor"] is not None
+        assert pages[2]["next_cursor"] is None
+        paged_ids = [item["id"] for page in pages for item in page["items"]]
+        assert paged_ids == sorted(paged_ids, reverse=True)
+        assert len(paged_ids) == len(set(paged_ids)) == 5
+        assert thread_first.status_code == 200
+        assert thread_second.status_code == 200
+        assert thread_first.json()["total"] == 5
+        assert thread_second.json()["total"] == 5
+        assert not (
+            {item["id"] for item in thread_first.json()["items"]}
+            & {item["id"] for item in thread_second.json()["items"]}
+        )
+        for response in [*malformed, *invalid_limits]:
+            assert response.status_code == 422
+            assert response.headers["Cache-Control"] == "no-store"

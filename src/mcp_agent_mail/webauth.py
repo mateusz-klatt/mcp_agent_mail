@@ -43,6 +43,7 @@ import hashlib
 import hmac
 import os
 from typing import Final, Literal
+from urllib.parse import urlsplit
 
 # scrypt cost. n=2**14 / r=8 / p=1 is ~16 MiB and tens of milliseconds per hash:
 # negligible for an interactive login, expensive in bulk for an offline attacker.
@@ -278,7 +279,13 @@ def verify_session(token: str, *, now: float, secret: bytes) -> "tuple[str, int,
     return username, epoch, generation
 
 
-def same_origin(origin_header: str, referer_header: str, expected_host: str) -> bool:
+def same_origin(
+    origin_header: str,
+    referer_header: str,
+    expected_host: str,
+    *,
+    expected_scheme: str,
+) -> bool:
     """Cross-origin check for state-changing requests (the CSRF defence).
 
     Deliberately not a per-form CSRF token: the viewer has ~34 server-rendered
@@ -291,18 +298,48 @@ def same_origin(origin_header: str, referer_header: str, expected_host: str) -> 
     ``Origin`` on a state-changing request is treated as suspicious unless a
     ``Referer`` corroborates the host. Both missing -> rejected.
     """
-    if not expected_host:
+    expected_scheme = expected_scheme.strip().lower()
+    if not expected_host or expected_scheme not in {"http", "https"}:
         return False
 
-    def _host_of(url: str) -> str:
-        # Cheap scheme://host[:port]/... split; avoids pulling in urlparse for a hot path.
-        rest = url.split("://", 1)[-1]
-        return rest.split("/", 1)[0].strip().lower()
+    try:
+        expected = urlsplit(f"{expected_scheme}://{expected_host.strip()}")
+        expected_port = expected.port or (443 if expected_scheme == "https" else 80)
+    except ValueError:
+        return False
+    if (
+        expected.username is not None
+        or expected.password is not None
+        or expected.hostname is None
+        or expected.path
+        or expected.query
+        or expected.fragment
+    ):
+        return False
+    expected_hostname = expected.hostname.lower()
+
+    def _matches(url: str, *, origin: bool) -> bool:
+        try:
+            parsed = urlsplit(url)
+            port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+        except ValueError:
+            return False
+        if (
+            parsed.scheme.lower() != expected_scheme
+            or parsed.scheme.lower() not in {"http", "https"}
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.hostname is None
+            or parsed.hostname.lower() != expected_hostname
+            or port != expected_port
+        ):
+            return False
+        return not origin or (parsed.path in {"", "/"} and not parsed.query and not parsed.fragment)
 
     if origin_header:
-        return _host_of(origin_header) == expected_host.strip().lower()
+        return _matches(origin_header, origin=True)
     if referer_header:
-        return _host_of(referer_header) == expected_host.strip().lower()
+        return _matches(referer_header, origin=False)
     return False
 
 

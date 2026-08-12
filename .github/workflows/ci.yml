@@ -40,6 +40,13 @@ jobs:
           python-version: ${{ matrix.python-version }}
           allow-prereleases: true
 
+      - name: Set up Node.js 22.22.2 for distribution builds
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22.22.2'
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
       # Replaces a hand-rolled installer and a hand-rolled cache. The shell
       # installer and `~/.cache/uv` are both POSIX assumptions; the action
       # resolves both per platform.
@@ -49,13 +56,14 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
+          version: "0.11.2"
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
       - name: Sync dependencies
         shell: bash
         run: |
-          uv sync --dev
+          uv sync --dev --frozen
 
       # Browser-level security and mobile-layout tests are part of the full
       # suite.  Installing Chromium here makes them a real Ubuntu gate instead
@@ -184,6 +192,45 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  frontend-webkit:
+    name: Hermes React WebKit UAT (Node 22.22.2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ui
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Node.js 22.22.2
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22.22.2'
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci --ignore-scripts
+
+      # The exact @playwright/test version in package-lock.json pins the WebKit
+      # revision. All application assets and API responses remain same-origin.
+      - name: Install pinned Playwright WebKit
+        run: ./node_modules/.bin/playwright install --with-deps webkit
+
+      - name: Run Hermes WebKit UAT
+        run: npm run test:e2e:webkit
+
+      - name: Upload WebKit failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: webkit-diagnostics-${{ github.sha }}
+          path: ${{ runner.temp }}/mcp-agent-mail-webkit-*
+          if-no-files-found: warn
+          retention-days: 7
+
   portability:
     name: Lint, Type Check, Test (${{ matrix.os }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
@@ -205,16 +252,24 @@ jobs:
           python-version: ${{ matrix.python-version }}
           allow-prereleases: true
 
+      - name: Set up Node.js 22.22.2 for distribution builds
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22.22.2'
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
       - name: Install uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
+          version: "0.11.2"
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
       - name: Sync dependencies
         shell: bash
         run: |
-          uv sync --dev
+          uv sync --dev --frozen
 
       - name: Lint (ruff)
         shell: bash
@@ -235,7 +290,7 @@ jobs:
 
   sonar:
     name: SonarCloud
-    needs: [build-and-test, frontend]
+    needs: [build-and-test, frontend, frontend-webkit]
     permissions:
       contents: read
       pull-requests: read
@@ -243,6 +298,7 @@ jobs:
       ${{
         needs.build-and-test.result == 'success' &&
         needs.frontend.result == 'success' &&
+        needs.frontend-webkit.result == 'success' &&
         (
           github.event_name == 'push' ||
           github.event.pull_request.head.repo.full_name == github.repository

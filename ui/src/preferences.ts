@@ -13,17 +13,6 @@ export interface MailUiPreferences {
   };
 }
 
-interface PreferencesShape {
-  stored?: {
-    preferred_ui_locale?: unknown;
-    preferred_correspondence_locale?: unknown;
-  };
-  effective?: {
-    ui_locale?: unknown;
-    correspondence_locale?: unknown;
-  };
-}
-
 export class PreferencesHttpError extends Error {
   constructor(readonly status: number) {
     super(`Preferences request failed with HTTP ${status}.`);
@@ -35,13 +24,43 @@ export function isSupportedLocale(value: unknown): value is SupportedLocale {
   return supportedLocales.some((locale) => locale === value);
 }
 
+function exactRecord(
+  value: unknown,
+  label: string,
+  expectedKeys: readonly string[],
+): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError(`Invalid ${label}.`);
+  }
+  const candidate = value as Record<string, unknown>;
+  const actualKeys = Object.keys(candidate);
+  const expected = new Set(expectedKeys);
+  if (
+    actualKeys.length !== expectedKeys.length ||
+    actualKeys.some((key) => !expected.has(key))
+  ) {
+    throw new TypeError(`Invalid ${label}.`);
+  }
+  return candidate;
+}
+
 export function parsePreferences(payload: unknown): MailUiPreferences {
-  const candidate = payload as PreferencesShape | null;
-  const preferredUiLocale = candidate?.stored?.preferred_ui_locale;
-  const preferredCorrespondenceLocale =
-    candidate?.stored?.preferred_correspondence_locale;
-  const effectiveUiLocale = candidate?.effective?.ui_locale;
-  const effectiveCorrespondenceLocale = candidate?.effective?.correspondence_locale;
+  const candidate = exactRecord(payload, "preferences response", [
+    "stored",
+    "effective",
+  ]);
+  const stored = exactRecord(candidate.stored, "stored preferences", [
+    "preferred_ui_locale",
+    "preferred_correspondence_locale",
+  ]);
+  const effective = exactRecord(candidate.effective, "effective preferences", [
+    "ui_locale",
+    "correspondence_locale",
+  ]);
+  const preferredUiLocale = stored.preferred_ui_locale;
+  const preferredCorrespondenceLocale = stored.preferred_correspondence_locale;
+  const effectiveUiLocale = effective.ui_locale;
+  const effectiveCorrespondenceLocale = effective.correspondence_locale;
 
   if (!isSupportedLocale(preferredUiLocale)) {
     throw new TypeError("Invalid preferred UI locale in preferences response.");
@@ -98,6 +117,16 @@ export function saveUiLocale(locale: SupportedLocale): Promise<MailUiPreferences
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ preferred_ui_locale: locale }),
+  });
+}
+
+export function saveCorrespondenceLocale(
+  locale: SupportedLocale | null,
+): Promise<MailUiPreferences> {
+  return preferencesRequest({
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ preferred_correspondence_locale: locale }),
   });
 }
 

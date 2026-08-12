@@ -19,6 +19,10 @@ htmlcov/
 ui/node_modules/
 ui/dist/
 ui/coverage/
+ui/playwright-report/
+ui/test-results/
+src/mcp_agent_mail/ui_dist/
+.playwright-mcp/
 
 # Development
 .git/

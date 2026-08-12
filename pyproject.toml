@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -103,6 +103,9 @@ exclude = [
     ".DS_Store",
 ]
 
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
+
 [tool.ruff]
 line-length = 120
 target-version = "py314"
@@ -164,6 +167,7 @@ markers = [
 
 [dependency-groups]
 dev = [
+    "hatchling==1.32.0",
     "playwright==1.62.0",
     "pytest-asyncio>=1.2.0",
     "pytest-cov>=7.0.0",

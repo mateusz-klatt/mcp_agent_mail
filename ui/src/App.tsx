@@ -1,38 +1,70 @@
-import { type ChangeEvent, useCallback, useEffect, useState } from "react";
+import {
+  type ChangeEvent,
+  type FormEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 
 import i18n, { supportedLocales, type SupportedLocale } from "./i18n";
 import {
+  AccountHttpError,
+  changePassword,
+  loadAdminAccess,
+  loadProfile,
+  saveDisplayName,
+  saveProjectAssignment,
+  type AdminAccessSnapshot,
+  type AdminProject,
+  type AdminUser,
+  type AssignmentRole,
+  type MailUiProfile,
+} from "./account";
+import {
+  loadInbox,
+  loadMessage,
+  loadProjects,
+  mailEventsEndpoint,
+  MailHttpError,
+  mailRouteHash,
+  parseMailRoute,
+  type InboxMessage,
+  type MailProject,
+  type MailRoute,
+  type MessageAttachment,
+  type MessageDetail,
+} from "./mail";
+import {
   loadPreferences,
   mailLoginUrl,
   PreferencesHttpError,
+  saveCorrespondenceLocale,
   saveUiLocale,
+  type MailUiPreferences,
 } from "./preferences";
 import "./app.css";
 
-type ViewerRole = "admin" | "operator" | "viewer";
+const mailNavigation = ["projects", "inbox"] as const;
 
-const roles: ViewerRole[] = ["admin", "operator", "viewer"];
+type ShellRoute = MailRoute | { view: "account" } | { view: "admin" };
+type NavigationItem = "projects" | "inbox" | "account" | "admin";
 
-const navigation = ["projects", "inbox"] as const;
+function parseShellRoute(hash: string): ShellRoute {
+  const normalized = hash.replace(/^#/, "");
+  if (normalized === "account" || normalized === "admin") {
+    return { view: normalized };
+  }
+  return parseMailRoute(hash);
+}
 
-const projects = [
-  { id: "mail", agents: 7, unread: 3, status: "statusLive" },
-  { id: "snapper", agents: 4, unread: 1, status: "statusLive" },
-  { id: "hestia", agents: 2, unread: 0, status: "statusQuiet" },
-] as const;
-
-const messages = [
-  { subject: "deployment", sender: "claude-linux-holzera-1", age: "2m" },
-  { subject: "roles", sender: "codex-wsl-home-1", age: "18m" },
-  { subject: "watcher", sender: "claude-win-home-1", age: "41m" },
-] as const;
-
-const visibleProjectCount: Record<ViewerRole, number> = {
-  admin: 3,
-  operator: 2,
-  viewer: 2,
-};
+function shellRouteHash(route: ShellRoute): string {
+  return route.view === "account" || route.view === "admin"
+    ? `#${route.view}`
+    : mailRouteHash(route);
+}
 
 type PreferenceStatus =
   | "loading"
@@ -51,22 +83,103 @@ const preferenceStatusKey: Record<PreferenceStatus, string> = {
   unauthorized: "localeStatus.unauthorized",
 };
 
+type LoadStatus = "loading" | "ready" | "error" | "unauthorized";
+type DetailStatus = "idle" | LoadStatus;
+type PaginationStatus = "idle" | "loading" | "error";
+type StreamStatus = "connecting" | "live" | "reconnecting";
+type MutationStatus = "idle" | "saving" | "saved" | "conflict" | "error";
+type PasswordStatus =
+  | "idle"
+  | "saving"
+  | "saved"
+  | "mismatch"
+  | "tooShort"
+  | "rateLimit"
+  | "error";
+type EventSourceLike = Pick<
+  EventSource,
+  "close" | "onerror" | "onmessage" | "onopen"
+>;
+
 interface AppProps {
   onUnauthorized?: (loginUrl: string) => void;
   navigateTo?: (url: string) => void;
+  createEventSource?: (url: string) => EventSourceLike;
 }
 
 const defaultNavigate = window.location.assign.bind(window.location);
+const defaultCreateEventSource = (url: string) => new EventSource(url);
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
+function mergeMessages(
+  current: InboxMessage[],
+  incoming: InboxMessage[],
+): InboxMessage[] {
+  const merged = new Map(current.map((message) => [message.id, message]));
+  for (const message of incoming) {
+    merged.set(message.id, message);
+  }
+  return [...merged.values()];
+}
 
 export function App({
   onUnauthorized,
   navigateTo = defaultNavigate,
+  createEventSource = defaultCreateEventSource,
 }: AppProps = {}) {
   const { t } = useTranslation();
-  const [role, setRole] = useState<ViewerRole>("admin");
   const [locale, setLocale] = useState<SupportedLocale>("en");
   const [preferenceStatus, setPreferenceStatus] =
     useState<PreferenceStatus>("loading");
+  const [preferences, setPreferences] = useState<MailUiPreferences | null>(null);
+  const [route, setRoute] = useState<ShellRoute>(() =>
+    parseShellRoute(window.location.hash),
+  );
+  const [profile, setProfile] = useState<MailUiProfile | null>(null);
+  const [profileStatus, setProfileStatus] = useState<LoadStatus>("loading");
+  const [displayName, setDisplayName] = useState("");
+  const [profileMutationStatus, setProfileMutationStatus] =
+    useState<MutationStatus>("idle");
+  const [correspondenceStatus, setCorrespondenceStatus] =
+    useState<MutationStatus>("idle");
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [passwordStatus, setPasswordStatus] =
+    useState<PasswordStatus>("idle");
+  const [adminSnapshot, setAdminSnapshot] =
+    useState<AdminAccessSnapshot | null>(null);
+  const [adminStatus, setAdminStatus] = useState<LoadStatus>("loading");
+  const [selectedUserId, setSelectedUserId] = useState<number | null>(null);
+  const [pendingProjectId, setPendingProjectId] = useState<number | null>(null);
+  const [adminMutationStatus, setAdminMutationStatus] =
+    useState<MutationStatus>("idle");
+  const [adminMutationProject, setAdminMutationProject] = useState("");
+  const [projects, setProjects] = useState<MailProject[]>([]);
+  const [projectTotal, setProjectTotal] = useState(0);
+  const [projectsStatus, setProjectsStatus] = useState<LoadStatus>("loading");
+  const [messages, setMessages] = useState<InboxMessage[]>([]);
+  const [messageTotal, setMessageTotal] = useState(0);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [inboxStatus, setInboxStatus] = useState<LoadStatus>("loading");
+  const [paginationStatus, setPaginationStatus] =
+    useState<PaginationStatus>("idle");
+  const [detail, setDetail] = useState<MessageDetail | null>(null);
+  const [detailStatus, setDetailStatus] = useState<DetailStatus>("idle");
+  const [streamStatus, setStreamStatus] =
+    useState<StreamStatus>("connecting");
+  const [refreshVersion, setRefreshVersion] = useState(0);
+  const redirectedRef = useRef(false);
+  const paginationControllerRef = useRef<AbortController | null>(null);
+  const detailRequestGenerationRef = useRef(0);
+  const mailRouteActive = mailNavigation.some((item) => route.view === item) ||
+    route.view === "message";
+  const routeProjectId =
+    route.view === "inbox" || route.view === "message" ? route.projectId : null;
+  const routeMessageId = route.view === "message" ? route.messageId : null;
 
   const applyLocale = useCallback(
     async (nextLocale: SupportedLocale) => {
@@ -78,6 +191,10 @@ export function App({
   );
 
   const redirectUnauthorized = useCallback(() => {
+    if (redirectedRef.current) {
+      return;
+    }
+    redirectedRef.current = true;
     const loginUrl = mailLoginUrl(window.location);
     if (onUnauthorized !== undefined) {
       onUnauthorized(loginUrl);
@@ -86,7 +203,7 @@ export function App({
     navigateTo(loginUrl);
   }, [navigateTo, onUnauthorized]);
 
-  const isUnauthorized = useCallback(
+  const isPreferenceUnauthorized = useCallback(
     (error: unknown) => {
       if (error instanceof PreferencesHttpError && error.status === 401) {
         redirectUnauthorized();
@@ -97,21 +214,236 @@ export function App({
     [redirectUnauthorized],
   );
 
+  const isAccountUnauthorized = useCallback(
+    (error: unknown) => {
+      if (error instanceof AccountHttpError && error.status === 401) {
+        redirectUnauthorized();
+        return true;
+      }
+      return false;
+    },
+    [redirectUnauthorized],
+  );
+
+  const dataFailureStatus = useCallback(
+    (error: unknown): LoadStatus | null => {
+      if (isAbortError(error)) {
+        return null;
+      }
+      if (error instanceof MailHttpError && error.status === 401) {
+        redirectUnauthorized();
+        return "unauthorized";
+      }
+      return "error";
+    },
+    [redirectUnauthorized],
+  );
+
+  useEffect(() => {
+    const syncRoute = () => {
+      const next = parseShellRoute(window.location.hash);
+      setRoute((current) =>
+        shellRouteHash(current) === shellRouteHash(next) ? current : next,
+      );
+    };
+    window.addEventListener("hashchange", syncRoute);
+    window.addEventListener("popstate", syncRoute);
+    return () => {
+      window.removeEventListener("hashchange", syncRoute);
+      window.removeEventListener("popstate", syncRoute);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!mailRouteActive) {
+      setStreamStatus("connecting");
+      return undefined;
+    }
+    let debounceTimer: number | undefined;
+    const events = createEventSource(mailEventsEndpoint);
+    events.onopen = () => setStreamStatus("live");
+    events.onerror = () => setStreamStatus("reconnecting");
+    events.onmessage = () => {
+      if (debounceTimer !== undefined) {
+        window.clearTimeout(debounceTimer);
+      }
+      debounceTimer = window.setTimeout(() => {
+        setRefreshVersion((version) => version + 1);
+      }, 250);
+    };
+    return () => {
+      if (debounceTimer !== undefined) {
+        window.clearTimeout(debounceTimer);
+      }
+      events.onopen = null;
+      events.onerror = null;
+      events.onmessage = null;
+      events.close();
+    };
+  }, [createEventSource, mailRouteActive]);
+
+  useEffect(() => {
+    const detailRequestGeneration = ++detailRequestGenerationRef.current;
+    if (!mailRouteActive) {
+      paginationControllerRef.current?.abort();
+      return undefined;
+    }
+    const controller = new AbortController();
+    const projectId = routeProjectId ?? undefined;
+    setProjectsStatus("loading");
+    setInboxStatus("loading");
+    setPaginationStatus("idle");
+
+    void loadProjects({ signal: controller.signal })
+      .then((page) => {
+        setProjects(page.items);
+        setProjectTotal(page.total);
+        setProjectsStatus("ready");
+      })
+      .catch((error: unknown) => {
+        const status = dataFailureStatus(error);
+        if (status !== null) {
+          setProjectsStatus(status);
+        }
+      });
+
+    void loadInbox({ projectId, signal: controller.signal })
+      .then((page) => {
+        setMessages(page.items);
+        setMessageTotal(page.total);
+        setNextCursor(page.next_cursor);
+        setInboxStatus("ready");
+      })
+      .catch((error: unknown) => {
+        const status = dataFailureStatus(error);
+        if (status !== null) {
+          setInboxStatus(status);
+        }
+      });
+
+    if (routeMessageId !== null && routeProjectId !== null) {
+      setDetail(null);
+      setDetailStatus("loading");
+      void loadMessage(routeProjectId, routeMessageId, {
+        signal: controller.signal,
+      })
+        .then((message) => {
+          if (detailRequestGeneration !== detailRequestGenerationRef.current) {
+            return;
+          }
+          if (
+            message.project_id !== routeProjectId ||
+            message.id !== routeMessageId
+          ) {
+            setDetail(null);
+            setDetailStatus("error");
+            return;
+          }
+          setDetail(message);
+          setDetailStatus("ready");
+        })
+        .catch((error: unknown) => {
+          if (detailRequestGeneration !== detailRequestGenerationRef.current) {
+            return;
+          }
+          const status = dataFailureStatus(error);
+          if (status !== null) {
+            setDetailStatus(status);
+          }
+        });
+    } else {
+      setDetail(null);
+      setDetailStatus("idle");
+    }
+
+    return () => controller.abort();
+  }, [
+    dataFailureStatus,
+    mailRouteActive,
+    refreshVersion,
+    routeMessageId,
+    routeProjectId,
+  ]);
+
+  useEffect(
+    () => () => {
+      paginationControllerRef.current?.abort();
+    },
+    [],
+  );
+
   useEffect(() => {
     void loadPreferences()
       .then(async (preferences) => {
         await applyLocale(preferences.effective.ui_locale);
+        setPreferences(preferences);
         setPreferenceStatus("saved");
       })
       .catch(async (error: unknown) => {
-        if (isUnauthorized(error)) {
+        if (isPreferenceUnauthorized(error)) {
           setPreferenceStatus("unauthorized");
           return;
         }
+        setPreferences(null);
         await applyLocale("en");
         setPreferenceStatus("loadError");
       });
-  }, [applyLocale, isUnauthorized]);
+  }, [applyLocale, isPreferenceUnauthorized]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setProfileStatus("loading");
+    void loadProfile(controller.signal)
+      .then((loadedProfile) => {
+        setProfile(loadedProfile);
+        setDisplayName(loadedProfile.display_name ?? "");
+        setProfileStatus("ready");
+      })
+      .catch((error: unknown) => {
+        if (isAbortError(error)) {
+          return;
+        }
+        if (isAccountUnauthorized(error)) {
+          setProfileStatus("unauthorized");
+          return;
+        }
+        setProfileStatus("error");
+      });
+    return () => controller.abort();
+  }, [isAccountUnauthorized]);
+
+  useEffect(() => {
+    if (
+      route.view !== "admin" ||
+      profileStatus !== "ready" ||
+      profile?.global_role !== "admin"
+    ) {
+      return undefined;
+    }
+    const controller = new AbortController();
+    setAdminStatus("loading");
+    void loadAdminAccess(controller.signal)
+      .then((snapshot) => {
+        setAdminSnapshot(snapshot);
+        setSelectedUserId((current) =>
+          current !== null && snapshot.users.some((user) => user.id === current)
+            ? current
+            : (snapshot.users[0]?.id ?? null),
+        );
+        setAdminStatus("ready");
+      })
+      .catch((error: unknown) => {
+        if (isAbortError(error)) {
+          return;
+        }
+        if (isAccountUnauthorized(error)) {
+          setAdminStatus("unauthorized");
+          return;
+        }
+        setAdminStatus("error");
+      });
+    return () => controller.abort();
+  }, [isAccountUnauthorized, profile?.global_role, profileStatus, route.view]);
 
   const handleLocaleChange = async (event: ChangeEvent<HTMLSelectElement>) => {
     const nextLocale = event.target.value as SupportedLocale;
@@ -124,10 +456,11 @@ export function App({
     try {
       const preferences = await saveUiLocale(nextLocale);
       await applyLocale(preferences.effective.ui_locale);
+      setPreferences(preferences);
       setPreferenceStatus("saved");
     } catch (error) {
       await applyLocale(previousLocale);
-      if (isUnauthorized(error)) {
+      if (isPreferenceUnauthorized(error)) {
         setPreferenceStatus("unauthorized");
         return;
       }
@@ -135,8 +468,823 @@ export function App({
     }
   };
 
-  const handleRoleChange = (event: ChangeEvent<HTMLSelectElement>) => {
-    setRole(event.target.value as ViewerRole);
+  const handleCorrespondenceChange = async (
+    event: ChangeEvent<HTMLSelectElement>,
+  ) => {
+    const selected = event.target.value;
+    const nextLocale = selected === "" ? null : (selected as SupportedLocale);
+    setCorrespondenceStatus("saving");
+    try {
+      const updatedPreferences = await saveCorrespondenceLocale(nextLocale);
+      setPreferences(updatedPreferences);
+      setCorrespondenceStatus("saved");
+    } catch (error) {
+      if (isPreferenceUnauthorized(error)) {
+        setCorrespondenceStatus("error");
+        return;
+      }
+      setCorrespondenceStatus("error");
+    }
+  };
+
+  const handleDisplayNameSubmit = async (
+    event: FormEvent<HTMLFormElement>,
+    currentProfile: MailUiProfile,
+  ) => {
+    event.preventDefault();
+    const requestedName = displayName.trim() === "" ? null : displayName;
+    setProfileMutationStatus("saving");
+    try {
+      const result = await saveDisplayName(
+        requestedName,
+        currentProfile.profile_revision,
+      );
+      setProfile({
+        ...currentProfile,
+        display_name: result.display_name,
+        profile_revision: result.profile_revision,
+      });
+      setDisplayName(result.display_name ?? "");
+      setProfileMutationStatus("saved");
+    } catch (error) {
+      if (isAccountUnauthorized(error)) {
+        setProfileMutationStatus("error");
+        return;
+      }
+      if (error instanceof AccountHttpError && error.status === 409) {
+        try {
+          const refreshed = await loadProfile();
+          setProfile(refreshed);
+          setDisplayName(refreshed.display_name ?? "");
+          setProfileMutationStatus("conflict");
+          return;
+        } catch (refreshError) {
+          if (isAccountUnauthorized(refreshError)) {
+            setProfileMutationStatus("error");
+            return;
+          }
+        }
+      }
+      setProfileMutationStatus("error");
+    }
+  };
+
+  const handlePasswordSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (newPassword !== confirmPassword) {
+      setPasswordStatus("mismatch");
+      return;
+    }
+    if (newPassword.length < 15) {
+      setPasswordStatus("tooShort");
+      return;
+    }
+    setPasswordStatus("saving");
+    try {
+      await changePassword(currentPassword, newPassword);
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+      setPasswordStatus("saved");
+    } catch (error) {
+      if (isAccountUnauthorized(error)) {
+        setPasswordStatus("error");
+        return;
+      }
+      setPasswordStatus(
+        error instanceof AccountHttpError && error.status === 429
+          ? "rateLimit"
+          : "error",
+      );
+    }
+  };
+
+  const applyAdminSnapshot = (snapshot: AdminAccessSnapshot) => {
+    setAdminSnapshot(snapshot);
+    setSelectedUserId((current) =>
+      current !== null && snapshot.users.some((user) => user.id === current)
+        ? current
+        : (snapshot.users[0]?.id ?? null),
+    );
+    setAdminStatus("ready");
+  };
+
+  const handleAssignmentChange = async (
+    user: AdminUser,
+    project: AdminProject,
+    role: AssignmentRole | null,
+    snapshot: AdminAccessSnapshot,
+  ) => {
+    setPendingProjectId(project.id);
+    setAdminMutationProject(project.human_key);
+    setAdminMutationStatus("saving");
+    try {
+      const result = await saveProjectAssignment(user, project, role);
+      setAdminSnapshot({
+          ...snapshot,
+          users: snapshot.users.map((candidate) =>
+            candidate.id === user.id
+              ? {
+                  ...candidate,
+                  access_version: result.access_version,
+                  assignments: [
+                    ...candidate.assignments.filter(
+                      (assignment) => assignment.project_id !== project.id,
+                    ),
+                    ...(result.role === null
+                      ? []
+                      : [{ project_id: project.id, role: result.role }]),
+                  ],
+                }
+              : candidate,
+          ),
+      });
+      setAdminMutationStatus("saved");
+    } catch (error) {
+      if (isAccountUnauthorized(error)) {
+        setAdminMutationStatus("error");
+      } else if (error instanceof AccountHttpError && error.status === 409) {
+        try {
+          applyAdminSnapshot(await loadAdminAccess());
+          setAdminMutationStatus("conflict");
+        } catch (refreshError) {
+          if (isAccountUnauthorized(refreshError)) {
+            setAdminMutationStatus("error");
+          } else {
+            setAdminStatus("error");
+            setAdminMutationStatus("error");
+          }
+        }
+      } else {
+        setAdminMutationStatus("error");
+      }
+    } finally {
+      setPendingProjectId(null);
+    }
+  };
+
+  const handleProjectFilter = (event: ChangeEvent<HTMLSelectElement>) => {
+    const value = event.target.value;
+    const next: MailRoute = {
+      view: "inbox",
+      projectId: value === "" ? null : Number(value),
+    };
+    window.history.pushState({}, "", mailRouteHash(next));
+    setRoute(next);
+  };
+
+  const handleLoadMore = async (cursor: string) => {
+    paginationControllerRef.current?.abort();
+    const controller = new AbortController();
+    paginationControllerRef.current = controller;
+    setPaginationStatus("loading");
+    try {
+      const page = await loadInbox({
+        cursor,
+        projectId: routeProjectId ?? undefined,
+        signal: controller.signal,
+      });
+      setMessages((current) => mergeMessages(current, page.items));
+      setMessageTotal(page.total);
+      setNextCursor(page.next_cursor);
+      setPaginationStatus("idle");
+    } catch (error) {
+      const status = dataFailureStatus(error);
+      if (status === "unauthorized") {
+        setInboxStatus("unauthorized");
+        setPaginationStatus("idle");
+      } else if (status === "error") {
+        setPaginationStatus("error");
+      }
+    }
+  };
+
+  const projectNames = useMemo(
+    () => new Map(projects.map((project) => [project.id, project.human_key])),
+    [projects],
+  );
+  const navigationItems = useMemo<NavigationItem[]>(
+    () => [
+      ...mailNavigation,
+      "account",
+      ...(profile?.global_role === "admin" ? (["admin"] as const) : []),
+    ],
+    [profile?.global_role],
+  );
+  const selectedAdminUser = useMemo(
+    () =>
+      adminSnapshot?.users.find((user) => user.id === selectedUserId) ?? null,
+    [adminSnapshot, selectedUserId],
+  );
+
+  const profileMutationMessage: Record<MutationStatus, string | null> = {
+    idle: null,
+    saving: "account.savingDisplayName",
+    saved: "account.displayNameSaved",
+    conflict: "account.displayNameConflict",
+    error: "account.displayNameError",
+  };
+  const correspondenceMessage: Record<MutationStatus, string | null> = {
+    idle: null,
+    saving: "account.correspondenceSaving",
+    saved: "account.correspondenceSaved",
+    conflict: "account.correspondenceError",
+    error: "account.correspondenceError",
+  };
+  const passwordMessage: Record<PasswordStatus, string | null> = {
+    idle: null,
+    saving: "account.changingPassword",
+    saved: "account.passwordSaved",
+    mismatch: "account.passwordMismatch",
+    tooShort: "account.passwordTooShort",
+    rateLimit: "account.passwordRateLimit",
+    error: "account.passwordError",
+  };
+  const adminMutationMessage: Record<MutationStatus, string | null> = {
+    idle: null,
+    saving: "admin.saving",
+    saved: "admin.saved",
+    conflict: "admin.conflict",
+    error: "admin.saveError",
+  };
+
+  const formatDate = (timestamp: string) =>
+    new Intl.DateTimeFormat(locale, {
+      dateStyle: "medium",
+      timeStyle: "short",
+    }).format(new Date(timestamp));
+
+  const attachmentText = (attachment: MessageAttachment) =>
+    t("message.attachment", {
+      type: attachment.type ?? t("message.unknownType"),
+      mediaType: attachment.media_type ?? t("message.unknownMediaType"),
+      size:
+        attachment.size_bytes === null
+          ? t("message.unknownSize")
+          : `${attachment.size_bytes.toLocaleString(locale)} B`,
+    });
+
+  const renderProjects = () => (
+    <section aria-labelledby="projects-heading">
+      <div className="page-heading">
+        <div>
+          <p className="eyebrow">{t("projects.eyebrow")}</p>
+          <h1 id="projects-heading">{t("projects.title")}</h1>
+          <p>{t("projects.hint")}</p>
+        </div>
+        {projectsStatus === "ready" ? (
+          <span className="count-pill">{t("projects.count", { count: projectTotal })}</span>
+        ) : null}
+      </div>
+      {projectsStatus === "loading" ? (
+        <p className="state-panel" role="status">{t("projects.loading")}</p>
+      ) : null}
+      {projectsStatus === "error" ? (
+        <p className="state-panel state-error" role="alert">{t("errors.projects")}</p>
+      ) : null}
+      {projectsStatus === "unauthorized" ? (
+        <p className="state-panel" role="status">{t("errors.unauthorized")}</p>
+      ) : null}
+      {projectsStatus === "ready" && projects.length === 0 ? (
+        <p className="state-panel">{t("projects.empty")}</p>
+      ) : null}
+      {projectsStatus === "ready" && projects.length > 0 ? (
+        <ul className="project-list project-grid">
+          {projects.map((project) => (
+            <li key={project.id}>
+              <a
+                className="project-row project-card"
+                href={mailRouteHash({ view: "inbox", projectId: project.id })}
+                aria-label={t("projects.openInbox", { project: project.human_key })}
+              >
+                <span className="project-avatar" aria-hidden="true">
+                  {project.human_key.slice(0, 1).toUpperCase()}
+                </span>
+                <span className="project-copy">
+                  <strong>{project.human_key}</strong>
+                  <small>{project.slug}</small>
+                  <small>{t("projects.added", { date: formatDate(project.created_at) })}</small>
+                </span>
+                <span className="project-badges">
+                  <span className={`status role-${project.role}`}>
+                    {t(`accessRole.${project.role}`)}
+                  </span>
+                  <span className={`status ${project.archived_at === null ? "status-live" : "status-archived"}`}>
+                    {t(project.archived_at === null ? "projects.active" : "projects.archived")}
+                  </span>
+                </span>
+              </a>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </section>
+  );
+
+  const renderInbox = () => (
+    <section aria-labelledby="inbox-heading">
+      <div className="page-heading inbox-heading">
+        <div>
+          <p className="eyebrow">{t("inbox.eyebrow")}</p>
+          <h1 id="inbox-heading">{t("inbox.title")}</h1>
+          <p>{t("inbox.hint")}</p>
+        </div>
+        <div className="inbox-tools">
+          <label htmlFor="project-filter">{t("inbox.projectFilter")}</label>
+          <select
+            id="project-filter"
+            name="project-filter"
+            value={routeProjectId ?? ""}
+            onChange={handleProjectFilter}
+            disabled={projectsStatus !== "ready"}
+          >
+            <option value="">{t("inbox.allProjects")}</option>
+            {projects.map((project) => (
+              <option key={project.id} value={project.id}>{project.human_key}</option>
+            ))}
+          </select>
+        </div>
+      </div>
+      <div className="inbox-summary">
+        {inboxStatus === "ready" ? <strong>{t("inbox.count", { count: messageTotal })}</strong> : <span />}
+        <span className={`stream-status stream-${streamStatus}`}>{t(`stream.${streamStatus}`)}</span>
+      </div>
+      {inboxStatus === "loading" ? (
+        <p className="state-panel" role="status">{t("inbox.loading")}</p>
+      ) : null}
+      {inboxStatus === "error" ? (
+        <p className="state-panel state-error" role="alert">{t("errors.inbox")}</p>
+      ) : null}
+      {inboxStatus === "unauthorized" ? (
+        <p className="state-panel" role="status">{t("errors.unauthorized")}</p>
+      ) : null}
+      {inboxStatus === "ready" && messages.length === 0 ? (
+        <p className="state-panel">{t("inbox.empty")}</p>
+      ) : null}
+      {inboxStatus === "ready" && messages.length > 0 ? (
+        <ul className="panel message-list">
+          {messages.map((message) => {
+            const sender = message.sender_display_name ?? message.sender_name;
+            const senderIdentity = message.sender === sender ? "" : ` · ${message.sender}`;
+            const project = projectNames.get(message.project_id) ?? message.project_slug;
+            return (
+              <li key={message.id}>
+                <a
+                  className="message-row"
+                  href={mailRouteHash({
+                    view: "message",
+                    projectId: message.project_id,
+                    messageId: message.id,
+                  })}
+                >
+                  <span className="sr-only">{t("inbox.openMessageCue")}</span>
+                  <span className={`importance-mark importance-${message.importance}`} aria-hidden="true" />
+                  <span className="message-copy">
+                    <strong>{message.subject}</strong>
+                    <small>{t("inbox.from", { sender })}{senderIdentity}</small>
+                    <small>{t("inbox.project", { project })}</small>
+                    {message.ack_required ? <small className="ack-label">{t("inbox.acknowledge")}</small> : null}
+                  </span>
+                  <span className="message-meta">
+                    <span className={`status importance-${message.importance}`}>
+                      {t(`importance.${message.importance}`)}
+                    </span>
+                    <time dateTime={message.created_ts}>{formatDate(message.created_ts)}</time>
+                  </span>
+                </a>
+              </li>
+            );
+          })}
+        </ul>
+      ) : null}
+      {inboxStatus === "ready" && nextCursor !== null ? (
+        <div className="load-more-area">
+          <button
+            type="button"
+            className="primary-button"
+            onClick={() => void handleLoadMore(nextCursor)}
+            disabled={paginationStatus === "loading"}
+          >
+            {t(paginationStatus === "loading" ? "inbox.loadingMore" : "inbox.loadMore")}
+          </button>
+          {paginationStatus === "error" ? <p role="alert">{t("errors.loadMore")}</p> : null}
+        </div>
+      ) : null}
+    </section>
+  );
+
+  const renderMessage = (projectId: number, messageId: number) => {
+    const inboxHash = mailRouteHash({ view: "inbox", projectId });
+    const currentDetail =
+      detail?.project_id === projectId && detail.id === messageId ? detail : null;
+    const detailSender =
+      currentDetail?.sender_display_name ?? currentDetail?.sender_name;
+    const detailSenderIdentity =
+      currentDetail !== null &&
+      detailSender !== undefined &&
+      currentDetail.sender !== detailSender
+        ? ` · ${currentDetail.sender}`
+        : "";
+    return (
+      <section aria-labelledby="message-heading">
+        <a className="back-link" href={inboxHash}>← {t("message.back")}</a>
+        {detailStatus === "loading" ? (
+          <p className="state-panel" role="status">{t("message.loading")}</p>
+        ) : null}
+        {detailStatus === "error" ? (
+          <p className="state-panel state-error" role="alert">{t("errors.message")}</p>
+        ) : null}
+        {detailStatus === "unauthorized" ? (
+          <p className="state-panel" role="status">{t("errors.unauthorized")}</p>
+        ) : null}
+        {detailStatus === "ready" && currentDetail !== null ? (
+          <article className="message-detail">
+            <header>
+              <p className="eyebrow">{t("message.eyebrow")}</p>
+              <h1 id="message-heading">{currentDetail.subject}</h1>
+              <p>{t("inbox.from", { sender: detailSender })}{detailSenderIdentity}</p>
+            </header>
+            <dl className="message-facts">
+              <div><dt>{t("message.project")}</dt><dd>{projectNames.get(currentDetail.project_id) ?? currentDetail.project_slug}</dd></div>
+              <div><dt>{t("message.sent")}</dt><dd><time dateTime={currentDetail.created_ts}>{formatDate(currentDetail.created_ts)}</time></dd></div>
+              <div><dt>{t("message.to")}</dt><dd>{currentDetail.to.length > 0 ? currentDetail.to.join(", ") : t("message.emptyRecipients")}</dd></div>
+              <div><dt>{t("message.cc")}</dt><dd>{currentDetail.cc.length > 0 ? currentDetail.cc.join(", ") : t("message.emptyRecipients")}</dd></div>
+            </dl>
+            <pre className="message-body">{currentDetail.body_md}</pre>
+            {currentDetail.attachments.length > 0 ? (
+              <section className="attachment-panel" aria-labelledby="attachments-heading">
+                <h2 id="attachments-heading">{t("message.attachments")}</h2>
+                <p>{t("message.attachmentCount", { count: currentDetail.attachments.length })}</p>
+                <ul>{currentDetail.attachments.map((attachment, index) => <li key={`${attachment.type ?? "attachment"}-${index}`}>{attachmentText(attachment)}</li>)}</ul>
+              </section>
+            ) : null}
+          </article>
+        ) : null}
+      </section>
+    );
+  };
+
+  const renderAccount = () => (
+    <section aria-labelledby="account-heading">
+      <div className="page-heading">
+        <div>
+          <p className="eyebrow">{t("account.eyebrow")}</p>
+          <h1 id="account-heading">{t("account.title")}</h1>
+          <p>{t("account.hint")}</p>
+        </div>
+      </div>
+      {profileStatus === "loading" ? (
+        <p className="state-panel" role="status">{t("account.loading")}</p>
+      ) : null}
+      {profileStatus === "error" ? (
+        <p className="state-panel state-error" role="alert">{t("account.loadError")}</p>
+      ) : null}
+      {profileStatus === "unauthorized" ? (
+        <p className="state-panel" role="status">{t("errors.unauthorized")}</p>
+      ) : null}
+      {profileStatus === "ready" && profile !== null ? (
+        <div className="settings-grid">
+          <section className="settings-card" aria-labelledby="identity-heading">
+            <h2 id="identity-heading">{t("account.identityTitle")}</h2>
+            <dl className="account-facts">
+              <div>
+                <dt>{t("account.username")}</dt>
+                <dd>{profile.username}</dd>
+              </div>
+              <div>
+                <dt>{t("account.globalRole")}</dt>
+                <dd>{t(`globalRole.${profile.global_role}`)}</dd>
+              </div>
+            </dl>
+            <form
+              className="settings-form"
+              onSubmit={(event) => void handleDisplayNameSubmit(event, profile)}
+            >
+              <label htmlFor="display-name">{t("account.displayName")}</label>
+              <input
+                id="display-name"
+                name="display-name"
+                autoComplete="name"
+                maxLength={128}
+                value={displayName}
+                onChange={(event) => {
+                  setDisplayName(event.target.value);
+                  setProfileMutationStatus("idle");
+                }}
+                aria-describedby="display-name-hint display-name-status"
+                disabled={profileMutationStatus === "saving"}
+              />
+              <small id="display-name-hint">{t("account.displayNameHint")}</small>
+              <button
+                className="primary-button"
+                type="submit"
+                disabled={profileMutationStatus === "saving"}
+              >
+                {t("account.saveDisplayName")}
+              </button>
+              <p
+                id="display-name-status"
+                className="form-status"
+                role="status"
+                aria-live="polite"
+                data-state={profileMutationStatus}
+              >
+                {profileMutationMessage[profileMutationStatus] === null
+                  ? ""
+                  : t(profileMutationMessage[profileMutationStatus])}
+              </p>
+            </form>
+          </section>
+
+          <section className="settings-card" aria-labelledby="languages-heading">
+            <h2 id="languages-heading">{t("account.languagesTitle")}</h2>
+            <p>{t("account.languagesHint")}</p>
+            <div className="settings-form">
+              <label htmlFor="account-ui-language">{t("account.uiLanguage")}</label>
+              <select
+                id="account-ui-language"
+                name="account-ui-language"
+                value={locale}
+                onChange={(event) => void handleLocaleChange(event)}
+                disabled={["loading", "saving", "unauthorized"].includes(
+                  preferenceStatus,
+                )}
+              >
+                {supportedLocales.map((supportedLocale) => (
+                  <option key={supportedLocale} value={supportedLocale}>
+                    {t(`languageName.${supportedLocale}`)}
+                  </option>
+                ))}
+              </select>
+              <label htmlFor="correspondence-language">
+                {t("account.correspondenceLanguage")}
+              </label>
+              <select
+                id="correspondence-language"
+                name="correspondence-language"
+                value={preferences?.stored.preferred_correspondence_locale ?? ""}
+                onChange={(event) => void handleCorrespondenceChange(event)}
+                disabled={
+                  preferences === null ||
+                  correspondenceStatus === "saving" ||
+                  preferenceStatus === "unauthorized"
+                }
+                aria-describedby="correspondence-status"
+              >
+                <option value="">{t("account.correspondenceInherit")}</option>
+                {supportedLocales.map((supportedLocale) => (
+                  <option key={supportedLocale} value={supportedLocale}>
+                    {t(`languageName.${supportedLocale}`)}
+                  </option>
+                ))}
+              </select>
+              <p
+                id="correspondence-status"
+                className="form-status"
+                role="status"
+                aria-live="polite"
+                data-state={correspondenceStatus}
+              >
+                {correspondenceMessage[correspondenceStatus] === null
+                  ? ""
+                  : t(correspondenceMessage[correspondenceStatus])}
+              </p>
+            </div>
+          </section>
+
+          <section className="settings-card" aria-labelledby="password-heading">
+            <h2 id="password-heading">{t("account.passwordTitle")}</h2>
+            <p>{t("account.passwordHint")}</p>
+            <form
+              className="settings-form"
+              noValidate
+              onSubmit={(event) => void handlePasswordSubmit(event)}
+            >
+              <label htmlFor="current-password">{t("account.currentPassword")}</label>
+              <input
+                id="current-password"
+                name="current-password"
+                type="password"
+                autoComplete="current-password"
+                required
+                maxLength={1024}
+                value={currentPassword}
+                onChange={(event) => {
+                  setCurrentPassword(event.target.value);
+                  setPasswordStatus("idle");
+                }}
+                disabled={passwordStatus === "saving"}
+              />
+              <label htmlFor="new-password">{t("account.newPassword")}</label>
+              <input
+                id="new-password"
+                name="new-password"
+                type="password"
+                autoComplete="new-password"
+                required
+                minLength={15}
+                maxLength={1024}
+                value={newPassword}
+                onChange={(event) => {
+                  setNewPassword(event.target.value);
+                  setPasswordStatus("idle");
+                }}
+                disabled={passwordStatus === "saving"}
+              />
+              <label htmlFor="confirm-password">{t("account.confirmPassword")}</label>
+              <input
+                id="confirm-password"
+                name="confirm-password"
+                type="password"
+                autoComplete="new-password"
+                required
+                minLength={15}
+                maxLength={1024}
+                value={confirmPassword}
+                onChange={(event) => {
+                  setConfirmPassword(event.target.value);
+                  setPasswordStatus("idle");
+                }}
+                disabled={passwordStatus === "saving"}
+              />
+              <button
+                className="primary-button"
+                type="submit"
+                disabled={passwordStatus === "saving"}
+              >
+                {t("account.changePassword")}
+              </button>
+              <p
+                className="form-status"
+                role="status"
+                aria-live="polite"
+                data-state={passwordStatus}
+              >
+                {passwordMessage[passwordStatus] === null
+                  ? ""
+                  : t(passwordMessage[passwordStatus])}
+              </p>
+            </form>
+          </section>
+        </div>
+      ) : null}
+    </section>
+  );
+
+  const renderAdmin = () => {
+    const profileIsAdmin = profile?.global_role === "admin";
+    const selectedUserReadOnly =
+      selectedAdminUser?.disabled === true ||
+      selectedAdminUser?.global_role === "admin";
+    return (
+      <section aria-labelledby="admin-heading">
+        <div className="page-heading">
+          <div>
+            <p className="eyebrow">{t("admin.eyebrow")}</p>
+            <h1 id="admin-heading">{t("admin.title")}</h1>
+            <p>{t("admin.hint")}</p>
+          </div>
+        </div>
+        {profileStatus === "loading" ? (
+          <p className="state-panel" role="status">{t("account.loading")}</p>
+        ) : null}
+        {profileStatus === "error" ? (
+          <p className="state-panel state-error" role="alert">{t("account.loadError")}</p>
+        ) : null}
+        {profileStatus === "unauthorized" ? (
+          <p className="state-panel" role="status">{t("errors.unauthorized")}</p>
+        ) : null}
+        {profileStatus === "ready" && !profileIsAdmin ? (
+          <p className="state-panel state-error" role="alert">{t("admin.forbidden")}</p>
+        ) : null}
+        {profileStatus === "ready" && profileIsAdmin && adminStatus === "loading" ? (
+          <p className="state-panel" role="status">{t("admin.loading")}</p>
+        ) : null}
+        {profileStatus === "ready" && profileIsAdmin && adminStatus === "error" ? (
+          <p className="state-panel state-error" role="alert">{t("admin.loadError")}</p>
+        ) : null}
+        {profileStatus === "ready" && profileIsAdmin && adminStatus === "unauthorized" ? (
+          <p className="state-panel" role="status">{t("errors.unauthorized")}</p>
+        ) : null}
+        {profileStatus === "ready" &&
+        profileIsAdmin &&
+        adminStatus === "ready" &&
+        adminSnapshot !== null ? (
+          <div className="admin-layout">
+            <section className="settings-card admin-people" aria-labelledby="people-heading">
+              <h2 id="people-heading">{t("admin.usersTitle")}</h2>
+              {adminSnapshot.users.length === 0 ? <p>{t("admin.usersEmpty")}</p> : null}
+              <ul className="admin-user-list">
+                {adminSnapshot.users.map((user) => {
+                  const label = user.display_name ?? user.username;
+                  return (
+                    <li key={user.id}>
+                      <button
+                        type="button"
+                        className={user.id === selectedUserId ? "admin-user is-selected" : "admin-user"}
+                        aria-pressed={user.id === selectedUserId}
+                        onClick={() => {
+                          setSelectedUserId(user.id);
+                          setAdminMutationStatus("idle");
+                        }}
+                      >
+                        <strong>{label}</strong>
+                        {label === user.username ? null : <small>{user.username}</small>}
+                        <span>
+                          {t(
+                            user.disabled
+                              ? "admin.disabled"
+                              : user.global_role === "admin"
+                                ? "admin.administrator"
+                                : "admin.member",
+                          )}
+                        </span>
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            </section>
+
+            <section className="settings-card admin-projects" aria-labelledby="assignments-heading">
+              <h2 id="assignments-heading">{t("admin.projectsTitle")}</h2>
+              {selectedAdminUser === null ? (
+                <p>{t("admin.usersEmpty")}</p>
+              ) : (
+                <>
+                  <p className="selected-account">
+                    {t("admin.selectedUser", {
+                      user: selectedAdminUser.display_name ?? selectedAdminUser.username,
+                    })}
+                  </p>
+                  {selectedUserReadOnly ? (
+                    <p className="readonly-notice">{t("admin.readOnly")}</p>
+                  ) : null}
+                  {adminSnapshot.projects.length === 0 ? (
+                    <p>{t("admin.projectsEmpty")}</p>
+                  ) : (
+                    <ul className="assignment-list">
+                      {adminSnapshot.projects.map((project) => {
+                        const assignment = selectedAdminUser.assignments.find(
+                          (candidate) => candidate.project_id === project.id,
+                        );
+                        return (
+                          <li key={project.id}>
+                            <div>
+                              <strong>{project.human_key}</strong>
+                              <small>{project.slug}</small>
+                              <span className={`status ${project.archived_at === null ? "status-live" : "status-archived"}`}>
+                                {t(project.archived_at === null ? "admin.active" : "admin.archived")}
+                              </span>
+                            </div>
+                            <label>
+                              <span className="sr-only">
+                                {t("admin.assignment", { project: project.human_key })}
+                              </span>
+                              <select
+                                aria-label={t("admin.assignment", { project: project.human_key })}
+                                name={`project-access-${project.id}`}
+                                value={assignment?.role ?? ""}
+                                disabled={selectedUserReadOnly || pendingProjectId !== null}
+                                onChange={(event) => {
+                                  const value = event.target.value;
+                                  void handleAssignmentChange(
+                                    selectedAdminUser,
+                                    project,
+                                    value === "" ? null : (value as AssignmentRole),
+                                    adminSnapshot,
+                                  );
+                                }}
+                              >
+                                <option value="">{t("admin.noAccess")}</option>
+                                <option value="viewer">{t("accessRole.viewer")}</option>
+                                <option value="operator">{t("accessRole.operator")}</option>
+                              </select>
+                            </label>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  )}
+                  <p
+                    className="form-status"
+                    role="status"
+                    aria-live="polite"
+                    data-state={adminMutationStatus}
+                  >
+                    {adminMutationMessage[adminMutationStatus] === null
+                      ? ""
+                      : t(adminMutationMessage[adminMutationStatus], {
+                          project: adminMutationProject,
+                        })}
+                  </p>
+                </>
+              )}
+            </section>
+          </div>
+        ) : null}
+      </section>
+    );
   };
 
   return (
@@ -157,13 +1305,16 @@ export function App({
         </div>
 
         <div className="topbar-controls">
-          <span className="read-only-badge">{t("readOnly")}</span>
+          <span className="read-only-badge">
+            {t("mailboxReadOnly")}
+          </span>
           <div className="locale-control">
             <label>
               <span>{t("language")}</span>
               <select
                 aria-label={t("language")}
                 aria-describedby="locale-preference-status"
+                name="ui-language"
                 value={locale}
                 onChange={handleLocaleChange}
                 disabled={["loading", "saving", "unauthorized"].includes(
@@ -172,7 +1323,7 @@ export function App({
               >
                 {supportedLocales.map((locale) => (
                   <option key={locale} value={locale}>
-                    {locale.toUpperCase()}
+                    {t(`languageName.${locale}`)}
                   </option>
                 ))}
               </select>
@@ -187,115 +1338,47 @@ export function App({
               {t(preferenceStatusKey[preferenceStatus])}
             </small>
           </div>
+          <form className="logout-form" action="/mail/logout" method="post">
+            <button className="logout-button" type="submit">
+              {t("signOut")}
+            </button>
+          </form>
         </div>
       </header>
 
       <div className="workspace">
         <aside className="sidebar">
           <nav aria-label={t("navigation")}>
-            {navigation.map((item) => (
+            {navigationItems.map((item) => (
               <a
-                className={item === "inbox" ? "nav-link is-active" : "nav-link"}
+                className={
+                  (route.view === item || (route.view === "message" && item === "inbox"))
+                    ? "nav-link is-active"
+                    : "nav-link"
+                }
                 href={`#${item}`}
                 key={item}
-                aria-current={item === "inbox" ? "page" : undefined}
+                aria-current={
+                  route.view === item || (route.view === "message" && item === "inbox")
+                    ? "page"
+                    : undefined
+                }
               >
                 <span className="nav-dot" aria-hidden="true" />
                 {t(`nav.${item}`)}
               </a>
             ))}
           </nav>
-
-          <section className="role-card" aria-labelledby="role-heading">
-            <p id="role-heading" className="eyebrow">
-              {t("rolePanel")}
-            </p>
-            <label>
-              <span>{t("role")}</span>
-              <select value={role} onChange={handleRoleChange}>
-                {roles.map((item) => (
-                  <option key={item} value={item}>
-                    {t(`roleName.${item}`)}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <p className="role-description">{t(`roleDescription.${role}`)}</p>
-          </section>
         </aside>
 
         <main id="main-content" className="content">
-          <section className="welcome" aria-labelledby="overview-heading">
-            <div>
-              <p className="eyebrow">{t("nav.inbox")}</p>
-              <h1 id="overview-heading">{t("overview")}</h1>
-              <p>{t("overviewHint")}</p>
-            </div>
-            <span className={`role-pill role-${role}`}>{t(`roleName.${role}`)}</span>
-          </section>
-
-          <section className="metrics" aria-label={t("overviewHint")}>
-            <article>
-              <span>{t("metrics.projects")}</span>
-              <strong>{visibleProjectCount[role]}</strong>
-            </article>
-            <article>
-              <span>{t("metrics.agents")}</span>
-              <strong>13</strong>
-            </article>
-            <article>
-              <span>{t("metrics.unread")}</span>
-              <strong>4</strong>
-            </article>
-          </section>
-
-          <div className="content-grid">
-            <section className="panel" id="projects" aria-labelledby="projects-heading">
-              <div className="panel-heading">
-                <h2 id="projects-heading">{t("projects")}</h2>
-                <span>3</span>
-              </div>
-              <div className="project-list" role="list">
-                {projects.slice(0, visibleProjectCount[role]).map((project) => (
-                  <article className="project-row" role="listitem" key={project.id}>
-                    <span className="project-avatar" aria-hidden="true">
-                      {project.id.slice(0, 1).toUpperCase()}
-                    </span>
-                    <div>
-                      <strong>{t(`projectRows.${project.id}`)}</strong>
-                      <small>
-                        {project.agents} {t("agents")} · {project.unread} {t("unread")}
-                      </small>
-                    </div>
-                    <span className={`status status-${project.status}`}>
-                      {t(project.status)}
-                    </span>
-                  </article>
-                ))}
-              </div>
-            </section>
-
-            <section className="panel" id="inbox" aria-labelledby="messages-heading">
-              <div className="panel-heading">
-                <h2 id="messages-heading">{t("recentMessages")}</h2>
-                <a href="#inbox">{t("viewInbox")}</a>
-              </div>
-              <div className="message-list">
-                {messages.map((message) => (
-                  <article className="message-row" key={message.subject}>
-                    <span className="unread-mark">
-                      <span className="sr-only">{t("unreadMessage")}</span>
-                    </span>
-                    <div>
-                      <strong>{t(`messageSubjects.${message.subject}`)}</strong>
-                      <small>{t("messageFrom", { sender: message.sender })}</small>
-                    </div>
-                    <time>{message.age}</time>
-                  </article>
-                ))}
-              </div>
-            </section>
-          </div>
+          {route.view === "projects" ? renderProjects() : null}
+          {route.view === "inbox" ? renderInbox() : null}
+          {route.view === "message"
+            ? renderMessage(route.projectId, route.messageId)
+            : null}
+          {route.view === "account" ? renderAccount() : null}
+          {route.view === "admin" ? renderAdmin() : null}
         </main>
       </div>
     </div>

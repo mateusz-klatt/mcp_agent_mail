@@ -392,6 +392,47 @@ Auth notes:
 - `MAIL_UI_AUTH_ENABLED=false` is an open test/development mode with no human project boundary. Do not use it as a production reverse-proxy handoff.
 - Health endpoints remain open at `/health/*`.
 
+### Hermes React interface
+
+The responsive interface is served at `/mail/v2/`. It uses the same signed human
+session and server-side authorization rules as the legacy views; hiding a control
+in React is never treated as an authorization boundary. All production JavaScript,
+CSS, fonts, icons, and images are served from the same origin.
+
+- `/mail/v2/#inbox` shows the real, project-scoped inbox and message detail views.
+- `/mail/v2/#projects` lists only projects visible to the signed-in human.
+- `/mail/v2/#account` lets every human choose a display name, select English or
+  Polish for the interface, set an optional correspondence-language preference,
+  and rotate their own password. The correspondence preference is an advisory
+  hint for agents replying to that human, not a project-wide instruction.
+- `/mail/v2/#admin` is visible only to global admins. It assigns or revokes
+  `viewer` and `operator` access per human and project. Global admins remain
+  global and do not receive per-project assignments.
+
+The server-rendered `/mail` interface remains only for the bounded migration
+period. After React reaches feature parity and passes production UAT, React will
+move to `/mail` and the legacy interface plus `/mail/v2` migration path will be
+removed. They are not permanent compatibility surfaces. Agents and hooks
+continue to use MCP and the documented service endpoints; mounting Hermes does
+not replace or intercept the configured MCP transport path.
+
+### Building distributable browser assets
+
+Generated browser bundles are not tracked in `ui/dist` or
+`src/mcp_agent_mail/ui_dist`. A standard source build requires exactly Node
+22.22.2 with npm 10.9.7 and runs both Vite builds in an isolated temporary
+directory:
+
+```bash
+uv build --out-dir /absolute/path/to/artifacts
+```
+
+The custom Hatch build hook embeds the validated bundle in the sdist. The wheel
+is then built from that sdist and reuses the embedded bundle without invoking
+Node a second time. Editable installs deliberately skip the browser build;
+Docker invokes the same hook with the pinned toolchain and extracts only the
+validated `ui_dist` tree (including its hash manifest) from the resulting wheel.
+
 ### Human users and project roles
 
 Human authorization is deny-by-default and separates a user's global role from their project assignments:

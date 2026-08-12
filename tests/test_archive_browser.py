@@ -561,7 +561,10 @@ async def test_archive_commit_detail(isolated_env):
         assert resp.status_code == 200
         assert "text/html" in resp.headers.get("content-type", "")
         body = resp.text
-        assert "diff2html-ui.min.js" in body
+        assert 'src="/mail/v2/assets/legacy.js"' in body
+        assert "diff2html-ui.min.js" not in body
+        assert "https://cdn." not in body
+        assert "https://unpkg.com" not in body
         detail = await get_commit_detail(
             (await ensure_archive(settings, data["project_slug"])).repo,
             data["head_sha"],

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import binascii
 import contextlib
 import contextvars
 import hmac
@@ -14,14 +15,14 @@ import logging
 import math
 import re
 import threading
-from collections.abc import MutableMapping
+from collections.abc import Callable, MutableMapping
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal, Protocol, TypedDict, cast
+from typing import Annotated, Any, Literal, Protocol, TypedDict, cast
 
 import structlog
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Path as FastApiPath, Query, Request, status
 from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -71,6 +72,14 @@ from .storage import (
     proactive_fd_cleanup,
     write_agent_profile,
     write_file_reservation_record,
+)
+from .ui_access import (
+    UiAccessMutationError,
+    UiAccessMutationErrorCode,
+    UiProfileMutationError,
+    UiProfileMutationErrorCode,
+    mutate_ui_project_access,
+    mutate_ui_user_display_name,
 )
 
 
@@ -850,10 +859,24 @@ def _localhost_bypass_allowed(request: Request, *, allow_localhost: bool) -> boo
 _MAIL_LOGIN_PATH = "/mail/login"
 _MAIL_LOGOUT_PATH = "/mail/logout"
 _MAIL_FILE_RESERVATIONS_API_PATH = "/mail/api/file-reservations"
+_MAIL_PROFILE_API_PATH = "/mail/api/v1/me/profile"
 _MAIL_PREFERENCES_API_PATH = "/mail/api/v1/me/preferences"
 _MAIL_PASSWORD_API_PATH = "/mail/api/v1/me/password"
-_MAIL_ACCOUNT_API_PATHS = frozenset({_MAIL_PREFERENCES_API_PATH, _MAIL_PASSWORD_API_PATH})
+_MAIL_ADMIN_ACCESS_API_PATH = "/mail/api/v1/admin/access"
+_MAIL_ADMIN_ASSIGNMENT_API_PATH = (
+    "/mail/api/v1/admin/users/{target_user_id}/projects/{project_id}"
+)
+# Fail closed until the Human Overseer flow can commit its database rows and
+# archive bundle atomically. A successful write to either persistence layer
+# must never survive when the other layer fails.
+_MAIL_LEGACY_OVERSEER_UNAVAILABLE_DETAIL = (
+    "Human Overseer messaging is temporarily unavailable while atomic archive persistence is implemented"
+)
+_MAIL_ACCOUNT_API_PATHS = frozenset(
+    {_MAIL_PROFILE_API_PATH, _MAIL_PREFERENCES_API_PATH, _MAIL_PASSWORD_API_PATH}
+)
 _MAIL_REACT_BASE_PATH = "/mail/v2"
+_MAIL_LOGIN_STYLESHEET_PATH = f"{_MAIL_REACT_BASE_PATH}/assets/legacy.css"
 _HERMES_FAVICON_PATH = "/favicon.ico"
 _HERMES_FAVICON_SVG = (
     b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">\n'
@@ -861,15 +884,44 @@ _HERMES_FAVICON_SVG = (
     b'  <path d="M17 14h9v14h12V14h9v36h-9V36H26v14h-9z" fill="#f4cf8a"/>\n'
     b"</svg>\n"
 )
+_MAIL_HTML_CACHE_CONTROL = "no-store, no-transform"
 _MAIL_REACT_INDEX_HEADERS = {
-    "Cache-Control": "no-store",
+    "Cache-Control": _MAIL_HTML_CACHE_CONTROL,
     "Content-Security-Policy": (
-        "default-src 'self'; connect-src 'self'; object-src 'none'; "
-        "base-uri 'none'; frame-ancestors 'none'"
+        "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; "
+        "img-src 'self' data:; font-src 'self'; object-src 'none'; "
+        "base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
     ),
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
 }
 _MAIL_REACT_ASSET_HEADERS = {
-    "Cache-Control": "public, max-age=31536000, immutable",
+    "Cache-Control": "public, max-age=31536000, immutable, no-transform",
+    "X-Content-Type-Options": "nosniff",
+}
+_MAIL_REACT_LEGACY_ASSET_HEADERS = {
+    "Cache-Control": "no-cache, no-transform",
+    "X-Content-Type-Options": "nosniff",
+}
+_MAIL_LEGACY_HTML_HEADERS = {
+    "Cache-Control": _MAIL_HTML_CACHE_CONTROL,
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
+        "style-src 'self' 'unsafe-inline'; connect-src 'self'; "
+        "img-src 'self' data: blob:; font-src 'self'; object-src 'none'; "
+        "base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+    ),
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+}
+_MAIL_BODY_INLINE_IMAGE_MAX_BYTES = 2 * 1024 * 1024
+_MAIL_BODY_INLINE_IMAGE_PREFIXES: dict[str, Callable[[bytes], bool]] = {
+    "data:image/png;base64,": lambda raw: raw.startswith(b"\x89PNG\r\n\x1a\n"),
+    "data:image/jpeg;base64,": lambda raw: raw.startswith(b"\xff\xd8\xff"),
+    "data:image/gif;base64,": lambda raw: raw.startswith((b"GIF87a", b"GIF89a")),
+    "data:image/webp;base64,": lambda raw: len(raw) >= 12 and raw.startswith(b"RIFF") and raw[8:12] == b"WEBP",
 }
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _OVERSEER_REPLY_PATH_RE = re.compile(r"^/mail/[^/]+/overseer/reply$")
@@ -878,7 +930,48 @@ _mail_ui_template_user: contextvars.ContextVar[dict[str, Any] | None] = contextv
     default=None,
 )
 
+
+def _mail_ui_inline_image_source_allowed(value: str) -> bool:
+    """Allow only bounded, canonical inline raster image bytes."""
+    if not value or value != value.strip():
+        return False
+    for prefix, signature_matches in _MAIL_BODY_INLINE_IMAGE_PREFIXES.items():
+        if not value.startswith(prefix):
+            continue
+        payload = value.removeprefix(prefix)
+        maximum_encoded_length = ((_MAIL_BODY_INLINE_IMAGE_MAX_BYTES + 2) // 3) * 4
+        if not payload or len(payload) > maximum_encoded_length:
+            return False
+        try:
+            raw = base64.b64decode(payload, validate=True)
+        except (binascii.Error, ValueError):
+            return False
+        return (
+            0 < len(raw) <= _MAIL_BODY_INLINE_IMAGE_MAX_BYTES
+            and base64.b64encode(raw).decode("ascii") == payload
+            and signature_matches(raw)
+        )
+    return False
+
 MailUiLocale = Literal["en", "pl"]
+MailUiGlobalRole = Literal["admin", "member"]
+MailUiAssignmentRole = Literal["viewer", "operator"]
+MailUiProjectRole = Literal["admin", "viewer", "operator"]
+MailUiImportance = Literal["low", "normal", "high", "urgent"]
+
+
+def _mail_ui_uses_typed_domain_errors(path: str) -> bool:
+    """Whether authorization failures on ``path`` use stable ``detail.code``."""
+    return path in {_MAIL_PROFILE_API_PATH, _MAIL_ADMIN_ACCESS_API_PATH} or path.startswith(
+        "/mail/api/v1/admin/users/"
+    )
+
+
+def _mail_ui_authorization_detail(path: str, fallback: str) -> str | dict[str, str]:
+    """Render middleware authorization failures through the advertised API shape."""
+    if _mail_ui_uses_typed_domain_errors(path):
+        return {"code": "actor_forbidden"}
+    return fallback
 
 
 def _normalized_http_base_path(path: str) -> str:
@@ -914,6 +1007,142 @@ class MailUiSessionPrincipal(TypedDict):
     role: webauth.UiUserRole
     session_epoch: int
     session_generation: str
+
+
+class MailUiDomainErrorDetail(BaseModel):
+    """Stable machine-readable refusal emitted by a typed mutation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: UiAccessMutationErrorCode | UiProfileMutationErrorCode
+
+
+class MailUiDomainErrorResponse(BaseModel):
+    """FastAPI-compatible wrapper retaining the conventional ``detail`` key."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    detail: MailUiDomainErrorDetail
+
+
+class MailUiDomainOrValidationErrorResponse(BaseModel):
+    """A domain refusal or FastAPI request-validation error at HTTP 422."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    detail: MailUiDomainErrorDetail | list[dict[str, Any]]
+
+
+class MailUiProfileResponse(BaseModel):
+    """Non-secret account profile for the authenticated human."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int = Field(gt=0)
+    username: str
+    display_name: str | None
+    global_role: MailUiGlobalRole
+    profile_revision: int = Field(ge=1)
+
+
+class MailUiProfilePatch(BaseModel):
+    """Compare-and-swap update of the authenticated human's display label."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    display_name: str | None = Field(max_length=1024)
+    expected_profile_revision: int = Field(ge=1)
+
+
+class MailUiProfileMutationResponse(BaseModel):
+    """Result of one normalized display-name mutation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    changed: bool
+    display_name: str | None
+    profile_revision: int = Field(ge=1)
+
+
+class MailUiAdminAssignmentSummary(BaseModel):
+    """One explicit project role belonging to a human account."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: int = Field(gt=0)
+    role: MailUiAssignmentRole
+
+
+class MailUiAdminUserSummary(BaseModel):
+    """Administrative account snapshot containing only access-management facts."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int = Field(gt=0)
+    username: str
+    display_name: str | None
+    disabled: bool
+    global_role: MailUiGlobalRole
+    account_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    access_version: int = Field(ge=1)
+    assignments: list[MailUiAdminAssignmentSummary]
+
+
+class MailUiAdminProjectSummary(BaseModel):
+    """Project identity snapshot used to protect assignment mutations from reuse."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int = Field(gt=0)
+    slug: str
+    human_key: str
+    project_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    archived_at: datetime | None
+
+
+class MailUiAdminAccessResponse(BaseModel):
+    """Consistent user/project/assignment snapshot for the administrator UI."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    users: list[MailUiAdminUserSummary]
+    projects: list[MailUiAdminProjectSummary]
+
+
+class MailUiAdminProjectAccessPut(BaseModel):
+    """CAS inputs for grant, replacement, or revocation of one assignment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    role: MailUiAssignmentRole | None
+    expected_access_version: int = Field(ge=1)
+    account_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_project_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class MailUiAdminProjectAccessResponse(BaseModel):
+    """Effective assignment and next CAS version after an admin request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    changed: bool
+    role: MailUiAssignmentRole | None
+    access_version: int = Field(ge=1)
+
+
+_MAIL_UI_DOMAIN_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
+    status.HTTP_401_UNAUTHORIZED: {"model": MailUiDomainErrorResponse},
+    status.HTTP_403_FORBIDDEN: {"model": MailUiDomainErrorResponse},
+    status.HTTP_404_NOT_FOUND: {"model": MailUiDomainErrorResponse},
+    status.HTTP_409_CONFLICT: {"model": MailUiDomainErrorResponse},
+    status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": MailUiDomainErrorResponse},
+}
+_MAIL_UI_DOMAIN_MUTATION_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **_MAIL_UI_DOMAIN_ERROR_RESPONSES,
+    status.HTTP_422_UNPROCESSABLE_CONTENT: {
+        "model": MailUiDomainOrValidationErrorResponse
+    },
+}
 
 
 class MailUiStoredPreferences(BaseModel):
@@ -980,6 +1209,227 @@ class MailUiPasswordChangeResponse(BaseModel):
     """Stable success response for a completed password rotation."""
 
     changed: Literal[True] = True
+
+
+class MailUiProjectSummary(BaseModel):
+    """One project visible to the authenticated human."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    slug: str
+    human_key: str
+    created_at: datetime
+    archived_at: datetime | None
+    role: MailUiProjectRole
+    can_reply: bool
+
+
+class MailUiProjectsResponse(BaseModel):
+    """Complete, authorization-filtered project list for the React shell."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[MailUiProjectSummary]
+    total: int
+
+
+class MailUiMessageSummary(BaseModel):
+    """Metadata safe for the unified inbox list.
+
+    Message bodies, recipient lists, and per-recipient read state deliberately
+    do not exist on this model.  Keeping the list contract separate from the
+    detail contract makes an accidental over-fetch visible in OpenAPI and in
+    response validation instead of silently shipping private fields.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    project_id: int
+    project_slug: str
+    subject: str
+    sender: str
+    sender_name: str
+    sender_display_name: str | None
+    importance: MailUiImportance
+    ack_required: bool
+    thread_id: str | None
+    reply_to: int | None
+    created_ts: datetime
+    can_reply: bool
+
+
+class MailUiAttachmentMetadata(BaseModel):
+    """Non-locating attachment metadata safe to expose to a browser."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: str | None
+    media_type: str | None
+    size_bytes: int | None
+
+
+class MailUiMessageDetail(MailUiMessageSummary):
+    """Full message content without blind-copy or storage-location metadata."""
+
+    body_md: str
+    to: list[str]
+    cc: list[str]
+    attachments: list[MailUiAttachmentMetadata]
+
+
+class MailUiInboxResponse(BaseModel):
+    """A stable page of unified inbox summaries."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[MailUiMessageSummary]
+    total: int
+    next_cursor: str | None
+
+
+class MailUiThreadResponse(BaseModel):
+    """A stable page of full messages from one visible thread."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[MailUiMessageDetail]
+    total: int
+    next_cursor: str | None
+
+
+_MAIL_UI_CURSOR_VERSION = 1
+_MAIL_UI_CURSOR_MAX_LENGTH = 512
+_MAIL_UI_CREATED_TS_KEY_SQL = (
+    "CASE "
+    "WHEN instr(CAST(m.created_ts AS TEXT), '.') = 0 "
+    "THEN CAST(m.created_ts AS TEXT) || '.000000' "
+    "ELSE substr(CAST(m.created_ts AS TEXT), 1, "
+    "instr(CAST(m.created_ts AS TEXT), '.') - 1) || '.' || "
+    "substr(substr(CAST(m.created_ts AS TEXT), "
+    "instr(CAST(m.created_ts AS TEXT), '.') + 1) || '000000', 1, 6) "
+    "END"
+)
+
+
+def _mail_ui_datetime(value: Any) -> datetime:
+    """Normalize one database timestamp to an aware UTC datetime.
+
+    Invalid persisted timestamps are data corruption and intentionally fail the
+    request instead of being replaced with the current time, which would make
+    keyset pagination duplicate or skip messages without an error.
+    """
+    if isinstance(value, datetime):
+        result = value
+    elif isinstance(value, str):
+        normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+        result = datetime.fromisoformat(normalized)
+    else:
+        raise ValueError("database timestamp is not a datetime")
+    if result.tzinfo is None:
+        result = result.replace(tzinfo=timezone.utc)
+    return result.astimezone(timezone.utc)
+
+
+def _mail_ui_importance(value: Any) -> MailUiImportance:
+    """Project legacy free-form importance onto the typed browser vocabulary."""
+    normalized = str(value or "normal").strip().casefold()
+    if normalized in {"low", "normal", "high", "urgent"}:
+        return normalized
+    return "normal"
+
+
+def _mail_ui_encode_cursor(created_ts_key: str, message_id: int) -> str:
+    """Encode the exact SQLite ordering key as an opaque URL-safe cursor."""
+    payload = json.dumps(
+        {"v": _MAIL_UI_CURSOR_VERSION, "created_ts": created_ts_key, "id": message_id},
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+
+
+def _mail_ui_decode_cursor(cursor: str) -> tuple[str, int]:
+    """Decode and strictly validate one keyset cursor.
+
+    The cursor is not an authorization token.  Project visibility is always
+    applied independently in SQL; this validation only prevents malformed
+    ordering keys from turning into surprising pages or database expressions.
+    """
+    if not cursor or len(cursor) > _MAIL_UI_CURSOR_MAX_LENGTH:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Invalid cursor.",
+        )
+    try:
+        padding = "=" * (-len(cursor) % 4)
+        raw = base64.b64decode(
+            (cursor + padding).encode("ascii"),
+            altchars=b"-_",
+            validate=True,
+        )
+        payload = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, dict) or set(payload) != {"v", "created_ts", "id"}:
+            raise ValueError("unexpected cursor shape")
+        if payload["v"] != _MAIL_UI_CURSOR_VERSION:
+            raise ValueError("unsupported cursor version")
+        created_ts = payload["created_ts"]
+        message_id = payload["id"]
+        if not isinstance(created_ts, str) or not created_ts or len(created_ts) > 64:
+            raise ValueError("invalid timestamp key")
+        _mail_ui_datetime(created_ts)
+        if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0:
+            raise ValueError("invalid message id")
+    except (
+        UnicodeEncodeError,
+        UnicodeDecodeError,
+        binascii.Error,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Invalid cursor.",
+        ) from None
+    return created_ts, message_id
+
+
+def _mail_ui_safe_attachments(value: Any) -> list[MailUiAttachmentMetadata]:
+    """Project stored attachment JSON onto a non-locating public shape."""
+    raw_items = value
+    if isinstance(raw_items, str):
+        try:
+            raw_items = json.loads(raw_items)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(raw_items, list):
+        return []
+
+    result: list[MailUiAttachmentMetadata] = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        raw_type = raw.get("type")
+        raw_media_type = raw.get("media_type")
+        raw_size = raw.get("size_bytes", raw.get("bytes"))
+        attachment_type = raw_type[:64] if isinstance(raw_type, str) else None
+        media_type = raw_media_type[:255] if isinstance(raw_media_type, str) else None
+        size_bytes = (
+            raw_size
+            if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0
+            else None
+        )
+        result.append(
+            MailUiAttachmentMetadata(
+                type=attachment_type,
+                media_type=media_type,
+                size_bytes=size_bytes,
+            )
+        )
+    return result
 
 # Login brute-force throttle, keyed by client address and normalized username. scrypt already caps an
 # attacker at roughly 20 guesses/second/core, but that is still ~1.7M/day against
@@ -1132,7 +1582,7 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
                 location = f"{location}?{raw_query.decode('latin-1')}"
             return Response(
                 status_code=status.HTTP_307_TEMPORARY_REDIRECT,
-                headers={"Cache-Control": "no-store", "Location": location},
+                headers={**_MAIL_REACT_INDEX_HEADERS, "Location": location},
             )
 
         if path == _HERMES_FAVICON_PATH and mcp_base not in {"/", _HERMES_FAVICON_PATH}:
@@ -1189,6 +1639,21 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
             finally:
                 _mail_ui_template_user.reset(token)
 
+        # The standalone login page needs exactly one locally built stylesheet
+        # before a browser can possess a session cookie.  Keep this exception
+        # deliberately narrower than the asset namespace: the legacy runtime
+        # JavaScript and every hashed application asset remain session-gated.
+        if (
+            request.method in {"GET", "HEAD"}
+            and path == _MAIL_LOGIN_STYLESHEET_PATH
+        ):
+            request.state.mail_ui_authenticated = True
+            token = _mail_ui_template_user.set(None)
+            try:
+                return await call_next(request)
+            finally:
+                _mail_ui_template_user.reset(token)
+
         token = request.cookies.get(cfg.cookie_name, "")
         user = await _load_session_user(token, settings=self._settings) if token else None
 
@@ -1215,18 +1680,31 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
 
                 return Response(
                     status_code=status.HTTP_303_SEE_OTHER,
-                    headers={"Location": f"{_MAIL_LOGIN_PATH}?next={quote(target, safe='')}"},
+                    headers={
+                        **_MAIL_LEGACY_HTML_HEADERS,
+                        "Location": f"{_MAIL_LOGIN_PATH}?next={quote(target, safe='')}",
+                    },
                 )
-            return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
+            return JSONResponse(
+                {"detail": _mail_ui_authorization_detail(path, "Unauthorized")},
+                status_code=status.HTTP_401_UNAUTHORIZED,
+            )
 
         if request.method in _UNSAFE_METHODS:
             if not webauth.same_origin(
                 request.headers.get("origin", ""),
                 request.headers.get("referer", ""),
                 request.headers.get("host", ""),
+                expected_scheme=request.url.scheme,
             ):
                 return JSONResponse(
-                    {"detail": "Cross-origin request rejected"}, status_code=status.HTTP_403_FORBIDDEN
+                    {
+                        "detail": _mail_ui_authorization_detail(
+                            path,
+                            "Cross-origin request rejected",
+                        )
+                    },
+                    status_code=status.HTTP_403_FORBIDDEN,
                 )
             if (
                 user["role"] != webauth.ROLE_ADMIN
@@ -1234,7 +1712,12 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
                 and not _OVERSEER_REPLY_PATH_RE.fullmatch(path)
             ):
                 return JSONResponse(
-                    {"detail": "Forbidden: this action requires the admin role"},
+                    {
+                        "detail": _mail_ui_authorization_detail(
+                            path,
+                            "Forbidden: this action requires the admin role",
+                        )
+                    },
                     status_code=status.HTTP_403_FORBIDDEN,
                 )
 
@@ -1254,13 +1737,17 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
 
 
 class MailUiAccountNoStoreMiddleware:
-    """Prevent browsers and intermediaries from caching account-bound API data."""
+    """Prevent caching of session-bound Mail UI API responses."""
 
     def __init__(self, app: Any) -> None:
         self._app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope.get("type") != "http" or scope.get("path") not in _MAIL_ACCOUNT_API_PATHS:
+        path = scope.get("path")
+        if scope.get("type") != "http" or not (
+            isinstance(path, str)
+            and (path == "/mail/api" or path.startswith("/mail/api/"))
+        ):
             await self._app(scope, receive, send)
             return
 
@@ -1377,6 +1864,121 @@ def _mail_ui_request_user(request: Request) -> MailUiSessionPrincipal | None:
     return cast(MailUiSessionPrincipal, user) if isinstance(user, dict) else None
 
 
+def _mail_ui_domain_http_exception(
+    *,
+    code: UiAccessMutationErrorCode | UiProfileMutationErrorCode,
+    status_code: int,
+) -> HTTPException:
+    """Translate one domain refusal without leaking implementation details."""
+    return HTTPException(status_code=status_code, detail={"code": code})
+
+
+def _mail_ui_profile_http_exception(exc: UiProfileMutationError) -> HTTPException:
+    """Map profile-domain refusals onto the stable typed HTTP surface."""
+    code = exc.code
+    if code == "invalid_display_name":
+        status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
+    elif code in {"profile_revision_conflict", "compare_and_swap_failed"}:
+        status_code = status.HTTP_409_CONFLICT
+    elif code == "session_not_fresh":
+        status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+    else:
+        status_code = status.HTTP_401_UNAUTHORIZED
+    return _mail_ui_domain_http_exception(code=code, status_code=status_code)
+
+
+def _mail_ui_access_http_exception(exc: UiAccessMutationError) -> HTTPException:
+    """Map project-access refusals onto stable authorization/CAS statuses."""
+    code = exc.code
+    if code in {"actor_recreated", "actor_session_epoch_conflict"}:
+        status_code = status.HTTP_401_UNAUTHORIZED
+    elif code == "actor_forbidden":
+        status_code = status.HTTP_403_FORBIDDEN
+    elif code in {"target_not_found", "project_not_found"}:
+        status_code = status.HTTP_404_NOT_FOUND
+    elif code == "invalid_requested_role":
+        status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
+    elif code in {"actor_contract_invalid", "invalid_existing_role", "session_not_fresh"}:
+        status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+    else:
+        status_code = status.HTTP_409_CONFLICT
+    return _mail_ui_domain_http_exception(code=code, status_code=status_code)
+
+
+def _mail_ui_require_admin_principal(request: Request) -> MailUiSessionPrincipal:
+    """Require a real current administrator session, including in development."""
+    principal = _mail_ui_request_user(request)
+    if principal is None:
+        raise _mail_ui_domain_http_exception(
+            code="actor_forbidden",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        )
+    if principal["role"] != webauth.ROLE_ADMIN:
+        raise _mail_ui_domain_http_exception(
+            code="actor_forbidden",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+    return principal
+
+
+def _mail_ui_profile_principal(request: Request) -> MailUiSessionPrincipal:
+    """Require a real human principal through the typed profile error shape."""
+    principal = _mail_ui_request_user(request)
+    if principal is None:
+        raise _mail_ui_domain_http_exception(
+            code="actor_forbidden",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        )
+    return principal
+
+
+async def _mail_ui_revalidated_profile_user(
+    request: Request,
+    session: AsyncSession,
+) -> Any:
+    """Revalidate all cookie claims before exposing typed profile state."""
+    _mail_ui_profile_principal(request)
+    try:
+        return await _mail_ui_preferences_user(request, session)
+    except HTTPException as exc:
+        if exc.status_code != status.HTTP_401_UNAUTHORIZED:
+            raise
+        raise _mail_ui_domain_http_exception(
+            code="session_epoch_conflict",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        ) from None
+
+
+async def _mail_ui_revalidated_admin_user(
+    request: Request,
+    session: AsyncSession,
+) -> Any:
+    """Revalidate the middleware's admin claim inside the snapshot read session."""
+    _mail_ui_require_admin_principal(request)
+    try:
+        row = await _mail_ui_preferences_user(request, session)
+    except HTTPException as exc:
+        if exc.status_code != status.HTTP_401_UNAUTHORIZED:
+            raise
+        raise _mail_ui_domain_http_exception(
+            code="actor_session_epoch_conflict",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        ) from None
+
+    role = webauth.normalize_ui_user_role(row.role)
+    if role is None:
+        raise _mail_ui_domain_http_exception(
+            code="actor_contract_invalid",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+    if role != webauth.ROLE_ADMIN:
+        raise _mail_ui_domain_http_exception(
+            code="actor_forbidden",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+    return row
+
+
 def _mail_ui_preferences_response(
     *,
     preferred_ui_locale: MailUiLocale,
@@ -1392,6 +1994,17 @@ def _mail_ui_preferences_response(
             ui_locale=preferred_ui_locale,
             correspondence_locale=preferred_correspondence_locale or preferred_ui_locale,
         ),
+    )
+
+
+def _mail_ui_correspondence_advisory(locale: MailUiLocale) -> str:
+    """Return the server-authored advisory injected into HumanOverseer mail."""
+    language = "Polish (pl)" if locale == "pl" else "English (en)"
+    return (
+        "Advisory communication preference: the authenticated human operator "
+        f"prefers replies in {language}. When practical, reply in that language. "
+        "This preference does not override explicit message instructions or "
+        "higher-priority policy."
     )
 
 
@@ -1431,6 +2044,34 @@ async def _mail_ui_preferences_user(
             detail="Authenticated Mail UI session is no longer current.",
         )
     return row
+
+
+async def _mail_ui_effective_correspondence_locale(
+    *,
+    settings: Settings,
+    request: Request,
+    session: AsyncSession,
+) -> MailUiLocale:
+    """Resolve correspondence language from a revalidated human account.
+
+    Explicit auth-disabled development/test mode has no human principal. It uses
+    the server's English default so legacy local workflows remain usable without
+    ever accepting a locale supplied in the message payload.
+    """
+    if not settings.mail_ui.enabled:
+        return "en"
+    principal = _mail_ui_preferences_principal(request)
+    row = await _mail_ui_preferences_user(request, session)
+    role = webauth.normalize_ui_user_role(row.role)
+    if role is None or role != principal["role"]:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authenticated Mail UI session is no longer current.",
+        )
+    locale = row.preferred_correspondence_locale or row.preferred_ui_locale
+    if locale not in {"en", "pl"}:
+        raise RuntimeError("authenticated human has an invalid correspondence locale")
+    return cast(MailUiLocale, locale)
 
 
 async def _mail_ui_preferences_cas_update(
@@ -1673,6 +2314,136 @@ async def _mail_ui_require_project_access(
             detail="Forbidden: this action requires the project operator role",
         )
     return access
+
+
+def _mail_ui_visible_project_predicate(
+    visible_project_ids: list[int],
+    *,
+    column: str,
+    parameter_prefix: str,
+) -> tuple[str, dict[str, int]]:
+    """Build one bound ``IN`` predicate for an already-authorized project set."""
+    if not visible_project_ids:
+        return "1 = 0", {}
+    parameters = {
+        f"{parameter_prefix}_{index}": project_id
+        for index, project_id in enumerate(visible_project_ids)
+    }
+    placeholders = ", ".join(f":{name}" for name in parameters)
+    return f"{column} IN ({placeholders})", parameters
+
+
+def _mail_ui_message_summary_from_row(
+    row: Any,
+    *,
+    settings: Settings,
+    request: Request,
+    visible_roles: dict[int, str | None],
+) -> MailUiMessageSummary:
+    """Render a database row through the deliberately lean inbox contract."""
+    project_id = int(row["project_id"])
+    sender_name = str(row["sender_name"] or "Unknown")
+    sender_project_id = (
+        int(row["sender_project_id"])
+        if row["sender_project_id"] is not None
+        else None
+    )
+    sender_project_slug = (
+        str(row["sender_project_slug"])
+        if row["sender_project_slug"] is not None
+        else None
+    )
+    sender = _sender_display_name(
+        message_project_id=project_id,
+        sender_name=sender_name,
+        sender_project_id=sender_project_id,
+        sender_project_slug=sender_project_slug,
+    )
+    access = _mail_ui_access_context(
+        settings=settings,
+        request=request,
+        project_id=project_id,
+        project_role=visible_roles[project_id],
+    )
+    return MailUiMessageSummary(
+        id=int(row["id"]),
+        project_id=project_id,
+        project_slug=str(row["project_slug"]),
+        subject=str(row["subject"] or "(No subject)"),
+        sender=sender,
+        sender_name=sender_name,
+        sender_display_name=(
+            str(row["sender_display_name"])
+            if row["sender_display_name"] is not None
+            else None
+        ),
+        importance=_mail_ui_importance(row["importance"]),
+        ack_required=bool(row["ack_required"]),
+        thread_id=str(row["thread_id"]) if row["thread_id"] is not None else None,
+        reply_to=int(row["reply_to"]) if row["reply_to"] is not None else None,
+        created_ts=_mail_ui_datetime(row["created_ts"]),
+        can_reply=bool(access["can_reply"]),
+    )
+
+
+async def _mail_ui_safe_recipient_map(
+    session: AsyncSession,
+    message_ids: list[int],
+) -> dict[int, dict[str, list[str]]]:
+    """Return only TO/CC names for a bounded set of messages.
+
+    BCC rows are removed by the SQL predicate, before Python sees any recipient
+    name.  This keeps a future serializer change from turning blind recipients
+    into ordinary response data.
+    """
+    result = {message_id: {"to": [], "cc": []} for message_id in message_ids}
+    if not message_ids:
+        return result
+    parameters = {
+        f"recipient_mid_{index}": message_id
+        for index, message_id in enumerate(message_ids)
+    }
+    placeholders = ", ".join(f":{name}" for name in parameters)
+    rows = await session.execute(
+        text(
+            "SELECT mr.message_id, mr.kind, a.name "
+            "FROM message_recipients mr "
+            "JOIN agents a ON a.id = mr.agent_id "
+            f"WHERE mr.message_id IN ({placeholders}) AND mr.kind IN ('to', 'cc') "
+            "ORDER BY mr.message_id, CASE mr.kind WHEN 'to' THEN 0 ELSE 1 END, a.name"
+        ),
+        parameters,
+    )
+    for message_id, kind, name in rows.fetchall():
+        normalized_kind = str(kind)
+        target = result.get(int(message_id))
+        if target is not None and normalized_kind in {"to", "cc"}:
+            target[normalized_kind].append(str(name))
+    return result
+
+
+def _mail_ui_message_detail_from_row(
+    row: Any,
+    *,
+    recipients: dict[str, list[str]],
+    settings: Settings,
+    request: Request,
+    visible_roles: dict[int, str | None],
+) -> MailUiMessageDetail:
+    """Render one full message while retaining the safe summary projection."""
+    summary = _mail_ui_message_summary_from_row(
+        row,
+        settings=settings,
+        request=request,
+        visible_roles=visible_roles,
+    )
+    return MailUiMessageDetail(
+        **summary.model_dump(),
+        body_md=str(row["body_md"] or ""),
+        to=list(recipients["to"]),
+        cc=list(recipients["cc"]),
+        attachments=_mail_ui_safe_attachments(row["attachments"]),
+    )
 
 
 def _mail_ui_require_admin_read(*, settings: Settings, request: Request) -> None:
@@ -2973,6 +3744,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             if CSSSanitizer
             else None
         )
+
         _html_cleaner = bleach.Cleaner(
             tags=[
                 "a",
@@ -3018,7 +3790,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 "table": ["class", "style"],
                 "td": ["class", "style"],
                 "th": ["class", "style"],
-                "img": ["src", "alt", "title", "width", "height", "loading", "decoding", "class"],
+                "img": lambda _tag, attribute, value: (
+                    attribute in {"alt", "title", "width", "height", "loading", "decoding", "class"}
+                    or (attribute == "src" and _mail_ui_inline_image_source_allowed(value))
+                ),
             },
             protocols=["http", "https", "mailto", "data"],
             strip=True,
@@ -3030,7 +3805,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             ctx.setdefault("mail_ui_access", None)
             tpl = env.get_template(name)
             html = await tpl.render_async(**ctx)
-            return HTMLResponse(html, status_code=status_code)
+            return HTMLResponse(
+                html,
+                status_code=status_code,
+                headers=_MAIL_LEGACY_HTML_HEADERS,
+            )
 
         def _parse_fts_query(
             raw: str, scope_preference: str | None = None
@@ -3510,7 +4289,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             if token and await _load_session_user(token, settings=settings):
                 return HTMLResponse(
                     "", status_code=status.HTTP_303_SEE_OTHER,
-                    headers={"Location": _safe_next(request.query_params.get("next", "/mail"))},
+                    headers={
+                        **_MAIL_LEGACY_HTML_HEADERS,
+                        "Location": _safe_next(request.query_params.get("next", "/mail")),
+                    },
                 )
             return await _render(
                 "mail_login.html",
@@ -3532,6 +4314,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 request.headers.get("origin", ""),
                 request.headers.get("referer", ""),
                 request.headers.get("host", ""),
+                expected_scheme=request.url.scheme,
             ):
                 return JSONResponse({"detail": "Cross-origin request rejected"}, status_code=403)
 
@@ -3602,20 +4385,45 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     s_touch.add(row2)
                     await s_touch.commit()
 
-            response = Response(status_code=status.HTTP_303_SEE_OTHER, headers={"Location": next_url})
+            response = Response(
+                status_code=status.HTTP_303_SEE_OTHER,
+                headers={**_MAIL_LEGACY_HTML_HEADERS, "Location": next_url},
+            )
             _set_mail_ui_session_cookie(response, token=token, settings=settings)
             structlog.get_logger("mail_ui").info("mail_ui.login_ok", username=username, client=client_ip)
             return response
 
-        @fastapi_app.get(_MAIL_LOGOUT_PATH)
         @fastapi_app.post(_MAIL_LOGOUT_PATH)
-        async def mail_logout() -> Response:
+        async def mail_logout(request: Request) -> Response:
+            if not webauth.same_origin(
+                request.headers.get("origin", ""),
+                request.headers.get("referer", ""),
+                request.headers.get("host", ""),
+                expected_scheme=request.url.scheme,
+            ):
+                return JSONResponse(
+                    {"detail": "Cross-origin request rejected"},
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    headers=_MAIL_LEGACY_HTML_HEADERS,
+                )
             cfg = settings.mail_ui
             response = Response(
-                status_code=status.HTTP_303_SEE_OTHER, headers={"Location": _MAIL_LOGIN_PATH}
+                status_code=status.HTTP_303_SEE_OTHER,
+                headers={**_MAIL_LEGACY_HTML_HEADERS, "Location": _MAIL_LOGIN_PATH},
             )
             response.delete_cookie(cfg.cookie_name, path="/mail")
             return response
+
+        @fastapi_app.api_route(
+            _MAIL_LOGOUT_PATH,
+            methods=["GET", "HEAD"],
+            include_in_schema=False,
+        )
+        async def mail_logout_method_not_allowed() -> Response:
+            return Response(
+                status_code=status.HTTP_405_METHOD_NOT_ALLOWED,
+                headers={**_MAIL_LEGACY_HTML_HEADERS, "Allow": "POST"},
+            )
 
         @fastapi_app.get("/mail", response_class=HTMLResponse)
         async def mail_unified_inbox(request: Request) -> HTMLResponse:
@@ -3754,6 +4562,525 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 payload["projects"] = []
             return JSONResponse(payload)
 
+        @fastapi_app.get(
+            "/mail/api/v1/projects",
+            response_model=MailUiProjectsResponse,
+        )
+        async def mail_ui_projects_v1(request: Request) -> MailUiProjectsResponse:
+            """Return only projects visible to the authenticated human."""
+            await ensure_schema()
+            async with get_session() as session:
+                visible_roles = await _mail_ui_visible_project_roles(
+                    settings=settings,
+                    request=request,
+                    session=session,
+                )
+                visible_ids = sorted(visible_roles)
+                predicate, parameters = _mail_ui_visible_project_predicate(
+                    visible_ids,
+                    column="p.id",
+                    parameter_prefix="projects_v1_pid",
+                )
+                rows = await session.execute(
+                    text(
+                        "SELECT p.id, p.slug, p.human_key, p.created_at, p.archived_at "
+                        "FROM projects p "
+                        f"WHERE {predicate} "
+                        "ORDER BY p.created_at DESC, p.id DESC"
+                    ),
+                    parameters,
+                )
+                items: list[MailUiProjectSummary] = []
+                for row in rows.mappings().all():
+                    project_id = int(row["id"])
+                    access = _mail_ui_access_context(
+                        settings=settings,
+                        request=request,
+                        project_id=project_id,
+                        project_role=visible_roles[project_id],
+                    )
+                    raw_role = "admin" if access["is_admin"] else access["project_role"]
+                    if raw_role not in {"admin", "viewer", "operator"}:
+                        raise RuntimeError("visible project has no valid UI role")
+                    items.append(
+                        MailUiProjectSummary(
+                            id=project_id,
+                            slug=str(row["slug"]),
+                            human_key=str(row["human_key"]),
+                            created_at=_mail_ui_datetime(row["created_at"]),
+                            archived_at=(
+                                _mail_ui_datetime(row["archived_at"])
+                                if row["archived_at"] is not None
+                                else None
+                            ),
+                            role=cast(MailUiProjectRole, raw_role),
+                            can_reply=bool(access["can_reply"]),
+                        )
+                    )
+            return MailUiProjectsResponse(items=items, total=len(items))
+
+        @fastapi_app.get(
+            "/mail/api/v1/inbox",
+            response_model=MailUiInboxResponse,
+        )
+        async def mail_ui_inbox_v1(
+            request: Request,
+            project_id: int | None = Query(default=None, gt=0),
+            limit: int = Query(default=50, ge=1, le=100),
+            cursor: str | None = Query(
+                default=None,
+                min_length=1,
+                max_length=_MAIL_UI_CURSOR_MAX_LENGTH,
+            ),
+        ) -> MailUiInboxResponse:
+            """Return a keyset-paginated inbox without bodies or recipients."""
+            cursor_key = _mail_ui_decode_cursor(cursor) if cursor is not None else None
+            await ensure_schema()
+            async with get_session() as session:
+                visible_roles = await _mail_ui_visible_project_roles(
+                    settings=settings,
+                    request=request,
+                    session=session,
+                )
+                if project_id is not None:
+                    if project_id not in visible_roles:
+                        raise HTTPException(status_code=404, detail="Project not found")
+                    visible_ids = [project_id]
+                else:
+                    visible_ids = sorted(visible_roles)
+
+                predicate, parameters = _mail_ui_visible_project_predicate(
+                    visible_ids,
+                    column="m.project_id",
+                    parameter_prefix="inbox_v1_pid",
+                )
+                total_result = await session.execute(
+                    text(f"SELECT COUNT(*) FROM messages m WHERE {predicate}"),
+                    parameters,
+                )
+                total = int(total_result.scalar_one())
+
+                cursor_predicate = ""
+                page_parameters: dict[str, Any] = {**parameters, "page_limit": limit + 1}
+                if cursor_key is not None:
+                    cursor_created_ts, cursor_message_id = cursor_key
+                    cursor_predicate = (
+                        f" AND ({_MAIL_UI_CREATED_TS_KEY_SQL} < :cursor_created_ts "
+                        f"OR ({_MAIL_UI_CREATED_TS_KEY_SQL} = :cursor_created_ts "
+                        "AND m.id < :cursor_message_id))"
+                    )
+                    page_parameters.update(
+                        {
+                            "cursor_created_ts": cursor_created_ts,
+                            "cursor_message_id": cursor_message_id,
+                        }
+                    )
+
+                rows = await session.execute(
+                    text(
+                        "SELECT m.id, m.project_id, p.slug AS project_slug, m.subject, "
+                        "m.importance, m.ack_required, m.thread_id, m.reply_to, "
+                        f"m.created_ts, {_MAIL_UI_CREATED_TS_KEY_SQL} AS cursor_created_ts, "
+                        "sender.name AS sender_name, sender.display_name AS sender_display_name, "
+                        "sender.project_id AS sender_project_id, "
+                        "sender_project.slug AS sender_project_slug "
+                        "FROM messages m "
+                        "JOIN projects p ON p.id = m.project_id "
+                        "JOIN agents sender ON sender.id = m.sender_id "
+                        "LEFT JOIN projects sender_project ON sender_project.id = sender.project_id "
+                        f"WHERE {predicate}{cursor_predicate} "
+                        f"ORDER BY {_MAIL_UI_CREATED_TS_KEY_SQL} DESC, m.id DESC "
+                        "LIMIT :page_limit"
+                    ),
+                    page_parameters,
+                )
+                page_rows = list(rows.mappings().all())
+                has_more = len(page_rows) > limit
+                response_rows = page_rows[:limit]
+                items = [
+                    _mail_ui_message_summary_from_row(
+                        row,
+                        settings=settings,
+                        request=request,
+                        visible_roles=visible_roles,
+                    )
+                    for row in response_rows
+                ]
+                next_cursor = (
+                    _mail_ui_encode_cursor(
+                        str(response_rows[-1]["cursor_created_ts"]),
+                        int(response_rows[-1]["id"]),
+                    )
+                    if has_more and response_rows
+                    else None
+                )
+            return MailUiInboxResponse(
+                items=items,
+                total=total,
+                next_cursor=next_cursor,
+            )
+
+        @fastapi_app.get(
+            "/mail/api/v1/projects/{project_id}/messages/{message_id}",
+            response_model=MailUiMessageDetail,
+        )
+        async def mail_ui_message_v1(
+            project_id: int,
+            message_id: int,
+            request: Request,
+        ) -> MailUiMessageDetail:
+            """Return one visible message with TO/CC but never BCC recipients."""
+            await ensure_schema()
+            async with get_session() as session:
+                visible_roles = await _mail_ui_visible_project_roles(
+                    settings=settings,
+                    request=request,
+                    session=session,
+                )
+                if project_id not in visible_roles:
+                    raise HTTPException(status_code=404, detail="Project not found")
+                row = (
+                    await session.execute(
+                        text(
+                            "SELECT m.id, m.project_id, p.slug AS project_slug, m.subject, "
+                            "m.body_md, m.importance, m.ack_required, m.thread_id, m.reply_to, "
+                            "m.created_ts, m.attachments, sender.name AS sender_name, "
+                            "sender.display_name AS sender_display_name, "
+                            "sender.project_id AS sender_project_id, "
+                            "sender_project.slug AS sender_project_slug "
+                            "FROM messages m "
+                            "JOIN projects p ON p.id = m.project_id "
+                            "JOIN agents sender ON sender.id = m.sender_id "
+                            "LEFT JOIN projects sender_project ON sender_project.id = sender.project_id "
+                            "WHERE m.project_id = :project_id AND m.id = :message_id"
+                        ),
+                        {"project_id": project_id, "message_id": message_id},
+                    )
+                ).mappings().first()
+                if row is None:
+                    raise HTTPException(status_code=404, detail="Message not found")
+                recipients = await _mail_ui_safe_recipient_map(session, [message_id])
+                return _mail_ui_message_detail_from_row(
+                    row,
+                    recipients=recipients[message_id],
+                    settings=settings,
+                    request=request,
+                    visible_roles=visible_roles,
+                )
+
+        @fastapi_app.get(
+            "/mail/api/v1/projects/{project_id}/threads/{thread_id}",
+            response_model=MailUiThreadResponse,
+        )
+        async def mail_ui_thread_v1(
+            project_id: int,
+            thread_id: str,
+            request: Request,
+            limit: int = Query(default=50, ge=1, le=100),
+            cursor: str | None = Query(
+                default=None,
+                min_length=1,
+                max_length=_MAIL_UI_CURSOR_MAX_LENGTH,
+            ),
+        ) -> MailUiThreadResponse:
+            """Return a bounded, newest-first page from one visible thread."""
+            if not thread_id or len(thread_id) > 128:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail="Invalid thread id.",
+                )
+            cursor_key = _mail_ui_decode_cursor(cursor) if cursor is not None else None
+            await ensure_schema()
+            async with get_session() as session:
+                visible_roles = await _mail_ui_visible_project_roles(
+                    settings=settings,
+                    request=request,
+                    session=session,
+                )
+                if project_id not in visible_roles:
+                    raise HTTPException(status_code=404, detail="Project not found")
+                total_result = await session.execute(
+                    text(
+                        "SELECT COUNT(*) FROM messages m "
+                        "WHERE m.project_id = :project_id AND m.thread_id = :thread_id"
+                    ),
+                    {"project_id": project_id, "thread_id": thread_id},
+                )
+                total = int(total_result.scalar_one())
+                if total == 0:
+                    raise HTTPException(status_code=404, detail="Thread not found")
+
+                cursor_predicate = ""
+                page_parameters: dict[str, Any] = {
+                    "project_id": project_id,
+                    "thread_id": thread_id,
+                    "page_limit": limit + 1,
+                }
+                if cursor_key is not None:
+                    cursor_created_ts, cursor_message_id = cursor_key
+                    cursor_predicate = (
+                        f" AND ({_MAIL_UI_CREATED_TS_KEY_SQL} < :cursor_created_ts "
+                        f"OR ({_MAIL_UI_CREATED_TS_KEY_SQL} = :cursor_created_ts "
+                        "AND m.id < :cursor_message_id))"
+                    )
+                    page_parameters.update(
+                        {
+                            "cursor_created_ts": cursor_created_ts,
+                            "cursor_message_id": cursor_message_id,
+                        }
+                    )
+                rows = await session.execute(
+                    text(
+                        "SELECT m.id, m.project_id, p.slug AS project_slug, m.subject, "
+                        "m.body_md, m.importance, m.ack_required, m.thread_id, m.reply_to, "
+                        f"m.created_ts, {_MAIL_UI_CREATED_TS_KEY_SQL} AS cursor_created_ts, "
+                        "m.attachments, sender.name AS sender_name, "
+                        "sender.display_name AS sender_display_name, "
+                        "sender.project_id AS sender_project_id, "
+                        "sender_project.slug AS sender_project_slug "
+                        "FROM messages m "
+                        "JOIN projects p ON p.id = m.project_id "
+                        "JOIN agents sender ON sender.id = m.sender_id "
+                        "LEFT JOIN projects sender_project ON sender_project.id = sender.project_id "
+                        "WHERE m.project_id = :project_id AND m.thread_id = :thread_id"
+                        f"{cursor_predicate} "
+                        f"ORDER BY {_MAIL_UI_CREATED_TS_KEY_SQL} DESC, m.id DESC "
+                        "LIMIT :page_limit"
+                    ),
+                    page_parameters,
+                )
+                page_rows = list(rows.mappings().all())
+                has_more = len(page_rows) > limit
+                response_rows = page_rows[:limit]
+                message_ids = [int(row["id"]) for row in response_rows]
+                recipients = await _mail_ui_safe_recipient_map(session, message_ids)
+                items = [
+                    _mail_ui_message_detail_from_row(
+                        row,
+                        recipients=recipients[int(row["id"])],
+                        settings=settings,
+                        request=request,
+                        visible_roles=visible_roles,
+                    )
+                    for row in response_rows
+                ]
+                next_cursor = (
+                    _mail_ui_encode_cursor(
+                        str(response_rows[-1]["cursor_created_ts"]),
+                        int(response_rows[-1]["id"]),
+                    )
+                    if has_more and response_rows
+                    else None
+                )
+            return MailUiThreadResponse(
+                items=items,
+                total=total,
+                next_cursor=next_cursor,
+            )
+
+        def _profile_response_for_user(row: Any) -> MailUiProfileResponse:
+            """Render one revalidated account without cookie or password material."""
+            global_role = webauth.normalize_ui_user_role(row.role)
+            if global_role is None or row.id is None:
+                raise RuntimeError("authenticated human has invalid profile identity")
+            return MailUiProfileResponse(
+                id=int(row.id),
+                username=str(row.username),
+                display_name=(
+                    str(row.display_name) if row.display_name is not None else None
+                ),
+                global_role=global_role,
+                profile_revision=int(row.profile_revision),
+            )
+
+        @fastapi_app.get(
+            _MAIL_PROFILE_API_PATH,
+            response_model=MailUiProfileResponse,
+            responses=_MAIL_UI_DOMAIN_ERROR_RESPONSES,
+        )
+        async def mail_ui_profile_get(request: Request) -> MailUiProfileResponse:
+            """Return the signed-in human's non-secret profile and global role."""
+            await ensure_schema()
+            async with get_session() as session:
+                row = await _mail_ui_revalidated_profile_user(request, session)
+                return _profile_response_for_user(row)
+
+        @fastapi_app.patch(
+            _MAIL_PROFILE_API_PATH,
+            response_model=MailUiProfileMutationResponse,
+            responses=_MAIL_UI_DOMAIN_MUTATION_ERROR_RESPONSES,
+        )
+        async def mail_ui_profile_patch(
+            request: Request,
+            profile: MailUiProfilePatch,
+        ) -> MailUiProfileMutationResponse:
+            """CAS-update only the signed-in human's normalized display name."""
+            principal = _mail_ui_profile_principal(request)
+            await ensure_schema()
+            try:
+                # The domain operation owns BEGIN IMMEDIATE and therefore must be
+                # the very first database action on this fresh session.
+                async with get_session() as session:
+                    result = await mutate_ui_user_display_name(
+                        session,
+                        target_user_id=principal["id"],
+                        account_generation=principal["session_generation"],
+                        expected_session_epoch=principal["session_epoch"],
+                        expected_profile_revision=profile.expected_profile_revision,
+                        display_name=profile.display_name,
+                    )
+            except UiProfileMutationError as exc:
+                raise _mail_ui_profile_http_exception(exc) from None
+            return MailUiProfileMutationResponse(
+                changed=result.changed,
+                display_name=result.display_name,
+                profile_revision=result.profile_revision,
+            )
+
+        @fastapi_app.get(
+            _MAIL_ADMIN_ACCESS_API_PATH,
+            response_model=MailUiAdminAccessResponse,
+            responses=_MAIL_UI_DOMAIN_ERROR_RESPONSES,
+        )
+        async def mail_ui_admin_access_get(request: Request) -> MailUiAdminAccessResponse:
+            """Return one consistent access-management snapshot to an administrator."""
+            await ensure_schema()
+            async with get_session() as session:
+                # This is the first SELECT in the fresh session. It both
+                # revalidates every cookie-bound identity claim and establishes
+                # the SQLite read snapshot used by all three matrix queries.
+                await _mail_ui_revalidated_admin_user(request, session)
+                user_rows = (
+                    await session.execute(
+                        text(
+                            "SELECT id, username, display_name, disabled, role, "
+                            "session_generation, session_epoch FROM ui_users "
+                            "ORDER BY lower(username), id"
+                        )
+                    )
+                ).mappings().all()
+                project_rows = (
+                    await session.execute(
+                        text(
+                            "SELECT id, slug, human_key, project_generation, archived_at "
+                            "FROM projects ORDER BY lower(slug), id"
+                        )
+                    )
+                ).mappings().all()
+                assignment_rows = (
+                    await session.execute(
+                        text(
+                            "SELECT user_id, project_id, role FROM ui_project_assignments "
+                            "ORDER BY user_id, project_id"
+                        )
+                    )
+                ).mappings().all()
+
+            user_ids = {int(row["id"]) for row in user_rows}
+            project_ids = {int(row["id"]) for row in project_rows}
+            assignments_by_user: dict[int, list[MailUiAdminAssignmentSummary]] = {
+                user_id: [] for user_id in user_ids
+            }
+            for row in assignment_rows:
+                user_id = int(row["user_id"])
+                project_id = int(row["project_id"])
+                assignment_role = webauth.normalize_project_role(row["role"])
+                if (
+                    user_id not in user_ids
+                    or project_id not in project_ids
+                    or assignment_role is None
+                ):
+                    raise RuntimeError("invalid persisted UI project assignment")
+                assignments_by_user[user_id].append(
+                    MailUiAdminAssignmentSummary(
+                        project_id=project_id,
+                        role=assignment_role,
+                    )
+                )
+
+            users: list[MailUiAdminUserSummary] = []
+            for row in user_rows:
+                user_id = int(row["id"])
+                global_role = webauth.normalize_ui_user_role(row["role"])
+                generation = str(row["session_generation"] or "")
+                if global_role is None or re.fullmatch(r"[0-9a-f]{64}", generation) is None:
+                    raise RuntimeError("invalid persisted UI user access identity")
+                users.append(
+                    MailUiAdminUserSummary(
+                        id=user_id,
+                        username=str(row["username"]),
+                        display_name=(
+                            str(row["display_name"])
+                            if row["display_name"] is not None
+                            else None
+                        ),
+                        disabled=bool(row["disabled"]),
+                        global_role=global_role,
+                        account_generation=generation,
+                        access_version=int(row["session_epoch"]),
+                        assignments=assignments_by_user[user_id],
+                    )
+                )
+
+            projects: list[MailUiAdminProjectSummary] = []
+            for row in project_rows:
+                generation = str(row["project_generation"] or "")
+                if re.fullmatch(r"[0-9a-f]{64}", generation) is None:
+                    raise RuntimeError("invalid persisted project access identity")
+                projects.append(
+                    MailUiAdminProjectSummary(
+                        id=int(row["id"]),
+                        slug=str(row["slug"]),
+                        human_key=str(row["human_key"]),
+                        project_generation=generation,
+                        archived_at=(
+                            _mail_ui_datetime(row["archived_at"])
+                            if row["archived_at"] is not None
+                            else None
+                        ),
+                    )
+                )
+            return MailUiAdminAccessResponse(users=users, projects=projects)
+
+        @fastapi_app.put(
+            _MAIL_ADMIN_ASSIGNMENT_API_PATH,
+            response_model=MailUiAdminProjectAccessResponse,
+            responses=_MAIL_UI_DOMAIN_MUTATION_ERROR_RESPONSES,
+        )
+        async def mail_ui_admin_assignment_put(
+            target_user_id: Annotated[int, FastApiPath(gt=0)],
+            project_id: Annotated[int, FastApiPath(gt=0)],
+            request: Request,
+            mutation: MailUiAdminProjectAccessPut,
+        ) -> MailUiAdminProjectAccessResponse:
+            """Grant, replace, or revoke one member assignment with full CAS."""
+            actor = _mail_ui_require_admin_principal(request)
+            await ensure_schema()
+            try:
+                # Do not pre-read through this session. The domain operation must
+                # acquire its own BEGIN IMMEDIATE boundary before every check.
+                async with get_session() as session:
+                    result = await mutate_ui_project_access(
+                        session,
+                        actor_user_id=actor["id"],
+                        actor_account_generation=actor["session_generation"],
+                        expected_actor_session_epoch=actor["session_epoch"],
+                        trusted_cli_actor=False,
+                        target_user_id=target_user_id,
+                        project_id=project_id,
+                        expected_project_generation=mutation.expected_project_generation,
+                        role=mutation.role,
+                        expected_access_version=mutation.expected_access_version,
+                        account_generation=mutation.account_generation,
+                    )
+            except UiAccessMutationError as exc:
+                raise _mail_ui_access_http_exception(exc) from None
+            return MailUiAdminProjectAccessResponse(
+                changed=result.changed,
+                role=result.role,
+                access_version=result.access_version,
+            )
+
         def _preferences_response_for_user(row: Any) -> MailUiPreferencesResponse:
             """Render a row whose locale integrity is enforced by the schema."""
             return _mail_ui_preferences_response(
@@ -3788,6 +5115,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 request.headers.get("origin", ""),
                 request.headers.get("referer", ""),
                 request.headers.get("host", ""),
+                expected_scheme=request.url.scheme,
             ):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
@@ -3837,6 +5165,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 request.headers.get("origin", ""),
                 request.headers.get("referer", ""),
                 request.headers.get("host", ""),
+                expected_scheme=request.url.scheme,
             ):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
@@ -4218,7 +5547,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 headers=_MAIL_REACT_INDEX_HEADERS,
             )
 
-        @fastapi_app.get(_MAIL_REACT_BASE_PATH, include_in_schema=False)
+        @fastapi_app.api_route(
+            "/mail/v2",
+            methods=["GET", "HEAD"],
+            include_in_schema=False,
+        )
         async def mail_react_slash_redirect(request: Request) -> Response:
             """Canonicalize the React shell URL before the project-slug route."""
             location = f"{_MAIL_REACT_BASE_PATH}/"
@@ -4226,16 +5559,21 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 location = f"{location}?{request.url.query}"
             return Response(
                 status_code=status.HTTP_307_TEMPORARY_REDIRECT,
-                headers={"Location": location},
+                headers={**_MAIL_REACT_INDEX_HEADERS, "Location": location},
             )
 
-        @fastapi_app.get(f"{_MAIL_REACT_BASE_PATH}/", include_in_schema=False)
+        @fastapi_app.api_route(
+            "/mail/v2/",
+            methods=["GET", "HEAD"],
+            include_in_schema=False,
+        )
         async def mail_react_index() -> FileResponse:
             """Serve the authenticated React shell."""
             return _mail_react_index_response()
 
-        @fastapi_app.get(
-            f"{_MAIL_REACT_BASE_PATH}/assets/{{asset_path:path}}",
+        @fastapi_app.api_route(
+            "/mail/v2/assets/{asset_path:path}",
+            methods=["GET", "HEAD"],
             include_in_schema=False,
         )
         async def mail_react_asset(asset_path: str) -> FileResponse:
@@ -4265,10 +5603,16 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail="React Mail UI asset not found.",
                 )
-            return FileResponse(asset_file, headers=_MAIL_REACT_ASSET_HEADERS)
+            asset_headers = (
+                _MAIL_REACT_LEGACY_ASSET_HEADERS
+                if asset_path in {"legacy.css", "legacy.js"}
+                else _MAIL_REACT_ASSET_HEADERS
+            )
+            return FileResponse(asset_file, headers=asset_headers)
 
-        @fastapi_app.get(
-            f"{_MAIL_REACT_BASE_PATH}/{{spa_path:path}}",
+        @fastapi_app.api_route(
+            "/mail/v2/{spa_path:path}",
+            methods=["GET", "HEAD"],
             include_in_schema=False,
         )
         async def mail_react_spa_fallback(spa_path: str) -> FileResponse:
@@ -5663,8 +7007,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     text(
                         "SELECT a.name, a.project_id, a.retired_at "
                         "FROM message_recipients mr JOIN agents a ON a.id = mr.agent_id "
-                        "WHERE mr.message_id = :mid "
-                        "ORDER BY CASE mr.kind WHEN 'to' THEN 0 WHEN 'cc' THEN 1 ELSE 2 END, a.name"
+                        "WHERE mr.message_id = :mid AND mr.kind IN ('to', 'cc') "
+                        "ORDER BY CASE mr.kind WHEN 'to' THEN 0 ELSE 1 END, a.name"
                     ),
                     {"mid": message_id},
                 )
@@ -5719,7 +7063,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             request: Request,
             reply_to: int | None = None,
         ) -> HTMLResponse:
-            """Display a new-message composer or a validated reply composer.
+            """Refuse the legacy composer until overseer writes are atomic.
 
             Args:
                 project: Project slug or canonical human key.
@@ -5730,7 +7074,6 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 The composer, or an explicit error page when the requested
                 reply cannot be routed safely.
             """
-            await ensure_schema()
             async with get_session() as session:
                 # Get project
                 prow = await _resolve_mail_project(session, project)
@@ -5752,6 +7095,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         status_code=403,
                         detail="Forbidden: new messages require the admin role",
                     )
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=_MAIL_LEGACY_OVERSEER_UNAVAILABLE_DETAIL,
+                )
+
                 agent_rows = await session.execute(
                     text("SELECT name FROM agents WHERE project_id = :pid AND retired_at IS NULL ORDER BY name"),
                     {"pid": pid}
@@ -5796,20 +7144,31 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         @fastapi_app.post("/mail/{project}/overseer/reply")
         @fastapi_app.post("/mail/{project}/overseer/send")
         async def overseer_send(project: str, request: Request) -> JSONResponse:
-            """Send message from Human Overseer to selected agents."""
-            await ensure_schema()
+            """Refuse legacy overseer writes until DB and archive commits are atomic."""
             reply_endpoint = request.url.path.endswith("/overseer/reply")
             async with get_session() as authorization_session:
                 authorization_project = await _resolve_mail_project(authorization_session, project)
                 if authorization_project is None:
                     raise HTTPException(status_code=404, detail="Project not found")
-                await _mail_ui_require_project_access(
+                access = await _mail_ui_require_project_access(
                     settings=settings,
                     request=request,
                     session=authorization_session,
                     project_id=int(authorization_project[0]),
                     operate=reply_endpoint,
                 )
+                if not reply_endpoint and not access["can_compose"]:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Forbidden: new messages require the admin role",
+                    )
+
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=_MAIL_LEGACY_OVERSEER_UNAVAILABLE_DETAIL,
+            )
+
+            await ensure_schema()
 
             try:
                 try:
@@ -5879,34 +7238,6 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     subject = ""
                     thread_id = None
 
-                # Add Human Overseer preamble (pure markdown for cross-renderer compatibility)
-                preamble = """---
-
-        🚨 MESSAGE FROM HUMAN OVERSEER 🚨
-
-        This message is from a human operator overseeing this project. Please prioritize the instructions below over your current tasks.
-
-        You should:
-        1. Temporarily pause your current work
-        2. Complete the request described below
-        3. Resume your original plans afterward (unless modified by these instructions)
-
-        The human's guidance supersedes all other priorities.
-
-        ---
-
-        """
-                full_body = preamble + body_md
-
-                # Validate combined length (preamble + user message)
-                if len(full_body) > 50000:
-                    preamble_length = len(preamble)
-                    max_user_length = 50000 - preamble_length
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Message body too long ({len(body_md)} characters). Maximum is {max_user_length} characters to accommodate the overseer preamble ({preamble_length} characters)."
-                    )
-
                 # Keep database work and archive work in separate phases so
                 # the request never holds a live DB transaction while doing
                 # archive/Git I/O.
@@ -5928,6 +7259,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     project_slug = prow[1]
                     project_human_key = prow[2]
 
+                    # Revalidate the human and derive the effective locale after
+                    # BEGIN IMMEDIATE. A revoked session or a changed preference
+                    # cannot cross the gap between the early check and this write.
+                    correspondence_locale = await _mail_ui_effective_correspondence_locale(
+                        settings=settings,
+                        request=request,
+                        session=session,
+                    )
                     access = await _mail_ui_require_project_access(
                         settings=settings,
                         request=request,
@@ -5948,6 +7287,40 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                             session,
                             message_id=reply_to,
                             project_id=project_id,
+                        )
+
+                    correspondence_advisory = _mail_ui_correspondence_advisory(
+                        correspondence_locale
+                    )
+                    preamble = f"""---
+
+        🚨 MESSAGE FROM HUMAN OVERSEER 🚨
+
+        This message is from a human operator overseeing this project. Please prioritize the instructions below over your current tasks.
+
+        You should:
+        1. Temporarily pause your current work
+        2. Complete the request described below
+        3. Resume your original plans afterward (unless modified by these instructions)
+
+        The human's guidance supersedes all other priorities.
+
+        {correspondence_advisory}
+
+        ---
+
+        """
+                    full_body = preamble + body_md
+                    if len(full_body) > 50000:
+                        preamble_length = len(preamble)
+                        max_user_length = 50000 - preamble_length
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                f"Message body too long ({len(body_md)} characters). "
+                                f"Maximum is {max_user_length} characters to accommodate "
+                                f"the overseer preamble ({preamble_length} characters)."
+                            ),
                         )
 
                     placeholders = ", ".join([f":name_{i}" for i in range(len(recipients))])
@@ -6837,6 +8210,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 path: item
                 for path, item in paths.items()
                 if path in _MAIL_ACCOUNT_API_PATHS
+                or path.startswith("/mail/api/v1/")
                 or not (path == "/mail" or path.startswith("/mail/"))
             }
         fastapi_app.openapi_schema = schema

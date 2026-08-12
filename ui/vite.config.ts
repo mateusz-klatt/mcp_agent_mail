@@ -9,6 +9,7 @@ export default defineConfig({
   plugins: [react()],
   test: {
     environment: "jsdom",
+    include: ["src/**/*.test.{ts,tsx}"],
     setupFiles: ["./src/test/setup.ts"],
     coverage: {
       provider: "v8",
@@ -19,6 +20,7 @@ export default defineConfig({
       ],
       include: ["src/**/*.{ts,tsx}"],
       exclude: [
+        "src/legacy.ts",
         "src/main.tsx",
         "src/vite-env.d.ts",
         "src/test/**",

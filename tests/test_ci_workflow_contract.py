@@ -116,7 +116,7 @@ def test_sonar_uses_ubuntu_gate_while_portability_remains_required() -> None:
     assert not any(line.startswith("    continue-on-error:") for line in portability)
 
     common_commands = (
-        "uv sync --dev",
+        "uv sync --dev --frozen",
         "uv run ruff check",
         "uvx ty check --python-version 3.14 --python-platform all",
     )
@@ -130,10 +130,11 @@ def test_sonar_uses_ubuntu_gate_while_portability_remains_required() -> None:
     assert any("tests/benchmarks/bench_*.py" in line for line in ubuntu)
     assert "          name: coverage-${{ github.sha }}" in ubuntu
     assert not any("coverage-${{ github.sha }}" in line for line in portability)
-    assert "    needs: [build-and-test, frontend]" in sonar
+    assert "    needs: [build-and-test, frontend, frontend-webkit]" in sonar
     assert not any("portability" in line for line in sonar)
     assert "        needs.build-and-test.result == 'success' &&" in sonar
     assert "        needs.frontend.result == 'success' &&" in sonar
+    assert "        needs.frontend-webkit.result == 'success' &&" in sonar
 
 
 def test_reusable_sonar_caller_grants_requested_permissions() -> None:

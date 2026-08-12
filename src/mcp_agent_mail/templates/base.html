@@ -7,11 +7,6 @@
     <link rel="icon" href="/favicon.ico" type="image/svg+xml" sizes="any" />
     <title>{% block title %}Agent Mail{% endblock %}</title>
 
-    <!-- Fonts -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-
     <script>
       (function () {
         try {
@@ -28,209 +23,10 @@
       })();
     </script>
 
-    <!-- Tailwind CSS -->
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script>
-      tailwind.config = {
-        darkMode: 'class',
-        theme: {
-          extend: {
-            fontFamily: {
-              sans: ['Inter', 'system-ui', '-apple-system', 'sans-serif'],
-            },
-            colors: {
-              primary: {
-                50: '#eef2ff',
-                100: '#e0e7ff',
-                200: '#c7d2fe',
-                300: '#a5b4fc',
-                400: '#818cf8',
-                500: '#6366f1',
-                600: '#4f46e5',
-                700: '#4338ca',
-                800: '#3730a3',
-                900: '#312e81',
-                950: '#1e1b4b',
-              },
-              success: {
-                50: '#f0fdf4',
-                100: '#dcfce7',
-                200: '#bbf7d0',
-                300: '#86efac',
-                400: '#4ade80',
-                500: '#10b981',
-                600: '#059669',
-                700: '#047857',
-                800: '#065f46',
-                900: '#064e3b',
-                950: '#022c22',
-              },
-              warning: {
-                50: '#fffbeb',
-                100: '#fef3c7',
-                200: '#fde68a',
-                300: '#fcd34d',
-                400: '#fbbf24',
-                500: '#f59e0b',
-                600: '#d97706',
-                700: '#b45309',
-                800: '#92400e',
-                900: '#78350f',
-                950: '#451a03',
-              },
-              danger: {
-                50: '#fef2f2',
-                100: '#fee2e2',
-                200: '#fecaca',
-                300: '#fca5a5',
-                400: '#f87171',
-                500: '#ef4444',
-                600: '#dc2626',
-                700: '#b91c1c',
-                800: '#991b1b',
-                900: '#7f1d1d',
-                950: '#450a0a',
-              },
-            },
-            boxShadow: {
-              'soft': '0 2px 8px 0 rgba(0, 0, 0, 0.05)',
-              'medium': '0 4px 16px 0 rgba(0, 0, 0, 0.08)',
-              'large': '0 8px 32px 0 rgba(0, 0, 0, 0.12)',
-              'glow': '0 0 20px rgba(99, 102, 241, 0.3)',
-            },
-            animation: {
-              'fade-in': 'fadeIn 0.2s ease-in-out',
-              'slide-up': 'slideUp 0.3s ease-out',
-              'slide-down': 'slideDown 0.3s ease-out',
-              'scale-in': 'scaleIn 0.2s ease-out',
-              'shimmer': 'shimmer 2s infinite',
-            },
-            keyframes: {
-              fadeIn: {
-                '0%': { opacity: '0' },
-                '100%': { opacity: '1' },
-              },
-              slideUp: {
-                '0%': { transform: 'translateY(10px)', opacity: '0' },
-                '100%': { transform: 'translateY(0)', opacity: '1' },
-              },
-              slideDown: {
-                '0%': { transform: 'translateY(-10px)', opacity: '0' },
-                '100%': { transform: 'translateY(0)', opacity: '1' },
-              },
-              scaleIn: {
-                '0%': { transform: 'scale(0.95)', opacity: '0' },
-                '100%': { transform: 'scale(1)', opacity: '1' },
-              },
-              shimmer: {
-                '0%': { backgroundPosition: '-1000px 0' },
-                '100%': { backgroundPosition: '1000px 0' },
-              },
-            },
-          },
-        },
-      }
-    </script>
-
-    <!-- Alpine.js (collapse plugin must load before core) -->
-    <script defer src="https://cdn.jsdelivr.net/npm/@alpinejs/collapse@3.x.x/dist/cdn.min.js"></script>
-    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
-
-    <!-- Lucide Icons -->
-    <script defer src="https://unpkg.com/lucide@latest"></script>
-
-    <!-- Prism.js for code highlighting -->
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" />
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-markdown.min.js"></script>
-
-    <!-- Marked.js for markdown rendering -->
-    <script src="https://cdn.jsdelivr.net/npm/marked@11/marked.min.js"></script>
-
-    <!-- DOMPurify for HTML sanitization (prevent XSS in markdown previews) -->
-    <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
-
-    <!-- Day.js for date formatting (lightweight utility) -->
-    <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.10/dayjs.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.10/plugin/relativeTime.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.10/plugin/calendar.min.js"></script>
-
-    <!-- Tippy.js for beautiful tooltips -->
-    <script src="https://unpkg.com/@popperjs/core@2"></script>
-    <script src="https://unpkg.com/tippy.js@6"></script>
-    <link rel="stylesheet" href="https://unpkg.com/tippy.js@6/dist/tippy.css" />
-    <link rel="stylesheet" href="https://unpkg.com/tippy.js@6/themes/light.css" />
-    <link rel="stylesheet" href="https://unpkg.com/tippy.js@6/animations/scale.css" />
-
-    <!-- NProgress for loading indicators -->
-    <script src="https://unpkg.com/nprogress@0.2.0/nprogress.js"></script>
-    <link rel="stylesheet" href="https://unpkg.com/nprogress@0.2.0/nprogress.css" />
-
-    <!-- Chart.js for data visualization -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-
-    <!-- Anime.js for advanced animations -->
-    <script src="https://cdn.jsdelivr.net/npm/animejs@3.2.1/lib/anime.min.js"></script>
-
-    <!-- SortableJS for drag and drop -->
-    <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
-
-    <!-- Fuse.js for fuzzy search -->
-    <script src="https://cdn.jsdelivr.net/npm/fuse.js@7.0.0/dist/fuse.min.js"></script>
-
-    <!-- Hotkeys.js for keyboard shortcuts -->
-    <script src="https://unpkg.com/hotkeys-js@3.13.7/dist/hotkeys.min.js"></script>
-
-    <!-- Particles.js for background effects -->
-    <script src="https://cdn.jsdelivr.net/npm/particles.js@2.0.0/particles.min.js"></script>
-
-    <!-- CountUp.js for number animations -->
-    <script src="https://cdn.jsdelivr.net/npm/countup@1.8.2/dist/countUp.min.js"></script>
-
-    <!-- Mo.js for micro-animations -->
-    <script defer src="https://cdn.jsdelivr.net/npm/@mojs/core@1.7.1/dist/mo.umd.js"></script>
-
-    <!-- Splitting.js for advanced text animations -->
-    <script src="https://unpkg.com/splitting@1.0.6/dist/splitting.min.js"></script>
-    <link rel="stylesheet" href="https://unpkg.com/splitting@1.0.6/dist/splitting.css" />
-
-    <!-- Mermaid.js for git graphs and diagrams -->
-    <script type="module">
-      import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
-      window.mermaid = mermaid;
-      mermaid.initialize({
-        startOnLoad: false,
-        theme: 'base',
-        themeVariables: {
-          primaryColor: '#6366f1',
-          primaryTextColor: '#fff',
-          primaryBorderColor: '#4f46e5',
-          lineColor: '#6366f1',
-          secondaryColor: '#818cf8',
-          tertiaryColor: '#a5b4fc',
-          background: '#ffffff',
-          mainBkg: '#6366f1',
-          secondBkg: '#818cf8',
-          tertiaryBkg: '#a5b4fc'
-        },
-        gitGraph: {
-          rotateCommitLabel: false,
-          mainBranchName: 'main',
-          showBranches: true,
-          showCommitLabel: true
-        }
-      });
-    </script>
-
-    <!-- Diff2Html for beautiful git diffs -->
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/diff2html@3.4.47/bundles/css/diff2html.min.css" />
-    <script src="https://cdn.jsdelivr.net/npm/diff2html@3.4.47/bundles/js/diff2html-ui.min.js"></script>
-
-    <!-- Vis.js for network graphs -->
-    <script src="https://unpkg.com/vis-network@9.1.9/dist/vis-network.min.js"></script>
-    <link href="https://unpkg.com/vis-network@9.1.9/styles/vis-network.min.css" rel="stylesheet" type="text/css" />
+    <!-- Every dependency is pinned and bundled at build time. Browsers never
+         contact a package CDN, font host, or telemetry endpoint. -->
+    <link rel="stylesheet" href="/mail/v2/assets/legacy.css" />
+    <script src="/mail/v2/assets/legacy.js"></script>
 
     <style>
       [x-cloak] { display: none !important; }
@@ -2251,6 +2047,14 @@
                 <path stroke-linecap="round" stroke-linejoin="round" d="M12 2v2m0 16v2m10-10h-2M6 12H4m15.364 6.364-1.414-1.414M6.05 6.05 4.636 4.636m12.728 0-1.414 1.414M6.05 17.95l-1.414 1.414" />
               </svg>
             </button>
+            <form action="/mail/logout" method="post" class="shrink-0">
+              <button type="submit"
+                      class="inline-flex min-h-[44px] min-w-[44px] items-center justify-center rounded-lg p-2 text-slate-500 transition-colors hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800"
+                      aria-label="Sign out" title="Sign out">
+                <i data-lucide="log-out" class="w-5 h-5" aria-hidden="true"></i>
+                <span class="sr-only">Sign out</span>
+              </button>
+            </form>
           </div>
           </div>
         </div>

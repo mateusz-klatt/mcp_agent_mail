@@ -538,7 +538,7 @@ class TestHTTPLockScope:
     """
 
     @pytest.mark.asyncio
-    async def test_overseer_send_archives_after_db_session_closes(self, isolated_env, monkeypatch):
+    async def test_overseer_send_is_held_before_archive_write(self, isolated_env, monkeypatch):
         import mcp_agent_mail.http as http_module
         import mcp_agent_mail.storage as storage_module
         from mcp_agent_mail.db import get_session as real_get_session
@@ -599,8 +599,11 @@ class TestHTTPLockScope:
                 },
             )
 
-        assert response.status_code == 200
-        assert archive_write_depths == [0]
+        assert response.status_code == 503
+        assert response.json()["detail"] == (
+            "Human Overseer messaging is temporarily unavailable while atomic archive persistence is implemented"
+        )
+        assert archive_write_depths == []
 
     @pytest.mark.asyncio
     async def test_delete_messages_archives_after_db_session_closes(self, isolated_env, monkeypatch):

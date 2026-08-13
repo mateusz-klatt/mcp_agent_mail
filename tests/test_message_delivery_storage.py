@@ -515,7 +515,11 @@ def test_posix_readonly_file_boundary_flushes_and_closes_descriptor(
 
     existing_file = tmp_path / "existing"
     existing_file.write_bytes(b"already durable")
-    opened: list[tuple[Path, int]] = []
+    # Record the raw filesystem path rather than a Path. Patching os.name below
+    # also switches pathlib's flavour, so a Path built inside the patch is a
+    # PosixPath while tmp_path stayed a WindowsPath, and the two never compare
+    # equal on Windows even for an identical path.
+    opened: list[tuple[str, int]] = []
     flushed: list[int] = []
     closed: list[int] = []
 
@@ -523,14 +527,14 @@ def test_posix_readonly_file_boundary_flushes_and_closes_descriptor(
     monkeypatch.setattr(
         storage_module.os,
         "open",
-        lambda path, flags: opened.append((Path(path), flags)) or 47,
+        lambda path, flags: opened.append((os.fspath(path), flags)) or 47,
     )
     monkeypatch.setattr(storage_module.os, "fsync", flushed.append)
     monkeypatch.setattr(storage_module.os, "close", closed.append)
 
     _fsync_readonly_file_sync(existing_file)
 
-    assert opened == [(existing_file, os.O_RDONLY | getattr(os, "O_BINARY", 0))]
+    assert opened == [(os.fspath(existing_file), os.O_RDONLY | getattr(os, "O_BINARY", 0))]
     assert flushed == [47]
     assert closed == [47]
 

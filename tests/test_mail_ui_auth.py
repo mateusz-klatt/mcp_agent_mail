@@ -1766,15 +1766,15 @@ class TestMailUiPreferences:
                 app=cast(Any, default_proxy_app),
                 client=("172.19.0.1", 43112),
             ),
-            base_url="http://hermes.klatt.ie",
+            base_url="http://hermes.example",
             cookies=await _cookie("preferences-proxied", epoch),
         ) as client:
             rejected = await client.patch(
                 "/mail/api/v1/me/preferences",
                 json={"preferred_ui_locale": "pl"},
                 headers={
-                    "Origin": "https://hermes.klatt.ie",
-                    "Referer": "https://hermes.klatt.ie/mail/",
+                    "Origin": "https://hermes.example",
+                    "Referer": "https://hermes.example/mail/",
                     "X-Forwarded-Proto": "https",
                 },
             )
@@ -1784,15 +1784,15 @@ class TestMailUiPreferences:
                 app=cast(Any, proxied_app),
                 client=("172.19.0.1", 43112),
             ),
-            base_url="http://hermes.klatt.ie",
+            base_url="http://hermes.example",
             cookies=await _cookie("preferences-proxied", epoch),
         ) as client:
             response = await client.patch(
                 "/mail/api/v1/me/preferences",
                 json={"preferred_ui_locale": "pl"},
                 headers={
-                    "Origin": "https://hermes.klatt.ie",
-                    "Referer": "https://hermes.klatt.ie/mail/",
+                    "Origin": "https://hermes.example",
+                    "Referer": "https://hermes.example/mail/",
                     "X-Forwarded-Proto": "https",
                 },
             )

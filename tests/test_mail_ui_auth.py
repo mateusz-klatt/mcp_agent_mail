@@ -220,7 +220,7 @@ class TestPublicRootAndFavicon:
                 expected_root_headers = {
                     "cache-control": "no-store, no-transform",
                     "content-security-policy": REACT_CSP,
-                    "referrer-policy": "no-referrer",
+                    "referrer-policy": "strict-origin-when-cross-origin",
                     "x-content-type-options": "nosniff",
                     "x-frame-options": "DENY",
                     "location": f"/mail?{raw_query}",
@@ -679,7 +679,7 @@ class TestMailUiSession:
         assert response.headers["location"] == "/mail"
         assert response.headers["Cache-Control"] == "no-store, no-transform"
         assert response.headers["Content-Security-Policy"] == LEGACY_CSP
-        assert response.headers["Referrer-Policy"] == "no-referrer"
+        assert response.headers["Referrer-Policy"] == "strict-origin-when-cross-origin"
         assert response.headers["X-Frame-Options"] == "DENY"
 
     @pytest.mark.asyncio
@@ -730,7 +730,7 @@ class TestMailUiLogout:
             assert response.headers["Allow"] == "POST"
             assert response.headers["Cache-Control"] == "no-store, no-transform"
             assert response.headers["Content-Security-Policy"] == LEGACY_CSP
-            assert response.headers["Referrer-Policy"] == "no-referrer"
+            assert response.headers["Referrer-Policy"] == "strict-origin-when-cross-origin"
             assert response.headers["X-Frame-Options"] == "DENY"
             assert "set-cookie" not in response.headers
         assert settings.mail_ui.cookie_name not in responses[0].cookies
@@ -885,7 +885,7 @@ class TestMailReactShell:
             assert response.headers["location"] == "/mail?tab=projects"
             assert response.headers["Cache-Control"] == "no-store, no-transform"
             assert response.headers["Content-Security-Policy"] == REACT_CSP
-            assert response.headers["Referrer-Policy"] == "no-referrer"
+            assert response.headers["Referrer-Policy"] == "strict-origin-when-cross-origin"
             assert response.headers["X-Content-Type-Options"] == "nosniff"
             assert response.headers["X-Frame-Options"] == "DENY"
             assert response.content == b""
@@ -915,7 +915,7 @@ class TestMailReactShell:
         )
         assert response.headers["Cache-Control"] == "no-store, no-transform"
         assert response.headers["Content-Security-Policy"] == LEGACY_CSP
-        assert response.headers["Referrer-Policy"] == "no-referrer"
+        assert response.headers["Referrer-Policy"] == "strict-origin-when-cross-origin"
         assert response.headers["X-Content-Type-Options"] == "nosniff"
         assert response.headers["X-Frame-Options"] == "DENY"
 
@@ -992,7 +992,7 @@ class TestMailReactShell:
             assert response.status_code == 200
             assert response.headers["Cache-Control"] == "no-store, no-transform"
             assert response.headers["Content-Security-Policy"] == REACT_CSP
-            assert response.headers["Referrer-Policy"] == "no-referrer"
+            assert response.headers["Referrer-Policy"] == "strict-origin-when-cross-origin"
             assert response.headers["X-Content-Type-Options"] == "nosniff"
             assert response.headers["X-Frame-Options"] == "DENY"
             assert response.headers["Content-Type"].startswith("text/html")
@@ -1033,7 +1033,7 @@ class TestMailReactShell:
         assert login.status_code == 200
         assert login.headers["Cache-Control"] == "no-store, no-transform"
         assert login.headers["Content-Security-Policy"] == LEGACY_CSP
-        assert login.headers["Referrer-Policy"] == "no-referrer"
+        assert login.headers["Referrer-Policy"] == "strict-origin-when-cross-origin"
         assert login.headers["X-Content-Type-Options"] == "nosniff"
         assert login.headers["X-Frame-Options"] == "DENY"
         assert 'href="/mail/assets/legacy.css"' in login.text
@@ -3557,8 +3557,64 @@ class TestMailUiRbacSurface:
         assert healthy.status_code == 303
         assert healthy.headers["Cache-Control"] == "no-store, no-transform"
         assert healthy.headers["Content-Security-Policy"] == LEGACY_CSP
-        assert healthy.headers["Referrer-Policy"] == "no-referrer"
+        assert healthy.headers["Referrer-Policy"] == "strict-origin-when-cross-origin"
         assert healthy.headers["X-Frame-Options"] == "DENY"
+
+    @pytest.mark.asyncio
+    async def test_login_rejects_opaque_origin_without_falling_back_to_referer(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """An explicit opaque Origin stays fail-closed even with a valid Referer."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        await _make_user("opaque-origin-user")
+        authentication_attempted = False
+
+        def authenticate(*_args: object) -> bool:
+            nonlocal authentication_attempted
+            authentication_attempted = True
+            return True
+
+        monkeypatch.setattr(webauth, "authenticate", authenticate)
+        http_module._login_failures.clear()
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://test",
+            ) as client:
+                response = await client.post(
+                    "/mail/login",
+                    data={
+                        "username": "opaque-origin-user",
+                        "password": "correct",
+                        "next": "/mail",
+                    },
+                    headers={
+                        "Origin": "null",
+                        "Referer": "http://test/mail/login",
+                        "Host": "test",
+                    },
+                )
+            async with get_session() as session:
+                last_login_ts = (
+                    await session.execute(
+                        text(
+                            "SELECT last_login_ts FROM ui_users "
+                            "WHERE username = 'opaque-origin-user'"
+                        )
+                    )
+                ).scalar_one()
+        finally:
+            login_failures = dict(http_module._login_failures)
+            http_module._login_failures.clear()
+
+        assert response.status_code == 403
+        assert response.json() == {"detail": "Cross-origin request rejected"}
+        assert "set-cookie" not in response.headers
+        assert authentication_attempted is False
+        assert last_login_ts is None
+        assert login_failures == {}
 
     @pytest.mark.asyncio
     async def test_static_bearer_is_limited_to_file_reservation_reads(

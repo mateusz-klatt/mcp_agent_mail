@@ -4,6 +4,7 @@ import {
   type Page,
   type Route,
 } from "@playwright/test";
+import { readFile } from "node:fs/promises";
 
 import type {
   AdminAccessSnapshot,
@@ -722,4 +723,52 @@ test("loads shell resources only from the canonical asset namespace", async ({ p
   expect(assetRequests.some((path) => path.startsWith("/mail/v2/"))).toBe(false);
   expect(state.externalRequests).toEqual([]);
   expect(state.browserErrors).toEqual([]);
+});
+
+test("production login form preserves a same-origin Origin header", async ({ page }) => {
+  const template = await readFile(
+    new URL("../../src/mcp_agent_mail/templates/mail_login.html", import.meta.url),
+    "utf8",
+  );
+  const renderedTemplate = template
+    .replace(/\{#[\s\S]*?#\}/gu, "")
+    .replace(/\{%\s*if error\s*%\}[\s\S]*?\{%\s*endif\s*%\}/gu, "")
+    .replaceAll("{{ next_url }}", "/mail");
+  let submittedOrigin: string | undefined;
+  let submittedSite: string | undefined;
+
+  await page.route("**/mail/login", async (route) => {
+    if (route.request().method() === "POST") {
+      submittedOrigin = route.request().headers().origin;
+      submittedSite = route.request().headers()["sec-fetch-site"];
+      await route.fulfill({
+        status: 401,
+        contentType: "text/html",
+        body: renderedTemplate,
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "text/html",
+      headers: { "Referrer-Policy": "strict-origin-when-cross-origin" },
+      body: renderedTemplate,
+    });
+  });
+
+  await page.goto("/mail/login");
+  await page.getByLabel("Username").fill("invalid-user");
+  await page.getByLabel("Password").fill("invalid-password");
+  await Promise.all([
+    page.waitForResponse(
+      (response) =>
+        response.url().endsWith("/mail/login") &&
+        response.request().method() === "POST",
+    ),
+    page.getByRole("button", { name: "Sign in" }).click(),
+  ]);
+
+  expect(submittedOrigin).toBe(new URL(page.url()).origin);
+  expect(submittedOrigin).not.toBe("null");
+  expect(submittedSite).toBe("same-origin");
 });

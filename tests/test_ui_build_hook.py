@@ -36,7 +36,7 @@ def _write_vite_output(
     assets = dist_root / "assets"
     assets.mkdir(parents=True, exist_ok=True)
     (dist_root / "index.html").write_text(
-        '<!doctype html><link rel="icon" href="/favicon.ico?v=iris" type="image/svg+xml" sizes="any">'
+        '<!doctype html><link rel="icon" href="/iris-rainbow.svg" type="image/svg+xml" sizes="any">'
         '<script type="module" src="/mail/assets/index-testhash.js"></script>'
         '<link rel="stylesheet" href="/mail/assets/index-testhash.css">',
         encoding="utf-8",

@@ -719,7 +719,7 @@ def _validate_dist(dist_root: Path, *, repository_root: Path) -> None:
         elif tag == "link":
             favicon_attributes = {
                 "rel": "icon",
-                "href": "/favicon.ico?v=iris",
+                "href": "/iris-rainbow.svg",
                 "type": "image/svg+xml",
                 "sizes": "any",
             }

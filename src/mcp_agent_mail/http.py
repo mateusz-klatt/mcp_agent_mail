@@ -930,10 +930,18 @@ _MAIL_LOGIN_STYLESHEET_PATH = f"{_MAIL_REACT_BASE_PATH}/assets/legacy.css"
 _MAIL_LOGIN_FLAG_FONT_PATH = (
     f"{_MAIL_REACT_BASE_PATH}/assets/TwemojiCountryFlags.woff2"
 )
-_IRIS_FAVICON_PATH = "/favicon.ico"
+_IRIS_FAVICON_PATH = "/iris-rainbow.svg"
 _IRIS_FAVICON_SVG = (
     b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">\n'
-    b'  <text x="32" y="47" text-anchor="middle" font-size="48">&#x1F308;</text>\n'
+    b'  <rect width="64" height="64" rx="14" fill="#17133b"/>\n'
+    b'  <g fill="none" stroke-width="4" stroke-linecap="round">\n'
+    b'    <path d="M8 47a24 24 0 0 1 48 0" stroke="#ef4444"/>\n'
+    b'    <path d="M12 47a20 20 0 0 1 40 0" stroke="#f97316"/>\n'
+    b'    <path d="M16 47a16 16 0 0 1 32 0" stroke="#facc15"/>\n'
+    b'    <path d="M20 47a12 12 0 0 1 24 0" stroke="#22c55e"/>\n'
+    b'    <path d="M24 47a8 8 0 0 1 16 0" stroke="#38bdf8"/>\n'
+    b'    <path d="M28 47a4 4 0 0 1 8 0" stroke="#8b5cf6"/>\n'
+    b"  </g>\n"
     b"</svg>\n"
 )
 _MAIL_HTML_CACHE_CONTROL = "no-store, no-transform"

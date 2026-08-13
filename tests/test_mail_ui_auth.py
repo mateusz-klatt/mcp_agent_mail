@@ -52,10 +52,18 @@ BEARER = "mail-ui-gate-bearer"
 SECRET = "mail-ui-gate-session-secret-0123456789"
 EXPECTED_FAVICON_SVG = (
     b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">\n'
-    b'  <text x="32" y="47" text-anchor="middle" font-size="48">&#x1F308;</text>\n'
+    b'  <rect width="64" height="64" rx="14" fill="#17133b"/>\n'
+    b'  <g fill="none" stroke-width="4" stroke-linecap="round">\n'
+    b'    <path d="M8 47a24 24 0 0 1 48 0" stroke="#ef4444"/>\n'
+    b'    <path d="M12 47a20 20 0 0 1 40 0" stroke="#f97316"/>\n'
+    b'    <path d="M16 47a16 16 0 0 1 32 0" stroke="#facc15"/>\n'
+    b'    <path d="M20 47a12 12 0 0 1 24 0" stroke="#22c55e"/>\n'
+    b'    <path d="M24 47a8 8 0 0 1 16 0" stroke="#38bdf8"/>\n'
+    b'    <path d="M28 47a4 4 0 0 1 8 0" stroke="#8b5cf6"/>\n'
+    b"  </g>\n"
     b"</svg>\n"
 )
-FAVICON_LINK = '<link rel="icon" href="/favicon.ico?v=iris" type="image/svg+xml" sizes="any" />'
+FAVICON_LINK = '<link rel="icon" href="/iris-rainbow.svg" type="image/svg+xml" sizes="any" />'
 REACT_CSP = (
     "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; "
     "img-src 'self' data:; font-src 'self'; object-src 'none'; "
@@ -223,8 +231,8 @@ class TestPublicRootAndFavicon:
             for caller, headers in callers.items():
                 root = await client.get(f"/?{raw_query}", headers=headers)
                 root_head = await client.head(f"/?{raw_query}", headers=headers)
-                favicon = await client.get("/favicon.ico", headers=headers)
-                favicon_head = await client.head("/favicon.ico", headers=headers)
+                favicon = await client.get("/iris-rainbow.svg", headers=headers)
+                favicon_head = await client.head("/iris-rainbow.svg", headers=headers)
 
                 expected_root_headers = {
                     "cache-control": "no-store, no-transform",
@@ -282,10 +290,11 @@ class TestPublicRootAndFavicon:
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             root_post = await client.post("/")
-            favicon_post = await client.post("/favicon.ico")
-            favicon_directory = await client.get("/favicon.ico/")
+            favicon_post = await client.post("/iris-rainbow.svg")
+            favicon_directory = await client.get("/iris-rainbow.svg/")
+            retired_favicon = await client.get("/favicon.ico")
 
-        for response in (root_post, favicon_post, favicon_directory):
+        for response in (root_post, favicon_post, favicon_directory, retired_favicon):
             assert response.status_code == 401
             assert response.json() == {"detail": "Unauthorized"}
             assert "location" not in response.headers
@@ -375,7 +384,7 @@ class TestPublicRootAndFavicon:
         _settings, app = _build(
             monkeypatch,
             MAIL_UI_SESSION_SECRET=SECRET,
-            HTTP_PATH="/favicon.ico/",
+            HTTP_PATH="/iris-rainbow.svg/",
         )
         health_call = {
             "jsonrpc": "2.0",
@@ -385,9 +394,9 @@ class TestPublicRootAndFavicon:
         }
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            anonymous_get = await client.get("/favicon.ico")
+            anonymous_get = await client.get("/iris-rainbow.svg")
             authenticated_post = await client.post(
-                "/favicon.ico",
+                "/iris-rainbow.svg",
                 headers={"Authorization": f"Bearer {BEARER}"},
                 json=health_call,
             )

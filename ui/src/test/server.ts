@@ -1,6 +1,8 @@
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 
+import type { SupportedLocale } from "../i18n";
+
 export const projectOne = {
   id: 11,
   slug: "mcp-agent-mail",
@@ -24,6 +26,32 @@ export const projectTwo = {
 export const projectsResponse = {
   items: [projectOne, projectTwo],
   total: 2,
+};
+
+export const projectAgentsResponse = {
+  project_id: projectOne.id,
+  project_generation: "d".repeat(64),
+  items: [
+    {
+      agent_id: 1,
+      agent_generation: "1".repeat(64),
+      name: "BlueLake",
+      display_name: null,
+    },
+    {
+      agent_id: 2,
+      agent_generation: "2".repeat(64),
+      name: "GreenDog",
+      display_name: "Release operator",
+    },
+    {
+      agent_id: 3,
+      agent_generation: "3".repeat(64),
+      name: "IndigoBridge",
+      display_name: "Schema keeper",
+    },
+  ],
+  total: 3,
 };
 
 export const messageOne = {
@@ -64,6 +92,16 @@ export const inboxResponse = {
   next_cursor: null,
 };
 
+export const searchResponse = {
+  items: [
+    {
+      ...messageOne,
+      snippet: "All rollout checks passed with the release marker.",
+    },
+  ],
+  next_cursor: null,
+};
+
 export const deliveryResponse = {
   id: "12345678-1234-4234-8234-123456789abc",
   status: "published" as const,
@@ -78,6 +116,13 @@ export const messageDetail = {
   body_md: "# Release\n\nAll checks passed. `<script>` remains plain text.",
   to: ["codex-wsl-home-1"],
   cc: [],
+  reply_target: {
+    agent_id: 41,
+    agent_generation: "4".repeat(64),
+    project_id: projectOne.id,
+    project_generation: projectAgentsResponse.project_generation,
+    canonical_name: messageOne.sender,
+  },
   attachments: [
     { type: "artifact", media_type: "application/json", size_bytes: 1280 },
     { type: null, media_type: null, size_bytes: null },
@@ -85,8 +130,8 @@ export const messageDetail = {
 };
 
 export const preferencesResponse = (
-  uiLocale: "en" | "pl",
-  correspondenceLocale: "en" | "pl" | null = null,
+  uiLocale: SupportedLocale,
+  correspondenceLocale: SupportedLocale | null = null,
 ) => ({
   stored: {
     preferred_ui_locale: uiLocale,
@@ -178,8 +223,8 @@ export const server = setupServer(
   ),
   http.patch("*/mail/api/v1/me/preferences", async ({ request }) => {
     const body = (await request.json()) as {
-      preferred_ui_locale?: "en" | "pl";
-      preferred_correspondence_locale?: "en" | "pl" | null;
+      preferred_ui_locale?: SupportedLocale;
+      preferred_correspondence_locale?: SupportedLocale | null;
     };
     return HttpResponse.json(
       preferencesResponse(
@@ -221,7 +266,14 @@ export const server = setupServer(
     },
   ),
   http.get("*/mail/api/v1/projects", () => HttpResponse.json(projectsResponse)),
+  http.get("*/mail/api/v1/projects/:projectId/agents", ({ params }) =>
+    HttpResponse.json({
+      ...projectAgentsResponse,
+      project_id: Number(params.projectId),
+    }),
+  ),
   http.get("*/mail/api/v1/inbox", () => HttpResponse.json(inboxResponse)),
+  http.get("*/mail/api/v1/search", () => HttpResponse.json(searchResponse)),
   http.get(
     "*/mail/api/v1/projects/:projectId/messages/:messageId",
     ({ params }) =>

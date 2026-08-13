@@ -810,7 +810,7 @@
     }
   },
   "search": {
-    "legacy_http_status": 404,
+    "legacy_http_status": 307,
     "tool_results": {
       "result": [
         {
@@ -846,7 +846,7 @@
         "messages": "viewer/data/messages.json",
         "meta": "viewer/data/meta.json",
         "meta_info": {
-          "fts_enabled": false,
+          "fts_enabled": true,
           "generated_at": "2025-01-01T12:00:00+00:00",
           "message_count": 6,
           "messages_cached": 6
@@ -864,16 +864,16 @@
     },
     "scrub_summary": {
       "ack_flags_cleared": 6,
-      "agent_links_removed": 2,
+      "agent_links_removed": 0,
       "agents_pseudonymized": 0,
-      "agents_total": 8,
+      "agents_total": 7,
       "attachments_cleared": 0,
       "attachments_sanitized": 0,
       "bodies_redacted": 0,
-      "file_reservations_removed": 4,
+      "file_reservations_removed": 0,
       "preset": "standard",
       "pseudonym_salt": "standard",
-      "recipients_cleared": 8,
+      "recipients_cleared": 0,
       "secrets_replaced": 0
     },
     "summary": {
@@ -890,15 +890,15 @@
       "messages": 6,
       "projects": [
         {
-          "human_key": "/<phase2_project>",
+          "human_key": "<phase2_project>",
           "slug": "<phase2_project>"
         },
         {
-          "human_key": "/alpha",
+          "human_key": "alpha",
           "slug": "alpha"
         },
         {
-          "human_key": "/beta",
+          "human_key": "beta",
           "slug": "beta"
         }
       ],

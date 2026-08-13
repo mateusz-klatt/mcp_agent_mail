@@ -143,49 +143,31 @@ def test_archive_save_with_label(isolated_env, monkeypatch):
     assert captured.get("label") == "nightly"
 
 
-def test_archive_save_with_project_filter(isolated_env, monkeypatch):
-    """archive save accepts --project filter option."""
-    captured: dict[str, Any] = {}
-
-    def fake_create_archive(**kwargs):
-        captured.update(kwargs)
-        return Path("/fake/archive.zip"), {"scrub_preset": kwargs["scrub_preset"]}
-
-    monkeypatch.setattr("mcp_agent_mail.cli._create_mailbox_archive", fake_create_archive)
-
+def test_archive_save_rejects_project_filter(isolated_env):
+    """Recovery archives are complete and cannot silently omit projects."""
     result = runner.invoke(
         app, ["archive", "save", "--project", "proj1", "--project", "proj2"]
     )
-    assert result.exit_code == 0
-    assert "proj1" in captured.get("project_filters", [])
-    assert "proj2" in captured.get("project_filters", [])
+    assert result.exit_code != 0
+    assert "No such option" in result.output
 
 
-def test_archive_save_with_scrub_preset(isolated_env, monkeypatch):
-    """archive save accepts --scrub-preset option."""
-    captured: dict[str, Any] = {}
-
-    def fake_create_archive(**kwargs):
-        captured.update(kwargs)
-        return Path("/fake/archive.zip"), {"scrub_preset": kwargs["scrub_preset"]}
-
-    monkeypatch.setattr("mcp_agent_mail.cli._create_mailbox_archive", fake_create_archive)
-
+def test_archive_save_rejects_scrub_preset(isolated_env):
+    """Recovery archives always use the lossless archive preset."""
     result = runner.invoke(app, ["archive", "save", "--scrub-preset", "standard"])
-    assert result.exit_code == 0
-    assert captured["scrub_preset"] == "standard"
+    assert result.exit_code != 0
+    assert "No such option" in result.output
 
 
 def test_archive_save_invalid_scrub_preset(isolated_env, monkeypatch):
-    """archive save rejects invalid scrub presets."""
-    # Don't need to mock since it should fail validation before calling create
+    """archive save rejects removed scrub options fail closed."""
     result = runner.invoke(app, ["archive", "save", "--scrub-preset", "invalid_preset"])
-    # Should fail with an error about invalid preset
-    assert result.exit_code != 0 or "invalid" in result.stdout.lower()
+    assert result.exit_code != 0
+    assert "No such option" in result.output
 
 
-def test_archive_save_short_options(isolated_env, monkeypatch):
-    """archive save accepts short options -p and -l."""
+def test_archive_save_short_label_option(isolated_env, monkeypatch):
+    """archive save keeps the non-destructive short label option."""
     captured: dict[str, Any] = {}
 
     def fake_create_archive(**kwargs):
@@ -194,9 +176,9 @@ def test_archive_save_short_options(isolated_env, monkeypatch):
 
     monkeypatch.setattr("mcp_agent_mail.cli._create_mailbox_archive", fake_create_archive)
 
-    result = runner.invoke(app, ["archive", "save", "-p", "myproj", "-l", "test"])
+    result = runner.invoke(app, ["archive", "save", "-l", "test"])
     assert result.exit_code == 0
-    assert "myproj" in captured.get("project_filters", [])
+    assert captured.get("project_filters") == ()
     assert captured.get("label") == "test"
 
 
@@ -581,9 +563,9 @@ def test_archive_save_help_text(isolated_env):
     assert result.exit_code == 0
     # Strip ANSI codes for reliable matching in CI
     stdout = strip_ansi(result.stdout)
-    assert "--project" in stdout or "-p" in stdout
     assert "--label" in stdout or "-l" in stdout
-    assert "--scrub-preset" in stdout
+    assert "--project" not in stdout
+    assert "--scrub-preset" not in stdout
 
 
 def test_archive_list_help_text(isolated_env):

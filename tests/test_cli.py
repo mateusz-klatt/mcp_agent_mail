@@ -9,7 +9,9 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
+from zipfile import ZipFile
 
 import pytest
 from git.cmd import Git
@@ -17,7 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.sql import ColumnElement
 from typer.testing import CliRunner
 
-from mcp_agent_mail import cli as cli_module
+from mcp_agent_mail import cli as cli_module, share as share_module
 from mcp_agent_mail.cli import app
 from mcp_agent_mail.config import clear_settings_cache, get_settings
 from mcp_agent_mail.db import ensure_schema, get_session
@@ -111,6 +113,319 @@ def _path_tree(root: Path) -> tuple[tuple[str, ...], dict[str, bytes]]:
         if path.is_file()
     }
     return paths, contents
+
+
+def test_copy_bundle_contents_rejects_owned_source_symlink(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    viewer = source / "viewer"
+    viewer.mkdir(parents=True)
+    destination.mkdir()
+    secret = tmp_path / "secret.txt"
+    secret.write_bytes(b"PRIVATE_SYMLINK_CANARY")
+    link = viewer / "index.html"
+    try:
+        link.symlink_to(secret)
+    except OSError:
+        pytest.skip("symlink creation is unavailable on this platform")
+    old_manifest = b'{"old": true}\n'
+    (destination / "manifest.json").write_bytes(old_manifest)
+
+    with pytest.raises(
+        cli_module.ShareExportError,
+        match="Refusing to follow source bundle link",
+    ):
+        cli_module._copy_bundle_contents(source, destination)
+
+    assert (destination / "manifest.json").read_bytes() == old_manifest
+    assert not (destination / "viewer" / "index.html").exists()
+
+
+def test_copy_bundle_contents_rejects_owned_destination_symlink(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source_viewer = source / "viewer"
+    source_viewer.mkdir(parents=True)
+    (source_viewer / "index.html").write_bytes(b"fresh viewer")
+    destination.mkdir()
+    external_viewer = tmp_path / "external-viewer"
+    external_viewer.mkdir()
+    canary = external_viewer / "index.html"
+    canary.write_bytes(b"PRIVATE_DESTINATION_LINK_CANARY")
+    destination_viewer = destination / "viewer"
+    try:
+        destination_viewer.symlink_to(external_viewer, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation is unavailable on this platform")
+
+    with pytest.raises(
+        cli_module.ShareExportError,
+        match="Refusing to follow destination bundle link",
+    ):
+        cli_module._copy_bundle_contents(source, destination)
+
+    assert canary.read_bytes() == b"PRIVATE_DESTINATION_LINK_CANARY"
+
+
+def test_copy_bundle_contents_rejects_destination_root_symlink(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "manifest.json").write_bytes(b'{"fresh": true}\n')
+    destination_target = tmp_path / "destination-target"
+    destination_target.mkdir()
+    canary = destination_target / "custom.txt"
+    canary.write_bytes(b"PRIVATE_ROOT_LINK_CANARY")
+    destination = tmp_path / "destination"
+    try:
+        destination.symlink_to(destination_target, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation is unavailable on this platform")
+
+    with pytest.raises(
+        cli_module.ShareExportError,
+        match="Destination bundle root must be a real directory",
+    ):
+        cli_module._copy_bundle_contents(source, destination)
+
+    assert canary.read_bytes() == b"PRIVATE_ROOT_LINK_CANARY"
+    assert not (destination_target / "manifest.json").exists()
+
+
+def test_copy_bundle_contents_publishes_manifest_after_assets_and_pruning(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    (source / "viewer").mkdir(parents=True)
+    (destination / "chunks").mkdir(parents=True)
+    (source / "viewer" / "index.html").write_bytes(b"fresh viewer")
+    (source / "manifest.json").write_bytes(b'{"fresh": true}\n')
+    stale_chunk = destination / "chunks" / "stale.bin"
+    stale_chunk.write_bytes(b"stale")
+    (destination / "manifest.json").write_bytes(b'{"old": true}\n')
+
+    events: list[str] = []
+    original_copy2 = shutil.copy2
+    original_unlink = Path.unlink
+
+    def observed_copy2(source_path: Path, destination_path: Path) -> str:
+        events.append(f"copy:{Path(destination_path).relative_to(destination).as_posix()}")
+        return str(original_copy2(source_path, destination_path))
+
+    def observed_unlink(path: Path, missing_ok: bool = False) -> None:
+        if path.is_relative_to(destination):
+            events.append(f"unlink:{path.relative_to(destination).as_posix()}")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(shutil, "copy2", observed_copy2)
+    monkeypatch.setattr(Path, "unlink", observed_unlink)
+
+    cli_module._copy_bundle_contents(source, destination)
+
+    assert events == [
+        "copy:viewer/index.html",
+        "unlink:chunks/stale.bin",
+        "copy:manifest.json",
+    ]
+
+
+def test_write_directory_to_zip_rejects_storage_symlink(
+    tmp_path: Path,
+) -> None:
+    storage_root = tmp_path / "storage"
+    storage_root.mkdir()
+    (storage_root / "safe.txt").write_bytes(b"safe")
+    external_secret = tmp_path / "external-secret.txt"
+    external_secret.write_bytes(b"PRIVATE_ARCHIVE_SYMLINK_CANARY")
+    link = storage_root / "linked-secret.txt"
+    try:
+        link.symlink_to(external_secret)
+    except OSError:
+        pytest.skip("symlink creation is unavailable on this platform")
+    archive_path = tmp_path / "archive.zip"
+
+    with ZipFile(archive_path, "w") as archive, pytest.raises(
+        cli_module.ShareExportError,
+        match="Recovery archive refuses storage link",
+    ):
+        cli_module._write_directory_to_zip(
+            archive,
+            storage_root,
+            Path("storage_repo"),
+        )
+
+    with ZipFile(archive_path) as archive:
+        archived_payload = b"".join(archive.read(name) for name in archive.namelist())
+    assert b"PRIVATE_ARCHIVE_SYMLINK_CANARY" not in archived_payload
+
+
+def test_share_update_preserves_host_repo_and_zips_only_fresh_owned_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    bundle_dir = tmp_path / "bundle"
+    bundle_dir.mkdir()
+    manifest = {
+        "export_config": {
+            "projects": ["demo"],
+            "inline_threshold": 64,
+            "detach_threshold": 1024,
+            "chunk_threshold": 2048,
+            "chunk_size": 1024,
+            "scrub_preset": "standard",
+        },
+        "project_scope": {"requested": ["demo"]},
+        "attachments": {
+            "config": {"inline_threshold": 64, "detach_threshold": 1024}
+        },
+        "scrub": {"preset": "standard"},
+        "database": {},
+    }
+    (bundle_dir / "manifest.json").write_text(
+        json.dumps(manifest),
+        encoding="utf-8",
+    )
+
+    preserved = {
+        ".git/config": b"https://operator:PRIVATE_GIT_TOKEN_CANARY@example.invalid/repo\n",
+        ".github/workflows/pages.yml": b"name: PRIVATE_WORKFLOW_CANARY\n",
+        "CNAME": b"mail.example.invalid\n",
+        "custom.txt": b"PRIVATE_CUSTOM_CANARY\n",
+    }
+    for relative, content in preserved.items():
+        target = bundle_dir / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+
+    stale_owned = (
+        bundle_dir / "chunks" / "stale.bin",
+        bundle_dir / "attachments" / "stale.bin",
+        bundle_dir / "viewer" / "stale.js",
+    )
+    for path in stale_owned:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"stale")
+
+    database_path = tmp_path / "mailbox.sqlite3"
+    database_path.write_bytes(b"source database")
+
+    def fake_create_snapshot_context(
+        *,
+        snapshot_path: Path,
+        **_kwargs: object,
+    ) -> SimpleNamespace:
+        snapshot_path.write_bytes(b"fresh snapshot")
+        return SimpleNamespace(
+            snapshot_path=snapshot_path,
+            scope=SimpleNamespace(
+                projects=[SimpleNamespace(slug="demo")],
+                removed_count=0,
+            ),
+            scrub_summary=SimpleNamespace(
+                preset="standard",
+                agents_total=1,
+                agents_pseudonymized=0,
+                secrets_replaced=0,
+                bodies_redacted=0,
+            ),
+            fts_enabled=False,
+        )
+
+    def fake_build_bundle_assets(
+        _snapshot_path: Path,
+        output_dir: Path,
+        **_kwargs: object,
+    ) -> SimpleNamespace:
+        fresh_manifest = dict(manifest)
+        fresh_manifest["database"] = {
+            "chunk_manifest": {"chunk_count": 1, "chunk_size": 1024}
+        }
+        (output_dir / "manifest.json").write_text(
+            json.dumps(fresh_manifest),
+            encoding="utf-8",
+        )
+        for relative, content in {
+            "viewer/index.html": b"fresh viewer",
+            "chunks/00000.bin": b"fresh chunk",
+            "attachments/aa/fresh.bin": b"fresh attachment",
+            "README.md": b"fresh readme\n",
+            "unexpected-private.tmp": b"PRIVATE_TEMP_CANARY",
+        }.items():
+            target = output_dir / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+        return SimpleNamespace(
+            attachments_manifest={
+                "stats": {
+                    "inline": 0,
+                    "copied": 1,
+                    "externalized": 0,
+                    "missing": 0,
+                }
+            },
+            chunk_manifest={"chunk_count": 1, "chunk_size": 1024},
+            viewer_data=None,
+        )
+
+    monkeypatch.setattr(
+        cli_module,
+        "resolve_sqlite_database_path",
+        lambda: database_path,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "create_snapshot_context",
+        fake_create_snapshot_context,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_bundle_assets",
+        fake_build_bundle_assets,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "get_settings",
+        lambda: SimpleNamespace(storage=SimpleNamespace(root=str(tmp_path / "storage"))),
+    )
+    monkeypatch.setattr(cli_module, "detect_hosting_hints", lambda _path: [])
+
+    result = CliRunner().invoke(
+        cli_module.app,
+        ["share", "update", str(bundle_dir), "--zip"],
+    )
+
+    assert result.exit_code == 0, result.output
+    for relative, content in preserved.items():
+        assert (bundle_dir / relative).read_bytes() == content
+    assert all(not path.exists() for path in stale_owned)
+    assert (bundle_dir / "chunks" / "00000.bin").read_bytes() == b"fresh chunk"
+    assert not (bundle_dir / "unexpected-private.tmp").exists()
+
+    archive_path = bundle_dir.with_suffix(".zip")
+    with ZipFile(archive_path) as archive:
+        archived_names = set(archive.namelist())
+        archived_payload = b"".join(archive.read(name) for name in archive.namelist())
+    assert "manifest.json" in archived_names
+    assert "viewer/index.html" in archived_names
+    assert "chunks/00000.bin" in archived_names
+    assert "attachments/aa/fresh.bin" in archived_names
+    assert not any(name.startswith(".git/") for name in archived_names)
+    assert not any(name.startswith(".github/") for name in archived_names)
+    assert "CNAME" not in archived_names
+    assert "custom.txt" not in archived_names
+    assert "unexpected-private.tmp" not in archived_names
+    for canary in (
+        b"PRIVATE_GIT_TOKEN_CANARY",
+        b"PRIVATE_WORKFLOW_CANARY",
+        b"PRIVATE_CUSTOM_CANARY",
+        b"PRIVATE_TEMP_CANARY",
+    ):
+        assert canary not in archived_payload
 
 
 def _init_projects_adopt_repo(tmp_path: Path) -> tuple[Path, Path]:
@@ -1342,6 +1657,86 @@ def test_archive_save_defaults_to_archive_preset(tmp_path, isolated_env, monkeyp
     result = runner.invoke(app, ["archive", "save"])
     assert result.exit_code == 0
     assert captured["scrub_preset"] == "archive"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission contract")
+def test_create_mailbox_archive_uses_private_posix_permissions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    archive_dir = project_root / cli_module.ARCHIVE_DIR_NAME
+    archive_dir.mkdir(mode=0o777)
+    archive_dir.chmod(0o777)
+    storage_root = tmp_path / "storage"
+    storage_root.mkdir()
+    (storage_root / "secret.txt").write_text(
+        "PRIVATE_ARCHIVE_CANARY\n",
+        encoding="utf-8",
+    )
+    database_path = tmp_path / "mailbox.sqlite3"
+    database_path.write_bytes(b"database")
+
+    scrub_summary = share_module.ScrubSummary(
+        preset="archive",
+        pseudonym_salt="archive",
+        agents_total=0,
+        agents_pseudonymized=0,
+        ack_flags_cleared=0,
+        recipients_cleared=0,
+        file_reservations_removed=0,
+        agent_links_removed=0,
+        secrets_replaced=0,
+        attachments_sanitized=0,
+        bodies_redacted=0,
+        attachments_cleared=0,
+    )
+
+    def fake_snapshot_context(
+        *,
+        snapshot_path: Path,
+        **_kwargs: object,
+    ) -> share_module.SnapshotContext:
+        snapshot_path.write_bytes(b"lossless snapshot")
+        return share_module.SnapshotContext(
+            snapshot_path=snapshot_path,
+            scope=share_module.ProjectScopeResult(projects=[], removed_count=0),
+            scrub_summary=scrub_summary,
+            fts_enabled=False,
+        )
+
+    monkeypatch.setattr(cli_module, "_detect_project_root", lambda: project_root)
+    monkeypatch.setattr(
+        cli_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            database=SimpleNamespace(url=f"sqlite+aiosqlite:///{database_path}"),
+            storage=SimpleNamespace(root=str(storage_root)),
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "resolve_sqlite_database_path",
+        lambda _url: database_path,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "create_snapshot_context",
+        fake_snapshot_context,
+    )
+
+    archive_path, _metadata = cli_module._create_mailbox_archive(
+        project_filters=(),
+        scrub_preset="archive",
+        label="permissions",
+        status_message="",
+    )
+
+    assert archive_dir.stat().st_mode & 0o777 == 0o700
+    assert archive_path.stat().st_mode & 0o777 == 0o600
+    with ZipFile(archive_path) as archive:
+        assert archive.read("storage_repo/secret.txt") == b"PRIVATE_ARCHIVE_CANARY\n"
 
 
 def test_clear_and_reset_skips_archive_when_disabled(isolated_env, monkeypatch):

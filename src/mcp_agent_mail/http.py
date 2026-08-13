@@ -1,5 +1,7 @@
 """HTTP transport helpers wrapping FastMCP with FastAPI."""
 
+# ruff: noqa: RUF001 -- Natural-language catalogs intentionally contain native confusables.
+
 from __future__ import annotations
 
 import argparse
@@ -9,6 +11,7 @@ import binascii
 import contextlib
 import contextvars
 import functools
+import hashlib
 import hmac
 import importlib
 import json
@@ -16,10 +19,12 @@ import logging
 import math
 import re
 import threading
+import unicodedata
 from collections.abc import Callable, MutableMapping
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Annotated, Any, Literal, Protocol, TypedDict, cast
+from typing import Annotated, Any, Literal, NamedTuple, Protocol, TypedDict, cast
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import structlog
 import uvicorn
@@ -69,7 +74,14 @@ from .delivery import (
     get_message_delivery_status,
     process_message_delivery,
 )
-from .models import Agent, Message, MessageDelivery, Project
+from .models import (
+    MAIL_UI_LOCALE_ENGLISH_NAMES,
+    Agent,
+    MailUiLocale,
+    Message,
+    MessageDelivery,
+    Project,
+)
 from .notify import KEEPALIVE_SECONDS, MAX_STREAM_SECONDS, hub
 from .storage import (
     AsyncFileLock,
@@ -908,11 +920,10 @@ _MAIL_ACCOUNT_API_PATHS = frozenset(
 )
 _MAIL_REACT_BASE_PATH = "/mail"
 _MAIL_LOGIN_STYLESHEET_PATH = f"{_MAIL_REACT_BASE_PATH}/assets/legacy.css"
-_HERMES_FAVICON_PATH = "/favicon.ico"
-_HERMES_FAVICON_SVG = (
+_IRIS_FAVICON_PATH = "/favicon.ico"
+_IRIS_FAVICON_SVG = (
     b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">\n'
-    b'  <rect width="64" height="64" rx="14" fill="#12242c"/>\n'
-    b'  <path d="M17 14h9v14h12V14h9v36h-9V36H26v14h-9z" fill="#f4cf8a"/>\n'
+    b'  <text x="32" y="47" text-anchor="middle" font-size="48">&#x1F308;</text>\n'
     b"</svg>\n"
 )
 _MAIL_HTML_CACHE_CONTROL = "no-store, no-transform"
@@ -947,6 +958,618 @@ _MAIL_LEGACY_HTML_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
 }
+_MAIL_LOGIN_HTML_HEADERS = {
+    "Cache-Control": _MAIL_HTML_CACHE_CONTROL,
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'none'; style-src 'self'; connect-src 'none'; "
+        "img-src 'self' data:; font-src 'self'; object-src 'none'; "
+        "base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+    ),
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+}
+
+
+class _MailLoginText(NamedTuple):
+    """Every human-readable string on the public sign-in surface."""
+
+    sign_in: str
+    hint: str
+    username: str
+    password: str
+    accounts: str
+    invalid_credentials: str
+    throttled: str
+    language: str
+
+
+class _MailLoginLocalePresentation(NamedTuple):
+    """Flag and self-name shared with the authenticated React locale picker."""
+
+    flag: str
+    native_name: str
+
+
+_MAIL_LOGIN_LOCALE_PRESENTATION: dict[MailUiLocale, _MailLoginLocalePresentation] = {
+    MailUiLocale.AR: _MailLoginLocalePresentation("🇸🇦", "العربية"),
+    MailUiLocale.BN: _MailLoginLocalePresentation("🇧🇩", "বাংলা"),
+    MailUiLocale.BS: _MailLoginLocalePresentation("🇧🇦", "Bosanski"),
+    MailUiLocale.CS: _MailLoginLocalePresentation("🇨🇿", "Čeština"),
+    MailUiLocale.DA: _MailLoginLocalePresentation("🇩🇰", "Dansk"),
+    MailUiLocale.DE: _MailLoginLocalePresentation("🇩🇪", "Deutsch"),
+    MailUiLocale.EL: _MailLoginLocalePresentation("🇬🇷", "Ελληνικά"),
+    MailUiLocale.EN: _MailLoginLocalePresentation("🇬🇧", "English"),
+    MailUiLocale.ES: _MailLoginLocalePresentation("🇪🇸", "Español"),
+    MailUiLocale.FA: _MailLoginLocalePresentation("🇮🇷", "فارسی"),
+    MailUiLocale.FI: _MailLoginLocalePresentation("🇫🇮", "Suomi"),
+    MailUiLocale.FIL: _MailLoginLocalePresentation("🇵🇭", "Filipino"),
+    MailUiLocale.FR: _MailLoginLocalePresentation("🇫🇷", "Français"),
+    MailUiLocale.GA: _MailLoginLocalePresentation("🇮🇪", "Gaeilge"),
+    MailUiLocale.HE: _MailLoginLocalePresentation("🇮🇱", "עברית"),
+    MailUiLocale.HI: _MailLoginLocalePresentation("🇮🇳", "हिन्दी"),
+    MailUiLocale.HR: _MailLoginLocalePresentation("🇭🇷", "Hrvatski"),
+    MailUiLocale.HU: _MailLoginLocalePresentation("🇭🇺", "Magyar"),
+    MailUiLocale.HY: _MailLoginLocalePresentation("🇦🇲", "Հայերեն"),
+    MailUiLocale.ID: _MailLoginLocalePresentation("🇮🇩", "Bahasa Indonesia"),
+    MailUiLocale.IS: _MailLoginLocalePresentation("🇮🇸", "Íslenska"),
+    MailUiLocale.IT: _MailLoginLocalePresentation("🇮🇹", "Italiano"),
+    MailUiLocale.JA: _MailLoginLocalePresentation("🇯🇵", "日本語"),
+    MailUiLocale.KO: _MailLoginLocalePresentation("🇰🇷", "한국어"),
+    MailUiLocale.LT: _MailLoginLocalePresentation("🇱🇹", "Lietuvių"),
+    MailUiLocale.LV: _MailLoginLocalePresentation("🇱🇻", "Latviešu"),
+    MailUiLocale.MS: _MailLoginLocalePresentation("🇲🇾", "Bahasa Melayu"),
+    MailUiLocale.MY_MM: _MailLoginLocalePresentation("🇲🇲", "မြန်မာဘာသာ"),
+    MailUiLocale.NL: _MailLoginLocalePresentation("🇳🇱", "Nederlands"),
+    MailUiLocale.NO: _MailLoginLocalePresentation("🇳🇴", "Norsk"),
+    MailUiLocale.PL: _MailLoginLocalePresentation("🇵🇱", "Polski"),
+    MailUiLocale.PT: _MailLoginLocalePresentation("🇵🇹", "Português"),
+    MailUiLocale.RO: _MailLoginLocalePresentation("🇷🇴", "Română"),
+    MailUiLocale.RU: _MailLoginLocalePresentation("🇷🇺", "Русский"),
+    MailUiLocale.SK: _MailLoginLocalePresentation("🇸🇰", "Slovenčina"),
+    MailUiLocale.SQ: _MailLoginLocalePresentation("🇦🇱", "Shqip"),
+    MailUiLocale.SR: _MailLoginLocalePresentation("🇷🇸", "Српски"),
+    MailUiLocale.SV: _MailLoginLocalePresentation("🇸🇪", "Svenska"),
+    MailUiLocale.SW: _MailLoginLocalePresentation("🇰🇪", "Kiswahili"),
+    MailUiLocale.TH: _MailLoginLocalePresentation("🇹🇭", "ไทย"),
+    MailUiLocale.TR: _MailLoginLocalePresentation("🇹🇷", "Türkçe"),
+    MailUiLocale.UK: _MailLoginLocalePresentation("🇺🇦", "Українська"),
+    MailUiLocale.VI: _MailLoginLocalePresentation("🇻🇳", "Tiếng Việt"),
+    MailUiLocale.ZH_HANT: _MailLoginLocalePresentation("🇹🇼", "繁體中文"),
+    MailUiLocale.ZH: _MailLoginLocalePresentation("🇨🇳", "简体中文"),
+}
+_MAIL_LOGIN_TEXT: dict[MailUiLocale, _MailLoginText] = {
+    MailUiLocale.AR: _MailLoginText(
+        "تسجيل الدخول",
+        "سجّل الدخول لعرض صندوق بريد Agent Mail الخاص بك.",
+        "اسم المستخدم",
+        "كلمة المرور",
+        "تُنشأ الحسابات على الخادم:",
+        "اسم المستخدم أو كلمة المرور غير صحيحة.",
+        "محاولات فاشلة كثيرة جدًا. انتظر دقيقة ثم حاول مرة أخرى.",
+        "اللغة",
+    ),
+    MailUiLocale.BN: _MailLoginText(
+        "সাইন ইন",
+        "আপনার Agent Mail মেইলবক্স দেখতে সাইন ইন করুন।",
+        "ব্যবহারকারীর নাম",
+        "পাসওয়ার্ড",
+        "সার্ভারে অ্যাকাউন্ট তৈরি করা হয়:",
+        "ব্যবহারকারীর নাম বা পাসওয়ার্ড সঠিক নয়।",
+        "অনেকবার ব্যর্থ চেষ্টা হয়েছে। এক মিনিট অপেক্ষা করে আবার চেষ্টা করুন।",
+        "ভাষা",
+    ),
+    MailUiLocale.BS: _MailLoginText(
+        "Prijava",
+        "Prijavite se da biste pregledali svoje Agent Mail sanduče.",
+        "Korisničko ime",
+        "Lozinka",
+        "Nalozi se kreiraju na serveru:",
+        "Neispravno korisničko ime ili lozinka.",
+        "Previše neuspjelih pokušaja. Sačekajte minutu i pokušajte ponovo.",
+        "Jezik",
+    ),
+    MailUiLocale.CS: _MailLoginText(
+        "Přihlásit se",
+        "Přihlaste se a zobrazte svou schránku Agent Mail.",
+        "Uživatelské jméno",
+        "Heslo",
+        "Účty se vytvářejí na serveru:",
+        "Neplatné uživatelské jméno nebo heslo.",
+        "Příliš mnoho neúspěšných pokusů. Počkejte minutu a zkuste to znovu.",
+        "Jazyk",
+    ),
+    MailUiLocale.DA: _MailLoginText(
+        "Log ind",
+        "Log ind for at se din Agent Mail-postkasse.",
+        "Brugernavn",
+        "Adgangskode",
+        "Konti oprettes på serveren:",
+        "Ugyldigt brugernavn eller adgangskode.",
+        "For mange mislykkede forsøg. Vent et minut, og prøv igen.",
+        "Sprog",
+    ),
+    MailUiLocale.DE: _MailLoginText(
+        "Anmelden",
+        "Melden Sie sich an, um Ihr Agent-Mail-Postfach anzuzeigen.",
+        "Benutzername",
+        "Passwort",
+        "Konten werden auf dem Server erstellt:",
+        "Benutzername oder Passwort ist ungültig.",
+        "Zu viele fehlgeschlagene Versuche. Warten Sie eine Minute und versuchen Sie es erneut.",
+        "Sprache",
+    ),
+    MailUiLocale.EL: _MailLoginText(
+        "Σύνδεση",
+        "Συνδεθείτε για να δείτε το γραμματοκιβώτιό σας στο Agent Mail.",
+        "Όνομα χρήστη",
+        "Κωδικός πρόσβασης",
+        "Οι λογαριασμοί δημιουργούνται στον διακομιστή:",
+        "Μη έγκυρο όνομα χρήστη ή κωδικός πρόσβασης.",
+        "Πάρα πολλές αποτυχημένες προσπάθειες. Περιμένετε ένα λεπτό και δοκιμάστε ξανά.",
+        "Γλώσσα",
+    ),
+    MailUiLocale.EN: _MailLoginText(
+        "Sign in",
+        "Sign in to view your Agent Mail mailbox.",
+        "Username",
+        "Password",
+        "Accounts are created on the server:",
+        "Invalid username or password.",
+        "Too many failed attempts. Wait a minute and try again.",
+        "Language",
+    ),
+    MailUiLocale.ES: _MailLoginText(
+        "Iniciar sesión",
+        "Inicia sesión para ver tu buzón de Agent Mail.",
+        "Nombre de usuario",
+        "Contraseña",
+        "Las cuentas se crean en el servidor:",
+        "El nombre de usuario o la contraseña no son válidos.",
+        "Demasiados intentos fallidos. Espera un minuto y vuelve a intentarlo.",
+        "Idioma",
+    ),
+    MailUiLocale.FA: _MailLoginText(
+        "ورود",
+        "برای مشاهده صندوق پستی Agent Mail خود وارد شوید.",
+        "نام کاربری",
+        "رمز عبور",
+        "حساب‌ها در سرور ایجاد می‌شوند:",
+        "نام کاربری یا رمز عبور نامعتبر است.",
+        "تعداد تلاش‌های ناموفق بیش از حد است. یک دقیقه صبر کنید و دوباره تلاش کنید.",
+        "زبان",
+    ),
+    MailUiLocale.FI: _MailLoginText(
+        "Kirjaudu sisään",
+        "Kirjaudu sisään nähdäksesi Agent Mail -postilaatikkosi.",
+        "Käyttäjänimi",
+        "Salasana",
+        "Tilit luodaan palvelimella:",
+        "Virheellinen käyttäjänimi tai salasana.",
+        "Liian monta epäonnistunutta yritystä. Odota minuutti ja yritä uudelleen.",
+        "Kieli",
+    ),
+    MailUiLocale.FIL: _MailLoginText(
+        "Mag-sign in",
+        "Mag-sign in upang tingnan ang iyong Agent Mail mailbox.",
+        "Username",
+        "Password",
+        "Ginagawa ang mga account sa server:",
+        "Hindi wastong username o password.",
+        "Masyadong maraming bigong pagsubok. Maghintay ng isang minuto at subukang muli.",
+        "Wika",
+    ),
+    MailUiLocale.FR: _MailLoginText(
+        "Se connecter",
+        "Connectez-vous pour consulter votre boîte Agent Mail.",
+        "Nom d’utilisateur",
+        "Mot de passe",
+        "Les comptes sont créés sur le serveur :",
+        "Nom d’utilisateur ou mot de passe incorrect.",
+        "Trop de tentatives infructueuses. Attendez une minute, puis réessayez.",
+        "Langue",
+    ),
+    MailUiLocale.GA: _MailLoginText(
+        "Sínigh isteach",
+        "Sínigh isteach chun do bhosca poist Agent Mail a fheiceáil.",
+        "Ainm úsáideora",
+        "Focal faire",
+        "Cruthaítear cuntais ar an bhfreastalaí:",
+        "Ainm úsáideora nó focal faire neamhbhailí.",
+        "An iomarca iarracht theipthe. Fan nóiméad agus bain triail eile as.",
+        "Teanga",
+    ),
+    MailUiLocale.HE: _MailLoginText(
+        "כניסה",
+        "יש להיכנס כדי לצפות בתיבת הדואר שלך ב-Agent Mail.",
+        "שם משתמש",
+        "סיסמה",
+        "חשבונות נוצרים בשרת:",
+        "שם המשתמש או הסיסמה שגויים.",
+        "יותר מדי ניסיונות כושלים. יש להמתין דקה ולנסות שוב.",
+        "שפה",
+    ),
+    MailUiLocale.HI: _MailLoginText(
+        "साइन इन करें",
+        "अपना Agent Mail मेलबॉक्स देखने के लिए साइन इन करें।",
+        "उपयोगकर्ता नाम",
+        "पासवर्ड",
+        "खाते सर्वर पर बनाए जाते हैं:",
+        "उपयोगकर्ता नाम या पासवर्ड अमान्य है।",
+        "बहुत अधिक असफल प्रयास हुए। एक मिनट प्रतीक्षा करें और फिर कोशिश करें।",
+        "भाषा",
+    ),
+    MailUiLocale.HR: _MailLoginText(
+        "Prijava",
+        "Prijavite se kako biste pregledali svoj sandučić Agent Mail.",
+        "Korisničko ime",
+        "Lozinka",
+        "Računi se stvaraju na poslužitelju:",
+        "Neispravno korisničko ime ili lozinka.",
+        "Previše neuspjelih pokušaja. Pričekajte minutu i pokušajte ponovno.",
+        "Jezik",
+    ),
+    MailUiLocale.HU: _MailLoginText(
+        "Bejelentkezés",
+        "Jelentkezzen be az Agent Mail-postafiókja megtekintéséhez.",
+        "Felhasználónév",
+        "Jelszó",
+        "A fiókok a kiszolgálón hozhatók létre:",
+        "Érvénytelen felhasználónév vagy jelszó.",
+        "Túl sok sikertelen próbálkozás. Várjon egy percet, majd próbálja újra.",
+        "Nyelv",
+    ),
+    MailUiLocale.HY: _MailLoginText(
+        "Մուտք գործել",
+        "Մուտք գործեք՝ ձեր Agent Mail փոստարկղը դիտելու համար։",
+        "Օգտանուն",
+        "Գաղտնաբառ",
+        "Հաշիվները ստեղծվում են սերվերում՝",
+        "Սխալ օգտանուն կամ գաղտնաբառ։",
+        "Չափազանց շատ անհաջող փորձեր։ Սպասեք մեկ րոպե և կրկին փորձեք։",
+        "Լեզու",
+    ),
+    MailUiLocale.ID: _MailLoginText(
+        "Masuk",
+        "Masuk untuk melihat kotak surat Agent Mail Anda.",
+        "Nama pengguna",
+        "Kata sandi",
+        "Akun dibuat di server:",
+        "Nama pengguna atau kata sandi tidak valid.",
+        "Terlalu banyak percobaan gagal. Tunggu satu menit lalu coba lagi.",
+        "Bahasa",
+    ),
+    MailUiLocale.IS: _MailLoginText(
+        "Skrá inn",
+        "Skráðu þig inn til að skoða Agent Mail-pósthólfið þitt.",
+        "Notandanafn",
+        "Lykilorð",
+        "Reikningar eru stofnaðir á þjóninum:",
+        "Ógilt notandanafn eða lykilorð.",
+        "Of margar misheppnaðar tilraunir. Bíddu í eina mínútu og reyndu aftur.",
+        "Tungumál",
+    ),
+    MailUiLocale.IT: _MailLoginText(
+        "Accedi",
+        "Accedi per visualizzare la tua casella di posta Agent Mail.",
+        "Nome utente",
+        "Password",
+        "Gli account vengono creati sul server:",
+        "Nome utente o password non validi.",
+        "Troppi tentativi non riusciti. Attendi un minuto e riprova.",
+        "Lingua",
+    ),
+    MailUiLocale.JA: _MailLoginText(
+        "サインイン",
+        "Agent Mail のメールボックスを表示するには、サインインしてください。",
+        "ユーザー名",
+        "パスワード",
+        "アカウントはサーバーで作成します:",
+        "ユーザー名またはパスワードが正しくありません。",
+        "失敗回数が多すぎます。1 分待ってからもう一度お試しください。",
+        "言語",
+    ),
+    MailUiLocale.KO: _MailLoginText(
+        "로그인",
+        "Agent Mail 사서함을 보려면 로그인하세요.",
+        "사용자 이름",
+        "비밀번호",
+        "계정은 서버에서 생성합니다:",
+        "사용자 이름 또는 비밀번호가 올바르지 않습니다.",
+        "실패한 시도가 너무 많습니다. 1분 후 다시 시도하세요.",
+        "언어",
+    ),
+    MailUiLocale.LT: _MailLoginText(
+        "Prisijungti",
+        "Prisijunkite, kad peržiūrėtumėte savo Agent Mail pašto dėžutę.",
+        "Naudotojo vardas",
+        "Slaptažodis",
+        "Paskyros kuriamos serveryje:",
+        "Neteisingas naudotojo vardas arba slaptažodis.",
+        "Per daug nesėkmingų bandymų. Palaukite minutę ir bandykite dar kartą.",
+        "Kalba",
+    ),
+    MailUiLocale.LV: _MailLoginText(
+        "Pierakstīties",
+        "Pierakstieties, lai skatītu savu Agent Mail pastkasti.",
+        "Lietotājvārds",
+        "Parole",
+        "Konti tiek izveidoti serverī:",
+        "Nederīgs lietotājvārds vai parole.",
+        "Pārāk daudz neveiksmīgu mēģinājumu. Uzgaidiet minūti un mēģiniet vēlreiz.",
+        "Valoda",
+    ),
+    MailUiLocale.MS: _MailLoginText(
+        "Log masuk",
+        "Log masuk untuk melihat peti mel Agent Mail anda.",
+        "Nama pengguna",
+        "Kata laluan",
+        "Akaun dicipta pada pelayan:",
+        "Nama pengguna atau kata laluan tidak sah.",
+        "Terlalu banyak percubaan gagal. Tunggu seminit dan cuba lagi.",
+        "Bahasa",
+    ),
+    MailUiLocale.MY_MM: _MailLoginText(
+        "ဝင်ရောက်ရန်",
+        "သင်၏ Agent Mail စာတိုက်ပုံးကို ကြည့်ရန် ဝင်ရောက်ပါ။",
+        "အသုံးပြုသူအမည်",
+        "စကားဝှက်",
+        "အကောင့်များကို ဆာဗာတွင် ဖန်တီးသည်၊",
+        "အသုံးပြုသူအမည် သို့မဟုတ် စကားဝှက် မမှန်ကန်ပါ။",
+        "ကြိုးစားမှု မအောင်မြင်သည်မှာ များလွန်းပါသည်။ တစ်မိနစ်စောင့်ပြီး ထပ်မံကြိုးစားပါ။",
+        "ဘာသာစကား",
+    ),
+    MailUiLocale.NL: _MailLoginText(
+        "Inloggen",
+        "Log in om uw Agent Mail-postvak te bekijken.",
+        "Gebruikersnaam",
+        "Wachtwoord",
+        "Accounts worden op de server aangemaakt:",
+        "Ongeldige gebruikersnaam of ongeldig wachtwoord.",
+        "Te veel mislukte pogingen. Wacht een minuut en probeer het opnieuw.",
+        "Taal",
+    ),
+    MailUiLocale.NO: _MailLoginText(
+        "Logg inn",
+        "Logg inn for å se Agent Mail-postboksen din.",
+        "Brukernavn",
+        "Passord",
+        "Kontoer opprettes på serveren:",
+        "Ugyldig brukernavn eller passord.",
+        "For mange mislykkede forsøk. Vent ett minutt og prøv igjen.",
+        "Språk",
+    ),
+    MailUiLocale.PL: _MailLoginText(
+        "Zaloguj się",
+        "Zaloguj się, aby wyświetlić swoją skrzynkę Agent Mail.",
+        "Nazwa użytkownika",
+        "Hasło",
+        "Konta tworzy się na serwerze:",
+        "Nieprawidłowa nazwa użytkownika lub hasło.",
+        "Zbyt wiele nieudanych prób. Poczekaj minutę i spróbuj ponownie.",
+        "Język",
+    ),
+    MailUiLocale.PT: _MailLoginText(
+        "Iniciar sessão",
+        "Inicie sessão para ver a sua caixa de correio do Agent Mail.",
+        "Nome de utilizador",
+        "Palavra-passe",
+        "As contas são criadas no servidor:",
+        "Nome de utilizador ou palavra-passe inválidos.",
+        "Demasiadas tentativas sem êxito. Aguarde um minuto e tente novamente.",
+        "Idioma",
+    ),
+    MailUiLocale.RO: _MailLoginText(
+        "Autentificare",
+        "Autentificați-vă pentru a vedea căsuța poștală Agent Mail.",
+        "Nume de utilizator",
+        "Parolă",
+        "Conturile se creează pe server:",
+        "Nume de utilizator sau parolă nevalidă.",
+        "Prea multe încercări nereușite. Așteptați un minut și încercați din nou.",
+        "Limbă",
+    ),
+    MailUiLocale.RU: _MailLoginText(
+        "Войти",
+        "Войдите, чтобы просмотреть свой почтовый ящик Agent Mail.",
+        "Имя пользователя",
+        "Пароль",
+        "Учётные записи создаются на сервере:",
+        "Неверное имя пользователя или пароль.",
+        "Слишком много неудачных попыток. Подождите минуту и повторите попытку.",
+        "Язык",
+    ),
+    MailUiLocale.SK: _MailLoginText(
+        "Prihlásiť sa",
+        "Prihláste sa a zobrazte svoju schránku Agent Mail.",
+        "Používateľské meno",
+        "Heslo",
+        "Účty sa vytvárajú na serveri:",
+        "Neplatné používateľské meno alebo heslo.",
+        "Príliš veľa neúspešných pokusov. Počkajte minútu a skúste to znova.",
+        "Jazyk",
+    ),
+    MailUiLocale.SQ: _MailLoginText(
+        "Hyni",
+        "Hyni për të parë kutinë tuaj postare Agent Mail.",
+        "Emri i përdoruesit",
+        "Fjalëkalimi",
+        "Llogaritë krijohen në server:",
+        "Emër përdoruesi ose fjalëkalim i pavlefshëm.",
+        "Shumë përpjekje të dështuara. Prisni një minutë dhe provoni përsëri.",
+        "Gjuha",
+    ),
+    MailUiLocale.SR: _MailLoginText(
+        "Пријавите се",
+        "Пријавите се да бисте видели своје Agent Mail сандуче.",
+        "Корисничко име",
+        "Лозинка",
+        "Налози се креирају на серверу:",
+        "Неисправно корисничко име или лозинка.",
+        "Превише неуспелих покушаја. Сачекајте минут и покушајте поново.",
+        "Језик",
+    ),
+    MailUiLocale.SV: _MailLoginText(
+        "Logga in",
+        "Logga in för att visa din Agent Mail-postlåda.",
+        "Användarnamn",
+        "Lösenord",
+        "Konton skapas på servern:",
+        "Ogiltigt användarnamn eller lösenord.",
+        "För många misslyckade försök. Vänta en minut och försök igen.",
+        "Språk",
+    ),
+    MailUiLocale.SW: _MailLoginText(
+        "Ingia",
+        "Ingia ili uone kisanduku chako cha barua cha Agent Mail.",
+        "Jina la mtumiaji",
+        "Nenosiri",
+        "Akaunti zinaundwa kwenye seva:",
+        "Jina la mtumiaji au nenosiri si sahihi.",
+        "Majaribio mengi sana yameshindwa. Subiri dakika moja kisha ujaribu tena.",
+        "Lugha",
+    ),
+    MailUiLocale.TH: _MailLoginText(
+        "ลงชื่อเข้าใช้",
+        "ลงชื่อเข้าใช้เพื่อดูกล่องจดหมาย Agent Mail ของคุณ",
+        "ชื่อผู้ใช้",
+        "รหัสผ่าน",
+        "บัญชีสร้างบนเซิร์ฟเวอร์:",
+        "ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง",
+        "มีความพยายามที่ล้มเหลวมากเกินไป โปรดรอหนึ่งนาทีแล้วลองอีกครั้ง",
+        "ภาษา",
+    ),
+    MailUiLocale.TR: _MailLoginText(
+        "Oturum aç",
+        "Agent Mail posta kutunuzu görüntülemek için oturum açın.",
+        "Kullanıcı adı",
+        "Parola",
+        "Hesaplar sunucuda oluşturulur:",
+        "Kullanıcı adı veya parola geçersiz.",
+        "Çok fazla başarısız deneme yapıldı. Bir dakika bekleyip yeniden deneyin.",
+        "Dil",
+    ),
+    MailUiLocale.UK: _MailLoginText(
+        "Увійти",
+        "Увійдіть, щоб переглянути свою поштову скриньку Agent Mail.",
+        "Ім’я користувача",
+        "Пароль",
+        "Облікові записи створюються на сервері:",
+        "Неправильне ім’я користувача або пароль.",
+        "Забагато невдалих спроб. Зачекайте хвилину й повторіть спробу.",
+        "Мова",
+    ),
+    MailUiLocale.VI: _MailLoginText(
+        "Đăng nhập",
+        "Đăng nhập để xem hộp thư Agent Mail của bạn.",
+        "Tên người dùng",
+        "Mật khẩu",
+        "Tài khoản được tạo trên máy chủ:",
+        "Tên người dùng hoặc mật khẩu không hợp lệ.",
+        "Có quá nhiều lần thử thất bại. Hãy đợi một phút rồi thử lại.",
+        "Ngôn ngữ",
+    ),
+    MailUiLocale.ZH_HANT: _MailLoginText(
+        "登入",
+        "登入以查看您的 Agent Mail 信箱。",
+        "使用者名稱",
+        "密碼",
+        "帳戶由伺服器建立：",
+        "使用者名稱或密碼無效。",
+        "失敗嘗試次數過多。請稍候一分鐘再試一次。",
+        "語言",
+    ),
+    MailUiLocale.ZH: _MailLoginText(
+        "登录",
+        "登录以查看您的 Agent Mail 邮箱。",
+        "用户名",
+        "密码",
+        "账户由服务器创建：",
+        "用户名或密码无效。",
+        "失败尝试次数过多。请等待一分钟后重试。",
+        "语言",
+    ),
+}
+_MAIL_LOGIN_RTL_LOCALES = frozenset({MailUiLocale.AR, MailUiLocale.FA, MailUiLocale.HE})
+_MAIL_LOGIN_ACCEPT_LANGUAGE_MAX_BYTES = 4096
+_MAIL_LOGIN_ACCEPT_LANGUAGE_MAX_RANGES = 32
+_MAIL_LOGIN_LANGUAGE_RANGE_RE = re.compile(r"^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$")
+
+
+def _mail_login_accept_language_locale(raw: str) -> MailUiLocale:
+    """Resolve a bounded browser language header into the closed locale set."""
+    if not raw or len(raw.encode("utf-8", errors="ignore")) > _MAIL_LOGIN_ACCEPT_LANGUAGE_MAX_BYTES:
+        return MailUiLocale.EN
+    candidates: list[tuple[float, int, MailUiLocale]] = []
+    ranges = raw.split(",")
+    if len(ranges) > _MAIL_LOGIN_ACCEPT_LANGUAGE_MAX_RANGES:
+        return MailUiLocale.EN
+    for index, item in enumerate(ranges):
+        parts = [part.strip() for part in item.split(";")]
+        language_range = parts[0]
+        if not _MAIL_LOGIN_LANGUAGE_RANGE_RE.fullmatch(language_range):
+            continue
+        quality = 1.0
+        invalid_quality = False
+        for parameter in parts[1:]:
+            name, separator, value = parameter.partition("=")
+            if name.casefold() != "q" or not separator:
+                invalid_quality = True
+                break
+            try:
+                quality = float(value)
+            except ValueError:
+                invalid_quality = True
+                break
+            if not math.isfinite(quality) or not 0.0 <= quality <= 1.0:
+                invalid_quality = True
+                break
+        if invalid_quality or quality == 0.0:
+            continue
+        locale = MailUiLocale.canonicalize(language_range)
+        folded = language_range.casefold()
+        if locale is None and (
+            folded.startswith("zh-hant-")
+            or folded in {"zh-hant", "zh-tw", "zh-hk", "zh-mo"}
+        ):
+            locale = MailUiLocale.ZH_HANT
+        if locale is None:
+            locale = MailUiLocale.canonicalize(language_range.partition("-")[0])
+        if locale is not None:
+            candidates.append((quality, -index, locale))
+    if not candidates:
+        return MailUiLocale.EN
+    return max(candidates)[2]
+
+
+def _mail_login_locale(requested: str | None, accept_language: str) -> MailUiLocale:
+    """Prefer an explicit canonical tag; invalid explicit input fails to English."""
+    if requested is not None:
+        return MailUiLocale.canonicalize(requested) or MailUiLocale.EN
+    return _mail_login_accept_language_locale(accept_language)
+
+
+def _mail_login_context(locale: MailUiLocale, next_url: str) -> dict[str, Any]:
+    """Build one escaped, server-rendered language choice model for the gate."""
+    options: list[dict[str, str | bool]] = []
+    for option_locale, presentation in _MAIL_LOGIN_LOCALE_PRESENTATION.items():
+        options.append(
+            {
+                "code": option_locale.value,
+                "direction": "rtl" if option_locale in _MAIL_LOGIN_RTL_LOCALES else "ltr",
+                "flag": presentation.flag,
+                "href": f"{_MAIL_LOGIN_PATH}?{urlencode({'lang': option_locale.value, 'next': next_url})}",
+                "is_current": option_locale is locale,
+                "native_name": presentation.native_name,
+            }
+        )
+    return {
+        "login_direction": "rtl" if locale in _MAIL_LOGIN_RTL_LOCALES else "ltr",
+        "login_locale": locale.value,
+        "login_locale_options": options,
+        "login_locale_presentation": _MAIL_LOGIN_LOCALE_PRESENTATION[locale],
+        "login_text": _MAIL_LOGIN_TEXT[locale],
+    }
 _MAIL_BODY_INLINE_IMAGE_MAX_BYTES = 2 * 1024 * 1024
 _MAIL_BODY_INLINE_IMAGE_PREFIXES: dict[str, Callable[[bytes], bool]] = {
     "data:image/png;base64,": lambda raw: raw.startswith(b"\x89PNG\r\n\x1a\n"),
@@ -962,9 +1585,42 @@ _MAIL_API_REPLY_SHAPE_RE = re.compile(
 _MAIL_API_COMPOSE_SHAPE_RE = re.compile(
     r"^/mail/api/v1/projects/[^/]+/messages$"
 )
+_MAIL_API_AGENT_DIRECTORY_SHAPE_RE = re.compile(
+    r"^/mail/api/v1/projects/[^/]+/agents$"
+)
 _MAIL_API_DELIVERY_SHAPE_RE = re.compile(
     r"^/mail/api/v1/deliveries/[^/]+(?:/retry)?$"
 )
+_MAIL_SEARCH_API_PATH = "/mail/api/v1/search"
+_MAIL_LEGACY_PROJECT_PATH_RE = re.compile(
+    r"^/mail/(?P<project>[a-z0-9](?:[a-z0-9-]{0,253}[a-z0-9])?)$"
+)
+_MAIL_LEGACY_MESSAGE_PATH_RE = re.compile(
+    r"^/mail/(?P<project>[a-z0-9](?:[a-z0-9-]{0,253}[a-z0-9])?)/message/"
+    r"(?P<message_id>[1-9][0-9]{0,18})$"
+)
+_MAIL_LEGACY_SEARCH_PATH_RE = re.compile(
+    r"^/mail/(?P<project>[a-z0-9](?:[a-z0-9-]{0,253}[a-z0-9])?)/search$"
+)
+_MAIL_LEGACY_RESERVED_PROJECT_NAMES = frozenset(
+    {
+        "api",
+        "archive",
+        "assets",
+        "events",
+        "login",
+        "logout",
+        "projects",
+        "unified-inbox",
+        "v2",
+    }
+)
+_MAIL_UI_SEARCH_TOKEN_RE = re.compile(
+    r'(?:(?P<field>subject|body):)?(?:"(?P<phrase>[^"]+)"|(?P<word>\S+))',
+    re.IGNORECASE,
+)
+_MAIL_UI_SEARCH_MAX_TOKENS = 32
+_MAIL_UI_SEARCH_SNIPPET_MAX_LENGTH = 320
 _mail_ui_template_user: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
     "mail_ui_template_user",
     default=None,
@@ -993,11 +1649,58 @@ def _mail_ui_inline_image_source_allowed(value: str) -> bool:
         )
     return False
 
-MailUiLocale = Literal["en", "pl"]
 MailUiGlobalRole = Literal["admin", "member"]
 MailUiAssignmentRole = Literal["viewer", "operator"]
 MailUiProjectRole = Literal["admin", "viewer", "operator"]
 MailUiImportance = Literal["low", "normal", "high", "urgent"]
+MailUiSearchScope = Literal["all", "subject", "body"]
+MailUiSearchOrder = Literal["relevance", "newest"]
+
+
+class _MailUiLegacyBookmark(TypedDict):
+    """One explicitly supported upstream bookmark shape."""
+
+    kind: Literal["projects", "inbox", "project", "message", "search"]
+    project_slug: str | None
+    message_id: int | None
+
+
+def _mail_ui_legacy_bookmark(path: str) -> _MailUiLegacyBookmark | None:
+    """Parse only legacy paths with an exact React successor.
+
+    This is intentionally not a catch-all under ``/mail``. In particular the
+    temporary development namespace ``/mail/v2`` and all retired APIs,
+    archives, assets, agent inboxes, threads, reservations, attachments, and
+    overseer forms remain outside the allowlist.
+    """
+    if path == "/mail/projects":
+        return {"kind": "projects", "project_slug": None, "message_id": None}
+    if path == "/mail/unified-inbox":
+        return {"kind": "inbox", "project_slug": None, "message_id": None}
+    for pattern, kind in (
+        (_MAIL_LEGACY_MESSAGE_PATH_RE, "message"),
+        (_MAIL_LEGACY_SEARCH_PATH_RE, "search"),
+        (_MAIL_LEGACY_PROJECT_PATH_RE, "project"),
+    ):
+        match = pattern.fullmatch(path)
+        if match is None:
+            continue
+        project_slug = match.group("project")
+        if project_slug in _MAIL_LEGACY_RESERVED_PROJECT_NAMES:
+            return None
+        raw_message_id = match.groupdict().get("message_id")
+        message_id = int(raw_message_id) if raw_message_id is not None else None
+        if message_id is not None and message_id > 9_223_372_036_854_775_807:
+            return None
+        return {
+            "kind": cast(
+                Literal["projects", "inbox", "project", "message", "search"],
+                kind,
+            ),
+            "project_slug": project_slug,
+            "message_id": message_id,
+        }
+    return None
 
 
 def _mail_ui_active_path(path: str) -> bool:
@@ -1014,14 +1717,20 @@ def _mail_ui_active_path(path: str) -> bool:
         or path.startswith("/mail/assets/")
         or path == "/mail/api/v1"
         or path.startswith("/mail/api/v1/")
+        or _mail_ui_legacy_bookmark(path) is not None
     )
 
 
 def _mail_ui_uses_typed_domain_errors(path: str) -> bool:
     """Whether authorization failures on ``path`` use stable ``detail.code``."""
     return (
-        path in {_MAIL_PROFILE_API_PATH, _MAIL_ADMIN_ACCESS_API_PATH}
+        path in {
+            _MAIL_PROFILE_API_PATH,
+            _MAIL_ADMIN_ACCESS_API_PATH,
+            _MAIL_SEARCH_API_PATH,
+        }
         or path.startswith("/mail/api/v1/admin/users/")
+        or bool(_MAIL_API_AGENT_DIRECTORY_SHAPE_RE.fullmatch(path))
         or bool(_MAIL_API_DELIVERY_SHAPE_RE.fullmatch(path))
         or bool(_MAIL_API_COMPOSE_SHAPE_RE.fullmatch(path))
         or bool(_MAIL_API_REPLY_SHAPE_RE.fullmatch(path))
@@ -1250,6 +1959,15 @@ _MAIL_UI_DELIVERY_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
 _MAIL_UI_DELIVERY_MUTATION_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     **_MAIL_UI_DELIVERY_ERROR_RESPONSES,
 }
+_MAIL_UI_SEARCH_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
+    status.HTTP_401_UNAUTHORIZED: {"model": MailUiDeliveryErrorResponse},
+    status.HTTP_403_FORBIDDEN: {"model": MailUiDeliveryErrorResponse},
+    status.HTTP_404_NOT_FOUND: {"model": MailUiDeliveryErrorResponse},
+    status.HTTP_422_UNPROCESSABLE_CONTENT: {
+        "model": MailUiDeliveryOrValidationErrorResponse
+    },
+    status.HTTP_503_SERVICE_UNAVAILABLE: {"model": MailUiDeliveryErrorResponse},
+}
 
 
 class MailUiStoredPreferences(BaseModel):
@@ -1278,14 +1996,16 @@ class MailUiPreferencesPatch(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    preferred_ui_locale: MailUiLocale = "en"
+    preferred_ui_locale: MailUiLocale = MailUiLocale.EN
     preferred_correspondence_locale: MailUiLocale | None = None
 
     @field_validator("preferred_ui_locale", "preferred_correspondence_locale", mode="before")
     @classmethod
     def canonicalize_locale(cls, value: object) -> object:
         """Canonicalize human-entered locale tags before the closed-set check."""
-        return value.strip().casefold() if isinstance(value, str) else value
+        if not isinstance(value, str):
+            return value
+        return MailUiLocale.canonicalize(value) or value
 
 
 class MailUiPasswordPatch(BaseModel):
@@ -1310,6 +2030,14 @@ class MailUiPasswordPatch(BaseModel):
         except UnicodeEncodeError:
             raise ValueError("Password must be valid UTF-8 Unicode text.") from None
         return value
+
+
+def _mail_ui_locale_from_db(value: object) -> MailUiLocale:
+    """Return one schema-guarded locale without silently widening corruption."""
+    try:
+        return MailUiLocale(value)
+    except (TypeError, ValueError):
+        raise RuntimeError("authenticated human has an invalid locale") from None
 
 
 class MailUiPasswordChangeResponse(BaseModel):
@@ -1339,6 +2067,28 @@ class MailUiProjectsResponse(BaseModel):
 
     items: list[MailUiProjectSummary]
     total: int
+
+
+class MailUiAgentDirectoryItem(BaseModel):
+    """One active agent identity that can receive an administrator message."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: int = Field(gt=0)
+    agent_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    name: str = Field(min_length=1, max_length=128)
+    display_name: str | None
+
+
+class MailUiProjectAgentsResponse(BaseModel):
+    """Privacy-minimal recipient directory for one active project."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: int = Field(gt=0)
+    project_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    items: list[MailUiAgentDirectoryItem]
+    total: int = Field(ge=0)
 
 
 class MailUiMessageSummary(BaseModel):
@@ -1377,6 +2127,18 @@ class MailUiAttachmentMetadata(BaseModel):
     size_bytes: int | None
 
 
+class MailUiReplyTarget(BaseModel):
+    """Immutable, privacy-minimal destination required to confirm a reply."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: int = Field(gt=0)
+    agent_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    project_id: int = Field(gt=0)
+    project_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    canonical_name: str = Field(min_length=1, max_length=384)
+
+
 class MailUiMessageDetail(MailUiMessageSummary):
     """Full message content without blind-copy or storage-location metadata."""
 
@@ -1384,6 +2146,7 @@ class MailUiMessageDetail(MailUiMessageSummary):
     to: list[str]
     cc: list[str]
     attachments: list[MailUiAttachmentMetadata]
+    reply_target: MailUiReplyTarget | None
 
 
 class MailUiInboxResponse(BaseModel):
@@ -1393,6 +2156,21 @@ class MailUiInboxResponse(BaseModel):
 
     items: list[MailUiMessageSummary]
     total: int
+    next_cursor: str | None
+
+
+class MailUiSearchItem(MailUiMessageSummary):
+    """One privacy-minimal full-text result with a plain-text excerpt."""
+
+    snippet: str = Field(max_length=_MAIL_UI_SEARCH_SNIPPET_MAX_LENGTH)
+
+
+class MailUiSearchResponse(BaseModel):
+    """One query-bound keyset page of visible full-text results."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[MailUiSearchItem]
     next_cursor: str | None
 
 
@@ -1406,13 +2184,23 @@ class MailUiThreadResponse(BaseModel):
     next_cursor: str | None
 
 
+class MailUiComposeRecipient(BaseModel):
+    """One immutable recipient lifetime selected from the typed directory."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: int = Field(gt=0)
+    expected_agent_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class MailUiComposeRequest(BaseModel):
     """Strict, idempotent administrator-authored project message."""
 
     model_config = ConfigDict(extra="forbid")
 
     idempotency_key: str = Field(min_length=1, max_length=128)
-    recipients: list[str] = Field(min_length=1, max_length=100)
+    expected_project_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    recipients: list[MailUiComposeRecipient] = Field(min_length=1, max_length=100)
     subject: str = Field(min_length=1, max_length=200)
     body_md: str = Field(min_length=1, max_length=50_000)
     thread_id: str | None = Field(default=None, max_length=128)
@@ -1426,20 +2214,25 @@ class MailUiComposeRequest(BaseModel):
 
     @field_validator("recipients")
     @classmethod
-    def require_unique_recipient_names(cls, value: list[str]) -> list[str]:
-        if any(not name.strip() or len(name) > 128 for name in value):
-            raise ValueError("Recipients must be bounded non-whitespace names.")
-        if len(set(value)) != len(value):
+    def require_unique_recipient_lifetimes(
+        cls,
+        value: list[MailUiComposeRecipient],
+    ) -> list[MailUiComposeRecipient]:
+        if len({recipient.agent_id for recipient in value}) != len(value):
             raise ValueError("Recipients must be unique.")
         return value
 
 
 class MailUiReplyRequest(BaseModel):
-    """Strict, idempotent reply body; routing is entirely server-derived."""
+    """Strict reply bound to the original sender and project lifetimes."""
 
     model_config = ConfigDict(extra="forbid")
 
     idempotency_key: str = Field(min_length=1, max_length=128)
+    expected_sender_agent_id: int = Field(gt=0)
+    expected_sender_agent_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_sender_project_id: int = Field(gt=0)
+    expected_sender_project_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
     body_md: str = Field(min_length=1, max_length=50_000)
 
     @field_validator("idempotency_key", "body_md")
@@ -1691,9 +2484,8 @@ async def _mail_ui_delivery_context(
         epoch=principal["session_epoch"],
         source_project=project_snapshot,
     )
-    ui_locale = cast(MailUiLocale, user.preferred_ui_locale)
-    correspondence_locale = cast(
-        MailUiLocale,
+    ui_locale = _mail_ui_locale_from_db(user.preferred_ui_locale)
+    correspondence_locale = _mail_ui_locale_from_db(
         user.preferred_correspondence_locale or ui_locale,
     )
     return project_snapshot, sender_snapshot, actor, correspondence_locale
@@ -1826,6 +2618,223 @@ def _mail_ui_decode_cursor(cursor: str) -> tuple[str, int]:
             detail="Invalid cursor.",
         ) from None
     return created_ts, message_id
+
+
+def _mail_ui_invalid_search_query() -> HTTPException:
+    """Return the stable typed refusal for a human search expression."""
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        detail={"code": "invalid_search_query"},
+    )
+
+
+def _mail_ui_compile_search_query(
+    raw_query: str,
+    scope: MailUiSearchScope,
+) -> tuple[str, tuple[tuple[str, str], ...]]:
+    """Compile a bounded literal query into FTS5 syntax.
+
+    Every user term is quoted by the server. The browser therefore receives a
+    useful word/phrase search without exposing FTS boolean operators, column
+    expressions, or prefix grammar as an executable query language.
+    """
+    query = raw_query.strip()
+    if (
+        not query
+        or len(query) > 256
+        or any(unicodedata.category(character).startswith("C") for character in query)
+    ):
+        raise _mail_ui_invalid_search_query()
+
+    expressions: list[str] = []
+    ranking_terms: list[tuple[str, str]] = []
+    token_count = 0
+    previous_end = 0
+    for match in _MAIL_UI_SEARCH_TOKEN_RE.finditer(query):
+        if query[previous_end : match.start()].strip():
+            raise _mail_ui_invalid_search_query()
+        previous_end = match.end()
+        value = match.group("phrase") or match.group("word") or ""
+        value = value.strip()
+        lexical_tokens = re.findall(r"\w+", value, flags=re.UNICODE)
+        if not value or not lexical_tokens:
+            raise _mail_ui_invalid_search_query()
+        token_count += len(lexical_tokens)
+        if token_count > _MAIL_UI_SEARCH_MAX_TOKENS:
+            raise _mail_ui_invalid_search_query()
+
+        explicit_field = match.group("field")
+        field = explicit_field.casefold() if explicit_field is not None else None
+        escaped = value.replace('"', '""')
+        literal = f'"{escaped}"'
+        if field in {"subject", "body"}:
+            expressions.append(f"{field}:{literal}")
+            ranking_terms.append((field, value))
+        elif scope == "subject":
+            expressions.append(f"subject:{literal}")
+            ranking_terms.append(("subject", value))
+        elif scope == "body":
+            expressions.append(f"body:{literal}")
+            ranking_terms.append(("body", value))
+        else:
+            expressions.append(f"(subject:{literal} OR body:{literal})")
+            ranking_terms.append(("all", value))
+
+    if query[previous_end:].strip() or not expressions:
+        raise _mail_ui_invalid_search_query()
+    return " AND ".join(expressions), tuple(ranking_terms)
+
+
+def _mail_ui_local_search_rank(
+    ranking_terms: tuple[tuple[str, str], ...],
+) -> tuple[str, dict[str, str]]:
+    """Return a row-local relevance score unaffected by invisible corpus rows."""
+    score_parts: list[str] = []
+    parameters: dict[str, str] = {}
+    for index, (field, value) in enumerate(ranking_terms):
+        parameter = f"search_rank_term_{index}"
+        parameters[parameter] = value
+
+        def occurrences(column: str, bound_parameter: str = parameter) -> str:
+            normalized = f"lower(COALESCE({column}, ''))"
+            return (
+                f"((length({normalized}) - length(replace({normalized}, "
+                f"lower(:{bound_parameter}), ''))) / "
+                f"max(length(:{bound_parameter}), 1))"
+            )
+
+        if field == "subject":
+            score_parts.append(f"(4 * {occurrences('m.subject')})")
+        elif field == "body":
+            score_parts.append(occurrences("m.body_md"))
+        else:
+            score_parts.append(
+                f"((4 * {occurrences('m.subject')}) + {occurrences('m.body_md')})"
+            )
+    if not score_parts:
+        raise _mail_ui_invalid_search_query()
+    # The search keyset already sorts ascending. Negating the positive score
+    # preserves that shape while ranking more row-local matches first.
+    return f"-({' + '.join(score_parts)})", parameters
+
+
+def _mail_ui_search_fingerprint(
+    *,
+    fts_query: str,
+    project_id: int | None,
+    scope: MailUiSearchScope,
+    order: MailUiSearchOrder,
+) -> str:
+    """Bind a cursor to the exact normalized search without storing query text."""
+    canonical = json.dumps(
+        {
+            "order": order,
+            "project_id": project_id,
+            "query": fts_query,
+            "scope": scope,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _mail_ui_encode_search_cursor(
+    *,
+    fingerprint: str,
+    created_ts_key: str,
+    message_id: int,
+    rank: float | None,
+) -> str:
+    """Encode one stable search ordering key as a URL-safe cursor."""
+    payload = json.dumps(
+        {
+            "created_ts": created_ts_key,
+            "fingerprint": fingerprint,
+            "id": message_id,
+            "rank": rank,
+            "v": _MAIL_UI_CURSOR_VERSION,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+
+
+def _mail_ui_decode_search_cursor(
+    cursor: str,
+    *,
+    expected_fingerprint: str,
+    order: MailUiSearchOrder,
+) -> tuple[float | None, str, int]:
+    """Validate one query-bound search keyset cursor."""
+    if not cursor or len(cursor) > _MAIL_UI_CURSOR_MAX_LENGTH:
+        raise _mail_ui_invalid_search_query()
+    try:
+        padding = "=" * (-len(cursor) % 4)
+        raw = base64.b64decode(
+            (cursor + padding).encode("ascii"),
+            altchars=b"-_",
+            validate=True,
+        )
+        payload = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, dict) or set(payload) != {
+            "created_ts",
+            "fingerprint",
+            "id",
+            "rank",
+            "v",
+        }:
+            raise ValueError("unexpected cursor shape")
+        if payload["v"] != _MAIL_UI_CURSOR_VERSION:
+            raise ValueError("unsupported cursor version")
+        fingerprint = payload["fingerprint"]
+        if (
+            not isinstance(fingerprint, str)
+            or len(fingerprint) != 64
+            or not hmac.compare_digest(fingerprint, expected_fingerprint)
+        ):
+            raise ValueError("cursor belongs to a different query")
+        created_ts = payload["created_ts"]
+        message_id = payload["id"]
+        rank = payload["rank"]
+        if not isinstance(created_ts, str) or not created_ts or len(created_ts) > 64:
+            raise ValueError("invalid timestamp key")
+        _mail_ui_datetime(created_ts)
+        if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0:
+            raise ValueError("invalid message id")
+        if order == "relevance":
+            if (
+                isinstance(rank, bool)
+                or not isinstance(rank, (float, int))
+                or not math.isfinite(float(rank))
+            ):
+                raise ValueError("invalid relevance key")
+            normalized_rank: float | None = float(rank)
+        elif rank is not None:
+            raise ValueError("unexpected relevance key")
+        else:
+            normalized_rank = None
+    except (
+        UnicodeEncodeError,
+        UnicodeDecodeError,
+        binascii.Error,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ):
+        raise _mail_ui_invalid_search_query() from None
+    return normalized_rank, created_ts, message_id
+
+
+def _mail_ui_plain_search_snippet(value: Any) -> str:
+    """Return a bounded, control-free, plain-text FTS excerpt."""
+    normalized = " ".join(str(value or "").split())
+    if len(normalized) <= _MAIL_UI_SEARCH_SNIPPET_MAX_LENGTH:
+        return normalized
+    return normalized[: _MAIL_UI_SEARCH_SNIPPET_MAX_LENGTH - 1].rstrip() + "…"
 
 
 def _mail_ui_safe_attachments(value: Any) -> list[MailUiAttachmentMetadata]:
@@ -2000,7 +3009,7 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
         return "text/html" in request.headers.get("accept", "")
 
     def _public_entrypoint(self, request: Request) -> Response | None:
-        """Serve only the public root redirect and passive Hermes favicon."""
+        """Serve only the public root redirect and passive Iris favicon."""
         if request.method not in {"GET", "HEAD"}:
             return None
 
@@ -2016,14 +3025,14 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
                 headers={**_MAIL_REACT_INDEX_HEADERS, "Location": location},
             )
 
-        if path == _HERMES_FAVICON_PATH and mcp_base not in {"/", _HERMES_FAVICON_PATH}:
-            body = _HERMES_FAVICON_SVG if request.method == "GET" else b""
+        if path == _IRIS_FAVICON_PATH and mcp_base not in {"/", _IRIS_FAVICON_PATH}:
+            body = _IRIS_FAVICON_SVG if request.method == "GET" else b""
             return Response(
                 content=body,
                 media_type="image/svg+xml",
                 headers={
                     "Cache-Control": "public, max-age=86400",
-                    "Content-Length": str(len(_HERMES_FAVICON_SVG)),
+                    "Content-Length": str(len(_IRIS_FAVICON_SVG)),
                     "X-Content-Type-Options": "nosniff",
                 },
             )
@@ -2037,7 +3046,14 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
         path = request.url.path
         if not (path == "/mail" or path.startswith("/mail/")):
             return await call_next(request)
+        legacy_bookmark = _mail_ui_legacy_bookmark(path)
         if not _mail_ui_active_path(path):
+            return JSONResponse(
+                {"detail": "Not Found"},
+                status_code=status.HTTP_404_NOT_FOUND,
+                headers=_MAIL_REACT_INDEX_HEADERS,
+            )
+        if legacy_bookmark is not None and request.method not in {"GET", "HEAD"}:
             return JSONResponse(
                 {"detail": "Not Found"},
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -2057,6 +3073,12 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
             # which is then the only thing standing in front of the UI.
             token = _mail_ui_template_user.set(None)
             try:
+                if legacy_bookmark is not None:
+                    return await _mail_ui_legacy_bookmark_redirect(
+                        settings=self._settings,
+                        request=request,
+                        bookmark=legacy_bookmark,
+                    )
                 return await call_next(request)
             finally:
                 _mail_ui_template_user.reset(token)
@@ -2173,6 +3195,12 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
         }
         token = _mail_ui_template_user.set(template_user)
         try:
+            if legacy_bookmark is not None:
+                return await _mail_ui_legacy_bookmark_redirect(
+                    settings=self._settings,
+                    request=request,
+                    bookmark=legacy_bookmark,
+                )
             return await call_next(request)
         finally:
             _mail_ui_template_user.reset(token)
@@ -2442,7 +3470,7 @@ def _mail_ui_preferences_response(
 
 def _mail_ui_correspondence_advisory(locale: MailUiLocale) -> str:
     """Return the server-authored advisory injected into HumanOverseer mail."""
-    language = "Polish (pl)" if locale == "pl" else "English (en)"
+    language = f"{MAIL_UI_LOCALE_ENGLISH_NAMES[locale]} ({locale.value})"
     return (
         "Advisory communication preference: the authenticated human operator "
         f"prefers replies in {language}. When practical, reply in that language. "
@@ -2502,7 +3530,7 @@ async def _mail_ui_effective_correspondence_locale(
     ever accepting a locale supplied in the message payload.
     """
     if not settings.mail_ui.enabled:
-        return "en"
+        return MailUiLocale.EN
     principal = _mail_ui_preferences_principal(request)
     row = await _mail_ui_preferences_user(request, session)
     role = webauth.normalize_ui_user_role(row.role)
@@ -2511,10 +3539,9 @@ async def _mail_ui_effective_correspondence_locale(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authenticated Mail UI session is no longer current.",
         )
-    locale = row.preferred_correspondence_locale or row.preferred_ui_locale
-    if locale not in {"en", "pl"}:
-        raise RuntimeError("authenticated human has an invalid correspondence locale")
-    return cast(MailUiLocale, locale)
+    return _mail_ui_locale_from_db(
+        row.preferred_correspondence_locale or row.preferred_ui_locale,
+    )
 
 
 async def _mail_ui_preferences_cas_update(
@@ -2714,6 +3741,150 @@ async def _mail_ui_visible_project_roles(
     return visible
 
 
+def _mail_ui_legacy_search_hash(
+    *,
+    bookmark: _MailUiLegacyBookmark,
+    project_id: int,
+    query_items: list[tuple[str, str]],
+) -> str | None:
+    """Map one legacy project/search query to the exact typed React route."""
+    kind = bookmark["kind"]
+    if kind not in {"project", "search"}:
+        return None if query_items else ""
+    if not query_items:
+        return (
+            f"#inbox?{urlencode({'project': project_id})}"
+            if kind == "project"
+            else None
+        )
+    values: dict[str, str] = {}
+    for key, value in query_items:
+        if key not in {"q", "scope", "order"} or key in values:
+            return None
+        values[key] = value
+    raw_query = values.get("q", "").strip()
+    if not raw_query:
+        return None
+    raw_scope = values.get("scope", "all")
+    scope_mapping: dict[str, MailUiSearchScope] = {
+        "all": "all",
+        "both": "all",
+        "subject": "subject",
+        "body": "body",
+    }
+    scope = scope_mapping.get(raw_scope)
+    raw_order = values.get("order", "relevance")
+    order_mapping: dict[str, MailUiSearchOrder] = {
+        "relevance": "relevance",
+        "newest": "newest",
+        "time": "newest",
+    }
+    order = order_mapping.get(raw_order)
+    if scope is None or order is None:
+        return None
+    try:
+        _mail_ui_compile_search_query(raw_query, scope)
+    except HTTPException:
+        return None
+    return "#search?" + urlencode(
+        {
+            "q": raw_query,
+            "project": project_id,
+            "scope": scope,
+            "order": order,
+        }
+    )
+
+
+async def _mail_ui_legacy_bookmark_redirect(
+    *,
+    settings: Settings,
+    request: Request,
+    bookmark: _MailUiLegacyBookmark,
+) -> Response:
+    """Redirect a verified upstream bookmark without reviving its old handler."""
+    kind = bookmark["kind"]
+    query_items = list(request.query_params.multi_items())
+    if kind in {"projects", "inbox"}:
+        if query_items:
+            return JSONResponse(
+                {"detail": "Not Found"},
+                status_code=status.HTTP_404_NOT_FOUND,
+                headers=_MAIL_REACT_INDEX_HEADERS,
+            )
+        fragment = "#projects" if kind == "projects" else "#inbox"
+    else:
+        project_slug = bookmark["project_slug"]
+        if project_slug is None:
+            return JSONResponse(
+                {"detail": "Not Found"},
+                status_code=status.HTTP_404_NOT_FOUND,
+                headers=_MAIL_REACT_INDEX_HEADERS,
+            )
+        try:
+            await ensure_schema()
+            async with get_session() as session:
+                visible_roles = await _mail_ui_visible_project_roles(
+                    settings=settings,
+                    request=request,
+                    session=session,
+                )
+                project_row = (
+                    await session.execute(
+                        text("SELECT id FROM projects WHERE slug = :slug"),
+                        {"slug": project_slug},
+                    )
+                ).first()
+                if project_row is None:
+                    raise LookupError("project not found")
+                project_id = int(project_row[0])
+                if project_id not in visible_roles:
+                    raise LookupError("project not visible")
+                if kind == "message":
+                    if query_items:
+                        raise LookupError("message bookmark has unsupported query")
+                    message_id = bookmark["message_id"]
+                    if message_id is None:
+                        raise LookupError("message id missing")
+                    message_exists = (
+                        await session.execute(
+                            text(
+                                "SELECT 1 FROM messages "
+                                "WHERE project_id = :project_id AND id = :message_id"
+                            ),
+                            {
+                                "project_id": project_id,
+                                "message_id": message_id,
+                            },
+                        )
+                    ).first()
+                    if message_exists is None:
+                        raise LookupError("message not found")
+                    fragment = f"#message/{project_id}/{message_id}"
+                else:
+                    search_hash = _mail_ui_legacy_search_hash(
+                        bookmark=bookmark,
+                        project_id=project_id,
+                        query_items=query_items,
+                    )
+                    if search_hash is None:
+                        raise LookupError("unsupported legacy search query")
+                    fragment = search_hash
+        except Exception:
+            return JSONResponse(
+                {"detail": "Not Found"},
+                status_code=status.HTTP_404_NOT_FOUND,
+                headers=_MAIL_REACT_INDEX_HEADERS,
+            )
+    return Response(
+        status_code=status.HTTP_307_TEMPORARY_REDIRECT,
+        headers={
+            **_MAIL_REACT_INDEX_HEADERS,
+            "Location": f"{_MAIL_REACT_BASE_PATH}{fragment}",
+        },
+    )
+
+
 async def _mail_ui_require_project_access(
     *,
     settings: Settings,
@@ -2880,12 +4051,39 @@ def _mail_ui_message_detail_from_row(
         request=request,
         visible_roles=visible_roles,
     )
+    reply_target = (
+        MailUiReplyTarget(
+            agent_id=int(row["reply_target_agent_id"]),
+            agent_generation=str(row["reply_target_agent_generation"]),
+            project_id=int(row["reply_target_project_id"]),
+            project_generation=str(row["reply_target_project_generation"]),
+            canonical_name=_sender_display_name(
+                message_project_id=summary.project_id,
+                sender_name=str(row["reply_target_agent_name"]),
+                sender_project_id=int(row["reply_target_project_id"]),
+                sender_project_slug=str(row["reply_target_project_slug"]),
+            ),
+        )
+        if row["reply_target_agent_id"] is not None
+        and str(row["reply_target_agent_name"]) != "HumanOverseer"
+        else None
+    )
+    summary = summary.model_copy(
+        update={
+            "can_reply": (
+                summary.can_reply
+                and reply_target is not None
+                and bool(row["reply_target_available"])
+            )
+        }
+    )
     return MailUiMessageDetail(
         **summary.model_dump(),
         body_md=str(row["body_md"] or ""),
         to=list(recipients["to"]),
         cc=list(recipients["cc"]),
         attachments=_mail_ui_safe_attachments(row["attachments"]),
+        reply_target=reply_target,
     )
 
 
@@ -4868,13 +6066,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         # ---------------------------------------------------------------
 
         def _safe_next(raw: str) -> str:
-            """Redirect a successful sign-in only to the canonical React shell.
+            """Redirect sign-in only to the shell or an enumerated bookmark.
 
-            This prevents open redirects and keeps retired server-rendered/API
-            paths from becoming accidental post-login compatibility surfaces.
+            The latter returns through the authenticated middleware, which
+            performs the project/message RBAC lookup before redirecting to a
+            typed hash route. Unmapped retired routes never become post-login
+            compatibility surfaces.
             """
-            from urllib.parse import urlsplit
-
             candidate = (raw or "").strip()
             if (
                 not candidate.startswith("/")
@@ -4884,9 +6082,59 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             ):
                 return "/mail"
             parsed = urlsplit(candidate)
-            if parsed.scheme or parsed.netloc or parsed.path != "/mail":
+            if parsed.scheme or parsed.netloc:
                 return "/mail"
-            return candidate
+            if parsed.path in {"/mail", "/mail/"}:
+                return urlunsplit(("", "", "/mail", parsed.query, parsed.fragment))
+            if parsed.fragment:
+                return "/mail"
+            bookmark = _mail_ui_legacy_bookmark(parsed.path)
+            if bookmark is None:
+                return "/mail"
+            try:
+                query_items = parse_qsl(
+                    parsed.query,
+                    keep_blank_values=True,
+                    strict_parsing=False,
+                    max_num_fields=4,
+                )
+            except ValueError:
+                return "/mail"
+            if bookmark["kind"] in {"project", "search"}:
+                if (
+                    _mail_ui_legacy_search_hash(
+                        bookmark=bookmark,
+                        project_id=1,
+                        query_items=query_items,
+                    )
+                    is None
+                ):
+                    return "/mail"
+            elif query_items:
+                return "/mail"
+            return urlunsplit(("", "", parsed.path, parsed.query, ""))
+
+        async def _render_mail_login(
+            request: Request,
+            *,
+            error: str | None,
+            next_url: str,
+            requested_locale: str | None,
+            status_code: int = status.HTTP_200_OK,
+        ) -> HTMLResponse:
+            locale = _mail_login_locale(
+                requested_locale,
+                request.headers.get("accept-language", ""),
+            )
+            response = await _render(
+                "mail_login.html",
+                error=error,
+                next_url=next_url,
+                status_code=status_code,
+                **_mail_login_context(locale, next_url),
+            )
+            response.headers.update(_MAIL_LOGIN_HTML_HEADERS)
+            return response
 
         @fastapi_app.get(_MAIL_LOGIN_PATH, response_class=HTMLResponse)
         async def mail_login_form(request: Request) -> HTMLResponse:
@@ -4897,14 +6145,15 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 return HTMLResponse(
                     "", status_code=status.HTTP_303_SEE_OTHER,
                     headers={
-                        **_MAIL_LEGACY_HTML_HEADERS,
+                        **_MAIL_LOGIN_HTML_HEADERS,
                         "Location": _safe_next(request.query_params.get("next", "/mail")),
                     },
                 )
-            return await _render(
-                "mail_login.html",
+            return await _render_mail_login(
+                request,
                 error=None,
                 next_url=_safe_next(request.query_params.get("next", "/mail")),
+                requested_locale=request.query_params.get("lang"),
             )
 
         @fastapi_app.post(_MAIL_LOGIN_PATH)
@@ -4914,6 +6163,16 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             username = str(form.get("username", "")).strip()
             password = str(form.get("password", ""))
             next_url = _safe_next(str(form.get("next", "/mail")))
+            submitted_locale = form.get("lang")
+            requested_locale = (
+                str(submitted_locale)
+                if submitted_locale is not None
+                else request.query_params.get("lang")
+            )
+            locale = _mail_login_locale(
+                requested_locale,
+                request.headers.get("accept-language", ""),
+            )
 
             # The login form is the one unauthenticated POST under /mail, so the
             # middleware's same-origin check has not run for it. Do it here.
@@ -4928,10 +6187,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             client_ip = request.client.host if request.client else "-"
             throttle_key = f"{client_ip}\0{username.casefold()[:64]}"
             if _login_throttled(throttle_key):
-                return await _render(
-                    "mail_login.html",
-                    error="Too many failed attempts. Wait a minute and try again.",
+                return await _render_mail_login(
+                    request,
+                    error=_MAIL_LOGIN_TEXT[locale].throttled,
                     next_url=next_url,
+                    requested_locale=locale.value,
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 )
 
@@ -4962,10 +6222,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 structlog.get_logger("mail_ui").info(
                     "mail_ui.login_failed", username=username[:64], client=client_ip
                 )
-                return await _render(
-                    "mail_login.html",
-                    error="Invalid username or password.",
+                return await _render_mail_login(
+                    request,
+                    error=_MAIL_LOGIN_TEXT[locale].invalid_credentials,
                     next_url=next_url,
+                    requested_locale=locale.value,
                     status_code=status.HTTP_401_UNAUTHORIZED,
                 )
 
@@ -4981,20 +6242,38 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 ttl=float(cfg.session_ttl_seconds),
             )
             async with get_session() as s_touch:
-                from sqlmodel import select as _select2
-
                 from .models import UiUser as _UiUser2
 
-                res2 = await s_touch.execute(_select2(_UiUser2).where(_UiUser2.username == username))
-                row2 = res2.scalars().first()
-                if row2 is not None:
-                    row2.last_login_ts = datetime.now(timezone.utc).replace(tzinfo=None)
-                    s_touch.add(row2)
-                    await s_touch.commit()
+                touch_result = await s_touch.execute(
+                    update(_UiUser2)
+                    .where(cast(Any, _UiUser2.username == username))
+                    .where(cast(Any, _UiUser2.session_epoch == row_epoch))
+                    .where(cast(Any, _UiUser2.session_generation == row_generation))
+                    .where(cast(Any, _UiUser2.disabled == False))  # noqa: E712
+                    .values(
+                        last_login_ts=datetime.now(timezone.utc).replace(tzinfo=None),
+                        preferred_ui_locale=locale.value,
+                    )
+                )
+                if int(getattr(touch_result, "rowcount", 0) or 0) != 1:
+                    await s_touch.rollback()
+                    structlog.get_logger("mail_ui").warning(
+                        "mail_ui.login_lifetime_changed",
+                        username=username[:64],
+                        client=client_ip,
+                    )
+                    return await _render_mail_login(
+                        request,
+                        error=_MAIL_LOGIN_TEXT[locale].invalid_credentials,
+                        next_url=next_url,
+                        requested_locale=locale.value,
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                    )
+                await s_touch.commit()
 
             response = Response(
                 status_code=status.HTTP_303_SEE_OTHER,
-                headers={**_MAIL_LEGACY_HTML_HEADERS, "Location": next_url},
+                headers={**_MAIL_LOGIN_HTML_HEADERS, "Location": next_url},
             )
             _set_mail_ui_session_cookie(response, token=token, settings=settings)
             structlog.get_logger("mail_ui").info("mail_ui.login_ok", username=username, client=client_ip)
@@ -5288,6 +6567,67 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             return MailUiProjectsResponse(items=items, total=len(items))
 
         @fastapi_app.get(
+            "/mail/api/v1/projects/{project_id}/agents",
+            response_model=MailUiProjectAgentsResponse,
+            responses=_MAIL_UI_DELIVERY_ERROR_RESPONSES,
+        )
+        async def mail_ui_project_agents_v1(
+            project_id: Annotated[int, FastApiPath(gt=0)],
+            request: Request,
+        ) -> MailUiProjectAgentsResponse:
+            """Return the active, addressable agents in one active project."""
+            await ensure_schema()
+            async with get_session() as session:
+                await _mail_ui_revalidated_admin_user(request, session)
+                visible_roles = await _mail_ui_visible_project_roles(
+                    settings=settings,
+                    request=request,
+                    session=session,
+                )
+                project = await session.get(Project, project_id)
+                if (
+                    project_id not in visible_roles
+                    or project is None
+                    or project.archived_at is not None
+                ):
+                    raise _mail_ui_domain_http_exception(
+                        code="project_not_found",
+                        status_code=status.HTTP_404_NOT_FOUND,
+                    )
+                rows = await session.execute(
+                    text(
+                        "SELECT id, agent_generation, name, display_name FROM agents "
+                        "WHERE project_id = :project_id AND retired_at IS NULL "
+                        "AND name <> :human_overseer "
+                        "AND contact_policy <> 'block_all' "
+                        "ORDER BY lower(name), name, id"
+                    ),
+                    {
+                        "project_id": project_id,
+                        "human_overseer": "HumanOverseer",
+                    },
+                )
+                items = [
+                    MailUiAgentDirectoryItem(
+                        agent_id=int(row["id"]),
+                        agent_generation=str(row["agent_generation"]),
+                        name=str(row["name"]),
+                        display_name=(
+                            str(row["display_name"])
+                            if row["display_name"] is not None
+                            else None
+                        ),
+                    )
+                    for row in rows.mappings().all()
+                ]
+            return MailUiProjectAgentsResponse(
+                project_id=project_id,
+                project_generation=project.project_generation,
+                items=items,
+                total=len(items),
+            )
+
+        @fastapi_app.get(
             "/mail/api/v1/inbox",
             response_model=MailUiInboxResponse,
         )
@@ -5389,6 +6729,171 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             )
 
         @fastapi_app.get(
+            _MAIL_SEARCH_API_PATH,
+            response_model=MailUiSearchResponse,
+            responses=_MAIL_UI_SEARCH_ERROR_RESPONSES,
+        )
+        async def mail_ui_search_v1(
+            request: Request,
+            q: Annotated[str, Query(min_length=1, max_length=256)],
+            project_id: Annotated[int | None, Query(gt=0)] = None,
+            scope: Annotated[MailUiSearchScope, Query()] = "all",
+            order: Annotated[MailUiSearchOrder, Query()] = "relevance",
+            limit: Annotated[int, Query(ge=1, le=100)] = 50,
+            cursor: Annotated[
+                str | None,
+                Query(min_length=1, max_length=_MAIL_UI_CURSOR_MAX_LENGTH),
+            ] = None,
+        ) -> MailUiSearchResponse:
+            """Search only visible messages through bounded SQLite FTS5."""
+            fts_query, ranking_terms = _mail_ui_compile_search_query(q, scope)
+            fingerprint = _mail_ui_search_fingerprint(
+                fts_query=fts_query,
+                project_id=project_id,
+                scope=scope,
+                order=order,
+            )
+            cursor_key = (
+                _mail_ui_decode_search_cursor(
+                    cursor,
+                    expected_fingerprint=fingerprint,
+                    order=order,
+                )
+                if cursor is not None
+                else None
+            )
+            try:
+                await ensure_schema()
+                async with get_session() as session:
+                    visible_roles = await _mail_ui_visible_project_roles(
+                        settings=settings,
+                        request=request,
+                        session=session,
+                    )
+                    if project_id is not None:
+                        if project_id not in visible_roles:
+                            raise HTTPException(
+                                status_code=status.HTTP_404_NOT_FOUND,
+                                detail={"code": "project_not_found"},
+                            )
+                        visible_ids = [project_id]
+                    else:
+                        visible_ids = sorted(visible_roles)
+
+                    predicate, parameters = _mail_ui_visible_project_predicate(
+                        visible_ids,
+                        column="m.project_id",
+                        parameter_prefix="search_v1_pid",
+                    )
+                    rank_expression, rank_parameters = _mail_ui_local_search_rank(
+                        ranking_terms
+                    )
+                    cursor_predicate = ""
+                    page_parameters: dict[str, Any] = {
+                        **parameters,
+                        **rank_parameters,
+                        "fts_query": fts_query,
+                        "page_limit": limit + 1,
+                    }
+                    if cursor_key is not None:
+                        cursor_rank, cursor_created_ts, cursor_message_id = cursor_key
+                        page_parameters.update(
+                            {
+                                "cursor_created_ts": cursor_created_ts,
+                                "cursor_message_id": cursor_message_id,
+                            }
+                        )
+                        time_keyset = (
+                            f"({_MAIL_UI_CREATED_TS_KEY_SQL} < :cursor_created_ts "
+                            f"OR ({_MAIL_UI_CREATED_TS_KEY_SQL} = :cursor_created_ts "
+                            "AND m.id < :cursor_message_id))"
+                        )
+                        if order == "relevance":
+                            page_parameters["cursor_rank"] = cursor_rank
+                            cursor_predicate = (
+                                f" AND ({rank_expression} > :cursor_rank "
+                                f"OR ({rank_expression} = :cursor_rank AND {time_keyset}))"
+                            )
+                        else:
+                            cursor_predicate = f" AND {time_keyset}"
+
+                    ordering = (
+                        f"{rank_expression} ASC, {_MAIL_UI_CREATED_TS_KEY_SQL} DESC, "
+                        "m.id DESC"
+                        if order == "relevance"
+                        else f"{_MAIL_UI_CREATED_TS_KEY_SQL} DESC, m.id DESC"
+                    )
+                    rows = await session.execute(
+                        text(
+                            "SELECT m.id, m.project_id, p.slug AS project_slug, m.subject, "
+                            "m.importance, m.ack_required, m.thread_id, m.reply_to, "
+                            f"m.created_ts, {_MAIL_UI_CREATED_TS_KEY_SQL} AS cursor_created_ts, "
+                            f"{rank_expression} AS search_rank, "
+                            "snippet(fts_messages, -1, '', '', '…', 24) AS search_snippet, "
+                            "sender.name AS sender_name, "
+                            "sender.display_name AS sender_display_name, "
+                            "sender.project_id AS sender_project_id, "
+                            "sender_project.slug AS sender_project_slug "
+                            "FROM fts_messages "
+                            "JOIN messages m ON m.id = fts_messages.rowid "
+                            "JOIN projects p ON p.id = m.project_id "
+                            "JOIN agents sender ON sender.id = m.sender_id "
+                            "LEFT JOIN projects sender_project "
+                            "ON sender_project.id = sender.project_id "
+                            f"WHERE {predicate} AND fts_messages MATCH :fts_query"
+                            f"{cursor_predicate} ORDER BY {ordering} LIMIT :page_limit"
+                        ),
+                        page_parameters,
+                    )
+                    page_rows = list(rows.mappings().all())
+                    has_more = len(page_rows) > limit
+                    response_rows = page_rows[:limit]
+                    items: list[MailUiSearchItem] = []
+                    for row in response_rows:
+                        summary = _mail_ui_message_summary_from_row(
+                            row,
+                            settings=settings,
+                            request=request,
+                            visible_roles=visible_roles,
+                        )
+                        items.append(
+                            MailUiSearchItem(
+                                **summary.model_dump(),
+                                snippet=_mail_ui_plain_search_snippet(
+                                    row["search_snippet"]
+                                ),
+                            )
+                        )
+                    next_cursor = (
+                        _mail_ui_encode_search_cursor(
+                            fingerprint=fingerprint,
+                            created_ts_key=str(
+                                response_rows[-1]["cursor_created_ts"]
+                            ),
+                            message_id=int(response_rows[-1]["id"]),
+                            rank=(
+                                float(response_rows[-1]["search_rank"])
+                                if order == "relevance"
+                                else None
+                            ),
+                        )
+                        if has_more and response_rows
+                        else None
+                    )
+            except HTTPException:
+                raise
+            except Exception as exc:
+                structlog.get_logger("mail_ui").warning(
+                    "mail_ui.search_unavailable",
+                    error_type=type(exc).__name__,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={"code": "search_unavailable"},
+                ) from None
+            return MailUiSearchResponse(items=items, next_cursor=next_cursor)
+
+        @fastapi_app.get(
             "/mail/api/v1/projects/{project_id}/messages/{message_id}",
             response_model=MailUiMessageDetail,
         )
@@ -5412,13 +6917,47 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         text(
                             "SELECT m.id, m.project_id, p.slug AS project_slug, m.subject, "
                             "m.body_md, m.importance, m.ack_required, m.thread_id, m.reply_to, "
-                            "m.created_ts, m.attachments, sender.name AS sender_name, "
-                            "sender.display_name AS sender_display_name, "
-                            "sender.project_id AS sender_project_id, "
-                            "sender_project.slug AS sender_project_slug "
+                            "m.created_ts, m.attachments, "
+                            "coalesce(delivery.sender_name_snapshot, sender.name) AS sender_name, "
+                            "CASE WHEN delivery.id IS NULL OR ("
+                            "sender.id = delivery.sender_id "
+                            "AND sender.agent_generation = delivery.sender_generation_snapshot "
+                            "AND sender.project_id = delivery.sender_project_id_snapshot) "
+                            "THEN sender.display_name ELSE NULL END AS sender_display_name, "
+                            "coalesce(delivery.sender_project_id_snapshot, sender.project_id) "
+                            "AS sender_project_id, "
+                            "coalesce(delivery.sender_project_slug_snapshot, sender_project.slug) "
+                            "AS sender_project_slug, "
+                            "delivery.sender_id AS reply_target_agent_id, "
+                            "delivery.sender_name_snapshot AS reply_target_agent_name, "
+                            "delivery.sender_generation_snapshot "
+                            "AS reply_target_agent_generation, "
+                            "delivery.sender_project_id_snapshot AS reply_target_project_id, "
+                            "delivery.sender_project_slug_snapshot AS reply_target_project_slug, "
+                            "delivery.sender_project_generation_snapshot "
+                            "AS reply_target_project_generation, "
+                            "CASE WHEN delivery.id IS NOT NULL "
+                            "AND sender.id = delivery.sender_id "
+                            "AND sender.name = delivery.sender_name_snapshot "
+                            "AND sender.agent_generation = delivery.sender_generation_snapshot "
+                            "AND sender.project_id = delivery.sender_project_id_snapshot "
+                            "AND sender.retired_at IS NULL "
+                            "AND sender.contact_policy != 'block_all' "
+                            "AND sender_project.id = delivery.sender_project_id_snapshot "
+                            "AND sender_project.slug = delivery.sender_project_slug_snapshot "
+                            "AND sender_project.project_generation = "
+                            "delivery.sender_project_generation_snapshot "
+                            "AND sender_project.archived_at IS NULL "
+                            "THEN 1 ELSE 0 END AS reply_target_available "
                             "FROM messages m "
                             "JOIN projects p ON p.id = m.project_id "
-                            "JOIN agents sender ON sender.id = m.sender_id "
+                            "LEFT JOIN message_deliveries delivery "
+                            "ON delivery.id = m.delivery_id "
+                            "AND delivery.state = 'published' "
+                            "AND delivery.message_id = m.id "
+                            "AND delivery.project_id = m.project_id "
+                            "AND delivery.project_generation_snapshot = p.project_generation "
+                            "LEFT JOIN agents sender ON sender.id = m.sender_id "
                             "LEFT JOIN projects sender_project ON sender_project.id = sender.project_id "
                             "WHERE m.project_id = :project_id AND m.id = :message_id"
                         ),
@@ -5456,29 +6995,46 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     project_id=project_id,
                     compose=True,
                 )
+                if project_snapshot.generation != message.expected_project_generation:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail={"code": "project_recreated"},
+                    )
+                recipient_ids = [recipient.agent_id for recipient in message.recipients]
                 recipient_rows = await session.execute(
                     select(Agent).where(
                         cast(Any, Agent.project_id == project_id),
-                        col(Agent.name).in_(message.recipients),
+                        col(Agent.id).in_(recipient_ids),
+                        col(Agent.retired_at).is_(None),
+                        col(Agent.contact_policy) != "block_all",
+                        col(Agent.name) != "HumanOverseer",
                     )
                 )
-                agents_by_name = {
-                    agent.name: agent for agent in recipient_rows.scalars().all()
+                agents_by_id = {
+                    int(agent.id): agent
+                    for agent in recipient_rows.scalars().all()
+                    if agent.id is not None
                 }
-                if set(agents_by_name) != set(message.recipients):
+                if set(agents_by_id) != set(recipient_ids):
                     raise HTTPException(
-                        status_code=422,
-                        detail={"code": "recipient_not_found"},
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail={"code": "recipient_unavailable"},
                     )
-                recipients = tuple(
-                    [
+                recipients_list: list[DeliveryRecipientSnapshot] = []
+                for recipient_ref in message.recipients:
+                    agent = agents_by_id[recipient_ref.agent_id]
+                    if agent.agent_generation != recipient_ref.expected_agent_generation:
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail={"code": "recipient_unavailable"},
+                        )
+                    recipients_list.append(
                         await _mail_ui_delivery_recipient(
                             session=session,
-                            agent=agents_by_name[name],
+                            agent=agent,
                         )
-                        for name in message.recipients
-                    ]
-                )
+                    )
+                recipients = tuple(recipients_list)
                 await session.commit()
 
             delivery_request = MessageDeliveryRequest(
@@ -5526,8 +7082,73 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 original = await session.get(Message, message_id)
                 if original is None or original.project_id != project_id:
                     raise HTTPException(status_code=404, detail={"code": "message_not_found"})
-                recipient_agent = await session.get(Agent, original.sender_id)
-                if recipient_agent is None or recipient_agent.name == "HumanOverseer":
+                original_delivery = (
+                    await session.get(MessageDelivery, original.delivery_id)
+                    if original.delivery_id is not None
+                    else None
+                )
+                if (
+                    original_delivery is None
+                    or original_delivery.state != "published"
+                    or original_delivery.message_id != message_id
+                    or original_delivery.project_id != source_project.project_id
+                    or not hmac.compare_digest(
+                        original_delivery.project_generation_snapshot,
+                        source_project.generation,
+                    )
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"code": "reply_provenance_unavailable"},
+                    )
+                expected_target = (
+                    reply.expected_sender_agent_id,
+                    reply.expected_sender_agent_generation,
+                    reply.expected_sender_project_id,
+                    reply.expected_sender_project_generation,
+                )
+                immutable_target = (
+                    original_delivery.sender_id,
+                    original_delivery.sender_generation_snapshot,
+                    original_delivery.sender_project_id_snapshot,
+                    original_delivery.sender_project_generation_snapshot,
+                )
+                if (
+                    expected_target[0] != immutable_target[0]
+                    or expected_target[2] != immutable_target[2]
+                    or not hmac.compare_digest(expected_target[1], immutable_target[1])
+                    or not hmac.compare_digest(expected_target[3], immutable_target[3])
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"code": "reply_target_changed"},
+                    )
+                recipient_agent = await session.get(Agent, original_delivery.sender_id)
+                target_project_row = await session.get(
+                    Project,
+                    original_delivery.sender_project_id_snapshot,
+                )
+                if (
+                    recipient_agent is None
+                    or target_project_row is None
+                    or recipient_agent.name == "HumanOverseer"
+                    or recipient_agent.name != original_delivery.sender_name_snapshot
+                    or recipient_agent.project_id
+                    != original_delivery.sender_project_id_snapshot
+                    or not hmac.compare_digest(
+                        recipient_agent.agent_generation,
+                        original_delivery.sender_generation_snapshot,
+                    )
+                    or target_project_row.slug
+                    != original_delivery.sender_project_slug_snapshot
+                    or not hmac.compare_digest(
+                        target_project_row.project_generation,
+                        original_delivery.sender_project_generation_snapshot,
+                    )
+                    or recipient_agent.retired_at is not None
+                    or recipient_agent.contact_policy == "block_all"
+                    or target_project_row.archived_at is not None
+                ):
                     raise HTTPException(
                         status_code=409,
                         detail={"code": "reply_target_unavailable"},
@@ -5537,8 +7158,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     agent=recipient_agent,
                 )
                 target_project = recipient.agent.project
-                thread_id = original.thread_id or str(original.id)
-                original_subject = original.subject or ""
+                thread_id = original_delivery.thread_id or str(original.id)
+                original_subject = original_delivery.subject or ""
                 subject = (
                     original_subject
                     if original_subject.casefold().startswith("re:")
@@ -5685,13 +7306,47 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         "SELECT m.id, m.project_id, p.slug AS project_slug, m.subject, "
                         "m.body_md, m.importance, m.ack_required, m.thread_id, m.reply_to, "
                         f"m.created_ts, {_MAIL_UI_CREATED_TS_KEY_SQL} AS cursor_created_ts, "
-                        "m.attachments, sender.name AS sender_name, "
-                        "sender.display_name AS sender_display_name, "
-                        "sender.project_id AS sender_project_id, "
-                        "sender_project.slug AS sender_project_slug "
+                        "m.attachments, "
+                        "coalesce(delivery.sender_name_snapshot, sender.name) AS sender_name, "
+                        "CASE WHEN delivery.id IS NULL OR ("
+                        "sender.id = delivery.sender_id "
+                        "AND sender.agent_generation = delivery.sender_generation_snapshot "
+                        "AND sender.project_id = delivery.sender_project_id_snapshot) "
+                        "THEN sender.display_name ELSE NULL END AS sender_display_name, "
+                        "coalesce(delivery.sender_project_id_snapshot, sender.project_id) "
+                        "AS sender_project_id, "
+                        "coalesce(delivery.sender_project_slug_snapshot, sender_project.slug) "
+                        "AS sender_project_slug, "
+                        "delivery.sender_id AS reply_target_agent_id, "
+                        "delivery.sender_name_snapshot AS reply_target_agent_name, "
+                        "delivery.sender_generation_snapshot "
+                        "AS reply_target_agent_generation, "
+                        "delivery.sender_project_id_snapshot AS reply_target_project_id, "
+                        "delivery.sender_project_slug_snapshot AS reply_target_project_slug, "
+                        "delivery.sender_project_generation_snapshot "
+                        "AS reply_target_project_generation, "
+                        "CASE WHEN delivery.id IS NOT NULL "
+                        "AND sender.id = delivery.sender_id "
+                        "AND sender.name = delivery.sender_name_snapshot "
+                        "AND sender.agent_generation = delivery.sender_generation_snapshot "
+                        "AND sender.project_id = delivery.sender_project_id_snapshot "
+                        "AND sender.retired_at IS NULL "
+                        "AND sender.contact_policy != 'block_all' "
+                        "AND sender_project.id = delivery.sender_project_id_snapshot "
+                        "AND sender_project.slug = delivery.sender_project_slug_snapshot "
+                        "AND sender_project.project_generation = "
+                        "delivery.sender_project_generation_snapshot "
+                        "AND sender_project.archived_at IS NULL "
+                        "THEN 1 ELSE 0 END AS reply_target_available "
                         "FROM messages m "
                         "JOIN projects p ON p.id = m.project_id "
-                        "JOIN agents sender ON sender.id = m.sender_id "
+                        "LEFT JOIN message_deliveries delivery "
+                        "ON delivery.id = m.delivery_id "
+                        "AND delivery.state = 'published' "
+                        "AND delivery.message_id = m.id "
+                        "AND delivery.project_id = m.project_id "
+                        "AND delivery.project_generation_snapshot = p.project_generation "
+                        "LEFT JOIN agents sender ON sender.id = m.sender_id "
                         "LEFT JOIN projects sender_project ON sender_project.id = sender.project_id "
                         "WHERE m.project_id = :project_id AND m.thread_id = :thread_id"
                         f"{cursor_predicate} "
@@ -5935,10 +7590,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         def _preferences_response_for_user(row: Any) -> MailUiPreferencesResponse:
             """Render a row whose locale integrity is enforced by the schema."""
             return _mail_ui_preferences_response(
-                preferred_ui_locale=cast(MailUiLocale, row.preferred_ui_locale),
-                preferred_correspondence_locale=cast(
-                    MailUiLocale | None,
-                    row.preferred_correspondence_locale,
+                preferred_ui_locale=_mail_ui_locale_from_db(row.preferred_ui_locale),
+                preferred_correspondence_locale=(
+                    _mail_ui_locale_from_db(row.preferred_correspondence_locale)
+                    if row.preferred_correspondence_locale is not None
+                    else None
                 ),
             )
 
@@ -9020,7 +10676,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         """Keep secrets and authored mail content out of typed 422 responses."""
         path = request.url.path
         redact_input = (
-            path == _MAIL_PASSWORD_API_PATH
+            path in (_MAIL_PASSWORD_API_PATH, _MAIL_SEARCH_API_PATH)
             or bool(_MAIL_API_COMPOSE_SHAPE_RE.fullmatch(path))
             or bool(_MAIL_API_REPLY_SHAPE_RE.fullmatch(path))
         )

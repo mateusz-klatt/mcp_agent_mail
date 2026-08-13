@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -117,6 +118,23 @@ async def get_message_recipients(message_id: int) -> list[dict]:
         return [dict(row) for row in result.mappings()]
 
 
+def _retry_windows_readonly_removal(
+    function: Any,
+    path: str,
+    error: BaseException,
+) -> None:
+    """Retry one Windows cleanup operation after clearing its read-only bit.
+
+    Git marks loose objects and packs read-only on native Windows.  The disaster
+    simulation must still remove the exact temporary repository it created, but
+    it must not turn unrelated cleanup failures into silent successes.
+    """
+    if os.name != "nt" or not isinstance(error, PermissionError):
+        raise error
+    Path(path).chmod(stat.S_IWRITE)
+    function(path)
+
+
 def delete_database_and_storage(settings) -> tuple[Path, Path]:
     """Delete the database and storage directory, returning their paths.
 
@@ -146,7 +164,7 @@ def delete_database_and_storage(settings) -> tuple[Path, Path]:
 
     # Delete storage directory
     if storage_path.exists():
-        shutil.rmtree(storage_path)
+        shutil.rmtree(storage_path, onexc=_retry_windows_readonly_removal)
 
     return db_path, storage_path
 

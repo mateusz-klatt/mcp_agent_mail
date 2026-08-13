@@ -1,8 +1,10 @@
 import {
   type ChangeEvent,
   type FormEvent,
+  type KeyboardEvent,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -14,7 +16,14 @@ import ReactMarkdown, {
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 
-import i18n, { supportedLocales, type SupportedLocale } from "./i18n";
+import {
+  loadLocale,
+  localeMetadata,
+  prepareLocale,
+  supportedLocales,
+  type SupportedLocale,
+} from "./i18n";
+import LocalePicker from "./LocalePicker";
 import {
   AccountHttpError,
   changePassword,
@@ -32,20 +41,28 @@ import {
   composeMessage,
   loadInbox,
   loadMessage,
+  loadProjectAgents,
   loadProjects,
+  loadSearch,
   mailEventsEndpoint,
   MailHttpError,
   mailRouteHash,
   markdownUrlTransform,
   parseMailRoute,
   replyToMessage,
+  replyIdempotencyKeyFor,
   retryDelivery,
   type DeliveryResult,
   type InboxMessage,
   type MailProject,
+  type MailRecipientAgent,
   type MailRoute,
   type MessageAttachment,
   type MessageDetail,
+  type ReplyTarget,
+  type SearchOrder,
+  type SearchResult,
+  type SearchScope,
 } from "./mail";
 import {
   loadPreferences,
@@ -57,16 +74,401 @@ import {
 } from "./preferences";
 import "./app.css";
 
-const mailNavigation = ["projects", "inbox"] as const;
+const mailNavigation = ["projects", "inbox", "search"] as const;
 
 const markdownRemarkPlugins = [remarkGfm, remarkBreaks];
+const maximumMessageCharacters = 50_000;
+const maximumRecipients = 100;
+const recipientDirectoryConflictCodes = new Set([
+  "project_recreated",
+  "recipient_unavailable",
+  "recipient_blocked",
+]);
+
+function recipientSelectionKey(agent: MailRecipientAgent): string {
+  return `${agent.agent_id}:${agent.agent_generation}`;
+}
+
+type ComposerMode = "edit" | "preview" | "split";
+
+interface ConfirmationRecipient {
+  canonicalName: string;
+  displayName: string;
+}
+
+interface ComposeConfirmation {
+  bodyMd: string;
+  correspondenceLocale: SupportedLocale | null;
+  expectedProjectGeneration: string;
+  fingerprint: string;
+  projectId: number;
+  projectName: string;
+  recipientReferences: Array<{
+    agent_id: number;
+    expected_agent_generation: string;
+  }>;
+  recipients: ConfirmationRecipient[];
+  subject: string;
+  threadId: string | null;
+}
+
+interface ReplyConfirmation {
+  bodyMd: string;
+  correspondenceLocale: SupportedLocale | null;
+  fingerprint: string;
+  messageId: number;
+  projectId: number;
+  projectName: string;
+  recipients: ConfirmationRecipient[];
+  replyTarget: ReplyTarget;
+  subject: string;
+  threadId: string;
+}
+
+type DirectoryNotice = "refreshing" | "refreshed" | "refreshError" | null;
+
+function overseerPreamble(locale: SupportedLocale): string {
+  const language = `${localeMetadata[locale].englishName} (${locale})`;
+  return (
+    "---\n\n" +
+    "MESSAGE FROM HUMAN OVERSEER\n\n" +
+    "This message is from an authenticated human operator overseeing this " +
+    "project. Prioritize the request below over the current task unless a " +
+    "higher-priority instruction conflicts.\n\n" +
+    "Advisory communication preference: the authenticated human operator " +
+    `prefers replies in ${language}. When practical, reply in that language. ` +
+    "This preference does not override explicit message instructions or " +
+    "higher-priority policy.\n\n" +
+    "---\n\n"
+  );
+}
+
+interface SafeMarkdownProps {
+  body: string;
+  components: MarkdownComponents;
+}
+
+function SafeMarkdown({ body, components }: SafeMarkdownProps) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={markdownRemarkPlugins}
+      skipHtml
+      urlTransform={markdownUrlTransform}
+      components={components}
+    >
+      {body}
+    </ReactMarkdown>
+  );
+}
+
+interface MarkdownComposerProps {
+  id: string;
+  label: string;
+  previewLabel: string;
+  value: string;
+  onChange: (value: string) => void;
+  mode: ComposerMode;
+  onModeChange: (mode: ComposerMode) => void;
+  rows: number;
+  disabled: boolean;
+  submitDisabled: boolean;
+  components: MarkdownComponents;
+}
+
+function MarkdownComposer({
+  id,
+  label,
+  previewLabel,
+  value,
+  onChange,
+  mode,
+  onModeChange,
+  rows,
+  disabled,
+  submitDisabled,
+  components,
+}: MarkdownComposerProps) {
+  const { i18n: translationI18n, t } = useTranslation();
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const pendingSelectionRef = useRef<{ end: number; start: number } | null>(null);
+  const showEditor = mode !== "preview";
+  const showPreview = mode !== "edit";
+  const modes: readonly ComposerMode[] = ["edit", "preview", "split"];
+  const formats = [
+    { key: "heading", prefix: "## ", suffix: "" },
+    { key: "bold", prefix: "**", suffix: "**" },
+    { key: "italic", prefix: "_", suffix: "_" },
+    { key: "code", prefix: "`", suffix: "`" },
+    { key: "link", prefix: "[", suffix: "](https://)" },
+    { key: "bulletList", prefix: "- ", suffix: "" },
+    { key: "fencedCode", prefix: "```\n", suffix: "\n```" },
+  ] as const;
+
+  useLayoutEffect(() => {
+    const selection = pendingSelectionRef.current;
+    if (selection === null) {
+      return;
+    }
+    const textarea = textareaRef.current;
+    /* v8 ignore next -- a pending selection can only originate from the mounted editor */
+    if (textarea === null) {
+      return;
+    }
+    pendingSelectionRef.current = null;
+    textarea.focus();
+    textarea.setSelectionRange(selection.start, selection.end);
+  }, [value]);
+
+  const insertMarkdown = (prefix: string, suffix: string) => {
+    const textarea = textareaRef.current;
+    /* v8 ignore next -- toolbar controls are rendered only beside this textarea */
+    if (textarea === null) {
+      return;
+    }
+    const start = textarea.selectionStart;
+    const end = textarea.selectionEnd;
+    const formatted =
+      `${value.slice(0, start)}${prefix}${value.slice(start, end)}${suffix}${value.slice(end)}`;
+    if (formatted.length > maximumMessageCharacters) {
+      textarea.focus();
+      return;
+    }
+    pendingSelectionRef.current = {
+      start: start + prefix.length,
+      end: end + prefix.length,
+    };
+    onChange(formatted);
+  };
+
+  const handleShortcut = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (
+      event.key === "Enter" &&
+      (event.ctrlKey || event.metaKey) &&
+      !disabled &&
+      !submitDisabled &&
+      value.trim() !== ""
+    ) {
+      event.preventDefault();
+      event.currentTarget.form?.requestSubmit();
+    }
+  };
+
+  return (
+    <div className="markdown-composer">
+      <div className="markdown-composer-header">
+        {showEditor ? <label htmlFor={id}>{label}</label> : <span>{label}</span>}
+        <div className="markdown-mode-switch" role="group" aria-label={t("markdown.mode")}>
+          {modes.map((candidate) => (
+            <button
+              key={candidate}
+              type="button"
+              className={mode === candidate ? "is-active" : undefined}
+              aria-pressed={mode === candidate}
+              onClick={() => onModeChange(candidate)}
+              disabled={disabled}
+            >
+              {t(`markdown.${candidate}`)}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className={`markdown-composer-layout is-${mode}`}>
+        {showEditor ? (
+          <div className="markdown-editor-pane">
+            <div className="markdown-toolbar" role="group" aria-label={t("markdown.toolbar")}>
+              {formats.map((format) => (
+                <button
+                  key={format.key}
+                  type="button"
+                  onClick={() => insertMarkdown(format.prefix, format.suffix)}
+                  disabled={disabled}
+                >
+                  {t(`markdown.${format.key}`)}
+                </button>
+              ))}
+            </div>
+            <textarea
+              ref={textareaRef}
+              id={id}
+              name={id}
+              value={value}
+              onChange={(event) => onChange(event.target.value)}
+              onKeyDown={handleShortcut}
+              maxLength={maximumMessageCharacters}
+              rows={rows}
+              required
+              disabled={disabled}
+              aria-describedby={`${id}-count ${id}-shortcut`}
+            />
+          </div>
+        ) : null}
+        {showPreview ? (
+          <div className="markdown-preview-pane" role="region" aria-label={previewLabel}>
+            {value.trim() === "" ? (
+              <p className="markdown-empty-preview">{t("markdown.emptyPreview")}</p>
+            ) : (
+              <div className="message-body">
+                <SafeMarkdown body={value} components={components} />
+              </div>
+            )}
+          </div>
+        ) : null}
+      </div>
+      <div className="markdown-composer-meta">
+        <small id={`${id}-count`}>
+          {t("markdown.characterCount", {
+            count: value.length,
+            maximum: maximumMessageCharacters.toLocaleString(translationI18n.language),
+          })}
+        </small>
+        <small id={`${id}-shortcut`}>{t("markdown.shortcutHint")}</small>
+      </div>
+    </div>
+  );
+}
+
+interface DeliveryConfirmationProps {
+  bodyMd: string;
+  components: MarkdownComponents;
+  correspondenceLocale: SupportedLocale | null;
+  disabled: boolean;
+  headingLevel: 2 | 3;
+  id: string;
+  onBack: () => void;
+  onConfirm: () => void;
+  projectLabel: string;
+  projectName: string;
+  recipients: ConfirmationRecipient[];
+  subject: string;
+  threadId: string | null;
+  title: string;
+}
+
+function DeliveryConfirmation({
+  bodyMd,
+  components,
+  correspondenceLocale,
+  disabled,
+  headingLevel,
+  id,
+  onBack,
+  onConfirm,
+  projectLabel,
+  projectName,
+  recipients,
+  subject,
+  threadId,
+  title,
+}: DeliveryConfirmationProps) {
+  const { t } = useTranslation();
+  const regionRef = useRef<HTMLElement>(null);
+  const Heading = headingLevel === 2 ? "h2" : "h3";
+  const previewBody =
+    correspondenceLocale === null
+      ? bodyMd
+      : `${overseerPreamble(correspondenceLocale)}${bodyMd}`;
+
+  useEffect(() => {
+    const region = regionRef.current as HTMLElement;
+    region.focus();
+  }, []);
+
+  return (
+    <section
+      ref={regionRef}
+      className="delivery-confirmation"
+      role="region"
+      aria-labelledby={`${id}-heading`}
+      tabIndex={-1}
+    >
+      <Heading id={`${id}-heading`}>{title}</Heading>
+      <p>{t("confirmation.hint")}</p>
+      <dl className="confirmation-facts">
+        <div>
+          <dt>{projectLabel}</dt>
+          <dd>{projectName}</dd>
+        </div>
+        <div>
+          <dt>{t("confirmation.subject")}</dt>
+          <dd>{subject}</dd>
+        </div>
+        <div>
+          <dt>{t("confirmation.thread")}</dt>
+          <dd>{threadId ?? t("confirmation.newThread")}</dd>
+        </div>
+        <div>
+          <dt>{t("confirmation.priority")}</dt>
+          <dd>{t("confirmation.priorityHigh")}</dd>
+        </div>
+      </dl>
+      <div className="confirmation-recipient-summary">
+        <strong>{t("confirmation.recipients")}</strong>
+        <ul>
+          {recipients.map((recipient) => (
+            <li key={recipient.canonicalName}>
+              <span>{recipient.displayName}</span>
+              {recipient.displayName !== recipient.canonicalName ? (
+                <code>{recipient.canonicalName}</code>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      </div>
+      <p className="confirmation-warning">{t("confirmation.highPriorityWarning")}</p>
+      {recipients.length > 1 ? (
+        <p className="confirmation-warning confirmation-warning-multiple">
+          {t("confirmation.multipleRecipientsWarning", { count: recipients.length })}
+        </p>
+      ) : null}
+      <div
+        className="confirmation-preview"
+        role="region"
+        aria-labelledby={`${id}-preview-heading`}
+      >
+        <strong id={`${id}-preview-heading`}>{t("confirmation.finalPreview")}</strong>
+        {correspondenceLocale === null ? (
+          <p className="confirmation-preamble-notice">
+            {t("confirmation.preambleUnavailable")}
+          </p>
+        ) : null}
+        <div className="message-body">
+          <SafeMarkdown body={previewBody} components={components} />
+        </div>
+      </div>
+      <div className="confirmation-actions">
+        <button
+          type="button"
+          className="secondary-button"
+          onClick={onBack}
+          disabled={disabled}
+        >
+          {t("confirmation.back")}
+        </button>
+        <button
+          type="button"
+          className="primary-button"
+          onClick={onConfirm}
+          disabled={disabled}
+        >
+          {t("confirmation.confirm")}
+        </button>
+      </div>
+    </section>
+  );
+}
 
 type ShellRoute =
   | MailRoute
   | { view: "compose" }
   | { view: "account" }
   | { view: "admin" };
-type NavigationItem = "projects" | "inbox" | "compose" | "account" | "admin";
+type NavigationItem =
+  | "projects"
+  | "inbox"
+  | "search"
+  | "compose"
+  | "account"
+  | "admin";
 
 function parseShellRoute(hash: string): ShellRoute {
   const normalized = hash.replace(/^#/, "");
@@ -132,6 +534,7 @@ interface AppProps {
   onUnauthorized?: (loginUrl: string) => void;
   navigateTo?: (url: string) => void;
   createEventSource?: (url: string) => EventSourceLike;
+  prepareLocaleCatalog?: (locale: SupportedLocale) => Promise<void>;
 }
 
 const defaultNavigate = window.location.assign.bind(window.location);
@@ -157,10 +560,21 @@ function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
 }
 
-function mergeMessages(
-  current: InboxMessage[],
-  incoming: InboxMessage[],
-): InboxMessage[] {
+function isRecipientLifetimeConflict(error: unknown): boolean {
+  if (
+    !(error instanceof MailHttpError) ||
+    error.status !== 409 ||
+    error.code === null
+  ) {
+    return false;
+  }
+  return (
+    recipientDirectoryConflictCodes.has(error.code) ||
+    error.code.endsWith("_lifetime_invalid")
+  );
+}
+
+function mergeMessages<T extends InboxMessage>(current: T[], incoming: T[]): T[] {
   const merged = new Map(current.map((message) => [message.id, message]));
   for (const message of incoming) {
     merged.set(message.id, message);
@@ -172,6 +586,7 @@ export function App({
   onUnauthorized,
   navigateTo = defaultNavigate,
   createEventSource = defaultCreateEventSource,
+  prepareLocaleCatalog = prepareLocale,
 }: AppProps = {}) {
   const { t } = useTranslation();
   const markdownComponents = useMemo<MarkdownComponents>(
@@ -284,43 +699,93 @@ export function App({
   const [inboxStatus, setInboxStatus] = useState<LoadStatus>("loading");
   const [paginationStatus, setPaginationStatus] =
     useState<PaginationStatus>("idle");
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [searchStatus, setSearchStatus] = useState<DetailStatus>("idle");
+  const [searchPaginationStatus, setSearchPaginationStatus] =
+    useState<PaginationStatus>("idle");
+  const [searchNextCursor, setSearchNextCursor] = useState<string | null>(null);
+  const [searchErrorCode, setSearchErrorCode] = useState<
+    "invalid" | "unavailable" | "generic" | null
+  >(null);
+  const [searchQuery, setSearchQuery] = useState(
+    route.view === "search" ? route.query : "",
+  );
+  const [searchProjectId, setSearchProjectId] = useState(
+    route.view === "search" && route.projectId !== null
+      ? String(route.projectId)
+      : "",
+  );
+  const [searchScope, setSearchScope] = useState<SearchScope>(
+    route.view === "search" ? route.scope : "all",
+  );
+  const [searchOrder, setSearchOrder] = useState<SearchOrder>(
+    route.view === "search" ? route.order : "relevance",
+  );
   const [detail, setDetail] = useState<MessageDetail | null>(null);
   const [detailStatus, setDetailStatus] = useState<DetailStatus>("idle");
   const [composeProjectId, setComposeProjectId] = useState("");
-  const [composeRecipients, setComposeRecipients] = useState("");
+  const [composeRecipients, setComposeRecipients] = useState<string[]>([]);
+  const [composeAgents, setComposeAgents] = useState<MailRecipientAgent[]>([]);
+  const [composeAgentsTotal, setComposeAgentsTotal] = useState(0);
+  const [composeProjectGeneration, setComposeProjectGeneration] =
+    useState<string | null>(null);
+  const [composeAgentsStatus, setComposeAgentsStatus] =
+    useState<DetailStatus>("idle");
+  const [composeRecipientQuery, setComposeRecipientQuery] = useState("");
   const [composeSubject, setComposeSubject] = useState("");
   const [composeBody, setComposeBody] = useState("");
+  const [composeMode, setComposeMode] = useState<ComposerMode>("edit");
   const [composeThreadId, setComposeThreadId] = useState("");
   const [composeStatus, setComposeStatus] =
     useState<DeliveryFormStatus>("idle");
   const [composeDelivery, setComposeDelivery] =
     useState<DeliveryResult | null>(null);
+  const [composeConfirmation, setComposeConfirmation] =
+    useState<ComposeConfirmation | null>(null);
+  const [composeDirectoryNotice, setComposeDirectoryNotice] =
+    useState<DirectoryNotice>(null);
+  const [composeDirectoryRefreshVersion, setComposeDirectoryRefreshVersion] =
+    useState(0);
   const [replyBody, setReplyBody] = useState("");
+  const [replyMode, setReplyMode] = useState<ComposerMode>("edit");
   const [replyStatus, setReplyStatus] =
     useState<DeliveryFormStatus>("idle");
   const [replyDelivery, setReplyDelivery] =
     useState<DeliveryResult | null>(null);
+  const [replyConfirmation, setReplyConfirmation] =
+    useState<ReplyConfirmation | null>(null);
   const [streamStatus, setStreamStatus] =
     useState<StreamStatus>("connecting");
   const [refreshVersion, setRefreshVersion] = useState(0);
   const redirectedRef = useRef(false);
   const paginationControllerRef = useRef<AbortController | null>(null);
+  const inboxRequestGenerationRef = useRef(0);
   const detailRequestGenerationRef = useRef(0);
+  const searchRequestGenerationRef = useRef(0);
+  const searchPaginationControllerRef = useRef<AbortController | null>(null);
+  const composeAgentsRequestGenerationRef = useRef(0);
+  const composeDirectoryReconcileRef = useRef(false);
+  const composeDirectorySnapshotRef = useRef<{
+    projectGeneration: string;
+    projectId: number;
+  } | null>(null);
   const composeAttemptRef = useRef<DeliveryAttempt | null>(null);
-  const replyAttemptRef = useRef<DeliveryAttempt | null>(null);
+  const replyAttemptRef = useRef<Map<string, string>>(new Map());
+  const localeChangeBusyRef = useRef(false);
   const mailRouteActive =
     mailNavigation.some((item) => route.view === item) ||
     route.view === "message" ||
     route.view === "compose";
   const routeProjectId =
-    route.view === "inbox" || route.view === "message" ? route.projectId : null;
+    route.view === "inbox" || route.view === "message" || route.view === "search"
+      ? route.projectId
+      : null;
   const routeMessageId = route.view === "message" ? route.messageId : null;
 
   const applyLocale = useCallback(
     async (nextLocale: SupportedLocale) => {
-      await i18n.changeLanguage(nextLocale);
+      await loadLocale(nextLocale);
       setLocale(nextLocale);
-      document.documentElement.lang = nextLocale;
     },
     [],
   );
@@ -390,6 +855,18 @@ export function App({
   }, []);
 
   useEffect(() => {
+    if (route.view !== "search") {
+      return;
+    }
+    setSearchQuery(route.query);
+    setSearchProjectId(
+      route.projectId === null ? "" : String(route.projectId),
+    );
+    setSearchScope(route.scope);
+    setSearchOrder(route.order);
+  }, [route]);
+
+  useEffect(() => {
     if (!mailRouteActive) {
       setStreamStatus("connecting");
       return undefined;
@@ -419,8 +896,10 @@ export function App({
 
   useEffect(() => {
     const detailRequestGeneration = ++detailRequestGenerationRef.current;
+    ++inboxRequestGenerationRef.current;
+    paginationControllerRef.current?.abort();
+    paginationControllerRef.current = null;
     if (!mailRouteActive) {
-      paginationControllerRef.current?.abort();
       return undefined;
     }
     const controller = new AbortController();
@@ -500,18 +979,144 @@ export function App({
     routeProjectId,
   ]);
 
+  useEffect(() => {
+    const requestGeneration = ++searchRequestGenerationRef.current;
+    searchPaginationControllerRef.current?.abort();
+    setSearchPaginationStatus("idle");
+    if (route.view !== "search" || route.query.trim() === "") {
+      setSearchResults([]);
+      setSearchNextCursor(null);
+      setSearchErrorCode(null);
+      setSearchStatus("idle");
+      return undefined;
+    }
+    const controller = new AbortController();
+    setSearchResults([]);
+    setSearchNextCursor(null);
+    setSearchErrorCode(null);
+    setSearchStatus("loading");
+    void loadSearch({
+      query: route.query,
+      projectId: route.projectId ?? undefined,
+      scope: route.scope,
+      order: route.order,
+      signal: controller.signal,
+    })
+      .then((page) => {
+        if (requestGeneration !== searchRequestGenerationRef.current) {
+          return;
+        }
+        setSearchResults(page.items);
+        setSearchNextCursor(page.next_cursor);
+        setSearchStatus("ready");
+      })
+      .catch((error: unknown) => {
+        if (requestGeneration !== searchRequestGenerationRef.current) {
+          return;
+        }
+        const status = dataFailureStatus(error);
+        if (status === null) {
+          return;
+        }
+        if (status === "unauthorized") {
+          setSearchStatus("unauthorized");
+          return;
+        }
+        setSearchErrorCode(
+          error instanceof MailHttpError &&
+            (error.status === 422 || error.code === "invalid_search_query")
+            ? "invalid"
+            : error instanceof MailHttpError &&
+                (error.status === 503 || error.code === "search_unavailable")
+              ? "unavailable"
+              : "generic",
+        );
+        setSearchStatus("error");
+      });
+    return () => controller.abort();
+  }, [dataFailureStatus, refreshVersion, route]);
+
+  useEffect(() => {
+    const requestGeneration = ++composeAgentsRequestGenerationRef.current;
+    if (route.view !== "compose" || composeProjectId === "") {
+      setComposeAgents([]);
+      setComposeAgentsTotal(0);
+      setComposeProjectGeneration(null);
+      setComposeAgentsStatus("idle");
+      setComposeDirectoryNotice(null);
+      setComposeConfirmation(null);
+      composeDirectorySnapshotRef.current = null;
+      composeDirectoryReconcileRef.current = false;
+      return undefined;
+    }
+    const controller = new AbortController();
+    const projectId = Number(composeProjectId);
+    const reconcile = composeDirectoryReconcileRef.current;
+    setComposeAgentsStatus("loading");
+    void loadProjectAgents(projectId, { signal: controller.signal })
+      .then((page) => {
+        if (requestGeneration !== composeAgentsRequestGenerationRef.current) {
+          return;
+        }
+        const previousSnapshot = composeDirectorySnapshotRef.current;
+        setComposeAgents(page.items);
+        setComposeAgentsTotal(page.total);
+        setComposeProjectGeneration(page.project_generation);
+        if (
+          reconcile &&
+          previousSnapshot?.projectId === projectId &&
+          previousSnapshot.projectGeneration === page.project_generation
+        ) {
+          const currentAgents = new Set(page.items.map(recipientSelectionKey));
+          setComposeRecipients((current) =>
+            current.filter((selectionKey) => currentAgents.has(selectionKey)),
+          );
+        } else {
+          setComposeRecipients([]);
+        }
+        composeDirectorySnapshotRef.current = {
+          projectGeneration: page.project_generation,
+          projectId,
+        };
+        composeDirectoryReconcileRef.current = false;
+        setComposeDirectoryNotice(reconcile ? "refreshed" : null);
+        setComposeAgentsStatus("ready");
+      })
+      .catch((error: unknown) => {
+        if (requestGeneration !== composeAgentsRequestGenerationRef.current) {
+          return;
+        }
+        const status = dataFailureStatus(error);
+        if (status !== null) {
+          setComposeAgentsStatus(status);
+          if (reconcile) {
+            setComposeDirectoryNotice("refreshError");
+            composeDirectoryReconcileRef.current = false;
+          }
+        }
+      });
+    return () => controller.abort();
+  }, [
+    composeDirectoryRefreshVersion,
+    composeProjectId,
+    dataFailureStatus,
+    route.view,
+  ]);
+
   useEffect(
     () => () => {
       paginationControllerRef.current?.abort();
+      searchPaginationControllerRef.current?.abort();
     },
     [],
   );
 
   useEffect(() => {
     setReplyBody("");
+    setReplyMode("edit");
     setReplyStatus("idle");
     setReplyDelivery(null);
-    replyAttemptRef.current = null;
+    setReplyConfirmation(null);
   }, [routeMessageId, routeProjectId]);
 
   useEffect(() => {
@@ -587,15 +1192,26 @@ export function App({
     return () => controller.abort();
   }, [isAccountUnauthorized, profile?.global_role, profileStatus, route.view]);
 
-  const handleLocaleChange = async (event: ChangeEvent<HTMLSelectElement>) => {
-    const nextLocale = event.target.value as SupportedLocale;
-    if (preferenceStatus === "loadError") {
-      await applyLocale(nextLocale);
+  const handleLocaleChange = async (nextLocale: SupportedLocale) => {
+    if (localeChangeBusyRef.current || nextLocale === locale) {
       return;
     }
+    localeChangeBusyRef.current = true;
+    // The correspondence locale can inherit this UI preference. Once the user
+    // changes it, an open confirmation is no longer guaranteed to match the
+    // server-added preamble, so return to the preserved draft first.
+    setComposeConfirmation(null);
+    setReplyConfirmation(null);
     const previousLocale = locale;
+    const persistenceUnavailable = preferenceStatus === "loadError";
     setPreferenceStatus("saving");
     try {
+      await prepareLocaleCatalog(nextLocale);
+      if (persistenceUnavailable) {
+        await applyLocale(nextLocale);
+        setPreferenceStatus("loadError");
+        return;
+      }
       const preferences = await saveUiLocale(nextLocale);
       await applyLocale(preferences.effective.ui_locale);
       setPreferences(preferences);
@@ -607,6 +1223,8 @@ export function App({
         return;
       }
       setPreferenceStatus("saveError");
+    } finally {
+      localeChangeBusyRef.current = false;
     }
   };
 
@@ -775,9 +1393,23 @@ export function App({
     setRoute(next);
   };
 
+  const handleSearchSubmit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const next: MailRoute = {
+      view: "search",
+      query: searchQuery.trim(),
+      projectId: searchProjectId === "" ? null : Number(searchProjectId),
+      scope: searchScope,
+      order: searchOrder,
+    };
+    window.history.pushState({}, "", mailRouteHash(next));
+    setRoute(next);
+  };
+
   const handleLoadMore = async (cursor: string) => {
     paginationControllerRef.current?.abort();
     const controller = new AbortController();
+    const requestGeneration = inboxRequestGenerationRef.current;
     paginationControllerRef.current = controller;
     setPaginationStatus("loading");
     try {
@@ -786,17 +1418,54 @@ export function App({
         projectId: routeProjectId ?? undefined,
         signal: controller.signal,
       });
+      if (requestGeneration !== inboxRequestGenerationRef.current) {
+        return;
+      }
       setMessages((current) => mergeMessages(current, page.items));
       setMessageTotal(page.total);
       setNextCursor(page.next_cursor);
       setPaginationStatus("idle");
     } catch (error) {
+      if (requestGeneration !== inboxRequestGenerationRef.current) {
+        return;
+      }
       const status = dataFailureStatus(error);
       if (status === "unauthorized") {
         setInboxStatus("unauthorized");
         setPaginationStatus("idle");
       } else if (status === "error") {
         setPaginationStatus("error");
+      }
+    }
+  };
+
+  const handleSearchLoadMore = async (
+    cursor: string,
+    activeRoute: Extract<MailRoute, { view: "search" }>,
+  ) => {
+    searchPaginationControllerRef.current?.abort();
+    const controller = new AbortController();
+    searchPaginationControllerRef.current = controller;
+    setSearchPaginationStatus("loading");
+    try {
+      const page = await loadSearch({
+        query: activeRoute.query,
+        projectId: activeRoute.projectId ?? undefined,
+        scope: activeRoute.scope,
+        order: activeRoute.order,
+        cursor,
+        signal: controller.signal,
+      });
+      setSearchResults((current) => mergeMessages(current, page.items));
+      setSearchNextCursor(page.next_cursor);
+      setSearchPaginationStatus("idle");
+    } catch (error) {
+      const status = dataFailureStatus(error);
+      if (status === "unauthorized") {
+        setSearchStatus("unauthorized");
+        setSearchPaginationStatus("idle");
+      } else if (status === "error") {
+        setSearchPaginationStatus("error");
       }
     }
   };
@@ -811,81 +1480,207 @@ export function App({
       : "error";
   };
 
-  const handleComposeSubmit = async (event: FormEvent<HTMLFormElement>) => {
+  const handleComposeProjectChange = (event: ChangeEvent<HTMLSelectElement>) => {
+    setComposeProjectId(event.target.value);
+    setComposeRecipients([]);
+    setComposeRecipientQuery("");
+    setComposeAgents([]);
+    setComposeAgentsTotal(0);
+    setComposeProjectGeneration(null);
+    setComposeAgentsStatus("idle");
+    setComposeConfirmation(null);
+    setComposeDirectoryNotice(null);
+    composeAttemptRef.current = null;
+    composeDirectoryReconcileRef.current = false;
+    composeDirectorySnapshotRef.current = null;
+  };
+
+  const handleRecipientToggle = (key: string, checked: boolean) => {
+    setComposeConfirmation(null);
+    setComposeRecipients((current) =>
+      checked ? [...current, key] : current.filter((candidate) => candidate !== key),
+    );
+  };
+
+  const handleComposeSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const projectId = Number(composeProjectId);
-    const recipients = [
-      ...new Set(
-        composeRecipients
-          .split(",")
-          .map((name) => name.trim())
-          .filter((name) => name.length > 0),
-      ),
-    ];
-    if (!Number.isSafeInteger(projectId) || projectId < 1 || recipients.length === 0) {
+    const selectedRecipients = new Set(composeRecipients);
+    const selectedAgents = composeAgents.filter((agent) =>
+      selectedRecipients.has(recipientSelectionKey(agent)),
+    );
+    const recipientReferences = selectedAgents.map((agent) => ({
+        agent_id: agent.agent_id,
+        expected_agent_generation: agent.agent_generation,
+      }));
+    if (
+      !Number.isSafeInteger(projectId) ||
+      projectId < 1 ||
+      composeAgentsStatus !== "ready" ||
+      composeProjectGeneration === null ||
+      recipientReferences.length === 0 ||
+      composeSubject.trim() === "" ||
+      composeBody.trim() === ""
+    ) {
       setComposeStatus("error");
       return;
     }
+    const correspondenceLocale =
+      preferences?.effective.correspondence_locale ?? null;
+    const threadId =
+      composeThreadId.trim() === "" ? null : composeThreadId.trim();
     const canonicalInput = {
       projectId,
-      recipients,
+      expected_project_generation: composeProjectGeneration,
+      recipients: recipientReferences,
       subject: composeSubject,
       body_md: composeBody,
-      thread_id: composeThreadId.trim() === "" ? null : composeThreadId.trim(),
+      thread_id: threadId,
+      correspondence_locale: correspondenceLocale,
     };
+    setComposeDelivery(null);
+    setComposeStatus("idle");
+    setComposeConfirmation({
+      bodyMd: composeBody,
+      correspondenceLocale,
+      expectedProjectGeneration: composeProjectGeneration,
+      fingerprint: JSON.stringify(canonicalInput),
+      projectId,
+      projectName:
+        projects.find((project) => project.id === projectId)?.human_key ??
+        String(projectId),
+      recipientReferences,
+      recipients: selectedAgents.map((agent) => ({
+        canonicalName: agent.name,
+        displayName: agent.display_name ?? agent.name,
+      })),
+      subject: composeSubject,
+      threadId,
+    });
+  };
+
+  const confirmCompose = async (confirmation: ComposeConfirmation) => {
     const idempotencyKey = idempotencyKeyFor(
       composeAttemptRef,
-      JSON.stringify(canonicalInput),
+      confirmation.fingerprint,
     );
     setComposeStatus("sending");
     try {
-      const delivery = await composeMessage(projectId, {
+      const delivery = await composeMessage(confirmation.projectId, {
         idempotency_key: idempotencyKey,
-        recipients,
-        subject: composeSubject,
-        body_md: composeBody,
-        thread_id: canonicalInput.thread_id,
+        expected_project_generation: confirmation.expectedProjectGeneration,
+        recipients: confirmation.recipientReferences,
+        subject: confirmation.subject,
+        body_md: confirmation.bodyMd,
+        thread_id: confirmation.threadId,
       });
       setComposeDelivery(delivery);
+      setComposeConfirmation(null);
       setComposeStatus("idle");
       if (delivery.status === "published") {
-        setComposeRecipients("");
+        setComposeRecipients([]);
+        setComposeRecipientQuery("");
         setComposeSubject("");
         setComposeBody("");
+        setComposeMode("edit");
         setComposeThreadId("");
         composeAttemptRef.current = null;
         setRefreshVersion((version) => version + 1);
       }
     } catch (error) {
+      if (isRecipientLifetimeConflict(error)) {
+        setComposeConfirmation(null);
+        setComposeStatus("idle");
+        setComposeAgentsStatus("loading");
+        setComposeDirectoryNotice("refreshing");
+        composeAttemptRef.current = null;
+        composeDirectoryReconcileRef.current = true;
+        setComposeDirectoryRefreshVersion((version) => version + 1);
+        return;
+      }
       setComposeStatus(deliveryFailureStatus(error));
     }
   };
 
-  const handleReplySubmit = async (
+  const handleReplySubmit = (
     event: FormEvent<HTMLFormElement>,
     message: MessageDetail,
   ) => {
     event.preventDefault();
+    if (replyBody.trim() === "" || message.reply_target === null) {
+      setReplyStatus("error");
+      return;
+    }
+    const correspondenceLocale =
+      preferences?.effective.correspondence_locale ?? null;
+    const subject = (
+      message.subject.toLowerCase().startsWith("re:")
+        ? message.subject
+        : `Re: ${message.subject}`
+    ).slice(0, 200);
+    const threadId = message.thread_id ?? String(message.id);
+    const recipients = [{
+      canonicalName: message.reply_target.canonical_name,
+      displayName: message.sender_display_name ?? message.sender,
+    }];
     const canonicalInput = {
       projectId: message.project_id,
       messageId: message.id,
       body_md: replyBody,
+      correspondence_locale: correspondenceLocale,
+      reply_target: {
+        agent_id: message.reply_target.agent_id,
+        agent_generation: message.reply_target.agent_generation,
+        project_id: message.reply_target.project_id,
+        project_generation: message.reply_target.project_generation,
+      },
+      subject,
+      thread_id: threadId,
     };
-    const idempotencyKey = idempotencyKeyFor(
-      replyAttemptRef,
-      JSON.stringify(canonicalInput),
+    setReplyDelivery(null);
+    setReplyStatus("idle");
+    setReplyConfirmation({
+      bodyMd: replyBody,
+      correspondenceLocale,
+      fingerprint: JSON.stringify(canonicalInput),
+      messageId: message.id,
+      projectId: message.project_id,
+      projectName: message.reply_target.canonical_name,
+      recipients,
+      replyTarget: message.reply_target,
+      subject,
+      threadId,
+    });
+  };
+
+  const confirmReply = async (confirmation: ReplyConfirmation) => {
+    const idempotencyKey = replyIdempotencyKeyFor(
+      replyAttemptRef.current,
+      confirmation.fingerprint,
     );
     setReplyStatus("sending");
     try {
-      const delivery = await replyToMessage(message.project_id, message.id, {
-        idempotency_key: idempotencyKey,
-        body_md: replyBody,
-      });
+      const delivery = await replyToMessage(
+        confirmation.projectId,
+        confirmation.messageId,
+        {
+          idempotency_key: idempotencyKey,
+          expected_sender_agent_id: confirmation.replyTarget.agent_id,
+          expected_sender_agent_generation:
+            confirmation.replyTarget.agent_generation,
+          expected_sender_project_id: confirmation.replyTarget.project_id,
+          expected_sender_project_generation:
+            confirmation.replyTarget.project_generation,
+          body_md: confirmation.bodyMd,
+        },
+      );
       setReplyDelivery(delivery);
+      setReplyConfirmation(null);
       setReplyStatus("idle");
       if (delivery.status === "published") {
         setReplyBody("");
-        replyAttemptRef.current = null;
+        setReplyMode("edit");
+        replyAttemptRef.current.delete(confirmation.fingerprint);
         setRefreshVersion((version) => version + 1);
       }
     } catch (error) {
@@ -1029,6 +1824,21 @@ export function App({
   const renderCompose = () => {
     const profileIsAdmin = profile?.global_role === "admin";
     const activeProjects = projects.filter((project) => project.archived_at === null);
+    const normalizedRecipientQuery = composeRecipientQuery.trim().toLocaleLowerCase(locale);
+    const filteredAgents = composeAgents.filter((agent) =>
+      normalizedRecipientQuery === "" ||
+      agent.name.toLocaleLowerCase(locale).includes(normalizedRecipientQuery) ||
+      (agent.display_name ?? "").toLocaleLowerCase(locale).includes(normalizedRecipientQuery),
+    );
+    const selectedRecipients = new Set(composeRecipients);
+    const composeIsSending = composeStatus === "sending";
+    const composeSubmitDisabled =
+      composeIsSending ||
+      composeAgentsStatus !== "ready" ||
+      composeProjectGeneration === null ||
+      composeRecipients.length === 0 ||
+      composeSubject.trim() === "" ||
+      composeBody.trim() === "";
     return (
       <section aria-labelledby="compose-heading">
         <div className="page-heading">
@@ -1057,64 +1867,205 @@ export function App({
                 id="compose-project"
                 name="compose-project"
                 value={composeProjectId}
-                onChange={(event) => setComposeProjectId(event.target.value)}
+                onChange={handleComposeProjectChange}
                 required
-                disabled={composeStatus === "sending"}
+                disabled={composeIsSending}
               >
                 <option value="">{t("compose.chooseProject")}</option>
                 {activeProjects.map((project) => (
                   <option key={project.id} value={project.id}>{project.human_key}</option>
                 ))}
               </select>
-              <label htmlFor="compose-recipients">{t("compose.recipients")}</label>
-              <input
-                id="compose-recipients"
-                name="compose-recipients"
-                value={composeRecipients}
-                onChange={(event) => setComposeRecipients(event.target.value)}
-                maxLength={12_899}
-                required
-                disabled={composeStatus === "sending"}
-                aria-describedby="compose-recipients-hint"
-              />
-              <small id="compose-recipients-hint">{t("compose.recipientsHint")}</small>
+              <fieldset className="recipient-picker" aria-describedby="compose-recipients-hint">
+                <legend>{t("compose.recipients")}</legend>
+                <small id="compose-recipients-hint">{t("compose.recipientsHint")}</small>
+                {composeProjectId === "" ? (
+                  <p className="recipient-picker-state">{t("compose.chooseRecipientsProject")}</p>
+                ) : null}
+                {composeAgentsStatus === "loading" ? (
+                  <p className="recipient-picker-state" role="status">{t("compose.loadingRecipients")}</p>
+                ) : null}
+                {composeDirectoryNotice !== null ? (
+                  <p
+                    className={`recipient-picker-state ${composeDirectoryNotice === "refreshError" ? "state-error" : ""}`}
+                    role={composeDirectoryNotice === "refreshError" ? "alert" : "status"}
+                  >
+                    {t(`compose.directory.${composeDirectoryNotice}`)}
+                  </p>
+                ) : null}
+                {composeAgentsStatus === "error" || composeAgentsStatus === "unauthorized" ? (
+                  <p className="recipient-picker-state state-error" role="alert">{t("compose.recipientsLoadError")}</p>
+                ) : null}
+                {composeAgentsStatus === "ready" && composeAgents.length === 0 ? (
+                  <p className="recipient-picker-state">{t("compose.noRecipients")}</p>
+                ) : null}
+                {composeAgentsStatus === "ready" && composeAgents.length > 0 ? (
+                  <div className="recipient-picker-controls">
+                    <label htmlFor="compose-recipient-search">{t("compose.recipientSearch")}</label>
+                    <input
+                      id="compose-recipient-search"
+                      name="compose-recipient-search"
+                      type="search"
+                      value={composeRecipientQuery}
+                      onChange={(event) => setComposeRecipientQuery(event.target.value)}
+                      maxLength={200}
+                      disabled={composeIsSending}
+                      aria-describedby="compose-recipient-search-hint"
+                    />
+                    <small id="compose-recipient-search-hint">{t("compose.recipientSearchHint")}</small>
+                    <div className="recipient-picker-actions">
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        onClick={() => {
+                          setComposeConfirmation(null);
+                          setComposeRecipients((current) =>
+                            Array.from(
+                              new Set([
+                                ...current,
+                                ...filteredAgents.map(recipientSelectionKey),
+                              ]),
+                            ).slice(0, maximumRecipients),
+                          );
+                        }}
+                        disabled={composeIsSending}
+                      >
+                        {t("compose.selectAll")}
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        onClick={() => {
+                          setComposeConfirmation(null);
+                          setComposeRecipients([]);
+                        }}
+                        disabled={composeIsSending || composeRecipients.length === 0}
+                      >
+                        {t("compose.clearRecipients")}
+                      </button>
+                    </div>
+                    <p className="recipient-selected-count">
+                      {t("compose.selectedCount", {
+                        count: composeRecipients.length,
+                        maximum: maximumRecipients,
+                      })}
+                    </p>
+                    {composeAgentsTotal > maximumRecipients ? (
+                      <p className="recipient-limit-notice">
+                        {t("compose.recipientLimit", {
+                          available: composeAgentsTotal,
+                          maximum: maximumRecipients,
+                        })}
+                      </p>
+                    ) : null}
+                    {filteredAgents.length === 0 ? (
+                      <p className="recipient-picker-state">{t("compose.noRecipientResults")}</p>
+                    ) : (
+                      <ul className="recipient-options">
+                        {filteredAgents.map((agent) => {
+                          const selectionKey = recipientSelectionKey(agent);
+                          const selected = selectedRecipients.has(selectionKey);
+                          return (
+                            <li key={selectionKey}>
+                              <label>
+                                <input
+                                  type="checkbox"
+                                  name="compose-recipient"
+                                  value={agent.name}
+                                  checked={selected}
+                                  onChange={(event) =>
+                                    handleRecipientToggle(selectionKey, event.target.checked)
+                                  }
+                                  disabled={
+                                    composeIsSending ||
+                                    (!selected && composeRecipients.length >= maximumRecipients)
+                                  }
+                                />
+                                <span>
+                                  <strong>{agent.display_name ?? agent.name}</strong>
+                                  {agent.display_name !== null ? (
+                                    <code>{agent.name}</code>
+                                  ) : null}
+                                </span>
+                              </label>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    )}
+                  </div>
+                ) : null}
+              </fieldset>
               <label htmlFor="compose-subject">{t("compose.subject")}</label>
               <input
                 id="compose-subject"
                 name="compose-subject"
                 value={composeSubject}
-                onChange={(event) => setComposeSubject(event.target.value)}
+                onChange={(event) => {
+                  setComposeConfirmation(null);
+                  setComposeSubject(event.target.value);
+                }}
                 maxLength={200}
                 required
-                disabled={composeStatus === "sending"}
+                disabled={composeIsSending}
               />
               <label htmlFor="compose-thread">{t("compose.thread")}</label>
               <input
                 id="compose-thread"
                 name="compose-thread"
                 value={composeThreadId}
-                onChange={(event) => setComposeThreadId(event.target.value)}
+                onChange={(event) => {
+                  setComposeConfirmation(null);
+                  setComposeThreadId(event.target.value);
+                }}
                 maxLength={128}
-                disabled={composeStatus === "sending"}
+                disabled={composeIsSending}
               />
-              <label htmlFor="compose-body">{t("compose.body")}</label>
-              <textarea
+              <MarkdownComposer
                 id="compose-body"
-                name="compose-body"
+                label={t("compose.body")}
+                previewLabel={t("compose.preview")}
                 value={composeBody}
-                onChange={(event) => setComposeBody(event.target.value)}
-                maxLength={50_000}
+                onChange={(value) => {
+                  setComposeConfirmation(null);
+                  setComposeBody(value);
+                }}
+                mode={composeMode}
+                onModeChange={setComposeMode}
                 rows={12}
-                required
-                disabled={composeStatus === "sending"}
+                disabled={composeIsSending}
+                submitDisabled={composeSubmitDisabled}
+                components={markdownComponents}
               />
-              <button
-                type="submit"
-                className="primary-button"
-                disabled={composeStatus === "sending"}
-              >
-                {t("compose.send")}
-              </button>
+              {composeConfirmation === null ? (
+                <button
+                  type="submit"
+                  className="primary-button"
+                  disabled={composeSubmitDisabled}
+                >
+                  {t("compose.review")}
+                </button>
+              ) : (
+                <DeliveryConfirmation
+                  id="compose-confirmation"
+                  title={t("confirmation.composeTitle")}
+                  headingLevel={2}
+                  projectLabel={t("confirmation.project")}
+                  projectName={composeConfirmation.projectName}
+                  recipients={composeConfirmation.recipients}
+                  subject={composeConfirmation.subject}
+                  threadId={composeConfirmation.threadId}
+                  bodyMd={composeConfirmation.bodyMd}
+                  correspondenceLocale={composeConfirmation.correspondenceLocale}
+                  components={markdownComponents}
+                  disabled={composeIsSending}
+                  onBack={() => {
+                    setComposeConfirmation(null);
+                    setComposeStatus("idle");
+                  }}
+                  onConfirm={() => void confirmCompose(composeConfirmation)}
+                />
+              )}
               {deliveryFeedback(
                 composeStatus,
                 composeDelivery,
@@ -1276,6 +2227,173 @@ export function App({
     </section>
   );
 
+  const renderSearch = (activeRoute: Extract<MailRoute, { view: "search" }>) => (
+    <section aria-labelledby="search-heading">
+      <div className="page-heading search-heading">
+        <div>
+          <p className="eyebrow">{t("search.eyebrow")}</p>
+          <h1 id="search-heading">{t("search.title")}</h1>
+          <p>{t("search.hint")}</p>
+        </div>
+      </div>
+      <form className="search-form" role="search" onSubmit={handleSearchSubmit}>
+        <div className="search-query-field">
+          <label htmlFor="message-search">{t("search.query")}</label>
+          <input
+            id="message-search"
+            name="q"
+            type="search"
+            value={searchQuery}
+            onChange={(event) => setSearchQuery(event.target.value)}
+            minLength={1}
+            maxLength={256}
+            required
+            aria-describedby="message-search-hint"
+          />
+          <small id="message-search-hint">{t("search.queryHint")}</small>
+        </div>
+        <div className="search-options">
+          <label htmlFor="search-project">{t("search.project")}</label>
+          <select
+            id="search-project"
+            name="project"
+            value={searchProjectId}
+            onChange={(event) => setSearchProjectId(event.target.value)}
+            disabled={projectsStatus !== "ready"}
+          >
+            <option value="">{t("search.allProjects")}</option>
+            {projects.map((project) => (
+              <option key={project.id} value={project.id}>
+                {project.human_key}
+              </option>
+            ))}
+          </select>
+          <label htmlFor="search-scope">{t("search.scope")}</label>
+          <select
+            id="search-scope"
+            name="scope"
+            value={searchScope}
+            onChange={(event) =>
+              setSearchScope(event.target.value as SearchScope)
+            }
+          >
+            <option value="all">{t("search.scopeAll")}</option>
+            <option value="subject">{t("search.scopeSubject")}</option>
+            <option value="body">{t("search.scopeBody")}</option>
+          </select>
+          <label htmlFor="search-order">{t("search.order")}</label>
+          <select
+            id="search-order"
+            name="order"
+            value={searchOrder}
+            onChange={(event) =>
+              setSearchOrder(event.target.value as SearchOrder)
+            }
+          >
+            <option value="relevance">{t("search.orderRelevance")}</option>
+            <option value="newest">{t("search.orderNewest")}</option>
+          </select>
+          <button
+            type="submit"
+            className="primary-button"
+            disabled={searchQuery.trim() === ""}
+          >
+            {t("search.submit")}
+          </button>
+        </div>
+      </form>
+      {activeRoute.query.trim() === "" ? (
+        <p className="state-panel">{t("search.prompt")}</p>
+      ) : null}
+      {searchStatus === "loading" ? (
+        <p className="state-panel" role="status">{t("search.loading")}</p>
+      ) : null}
+      {searchStatus === "error" ? (
+        <p className="state-panel state-error" role="alert">
+          {t(
+            searchErrorCode === "invalid"
+              ? "search.invalid"
+              : searchErrorCode === "unavailable"
+                ? "search.unavailable"
+                : "search.error",
+          )}
+        </p>
+      ) : null}
+      {searchStatus === "unauthorized" ? (
+        <p className="state-panel" role="status">{t("errors.unauthorized")}</p>
+      ) : null}
+      {searchStatus === "ready" && searchResults.length === 0 ? (
+        <p className="state-panel">{t("search.empty")}</p>
+      ) : null}
+      {searchStatus === "ready" && searchResults.length > 0 ? (
+        <ul className="panel message-list search-result-list">
+          {searchResults.map((message) => {
+            const sender = message.sender_display_name ?? message.sender_name;
+            const senderIdentity =
+              message.sender === sender ? "" : ` · ${message.sender}`;
+            const project =
+              projectNames.get(message.project_id) ?? message.project_slug;
+            return (
+              <li key={message.id}>
+                <a
+                  className="message-row search-result-row"
+                  href={mailRouteHash({
+                    view: "message",
+                    projectId: message.project_id,
+                    messageId: message.id,
+                  })}
+                  aria-label={t("search.openMessage", {
+                    subject: message.subject,
+                  })}
+                >
+                  <span
+                    className={`importance-mark importance-${message.importance}`}
+                    aria-hidden="true"
+                  />
+                  <span className="message-copy">
+                    <strong>{message.subject}</strong>
+                    <small>{t("inbox.from", { sender })}{senderIdentity}</small>
+                    <small>{t("inbox.project", { project })}</small>
+                    {message.snippet !== "" ? (
+                      <span className="search-snippet">{message.snippet}</span>
+                    ) : null}
+                  </span>
+                  <span className="message-meta">
+                    <span className={`status importance-${message.importance}`}>
+                      {t(`importance.${message.importance}`)}
+                    </span>
+                    <time dateTime={message.created_ts}>
+                      {formatDate(message.created_ts)}
+                    </time>
+                  </span>
+                </a>
+              </li>
+            );
+          })}
+        </ul>
+      ) : null}
+      {searchStatus === "ready" && searchNextCursor !== null ? (
+        <div className="load-more-area">
+          <button
+            type="button"
+            className="primary-button"
+            onClick={() => void handleSearchLoadMore(searchNextCursor, activeRoute)}
+            disabled={searchPaginationStatus === "loading"}
+          >
+            {t(
+              searchPaginationStatus === "loading"
+                ? "search.loadingMore"
+                : "search.loadMore",
+            )}
+          </button>
+          {searchPaginationStatus === "error" ? (
+            <p role="alert">{t("search.loadMoreError")}</p>
+          ) : null}
+        </div>
+      ) : null}
+    </section>
+  );
+
   const renderMessage = (projectId: number, messageId: number) => {
     const inboxHash = mailRouteHash({ view: "inbox", projectId });
     const currentDetail =
@@ -1314,14 +2432,7 @@ export function App({
               <div><dt>{t("message.cc")}</dt><dd>{currentDetail.cc.length > 0 ? currentDetail.cc.join(", ") : t("message.emptyRecipients")}</dd></div>
             </dl>
             <div className="message-body">
-              <ReactMarkdown
-                remarkPlugins={markdownRemarkPlugins}
-                skipHtml
-                urlTransform={markdownUrlTransform}
-                components={markdownComponents}
-              >
-                {currentDetail.body_md}
-              </ReactMarkdown>
+              <SafeMarkdown body={currentDetail.body_md} components={markdownComponents} />
             </div>
             {currentDetail.can_reply ? (
               <section className="reply-panel" aria-labelledby="reply-heading">
@@ -1331,24 +2442,53 @@ export function App({
                   className="delivery-form"
                   onSubmit={(event) => void handleReplySubmit(event, currentDetail)}
                 >
-                  <label htmlFor="reply-body">{t("reply.body")}</label>
-                  <textarea
+                  <MarkdownComposer
                     id="reply-body"
-                    name="reply-body"
+                    label={t("reply.body")}
+                    previewLabel={t("reply.preview")}
                     value={replyBody}
-                    onChange={(event) => setReplyBody(event.target.value)}
-                    maxLength={50_000}
+                    onChange={(value) => {
+                      setReplyConfirmation(null);
+                      setReplyBody(value);
+                    }}
+                    mode={replyMode}
+                    onModeChange={setReplyMode}
                     rows={8}
-                    required
                     disabled={replyStatus === "sending"}
+                    submitDisabled={
+                      replyStatus === "sending" || replyBody.trim() === ""
+                    }
+                    components={markdownComponents}
                   />
-                  <button
-                    type="submit"
-                    className="primary-button"
-                    disabled={replyStatus === "sending"}
-                  >
-                    {t("reply.send")}
-                  </button>
+                  {replyConfirmation === null ? (
+                    <button
+                      type="submit"
+                      className="primary-button"
+                      disabled={replyStatus === "sending" || replyBody.trim() === ""}
+                    >
+                      {t("reply.review")}
+                    </button>
+                  ) : (
+                    <DeliveryConfirmation
+                      id="reply-confirmation"
+                      title={t("confirmation.replyTitle")}
+                      headingLevel={3}
+                      projectLabel={t("confirmation.targetRoute")}
+                      projectName={replyConfirmation.projectName}
+                      recipients={replyConfirmation.recipients}
+                      subject={replyConfirmation.subject}
+                      threadId={replyConfirmation.threadId}
+                      bodyMd={replyConfirmation.bodyMd}
+                      correspondenceLocale={replyConfirmation.correspondenceLocale}
+                      components={markdownComponents}
+                      disabled={replyStatus === "sending"}
+                      onBack={() => {
+                        setReplyConfirmation(null);
+                        setReplyStatus("idle");
+                      }}
+                      onConfirm={() => void confirmReply(replyConfirmation)}
+                    />
+                  )}
                   {deliveryFeedback(
                     replyStatus,
                     replyDelivery,
@@ -1451,14 +2591,17 @@ export function App({
                 id="account-ui-language"
                 name="account-ui-language"
                 value={locale}
-                onChange={(event) => void handleLocaleChange(event)}
+                onChange={(event) =>
+                  void handleLocaleChange(event.target.value as SupportedLocale)
+                }
                 disabled={["loading", "saving", "unauthorized"].includes(
                   preferenceStatus,
                 )}
               >
                 {supportedLocales.map((supportedLocale) => (
                   <option key={supportedLocale} value={supportedLocale}>
-                    {t(`languageName.${supportedLocale}`)}
+                    {localeMetadata[supportedLocale].flag}{" "}
+                    {localeMetadata[supportedLocale].nativeName}
                   </option>
                 ))}
               </select>
@@ -1480,7 +2623,8 @@ export function App({
                 <option value="">{t("account.correspondenceInherit")}</option>
                 {supportedLocales.map((supportedLocale) => (
                   <option key={supportedLocale} value={supportedLocale}>
-                    {t(`languageName.${supportedLocale}`)}
+                    {localeMetadata[supportedLocale].flag}{" "}
+                    {localeMetadata[supportedLocale].nativeName}
                   </option>
                 ))}
               </select>
@@ -1742,7 +2886,7 @@ export function App({
       <header className="topbar">
         <div className="brand" aria-label={t("appName")}>
           <span className="brand-mark" aria-hidden="true">
-            H
+            🌈
           </span>
           <span>
             <strong>{t("appName")}</strong>
@@ -1755,25 +2899,15 @@ export function App({
             {t("mailboxSecureDelivery")}
           </span>
           <div className="locale-control">
-            <label>
-              <span>{t("language")}</span>
-              <select
-                aria-label={t("language")}
-                aria-describedby="locale-preference-status"
-                name="ui-language"
-                value={locale}
-                onChange={handleLocaleChange}
-                disabled={["loading", "saving", "unauthorized"].includes(
-                  preferenceStatus,
-                )}
-              >
-                {supportedLocales.map((locale) => (
-                  <option key={locale} value={locale}>
-                    {t(`languageName.${locale}`)}
-                  </option>
-                ))}
-              </select>
-            </label>
+            <span className="locale-control-label">{t("language")}</span>
+            <LocalePicker
+              locale={locale}
+              describedBy="locale-preference-status"
+              disabled={["loading", "saving", "unauthorized"].includes(
+                preferenceStatus,
+              )}
+              onSelect={(nextLocale) => void handleLocaleChange(nextLocale)}
+            />
             <small
               id="locale-preference-status"
               className="locale-hint"
@@ -1820,6 +2954,7 @@ export function App({
         <main id="main-content" className="content">
           {route.view === "projects" ? renderProjects() : null}
           {route.view === "inbox" ? renderInbox() : null}
+          {route.view === "search" ? renderSearch(route) : null}
           {route.view === "compose" ? renderCompose() : null}
           {route.view === "message"
             ? renderMessage(route.projectId, route.messageId)

@@ -27,17 +27,60 @@ def _build_hook(root: Path, output: Path, target_name: str) -> hatch_build.Custo
     )
 
 
-def _write_valid_dist(dist_root: Path, *, repository_root: Path) -> None:
+def _write_vite_output(dist_root: Path) -> None:
     assets = dist_root / "assets"
     assets.mkdir(parents=True, exist_ok=True)
     (dist_root / "index.html").write_text(
-        '<!doctype html><link rel="icon" href="/favicon.ico" type="image/svg+xml" sizes="any">'
-        '<script type="module" src="/mail/assets/index-test.js"></script>'
-        '<link rel="stylesheet" href="/mail/assets/index-test.css">',
+        '<!doctype html><link rel="icon" href="/favicon.ico?v=iris" type="image/svg+xml" sizes="any">'
+        '<script type="module" src="/mail/assets/index-testhash.js"></script>'
+        '<link rel="stylesheet" href="/mail/assets/index-testhash.css">',
         encoding="utf-8",
     )
-    for name in ("index-test.js", "index-test.css", "legacy.css"):
+    (assets / "index-testhash.js").write_text(
+        "/* English-only Iris entry */\n",
+        encoding="utf-8",
+    )
+    for name in ("index-testhash.css", "legacy.css"):
         (assets / name).write_text(f"/* {name} */\n", encoding="utf-8")
+
+    locale_records: dict[str, dict[str, object]] = {}
+    for locale_key in hatch_build._EXPECTED_LOCALE_MANIFEST_KEYS:
+        locale = locale_key.removeprefix("src/locales/").removesuffix(".ts")
+        locale_file = f"assets/{locale}-localehash.js"
+        catalog_marker = "Język" if locale == "pl" else locale
+        (dist_root / locale_file).write_text(
+            f"export default {{ catalog: {catalog_marker!r} }};\n",
+            encoding="utf-8",
+        )
+        locale_records[locale_key] = {
+            "file": locale_file,
+            "name": locale,
+            "src": locale_key,
+            "isDynamicEntry": True,
+        }
+
+    vite_manifest = dist_root / ".vite" / "manifest.json"
+    vite_manifest.parent.mkdir()
+    vite_manifest.write_text(
+        json.dumps(
+            {
+                "index.html": {
+                    "file": "assets/index-testhash.js",
+                    "name": "index",
+                    "src": "index.html",
+                    "isEntry": True,
+                    "dynamicImports": list(hatch_build._EXPECTED_LOCALE_MANIFEST_KEYS),
+                    "css": ["assets/index-testhash.css"],
+                },
+                **locale_records,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_valid_dist(dist_root: Path, *, repository_root: Path) -> None:
+    _write_vite_output(dist_root)
     (dist_root / hatch_build._BUILD_MANIFEST).write_text(
         json.dumps(
             {
@@ -50,6 +93,13 @@ def _write_valid_dist(dist_root: Path, *, repository_root: Path) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def _refresh_build_manifest(dist_root: Path) -> None:
+    manifest_path = dist_root / hatch_build._BUILD_MANIFEST
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"] = hatch_build._dist_file_hashes(dist_root)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
 
 def _write_ui_archive(
@@ -429,7 +479,7 @@ def test_generated_dist_rejects_missing_index_asset(tmp_path: Path) -> None:
     _write_valid_dist(dist_root, repository_root=REPOSITORY_ROOT)
     (dist_root / "index.html").write_text(
         '<script type="module" src="/mail/assets/missing.js"></script>'
-        '<link rel="stylesheet" href="/mail/assets/index-test.css">',
+        '<link rel="stylesheet" href="/mail/assets/index-testhash.css">',
         encoding="utf-8",
     )
 
@@ -437,17 +487,70 @@ def test_generated_dist_rejects_missing_index_asset(tmp_path: Path) -> None:
         hatch_build._validate_dist(dist_root, repository_root=REPOSITORY_ROOT)
 
 
+@pytest.mark.parametrize(
+    "unexpected_name",
+    ["orphan-localehash.js", "orphan-stylehash.css", "legacy.js"],
+)
 def test_generated_dist_rejects_unreferenced_or_legacy_runtime_files(
     tmp_path: Path,
+    unexpected_name: str,
 ) -> None:
     dist_root = tmp_path / "dist"
     _write_valid_dist(dist_root, repository_root=REPOSITORY_ROOT)
-    (dist_root / "assets" / "legacy.js").write_text(
-        "window.unexpected = true;\n",
+    (dist_root / "assets" / unexpected_name).write_text(
+        "/* unexpected runtime asset */\n",
         encoding="utf-8",
     )
 
     with pytest.raises(hatch_build.HermesUiBuildError, match="unexpected file"):
+        hatch_build._validate_dist(dist_root, repository_root=REPOSITORY_ROOT)
+
+
+def test_generated_dist_requires_exact_lazy_locale_chunk_contract(
+    tmp_path: Path,
+) -> None:
+    dist_root = tmp_path / "dist"
+    _write_valid_dist(dist_root, repository_root=REPOSITORY_ROOT)
+    vite_manifest_path = dist_root / hatch_build._VITE_MANIFEST
+    vite_manifest = json.loads(vite_manifest_path.read_text(encoding="utf-8"))
+    entry = vite_manifest["index.html"]
+    locale_keys = set(hatch_build._EXPECTED_LOCALE_MANIFEST_KEYS)
+    chunk_files = {record["file"] for record in vite_manifest.values()}
+
+    assert len(locale_keys) == 44
+    assert len(vite_manifest) == 45
+    assert len(entry["dynamicImports"]) == 44
+    assert set(entry["dynamicImports"]) == locale_keys
+    assert len(chunk_files) == 45
+    assert vite_manifest["src/locales/pl.ts"]["isDynamicEntry"] is True
+    assert vite_manifest["src/locales/pl.ts"]["file"] != entry["file"]
+    assert "Język" not in (dist_root / entry["file"]).read_text(encoding="utf-8")
+    assert "Język" in (dist_root / vite_manifest["src/locales/pl.ts"]["file"]).read_text(encoding="utf-8")
+
+    hatch_build._validate_dist(dist_root, repository_root=REPOSITORY_ROOT)
+
+    entry["dynamicImports"].remove("src/locales/pl.ts")
+    vite_manifest_path.write_text(json.dumps(vite_manifest), encoding="utf-8")
+    _refresh_build_manifest(dist_root)
+    with pytest.raises(hatch_build.HermesUiBuildError, match="44 locale chunks"):
+        hatch_build._validate_dist(dist_root, repository_root=REPOSITORY_ROOT)
+
+
+def test_generated_dist_rejects_duplicate_lazy_chunk_output_files(
+    tmp_path: Path,
+) -> None:
+    dist_root = tmp_path / "dist"
+    _write_valid_dist(dist_root, repository_root=REPOSITORY_ROOT)
+    vite_manifest_path = dist_root / hatch_build._VITE_MANIFEST
+    vite_manifest = json.loads(vite_manifest_path.read_text(encoding="utf-8"))
+    vite_manifest["src/locales/fr.ts"]["file"] = vite_manifest["src/locales/pl.ts"]["file"]
+    vite_manifest_path.write_text(json.dumps(vite_manifest), encoding="utf-8")
+    _refresh_build_manifest(dist_root)
+
+    with pytest.raises(
+        hatch_build.HermesUiBuildError,
+        match=r"unsafe output file|multiple chunks",
+    ):
         hatch_build._validate_dist(dist_root, repository_root=REPOSITORY_ROOT)
 
 
@@ -459,8 +562,8 @@ def test_generated_dist_rejects_duplicate_html_attributes_before_resolution(
     index = dist_root / "index.html"
     index.write_text(
         index.read_text(encoding="utf-8").replace(
-            'src="/mail/assets/index-test.js"',
-            'src="https://cdn.invalid/app.js" src="/mail/assets/index-test.js"',
+            'src="/mail/assets/index-testhash.js"',
+            'src="https://cdn.invalid/app.js" src="/mail/assets/index-testhash.js"',
         ),
         encoding="utf-8",
     )
@@ -472,9 +575,9 @@ def test_generated_dist_rejects_duplicate_html_attributes_before_resolution(
 @pytest.mark.parametrize(
     "unexpected_markup",
     [
-        '<link rel="preload" href="/mail/assets/index-test.js" as="script">',
+        '<link rel="preload" href="/mail/assets/index-testhash.js" as="script">',
         '<link rel="icon" href="/favicon.ico">',
-        '<script type="module" src="/mail/assets/index-test.js"></script>',
+        '<script type="module" src="/mail/assets/index-testhash.js"></script>',
         '<script src="/mail/assets/legacy.js"></script>',
     ],
 )
@@ -501,8 +604,8 @@ def test_generated_dist_rejects_extraneous_script_and_link_elements(
         '<video poster="/mail/logout"></video>',
         '<source srcset="https://cdn.invalid/image.png">',
         '<div style="background-image:url(https://cdn.invalid/image.png)"></div>',
-        '<iframe srcdoc="&lt;script&gt;fetch(\'https://cdn.invalid\')&lt;/script&gt;"></iframe>',
-        '<main onload="fetch(\'https://cdn.invalid\')"></main>',
+        "<iframe srcdoc=\"&lt;script&gt;fetch('https://cdn.invalid')&lt;/script&gt;\"></iframe>",
+        "<main onload=\"fetch('https://cdn.invalid')\"></main>",
     ],
 )
 def test_generated_dist_rejects_alternative_active_html(
@@ -542,7 +645,7 @@ def test_generated_dist_rejects_inline_active_content(
 def test_generated_dist_rejects_external_stylesheet_url(tmp_path: Path) -> None:
     dist_root = tmp_path / "dist"
     _write_valid_dist(dist_root, repository_root=REPOSITORY_ROOT)
-    (dist_root / "assets" / "index-test.css").write_text(
+    (dist_root / "assets" / "index-testhash.css").write_text(
         ".tracker { background-image: url(https://cdn.invalid/pixel.png); }\n",
         encoding="utf-8",
     )
@@ -555,11 +658,70 @@ def test_generated_dist_rejects_external_stylesheet_url(tmp_path: Path) -> None:
         hatch_build._validate_dist(dist_root, repository_root=REPOSITORY_ROOT)
 
 
+@pytest.mark.parametrize(
+    ("css_text", "expected_error"),
+    [
+        (
+            "@import 'https://cdn.invalid/theme.css';\n",
+            "active import",
+        ),
+        (
+            r"@\69 mport 'https\3a //cdn.invalid/theme.css';",
+            "active import",
+        ),
+        (
+            r".tracker { background-image: u\72l(https\3a //cdn.invalid/pixel.png); }",
+            "non-inline runtime URL",
+        ),
+        (
+            r".tracker { background-image: u\/**\/\72l(https://cdn.invalid/pixel.png); }",
+            "non-inline runtime URL",
+        ),
+    ],
+)
+def test_generated_dist_rejects_external_references_in_lazy_stylesheets(
+    tmp_path: Path,
+    css_text: str,
+    expected_error: str,
+) -> None:
+    dist_root = tmp_path / "dist"
+    _write_valid_dist(dist_root, repository_root=REPOSITORY_ROOT)
+    lazy_stylesheet = dist_root / "assets" / "pl-styleshash.css"
+    lazy_stylesheet.write_text(css_text, encoding="utf-8")
+    vite_manifest_path = dist_root / hatch_build._VITE_MANIFEST
+    vite_manifest = json.loads(vite_manifest_path.read_text(encoding="utf-8"))
+    vite_manifest["src/locales/pl.ts"]["css"] = ["assets/pl-styleshash.css"]
+    vite_manifest_path.write_text(json.dumps(vite_manifest), encoding="utf-8")
+    _refresh_build_manifest(dist_root)
+
+    with pytest.raises(hatch_build.HermesUiBuildError, match=expected_error):
+        hatch_build._validate_dist(dist_root, repository_root=REPOSITORY_ROOT)
+
+
+def test_generated_dist_accepts_inline_image_in_lazy_stylesheet(
+    tmp_path: Path,
+) -> None:
+    dist_root = tmp_path / "dist"
+    _write_valid_dist(dist_root, repository_root=REPOSITORY_ROOT)
+    lazy_stylesheet = dist_root / "assets" / "pl-styleshash.css"
+    lazy_stylesheet.write_text(
+        ".flag { background-image: url('data:image/png;base64,iVBORw0KGgo='); }\n",
+        encoding="utf-8",
+    )
+    vite_manifest_path = dist_root / hatch_build._VITE_MANIFEST
+    vite_manifest = json.loads(vite_manifest_path.read_text(encoding="utf-8"))
+    vite_manifest["src/locales/pl.ts"]["css"] = ["assets/pl-styleshash.css"]
+    vite_manifest_path.write_text(json.dumps(vite_manifest), encoding="utf-8")
+    _refresh_build_manifest(dist_root)
+
+    hatch_build._validate_dist(dist_root, repository_root=REPOSITORY_ROOT)
+
+
 def test_generated_dist_rejects_asset_tampering(tmp_path: Path) -> None:
     dist_root = tmp_path / "dist"
     _write_valid_dist(dist_root, repository_root=REPOSITORY_ROOT)
     hatch_build._validate_dist(dist_root, repository_root=REPOSITORY_ROOT)
-    (dist_root / "assets" / "index-test.js").write_text("tampered\n", encoding="utf-8")
+    (dist_root / "assets" / "index-testhash.js").write_text("tampered\n", encoding="utf-8")
 
     with pytest.raises(hatch_build.HermesUiBuildError, match="do not match"):
         hatch_build._validate_dist(dist_root, repository_root=REPOSITORY_ROOT)
@@ -603,10 +765,13 @@ def test_windows_build_environment_preserves_only_required_process_variables() -
         "ComSpec": r"C:\Windows\System32\cmd.exe",
         "PATHEXT": ".COM;.EXE;.BAT;.CMD",
     }
-    assert hatch_build._allowlisted_windows_environment(
-        host_environment,
-        platform_name="posix",
-    ) == {}
+    assert (
+        hatch_build._allowlisted_windows_environment(
+            host_environment,
+            platform_name="posix",
+        )
+        == {}
+    )
 
 
 def test_docker_build_is_locked_and_rejects_unvalidated_ui_sources() -> None:
@@ -661,16 +826,7 @@ def test_node_build_environment_drops_host_injection_variables(
             )
         if command[-1] == "build":
             dist_root = stage.path / "ui" / "dist"
-            assets = dist_root / "assets"
-            assets.mkdir(parents=True)
-            (dist_root / "index.html").write_text(
-                '<link rel="icon" href="/favicon.ico" type="image/svg+xml" sizes="any">'
-                '<script type="module" src="/mail/assets/index-test.js"></script>'
-                '<link rel="stylesheet" href="/mail/assets/index-test.css">',
-                encoding="utf-8",
-            )
-            for name in ("index-test.js", "index-test.css", "legacy.css"):
-                (assets / name).write_text(f"/* {name} */\n", encoding="utf-8")
+            _write_vite_output(dist_root)
         return ""
 
     monkeypatch.setattr(hatch_build, "_run_checked", capture_run)
@@ -745,5 +901,5 @@ def test_build_hook_rejects_unsupported_target_modes(
 ) -> None:
     hook = _build_hook(REPOSITORY_ROOT, tmp_path, target_name)
 
-    with pytest.raises(hatch_build.HermesUiBuildError, match="Unsupported Hermes UI build target"):
+    with pytest.raises(hatch_build.HermesUiBuildError, match="Unsupported Iris UI build target"):
         hook.initialize(version, {})

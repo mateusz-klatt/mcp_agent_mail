@@ -18,7 +18,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from importlib import resources
 from pathlib import Path, PurePosixPath
-from typing import Any, Mapping, Optional, Sequence, cast
+from typing import Any, Literal, Mapping, Optional, Sequence, cast
+from urllib.parse import urlsplit
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 from sqlalchemy.engine import make_url
@@ -63,7 +64,8 @@ INDEX_REDIRECT_HTML = """<!doctype html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta http-equiv="refresh" content="0; url=./viewer/" />
-  <title>MCP Agent Mail Viewer</title>
+  <title>Iris · Agent Mail Viewer</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ctext x='32' y='47' text-anchor='middle' font-size='48'%3E%26%23x1F308%3B%3C/text%3E%3C/svg%3E" />
   <link rel="canonical" href="./viewer/" />
   <style>
     :root {
@@ -117,7 +119,7 @@ INDEX_REDIRECT_HTML = """<!doctype html>
 
 <body>
   <main>
-    <h1>MCP Agent Mail Viewer</h1>
+    <h1><span aria-hidden="true">🌈</span> Iris</h1>
     <p>You are being redirected to the hosted viewer experience.</p>
     <p>If you are not redirected automatically, <a href="./viewer/">click here to open the viewer</a>.</p>
   </main>
@@ -175,10 +177,10 @@ class HostingHint:
 
 SCRUB_PRESETS: dict[str, dict[str, Any]] = {
     "standard": {
-        "description": "Default redaction: clear ack/read state, scrub common secrets (API keys, tokens); retain agent names, message bodies and attachments.",
+        "description": "Default public redaction: scrub common secrets while retaining message bodies; omit all source attachments because arbitrary file bytes cannot be safely redacted.",
         "redact_body": False,
         "body_placeholder": None,
-        "drop_attachments": False,
+        "drop_attachments": True,
         "scrub_secrets": True,
         "clear_ack_state": True,
         "clear_recipients": True,
@@ -208,6 +210,7 @@ SCRUB_PRESETS: dict[str, dict[str, Any]] = {
         "clear_agent_links": False,
     },
 }
+VIEWER_SCRUB_PRESETS: tuple[str, ...] = ("standard", "strict")
 
 
 HOSTING_GUIDES: dict[str, dict[str, object]] = {
@@ -346,6 +349,23 @@ def _read_git_remotes(repo_root: Path) -> list[str]:
     return urls
 
 
+def _git_remote_hostname(remote_url: str) -> str | None:
+    """Return only the remote hostname, never userinfo or repository paths."""
+
+    candidate = remote_url.strip()
+    if not candidate:
+        return None
+    if "://" in candidate:
+        try:
+            return urlsplit(candidate).hostname
+        except ValueError:
+            return None
+    scp_match = re.fullmatch(r"(?:[^@/:]+@)?([^/:]+):.+", candidate)
+    if scp_match is not None:
+        return scp_match.group(1)
+    return None
+
+
 def detect_hosting_hints(output_dir: Path) -> list[HostingHint]:
     signals: dict[str, list[str]] = defaultdict(list)
     resolved_output_dir = output_dir.expanduser().resolve()
@@ -368,15 +388,15 @@ def detect_hosting_hints(output_dir: Path) -> list[HostingHint]:
             signals["s3"].append("Detected deploy scripts referencing S3/AWS")
 
     for url in remote_urls:
-        lower = url.lower()
-        if "github.com" in lower:
-            signals["github_pages"].append(f"Git remote: {url}")
-        if "cloudflare" in lower:
-            signals["cloudflare_pages"].append(f"Git remote: {url}")
-        if "netlify" in lower:
-            signals["netlify"].append(f"Git remote: {url}")
-        if "amazonaws" in lower or "s3" in lower:
-            signals["s3"].append(f"Git remote: {url}")
+        hostname = (_git_remote_hostname(url) or "").casefold()
+        if hostname == "github.com" or hostname.endswith(".github.com"):
+            signals["github_pages"].append("GitHub remote detected")
+        if hostname == "cloudflare.com" or hostname.endswith(".cloudflare.com"):
+            signals["cloudflare_pages"].append("Cloudflare remote detected")
+        if hostname == "netlify.com" or hostname.endswith(".netlify.com"):
+            signals["netlify"].append("Netlify remote detected")
+        if hostname == "amazonaws.com" or hostname.endswith(".amazonaws.com"):
+            signals["s3"].append("AWS remote detected")
 
     env = os.environ
     if env.get("GITHUB_REPOSITORY"):
@@ -458,6 +478,141 @@ def build_how_to_deploy(hosting_hints: Sequence[HostingHint]) -> str:
     sections.append("Review `manifest.json` before publication to confirm the included projects, hashing, and scrubbing policies.")
 
     return "\n".join(sections)
+
+
+def _assert_viewer_snapshot_schema(snapshot_path: Path) -> None:
+    """Fail closed if a viewer snapshot contains anything outside its public schema."""
+
+    allowed_base_columns = {
+        "projects": {"id", "slug", "human_key"},
+        "agents": {"id", "project_id", "name", "origin_project_slug"},
+        "messages": {
+            "id",
+            "project_id",
+            "sender_id",
+            "thread_id",
+            "subject",
+            "body_md",
+            "importance",
+            "ack_required",
+            "created_ts",
+            "attachments",
+            "subject_lower",
+            "sender_lower",
+        },
+        "message_recipients": {"message_id", "agent_id"},
+    }
+    allowed_derived_tables = {
+        "message_overview_mv",
+        "attachments_by_message_mv",
+        "fts_search_overview_mv",
+    }
+    expected_derived_columns = {
+        "message_overview_mv": {
+            "id",
+            "project_id",
+            "thread_id",
+            "subject",
+            "importance",
+            "ack_required",
+            "created_ts",
+            "sender_name",
+            "sender_display",
+            "sender_project_id",
+            "sender_project_slug",
+            "sender_project_name",
+            "sender_address",
+            "body_length",
+            "attachment_count",
+            "latest_snippet",
+            "recipients",
+        },
+        "attachments_by_message_mv": {
+            "message_id",
+            "project_id",
+            "thread_id",
+            "created_ts",
+            "attachment_type",
+            "media_type",
+            "path",
+            "size_bytes",
+        },
+        "fts_search_overview_mv": {
+            "message_rowid",
+            "message_id",
+            "subject",
+            "created_ts",
+            "importance",
+            "sender_name",
+            "sender_display",
+            "sender_project_id",
+            "sender_project_slug",
+            "sender_project_name",
+            "sender_address",
+            "snippet",
+        },
+    }
+    expected_fts_columns = {
+        "subject",
+        "body",
+        "importance",
+        "project_slug",
+        "thread_key",
+        "created_ts",
+    }
+    conn = sqlite3.connect(str(snapshot_path))
+    try:
+        table_rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+        table_names = {str(row[0]) for row in table_rows}
+        allowed_tables = set(allowed_base_columns) | allowed_derived_tables
+        unexpected_tables = sorted(
+            name
+            for name in table_names
+            if name not in allowed_tables
+            and name != "fts_messages"
+            and not name.startswith("fts_messages_")
+            and name != "sqlite_stat1"
+        )
+        if unexpected_tables:
+            raise ShareExportError(
+                "Viewer snapshot contains unexpected tables: " + ", ".join(unexpected_tables)
+            )
+        for table_name, expected_columns in allowed_base_columns.items():
+            actual_columns = {
+                str(row[1])
+                for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+            }
+            if actual_columns != expected_columns:
+                raise ShareExportError(
+                    f"Viewer snapshot table {table_name} has unexpected columns."
+                )
+        for table_name, expected_columns in expected_derived_columns.items():
+            if table_name not in table_names:
+                if table_name == "fts_search_overview_mv" and "fts_messages" not in table_names:
+                    continue
+                raise ShareExportError(f"Viewer snapshot is missing table {table_name}.")
+            actual_columns = {
+                str(row[1])
+                for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+            }
+            if actual_columns != expected_columns:
+                raise ShareExportError(
+                    f"Viewer snapshot table {table_name} has unexpected columns."
+                )
+        if "fts_messages" in table_names:
+            actual_fts_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(fts_messages)").fetchall()
+            }
+            if actual_fts_columns != expected_fts_columns:
+                raise ShareExportError("Viewer snapshot FTS table has unexpected columns.")
+        integrity_result = conn.execute("PRAGMA integrity_check").fetchone()
+        if integrity_result is None or integrity_result[0] != "ok":
+            raise ShareExportError("Viewer snapshot failed SQLite integrity_check.")
+    finally:
+        conn.close()
 
 
 def export_viewer_data(
@@ -731,6 +886,243 @@ def _format_in_clause(count: int) -> str:
     return ",".join("?" for _ in range(count))
 
 
+def _select_projects_for_export(
+    conn: sqlite3.Connection,
+    identifiers: Sequence[str],
+) -> tuple[list[ProjectRecord], int]:
+    rows = conn.execute("SELECT id, slug, human_key FROM projects").fetchall()
+    if not rows:
+        raise ShareExportError("Snapshot does not contain any projects to export.")
+
+    projects = [
+        ProjectRecord(int(row["id"]), str(row["slug"]), str(row["human_key"]))
+        for row in rows
+    ]
+    if not identifiers:
+        return projects, 0
+
+    lookup: dict[str, ProjectRecord] = {}
+    for record in projects:
+        lookup[record.slug.casefold()] = record
+        lookup[record.human_key.casefold()] = record
+
+    selected: list[ProjectRecord] = []
+    selected_ids: set[int] = set()
+    for identifier in identifiers:
+        key = identifier.strip().casefold()
+        if not key:
+            continue
+        record = lookup.get(key)
+        if record is None:
+            raise ShareExportError(f"Project identifier '{identifier}' not found in snapshot.")
+        if record.id not in selected_ids:
+            selected.append(record)
+            selected_ids.add(record.id)
+
+    if not selected:
+        raise ShareExportError("No matching projects found for provided filters.")
+    return selected, len(projects) - len(selected)
+
+
+def _row_value(row: sqlite3.Row, column: str, default: Any = None) -> Any:
+    try:
+        return row[column]
+    except IndexError:
+        return default
+
+
+def _create_viewer_snapshot(
+    source: Path,
+    destination: Path,
+    identifiers: Sequence[str],
+) -> ProjectScopeResult:
+    """Project a private runtime database into a fresh viewer-only allowlist."""
+
+    source = source.resolve()
+    destination = destination.resolve()
+    if not source.is_file():
+        raise ShareExportError(f"Source SQLite database not found at {source}.")
+    if destination.exists():
+        raise ShareExportError(
+            f"Destination snapshot already exists at {destination}. Choose a new path or remove it manually."
+        )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    source_conn = sqlite3.connect(str(source))
+    destination_conn: sqlite3.Connection | None = None
+    try:
+        source_conn.row_factory = sqlite3.Row
+        source_conn.execute("BEGIN")
+        required_columns = {
+            "projects": {"id", "slug", "human_key"},
+            "agents": {"id", "project_id", "name"},
+            "messages": {
+                "id",
+                "project_id",
+                "sender_id",
+                "thread_id",
+                "subject",
+                "body_md",
+                "importance",
+                "ack_required",
+                "created_ts",
+                "attachments",
+            },
+            "message_recipients": {"message_id", "agent_id"},
+        }
+        for table_name, expected_columns in required_columns.items():
+            actual_columns = {
+                str(row["name"])
+                for row in source_conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+            }
+            missing_columns = sorted(expected_columns - actual_columns)
+            if missing_columns:
+                raise ShareExportError(
+                    f"Source database is missing required {table_name} columns: "
+                    + ", ".join(missing_columns)
+                )
+        selected, removed_count = _select_projects_for_export(source_conn, identifiers)
+        public_projects = [
+            ProjectRecord(record.id, record.slug, record.slug) for record in selected
+        ]
+        selected_ids = {record.id for record in selected}
+        selected_placeholders = _format_in_clause(len(selected_ids))
+
+        message_rows = source_conn.execute(
+            f"SELECT * FROM messages WHERE project_id IN ({selected_placeholders})",
+            tuple(selected_ids),
+        ).fetchall()
+        message_ids = {int(row["id"]) for row in message_rows}
+
+        recipient_rows: list[sqlite3.Row] = []
+        if message_ids:
+            recipient_placeholders = _format_in_clause(len(message_ids))
+            recipient_rows = source_conn.execute(
+                "SELECT * FROM message_recipients "
+                f"WHERE message_id IN ({recipient_placeholders})",
+                tuple(message_ids),
+            ).fetchall()
+
+        referenced_agent_ids = {
+            int(sender_id)
+            for row in message_rows
+            if (sender_id := _row_value(row, "sender_id")) is not None
+        }
+        referenced_agent_ids.update(
+            int(agent_id)
+            for row in recipient_rows
+            if (agent_id := _row_value(row, "agent_id")) is not None
+        )
+        agent_rows: list[sqlite3.Row] = []
+        project_slugs = {
+            int(row["id"]): str(row["slug"])
+            for row in source_conn.execute("SELECT id, slug FROM projects").fetchall()
+        }
+        if referenced_agent_ids:
+            agent_placeholders = _format_in_clause(len(referenced_agent_ids))
+            agent_rows = source_conn.execute(
+                f"SELECT * FROM agents WHERE id IN ({agent_placeholders})",
+                tuple(referenced_agent_ids),
+            ).fetchall()
+
+        destination_conn = sqlite3.connect(str(destination))
+        destination_conn.executescript(
+            """
+            CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL,
+                human_key TEXT NOT NULL
+            );
+            CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER,
+                name TEXT NOT NULL,
+                origin_project_slug TEXT
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                sender_id INTEGER,
+                thread_id TEXT,
+                subject TEXT,
+                body_md TEXT,
+                importance TEXT,
+                ack_required INTEGER,
+                created_ts TEXT,
+                attachments TEXT
+            );
+            CREATE TABLE message_recipients (
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER
+            );
+            """
+        )
+        destination_conn.executemany(
+            "INSERT INTO projects (id, slug, human_key) VALUES (?, ?, ?)",
+            [(record.id, record.slug, record.slug) for record in selected],
+        )
+        destination_conn.executemany(
+            """
+            INSERT INTO agents (id, project_id, name, origin_project_slug)
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                (
+                    int(row["id"]),
+                    int(row["project_id"])
+                    if row["project_id"] is not None and int(row["project_id"]) in selected_ids
+                    else None,
+                    str(row["name"]),
+                    project_slugs.get(int(row["project_id"]))
+                    if row["project_id"] is not None
+                    and int(row["project_id"]) not in selected_ids
+                    else None,
+                )
+                for row in agent_rows
+            ],
+        )
+        destination_conn.executemany(
+            """
+            INSERT INTO messages (
+                id, project_id, sender_id, thread_id, subject, body_md,
+                importance, ack_required, created_ts, attachments
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    int(row["id"]),
+                    int(row["project_id"]),
+                    _row_value(row, "sender_id"),
+                    _row_value(row, "thread_id"),
+                    _row_value(row, "subject", ""),
+                    _row_value(row, "body_md", ""),
+                    _row_value(row, "importance", "normal"),
+                    int(bool(_row_value(row, "ack_required", 0))),
+                    _row_value(row, "created_ts", ""),
+                    _row_value(row, "attachments", "[]") or "[]",
+                )
+                for row in message_rows
+            ],
+        )
+        destination_conn.executemany(
+            "INSERT INTO message_recipients (message_id, agent_id) VALUES (?, ?)",
+            [
+                (int(row["message_id"]), _row_value(row, "agent_id"))
+                for row in recipient_rows
+            ],
+        )
+        destination_conn.commit()
+        return ProjectScopeResult(projects=public_projects, removed_count=removed_count)
+    except sqlite3.Error as exc:
+        if destination_conn is not None:
+            destination_conn.rollback()
+        raise ShareExportError(f"Failed to create viewer-only SQLite snapshot: {exc}") from exc
+    finally:
+        if destination_conn is not None:
+            destination_conn.close()
+        source_conn.close()
+
+
 def apply_project_scope(snapshot_path: Path, identifiers: Sequence[str]) -> ProjectScopeResult:
     """Restrict the snapshot to the requested projects and return retained records."""
 
@@ -842,6 +1234,16 @@ def _normalize_scrub_preset(preset: str) -> str:
     return key
 
 
+def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        is not None
+    )
+
+
 def _scrub_structure(value: Any) -> tuple[Any, int, int]:
     """Recursively scrub secrets from attachment metadata structures.
 
@@ -913,7 +1315,11 @@ def scrub_snapshot(
         else:
             ack_flags_cleared = 0
 
-        if clear_recipients:
+        recipient_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(message_recipients)").fetchall()
+        }
+        if clear_recipients and {"read_ts", "ack_ts"}.issubset(recipient_columns):
             recipients_cursor = conn.execute(
                 "UPDATE message_recipients SET read_ts = NULL, ack_ts = NULL"
             )
@@ -921,13 +1327,13 @@ def scrub_snapshot(
         else:
             recipients_cleared = 0
 
-        if clear_file_reservations:
+        if clear_file_reservations and _table_exists(conn, "file_reservations"):
             file_res_cursor = conn.execute("DELETE FROM file_reservations")
             file_res_removed = file_res_cursor.rowcount or 0
         else:
             file_res_removed = 0
 
-        if clear_agent_links:
+        if clear_agent_links and _table_exists(conn, "agent_links"):
             agent_links_cursor = conn.execute("DELETE FROM agent_links")
             agent_links_removed = agent_links_cursor.rowcount or 0
         else:
@@ -936,19 +1342,25 @@ def scrub_snapshot(
         secrets_replaced = 0
         attachments_sanitized = 0
 
-        message_rows = conn.execute("SELECT id, subject, body_md, attachments FROM messages").fetchall()
+        message_rows = conn.execute(
+            "SELECT id, thread_id, subject, body_md, attachments FROM messages"
+        ).fetchall()
         for msg in message_rows:
+            thread_original = msg["thread_id"] or ""
             subject_original = msg["subject"] or ""
             body_original = msg["body_md"] or ""
             if scrub_secrets:
+                thread_id, thread_replacements = _scrub_text(thread_original)
                 subject, subj_replacements = _scrub_text(subject_original)
                 body, body_replacements = _scrub_text(body_original)
             else:
+                thread_id = thread_original
                 subject = subject_original
                 body = body_original
+                thread_replacements = 0
                 subj_replacements = 0
                 body_replacements = 0
-            secrets_replaced += subj_replacements + body_replacements
+            secrets_replaced += thread_replacements + subj_replacements + body_replacements
             attachments_value = msg["attachments"]
             attachments_updated = False
             attachment_replacements = 0
@@ -991,6 +1403,11 @@ def scrub_snapshot(
                 )
             if subject != msg["subject"]:
                 conn.execute("UPDATE messages SET subject = ? WHERE id = ?", (subject, msg["id"]))
+            if thread_id != msg["thread_id"]:
+                conn.execute(
+                    "UPDATE messages SET thread_id = ? WHERE id = ?",
+                    (thread_id, msg["id"]),
+                )
             if preset_opts["redact_body"]:
                 body = preset_opts.get("body_placeholder") or "[Message body redacted]"
                 if msg["body_md"] != body:
@@ -1139,9 +1556,20 @@ def build_materialized_views(snapshot_path: Path) -> None:
         colset = {c.lower() for c in cols}
         has_thread_id = "thread_id" in colset
         has_sender_id = "sender_id" in colset
+        agent_columns = {
+            str(row[1]).casefold()
+            for row in conn.execute("PRAGMA table_info(agents)").fetchall()
+        }
+        has_origin_project_slug = "origin_project_slug" in agent_columns
+        origin_slug_expr = "a.origin_project_slug" if has_origin_project_slug else "NULL"
+        external_origin_condition = (
+            f"a.project_id IS NULL AND COALESCE({origin_slug_expr}, '') != ''"
+        )
         sender_expr = "a.name" if has_sender_id else "''"
         sender_display_expr = (
             "CASE "
+            f"WHEN {external_origin_condition} "
+            f"THEN a.name || '@' || {origin_slug_expr} "
             "WHEN sp.id IS NOT NULL AND sp.id != m.project_id AND COALESCE(sp.slug, '') != '' "
             "THEN a.name || '@' || sp.slug "
             "ELSE a.name END"
@@ -1154,17 +1582,25 @@ def build_materialized_views(snapshot_path: Path) -> None:
             else "NULL"
         )
         sender_project_slug_expr = (
-            "CASE WHEN sp.id IS NOT NULL AND sp.id != m.project_id THEN sp.slug ELSE NULL END"
+            "CASE "
+            f"WHEN {external_origin_condition} THEN {origin_slug_expr} "
+            "WHEN sp.id IS NOT NULL AND sp.id != m.project_id THEN sp.slug "
+            "ELSE NULL END"
             if has_sender_id
             else "NULL"
         )
         sender_project_name_expr = (
-            "CASE WHEN sp.id IS NOT NULL AND sp.id != m.project_id THEN sp.human_key ELSE NULL END"
+            "CASE "
+            f"WHEN {external_origin_condition} THEN {origin_slug_expr} "
+            "WHEN sp.id IS NOT NULL AND sp.id != m.project_id THEN sp.human_key "
+            "ELSE NULL END"
             if has_sender_id
             else "NULL"
         )
         sender_address_expr = (
             "CASE "
+            f"WHEN {external_origin_condition} "
+            f"THEN 'project:' || {origin_slug_expr} || '#' || a.name "
             "WHEN sp.id IS NOT NULL AND sp.id != m.project_id AND COALESCE(sp.slug, '') != '' "
             "THEN 'project:' || sp.slug || '#' || a.name "
             "ELSE NULL END"
@@ -1340,8 +1776,8 @@ def build_materialized_views(snapshot_path: Path) -> None:
                 DROP TABLE IF EXISTS fts_search_overview_mv;
                 CREATE TABLE fts_search_overview_mv AS
                 SELECT
-                    m.rowid,
-                    m.id,
+                    m.rowid AS message_rowid,
+                    m.id AS message_id,
                     m.subject,
                     m.created_ts,
                     m.importance,
@@ -1357,7 +1793,7 @@ def build_materialized_views(snapshot_path: Path) -> None:
                 ORDER BY m.created_ts DESC;
 
                 -- Index for FTS result lookups
-                CREATE INDEX idx_fts_overview_rowid ON fts_search_overview_mv(rowid);
+                CREATE INDEX idx_fts_overview_rowid ON fts_search_overview_mv(message_rowid);
                 CREATE INDEX idx_fts_overview_created ON fts_search_overview_mv(created_ts DESC);
                 """
                 .format(
@@ -1538,16 +1974,63 @@ def create_snapshot_context(
     snapshot_path: Path,
     project_filters: Sequence[str],
     scrub_preset: str,
+    purpose: Literal["viewer_export", "recovery_archive"],
 ) -> SnapshotContext:
     """Materialize and prepare a snapshot for export."""
 
-    create_sqlite_snapshot(source_database, snapshot_path)
-    scope = apply_project_scope(snapshot_path, project_filters)
+    preset_key = _normalize_scrub_preset(scrub_preset)
+    if purpose == "viewer_export":
+        if preset_key == "archive":
+            raise ShareExportError(
+                "The lossless archive preset is private recovery data and cannot be used for a public viewer export."
+            )
+        scope = _create_viewer_snapshot(source_database, snapshot_path, project_filters)
+    elif purpose == "recovery_archive":
+        if project_filters:
+            raise ShareExportError(
+                "Lossless recovery archives must include the complete database; project filtering is not supported."
+            )
+        if preset_key != "archive":
+            raise ShareExportError(
+                "Recovery archives require the lossless 'archive' scrub preset."
+            )
+        create_sqlite_snapshot(source_database, snapshot_path)
+        scope = apply_project_scope(snapshot_path, ())
+        conn = sqlite3.connect(str(snapshot_path))
+        try:
+            integrity_result = conn.execute("PRAGMA integrity_check").fetchone()
+            if integrity_result is None or integrity_result[0] != "ok":
+                raise ShareExportError("Recovery snapshot failed SQLite integrity_check.")
+        finally:
+            conn.close()
+        return SnapshotContext(
+            snapshot_path=snapshot_path,
+            scope=scope,
+            scrub_summary=ScrubSummary(
+                preset=preset_key,
+                pseudonym_salt=preset_key,
+                agents_total=0,
+                agents_pseudonymized=0,
+                ack_flags_cleared=0,
+                recipients_cleared=0,
+                file_reservations_removed=0,
+                agent_links_removed=0,
+                secrets_replaced=0,
+                attachments_sanitized=0,
+                bodies_redacted=0,
+                attachments_cleared=0,
+            ),
+            fts_enabled=False,
+        )
+    else:
+        raise ShareExportError(f"Unknown snapshot purpose: {purpose}")
     scrub_summary = scrub_snapshot(snapshot_path, preset=scrub_preset)
     fts_enabled = build_search_indexes(snapshot_path)
     build_materialized_views(snapshot_path)
     create_performance_indexes(snapshot_path)
     finalize_snapshot_for_export(snapshot_path)
+    if purpose == "viewer_export":
+        _assert_viewer_snapshot_schema(snapshot_path)
     return SnapshotContext(
         snapshot_path=snapshot_path,
         scope=scope,
@@ -1635,7 +2118,6 @@ def bundle_attachments(
                         {
                             "message_id": int(row["id"]),
                             "mode": "missing",
-                            "original_path": original_path,
                             "sha_hint": sha_hint,
                             "media_type": media_type,
                         }
@@ -1643,7 +2125,6 @@ def bundle_attachments(
                     updated_list.append(
                         {
                             "type": "missing",
-                            "original_path": original_path,
                             "media_type": media_type,
                             "sha_hint": sha_hint,
                         }
@@ -1663,7 +2144,6 @@ def bundle_attachments(
                     "message_id": int(row["id"]),
                     "sha256": sha256,
                     "media_type": media_type,
-                    "original_path": original_path,
                     "bytes": size,
                 }
 
@@ -1694,7 +2174,6 @@ def bundle_attachments(
                             "media_type": media_type,
                             "bytes": size,
                             "sha256": sha256,
-                            "original_path": original_path,
                             "note": "Requires manual hosting (exceeds bundle threshold).",
                         }
                     )
@@ -2215,9 +2694,10 @@ def write_bundle_scaffolding(
     """Create manifest and helper docs around the freshly minted snapshot."""
 
     project_entries = [
-        {"slug": record.slug, "human_key": record.human_key}
+        {"slug": record.slug, "human_key": record.slug}
         for record in scope.projects
     ]
+    public_project_filters = [record.slug for record in scope.projects]
 
     viewer_sri = _build_viewer_sri(output_dir)
 
@@ -2233,7 +2713,7 @@ def write_bundle_scaffolding(
             "chunk_manifest": chunk_manifest,
         },
         "project_scope": {
-            "requested": list(project_filters),
+            "requested": public_project_filters,
             "included": project_entries,
             "removed_count": scope.removed_count,
         },
@@ -2267,7 +2747,7 @@ def write_bundle_scaffolding(
     elif viewer_sri:
         manifest["viewer"] = {"sri": viewer_sri}
     export_config_payload = dict(export_config)
-    export_config_payload.setdefault("projects", list(project_filters))
+    export_config_payload["projects"] = public_project_filters
     export_config_payload.setdefault("scrub_preset", scrub_summary.preset)
     manifest["export_config"] = {k: v for k, v in export_config_payload.items() if v is not None}
     _write_json_file(output_dir / "manifest.json", manifest)
@@ -2404,6 +2884,7 @@ def _generate_headers_file() -> str:
 
 __all__ = [
     "SCRUB_PRESETS",
+    "VIEWER_SCRUB_PRESETS",
     "HostingHint",
     "ShareExportError",
     "apply_project_scope",

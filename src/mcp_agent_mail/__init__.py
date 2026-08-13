@@ -1,4 +1,4 @@
-"""Top-level package for the MCP Agent Mail server."""
+"""Top-level package for Iris, the MCP Agent Mail server."""
 
 from __future__ import annotations
 

@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -52,6 +53,8 @@ from .app import (
     _LIKE_ESCAPE_CHAR,
     _canonicalize_project_identifier,
     _extract_like_terms,
+    _hard_delete_agent_database_rows,
+    _hard_delete_project_database_rows,
     _like_escape,
     _sanitize_fts_query,
     _sender_display_name,
@@ -69,16 +72,13 @@ from .guard import install_guard as install_guard_script, uninstall_guard as uni
 from .http import build_http_app
 from .models import (
     Agent,
-    AgentLink,
     FileReservation,
     Message,
     MessageDelivery,
     MessageRecipient,
-    MessageSummary,
     Product,
     ProductProjectLink,
     Project,
-    ProjectSiblingSuggestion,
     WindowIdentity,
 )
 from .share import (
@@ -87,6 +87,7 @@ from .share import (
     DETACH_ATTACHMENT_THRESHOLD,
     INLINE_ATTACHMENT_THRESHOLD,
     SCRUB_PRESETS,
+    VIEWER_SCRUB_PRESETS,
     ShareExportError,
     build_bundle_assets,
     copy_viewer_assets,
@@ -134,6 +135,22 @@ ARCHIVE_METADATA_FILENAME = "metadata.json"
 ARCHIVE_SNAPSHOT_RELATIVE = Path("snapshot") / "mailbox.sqlite3"
 ARCHIVE_STORAGE_DIRNAME = Path("storage_repo")
 DEFAULT_ARCHIVE_SCRUB_PRESET = "archive"
+
+_SHARE_BUNDLE_OWNED_FILES = frozenset(
+    {
+        ".nojekyll",
+        "HOW_TO_DEPLOY.md",
+        "README.md",
+        "_headers",
+        "chunks.sha256",
+        "index.html",
+        "mailbox.sqlite3",
+        "mailbox.sqlite3.config.json",
+        "manifest.json",
+        "manifest.sig.json",
+    }
+)
+_SHARE_BUNDLE_OWNED_DIRECTORIES = frozenset({"attachments", "chunks", "viewer"})
 
 
 def _cli_sender_display(
@@ -358,7 +375,7 @@ def _run_async(coro: Any) -> Any:
         reset_database_state()
 
 
-app = typer.Typer(help="Developer utilities for the MCP Agent Mail service.", invoke_without_command=True)
+app = typer.Typer(help="Developer utilities for Iris, the MCP Agent Mail service.", invoke_without_command=True)
 
 
 @app.callback()
@@ -2005,7 +2022,7 @@ def serve_stdio() -> None:
         )
 
         # Print startup message to stderr (stdout is reserved for MCP protocol)
-        print("MCP Agent Mail - Starting stdio transport...", file=sys.stderr)
+        print("Iris / MCP Agent Mail - Starting stdio transport...", file=sys.stderr)
 
         server = build_mcp_server()
         server.run(transport="stdio")
@@ -3026,10 +3043,10 @@ def share_export(
     if projects is None:
         projects = []
     scrub_preset = (scrub_preset or "standard").strip().lower()
-    if scrub_preset not in SCRUB_PRESETS:
+    if scrub_preset not in VIEWER_SCRUB_PRESETS:
         console.print(
             "[red]Invalid scrub preset:[/] "
-            f"{scrub_preset}. Choose one of: {', '.join(SCRUB_PRESETS)}."
+            f"{scrub_preset}. Choose one of: {', '.join(VIEWER_SCRUB_PRESETS)}."
         )
         raise typer.Exit(code=1)
     raw_output = _resolve_path(output)
@@ -3102,6 +3119,7 @@ def share_export(
             snapshot_path=snapshot_path,
             project_filters=projects,
             scrub_preset=scrub_preset,
+            purpose="viewer_export",
         )
     except ShareExportError as exc:
         console.print(f"[red]Snapshot preparation failed:[/] {exc}")
@@ -3363,14 +3381,15 @@ def _run_share_export_wizard(
     chunk_size = _parse_positive_int(chunk_size_input, default_chunk_size)
 
     console.print("[cyan]Scrub presets:[/]")
-    for name, config in SCRUB_PRESETS.items():
+    for name in VIEWER_SCRUB_PRESETS:
+        config = SCRUB_PRESETS[name]
         console.print(f"  • [bold]{name}[/] - {config['description']}")
     preset_input = typer.prompt(
         f"Scrub preset (default {default_scrub_preset})",
         default=default_scrub_preset,
     )
     preset_value = (preset_input or default_scrub_preset).strip().lower()
-    if preset_value not in SCRUB_PRESETS:
+    if preset_value not in VIEWER_SCRUB_PRESETS:
         console.print(
             f"[yellow]Unknown preset '{preset_value}'. Using {default_scrub_preset} instead.[/]"
         )
@@ -3563,10 +3582,10 @@ def share_update(
 
     project_filters = list(projects) if projects else list(stored_config.projects)
     scrub_preset = (scrub_preset_override or stored_config.scrub_preset or "standard").strip().lower()
-    if scrub_preset not in SCRUB_PRESETS:
+    if scrub_preset not in VIEWER_SCRUB_PRESETS:
         console.print(
             "[red]Invalid scrub preset override:[/] "
-            f"{scrub_preset}. Choose one of: {', '.join(SCRUB_PRESETS)}."
+            f"{scrub_preset}. Choose one of: {', '.join(VIEWER_SCRUB_PRESETS)}."
         )
         raise typer.Exit(code=1)
 
@@ -3623,6 +3642,14 @@ def share_update(
     scrub_summary = None
     fts_enabled = False
     sync_result = BundleSyncResult()
+    archive_path: Optional[Path] = None
+    if zip_bundle:
+        archive_path = bundle_path.parent / f"{bundle_path.name}.zip"
+        if archive_path.exists():
+            console.print(
+                f"[red]Archive already exists at {archive_path}. Remove it or specify --no-zip to skip packaging.[/]"
+            )
+            raise typer.Exit(code=1)
 
     with tempfile.TemporaryDirectory(prefix="mailbox-share-update-") as temp_dir_name:
         temp_path = Path(temp_dir_name)
@@ -3634,6 +3661,7 @@ def share_update(
                 snapshot_path=snapshot_path,
                 project_filters=project_filters,
                 scrub_preset=scrub_preset,
+                purpose="viewer_export",
             )
         except ShareExportError as exc:
             console.print(f"[red]Snapshot preparation failed:[/] {exc}")
@@ -3687,28 +3715,46 @@ def share_update(
                 f"[cyan]Chunked database into {chunk_manifest['chunk_count']} files of ~{chunk_manifest['chunk_size']//1024} KiB.[/]"
             )
 
+        if signing_key is not None:
+            try:
+                public_out_path = _resolve_path(signing_public_out) if signing_public_out else None
+                signature_info = sign_manifest(
+                    temp_path / "manifest.json",
+                    signing_key,
+                    temp_path,
+                    public_out=public_out_path,
+                    overwrite=True,
+                )
+                console.print(
+                    f"[green]✓ Signed manifest (Ed25519, public key {signature_info['public_key']})[/]"
+                )
+            except ShareExportError as exc:
+                console.print(f"[red]Manifest signing failed:[/] {exc}")
+                raise typer.Exit(code=1) from exc
+
         console.print(f"[cyan]Synchronizing updated bundle into:[/] {bundle_path}")
-        sync_result = _copy_bundle_contents(temp_path, bundle_path)
+        try:
+            sync_result = _copy_bundle_contents(temp_path, bundle_path)
+        except ShareExportError as exc:
+            console.print(f"[red]Failed to synchronize bundle:[/] {exc}")
+            raise typer.Exit(code=1) from exc
+
+        if archive_path is not None:
+            console.print(f"[cyan]Packaging archive:[/] {archive_path}")
+            try:
+                with tempfile.TemporaryDirectory(
+                    prefix="mailbox-share-zip-stage-"
+                ) as zip_stage_name:
+                    zip_stage_path = Path(zip_stage_name)
+                    _copy_bundle_contents(temp_path, zip_stage_path)
+                    package_directory_as_zip(zip_stage_path, archive_path)
+            except ShareExportError as exc:
+                console.print(f"[red]Failed to create ZIP archive:[/] {exc}")
+                raise typer.Exit(code=1) from exc
 
     assert scope is not None and scrub_summary is not None
 
-    if signing_key is not None:
-        try:
-            public_out_path = _resolve_path(signing_public_out) if signing_public_out else None
-            signature_info = sign_manifest(
-                bundle_path / "manifest.json",
-                signing_key,
-                bundle_path,
-                public_out=public_out_path,
-                overwrite=True,
-            )
-            console.print(
-                f"[green]✓ Signed manifest (Ed25519, public key {signature_info['public_key']})[/]"
-            )
-        except ShareExportError as exc:
-            console.print(f"[red]Manifest signing failed:[/] {exc}")
-            raise typer.Exit(code=1) from exc
-    elif existing_signature:
+    if signing_key is None and existing_signature:
         if (bundle_path / "manifest.sig.json").exists():
             console.print(
                 "[yellow]Existing manifest signature may no longer match. Re-run with --signing-key to refresh it.[/]"
@@ -3717,21 +3763,6 @@ def share_update(
             console.print(
                 "[yellow]Removed stale manifest.sig.json during update. Re-run with --signing-key to refresh the signature.[/]"
             )
-
-    archive_path: Optional[Path] = None
-    if zip_bundle:
-        archive_path = bundle_path.parent / f"{bundle_path.name}.zip"
-        console.print(f"[cyan]Packaging archive:[/] {archive_path}")
-        if archive_path.exists():
-            console.print(
-                f"[red]Archive already exists at {archive_path}. Remove it or specify --no-zip to skip packaging.[/]"
-            )
-            raise typer.Exit(code=1)
-        try:
-            package_directory_as_zip(bundle_path, archive_path)
-        except ShareExportError as exc:
-            console.print(f"[red]Failed to create ZIP archive:[/] {exc}")
-            raise typer.Exit(code=1) from exc
 
     if age_recipient_list:
         if not archive_path:
@@ -4140,56 +4171,195 @@ def _load_bundle_export_config(bundle_dir: Path) -> StoredExportConfig:
     )
 
 
+def _is_bundle_link(path: Path) -> bool:
+    """Return whether *path* is a symlink or a Windows junction."""
+
+    if path.is_symlink():
+        return True
+    junction_check = getattr(path, "is_junction", None)
+    return bool(junction_check is not None and junction_check())
+
+
+def _collect_owned_bundle_paths(
+    bundle_root: Path,
+    *,
+    role: str,
+) -> tuple[set[Path], set[Path]]:
+    """Inventory regular files and directories owned by the share exporter."""
+
+    owned_files: set[Path] = set()
+    owned_dirs: set[Path] = set()
+
+    for filename in _SHARE_BUNDLE_OWNED_FILES:
+        path = bundle_root / filename
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if _is_bundle_link(path):
+            raise ShareExportError(
+                f"Refusing to follow {role} bundle link at {filename}"
+            )
+        if not stat.S_ISREG(mode):
+            raise ShareExportError(
+                f"Expected {role} bundle path {filename} to be a regular file"
+            )
+        owned_files.add(path)
+
+    for dirname in _SHARE_BUNDLE_OWNED_DIRECTORIES:
+        tree_root = bundle_root / dirname
+        try:
+            mode = tree_root.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if _is_bundle_link(tree_root):
+            raise ShareExportError(
+                f"Refusing to follow {role} bundle link at {dirname}"
+            )
+        if not stat.S_ISDIR(mode):
+            raise ShareExportError(
+                f"Expected {role} bundle path {dirname} to be a directory"
+            )
+        owned_dirs.add(tree_root)
+
+        for current_root, dirnames, filenames in os.walk(
+            tree_root,
+            topdown=True,
+            followlinks=False,
+        ):
+            current_path = Path(current_root)
+            for child_name in dirnames:
+                child = current_path / child_name
+                relative = child.relative_to(bundle_root).as_posix()
+                child_mode = child.lstat().st_mode
+                if _is_bundle_link(child):
+                    raise ShareExportError(
+                        f"Refusing to follow {role} bundle link at {relative}"
+                    )
+                if not stat.S_ISDIR(child_mode):
+                    raise ShareExportError(
+                        f"Expected {role} bundle path {relative} to be a directory"
+                    )
+                owned_dirs.add(child)
+            for child_name in filenames:
+                child = current_path / child_name
+                relative = child.relative_to(bundle_root).as_posix()
+                child_mode = child.lstat().st_mode
+                if _is_bundle_link(child):
+                    raise ShareExportError(
+                        f"Refusing to follow {role} bundle link at {relative}"
+                    )
+                if not stat.S_ISREG(child_mode):
+                    raise ShareExportError(
+                        f"Expected {role} bundle path {relative} to be a regular file"
+                    )
+                owned_files.add(child)
+
+    return owned_files, owned_dirs
+
+
 def _copy_bundle_contents(source: Path, destination: Path) -> BundleSyncResult:
-    """Synchronise *destination* with *source* by mirroring files and pruning stale artefacts."""
+    """Refresh exporter-owned paths while preserving the hosting repository."""
 
-    source = source.resolve()
-    destination = destination.resolve()
-    destination.mkdir(parents=True, exist_ok=True)
+    source = source.expanduser().absolute()
+    destination = destination.expanduser().absolute()
+    try:
+        source_mode = source.lstat().st_mode
+    except FileNotFoundError as exc:
+        raise ShareExportError(f"Source bundle directory does not exist: {source}") from exc
+    if _is_bundle_link(source) or not stat.S_ISDIR(source_mode):
+        raise ShareExportError(
+            f"Source bundle root must be a real directory, not a link: {source}"
+        )
 
-    desired_files: set[Path] = set()
-    desired_dirs: set[Path] = {destination}
+    try:
+        destination_mode = destination.lstat().st_mode
+    except FileNotFoundError:
+        destination.mkdir(parents=True, exist_ok=False)
+    else:
+        if _is_bundle_link(destination) or not stat.S_ISDIR(destination_mode):
+            raise ShareExportError(
+                "Destination bundle root must be a real directory, not a link: "
+                f"{destination}"
+            )
 
-    for root, _, files in os.walk(source):
-        root_path = Path(root)
-        relative_root = root_path.relative_to(source)
-        dest_root = destination / relative_root
-        desired_dirs.add(dest_root)
-        for filename in files:
-            rel_file = relative_root / filename
-            desired_files.add(destination / rel_file)
-            parent = (destination / rel_file).parent
-            while parent != destination:
-                desired_dirs.add(parent)
-                parent = parent.parent
+    source_files, source_dirs = _collect_owned_bundle_paths(source, role="source")
+    existing_files, existing_dirs = _collect_owned_bundle_paths(
+        destination,
+        role="destination",
+    )
+    manifest_source = source / "manifest.json"
+    if manifest_source not in source_files:
+        raise ShareExportError("Fresh bundle is missing required manifest.json")
+    desired_files = {
+        destination / source_file.relative_to(source)
+        for source_file in source_files
+    }
+    desired_dirs = {
+        destination / source_dir.relative_to(source)
+        for source_dir in source_dirs
+    }
 
-    # Remove files that are no longer present in the source bundle.
-    existing_files = {path for path in destination.rglob("*") if path.is_file()}
+    # Validate every destination before mutating it. The existing manifest is
+    # retained until all refreshed assets have landed and stale owned files
+    # have been pruned, so readers never observe a manifest for partial data.
+    for desired_dir in sorted(desired_dirs, key=lambda path: len(path.parts)):
+        try:
+            mode = desired_dir.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if _is_bundle_link(desired_dir) or not stat.S_ISDIR(mode):
+            relative = desired_dir.relative_to(destination).as_posix()
+            raise ShareExportError(
+                f"Cannot replace non-directory destination bundle path {relative}"
+            )
+
+    for source_file in source_files:
+        relative = source_file.relative_to(source)
+        destination_file = destination / relative
+        try:
+            mode = destination_file.lstat().st_mode
+        except FileNotFoundError:
+            mode = None
+        if mode is not None and (
+            _is_bundle_link(destination_file) or not stat.S_ISREG(mode)
+        ):
+            raise ShareExportError(
+                "Cannot replace non-file destination bundle path "
+                f"{relative.as_posix()}"
+            )
+        if _is_bundle_link(source_file):
+            raise ShareExportError(
+                f"Refusing to follow source bundle link at {relative.as_posix()}"
+            )
+
+    for desired_dir in sorted(desired_dirs, key=lambda path: len(path.parts)):
+        desired_dir.mkdir(exist_ok=True)
+
+    for source_file in sorted(source_files - {manifest_source}):
+        relative = source_file.relative_to(source)
+        shutil.copy2(source_file, destination / relative)
+
     stale_files = tuple(sorted(existing_files - desired_files))
     for stale_file in stale_files:
-        # Unlink without following symlinks (we never export symlinks, but be defensive).
-        stale_file.unlink(missing_ok=True)
+        stale_file.unlink()
 
-    # Remove directories that are no longer needed (deepest first).
-    existing_dirs = {path for path in destination.rglob("*") if path.is_dir()}
     removed_dirs: list[Path] = []
-    for stale_dir in sorted(existing_dirs - desired_dirs, key=lambda p: len(p.parts), reverse=True):
+    for stale_dir in sorted(
+        existing_dirs - desired_dirs,
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
         with suppress(OSError):
             stale_dir.rmdir()
             removed_dirs.append(stale_dir)
 
-    # Copy fresh files from source (overwrite in place to handle updated content).
-    for root, _, files in os.walk(source):
-        root_path = Path(root)
-        relative_root = root_path.relative_to(source)
-        dest_root = destination / relative_root
-        dest_root.mkdir(parents=True, exist_ok=True)
-        for filename in files:
-            src_file = root_path / filename
-            dest_file = dest_root / filename
-            shutil.copy2(src_file, dest_file)
+    shutil.copy2(manifest_source, destination / "manifest.json")
 
-    return BundleSyncResult(removed_files=stale_files, removed_dirs=tuple(removed_dirs))
+    return BundleSyncResult(
+        removed_files=stale_files,
+        removed_dirs=tuple(removed_dirs),
+    )
 
 
 def _detect_project_root() -> Path:
@@ -4211,6 +4381,8 @@ def _archive_states_dir(*, create: bool) -> Path:
     archive_dir = root / ARCHIVE_DIR_NAME
     if create:
         archive_dir.mkdir(parents=True, exist_ok=True)
+        if os.name == "posix":
+            archive_dir.chmod(0o700)
     return archive_dir
 
 
@@ -4326,18 +4498,77 @@ def _ensure_unique_archive_path(base_dir: Path, base_name: str) -> Path:
     return candidate
 
 
+def _collect_archive_storage_paths(
+    source_dir: Path,
+) -> tuple[Path, tuple[Path, ...], tuple[Path, ...]]:
+    """Validate a recovery-archive tree without following links."""
+
+    source_dir = source_dir.expanduser().absolute()
+    try:
+        source_mode = source_dir.lstat().st_mode
+    except FileNotFoundError as exc:
+        raise ShareExportError(
+            f"Storage root {source_dir} does not exist; nothing to archive."
+        ) from exc
+    if _is_bundle_link(source_dir) or not stat.S_ISDIR(source_mode):
+        raise ShareExportError(
+            f"Storage root must be a real directory, not a link: {source_dir}"
+        )
+
+    directories: list[Path] = []
+    files: list[Path] = []
+    for current_root, dirnames, filenames in os.walk(
+        source_dir,
+        topdown=True,
+        followlinks=False,
+    ):
+        current_path = Path(current_root)
+        for child_name in dirnames:
+            child = current_path / child_name
+            relative = child.relative_to(source_dir).as_posix()
+            child_mode = child.lstat().st_mode
+            if _is_bundle_link(child):
+                raise ShareExportError(
+                    f"Recovery archive refuses storage link at {relative}"
+                )
+            if not stat.S_ISDIR(child_mode):
+                raise ShareExportError(
+                    f"Recovery archive expected a directory at {relative}"
+                )
+            directories.append(child)
+        for child_name in filenames:
+            child = current_path / child_name
+            relative = child.relative_to(source_dir).as_posix()
+            child_mode = child.lstat().st_mode
+            if _is_bundle_link(child):
+                raise ShareExportError(
+                    f"Recovery archive refuses storage link at {relative}"
+                )
+            if not stat.S_ISREG(child_mode):
+                raise ShareExportError(
+                    f"Recovery archive expected a regular file at {relative}"
+                )
+            files.append(child)
+
+    return source_dir, tuple(sorted(directories)), tuple(sorted(files))
+
+
 def _write_directory_to_zip(zip_file: ZipFile, source_dir: Path, arc_prefix: Path) -> None:
-    source_dir = source_dir.resolve()
-    if not source_dir.exists():
-        raise ShareExportError(f"Storage root {source_dir} does not exist; nothing to archive.")
+    source_dir, directories, files = _collect_archive_storage_paths(source_dir)
     prefix = arc_prefix.as_posix().rstrip("/") + "/"
     zip_file.writestr(prefix, b"")
-    for path in source_dir.rglob("*"):
+    for path in directories:
         arcname = (arc_prefix / path.relative_to(source_dir)).as_posix()
-        if path.is_dir():
-            zip_file.writestr(arcname.rstrip("/") + "/", b"")
-        else:
-            zip_file.write(path, arcname=arcname)
+        zip_file.writestr(arcname.rstrip("/") + "/", b"")
+    for path in files:
+        relative = path.relative_to(source_dir).as_posix()
+        path_mode = path.lstat().st_mode
+        if _is_bundle_link(path) or not stat.S_ISREG(path_mode):
+            raise ShareExportError(
+                f"Recovery archive storage path changed during packaging: {relative}"
+            )
+        arcname = (arc_prefix / path.relative_to(source_dir)).as_posix()
+        zip_file.write(path, arcname=arcname)
 
 
 def _load_archive_metadata(zip_path: Path) -> tuple[dict[str, Any], str | None]:
@@ -4488,12 +4719,15 @@ def _create_mailbox_archive(
     status_ctx = console.status(status_message) if status_message else nullcontext()
     with status_ctx, tempfile.TemporaryDirectory(prefix="mailbox-archive-") as temp_dir_str:
         temp_dir = Path(temp_dir_str)
+        if os.name == "posix":
+            temp_dir.chmod(0o700)
         snapshot_path = temp_dir / ARCHIVE_SNAPSHOT_RELATIVE.name
         context = create_snapshot_context(
             source_database=database_path,
             snapshot_path=snapshot_path,
             project_filters=project_filters,
             scrub_preset=scrub_preset,
+            purpose="recovery_archive",
         )
         metadata: dict[str, Any] = {
             "version": 1,
@@ -4532,6 +4766,13 @@ def _create_mailbox_archive(
             ],
         }
         temp_zip_path = temp_dir / "mailbox-state.zip"
+        if os.name == "posix":
+            descriptor = os.open(
+                temp_zip_path,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+            os.close(descriptor)
         with ZipFile(temp_zip_path, "w", compression=ZIP_DEFLATED, compresslevel=9) as archive:
             archive.writestr(
                 ARCHIVE_METADATA_FILENAME,
@@ -4539,8 +4780,12 @@ def _create_mailbox_archive(
             )
             archive.write(snapshot_path, arcname=ARCHIVE_SNAPSHOT_RELATIVE.as_posix())
             _write_directory_to_zip(archive, storage_root, ARCHIVE_STORAGE_DIRNAME)
+        if os.name == "posix":
+            temp_zip_path.chmod(0o600)
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(temp_zip_path), str(destination))
+        if os.name == "posix":
+            destination.chmod(0o600)
     return destination, metadata
 
 
@@ -4549,39 +4794,15 @@ def _create_mailbox_archive(
     help="Create a lossless ZIP that captures the SQLite snapshot and storage repo (default preset keeps ack/read state).",
 )
 def archive_save_state(
-    projects: Annotated[
-        list[str] | None,
-        typer.Option(
-            "--project",
-            "-p",
-            help="Limit archive to specific project slugs or human keys (pass multiple times to include several).",
-        ),
-    ] = None,
-    scrub_preset: Annotated[
-        str,
-        typer.Option(
-            "--scrub-preset",
-            help="Scrub preset (archive keeps everything; standard/strict scrub secrets).",
-            case_sensitive=False,
-            show_default=True,
-        ),
-    ] = DEFAULT_ARCHIVE_SCRUB_PRESET,
     label: Annotated[
         Optional[str],
         typer.Option("--label", "-l", help="Optional label appended to the archive filename (e.g., nightly, pre-reset)."),
     ] = None,
 ) -> None:
-    project_filters: Sequence[str] = tuple(projects or ())
-    preset = (scrub_preset or "standard").strip().lower()
-    if preset not in SCRUB_PRESETS:
-        console.print(
-            f"[red]Invalid scrub preset '{scrub_preset}'. Choose one of: {', '.join(SCRUB_PRESETS)}.[/]"
-        )
-        raise typer.Exit(code=1)
     try:
         archive_path, metadata = _create_mailbox_archive(
-            project_filters=project_filters,
-            scrub_preset=preset,
+            project_filters=(),
+            scrub_preset=DEFAULT_ARCHIVE_SCRUB_PRESET,
             label=label,
             status_message="Creating mailbox archive...",
         )
@@ -4592,7 +4813,7 @@ def archive_save_state(
     projects_desc = metadata.get("projects_requested") or ["all"]
     console.print(f"[green]✓ Mailbox state saved to:[/] {archive_path}")
     console.print(
-        f"[dim]Preset:[/] {metadata.get('scrub_preset', preset)} | [dim]Projects:[/] {', '.join(projects_desc)} | [dim]Size:[/] {_format_bytes(size_bytes)}"
+        f"[dim]Preset:[/] {metadata.get('scrub_preset', DEFAULT_ARCHIVE_SCRUB_PRESET)} | [dim]Projects:[/] {', '.join(projects_desc)} | [dim]Size:[/] {_format_bytes(size_bytes)}"
     )
     console.print(f"[dim]Restore later with:[/] mcp-agent-mail archive restore {archive_path.name}")
 
@@ -4978,90 +5199,15 @@ def hard_delete_agent(
         if agent_id is None:
             raise ValueError("Agent must have an id before hard delete")
         project_id = proj.id
-        deleted_counts: dict[str, int] = {}
 
         # Phase 1: Database cleanup in a single transaction
-        async with get_session() as session:
-            # Delete message_recipients where this agent is a recipient
-            recipient_rows = await session.execute(
-                select(MessageRecipient).where(cast(Any, MessageRecipient.agent_id) == agent_id)
+        async with get_immediate_session() as session:
+            deleted_counts = await _hard_delete_agent_database_rows(
+                session,
+                project_id=cast(int, project_id),
+                agent_id=agent_id,
+                agent_name=agent_name,
             )
-            recipient_records = recipient_rows.scalars().all()
-            deleted_counts["message_recipients"] = len(recipient_records)
-            for rec in recipient_records:
-                await session.delete(rec)
-
-            # Find and delete messages sent by this agent
-            sent_msg_rows = await session.execute(
-                select(Message).where(
-                    cast(Any, Message.project_id) == project_id,
-                    cast(Any, Message.sender_id) == agent_id,
-                )
-            )
-            sent_messages = sent_msg_rows.scalars().all()
-            sent_message_ids = [m.id for m in sent_messages]
-
-            # Delete recipient records for sent messages
-            if sent_message_ids:
-                sent_recipient_rows = await session.execute(
-                    select(MessageRecipient).where(
-                        cast(Any, MessageRecipient.message_id).in_(sent_message_ids)
-                    )
-                )
-                sent_recipient_records = sent_recipient_rows.scalars().all()
-                deleted_counts["sent_message_recipients"] = len(sent_recipient_records)
-                for rec in sent_recipient_records:
-                    await session.delete(rec)
-
-            # Delete messages (FTS cleanup by DB trigger)
-            deleted_counts["messages_sent"] = len(sent_messages)
-            for msg in sent_messages:
-                await session.delete(msg)
-
-            # Delete file reservations
-            fr_rows = await session.execute(
-                select(FileReservation).where(
-                    cast(Any, FileReservation.project_id) == project_id,
-                    cast(Any, FileReservation.agent_id) == agent_id,
-                )
-            )
-            file_reservations = fr_rows.scalars().all()
-            deleted_counts["file_reservations"] = len(file_reservations)
-            for fr in file_reservations:
-                await session.delete(fr)
-
-            # Delete agent links (both directions)
-            link_rows = await session.execute(
-                select(AgentLink).where(
-                    or_(
-                        cast(Any, AgentLink.a_agent_id) == agent_id,
-                        cast(Any, AgentLink.b_agent_id) == agent_id,
-                    )
-                )
-            )
-            agent_links = link_rows.scalars().all()
-            deleted_counts["agent_links"] = len(agent_links)
-            for link in agent_links:
-                await session.delete(link)
-
-            # Delete window identities
-            wi_rows = await session.execute(
-                select(WindowIdentity).where(
-                    cast(Any, WindowIdentity.project_id) == project_id,
-                    cast(Any, WindowIdentity.display_name) == agent_name,
-                )
-            )
-            window_identities = wi_rows.scalars().all()
-            deleted_counts["window_identities"] = len(window_identities)
-            for wi in window_identities:
-                await session.delete(wi)
-
-            # Delete the agent record itself
-            db_agent = await session.get(Agent, agent_id)
-            if db_agent:
-                await session.delete(db_agent)
-                deleted_counts["agent"] = 1
-
             await session.commit()
 
         # Phase 2: Filesystem cleanup (best-effort)
@@ -5186,150 +5332,12 @@ def hard_delete_project(
             ):
                 raise ValueError("Invalid registration_token — must match a registered agent in the project")
 
-        deleted_counts: dict[str, int] = {}
-
         # Phase 1: Database cleanup in a single transaction
         async with get_immediate_session() as session:
-            delivery_history = (
-                await session.execute(
-                    select(MessageDelivery.id)
-                    .where(
-                        _sa_or(
-                            cast(
-                                ColumnElement[bool],
-                                MessageDelivery.project_id == project_id,
-                            ),
-                            cast(
-                                ColumnElement[bool],
-                                MessageDelivery.sender_project_id_snapshot == project_id,
-                            ),
-                            and_(
-                                cast(
-                                    ColumnElement[bool],
-                                    MessageDelivery.actor_kind == "agent",
-                                ),
-                                cast(
-                                    ColumnElement[bool],
-                                    MessageDelivery.actor_project_id_snapshot == project_id,
-                                ),
-                            ),
-                        )
-                    )
-                    .limit(1)
-                )
-            ).first()
-            if delivery_history is not None:
-                raise ValueError(
-                    "Project has immutable message delivery history and cannot be hard-deleted"
-                )
-
-            # Collect all agent IDs
-            agent_rows = await session.execute(
-                select(Agent).where(cast(Any, Agent.project_id) == project_id)
+            deleted_counts = await _hard_delete_project_database_rows(
+                session,
+                project_id=cast(int, project_id),
             )
-            agents = agent_rows.scalars().all()
-            agent_ids = [a.id for a in agents]
-            deleted_counts["agents"] = len(agents)
-
-            # Collect all message IDs
-            msg_rows = await session.execute(
-                select(Message).where(cast(Any, Message.project_id) == project_id)
-            )
-            messages = msg_rows.scalars().all()
-            message_ids = [m.id for m in messages]
-            deleted_counts["messages"] = len(messages)
-
-            # Delete message recipients
-            if message_ids:
-                mr_rows = await session.execute(
-                    select(MessageRecipient).where(
-                        cast(Any, MessageRecipient.message_id).in_(message_ids)
-                    )
-                )
-                mrs = mr_rows.scalars().all()
-                deleted_counts["message_recipients"] = len(mrs)
-                for mr in mrs:
-                    await session.delete(mr)
-
-            # Delete messages (FTS cleanup by DB trigger)
-            for msg in messages:
-                await session.delete(msg)
-
-            # Delete file reservations
-            fr_rows = await session.execute(
-                select(FileReservation).where(cast(Any, FileReservation.project_id) == project_id)
-            )
-            frs = fr_rows.scalars().all()
-            deleted_counts["file_reservations"] = len(frs)
-            for fr in frs:
-                await session.delete(fr)
-
-            # Delete agent links
-            if agent_ids:
-                link_rows = await session.execute(
-                    select(AgentLink).where(
-                        or_(
-                            cast(Any, AgentLink.a_agent_id).in_(agent_ids),
-                            cast(Any, AgentLink.b_agent_id).in_(agent_ids),
-                        )
-                    )
-                )
-                links = link_rows.scalars().all()
-                deleted_counts["agent_links"] = len(links)
-                for link in links:
-                    await session.delete(link)
-
-            # Delete window identities
-            wi_rows = await session.execute(
-                select(WindowIdentity).where(cast(Any, WindowIdentity.project_id) == project_id)
-            )
-            wis = wi_rows.scalars().all()
-            deleted_counts["window_identities"] = len(wis)
-            for wi in wis:
-                await session.delete(wi)
-
-            # Delete message summaries
-            ms_rows = await session.execute(
-                select(MessageSummary).where(cast(Any, MessageSummary.project_id) == project_id)
-            )
-            summaries = ms_rows.scalars().all()
-            deleted_counts["message_summaries"] = len(summaries)
-            for ms in summaries:
-                await session.delete(ms)
-
-            # Delete sibling suggestions
-            ss_rows = await session.execute(
-                select(ProjectSiblingSuggestion).where(
-                    or_(
-                        cast(Any, ProjectSiblingSuggestion.project_a_id) == project_id,
-                        cast(Any, ProjectSiblingSuggestion.project_b_id) == project_id,
-                    )
-                )
-            )
-            suggestions = ss_rows.scalars().all()
-            deleted_counts["sibling_suggestions"] = len(suggestions)
-            for ss in suggestions:
-                await session.delete(ss)
-
-            # Delete product-project links
-            ppl_rows = await session.execute(
-                select(ProductProjectLink).where(cast(Any, ProductProjectLink.project_id) == project_id)
-            )
-            ppls = ppl_rows.scalars().all()
-            deleted_counts["product_links"] = len(ppls)
-            for ppl in ppls:
-                await session.delete(ppl)
-
-            # Delete all agents
-            for agent in agents:
-                await session.delete(agent)
-
-            # Delete the project itself
-            db_project = await session.get(Project, project_id)
-            if db_project:
-                await session.delete(db_project)
-                deleted_counts["project"] = 1
-
             await session.commit()
 
         # Phase 2: Filesystem cleanup (best-effort)

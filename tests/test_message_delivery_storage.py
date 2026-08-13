@@ -25,6 +25,7 @@ from mcp_agent_mail.storage import (
     _commit_lock_path,
     _commit_message_delivery_sync,
     _fsync_message_delivery_directory_sync,
+    _fsync_readonly_file_sync,
     _is_ephemeral_archive_path,
     _publish_message_delivery_sync,
     _write_message_delivery_attempt_sync,
@@ -484,6 +485,54 @@ def test_windows_directory_boundary_is_explicit_best_effort_without_native_flush
         lambda *args, **kwargs: pytest.fail("Windows must not fake POSIX directory fsync"),
     )
     _fsync_message_delivery_directory_sync(tmp_path)
+
+
+def test_windows_readonly_file_boundary_skips_unsupported_crt_fsync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mcp_agent_mail import storage as storage_module
+
+    existing_file = tmp_path / "existing"
+    existing_file.write_bytes(b"already durable")
+    monkeypatch.setattr(storage_module.os, "name", "nt")
+    monkeypatch.setattr(
+        storage_module.os,
+        "open",
+        lambda *args, **kwargs: pytest.fail(
+            "Windows must not fsync an O_RDONLY CRT descriptor"
+        ),
+    )
+
+    _fsync_readonly_file_sync(existing_file)
+
+
+def test_posix_readonly_file_boundary_flushes_and_closes_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mcp_agent_mail import storage as storage_module
+
+    existing_file = tmp_path / "existing"
+    existing_file.write_bytes(b"already durable")
+    opened: list[tuple[Path, int]] = []
+    flushed: list[int] = []
+    closed: list[int] = []
+
+    monkeypatch.setattr(storage_module.os, "name", "posix")
+    monkeypatch.setattr(
+        storage_module.os,
+        "open",
+        lambda path, flags: opened.append((Path(path), flags)) or 47,
+    )
+    monkeypatch.setattr(storage_module.os, "fsync", flushed.append)
+    monkeypatch.setattr(storage_module.os, "close", closed.append)
+
+    _fsync_readonly_file_sync(existing_file)
+
+    assert opened == [(existing_file, os.O_RDONLY | getattr(os, "O_BINARY", 0))]
+    assert flushed == [47]
+    assert closed == [47]
 
 
 @pytest.mark.asyncio

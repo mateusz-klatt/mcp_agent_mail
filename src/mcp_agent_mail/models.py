@@ -5,11 +5,119 @@ from __future__ import annotations
 import secrets
 import uuid
 from datetime import datetime, timezone
+from enum import StrEnum
 from typing import Any, Optional
 
 from sqlalchemy import CheckConstraint, Column, Index, Integer, String, UniqueConstraint, text
 from sqlalchemy.types import JSON
 from sqlmodel import Field, SQLModel
+
+
+class MailUiLocale(StrEnum):
+    """Canonical closed set of human interface and correspondence locales."""
+
+    AR = "ar"
+    BN = "bn"
+    BS = "bs"
+    CS = "cs"
+    DA = "da"
+    DE = "de"
+    EL = "el"
+    EN = "en"
+    ES = "es"
+    FA = "fa"
+    FI = "fi"
+    FIL = "fil"
+    FR = "fr"
+    GA = "ga"
+    HE = "he"
+    HI = "hi"
+    HR = "hr"
+    HU = "hu"
+    HY = "hy"
+    ID = "id"
+    IS = "is"
+    IT = "it"
+    JA = "ja"
+    KO = "ko"
+    LT = "lt"
+    LV = "lv"
+    MS = "ms"
+    MY_MM = "my-MM"
+    NL = "nl"
+    NO = "no"
+    PL = "pl"
+    PT = "pt"
+    RO = "ro"
+    RU = "ru"
+    SK = "sk"
+    SQ = "sq"
+    SR = "sr"
+    SV = "sv"
+    SW = "sw"
+    TH = "th"
+    TR = "tr"
+    UK = "uk"
+    VI = "vi"
+    ZH_HANT = "zh-Hant"
+    ZH = "zh"
+
+    @classmethod
+    def canonicalize(cls, value: str) -> "MailUiLocale | None":
+        """Map case-insensitive human input back to its canonical BCP-47 tag."""
+        folded = value.strip().casefold()
+        return next((locale for locale in cls if locale.value.casefold() == folded), None)
+
+
+MAIL_UI_LOCALE_VALUES = tuple(locale.value for locale in MailUiLocale)
+_MAIL_UI_LOCALE_SQL = ", ".join(repr(value) for value in MAIL_UI_LOCALE_VALUES)
+MAIL_UI_LOCALE_ENGLISH_NAMES: dict[MailUiLocale, str] = {
+    MailUiLocale.AR: "Arabic",
+    MailUiLocale.BN: "Bengali",
+    MailUiLocale.BS: "Bosnian",
+    MailUiLocale.CS: "Czech",
+    MailUiLocale.DA: "Danish",
+    MailUiLocale.DE: "German",
+    MailUiLocale.EL: "Greek",
+    MailUiLocale.EN: "English",
+    MailUiLocale.ES: "Spanish",
+    MailUiLocale.FA: "Persian",
+    MailUiLocale.FI: "Finnish",
+    MailUiLocale.FIL: "Filipino",
+    MailUiLocale.FR: "French",
+    MailUiLocale.GA: "Irish",
+    MailUiLocale.HE: "Hebrew",
+    MailUiLocale.HI: "Hindi",
+    MailUiLocale.HR: "Croatian",
+    MailUiLocale.HU: "Hungarian",
+    MailUiLocale.HY: "Armenian",
+    MailUiLocale.ID: "Indonesian",
+    MailUiLocale.IS: "Icelandic",
+    MailUiLocale.IT: "Italian",
+    MailUiLocale.JA: "Japanese",
+    MailUiLocale.KO: "Korean",
+    MailUiLocale.LT: "Lithuanian",
+    MailUiLocale.LV: "Latvian",
+    MailUiLocale.MS: "Malay",
+    MailUiLocale.MY_MM: "Burmese",
+    MailUiLocale.NL: "Dutch",
+    MailUiLocale.NO: "Norwegian",
+    MailUiLocale.PL: "Polish",
+    MailUiLocale.PT: "Portuguese",
+    MailUiLocale.RO: "Romanian",
+    MailUiLocale.RU: "Russian",
+    MailUiLocale.SK: "Slovak",
+    MailUiLocale.SQ: "Albanian",
+    MailUiLocale.SR: "Serbian",
+    MailUiLocale.SV: "Swedish",
+    MailUiLocale.SW: "Swahili",
+    MailUiLocale.TH: "Thai",
+    MailUiLocale.TR: "Turkish",
+    MailUiLocale.UK: "Ukrainian",
+    MailUiLocale.VI: "Vietnamese",
+    MailUiLocale.ZH_HANT: "Traditional Chinese",
+    MailUiLocale.ZH: "Simplified Chinese",
+}
 
 
 def _utcnow_naive() -> datetime:
@@ -571,12 +679,12 @@ class UiUser(SQLModel, table=True):
             name="ck_ui_users_profile_revision",
         ),
         CheckConstraint(
-            "preferred_ui_locale IN ('en', 'pl')",
+            f"preferred_ui_locale IN ({_MAIL_UI_LOCALE_SQL})",
             name="ck_ui_users_preferred_ui_locale",
         ),
         CheckConstraint(
             "preferred_correspondence_locale IS NULL "
-            "OR preferred_correspondence_locale IN ('en', 'pl')",
+            f"OR preferred_correspondence_locale IN ({_MAIL_UI_LOCALE_SQL})",
             name="ck_ui_users_preferred_correspondence_locale",
         ),
     )
@@ -598,11 +706,11 @@ class UiUser(SQLModel, table=True):
     )
     preferred_ui_locale: str = Field(
         default="en",
-        sa_column=Column(String(2), nullable=False, server_default="en"),
+        sa_column=Column(String(16), nullable=False, server_default="en"),
     )
     preferred_correspondence_locale: Optional[str] = Field(
         default=None,
-        sa_column=Column(String(2), nullable=True),
+        sa_column=Column(String(16), nullable=True),
     )
     created_ts: datetime = Field(default_factory=_utcnow_naive)
     last_login_ts: Optional[datetime] = Field(default=None)

@@ -4,31 +4,53 @@
    projects and agent names to anyone who can reach the login page. A login form
    should disclose nothing about what it guards. #}
 <!doctype html>
-<html lang="en">
+<html lang="{{ login_locale }}" dir="{{ login_direction }}">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="robots" content="noindex, nofollow" />
-    <link rel="icon" href="/favicon.ico" type="image/svg+xml" sizes="any" />
-    <title>Sign in · Agent Mail</title>
-    <script>
-      (function () {
-        try {
-          const stored = localStorage.getItem('darkMode');
-          const prefers = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-          if (stored === 'true' || (stored === null && prefers)) {
-            document.documentElement.classList.add('dark');
-          }
-        } catch (error) { /* styling only; never block the form */ }
-      })();
-    </script>
+    <link rel="icon" href="/favicon.ico?v=iris" type="image/svg+xml" sizes="any" />
+    <title>{{ login_text.sign_in }} · Iris</title>
     <link rel="stylesheet" href="/mail/assets/legacy.css" />
   </head>
   <body class="bg-slate-100 dark:bg-slate-900 min-h-screen flex items-center justify-center p-4">
     <main class="w-full max-w-sm">
       <div class="bg-white dark:bg-slate-800 rounded-2xl shadow-xl p-8">
-        <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-1">Agent Mail</h1>
-        <p class="text-sm text-slate-500 dark:text-slate-400 mb-6">Sign in to view the mailbox.</p>
+        <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-1"><span aria-hidden="true">🌈</span> Iris</h1>
+        <p class="text-sm text-slate-500 dark:text-slate-400 mb-5">{{ login_text.hint }}</p>
+
+        <details class="mb-5">
+          <summary
+            class="min-h-[44px] cursor-pointer rounded-lg border border-slate-300 dark:border-slate-600
+                   bg-white dark:bg-slate-900 px-3 py-2 text-sm text-slate-700 dark:text-slate-200
+                   flex items-center gap-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            aria-label="{{ login_text.language }}"
+          >
+            <span aria-hidden="true" class="text-xl">{{ login_locale_presentation.flag }}</span>
+            <span>{{ login_text.language }}: {{ login_locale_presentation.native_name }}</span>
+          </summary>
+          <nav
+            aria-label="{{ login_text.language }}"
+            class="mt-2 max-h-72 overflow-y-auto rounded-lg border border-slate-200 dark:border-slate-700
+                   bg-slate-50 dark:bg-slate-950 p-2 grid grid-cols-2 gap-2"
+          >
+            {% for option in login_locale_options %}
+            <a
+              href="{{ option.href }}"
+              hreflang="{{ option.code }}"
+              lang="{{ option.code }}"
+              dir="{{ option.direction }}"
+              {% if option.is_current %}aria-current="true"{% endif %}
+              class="min-h-[44px] rounded-md px-2 py-2 text-sm flex items-center gap-2
+                     {% if option.is_current %}bg-indigo-100 dark:bg-indigo-950 font-semibold{% else %}hover:bg-slate-200 dark:hover:bg-slate-800{% endif %}
+                     text-slate-700 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            >
+              <span aria-hidden="true" class="text-lg">{{ option.flag }}</span>
+              <span>{{ option.native_name }}</span>
+            </a>
+            {% endfor %}
+          </nav>
+        </details>
 
         {% if error %}
         <div role="alert"
@@ -43,40 +65,41 @@
              The server re-validates it as a same-site relative path — never
              trust it here. #}
           <input type="hidden" name="next" value="{{ next_url }}" />
+          <input type="hidden" name="lang" value="{{ login_locale }}" />
 
           <div>
             <label for="username" class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">
-              Username
+              {{ login_text.username }}
             </label>
             <input id="username" name="username" type="text" required autofocus
                    autocomplete="username" autocapitalize="none" spellcheck="false"
-                   class="w-full rounded-lg border border-slate-300 dark:border-slate-600
+                   class="w-full min-h-[44px] rounded-lg border border-slate-300 dark:border-slate-600
                           bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100
                           px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500" />
           </div>
 
           <div>
             <label for="password" class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">
-              Password
+              {{ login_text.password }}
             </label>
             <input id="password" name="password" type="password" required
                    autocomplete="current-password"
-                   class="w-full rounded-lg border border-slate-300 dark:border-slate-600
+                   class="w-full min-h-[44px] rounded-lg border border-slate-300 dark:border-slate-600
                           bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100
                           px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500" />
           </div>
 
           <button type="submit"
-                  class="w-full rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white font-semibold
+                  class="w-full min-h-[44px] rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white font-semibold
                          px-4 py-2 transition-colors">
-            Sign in
+            {{ login_text.sign_in }}
           </button>
         </form>
       </div>
 
       <p class="text-center text-xs text-slate-400 dark:text-slate-500 mt-4">
-        Accounts are created from the server:
-        <code class="font-mono">mcp-agent-mail ui-users add &lt;name&gt;</code>
+        {{ login_text.accounts }}
+        <code dir="ltr" class="font-mono">mcp-agent-mail ui-users add &lt;name&gt;</code>
       </p>
     </main>
   </body>

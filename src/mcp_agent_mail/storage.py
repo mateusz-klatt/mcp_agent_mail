@@ -1797,6 +1797,30 @@ async def _open_repo_cancellation_safe(factory: Any, *args: Any) -> Repo:
 _ARCHIVE_ATTRIBUTES_BYTES = b"*.json text\n*.md text\n"
 
 
+def _fsync_readonly_file_sync(path: Path) -> None:
+    """Flush an existing file where the platform supports read-only fsync.
+
+    On native Windows, :func:`os.fsync` delegates to the CRT ``_commit`` and
+    rejects an ``O_RDONLY`` descriptor with ``EBADF``.  Reopening with write
+    access is not equivalent: Git legitimately marks pack and index files
+    read-only, so a whole-tree durability pass would then fail with
+    ``EACCES``.  Files created by this publisher are already fsynced through
+    their write-capable descriptors; the additional read-only reflush is
+    therefore an explicit best-effort boundary on Windows, matching directory
+    entry flushing below.
+    """
+    if os.name == "nt":
+        return
+    file_descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_BINARY", 0),
+    )
+    try:
+        os.fsync(file_descriptor)
+    finally:
+        os.close(file_descriptor)
+
+
 def _ensure_archive_attributes_durable_sync(attributes_path: Path) -> None:
     """Create the initial attributes file exactly once and persist its entry."""
     if attributes_path.exists() or attributes_path.is_symlink():
@@ -1808,11 +1832,7 @@ def _ensure_archive_attributes_durable_sync(attributes_path: Path) -> None:
             raise RuntimeError(
                 "Archive initialization found a noncanonical .gitattributes file"
             )
-        file_descriptor = os.open(attributes_path, os.O_RDONLY)
-        try:
-            os.fsync(file_descriptor)
-        finally:
-            os.close(file_descriptor)
+        _fsync_readonly_file_sync(attributes_path)
         return
 
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
@@ -1850,14 +1870,7 @@ def _fsync_archive_initialization_tree_sync(root: Path) -> None:
             path = directory / filename
             if path.is_symlink() or not path.is_file():
                 continue
-            file_descriptor = os.open(
-                path,
-                os.O_RDONLY | getattr(os, "O_BINARY", 0),
-            )
-            try:
-                os.fsync(file_descriptor)
-            finally:
-                os.close(file_descriptor)
+            _fsync_readonly_file_sync(path)
     for directory in reversed(directories):
         _fsync_message_delivery_directory_sync(directory)
     _fsync_message_delivery_directory_sync(root.parent)
@@ -3158,11 +3171,7 @@ def _publish_message_delivery_link_sync(
 
     # Flush the published inode again through its canonical name, then persist
     # the directory entry on platforms with directory-fsync support.
-    final_fd = os.open(final_path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
-    try:
-        os.fsync(final_fd)
-    finally:
-        os.close(final_fd)
+    _fsync_readonly_file_sync(final_path)
     _fsync_message_delivery_directory_sync(delivery_dir)
     _read_exact_message_delivery_file(
         delivery_id,

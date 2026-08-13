@@ -249,6 +249,130 @@ def _build_multi_project_snapshot(tmp_path: Path) -> Path:
     return snapshot
 
 
+def _build_private_runtime_snapshot(tmp_path: Path) -> Path:
+    snapshot = tmp_path / "private-runtime.sqlite3"
+    conn = sqlite3.connect(snapshot)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT,
+                human_key TEXT,
+                project_generation TEXT
+            );
+            CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER,
+                name TEXT,
+                registration_token TEXT,
+                agent_generation TEXT,
+                task_description TEXT
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER,
+                sender_id INTEGER,
+                thread_id TEXT,
+                subject TEXT,
+                body_md TEXT,
+                importance TEXT,
+                ack_required INTEGER,
+                created_ts TEXT,
+                attachments TEXT,
+                delivery_id TEXT
+            );
+            CREATE TABLE message_recipients (
+                message_id INTEGER,
+                agent_id INTEGER,
+                kind TEXT,
+                read_ts TEXT,
+                ack_ts TEXT
+            );
+            CREATE TABLE ui_users (
+                id INTEGER PRIMARY KEY,
+                username TEXT,
+                password_hash TEXT,
+                session_generation TEXT
+            );
+            CREATE TABLE message_deliveries (
+                id TEXT PRIMARY KEY,
+                body_md TEXT,
+                archive_document TEXT,
+                attachments TEXT,
+                idempotency_key TEXT,
+                last_error TEXT
+            );
+            CREATE TABLE future_secret_table (secret_value TEXT);
+            """
+        )
+        conn.executemany(
+            "INSERT INTO projects (id, slug, human_key, project_generation) VALUES (?, ?, ?, ?)",
+            [
+                (1, "alpha", "/private/PRIVATE_ALPHA_PATH_CANARY", "a" * 64),
+                (2, "beta", "/private/PRIVATE_BETA_PATH_CANARY", "b" * 64),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO agents (
+                id, project_id, name, registration_token, agent_generation, task_description
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    1,
+                    1,
+                    "ExternalSender",
+                    "AGENT_TOKEN_CANARY",
+                    "c" * 64,
+                    "PRIVATE_TASK_CANARY",
+                ),
+                (2, 2, "BetaRecipient", "SECOND_TOKEN_CANARY", "d" * 64, "Safe task"),
+            ],
+        )
+        conn.execute(
+            """
+            INSERT INTO messages (
+                id, project_id, sender_id, thread_id, subject, body_md,
+                importance, ack_required, created_ts, attachments, delivery_id
+            ) VALUES (10, 2, 1, ?, 'Viewer subject', 'Viewer body',
+                      'normal', 1, '2026-08-13T00:00:00Z', '[]', 'delivery-private')
+            """,
+            ("thread-sk-" + "Z" * 24,),
+        )
+        conn.execute(
+            """
+            INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+            VALUES (10, 2, 'to', 'PRIVATE_READ_CANARY', 'PRIVATE_ACK_CANARY')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO ui_users (id, username, password_hash, session_generation)
+            VALUES (1, 'operator', 'PASSWORD_HASH_CANARY', 'SESSION_GENERATION_CANARY')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO message_deliveries (
+                id, body_md, archive_document, attachments, idempotency_key, last_error
+            ) VALUES (
+                'delivery-private', 'DELIVERY_BODY_CANARY', 'ARCHIVE_DOCUMENT_CANARY',
+                '[{"secret":"DELIVERY_ATTACHMENT_CANARY"}]',
+                'IDEMPOTENCY_CANARY', 'DELIVERY_ERROR_CANARY'
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO future_secret_table (secret_value) VALUES ('FUTURE_SCHEMA_CANARY')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return snapshot
+
+
 def _read_message(snapshot: Path) -> tuple[str, str, list[dict[str, object]]]:
     conn = sqlite3.connect(snapshot)
     try:
@@ -281,6 +405,268 @@ def test_apply_project_scope_dedup_and_removes(tmp_path: Path) -> None:
         assert conn.execute("SELECT COUNT(*) FROM project_sibling_suggestions").fetchone()[0] == 0
     finally:
         conn.close()
+
+
+def test_viewer_snapshot_is_a_fresh_allowlist_without_private_runtime_data(
+    tmp_path: Path,
+) -> None:
+    source = _build_private_runtime_snapshot(tmp_path)
+    snapshot = tmp_path / "public-viewer.sqlite3"
+
+    context = share.create_snapshot_context(
+        source_database=source,
+        snapshot_path=snapshot,
+        project_filters=["beta"],
+        scrub_preset="standard",
+        purpose="viewer_export",
+    )
+
+    assert [(project.slug, project.human_key) for project in context.scope.projects] == [
+        ("beta", "beta")
+    ]
+    assert context.scope.removed_count == 1
+
+    conn = sqlite3.connect(snapshot)
+    try:
+        table_names = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        assert "ui_users" not in table_names
+        assert "message_deliveries" not in table_names
+        assert "future_secret_table" not in table_names
+        assert {
+            "projects",
+            "agents",
+            "messages",
+            "message_recipients",
+            "message_overview_mv",
+            "attachments_by_message_mv",
+        }.issubset(table_names)
+        assert {
+            row[1] for row in conn.execute("PRAGMA table_info(projects)").fetchall()
+        } == {"id", "slug", "human_key"}
+        assert {
+            row[1] for row in conn.execute("PRAGMA table_info(agents)").fetchall()
+        } == {"id", "project_id", "name", "origin_project_slug"}
+        assert conn.execute(
+            "SELECT slug, human_key FROM projects"
+        ).fetchall() == [("beta", "beta")]
+        assert conn.execute(
+            "SELECT id, project_id, name, origin_project_slug FROM agents ORDER BY id"
+        ).fetchall() == [
+            (1, None, "ExternalSender", "alpha"),
+            (2, 2, "BetaRecipient", None),
+        ]
+        assert conn.execute(
+            "SELECT sender_id, subject, body_md FROM messages"
+        ).fetchall() == [(1, "Viewer subject", "Viewer body")]
+        assert conn.execute(
+            "SELECT message_id, agent_id FROM message_recipients"
+        ).fetchall() == [(10, 2)]
+        assert conn.execute(
+            """
+            SELECT sender_display, sender_project_slug, sender_project_name, sender_address
+            FROM message_overview_mv
+            """
+        ).fetchall() == [
+            (
+                "ExternalSender@alpha",
+                "alpha",
+                "alpha",
+                "project:alpha#ExternalSender",
+            )
+        ]
+    finally:
+        conn.close()
+
+    snapshot_bytes = snapshot.read_bytes()
+    for canary in (
+        b"PRIVATE_ALPHA_PATH_CANARY",
+        b"PRIVATE_BETA_PATH_CANARY",
+        b"AGENT_TOKEN_CANARY",
+        b"SECOND_TOKEN_CANARY",
+        b"PRIVATE_TASK_CANARY",
+        b"PRIVATE_READ_CANARY",
+        b"PRIVATE_ACK_CANARY",
+        b"PASSWORD_HASH_CANARY",
+        b"SESSION_GENERATION_CANARY",
+        b"DELIVERY_BODY_CANARY",
+        b"ARCHIVE_DOCUMENT_CANARY",
+        b"DELIVERY_ATTACHMENT_CANARY",
+        b"IDEMPOTENCY_CANARY",
+        b"DELIVERY_ERROR_CANARY",
+        b"FUTURE_SCHEMA_CANARY",
+        b"sk-" + b"Z" * 24,
+    ):
+        assert canary not in snapshot_bytes
+
+
+def test_recovery_snapshot_is_explicit_lossless_and_unfiltered(tmp_path: Path) -> None:
+    source = _build_private_runtime_snapshot(tmp_path)
+    snapshot = tmp_path / "private-recovery.sqlite3"
+    source_conn = sqlite3.connect(source)
+    try:
+        source_schema = source_conn.execute(
+            """
+            SELECT type, name, tbl_name, sql
+            FROM sqlite_master
+            WHERE name NOT LIKE 'sqlite_%'
+            ORDER BY type, name
+            """
+        ).fetchall()
+        source_dump = list(source_conn.iterdump())
+    finally:
+        source_conn.close()
+
+    context = share.create_snapshot_context(
+        source_database=source,
+        snapshot_path=snapshot,
+        project_filters=(),
+        scrub_preset="archive",
+        purpose="recovery_archive",
+    )
+
+    assert {project.slug for project in context.scope.projects} == {"alpha", "beta"}
+    conn = sqlite3.connect(snapshot)
+    try:
+        assert conn.execute(
+            "SELECT registration_token FROM agents WHERE id = 1"
+        ).fetchone() == ("AGENT_TOKEN_CANARY",)
+        assert conn.execute(
+            "SELECT password_hash, session_generation FROM ui_users"
+        ).fetchone() == ("PASSWORD_HASH_CANARY", "SESSION_GENERATION_CANARY")
+        assert conn.execute(
+            "SELECT body_md, archive_document FROM message_deliveries"
+        ).fetchone() == ("DELIVERY_BODY_CANARY", "ARCHIVE_DOCUMENT_CANARY")
+        assert conn.execute(
+            """
+            SELECT type, name, tbl_name, sql
+            FROM sqlite_master
+            WHERE name NOT LIKE 'sqlite_%'
+            ORDER BY type, name
+            """
+        ).fetchall() == source_schema
+        assert list(conn.iterdump()) == source_dump
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'fts_messages'"
+        ).fetchone() is None
+    finally:
+        conn.close()
+
+    with pytest.raises(ShareExportError, match="cannot be used for a public viewer"):
+        share.create_snapshot_context(
+            source_database=source,
+            snapshot_path=tmp_path / "invalid-public.sqlite3",
+            project_filters=(),
+            scrub_preset="archive",
+            purpose="viewer_export",
+        )
+    with pytest.raises(ShareExportError, match="must include the complete database"):
+        share.create_snapshot_context(
+            source_database=source,
+            snapshot_path=tmp_path / "invalid-filtered-recovery.sqlite3",
+            project_filters=("beta",),
+            scrub_preset="archive",
+            purpose="recovery_archive",
+        )
+
+
+def test_complete_public_bundle_and_zip_exclude_private_canaries(tmp_path: Path) -> None:
+    source = _build_private_runtime_snapshot(tmp_path)
+    storage_root = tmp_path / "PRIVATE_STORAGE_ROOT_CANARY"
+    attachment_path = storage_root / "attachments" / "PRIVATE_FILE_PATH_CANARY.txt"
+    attachment_path.parent.mkdir(parents=True)
+    attachment_path.write_text("PRIVATE_ATTACHMENT_BYTES_CANARY", encoding="utf-8")
+    conn = sqlite3.connect(source)
+    try:
+        conn.execute(
+            "UPDATE messages SET attachments = ? WHERE id = 10",
+            (
+                json.dumps(
+                    [
+                        {
+                            "type": "file",
+                            "path": str(attachment_path),
+                            "media_type": "text/plain",
+                        }
+                    ]
+                ),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    repo_root = tmp_path / "public-repo"
+    bundle_root = repo_root / "docs" / "bundle"
+    bundle_root.mkdir(parents=True)
+    git_dir = repo_root / ".git"
+    git_dir.mkdir()
+    (git_dir / "config").write_text(
+        '[remote "origin"]\n'
+        "    url = https://PRIVATE_REMOTE_USER_CANARY:PRIVATE_REMOTE_TOKEN_CANARY@"
+        "github.com/PRIVATE_REMOTE_OWNER_CANARY/PRIVATE_REMOTE_REPO_CANARY.git\n",
+        encoding="utf-8",
+    )
+
+    snapshot = bundle_root / "mailbox.sqlite3"
+    context = share.create_snapshot_context(
+        source_database=source,
+        snapshot_path=snapshot,
+        project_filters=["/private/PRIVATE_BETA_PATH_CANARY"],
+        scrub_preset="standard",
+        purpose="viewer_export",
+    )
+    hints = share.detect_hosting_hints(bundle_root)
+    share.build_bundle_assets(
+        snapshot,
+        bundle_root,
+        storage_root=storage_root,
+        inline_threshold=32,
+        detach_threshold=512,
+        chunk_threshold=1 << 30,
+        chunk_size=1024,
+        scope=context.scope,
+        project_filters=["/private/PRIVATE_BETA_PATH_CANARY"],
+        scrub_summary=context.scrub_summary,
+        hosting_hints=hints,
+        fts_enabled=context.fts_enabled,
+        export_config={
+            "projects": ["/private/PRIVATE_BETA_PATH_CANARY"],
+            "scrub_preset": "standard",
+        },
+    )
+    archive_path = share.package_directory_as_zip(bundle_root, tmp_path / "public-bundle.zip")
+
+    canaries = (
+        b"PRIVATE_ALPHA_PATH_CANARY",
+        b"PRIVATE_BETA_PATH_CANARY",
+        b"AGENT_TOKEN_CANARY",
+        b"PASSWORD_HASH_CANARY",
+        b"DELIVERY_BODY_CANARY",
+        b"ARCHIVE_DOCUMENT_CANARY",
+        b"FUTURE_SCHEMA_CANARY",
+        b"PRIVATE_STORAGE_ROOT_CANARY",
+        b"PRIVATE_FILE_PATH_CANARY",
+        b"PRIVATE_ATTACHMENT_BYTES_CANARY",
+        b"PRIVATE_REMOTE_USER_CANARY",
+        b"PRIVATE_REMOTE_TOKEN_CANARY",
+        b"PRIVATE_REMOTE_OWNER_CANARY",
+        b"PRIVATE_REMOTE_REPO_CANARY",
+    )
+    for public_file in (path for path in bundle_root.rglob("*") if path.is_file()):
+        public_bytes = public_file.read_bytes()
+        for canary in canaries:
+            assert canary not in public_bytes, public_file
+    with ZipFile(archive_path) as archive:
+        assert all(not name.startswith((".git/", ".github/")) for name in archive.namelist())
+        for name in archive.namelist():
+            archived_bytes = archive.read(name)
+            for canary in canaries:
+                assert canary not in archived_bytes, name
 
 
 def test_detect_hosting_hints_sort_order(monkeypatch, tmp_path: Path) -> None:
@@ -381,6 +767,9 @@ def test_copy_viewer_assets_is_self_contained_and_air_gapped(
     collector = _ViewerAssetReferenceCollector()
     collector.feed(index_text)
 
+    assert "<title>Iris · Agent Mail Viewer</title>" in index_text
+    assert '<span aria-hidden="true">🌈</span> Iris' in index_text
+    assert "%26%23x1F308%3B" in index_text
     assert collector.csp
     assert "https:" not in collector.csp
     assert "http:" not in collector.csp
@@ -584,7 +973,7 @@ def test_detect_hosting_hints_uses_output_dir_repo_when_cwd_elsewhere(
     hints = share.detect_hosting_hints(output_dir)
 
     github_hint = next(hint for hint in hints if hint.key == "github_pages")
-    assert any("Git remote" in signal for signal in github_hint.signals)
+    assert "GitHub remote detected" in github_hint.signals
     assert "Workflow pages.yml references Pages" in github_hint.signals
     assert "Export path inside docs/ directory" in github_hint.signals
 
@@ -606,7 +995,7 @@ def test_detect_hosting_hints_reads_remotes_from_gitfile_worktree(
         '\n'.join(
             [
                 '[remote "origin"]',
-                "    url = https://github.com/example/worktree-pages.git",
+                "    url = https://PRIVATE_USER_CANARY:PRIVATE_TOKEN_CANARY@github.com/PRIVATE_OWNER_CANARY/PRIVATE_REPO_CANARY.git?secret=PRIVATE_QUERY_CANARY",
             ]
         )
         + "\n",
@@ -621,10 +1010,16 @@ def test_detect_hosting_hints_reads_remotes_from_gitfile_worktree(
     hints = share.detect_hosting_hints(output_dir)
 
     github_hint = next(hint for hint in hints if hint.key == "github_pages")
-    assert any(
-        signal == "Git remote: https://github.com/example/worktree-pages.git"
-        for signal in github_hint.signals
-    )
+    assert "GitHub remote detected" in github_hint.signals
+    serialized_hints = json.dumps([hint.signals for hint in hints])
+    for canary in (
+        "PRIVATE_USER_CANARY",
+        "PRIVATE_TOKEN_CANARY",
+        "PRIVATE_OWNER_CANARY",
+        "PRIVATE_REPO_CANARY",
+        "PRIVATE_QUERY_CANARY",
+    ):
+        assert canary not in serialized_hints
 
 
 def test_load_bundle_export_config_preserves_explicit_zero_thresholds(tmp_path: Path) -> None:
@@ -855,7 +1250,7 @@ def test_scrub_snapshot_pseudonymizes_and_clears(tmp_path: Path) -> None:
     assert summary.agent_links_removed == 1
     assert summary.secrets_replaced >= 2  # subject + body tokens
     assert summary.bodies_redacted == 0
-    assert summary.attachments_cleared == 0
+    assert summary.attachments_cleared == 1
 
     conn = sqlite3.connect(snapshot)
     try:
@@ -874,8 +1269,7 @@ def test_scrub_snapshot_pseudonymizes_and_clears(tmp_path: Path) -> None:
     subject, body, attachments = _read_message(snapshot)
     assert "sk-" not in subject
     assert "bearer" not in body.lower()
-    assert attachments[0]["type"] == "file"
-    assert "download_url" not in attachments[0]
+    assert attachments == []
 
 
 def test_scrub_snapshot_strict_preset(tmp_path: Path) -> None:
@@ -955,7 +1349,7 @@ def test_scrub_snapshot_invalid_attachments_json(tmp_path: Path) -> None:
 
 def test_bundle_attachments_handles_modes(tmp_path: Path) -> None:
     snapshot = _build_snapshot(tmp_path)
-    storage_root = tmp_path / "storage"
+    storage_root = tmp_path / "PRIVATE_SOURCE_PATH_CANARY"
     base_assets = storage_root / "attachments" / "raw"
     base_assets.mkdir(parents=True, exist_ok=True)
 
@@ -969,10 +1363,14 @@ def test_bundle_attachments_handles_modes(tmp_path: Path) -> None:
     large.write_bytes(b"L" * 512)
 
     payload = [
-        {"type": "file", "path": str(small.relative_to(storage_root)), "media_type": "text/plain"},
-        {"type": "file", "path": str(medium.relative_to(storage_root)), "media_type": "text/plain"},
-        {"type": "file", "path": str(large.relative_to(storage_root)), "media_type": "text/plain"},
-        {"type": "file", "path": "attachments/raw/missing.txt", "media_type": "text/plain"},
+        {"type": "file", "path": str(small), "media_type": "text/plain"},
+        {"type": "file", "path": str(medium), "media_type": "text/plain"},
+        {"type": "file", "path": str(large), "media_type": "text/plain"},
+        {
+            "type": "file",
+            "path": str(base_assets / "missing.txt"),
+            "media_type": "text/plain",
+        },
     ]
 
     conn = sqlite3.connect(snapshot)
@@ -1023,6 +1421,13 @@ def test_bundle_attachments_handles_modes(tmp_path: Path) -> None:
     assert len(items) == 4
     modes = {item["mode"] for item in items}
     assert modes == {"inline", "file", "external", "missing"}
+    public_attachment_json = json.dumps(
+        {"manifest": manifest, "attachments": attachments},
+        sort_keys=True,
+    )
+    assert "PRIVATE_SOURCE_PATH_CANARY" not in public_attachment_json
+    assert str(storage_root) not in public_attachment_json
+    assert "original_path" not in public_attachment_json
 
 
 def test_bundle_attachments_rejects_noncanonical_sha256_before_writing(
@@ -1292,15 +1697,15 @@ def test_manifest_snapshot_structure(monkeypatch, tmp_path: Path) -> None:
         assert manifest["scrub"]["agents_total"] == 1
         assert manifest["scrub"]["agents_pseudonymized"] == 0
         assert manifest["scrub"]["ack_flags_cleared"] == 1
-        assert manifest["scrub"]["recipients_cleared"] == 1
-        assert manifest["scrub"]["file_reservations_removed"] == 1
-        assert manifest["scrub"]["agent_links_removed"] == 1
+        assert manifest["scrub"]["recipients_cleared"] == 0
+        assert manifest["scrub"]["file_reservations_removed"] == 0
+        assert manifest["scrub"]["agent_links_removed"] == 0
         assert manifest["scrub"]["bodies_redacted"] == 0
-        assert manifest["scrub"]["attachments_cleared"] == 0
+        assert manifest["scrub"]["attachments_cleared"] == 1
         assert manifest["scrub"]["attachments_sanitized"] == 1
         assert manifest["scrub"]["secrets_replaced"] >= 2
         assert manifest["project_scope"]["included"] == [
-            {"slug": "demo", "human_key": "demo-human"}
+            {"slug": "demo", "human_key": "demo"}
         ]
         assert manifest["project_scope"]["removed_count"] == 0
         assert manifest["database"]["chunked"] is False
@@ -2546,7 +2951,7 @@ def test_build_materialized_views_supports_legacy_fts_without_sender_id(tmp_path
             """
             SELECT sender_name, sender_display, sender_project_slug, sender_address
             FROM fts_search_overview_mv
-            WHERE id = 1
+            WHERE message_id = 1
             """
         ).fetchone()
         assert row is not None

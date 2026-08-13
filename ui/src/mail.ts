@@ -1,8 +1,10 @@
 export const projectsEndpoint = "/mail/api/v1/projects";
 export const inboxEndpoint = "/mail/api/v1/inbox";
+export const searchEndpoint = "/mail/api/v1/search";
 export const mailEventsEndpoint = "/mail/events";
 
 export const inboxPageSize = 50;
+export const searchPageSize = 50;
 
 const maximumInlineImageBytes = 2 * 1024 * 1024;
 const maximumInlineImageBase64Length = Math.ceil(maximumInlineImageBytes / 3) * 4;
@@ -106,6 +108,26 @@ export type DeliveryStatus =
   | "quarantined"
   | "busy"
   | "deferred";
+export type SearchScope = "all" | "subject" | "body";
+export type SearchOrder = "relevance" | "newest";
+const maximumRememberedReplyAttempts = 64;
+
+export function replyIdempotencyKeyFor(
+  attempts: Map<string, string>,
+  fingerprint: string,
+): string {
+  const existing = attempts.get(fingerprint);
+  if (existing !== undefined) {
+    return existing;
+  }
+  if (attempts.size >= maximumRememberedReplyAttempts) {
+    const oldestFingerprint = attempts.keys().next().value as string;
+    attempts.delete(oldestFingerprint);
+  }
+  const key = `human-ui:${window.crypto.randomUUID()}`;
+  attempts.set(fingerprint, key);
+  return key;
+}
 
 export interface MailProject {
   id: number;
@@ -120,6 +142,25 @@ export interface MailProject {
 export interface ProjectsPage {
   items: MailProject[];
   total: number;
+}
+
+export interface MailRecipientAgent {
+  agent_id: number;
+  agent_generation: string;
+  name: string;
+  display_name: string | null;
+}
+
+export interface ProjectAgentsPage {
+  project_id: number;
+  project_generation: string;
+  items: MailRecipientAgent[];
+  total: number;
+}
+
+export interface ComposeRecipientReference {
+  agent_id: number;
+  expected_agent_generation: string;
 }
 
 export interface InboxMessage {
@@ -144,10 +185,27 @@ export interface InboxPage {
   total: number;
 }
 
+export interface SearchResult extends InboxMessage {
+  snippet: string;
+}
+
+export interface SearchPage {
+  items: SearchResult[];
+  next_cursor: string | null;
+}
+
 export interface MessageAttachment {
   type: string | null;
   media_type: string | null;
   size_bytes: number | null;
+}
+
+export interface ReplyTarget {
+  agent_id: number;
+  agent_generation: string;
+  project_id: number;
+  project_generation: string;
+  canonical_name: string;
 }
 
 export interface MessageDetail extends InboxMessage {
@@ -155,6 +213,7 @@ export interface MessageDetail extends InboxMessage {
   to: string[];
   cc: string[];
   attachments: MessageAttachment[];
+  reply_target: ReplyTarget | null;
 }
 
 export interface DeliveryResult {
@@ -168,7 +227,8 @@ export interface DeliveryResult {
 
 export interface ComposeMessageInput {
   idempotency_key: string;
-  recipients: string[];
+  expected_project_generation: string;
+  recipients: ComposeRecipientReference[];
   subject: string;
   body_md: string;
   thread_id: string | null;
@@ -176,12 +236,23 @@ export interface ComposeMessageInput {
 
 export interface ReplyMessageInput {
   idempotency_key: string;
+  expected_sender_agent_id: number;
+  expected_sender_agent_generation: string;
+  expected_sender_project_id: number;
+  expected_sender_project_generation: string;
   body_md: string;
 }
 
 export type MailRoute =
   | { view: "projects" }
   | { view: "inbox"; projectId: number | null }
+  | {
+      view: "search";
+      query: string;
+      projectId: number | null;
+      scope: SearchScope;
+      order: SearchOrder;
+    }
   | { view: "message"; projectId: number; messageId: number };
 
 interface FetchOptions {
@@ -191,6 +262,14 @@ interface FetchOptions {
 interface InboxOptions extends FetchOptions {
   cursor?: string;
   projectId?: number;
+}
+
+interface SearchOptions extends FetchOptions {
+  query: string;
+  projectId?: number;
+  scope: SearchScope;
+  order: SearchOrder;
+  cursor?: string;
 }
 
 export class MailHttpError extends Error {
@@ -260,6 +339,14 @@ function booleanValue(value: unknown, label: string): boolean {
     throw new TypeError(`Invalid ${label}.`);
   }
   return value;
+}
+
+function generationValue(value: unknown, label: string): string {
+  const generation = stringValue(value, label);
+  if (!/^[0-9a-f]{64}$/u.test(generation)) {
+    throw new TypeError(`Invalid ${label}.`);
+  }
+  return generation;
 }
 
 function validTimestamp(value: unknown, label: string): string {
@@ -378,6 +465,35 @@ function parseAttachment(value: unknown): MessageAttachment {
   };
 }
 
+function parseReplyTarget(value: unknown): ReplyTarget | null {
+  if (value === null) {
+    return null;
+  }
+  const candidate = exactRecord(value, "reply target", [
+    "agent_id",
+    "agent_generation",
+    "project_id",
+    "project_generation",
+    "canonical_name",
+  ]);
+  return {
+    agent_id: positiveInteger(candidate.agent_id, "reply target agent id"),
+    agent_generation: generationValue(
+      candidate.agent_generation,
+      "reply target agent generation",
+    ),
+    project_id: positiveInteger(candidate.project_id, "reply target project id"),
+    project_generation: generationValue(
+      candidate.project_generation,
+      "reply target project generation",
+    ),
+    canonical_name: stringValue(
+      candidate.canonical_name,
+      "reply target canonical name",
+    ),
+  };
+}
+
 export function parseProjects(payload: unknown): ProjectsPage {
   const response = exactRecord(payload, "projects response", ["items", "total"]);
   if (!Array.isArray(response.items)) {
@@ -409,6 +525,43 @@ export function parseProjects(payload: unknown): ProjectsPage {
   };
 }
 
+export function parseProjectAgents(payload: unknown): ProjectAgentsPage {
+  const response = exactRecord(payload, "project agents response", [
+    "project_id",
+    "project_generation",
+    "items",
+    "total",
+  ]);
+  if (!Array.isArray(response.items)) {
+    throw new TypeError("Invalid project agent items.");
+  }
+  return {
+    project_id: positiveInteger(response.project_id, "agent project id"),
+    project_generation: generationValue(
+      response.project_generation,
+      "agent project generation",
+    ),
+    items: response.items.map((value) => {
+      const candidate = exactRecord(value, "project agent", [
+        "agent_id",
+        "agent_generation",
+        "name",
+        "display_name",
+      ]);
+      return {
+        agent_id: positiveInteger(candidate.agent_id, "recipient agent id"),
+        agent_generation: generationValue(
+          candidate.agent_generation,
+          "recipient agent generation",
+        ),
+        name: stringValue(candidate.name, "agent name"),
+        display_name: nullableString(candidate.display_name, "agent display name"),
+      };
+    }),
+    total: nonNegativeInteger(response.total, "project agent total"),
+  };
+}
+
 export function parseInboxPage(payload: unknown): InboxPage {
   const candidate = exactRecord(payload, "inbox response", [
     "items",
@@ -425,8 +578,38 @@ export function parseInboxPage(payload: unknown): InboxPage {
   };
 }
 
+export function parseSearchPage(payload: unknown): SearchPage {
+  const candidate = exactRecord(payload, "search response", [
+    "items",
+    "next_cursor",
+  ]);
+  if (!Array.isArray(candidate.items)) {
+    throw new TypeError("Invalid search items.");
+  }
+  return {
+    items: candidate.items.map((value) => {
+      const summary = parseInboxMessage(value, ["snippet"]);
+      const result = exactRecord(value, "search result", [
+        ...inboxMessageKeys,
+        "snippet",
+      ]);
+      return {
+        ...summary,
+        snippet: stringValue(result.snippet, "search snippet"),
+      };
+    }),
+    next_cursor: nullableString(candidate.next_cursor, "search cursor"),
+  };
+}
+
 export function parseMessageDetail(payload: unknown): MessageDetail {
-  const detailKeys = ["body_md", "to", "cc", "attachments"] as const;
+  const detailKeys = [
+    "body_md",
+    "to",
+    "cc",
+    "attachments",
+    "reply_target",
+  ] as const;
   const summary = parseInboxMessage(payload, detailKeys);
   const candidate = exactRecord(payload, "message detail", [
     ...inboxMessageKeys,
@@ -441,6 +624,7 @@ export function parseMessageDetail(payload: unknown): MessageDetail {
     to: stringArray(candidate.to, "message to recipients"),
     cc: stringArray(candidate.cc, "message cc recipients"),
     attachments: candidate.attachments.map(parseAttachment),
+    reply_target: parseReplyTarget(candidate.reply_target),
   };
 }
 
@@ -514,6 +698,22 @@ export function loadProjects(options: FetchOptions = {}): Promise<ProjectsPage> 
   return mailRequest(projectsEndpoint, parseProjects, options);
 }
 
+export async function loadProjectAgents(
+  projectId: number,
+  options: FetchOptions = {},
+): Promise<ProjectAgentsPage> {
+  positiveInteger(projectId, "agent project id");
+  const page = await mailRequest(
+    `/mail/api/v1/projects/${projectId}/agents`,
+    parseProjectAgents,
+    options,
+  );
+  if (page.project_id !== projectId) {
+    throw new TypeError("Invalid agent project id.");
+  }
+  return page;
+}
+
 export function loadInbox(options: InboxOptions = {}): Promise<InboxPage> {
   const url = new URL(inboxEndpoint, window.location.origin);
   url.searchParams.set("limit", String(inboxPageSize));
@@ -524,6 +724,21 @@ export function loadInbox(options: InboxOptions = {}): Promise<InboxPage> {
     url.searchParams.set("project_id", String(options.projectId));
   }
   return mailRequest(url.pathname + url.search, parseInboxPage, options);
+}
+
+export function loadSearch(options: SearchOptions): Promise<SearchPage> {
+  const url = new URL(searchEndpoint, window.location.origin);
+  url.searchParams.set("q", options.query);
+  url.searchParams.set("scope", options.scope);
+  url.searchParams.set("order", options.order);
+  url.searchParams.set("limit", String(searchPageSize));
+  if (options.projectId !== undefined) {
+    url.searchParams.set("project_id", String(options.projectId));
+  }
+  if (options.cursor !== undefined) {
+    url.searchParams.set("cursor", options.cursor);
+  }
+  return mailRequest(url.pathname + url.search, parseSearchPage, options);
 }
 
 export function loadMessage(
@@ -636,6 +851,20 @@ export function parseMailRoute(hash: string): MailRoute {
     const projectId = routeInteger(new URLSearchParams(query).get("project") ?? undefined);
     return { view: "inbox", projectId };
   }
+  if (path === "search") {
+    const params = new URLSearchParams(query);
+    const rawQuery = params.get("q") ?? "";
+    const rawScope = params.get("scope");
+    const rawOrder = params.get("order");
+    return {
+      view: "search",
+      query: rawQuery.length <= 256 ? rawQuery : "",
+      projectId: routeInteger(params.get("project") ?? undefined),
+      scope:
+        rawScope === "subject" || rawScope === "body" ? rawScope : "all",
+      order: rawOrder === "newest" ? "newest" : "relevance",
+    };
+  }
   const parts = path.split("/");
   if (parts[0] === "message" && parts.length === 3) {
     const projectId = routeInteger(parts[1]);
@@ -653,6 +882,18 @@ export function mailRouteHash(route: MailRoute): string {
   }
   if (route.view === "message") {
     return `#message/${route.projectId}/${route.messageId}`;
+  }
+  if (route.view === "search") {
+    const params = new URLSearchParams();
+    if (route.query !== "") {
+      params.set("q", route.query);
+    }
+    if (route.projectId !== null) {
+      params.set("project", String(route.projectId));
+    }
+    params.set("scope", route.scope);
+    params.set("order", route.order);
+    return `#search?${params.toString()}`;
   }
   return route.projectId === null ? "#inbox" : `#inbox?project=${route.projectId}`;
 }

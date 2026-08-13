@@ -5,15 +5,23 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import sqlite3
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import delete, func, select
+from fastmcp import Client
+from sqlalchemy import delete, func, select, text
 from sqlmodel import col
 
+from mcp_agent_mail.app import (
+    _hard_delete_agent_database_rows,
+    _hard_delete_project_database_rows,
+    build_mcp_server,
+)
 from mcp_agent_mail.config import get_settings
 from mcp_agent_mail.db import ensure_schema, get_immediate_session
 from mcp_agent_mail.delivery import (
@@ -239,6 +247,316 @@ async def _seed_inbound_message(
             )
         await session.commit()
         return message.id
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_agent_database_rows_close_cross_project_fks(
+    isolated_env: Any,
+) -> None:
+    seeded = await _seed_identities(cross_project=True)
+    async with get_immediate_session() as session:
+        outbound = Message(
+            project_id=seeded.target.project_id,
+            sender_id=seeded.sender.agent_id,
+            thread_id="cross-project-delete-agent",
+            subject="Cross-project outbound",
+            body_md="Delete with its sender.",
+            created_ts=BASE_TIME,
+        )
+        retained_inbound = Message(
+            project_id=seeded.target.project_id,
+            sender_id=seeded.to.agent_id,
+            thread_id="cross-project-delete-agent",
+            subject="Retained inbound",
+            body_md="Keep this message.",
+            created_ts=BASE_TIME,
+        )
+        session.add_all([outbound, retained_inbound])
+        await session.flush()
+        assert outbound.id is not None
+        assert retained_inbound.id is not None
+        retained_reply = Message(
+            project_id=seeded.target.project_id,
+            sender_id=seeded.to.agent_id,
+            thread_id="cross-project-delete-agent",
+            reply_to=outbound.id,
+            subject="Retained reply",
+            body_md="Keep this reply without a stale direct edge.",
+            created_ts=BASE_TIME + timedelta(seconds=1),
+        )
+        session.add(retained_reply)
+        session.add_all(
+            [
+                MessageRecipient(
+                    message_id=outbound.id,
+                    agent_id=seeded.to.agent_id,
+                    kind="to",
+                ),
+                MessageRecipient(
+                    message_id=retained_inbound.id,
+                    agent_id=seeded.sender.agent_id,
+                    kind="to",
+                ),
+            ]
+        )
+        await session.flush()
+        assert retained_reply.id is not None
+        retained_reply_id = retained_reply.id
+        retained_inbound_id = retained_inbound.id
+
+        counts = await _hard_delete_agent_database_rows(
+            session,
+            project_id=seeded.source.project_id,
+            agent_id=seeded.sender.agent_id,
+            agent_name=seeded.sender.name,
+        )
+        await session.commit()
+
+    assert counts["messages_sent"] == 1
+    async with get_immediate_session() as session:
+        assert await session.get(Agent, seeded.sender.agent_id) is None
+        assert await session.get(Message, outbound.id) is None
+        retained = await session.get(Message, retained_reply_id)
+        assert retained is not None
+        assert retained.reply_to is None
+        assert await session.get(Message, retained_inbound_id) is not None
+        dangling = await session.execute(
+            select(MessageRecipient).where(
+                col(MessageRecipient.agent_id) == seeded.sender.agent_id
+            )
+        )
+        assert dangling.scalars().all() == []
+        foreign_keys = await session.execute(text("PRAGMA foreign_key_check"))
+        assert foreign_keys.all() == []
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_agent_database_rows_blocks_pending_delivery_atomically(
+    isolated_env: Any,
+) -> None:
+    seeded = await _seed_identities()
+    accepted = await accept_message_delivery(
+        seeded.request("pending-hard-delete-agent"),
+        now=BASE_TIME,
+    )
+
+    async with get_immediate_session() as session:
+        with pytest.raises(ValueError, match="pending message delivery"):
+            await _hard_delete_agent_database_rows(
+                session,
+                project_id=seeded.source.project_id,
+                agent_id=seeded.sender.agent_id,
+                agent_name=seeded.sender.name,
+            )
+
+    async with get_immediate_session() as session:
+        assert await session.get(Agent, seeded.sender.agent_id) is not None
+        delivery = await session.get(MessageDelivery, accepted.delivery_id)
+        assert delivery is not None
+        assert delivery.state == "pending"
+        foreign_keys = await session.execute(text("PRAGMA foreign_key_check"))
+        assert foreign_keys.all() == []
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_agent_database_rows_preserves_terminal_delivery_ledger(
+    isolated_env: Any,
+) -> None:
+    seeded = await _seed_identities()
+    accepted = await accept_message_delivery(
+        seeded.request("terminal-hard-delete-agent"),
+        now=BASE_TIME,
+    )
+    lease = await claim_message_delivery(accepted.delivery_id, now=BASE_TIME)
+    assert lease is not None
+    published = await process_claimed_message_delivery(
+        lease,
+        settings=get_settings(),
+        now=BASE_TIME,
+    )
+    assert published.message_id is not None
+
+    async with get_immediate_session() as session:
+        counts = await _hard_delete_agent_database_rows(
+            session,
+            project_id=seeded.source.project_id,
+            agent_id=seeded.sender.agent_id,
+            agent_name=seeded.sender.name,
+        )
+        await session.commit()
+
+    assert counts["messages_sent"] == 1
+    async with get_immediate_session() as session:
+        assert await session.get(Agent, seeded.sender.agent_id) is None
+        assert await session.get(Message, published.message_id) is None
+        delivery = await session.get(MessageDelivery, accepted.delivery_id)
+        assert delivery is not None
+        assert delivery.state == "published"
+        assert delivery.message_id == published.message_id
+        foreign_keys = await session.execute(text("PRAGMA foreign_key_check"))
+        assert foreign_keys.all() == []
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_project_database_rows_close_cross_project_fks(
+    isolated_env: Any,
+) -> None:
+    seeded = await _seed_identities(cross_project=True)
+    async with get_immediate_session() as session:
+        outbound = Message(
+            project_id=seeded.target.project_id,
+            sender_id=seeded.sender.agent_id,
+            thread_id="cross-project-delete-project",
+            subject="Cross-project outbound",
+            body_md="Delete with its sender project.",
+            created_ts=BASE_TIME,
+        )
+        retained_inbound = Message(
+            project_id=seeded.target.project_id,
+            sender_id=seeded.to.agent_id,
+            thread_id="cross-project-delete-project",
+            subject="Retained inbound",
+            body_md="Keep this message.",
+            created_ts=BASE_TIME,
+        )
+        session.add_all([outbound, retained_inbound])
+        await session.flush()
+        assert outbound.id is not None
+        assert retained_inbound.id is not None
+        retained_reply = Message(
+            project_id=seeded.target.project_id,
+            sender_id=seeded.to.agent_id,
+            thread_id="cross-project-delete-project",
+            reply_to=outbound.id,
+            subject="Retained reply",
+            body_md="Keep this reply without a stale direct edge.",
+            created_ts=BASE_TIME + timedelta(seconds=1),
+        )
+        session.add(retained_reply)
+        session.add_all(
+            [
+                MessageRecipient(
+                    message_id=outbound.id,
+                    agent_id=seeded.to.agent_id,
+                    kind="to",
+                ),
+                MessageRecipient(
+                    message_id=retained_inbound.id,
+                    agent_id=seeded.sender.agent_id,
+                    kind="to",
+                ),
+            ]
+        )
+        await session.flush()
+        assert retained_reply.id is not None
+        retained_reply_id = retained_reply.id
+        retained_inbound_id = retained_inbound.id
+
+        counts = await _hard_delete_project_database_rows(
+            session,
+            project_id=seeded.source.project_id,
+        )
+        await session.commit()
+
+    assert counts["messages"] == 1
+    async with get_immediate_session() as session:
+        assert await session.get(Project, seeded.source.project_id) is None
+        assert await session.get(Agent, seeded.sender.agent_id) is None
+        assert await session.get(Message, outbound.id) is None
+        retained = await session.get(Message, retained_reply_id)
+        assert retained is not None
+        assert retained.reply_to is None
+        assert await session.get(Message, retained_inbound_id) is not None
+        dangling = await session.execute(
+            select(MessageRecipient).where(
+                col(MessageRecipient.agent_id) == seeded.sender.agent_id
+            )
+        )
+        assert dangling.scalars().all() == []
+        foreign_keys = await session.execute(text("PRAGMA foreign_key_check"))
+        assert foreign_keys.all() == []
+
+
+@pytest.mark.asyncio
+async def test_purge_old_messages_detaches_retained_replies_and_skips_pending_targets(
+    isolated_env: Any,
+) -> None:
+    seeded = await _seed_identities(cross_project=True)
+    await _set_route_status(seeded, seeded.to, "blocked")
+    await _seed_inbound_message(
+        seeded,
+        thread_id="purge-pending-target",
+    )
+    old_time = datetime(2000, 1, 1)
+    async with get_immediate_session() as session:
+        purge_parent = Message(
+            project_id=seeded.target.project_id,
+            sender_id=seeded.sender.agent_id,
+            thread_id="purge-retained-child",
+            subject="Purge parent",
+            body_md="Old and eligible.",
+            created_ts=old_time,
+        )
+        protected_target = Message(
+            project_id=seeded.target.project_id,
+            sender_id=seeded.sender.agent_id,
+            thread_id="purge-pending-target",
+            subject="Protected pending target",
+            body_md="Old but protected.",
+            created_ts=old_time,
+        )
+        session.add_all([purge_parent, protected_target])
+        await session.flush()
+        assert purge_parent.id is not None
+        assert protected_target.id is not None
+        retained_child = Message(
+            project_id=seeded.target.project_id,
+            sender_id=seeded.to.agent_id,
+            thread_id="purge-retained-child",
+            reply_to=purge_parent.id,
+            subject="Retained child",
+            body_md="New enough to retain.",
+            created_ts=datetime.now(),
+        )
+        session.add(retained_child)
+        await session.flush()
+        assert retained_child.id is not None
+        purge_parent_id = purge_parent.id
+        protected_target_id = protected_target.id
+        retained_child_id = retained_child.id
+        await session.commit()
+
+    await accept_message_delivery(
+        replace(
+            seeded.request("purge-pending-target"),
+            purpose="reply",
+            thread_id="purge-pending-target",
+            reply_to_message_id=protected_target_id,
+            recipients=(DeliveryRecipientSnapshot(kind="to", agent=seeded.to),),
+        ),
+        now=BASE_TIME,
+    )
+
+    server = build_mcp_server()
+    async with Client(server) as client:
+        purged = await client.call_tool(
+            "purge_old_messages",
+            {
+                "project_key": seeded.target.slug,
+                "max_age_days": 1,
+                "dry_run": False,
+            },
+        )
+
+    assert purged.data["messages_affected"] == 1
+    async with get_immediate_session() as session:
+        assert await session.get(Message, purge_parent_id) is None
+        assert await session.get(Message, protected_target_id) is not None
+        retained = await session.get(Message, retained_child_id)
+        assert retained is not None
+        assert retained.reply_to is None
+        foreign_keys = await session.execute(text("PRAGMA foreign_key_check"))
+        assert foreign_keys.all() == []
 
 
 @pytest.mark.asyncio
@@ -624,17 +942,38 @@ async def test_deleted_inbound_reply_source_quarantines_before_claim(
         now=BASE_TIME,
     )
 
-    async with get_immediate_session() as session:
-        recipient = await session.get(
-            MessageRecipient,
-            (source_message_id, seeded.sender.agent_id),
+    # A normal application connection cannot delete this route source while a
+    # recipient FK protects it. Reproduce external corruption so claim-time
+    # validation still proves the accepted route fails closed if that source
+    # disappears outside the application.
+    database_url = get_settings().database.url
+    prefix = "sqlite+aiosqlite:///"
+    assert database_url.startswith(prefix)
+    database_path = Path(database_url.removeprefix(prefix))
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="FOREIGN KEY",
+        ):
+            connection.execute(
+                "DELETE FROM messages WHERE id = ?",
+                (source_message_id,),
+            )
+        connection.rollback()
+        connection.execute("PRAGMA foreign_keys=OFF")
+        deleted_recipient = connection.execute(
+            "DELETE FROM message_recipients WHERE message_id = ?",
+            (source_message_id,),
         )
-        message = await session.get(Message, source_message_id)
-        assert recipient is not None
-        assert message is not None
-        await session.delete(recipient)
-        await session.delete(message)
-        await session.commit()
+        deleted_message = connection.execute(
+            "DELETE FROM messages WHERE id = ?",
+            (source_message_id,),
+        )
+        assert deleted_recipient.rowcount == 1
+        assert deleted_message.rowcount == 1
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        connection.commit()
 
     with pytest.raises(MessageDeliveryTerminalError):
         await claim_message_delivery(

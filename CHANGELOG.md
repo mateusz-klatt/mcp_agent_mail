@@ -6,6 +6,50 @@ Format: entries are organized by version in reverse chronological order. Each ve
 
 ---
 
+## v0.4.0 - 2026-08-13
+
+### Iris human interface
+
+- Renamed the human-facing product to Iris and introduced a responsive,
+  rainbow-themed React interface with an accessible local favicon and no
+  third-party runtime assets.
+- Restored and hardened the complete compose and reply workflow: secure live
+  Markdown preview, formatting tools, searchable generation-bound recipient
+  selection, review-before-send, exact delivery targets, and durable
+  idempotency across navigation and retries.
+- Added privacy-bounded, project-authorized full-text search and a small,
+  enumerated bridge for confirmed upstream bookmarks. The temporary
+  `/mail/v2` namespace and every retired route without an exact successor
+  remain 404.
+
+### Internationalization
+
+- Added complete interface and public-login localization for English plus 44
+  additional languages, including three RTL locales, an accessible flag and
+  native-language picker, canonical locale tags, and server-owned
+  correspondence advisories.
+- Added an atomic SQLite account-table migration for the expanded locale set.
+  This is a one-way data migration: an older image must be paired with the
+  verified pre-deploy database snapshot during rollback.
+
+### Delivery, privacy, and reliability
+
+- Published messages through immutable, idempotent delivery intents with
+  durable Git and SQLite receipts, generation-bound Reply targets and SSE
+  subscriptions, cancellation-safe locking, and fail-closed attachment
+  handling.
+- Added typed human compose, reply, status, retry, directory, and search APIs;
+  tightened same-origin handling, validation redaction, notification lifetime
+  checks, and legacy route retirement.
+- Hardened the distributable UI graph to exactly one entry chunk plus 44
+  isolated locale chunks, validating every reachable stylesheet and rejecting
+  orphan or external assets.
+
+### Verification
+
+- Expanded Python, React, WebKit, schema-migration, packaging, durability,
+  accessibility, and cross-lifetime regression coverage for the new release.
+
 ## [v0.3.2] - 2026-04-16
 
 ### Bug Fixes
@@ -16,9 +60,11 @@ Format: entries are organized by version in reverse chronological order. Each ve
 
 > Note: v0.3.1 was tagged but its Release workflow failed on two pre-existing ty diagnostics; v0.3.2 supersedes it with the same three fixes plus the type-check cleanup.
 
-## [Unreleased] (v0.3.2...main)
+## Historical v0.3.x development notes
 
-132 commits since v0.3.0, spanning 2026-01-07 through 2026-03-21. No release tag yet.
+The following detailed notes cover 132 commits after v0.3.0, spanning
+2026-01-07 through 2026-03-21. They were retained from the former Unreleased
+section and were subsequently incorporated into the v0.3.x release line.
 
 ### Agent Identity and Lifecycle
 

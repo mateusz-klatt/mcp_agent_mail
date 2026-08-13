@@ -1,4 +1,4 @@
-"""Build the Hermes browser bundle into Python distributions.
+"""Build the Iris browser bundle into Python distributions.
 
 The repository deliberately does not track generated ``ui/dist`` files.  A
 source build therefore compiles the UI in an isolated, validated temporary
@@ -13,6 +13,7 @@ import atexit
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -36,6 +37,61 @@ _UI_DIST_SOURCE = Path("src/mcp_agent_mail/ui_dist")
 _UI_DIST_WHEEL = "mcp_agent_mail/ui_dist"
 _UI_DIST_SDIST = _UI_DIST_SOURCE.as_posix()
 _DIST_HASHES_KEY = "files"
+_VITE_MANIFEST = ".vite/manifest.json"
+_FINGERPRINTED_ASSET_RE = re.compile(r"^assets/[A-Za-z0-9_.-]+-[A-Za-z0-9_-]{8,}\.(?:css|js)$")
+_CSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_CSS_ESCAPE_RE = re.compile(
+    r"\\(?:(?P<hex>[0-9A-Fa-f]{1,6})(?:\r\n|[ \t\r\n\f])?"
+    r"|(?P<newline>\r\n|[\r\n\f])|(?P<char>.))",
+    re.DOTALL,
+)
+_CSS_URL_FUNCTION_RE = re.compile(r"url[ \t\r\n\f]*\(", re.IGNORECASE)
+_EXPECTED_LOCALE_MANIFEST_KEYS = (
+    "src/locales/ar.ts",
+    "src/locales/bn.ts",
+    "src/locales/bs.ts",
+    "src/locales/cs.ts",
+    "src/locales/da.ts",
+    "src/locales/de.ts",
+    "src/locales/el.ts",
+    "src/locales/es.ts",
+    "src/locales/fa.ts",
+    "src/locales/fi.ts",
+    "src/locales/fil.ts",
+    "src/locales/fr.ts",
+    "src/locales/ga.ts",
+    "src/locales/he.ts",
+    "src/locales/hi.ts",
+    "src/locales/hr.ts",
+    "src/locales/hu.ts",
+    "src/locales/hy.ts",
+    "src/locales/id.ts",
+    "src/locales/is.ts",
+    "src/locales/it.ts",
+    "src/locales/ja.ts",
+    "src/locales/ko.ts",
+    "src/locales/lt.ts",
+    "src/locales/lv.ts",
+    "src/locales/ms.ts",
+    "src/locales/my-MM.ts",
+    "src/locales/nl.ts",
+    "src/locales/no.ts",
+    "src/locales/pl.ts",
+    "src/locales/pt.ts",
+    "src/locales/ro.ts",
+    "src/locales/ru.ts",
+    "src/locales/sk.ts",
+    "src/locales/sq.ts",
+    "src/locales/sr.ts",
+    "src/locales/sv.ts",
+    "src/locales/sw.ts",
+    "src/locales/th.ts",
+    "src/locales/tr.ts",
+    "src/locales/uk.ts",
+    "src/locales/vi.ts",
+    "src/locales/zh-Hant.ts",
+    "src/locales/zh.ts",
+)
 _WINDOWS_CHILD_ENVIRONMENT_KEYS = ("SystemRoot", "ComSpec", "PATHEXT")
 _IGNORED_UI_DIRECTORIES = frozenset(
     {
@@ -74,9 +130,7 @@ class _EntryPointReferenceCollector(HTMLParser):
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attribute_names = [name for name, _value in attrs]
-        duplicate_names = {
-            name for name in attribute_names if attribute_names.count(name) > 1
-        }
+        duplicate_names = {name for name in attribute_names if attribute_names.count(name) > 1}
         if duplicate_names:
             self.duplicate_attributes.update((tag, name) for name in duplicate_names)
             return
@@ -106,11 +160,7 @@ def _allowlisted_windows_environment(
     """Return only the Windows process variables required to launch Node."""
     if platform_name != "nt":
         return {}
-    return {
-        name: host_environment[name]
-        for name in _WINDOWS_CHILD_ENVIRONMENT_KEYS
-        if name in host_environment
-    }
+    return {name: host_environment[name] for name in _WINDOWS_CHILD_ENVIRONMENT_KEYS if name in host_environment}
 
 
 def _iter_build_inputs(repository_root: Path) -> list[Path]:
@@ -270,9 +320,7 @@ def _dist_file_hashes(dist_root: Path) -> dict[str, str]:
 def _complete_dist_file_hashes(dist_root: Path) -> dict[str, str]:
     """Hash every browser artifact, including the manifest itself."""
     return {
-        candidate.relative_to(dist_root).as_posix(): hashlib.sha256(
-            candidate.read_bytes()
-        ).hexdigest()
+        candidate.relative_to(dist_root).as_posix(): hashlib.sha256(candidate.read_bytes()).hexdigest()
         for candidate in sorted(dist_root.rglob("*"))
         if candidate.is_file()
     }
@@ -290,10 +338,7 @@ def _validate_artifact_ui(
 
     def _mentions_ui_dist(raw_name: str, marker: tuple[str, ...]) -> bool:
         parts = tuple(part for part in raw_name.replace("\\", "/").split("/") if part)
-        return any(
-            parts[index : index + len(marker)] == marker
-            for index in range(len(parts) - len(marker) + 1)
-        )
+        return any(parts[index : index + len(marker)] == marker for index in range(len(parts) - len(marker) + 1))
 
     try:
         if target_name == "wheel":
@@ -303,30 +348,22 @@ def _validate_artifact_ui(
                     path = PurePosixPath(info.filename)
                     if path.is_absolute() or ".." in path.parts:
                         if _mentions_ui_dist(info.filename, prefix.parts):
-                            raise HermesUiBuildError(
-                                f"Hermes wheel contains an unsafe ui_dist member: {info.filename}"
-                            )
+                            raise HermesUiBuildError(f"Iris wheel contains an unsafe ui_dist member: {info.filename}")
                         continue
                     if path.parts[: len(prefix.parts)] != prefix.parts:
                         continue
                     relative_parts = path.parts[len(prefix.parts) :]
                     if not relative_parts:
                         if not info.is_dir():
-                            raise HermesUiBuildError(
-                                "Hermes wheel contains an invalid ui_dist member."
-                            )
+                            raise HermesUiBuildError("Iris wheel contains an invalid ui_dist member.")
                         continue
                     if info.is_dir():
                         continue
                     if stat.S_ISLNK(info.external_attr >> 16):
-                        raise HermesUiBuildError(
-                            f"Hermes wheel contains a linked ui_dist member: {info.filename}"
-                        )
+                        raise HermesUiBuildError(f"Iris wheel contains a linked ui_dist member: {info.filename}")
                     relative = PurePosixPath(*relative_parts).as_posix()
                     if relative in actual:
-                        raise HermesUiBuildError(
-                            f"Hermes wheel contains a duplicate ui_dist member: {relative}"
-                        )
+                        raise HermesUiBuildError(f"Iris wheel contains a duplicate ui_dist member: {relative}")
                     actual[relative] = hashlib.sha256(archive.read(info)).hexdigest()
         elif target_name == "sdist":
             roots: set[str] = set()
@@ -336,9 +373,7 @@ def _validate_artifact_ui(
                     marker = ("src", "mcp_agent_mail", "ui_dist")
                     if path.is_absolute() or ".." in path.parts:
                         if _mentions_ui_dist(member.name, marker):
-                            raise HermesUiBuildError(
-                                f"Hermes sdist contains an unsafe ui_dist member: {member.name}"
-                            )
+                            raise HermesUiBuildError(f"Iris sdist contains an unsafe ui_dist member: {member.name}")
                         continue
                     if len(path.parts) < 4 or path.parts[1:4] != marker:
                         continue
@@ -346,44 +381,28 @@ def _validate_artifact_ui(
                     relative_parts = path.parts[4:]
                     if not relative_parts:
                         if not member.isdir():
-                            raise HermesUiBuildError(
-                                "Hermes sdist contains an invalid ui_dist member."
-                            )
+                            raise HermesUiBuildError("Iris sdist contains an invalid ui_dist member.")
                         continue
                     if member.isdir():
                         continue
                     if not member.isfile():
-                        raise HermesUiBuildError(
-                            f"Hermes sdist contains a linked ui_dist member: {member.name}"
-                        )
+                        raise HermesUiBuildError(f"Iris sdist contains a linked ui_dist member: {member.name}")
                     relative = PurePosixPath(*relative_parts).as_posix()
                     if relative in actual:
-                        raise HermesUiBuildError(
-                            f"Hermes sdist contains a duplicate ui_dist member: {relative}"
-                        )
+                        raise HermesUiBuildError(f"Iris sdist contains a duplicate ui_dist member: {relative}")
                     stream = archive.extractfile(member)
                     if stream is None:
-                        raise HermesUiBuildError(
-                            f"Hermes sdist ui_dist member is unreadable: {member.name}"
-                        )
+                        raise HermesUiBuildError(f"Iris sdist ui_dist member is unreadable: {member.name}")
                     actual[relative] = hashlib.sha256(stream.read()).hexdigest()
             if len(roots) != 1:
-                raise HermesUiBuildError(
-                    "Hermes sdist must contain ui_dist beneath exactly one archive root."
-                )
+                raise HermesUiBuildError("Iris sdist must contain ui_dist beneath exactly one archive root.")
         else:
-            raise HermesUiBuildError(
-                f"Unsupported Hermes UI artifact target: {target_name}"
-            )
+            raise HermesUiBuildError(f"Unsupported Iris UI artifact target: {target_name}")
     except (BadZipFile, OSError, tarfile.TarError) as exc:
-        raise HermesUiBuildError(
-            f"Hermes {target_name} artifact is unavailable or invalid: {artifact_path}"
-        ) from exc
+        raise HermesUiBuildError(f"Iris {target_name} artifact is unavailable or invalid: {artifact_path}") from exc
 
     if actual != expected:
-        raise HermesUiBuildError(
-            f"Hermes {target_name} UI members do not match the validated browser bundle."
-        )
+        raise HermesUiBuildError(f"Iris {target_name} UI members do not match the validated browser bundle.")
 
 
 def _resolve_tool(name: str) -> str:
@@ -425,7 +444,7 @@ def _verify_toolchain(
     )
     if node_version != _NODE_VERSION or npm_version != _NPM_VERSION:
         raise HermesUiBuildError(
-            "Hermes UI distributions require "
+            "Iris UI distributions require "
             f"Node {_NODE_VERSION} with npm {_NPM_VERSION}; found Node {node_version or '<empty>'} "
             f"and npm {npm_version or '<empty>'}."
         )
@@ -456,58 +475,211 @@ def _write_build_manifest(
         raise HermesUiBuildError(f"Refusing a pre-existing UI build manifest: {manifest_path}") from exc
 
 
+def _reachable_vite_assets(
+    dist_root: Path,
+) -> tuple[Path, Path, set[str], set[Path]]:
+    """Return the exact Iris entry, locale chunks, and reachable stylesheets."""
+    manifest_path = dist_root / _VITE_MANIFEST
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        raise HermesUiBuildError("Iris UI output has no regular Vite manifest.")
+    try:
+        raw_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise HermesUiBuildError("Iris UI Vite manifest is invalid.") from exc
+    if not isinstance(raw_manifest, dict) or not raw_manifest:
+        raise HermesUiBuildError("Iris UI Vite manifest must be a non-empty object.")
+    manifest: dict[str, dict[str, Any]] = {}
+    for key, value in raw_manifest.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            raise HermesUiBuildError("Iris UI Vite manifest has an invalid entry.")
+        manifest[key] = value
+
+    entry_keys = [key for key, value in manifest.items() if value.get("isEntry") is True]
+    if entry_keys != ["index.html"]:
+        raise HermesUiBuildError("Iris UI Vite manifest must contain only the index.html entry point.")
+    expected_locale_keys = frozenset(_EXPECTED_LOCALE_MANIFEST_KEYS)
+    if set(manifest) != {"index.html", *expected_locale_keys}:
+        raise HermesUiBuildError("Iris UI Vite manifest must contain the entry and exactly 44 locale chunks.")
+
+    entry = manifest["index.html"]
+    dynamic_imports = entry.get("dynamicImports")
+    if (
+        entry.get("src") != "index.html"
+        or not isinstance(dynamic_imports, list)
+        or len(dynamic_imports) != len(expected_locale_keys)
+        or any(not isinstance(item, str) for item in dynamic_imports)
+        or set(dynamic_imports) != expected_locale_keys
+        or entry.get("imports", []) != []
+        or entry.get("assets", []) != []
+    ):
+        raise HermesUiBuildError("Iris UI entry must dynamically import each of the 44 locale chunks exactly once.")
+    for locale_key in _EXPECTED_LOCALE_MANIFEST_KEYS:
+        locale_record = manifest[locale_key]
+        if (
+            locale_record.get("src") != locale_key
+            or locale_record.get("isDynamicEntry") is not True
+            or locale_record.get("imports", []) != []
+            or locale_record.get("dynamicImports", []) != []
+            or locale_record.get("assets", []) != []
+        ):
+            raise HermesUiBuildError("Iris UI locale catalogs must remain isolated dynamic chunks.")
+
+    reachable_keys: set[str] = set()
+    reachable_files: set[str] = set()
+    reachable_stylesheets: set[Path] = set()
+    chunk_files: dict[str, str] = {}
+    pending = ["index.html"]
+    while pending:
+        key = pending.pop()
+        if key in reachable_keys:
+            continue
+        record = manifest.get(key)
+        if record is None:
+            raise HermesUiBuildError("Iris UI Vite manifest references a missing chunk.")
+        reachable_keys.add(key)
+        file_name = record.get("file")
+        expected_stem = "index" if key == "index.html" else key.removeprefix("src/locales/").removesuffix(".ts")
+        if (
+            not isinstance(file_name, str)
+            or _FINGERPRINTED_ASSET_RE.fullmatch(file_name) is None
+            or not file_name.startswith(f"assets/{expected_stem}-")
+            or not file_name.endswith(".js")
+        ):
+            raise HermesUiBuildError("Iris UI Vite manifest references an unsafe output file.")
+        previous_key = chunk_files.setdefault(file_name, key)
+        if previous_key != key:
+            raise HermesUiBuildError("Iris UI Vite manifest maps multiple chunks to one output file.")
+        reachable_files.add(file_name)
+        stylesheets = record.get("css", [])
+        if not isinstance(stylesheets, list) or any(not isinstance(item, str) for item in stylesheets):
+            raise HermesUiBuildError("Iris UI Vite manifest has an invalid stylesheet collection.")
+        for stylesheet in stylesheets:
+            if _FINGERPRINTED_ASSET_RE.fullmatch(stylesheet) is None or not stylesheet.endswith(".css"):
+                raise HermesUiBuildError("Iris UI Vite manifest references an unsafe stylesheet.")
+            reachable_files.add(stylesheet)
+            reachable_stylesheets.add(dist_root / stylesheet)
+        for relation_name in ("imports", "dynamicImports"):
+            relations = record.get(relation_name, [])
+            if not isinstance(relations, list) or any(not isinstance(item, str) for item in relations):
+                raise HermesUiBuildError("Iris UI Vite manifest has an invalid chunk graph.")
+            pending.extend(relations)
+
+    if reachable_keys != set(manifest):
+        raise HermesUiBuildError("Iris UI Vite manifest contains an unreachable output entry.")
+    for relative in reachable_files:
+        candidate = dist_root / relative
+        if not candidate.is_file() or candidate.is_symlink() or candidate.stat().st_size == 0:
+            raise HermesUiBuildError("Iris UI Vite manifest references a missing output file.")
+
+    entry_file = entry.get("file")
+    entry_css = entry.get("css", [])
+    if (
+        not isinstance(entry_file, str)
+        or not entry_file.endswith(".js")
+        or not isinstance(entry_css, list)
+        or len(entry_css) != 1
+        or not isinstance(entry_css[0], str)
+        or not entry_css[0].endswith(".css")
+    ):
+        raise HermesUiBuildError("Iris UI entry must have one script and one stylesheet.")
+    return (
+        dist_root / entry_file,
+        dist_root / entry_css[0],
+        reachable_files,
+        reachable_stylesheets,
+    )
+
+
+def _decode_css_escapes(css_text: str) -> str:
+    """Decode CSS escapes before looking for browser-active URL syntax."""
+
+    def replace_escape(match: re.Match[str]) -> str:
+        hexadecimal = match.group("hex")
+        if hexadecimal is not None:
+            codepoint = int(hexadecimal, 16)
+            if codepoint == 0 or codepoint > 0x10FFFF or 0xD800 <= codepoint <= 0xDFFF:
+                return "\N{REPLACEMENT CHARACTER}"
+            return chr(codepoint)
+        if match.group("newline") is not None:
+            return ""
+        escaped_character = match.group("char")
+        return escaped_character if escaped_character is not None else ""
+
+    return _CSS_ESCAPE_RE.sub(replace_escape, css_text)
+
+
+def _validate_stylesheet(stylesheet: Path) -> None:
+    """Reject imports and non-inline URLs, including CSS-escaped spellings."""
+    try:
+        css_text = stylesheet.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise HermesUiBuildError(f"Iris UI stylesheet is unreadable: {stylesheet.name}") from exc
+    normalized_css = _CSS_COMMENT_RE.sub("", _decode_css_escapes(css_text))
+    if "@import" in normalized_css.casefold():
+        raise HermesUiBuildError(f"Iris UI stylesheet contains an active import: {stylesheet.name}")
+
+    cursor = 0
+    while match := _CSS_URL_FUNCTION_RE.search(normalized_css, cursor):
+        end = normalized_css.find(")", match.end())
+        if end == -1:
+            raise HermesUiBuildError(f"Iris UI stylesheet contains an incomplete URL: {stylesheet.name}")
+        raw_reference = normalized_css[match.end() : end].strip()
+        if raw_reference[:1] in {'"', "'"}:
+            quote = raw_reference[0]
+            if len(raw_reference) < 2 or raw_reference[-1] != quote:
+                raise HermesUiBuildError(f"Iris UI stylesheet contains an incomplete URL: {stylesheet.name}")
+            reference = raw_reference[1:-1].strip()
+        else:
+            reference = raw_reference
+        if not reference.casefold().startswith("data:image/"):
+            raise HermesUiBuildError(f"Iris UI stylesheet contains a non-inline runtime URL: {stylesheet.name}")
+        cursor = end + 1
+
+
 def _validate_dist(dist_root: Path, *, repository_root: Path) -> None:
     """Validate the generated tree before Hatch reads any of its files."""
     if not dist_root.is_dir() or dist_root.is_symlink():
-        raise HermesUiBuildError(f"Hermes UI output directory is unavailable: {dist_root}")
+        raise HermesUiBuildError(f"Iris UI output directory is unavailable: {dist_root}")
     required = (
         dist_root / "index.html",
         dist_root / "assets" / "legacy.css",
         dist_root / _BUILD_MANIFEST,
     )
     if any(not path.is_file() or path.is_symlink() or path.stat().st_size == 0 for path in required):
-        raise HermesUiBuildError("Hermes UI output is missing index.html, login styles, or its build manifest.")
+        raise HermesUiBuildError("Iris UI output is missing index.html, login styles, or its build manifest.")
 
-    javascript = list((dist_root / "assets").glob("index-*.js"))
-    stylesheets = list((dist_root / "assets").glob("index-*.css"))
-    if len(javascript) != 1 or len(stylesheets) != 1:
-        raise HermesUiBuildError("Hermes UI output must contain one fingerprinted React script and stylesheet.")
+    (
+        entry_javascript,
+        entry_stylesheet,
+        reachable_assets,
+        reachable_stylesheets,
+    ) = _reachable_vite_assets(dist_root)
+    javascript = [entry_javascript]
+    stylesheets = [entry_stylesheet]
     allowed_files = {
         "index.html",
         _BUILD_MANIFEST,
+        _VITE_MANIFEST,
         "assets/legacy.css",
-        javascript[0].relative_to(dist_root).as_posix(),
-        stylesheets[0].relative_to(dist_root).as_posix(),
+        *reachable_assets,
     }
     for candidate in dist_root.rglob("*"):
         if candidate.is_symlink() or (candidate.exists() and not (candidate.is_dir() or candidate.is_file())):
-            raise HermesUiBuildError(f"Hermes UI output contains an unsupported filesystem entry: {candidate}")
+            raise HermesUiBuildError(f"Iris UI output contains an unsupported filesystem entry: {candidate}")
         if candidate.is_file() and candidate.stat().st_size == 0:
-            raise HermesUiBuildError(f"Hermes UI output contains an empty file: {candidate}")
-        if (
-            candidate.is_file()
-            and candidate.relative_to(dist_root).as_posix() not in allowed_files
-        ):
-            raise HermesUiBuildError(
-                f"Hermes UI output contains an unexpected file: {candidate}"
-            )
+            raise HermesUiBuildError(f"Iris UI output contains an empty file: {candidate}")
+        if candidate.is_file() and candidate.relative_to(dist_root).as_posix() not in allowed_files:
+            raise HermesUiBuildError(f"Iris UI output contains an unexpected file: {candidate}")
 
     index_text = required[0].read_text(encoding="utf-8")
     collector = _EntryPointReferenceCollector()
     collector.feed(index_text)
     if collector.duplicate_attributes:
-        duplicate_attributes = ", ".join(
-            f"{tag}[{name}]" for tag, name in sorted(collector.duplicate_attributes)
-        )
-        raise HermesUiBuildError(
-            "Hermes UI entry point contains duplicate HTML attributes: "
-            f"{duplicate_attributes}"
-        )
+        duplicate_attributes = ", ".join(f"{tag}[{name}]" for tag, name in sorted(collector.duplicate_attributes))
+        raise HermesUiBuildError(f"Iris UI entry point contains duplicate HTML attributes: {duplicate_attributes}")
     if collector.inline_active_content:
         active_tags = ", ".join(sorted(collector.inline_active_content))
-        raise HermesUiBuildError(
-            f"Hermes UI entry point contains unsafe inline active content: {active_tags}"
-        )
+        raise HermesUiBuildError(f"Iris UI entry point contains unsafe inline active content: {active_tags}")
     referenced_module_scripts: list[Path] = []
     referenced_stylesheets: list[Path] = []
     favicon_links = 0
@@ -521,7 +693,7 @@ def _validate_dist(dist_root: Path, *, repository_root: Path) -> None:
             or any(name.startswith("on") for name in attributes)
             or (attributes.get("http-equiv") or "").casefold() == "refresh"
         ):
-            raise HermesUiBuildError(f"Hermes UI entry point contains an unsafe active element: {tag}")
+            raise HermesUiBuildError(f"Iris UI entry point contains an unsafe active element: {tag}")
         if tag == "script":
             if (
                 not {"type", "src"}.issubset(attributes)
@@ -529,11 +701,11 @@ def _validate_dist(dist_root: Path, *, repository_root: Path) -> None:
                 or attributes["type"] != "module"
                 or attributes.get("crossorigin") not in {None, ""}
             ):
-                raise HermesUiBuildError("Hermes UI entry point contains an unexpected script element.")
+                raise HermesUiBuildError("Iris UI entry point contains an unexpected script element.")
         elif tag == "link":
             favicon_attributes = {
                 "rel": "icon",
-                "href": "/favicon.ico",
+                "href": "/favicon.ico?v=iris",
                 "type": "image/svg+xml",
                 "sizes": "any",
             }
@@ -546,62 +718,45 @@ def _validate_dist(dist_root: Path, *, repository_root: Path) -> None:
                 or attributes["rel"] != "stylesheet"
                 or attributes.get("crossorigin") not in {None, ""}
             ):
-                raise HermesUiBuildError("Hermes UI entry point contains an unexpected link element.")
+                raise HermesUiBuildError("Iris UI entry point contains an unexpected link element.")
         active_attributes = browser_url_attributes.intersection(attributes)
         if not active_attributes:
             continue
         expected_attribute = "href" if tag == "link" else "src" if tag == "script" else None
         if expected_attribute is None or active_attributes != {expected_attribute}:
-            raise HermesUiBuildError(f"Hermes UI entry point contains an unsafe active element: {tag}")
+            raise HermesUiBuildError(f"Iris UI entry point contains an unsafe active element: {tag}")
         reference = attributes[expected_attribute]
         if reference is None:
-            raise HermesUiBuildError(f"Hermes UI entry point contains an empty runtime reference: {tag}")
+            raise HermesUiBuildError(f"Iris UI entry point contains an empty runtime reference: {tag}")
         prefix = "/mail/assets/"
-        if not reference.startswith(prefix) or any(
-            character in reference for character in ("\\", ":", "?", "#", "%")
-        ):
-            raise HermesUiBuildError(f"Hermes UI entry point contains an unsafe runtime reference: {reference}")
+        if not reference.startswith(prefix) or any(character in reference for character in ("\\", ":", "?", "#", "%")):
+            raise HermesUiBuildError(f"Iris UI entry point contains an unsafe runtime reference: {reference}")
         relative = Path(reference.removeprefix(prefix))
         if relative.is_absolute() or ".." in relative.parts:
-            raise HermesUiBuildError(f"Hermes UI entry point contains an unsafe runtime reference: {reference}")
+            raise HermesUiBuildError(f"Iris UI entry point contains an unsafe runtime reference: {reference}")
         target = dist_root / "assets" / relative
         if not target.is_file() or target.is_symlink():
-            raise HermesUiBuildError(f"Hermes UI entry point references a missing build asset: {reference}")
+            raise HermesUiBuildError(f"Iris UI entry point references a missing build asset: {reference}")
         if tag == "script" and attributes.get("type") == "module":
             referenced_module_scripts.append(target)
         if tag == "link" and "stylesheet" in (attributes.get("rel") or "").split():
             referenced_stylesheets.append(target)
-    if (
-        referenced_module_scripts != javascript
-        or referenced_stylesheets != stylesheets
-        or favicon_links != 1
-    ):
+    if referenced_module_scripts != javascript or referenced_stylesheets != stylesheets or favicon_links != 1:
         raise HermesUiBuildError(
-            "Hermes UI entry point must contain exactly one built module script, "
+            "Iris UI entry point must contain exactly one built module script, "
             "one built stylesheet, and the exact favicon link."
         )
 
-    for stylesheet in (*stylesheets, dist_root / "assets" / "legacy.css"):
-        css_text = stylesheet.read_text(encoding="utf-8")
-        lowered_css = css_text.casefold()
-        if "@import" in lowered_css:
-            raise HermesUiBuildError(f"Hermes UI stylesheet contains an active import: {stylesheet.name}")
-        cursor = 0
-        while (start := lowered_css.find("url(", cursor)) != -1:
-            end = lowered_css.find(")", start + 4)
-            if end == -1:
-                raise HermesUiBuildError(f"Hermes UI stylesheet contains an incomplete URL: {stylesheet.name}")
-            reference = css_text[start + 4 : end].strip().strip("\"'")
-            if not reference.casefold().startswith("data:image/"):
-                raise HermesUiBuildError(
-                    f"Hermes UI stylesheet contains a non-inline runtime URL: {stylesheet.name}"
-                )
-            cursor = end + 1
+    for stylesheet in (
+        *sorted(reachable_stylesheets),
+        dist_root / "assets" / "legacy.css",
+    ):
+        _validate_stylesheet(stylesheet)
 
     try:
         manifest = json.loads((dist_root / _BUILD_MANIFEST).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        raise HermesUiBuildError("Hermes UI build manifest is invalid.") from exc
+        raise HermesUiBuildError("Iris UI build manifest is invalid.") from exc
     expected_manifest = {
         "schema": 1,
         "node_version": _NODE_VERSION,
@@ -610,7 +765,7 @@ def _validate_dist(dist_root: Path, *, repository_root: Path) -> None:
         _DIST_HASHES_KEY: _dist_file_hashes(dist_root),
     }
     if manifest != expected_manifest:
-        raise HermesUiBuildError("Hermes UI assets do not match the current source tree and pinned toolchain.")
+        raise HermesUiBuildError("Iris UI assets do not match the current source tree and pinned toolchain.")
 
 
 def _build_ui_in_stage(repository_root: Path) -> tuple[_StageDirectory, Path]:
@@ -646,9 +801,7 @@ def _build_ui_in_stage(repository_root: Path) -> tuple[_StageDirectory, Path]:
             "npm_config_globalconfig": str(npm_global_config),
             "npm_config_userconfig": str(npm_config),
         }
-        environment.update(
-            _allowlisted_windows_environment(os.environ, platform_name=os.name)
-        )
+        environment.update(_allowlisted_windows_environment(os.environ, platform_name=os.name))
         node_version, npm_version = _verify_toolchain(
             repository_root,
             node=node,
@@ -688,7 +841,7 @@ def _build_ui_in_stage(repository_root: Path) -> tuple[_StageDirectory, Path]:
 
 
 class CustomBuildHook(BuildHookInterface):
-    """Attach one validated Hermes UI tree to sdist and standard wheel builds."""
+    """Attach one validated Iris UI tree to sdist and standard wheel builds."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -712,9 +865,7 @@ class CustomBuildHook(BuildHookInterface):
         if self.target_name == "wheel" and version == "editable":
             return
         if self.target_name not in {"sdist", "wheel"} or version != "standard":
-            raise HermesUiBuildError(
-                f"Unsupported Hermes UI build target: {self.target_name}/{version}"
-            )
+            raise HermesUiBuildError(f"Unsupported Iris UI build target: {self.target_name}/{version}")
 
         packaged_dist = repository_root / _UI_DIST_SOURCE
         building_wheel_from_sdist = self.target_name == "wheel" and (repository_root / "PKG-INFO").is_file()
@@ -731,7 +882,7 @@ class CustomBuildHook(BuildHookInterface):
         source_digest_at_build = manifest.get("source_sha256")
         if not isinstance(source_digest_at_build, str) or len(source_digest_at_build) != 64:
             _cleanup_stage_directory(stage, repository_root)
-            raise HermesUiBuildError("Hermes UI build manifest has no valid source digest.")
+            raise HermesUiBuildError("Iris UI build manifest has no valid source digest.")
         self._stages.append((stage, source_digest_at_build))
         self._artifact_dist_roots.append(dist_root)
 
@@ -743,9 +894,7 @@ class CustomBuildHook(BuildHookInterface):
         repository_root = Path(self.root).resolve(strict=True)
         try:
             if any(_source_digest(repository_root) != expected for _stage, expected in self._stages):
-                raise HermesUiBuildError(
-                    "UI sources changed while Hatch was assembling the distribution artifact."
-                )
+                raise HermesUiBuildError("UI sources changed while Hatch was assembling the distribution artifact.")
             for dist_root in self._artifact_dist_roots:
                 _validate_dist(dist_root, repository_root=repository_root)
                 _validate_artifact_ui(

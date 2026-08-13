@@ -34,11 +34,15 @@ from pathlib import Path
 from typing import Any, Final, TypeVar, cast
 
 import anyio
+from sqlalchemy import MetaData
 from sqlalchemy.exc import OperationalError, TimeoutError as SATimeoutError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.schema import CreateIndex, CreateTable
+from sqlalchemy.sql.schema import Table
 from sqlmodel import SQLModel
 
 from .config import DatabaseSettings, Settings, clear_settings_cache, get_settings
+from .models import MAIL_UI_LOCALE_VALUES, UiUser
 
 T = TypeVar("T")
 _logger = logging.getLogger(__name__)
@@ -117,6 +121,7 @@ class CircuitBreakerOpenError(Exception):
 _QUERY_TRACKER: contextvars.ContextVar["QueryTracker | None"] = contextvars.ContextVar("query_tracker", default=None)
 _QUERY_HOOKS_INSTALLED = False
 _SLOW_QUERY_LIMIT = 50
+_MAIL_UI_LOCALE_SQL = ", ".join(repr(value) for value in MAIL_UI_LOCALE_VALUES)
 _SQL_TABLE_RE = re.compile(r"\bfrom\s+([\w\.\"`\[\]]+)", re.IGNORECASE)
 _SQL_UPDATE_RE = re.compile(r"\bupdate\s+([\w\.\"`\[\]]+)", re.IGNORECASE)
 _SQL_INSERT_RE = re.compile(r"\binsert\s+into\s+([\w\.\"`\[\]]+)", re.IGNORECASE)
@@ -428,6 +433,13 @@ def _build_engine(settings: DatabaseSettings) -> AsyncEngine:
             """
             cursor = dbapi_conn.cursor()
             try:
+                # SQLite leaves foreign-key enforcement disabled on every new
+                # connection unless the application enables it explicitly.
+                # This must be connection-local: enabling it on the one
+                # connection used by a schema migration does not protect later
+                # pool checkouts.
+                cursor.execute("PRAGMA foreign_keys=ON")
+
                 # Enable WAL mode for concurrent reads/writes
                 # This is persistent - only needs to be set once per database file
                 cursor.execute("PRAGMA journal_mode=WAL")
@@ -753,6 +765,141 @@ def get_db_health_status() -> dict[str, Any]:
     return status
 
 
+def _ui_users_locale_schema_needs_rebuild(connection: Any) -> bool:
+    """Return whether an existing UI-account table still has the two-locale schema."""
+    row = connection.exec_driver_sql(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ui_users'"
+    ).fetchone()
+    if row is None:
+        return False
+    create_sql = re.sub(r"\s+", " ", str(row[0])).casefold()
+    return (
+        "preferred_ui_locale varchar(16)" not in create_sql
+        or "preferred_correspondence_locale varchar(16)" not in create_sql
+        or any(repr(value).casefold() not in create_sql for value in MAIL_UI_LOCALE_VALUES)
+    )
+
+
+def _rebuild_ui_users_locale_schema(connection: Any) -> None:
+    """Rebuild ``ui_users`` with the canonical locale CHECK inside one transaction."""
+    if not _ui_users_locale_schema_needs_rebuild(connection):
+        return
+
+    dependent_schema_objects = connection.exec_driver_sql(
+        """
+        SELECT type, name, sql
+        FROM sqlite_master
+        WHERE sql IS NOT NULL
+          AND (
+              (type = 'index' AND tbl_name = 'ui_users')
+              OR (
+                  type IN ('trigger', 'view')
+                  AND (tbl_name = 'ui_users' OR instr(lower(sql), 'ui_users') > 0)
+              )
+          )
+        ORDER BY type, name
+        """
+    ).fetchall()
+    ui_users_table = cast(Table, getattr(UiUser, "__table__"))  # noqa: B009
+    existing_columns = {
+        str(row[1]) for row in connection.exec_driver_sql("PRAGMA table_info(ui_users)")
+    }
+    expected_columns = [column.name for column in ui_users_table.columns]
+    missing_columns = set(expected_columns) - existing_columns
+    if missing_columns:
+        missing = ", ".join(sorted(missing_columns))
+        raise RuntimeError(f"ui_users locale migration is missing columns: {missing}")
+
+    temporary_metadata = MetaData()
+    temporary_table = ui_users_table.to_metadata(
+        temporary_metadata,
+        name="ui_users_locale_v2",
+    )
+    connection.execute(CreateTable(temporary_table))
+    quoted_columns = ", ".join(f'"{name}"' for name in expected_columns)
+    connection.exec_driver_sql(
+        f'INSERT INTO "ui_users_locale_v2" ({quoted_columns}) '
+        f'SELECT {quoted_columns} FROM "ui_users"'
+    )
+
+    source_count = int(
+        connection.exec_driver_sql("SELECT COUNT(*) FROM ui_users").scalar_one()
+    )
+    target_count = int(
+        connection.exec_driver_sql("SELECT COUNT(*) FROM ui_users_locale_v2").scalar_one()
+    )
+    forward_difference = connection.exec_driver_sql(
+        f"SELECT 1 FROM (SELECT {quoted_columns} FROM ui_users "
+        f"EXCEPT SELECT {quoted_columns} FROM ui_users_locale_v2) LIMIT 1"
+    ).fetchone()
+    reverse_difference = connection.exec_driver_sql(
+        f"SELECT 1 FROM (SELECT {quoted_columns} FROM ui_users_locale_v2 "
+        f"EXCEPT SELECT {quoted_columns} FROM ui_users) LIMIT 1"
+    ).fetchone()
+    if (
+        source_count != target_count
+        or forward_difference is not None
+        or reverse_difference is not None
+    ):
+        raise RuntimeError("ui_users locale migration did not preserve every account row")
+
+    identifier_preparer = connection.dialect.identifier_preparer
+    for object_type, name, _sql in dependent_schema_objects:
+        if object_type not in {"trigger", "view"}:
+            continue
+        quoted_name = identifier_preparer.quote(str(name))
+        connection.exec_driver_sql(f"DROP {str(object_type).upper()} {quoted_name}")
+
+    connection.exec_driver_sql("DROP TABLE ui_users")
+    connection.exec_driver_sql("ALTER TABLE ui_users_locale_v2 RENAME TO ui_users")
+
+    replaced_locale_triggers = {"ui_users_locale_guard_bi", "ui_users_locale_guard_bu"}
+    for object_type in ("view", "index", "trigger"):
+        for stored_type, name, sql in dependent_schema_objects:
+            if stored_type != object_type or name in replaced_locale_triggers:
+                continue
+            connection.exec_driver_sql(str(sql))
+
+    existing_indexes = {
+        str(row[0])
+        for row in connection.exec_driver_sql(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'ui_users'"
+        )
+    }
+    for index in sorted(ui_users_table.indexes, key=lambda item: item.name or ""):
+        if index.name not in existing_indexes:
+            connection.execute(CreateIndex(index))
+
+    violations = connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise RuntimeError("ui_users locale migration failed foreign-key validation")
+
+
+async def _migrate_ui_users_locale_schema(engine: AsyncEngine) -> None:
+    """Run the SQLite table rebuild with FK enforcement paused only for the transaction."""
+    async with engine.connect() as connection:
+        if connection.dialect.name != "sqlite":
+            return
+        await connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        await connection.commit()
+        try:
+            await connection.exec_driver_sql("BEGIN IMMEDIATE")
+            await connection.run_sync(_rebuild_ui_users_locale_schema)
+            await connection.commit()
+        except BaseException:
+            with suppress(BaseException):
+                await connection.rollback()
+            raise
+        finally:
+            await connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+            foreign_keys_enabled = int(
+                (await connection.exec_driver_sql("PRAGMA foreign_keys")).scalar_one()
+            )
+            if foreign_keys_enabled != 1:
+                raise RuntimeError("SQLite foreign-key enforcement was not restored")
+            await connection.commit()
+
+
 @retry_on_db_lock(max_retries=7, base_delay=0.1, max_delay=8.0, use_circuit_breaker=False)
 async def ensure_schema(settings: Settings | None = None) -> None:
     """Ensure database schema exists (creates tables from SQLModel definitions).
@@ -782,6 +929,12 @@ async def ensure_schema(settings: Settings | None = None) -> None:
             # (WAL mode is set automatically via event listener in _build_engine)
             await conn.run_sync(SQLModel.metadata.create_all)
             # Setup FTS and custom indexes
+            await conn.run_sync(_setup_fts)
+        # SQLite cannot widen a table-level CHECK in place. Rebuild the one
+        # account table atomically after additive legacy migrations have made
+        # every current column available, then recreate its dropped triggers.
+        await _migrate_ui_users_locale_schema(engine)
+        async with engine.begin() as conn:
             await conn.run_sync(_setup_fts)
         _schema_ready = True
 
@@ -972,8 +1125,8 @@ def _setup_fts(connection: Any) -> None:
         "ALTER TABLE ui_users ADD COLUMN session_generation VARCHAR(64) DEFAULT NULL",
         "ALTER TABLE ui_users ADD COLUMN display_name VARCHAR(128) DEFAULT NULL",
         "ALTER TABLE ui_users ADD COLUMN profile_revision INTEGER NOT NULL DEFAULT 1",
-        "ALTER TABLE ui_users ADD COLUMN preferred_ui_locale VARCHAR(2) NOT NULL DEFAULT 'en'",
-        "ALTER TABLE ui_users ADD COLUMN preferred_correspondence_locale VARCHAR(2) DEFAULT NULL",
+        "ALTER TABLE ui_users ADD COLUMN preferred_ui_locale VARCHAR(16) NOT NULL DEFAULT 'en'",
+        "ALTER TABLE ui_users ADD COLUMN preferred_correspondence_locale VARCHAR(16) DEFAULT NULL",
         "ALTER TABLE ui_access_audit_events ADD COLUMN "
         "actor_account_generation_snapshot VARCHAR(64) DEFAULT NULL",
         "ALTER TABLE ui_access_audit_events ADD COLUMN "
@@ -1026,17 +1179,23 @@ def _setup_fts(connection: Any) -> None:
         """
     )
     connection.exec_driver_sql(
-        """
+        f"""
         UPDATE ui_users
         SET preferred_ui_locale = CASE
-            WHEN lower(trim(COALESCE(preferred_ui_locale, ''))) IN ('en', 'pl')
-                THEN lower(trim(preferred_ui_locale))
+            WHEN trim(COALESCE(preferred_ui_locale, '')) COLLATE NOCASE
+                 IN ({_MAIL_UI_LOCALE_SQL})
+                THEN CASE lower(trim(preferred_ui_locale))
+                    {" ".join(f"WHEN {value.casefold()!r} THEN {value!r}" for value in MAIL_UI_LOCALE_VALUES)}
+                END
             ELSE 'en'
         END,
         preferred_correspondence_locale = CASE
             WHEN preferred_correspondence_locale IS NULL THEN NULL
-            WHEN lower(trim(preferred_correspondence_locale)) IN ('en', 'pl')
-                THEN lower(trim(preferred_correspondence_locale))
+            WHEN trim(preferred_correspondence_locale) COLLATE NOCASE
+                 IN ({_MAIL_UI_LOCALE_SQL})
+                THEN CASE lower(trim(preferred_correspondence_locale))
+                    {" ".join(f"WHEN {value.casefold()!r} THEN {value!r}" for value in MAIL_UI_LOCALE_VALUES)}
+                END
             ELSE NULL
         END
         """
@@ -1070,17 +1229,18 @@ def _setup_fts(connection: Any) -> None:
         END
         """
     )
+    connection.exec_driver_sql("DROP TRIGGER IF EXISTS ui_users_locale_guard_bi")
     connection.exec_driver_sql(
-        """
+        f"""
         CREATE TRIGGER IF NOT EXISTS ui_users_locale_guard_bi
         BEFORE INSERT ON ui_users
         BEGIN
             SELECT RAISE(ABORT, 'invalid preferred_ui_locale')
             WHERE new.preferred_ui_locale IS NULL
-               OR new.preferred_ui_locale NOT IN ('en', 'pl');
+               OR new.preferred_ui_locale NOT IN ({_MAIL_UI_LOCALE_SQL});
             SELECT RAISE(ABORT, 'invalid preferred_correspondence_locale')
             WHERE new.preferred_correspondence_locale IS NOT NULL
-              AND new.preferred_correspondence_locale NOT IN ('en', 'pl');
+              AND new.preferred_correspondence_locale NOT IN ({_MAIL_UI_LOCALE_SQL});
         END
         """
     )
@@ -1110,17 +1270,18 @@ def _setup_fts(connection: Any) -> None:
         END
         """
     )
+    connection.exec_driver_sql("DROP TRIGGER IF EXISTS ui_users_locale_guard_bu")
     connection.exec_driver_sql(
-        """
+        f"""
         CREATE TRIGGER IF NOT EXISTS ui_users_locale_guard_bu
         BEFORE UPDATE OF preferred_ui_locale, preferred_correspondence_locale ON ui_users
         BEGIN
             SELECT RAISE(ABORT, 'invalid preferred_ui_locale')
             WHERE new.preferred_ui_locale IS NULL
-               OR new.preferred_ui_locale NOT IN ('en', 'pl');
+               OR new.preferred_ui_locale NOT IN ({_MAIL_UI_LOCALE_SQL});
             SELECT RAISE(ABORT, 'invalid preferred_correspondence_locale')
             WHERE new.preferred_correspondence_locale IS NOT NULL
-              AND new.preferred_correspondence_locale NOT IN ('en', 'pl');
+              AND new.preferred_correspondence_locale NOT IN ({_MAIL_UI_LOCALE_SQL});
         END
         """
     )

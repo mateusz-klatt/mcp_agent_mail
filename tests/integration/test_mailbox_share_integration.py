@@ -206,14 +206,21 @@ def test_share_export_end_to_end(monkeypatch, tmp_path: Path) -> None:
     )
 
     stats = manifest["attachments"]["stats"]
-    assert stats["inline"] == 1
-    assert stats["copied"] == 1
-    assert stats["externalized"] == 1
+    assert stats["inline"] == 0
+    assert stats["copied"] == 0
+    assert stats["externalized"] == 0
     assert stats["missing"] == 0
+    assert manifest["attachments"]["items"] == []
     assert manifest["scrub"]["preset"] == "standard"
+    assert manifest["scrub"]["attachments_cleared"] == 1
 
     hosting_detected = {entry["id"] for entry in manifest.get("hosting", {}).get("detected", [])}
     assert "github_pages" in hosting_detected
+
+    redirect_content = (output_dir / "index.html").read_text(encoding="utf-8")
+    assert "<title>Iris · Agent Mail Viewer</title>" in redirect_content
+    assert '<h1><span aria-hidden="true">🌈</span> Iris</h1>' in redirect_content
+    assert "%26%23x1F308%3B" in redirect_content
 
     viewer_dir = output_dir / "viewer"
     assert (viewer_dir / "index.html").is_file()
@@ -226,7 +233,8 @@ def test_share_export_end_to_end(monkeypatch, tmp_path: Path) -> None:
     index_content = (viewer_dir / "index.html").read_text(encoding="utf-8")
     # The legacy "Static Viewer" compat marker was removed (#224); assert the
     # stable page title instead, which still proves index.html was exported.
-    assert "Agent Mail Viewer" in index_content
+    assert "Iris · Agent Mail Viewer" in index_content
+    assert '<span aria-hidden="true">🌈</span> Iris' in index_content
     assert "https://cdn." not in index_content
     assert "https://unpkg.com" not in index_content
     assert "https://fonts." not in index_content

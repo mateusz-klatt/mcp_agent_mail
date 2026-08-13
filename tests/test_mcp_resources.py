@@ -21,16 +21,16 @@ Reference: mcp_agent_mail-hqk
 from __future__ import annotations
 
 import json
-from typing import Any, cast
+import sqlite3
+from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
 import pytest
 from fastmcp import Client
-from sqlalchemy import delete
 
 from mcp_agent_mail.app import build_mcp_server
-from mcp_agent_mail.db import get_session
-from mcp_agent_mail.models import Agent
+from mcp_agent_mail.config import get_settings
 from tests.keys import pkey
 
 # ============================================================================
@@ -921,11 +921,10 @@ async def test_agent_scoped_resources_require_project(isolated_env, uri_template
             await client.read_resource(uri_template.format(agent=agent_name))
 
 
-# When an Agent row is deleted out from under an outstanding FileReservation
-# (manual hygiene, project rotation, test reset), the reservation must still
-# be discoverable so the staleness sweeper can release it. Before #161 the
-# INNER JOIN dropped these rows from the listing entirely, leaving the path
-# pinned forever. (#161)
+# When external corruption deletes an Agent row out from under an outstanding
+# FileReservation, the reservation must still be discoverable so the staleness
+# sweeper can release it. Before #161 the INNER JOIN dropped these rows from
+# the listing entirely, leaving the path pinned forever. (#161)
 @pytest.mark.asyncio
 async def test_file_reservations_resource_surfaces_orphaned(isolated_env):
     server = build_mcp_server()
@@ -936,6 +935,7 @@ async def test_file_reservations_resource_surfaces_orphaned(isolated_env):
             {"project_key": "orphan", "program": "test", "model": "test"},
         )
         agent_name = agent_result.data["name"]
+        agent_id = int(agent_result.data["id"])
 
         await client.call_tool(
             "file_reservation_paths",
@@ -946,11 +946,27 @@ async def test_file_reservations_resource_surfaces_orphaned(isolated_env):
             },
         )
 
-        # Delete the owning agent row out-of-band — mimics the operational
-        # condition the issue describes.
-        async with get_session() as session:
-            await session.execute(delete(Agent).where(cast(Any, Agent.name) == agent_name))
-            await session.commit()
+        # Simulate a database that was manually corrupted outside the
+        # application. Normal connections enforce the FileReservation FK and
+        # hard-delete removes reservations first; this raw connection
+        # deliberately does neither so the orphan-recovery path remains tested
+        # while retaining the original agent_id for forensics.
+        database_url = get_settings().database.url
+        prefix = "sqlite+aiosqlite:///"
+        assert database_url.startswith(prefix)
+        database_path = Path(database_url.removeprefix(prefix))
+        with sqlite3.connect(database_path) as connection:
+            connection.execute("PRAGMA foreign_keys=ON")
+            with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+                connection.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
+            connection.rollback()
+            connection.execute("PRAGMA foreign_keys=OFF")
+            deleted = connection.execute(
+                "DELETE FROM agents WHERE id = ?",
+                (agent_id,),
+            )
+            assert deleted.rowcount == 1
+            connection.commit()
 
         # Orphaned reservations are stale=True by definition, so the resource
         # endpoint auto-releases them via `_expire_stale_file_reservations`

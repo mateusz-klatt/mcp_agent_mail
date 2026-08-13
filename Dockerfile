@@ -9,7 +9,7 @@
 # TOON encoder at all, so every `format='toon'` request from a container
 # deployment was silently downgraded — see issue #163.
 #
-# We build the encoder from source pinned to a specific ref (default: main)
+# We build the encoder from source pinned to a specific commit by default
 # so the container's TOON output matches a known toon_rust commit, then copy
 # the single binary into the runtime stage. The crate name on cargo install
 # is `tru` but the [[bin]] target name is `toon`, so we rename on copy.
@@ -19,8 +19,8 @@
 #
 # toon_rust pins nightly via rust-toolchain.toml. Install rustup into a
 # stable Debian base, let the toolchain file drive channel selection — that
-# way this builder stage tracks whatever toon_rust pins without us having
-# to bump a hard-coded image tag every nightly cycle.
+# way the upstream repository controls its own compiler requirements without
+# making the source revision itself mutable.
 FROM debian:bookworm-slim AS tru-builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -36,7 +36,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain none --profile minimal --no-modify-path
 
 ARG TOON_RUST_REPO=https://github.com/Dicklesworthstone/toon_rust.git
-ARG TOON_RUST_REF=main
+ARG TOON_RUST_REF=cb256dcf73ab78c248a14f65840a3fa722ec8682
 
 # Resolve ${TOON_RUST_REF} as a branch name, tag, or full 40-char commit
 # SHA. We can't use `git clone --depth 1 --branch <ref>` because `--branch`
@@ -96,7 +96,7 @@ from zipfile import ZipFile
 
 wheels = list(Path("/artifacts").glob("*.whl"))
 if len(wheels) != 1:
-    raise RuntimeError(f"Expected one Hermes wheel, found {len(wheels)}")
+    raise RuntimeError(f"Expected one Iris wheel, found {len(wheels)}")
 prefix = PurePosixPath("mcp_agent_mail/ui_dist")
 output = Path("/ui/dist")
 with ZipFile(wheels[0]) as archive:
@@ -106,7 +106,7 @@ with ZipFile(wheels[0]) as archive:
         if PurePosixPath(info.filename).is_relative_to(prefix) and not info.is_dir()
     ]
     if not members:
-        raise RuntimeError("The Hermes wheel does not contain ui_dist")
+        raise RuntimeError("The Iris wheel does not contain ui_dist")
     for info in members:
         relative = PurePosixPath(info.filename).relative_to(prefix)
         if relative.is_absolute() or ".." in relative.parts:
@@ -116,7 +116,7 @@ with ZipFile(wheels[0]) as archive:
         with archive.open(info) as source, target.open("xb") as destination:
             copyfileobj(source, destination)
 if not (output / "index.html").is_file() or not (output / ".hermes-ui-build.json").is_file():
-    raise RuntimeError("Validated Hermes index or build manifest is missing")
+    raise RuntimeError("Validated Iris index or build manifest is missing")
 PY
 
 # --------------------------------------------------------------------------

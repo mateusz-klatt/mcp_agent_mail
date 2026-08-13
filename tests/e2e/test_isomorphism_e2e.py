@@ -745,13 +745,17 @@ async def test_isomorphism_e2e_suite(
             await client.call_tool("search_messages", {"project_key": alpha_key, "query": "Launch", "limit": 5})
         )
 
-        # The legacy HTML mailbox was removed at canonical cutover. Search is
-        # exposed only through MCP tools/resources and the React HTTP surface.
+        # The removed HTML mailbox has one enumerated bookmark bridge into the
+        # typed React search route.  The bridge must stay project-bound and
+        # preserve only the supported search fields.
         app = build_http_app(get_settings(), server=server)
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as http_client:
             legacy_mailbox = await http_client.get(f"/mail/{alpha_key}", params={"q": "Launch"})
-        assert legacy_mailbox.status_code == 404
+        assert legacy_mailbox.status_code == 307
+        assert legacy_mailbox.headers["location"] == (
+            f"/mail#search?q=Launch&project={alpha_project['id']}&scope=all&order=relevance"
+        )
         phases.append(
             {
                 "phase": "search",
@@ -859,6 +863,7 @@ async def test_isomorphism_e2e_suite(
             snapshot_path=snapshot_path,
             project_filters=[],
             scrub_preset="standard",
+            purpose="viewer_export",
         )
         summary = share.summarize_snapshot(
             snapshot_path,

@@ -9,16 +9,16 @@
        stylesheet, font, database, and WASM resources are bundled with the export. -->
   <meta http-equiv="Content-Security-Policy"
     content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: blob:; connect-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none';" />
-  <title>Agent Mail Viewer</title>
+  <title>Iris · Agent Mail Viewer</title>
 
   <!-- Preload critical assets to reduce time-to-interactive -->
   <link rel="preload" href="./vendor/sql-wasm.js" as="script" crossorigin="anonymous">
   <link rel="preload" href="./vendor/sql-wasm.wasm" as="fetch" type="application/wasm" crossorigin="anonymous">
   <link rel="preload" href="../mailbox.sqlite3" as="fetch" crossorigin="anonymous">
 
-  <!-- Favicon to prevent 404s in preview -->
+  <!-- Iris rainbow favicon; local data only, so exported viewers stay air-gapped. -->
   <link rel="icon"
-    href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='8' fill='%236366F1'/%3E%3Cpath d='M8 20h48v24H8z' fill='white'/%3E%3Cpath d='M8 20l24 18 24-18' stroke='%236366F1' stroke-width='4' fill='none'/%3E%3C/svg%3E" />
+    href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ctext x='32' y='47' text-anchor='middle' font-size='48'%3E%26%23x1F308%3B%3C/text%3E%3C/svg%3E" />
 
   <!-- Tailwind is compiled against this viewer at release time and shipped locally. -->
   <link rel="stylesheet" href="./vendor/tailwind.min.css"
@@ -322,8 +322,7 @@
       class="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 px-4 sm:px-6 py-2.5 flex items-center justify-between gap-2 sticky top-0 z-30">
       <div class="flex min-w-0 items-center gap-2 sm:gap-4">
         <h1 class="text-xl font-bold text-slate-900 dark:text-white flex items-center gap-2">
-          <i data-lucide="mail" class="w-6 h-6 text-primary-600 dark:text-primary-400"></i>
-          Agent Mail
+          <span aria-hidden="true">🌈</span> Iris
         </h1>
         <span x-show="manifest" class="hidden sm:inline text-sm text-slate-500 dark:text-slate-400"
           x-text="((manifest?.project_scope?.included || []).length) + ' project(s)'"></span>

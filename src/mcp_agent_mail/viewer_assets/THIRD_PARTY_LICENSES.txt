@@ -1,4 +1,4 @@
-MCP Agent Mail standalone viewer third-party notices
+Iris standalone Agent Mail viewer third-party notices
 ====================================================
 
 Alpine.js 3.14.1

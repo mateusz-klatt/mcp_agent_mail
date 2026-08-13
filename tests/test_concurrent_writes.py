@@ -19,6 +19,7 @@ from sqlalchemy import text
 from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import ensure_schema, get_session
+from mcp_agent_mail.models import Agent
 from mcp_agent_mail.storage import AsyncFileLock, _commit_lock_path
 from tests.keys import pkey
 
@@ -466,6 +467,27 @@ async def test_concurrent_agent_registration(isolated_env):
 
 
 @pytest.mark.asyncio
+async def test_sqlite_foreign_keys_enabled_on_every_pooled_connection(isolated_env):
+    """Every concurrently checked-out SQLite connection must enforce FKs."""
+    await ensure_schema()
+    connection_count = 8
+    barrier = asyncio.Barrier(connection_count)
+
+    async def read_foreign_keys() -> int:
+        async with get_session() as session:
+            row = await session.execute(text("PRAGMA foreign_keys"))
+            value = int(row.scalar_one())
+            # Hold each checkout until the whole cohort owns a distinct pooled
+            # connection; otherwise one connection could satisfy every task.
+            await barrier.wait()
+            return value
+
+    assert await asyncio.gather(
+        *(read_foreign_keys() for _ in range(connection_count))
+    ) == [1] * connection_count
+
+
+@pytest.mark.asyncio
 async def test_concurrent_message_read_write(isolated_env):
     """Test concurrent reads and writes to messages table."""
     _config.get_settings()  # Ensure settings are loaded
@@ -480,6 +502,19 @@ async def test_concurrent_message_read_write(isolated_env):
 
         row = await session.execute(text("SELECT id FROM projects WHERE slug = :slug"), {"slug": "db-concurrent"})
         project_id = row.scalar()
+        assert project_id is not None
+
+        sender = Agent(
+            project_id=int(project_id),
+            name="ConcurrentSender",
+            program="pytest",
+            model="test",
+        )
+        session.add(sender)
+        await session.flush()
+        sender_id = sender.id
+        assert sender_id is not None
+        await session.commit()
 
     async def write_message(i: int) -> None:
         """Write a message."""
@@ -487,9 +522,16 @@ async def test_concurrent_message_read_write(isolated_env):
             await session.execute(
                 text(
                     "INSERT INTO messages (project_id, subject, body_md, importance, ack_required, sender_id, created_ts) "
-                    "VALUES (:pid, :subj, :body, :imp, :ack, 1, datetime('now'))"
+                    "VALUES (:pid, :subj, :body, :imp, :ack, :sender_id, datetime('now'))"
                 ),
-                {"pid": project_id, "subj": f"Msg {i}", "body": f"Body {i}", "imp": "normal", "ack": 0},
+                {
+                    "pid": project_id,
+                    "subj": f"Msg {i}",
+                    "body": f"Body {i}",
+                    "imp": "normal",
+                    "ack": 0,
+                    "sender_id": sender_id,
+                },
             )
             await session.commit()
 

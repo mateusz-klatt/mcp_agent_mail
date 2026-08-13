@@ -86,6 +86,7 @@ from .models import (
     ProjectSiblingSuggestion,
     Product,
     ProductProjectLink,
+    UiProjectAssignment,
     WindowIdentity,
 )
 from .storage import (
@@ -5118,6 +5119,327 @@ async def _update_recipient_timestamp(
         return existing[0]
 
 
+async def _hard_delete_agent_database_rows(
+    session: Any,
+    *,
+    project_id: int,
+    agent_id: int,
+    agent_name: str,
+) -> dict[str, int]:
+    """Delete one agent's mutable database graph in explicit FK-safe phases."""
+    sent_rows = await session.execute(
+        select(Message.id).where(cast(Any, Message.sender_id) == agent_id)
+    )
+    sent_message_ids = [int(row[0]) for row in sent_rows.all()]
+
+    pending_delivery = (
+        await session.execute(
+            select(MessageDelivery.id)
+            .where(
+                cast(Any, MessageDelivery.state) == "pending",
+                or_(
+                    cast(Any, MessageDelivery.sender_id) == agent_id,
+                    and_(
+                        cast(Any, MessageDelivery.actor_kind) == "agent",
+                        cast(Any, MessageDelivery.actor_id) == agent_id,
+                    ),
+                    exists(
+                        select(MessageDeliveryRecipient.delivery_id).where(
+                            cast(Any, MessageDeliveryRecipient.delivery_id)
+                            == cast(Any, MessageDelivery.id),
+                            cast(Any, MessageDeliveryRecipient.agent_id)
+                            == agent_id,
+                        )
+                    ),
+                ),
+            )
+            .limit(1)
+        )
+    ).first()
+    if pending_delivery is not None:
+        raise ValueError("Agent has a pending message delivery and cannot be hard-deleted")
+
+    recipient_count = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(MessageRecipient)
+                .where(cast(Any, MessageRecipient.agent_id) == agent_id)
+            )
+        ).scalar_one()
+    )
+    sent_recipient_count = 0
+    if sent_message_ids:
+        sent_recipient_count = int(
+            (
+                await session.execute(
+                    select(func.count())
+                    .select_from(MessageRecipient)
+                    .where(
+                        cast(Any, MessageRecipient.message_id).in_(sent_message_ids),
+                        cast(Any, MessageRecipient.agent_id) != agent_id,
+                    )
+                )
+            ).scalar_one()
+        )
+        # A retained reply remains in its thread, but its direct edge cannot
+        # point at a message lifetime that is about to be removed.
+        await session.execute(
+            update(Message)
+            .where(
+                cast(Any, Message.reply_to).in_(sent_message_ids),
+                cast(Any, Message.id).not_in(sent_message_ids),
+            )
+            .values(reply_to=None)
+        )
+
+    recipient_predicates: list[Any] = [
+        cast(Any, MessageRecipient.agent_id) == agent_id
+    ]
+    if sent_message_ids:
+        recipient_predicates.append(
+            cast(Any, MessageRecipient.message_id).in_(sent_message_ids)
+        )
+    await session.execute(
+        delete(MessageRecipient).where(or_(*recipient_predicates))
+    )
+    await session.flush()
+
+    if sent_message_ids:
+        await session.execute(
+            delete(Message).where(cast(Any, Message.id).in_(sent_message_ids))
+        )
+        await session.flush()
+
+    reservation_count = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(FileReservation)
+                .where(cast(Any, FileReservation.agent_id) == agent_id)
+            )
+        ).scalar_one()
+    )
+    link_count = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(AgentLink)
+                .where(
+                    or_(
+                        cast(Any, AgentLink.a_agent_id) == agent_id,
+                        cast(Any, AgentLink.b_agent_id) == agent_id,
+                    )
+                )
+            )
+        ).scalar_one()
+    )
+    window_count = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(WindowIdentity)
+                .where(
+                    cast(Any, WindowIdentity.project_id) == project_id,
+                    cast(Any, WindowIdentity.display_name) == agent_name,
+                )
+            )
+        ).scalar_one()
+    )
+    await session.execute(
+        delete(FileReservation).where(
+            cast(Any, FileReservation.agent_id) == agent_id
+        )
+    )
+    await session.execute(
+        delete(AgentLink).where(
+            or_(
+                cast(Any, AgentLink.a_agent_id) == agent_id,
+                cast(Any, AgentLink.b_agent_id) == agent_id,
+            )
+        )
+    )
+    await session.execute(
+        delete(WindowIdentity).where(
+            cast(Any, WindowIdentity.project_id) == project_id,
+            cast(Any, WindowIdentity.display_name) == agent_name,
+        )
+    )
+    await session.flush()
+
+    deleted_agent = await session.execute(
+        delete(Agent).where(cast(Any, Agent.id) == agent_id)
+    )
+    await session.flush()
+    return {
+        "message_recipients": recipient_count,
+        "sent_message_recipients": sent_recipient_count,
+        "messages_sent": len(sent_message_ids),
+        "file_reservations": reservation_count,
+        "agent_links": link_count,
+        "window_identities": window_count,
+        "agent": int(deleted_agent.rowcount or 0),
+    }
+
+
+async def _hard_delete_project_database_rows(
+    session: Any,
+    *,
+    project_id: int,
+) -> dict[str, int]:
+    """Delete one project's mutable database graph in explicit FK-safe phases."""
+    delivery_history = (
+        await session.execute(
+            select(MessageDelivery.id)
+            .where(
+                or_(
+                    cast(Any, MessageDelivery.project_id) == project_id,
+                    cast(Any, MessageDelivery.sender_project_id_snapshot)
+                    == project_id,
+                    and_(
+                        cast(Any, MessageDelivery.actor_kind) == "agent",
+                        cast(Any, MessageDelivery.actor_project_id_snapshot)
+                        == project_id,
+                    ),
+                )
+            )
+            .limit(1)
+        )
+    ).first()
+    if delivery_history is not None:
+        raise ValueError(
+            "Project has immutable message delivery history and cannot be hard-deleted"
+        )
+
+    agent_rows = await session.execute(
+        select(Agent.id).where(cast(Any, Agent.project_id) == project_id)
+    )
+    agent_ids = [int(row[0]) for row in agent_rows.all()]
+    message_filter = cast(Any, Message.project_id) == project_id
+    if agent_ids:
+        message_filter = or_(
+            message_filter,
+            cast(Any, Message.sender_id).in_(agent_ids),
+        )
+    message_rows = await session.execute(select(Message.id).where(message_filter))
+    message_ids = [int(row[0]) for row in message_rows.all()]
+
+    recipient_predicates: list[Any] = []
+    if message_ids:
+        recipient_predicates.append(
+            cast(Any, MessageRecipient.message_id).in_(message_ids)
+        )
+        await session.execute(
+            update(Message)
+            .where(
+                cast(Any, Message.reply_to).in_(message_ids),
+                cast(Any, Message.id).not_in(message_ids),
+            )
+            .values(reply_to=None)
+        )
+    if agent_ids:
+        recipient_predicates.append(
+            cast(Any, MessageRecipient.agent_id).in_(agent_ids)
+        )
+    recipient_count = 0
+    if recipient_predicates:
+        recipient_count = int(
+            (
+                await session.execute(
+                    select(func.count())
+                    .select_from(MessageRecipient)
+                    .where(or_(*recipient_predicates))
+                )
+            ).scalar_one()
+        )
+        await session.execute(
+            delete(MessageRecipient).where(or_(*recipient_predicates))
+        )
+    await session.flush()
+
+    if message_ids:
+        await session.execute(
+            delete(Message).where(cast(Any, Message.id).in_(message_ids))
+        )
+        await session.flush()
+
+    reservation_filter = cast(Any, FileReservation.project_id) == project_id
+    link_filter = or_(
+        cast(Any, AgentLink.a_project_id) == project_id,
+        cast(Any, AgentLink.b_project_id) == project_id,
+    )
+    if agent_ids:
+        reservation_filter = or_(
+            reservation_filter,
+            cast(Any, FileReservation.agent_id).in_(agent_ids),
+        )
+        link_filter = or_(
+            link_filter,
+            cast(Any, AgentLink.a_agent_id).in_(agent_ids),
+            cast(Any, AgentLink.b_agent_id).in_(agent_ids),
+        )
+
+    dependent_specs = (
+        ("file_reservations", FileReservation, reservation_filter),
+        ("agent_links", AgentLink, link_filter),
+        (
+            "window_identities",
+            WindowIdentity,
+            cast(Any, WindowIdentity.project_id) == project_id,
+        ),
+        (
+            "message_summaries",
+            MessageSummary,
+            cast(Any, MessageSummary.project_id) == project_id,
+        ),
+        (
+            "sibling_suggestions",
+            ProjectSiblingSuggestion,
+            or_(
+                cast(Any, ProjectSiblingSuggestion.project_a_id) == project_id,
+                cast(Any, ProjectSiblingSuggestion.project_b_id) == project_id,
+            ),
+        ),
+        (
+            "product_links",
+            ProductProjectLink,
+            cast(Any, ProductProjectLink.project_id) == project_id,
+        ),
+        (
+            "ui_project_assignments",
+            UiProjectAssignment,
+            cast(Any, UiProjectAssignment.project_id) == project_id,
+        ),
+    )
+    counts: dict[str, int] = {
+        "agents": len(agent_ids),
+        "messages": len(message_ids),
+        "message_recipients": recipient_count,
+    }
+    for key, model, predicate in dependent_specs:
+        counts[key] = int(
+            (
+                await session.execute(
+                    select(func.count()).select_from(model).where(predicate)
+                )
+            ).scalar_one()
+        )
+        await session.execute(delete(model).where(predicate))
+    await session.flush()
+
+    if agent_ids:
+        await session.execute(
+            delete(Agent).where(cast(Any, Agent.id).in_(agent_ids))
+        )
+        await session.flush()
+    deleted_project = await session.execute(
+        delete(Project).where(cast(Any, Project.id) == project_id)
+    )
+    await session.flush()
+    counts["project"] = int(deleted_project.rowcount or 0)
+    return counts
+
+
 def build_mcp_server() -> FastMCP:
     """Create and configure the FastMCP server instance."""
     settings: Settings = get_settings()
@@ -6550,90 +6872,14 @@ def build_mcp_server() -> FastMCP:
         if agent_id is None:
             raise ValueError("Agent must have an id before hard delete")
         project_id = project.id
-        deleted_counts: dict[str, int] = {}
-
         # Phase 1: Database cleanup in a single transaction
-        async with get_session() as session:
-            # Count and delete message_recipients where this agent is a recipient
-            recipient_rows = await session.execute(
-                select(MessageRecipient).where(cast(Any, MessageRecipient.agent_id) == agent_id)
+        async with get_immediate_session() as session:
+            deleted_counts = await _hard_delete_agent_database_rows(
+                session,
+                project_id=cast(int, project_id),
+                agent_id=agent_id,
+                agent_name=agent_name,
             )
-            recipient_records = recipient_rows.scalars().all()
-            deleted_counts["message_recipients"] = len(recipient_records)
-            for rec in recipient_records:
-                await session.delete(rec)
-
-            # Find all messages sent by this agent
-            sent_msg_rows = await session.execute(
-                select(Message).where(
-                    cast(Any, Message.project_id) == project_id,
-                    cast(Any, Message.sender_id) == agent_id,
-                )
-            )
-            sent_messages = sent_msg_rows.scalars().all()
-            sent_message_ids = [m.id for m in sent_messages]
-
-            # Delete recipient records for messages sent by this agent
-            if sent_message_ids:
-                sent_recipient_rows = await session.execute(
-                    select(MessageRecipient).where(
-                        cast(Any, MessageRecipient.message_id).in_(sent_message_ids)
-                    )
-                )
-                sent_recipient_records = sent_recipient_rows.scalars().all()
-                deleted_counts["sent_message_recipients"] = len(sent_recipient_records)
-                for rec in sent_recipient_records:
-                    await session.delete(rec)
-
-            # Delete messages sent by this agent (FTS cleanup handled by DB trigger)
-            deleted_counts["messages_sent"] = len(sent_messages)
-            for msg in sent_messages:
-                await session.delete(msg)
-
-            # Delete file reservations
-            fr_rows = await session.execute(
-                select(FileReservation).where(
-                    cast(Any, FileReservation.project_id) == project_id,
-                    cast(Any, FileReservation.agent_id) == agent_id,
-                )
-            )
-            file_reservations = fr_rows.scalars().all()
-            deleted_counts["file_reservations"] = len(file_reservations)
-            for fr in file_reservations:
-                await session.delete(fr)
-
-            # Delete agent links (both directions)
-            link_rows = await session.execute(
-                select(AgentLink).where(
-                    or_(
-                        cast(Any, AgentLink.a_agent_id) == agent_id,
-                        cast(Any, AgentLink.b_agent_id) == agent_id,
-                    )
-                )
-            )
-            agent_links = link_rows.scalars().all()
-            deleted_counts["agent_links"] = len(agent_links)
-            for link in agent_links:
-                await session.delete(link)
-
-            # Delete window identities for this agent's project
-            wi_rows = await session.execute(
-                select(WindowIdentity).where(
-                    cast(Any, WindowIdentity.project_id) == project_id,
-                    cast(Any, WindowIdentity.display_name) == agent_name,
-                )
-            )
-            window_identities = wi_rows.scalars().all()
-            deleted_counts["window_identities"] = len(window_identities)
-            for wi in window_identities:
-                await session.delete(wi)
-
-            # Delete the agent record itself
-            db_agent = await session.get(Agent, agent_id)
-            if db_agent:
-                await session.delete(db_agent)
-                deleted_counts["agent"] = 1
-
             await session.commit()
 
         # Phase 2: Filesystem cleanup (non-transactional, best-effort)
@@ -6732,144 +6978,12 @@ def build_mcp_server() -> FastMCP:
             action="hard_delete_project",
         )
 
-        deleted_counts: dict[str, int] = {}
-
         # Phase 1: Database cleanup in a single transaction
-        # Order matters: delete from leaf tables first to respect foreign key constraints
         async with get_immediate_session() as session:
-            delivery_history = (
-                await session.execute(
-                    select(MessageDelivery.id)
-                    .where(
-                        or_(
-                            cast(Any, MessageDelivery.project_id) == project_id,
-                            cast(Any, MessageDelivery.sender_project_id_snapshot)
-                            == project_id,
-                            and_(
-                                cast(Any, MessageDelivery.actor_kind) == "agent",
-                                cast(
-                                    Any,
-                                    MessageDelivery.actor_project_id_snapshot,
-                                )
-                                == project_id,
-                            ),
-                        )
-                    )
-                    .limit(1)
-                )
-            ).first()
-            if delivery_history is not None:
-                raise ValueError(
-                    "Project has immutable message delivery history and cannot be hard-deleted"
-                )
-
-            # Collect all agent IDs in this project
-            agent_rows = await session.execute(
-                select(Agent).where(cast(Any, Agent.project_id) == project_id)
+            deleted_counts = await _hard_delete_project_database_rows(
+                session,
+                project_id=cast(int, project_id),
             )
-            agents = agent_rows.scalars().all()
-            agent_ids = [a.id for a in agents]
-            deleted_counts["agents"] = len(agents)
-
-            # Collect all message IDs in this project
-            msg_rows = await session.execute(
-                select(Message).where(cast(Any, Message.project_id) == project_id)
-            )
-            messages = msg_rows.scalars().all()
-            message_ids = [m.id for m in messages]
-            deleted_counts["messages"] = len(messages)
-
-            # Delete message recipients for all project messages
-            if message_ids:
-                mr_rows = await session.execute(
-                    select(MessageRecipient).where(
-                        cast(Any, MessageRecipient.message_id).in_(message_ids)
-                    )
-                )
-                mrs = mr_rows.scalars().all()
-                deleted_counts["message_recipients"] = len(mrs)
-                for mr in mrs:
-                    await session.delete(mr)
-
-            # Delete all messages (FTS cleanup handled by DB trigger)
-            for msg in messages:
-                await session.delete(msg)
-
-            # Delete file reservations
-            fr_rows = await session.execute(
-                select(FileReservation).where(cast(Any, FileReservation.project_id) == project_id)
-            )
-            frs = fr_rows.scalars().all()
-            deleted_counts["file_reservations"] = len(frs)
-            for fr in frs:
-                await session.delete(fr)
-
-            # Delete agent links involving any agent in this project
-            if agent_ids:
-                link_rows = await session.execute(
-                    select(AgentLink).where(
-                        or_(
-                            cast(Any, AgentLink.a_agent_id).in_(agent_ids),
-                            cast(Any, AgentLink.b_agent_id).in_(agent_ids),
-                        )
-                    )
-                )
-                links = link_rows.scalars().all()
-                deleted_counts["agent_links"] = len(links)
-                for link in links:
-                    await session.delete(link)
-
-            # Delete window identities
-            wi_rows = await session.execute(
-                select(WindowIdentity).where(cast(Any, WindowIdentity.project_id) == project_id)
-            )
-            wis = wi_rows.scalars().all()
-            deleted_counts["window_identities"] = len(wis)
-            for wi in wis:
-                await session.delete(wi)
-
-            # Delete message summaries
-            ms_rows = await session.execute(
-                select(MessageSummary).where(cast(Any, MessageSummary.project_id) == project_id)
-            )
-            summaries = ms_rows.scalars().all()
-            deleted_counts["message_summaries"] = len(summaries)
-            for ms in summaries:
-                await session.delete(ms)
-
-            # Delete sibling suggestions involving this project
-            ss_rows = await session.execute(
-                select(ProjectSiblingSuggestion).where(
-                    or_(
-                        cast(Any, ProjectSiblingSuggestion.project_a_id) == project_id,
-                        cast(Any, ProjectSiblingSuggestion.project_b_id) == project_id,
-                    )
-                )
-            )
-            suggestions = ss_rows.scalars().all()
-            deleted_counts["sibling_suggestions"] = len(suggestions)
-            for ss in suggestions:
-                await session.delete(ss)
-
-            # Delete product-project links
-            ppl_rows = await session.execute(
-                select(ProductProjectLink).where(cast(Any, ProductProjectLink.project_id) == project_id)
-            )
-            ppls = ppl_rows.scalars().all()
-            deleted_counts["product_links"] = len(ppls)
-            for ppl in ppls:
-                await session.delete(ppl)
-
-            # Delete all agents
-            for agent in agents:
-                await session.delete(agent)
-
-            # Delete the project itself
-            db_project = await session.get(Project, project_id)
-            if db_project:
-                await session.delete(db_project)
-                deleted_counts["project"] = 1
-
             await session.commit()
 
         # Phase 2: Filesystem cleanup (non-transactional, best-effort)
@@ -8704,21 +8818,46 @@ def build_mcp_server() -> FastMCP:
         cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=age_limit)
 
         async with get_session() as session:
-            stale_filter = [Message.project_id == project.id, Message.created_ts < cutoff]
+            pending_reply_targets = (
+                select(MessageDelivery.reply_to_message_id)
+                .where(
+                    cast(Any, MessageDelivery.state) == "pending",
+                    cast(Any, MessageDelivery.reply_to_message_id).is_not(None),
+                )
+                .scalar_subquery()
+            )
+            stale_filter = [
+                Message.project_id == project.id,
+                Message.created_ts < cutoff,
+                cast(Any, Message.id).not_in(pending_reply_targets),
+            ]
             count_result = await session.execute(
                 select(func.count()).select_from(Message).where(*stale_filter)
             )
             count = count_result.scalar() or 0
 
             if not dry_run and count > 0:
-                # Delete recipient links first to avoid FK violations / orphan rows
                 stale_ids = select(Message.id).where(*stale_filter).scalar_subquery()
+                # Retained replies remain grouped by thread_id but lose the
+                # direct edge to the deleted message lifetime.
+                await session.execute(
+                    update(Message)
+                    .where(
+                        cast(Any, Message.reply_to).in_(stale_ids),
+                        cast(Any, Message.id).not_in(stale_ids),
+                    )
+                    .values(reply_to=None)
+                )
                 await session.execute(
                     delete(MessageRecipient).where(
                         cast(Any, MessageRecipient.message_id).in_(stale_ids)
                     )
                 )
-                await session.execute(delete(Message).where(*stale_filter))
+                await session.flush()
+                await session.execute(
+                    delete(Message).where(cast(Any, Message.id).in_(stale_ids))
+                )
+                await session.flush()
                 await session.commit()
 
         status = "purged" if not dry_run else "dry_run"

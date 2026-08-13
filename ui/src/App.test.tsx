@@ -17,7 +17,7 @@ import {
   saveDisplayName,
   saveProjectAssignment,
 } from "./account";
-import i18n from "./i18n";
+import i18n, { type SupportedLocale } from "./i18n";
 import {
   composeMessage,
   inboxPageSize,
@@ -26,7 +26,9 @@ import {
   loadDeliveryStatus,
   loadInbox,
   loadMessage,
+  loadProjectAgents,
   loadProjects,
+  loadSearch,
   MailHttpError,
   mailRouteHash,
   markdownUrlTransform,
@@ -34,7 +36,10 @@ import {
   parseDeliveryResult,
   parseMailRoute,
   parseMessageDetail,
+  parseProjectAgents,
   parseProjects,
+  parseSearchPage,
+  replyIdempotencyKeyFor,
   replyToMessage,
   retryDelivery,
 } from "./mail";
@@ -57,9 +62,11 @@ import {
   messageOne,
   messageTwo,
   preferencesResponse,
+  projectAgentsResponse,
   projectOne,
   projectsResponse,
   projectTwo,
+  searchResponse,
   server,
 } from "./test/server";
 
@@ -157,9 +164,32 @@ describe("Markdown resource boundaries", () => {
 });
 
 describe("Durable mail client", () => {
+  it("bounds remembered reply attempts with deterministic oldest-first eviction", () => {
+    const attempts = new Map<string, string>();
+    for (let index = 0; index < 64; index += 1) {
+      attempts.set(`fingerprint-${index}`, `key-${index}`);
+    }
+
+    expect(replyIdempotencyKeyFor(attempts, "fingerprint-10")).toBe("key-10");
+    const added = replyIdempotencyKeyFor(attempts, "fingerprint-new");
+
+    expect(added).toMatch(/^human-ui:/u);
+    expect(attempts.size).toBe(64);
+    expect(attempts.has("fingerprint-0")).toBe(false);
+    expect(attempts.get("fingerprint-new")).toBe(added);
+  });
+
   it("parses and sends the exact compose, reply, and status contracts", async () => {
     const requests: Array<{ method: string; path: string; body: unknown }> = [];
     server.use(
+      http.get("*/mail/api/v1/projects/:projectId/agents", ({ request }) => {
+        requests.push({
+          method: request.method,
+          path: new URL(request.url).pathname,
+          body: null,
+        });
+        return HttpResponse.json(projectAgentsResponse);
+      }),
       http.post("*/mail/api/v1/projects/:projectId/messages", async ({ request }) => {
         requests.push({
           method: request.method,
@@ -197,10 +227,17 @@ describe("Durable mail client", () => {
       }),
     );
 
+    await expect(loadProjectAgents(projectOne.id)).resolves.toEqual(
+      projectAgentsResponse,
+    );
     await expect(
       composeMessage(projectOne.id, {
         idempotency_key: "compose-key",
-        recipients: ["GreenDog"],
+        expected_project_generation: projectAgentsResponse.project_generation,
+        recipients: [{
+          agent_id: projectAgentsResponse.items[1]!.agent_id,
+          expected_agent_generation: projectAgentsResponse.items[1]!.agent_generation,
+        }],
         subject: "Subject",
         body_md: "Body",
         thread_id: null,
@@ -209,6 +246,12 @@ describe("Durable mail client", () => {
     await expect(
       replyToMessage(projectOne.id, messageOne.id, {
         idempotency_key: "reply-key",
+        expected_sender_agent_id: messageDetail.reply_target.agent_id,
+        expected_sender_agent_generation:
+          messageDetail.reply_target.agent_generation,
+        expected_sender_project_id: messageDetail.reply_target.project_id,
+        expected_sender_project_generation:
+          messageDetail.reply_target.project_generation,
         body_md: "Reply",
       }),
     ).resolves.toEqual(deliveryResponse);
@@ -222,11 +265,20 @@ describe("Durable mail client", () => {
     });
     expect(requests).toEqual([
       {
+        method: "GET",
+        path: `/mail/api/v1/projects/${projectOne.id}/agents`,
+        body: null,
+      },
+      {
         method: "POST",
         path: `/mail/api/v1/projects/${projectOne.id}/messages`,
         body: {
           idempotency_key: "compose-key",
-          recipients: ["GreenDog"],
+          expected_project_generation: projectAgentsResponse.project_generation,
+          recipients: [{
+            agent_id: projectAgentsResponse.items[1]!.agent_id,
+            expected_agent_generation: projectAgentsResponse.items[1]!.agent_generation,
+          }],
           subject: "Subject",
           body_md: "Body",
           thread_id: null,
@@ -235,7 +287,16 @@ describe("Durable mail client", () => {
       {
         method: "POST",
         path: `/mail/api/v1/projects/${projectOne.id}/messages/${messageOne.id}/replies`,
-        body: { idempotency_key: "reply-key", body_md: "Reply" },
+        body: {
+          idempotency_key: "reply-key",
+          expected_sender_agent_id: messageDetail.reply_target.agent_id,
+          expected_sender_agent_generation:
+            messageDetail.reply_target.agent_generation,
+          expected_sender_project_id: messageDetail.reply_target.project_id,
+          expected_sender_project_generation:
+            messageDetail.reply_target.project_generation,
+          body_md: "Reply",
+        },
       },
       {
         method: "GET",
@@ -262,11 +323,16 @@ describe("Durable mail client", () => {
     expect(() => parseDeliveryResult(payload)).toThrow(TypeError);
   });
 
-  it("rejects invalid route identities before sending", () => {
+  it("rejects invalid route identities before sending", async () => {
+    await expect(loadProjectAgents(0)).rejects.toThrow(TypeError);
     expect(() =>
       composeMessage(0, {
         idempotency_key: "key",
-        recipients: ["Agent"],
+        expected_project_generation: "d".repeat(64),
+        recipients: [{
+          agent_id: 1,
+          expected_agent_generation: "1".repeat(64),
+        }],
         subject: "Subject",
         body_md: "Body",
         thread_id: null,
@@ -275,11 +341,63 @@ describe("Durable mail client", () => {
     expect(() =>
       replyToMessage(projectOne.id, 0, {
         idempotency_key: "key",
+        expected_sender_agent_id: messageDetail.reply_target.agent_id,
+        expected_sender_agent_generation:
+          messageDetail.reply_target.agent_generation,
+        expected_sender_project_id: messageDetail.reply_target.project_id,
+        expected_sender_project_generation:
+          messageDetail.reply_target.project_generation,
         body_md: "Body",
       }),
     ).toThrow(TypeError);
     expect(() => loadDeliveryStatus("not-a-delivery")).toThrow(TypeError);
     expect(() => retryDelivery("not-a-delivery")).toThrow(TypeError);
+  });
+
+  it("validates the exact project-agent contract and requested identity", async () => {
+    expect(parseProjectAgents(projectAgentsResponse)).toEqual(projectAgentsResponse);
+    const invalidPayloads: unknown[] = [
+      null,
+      { ...projectAgentsResponse, items: {} },
+      { ...projectAgentsResponse, project_id: 0 },
+      { ...projectAgentsResponse, project_generation: "INVALID" },
+      {
+        ...projectAgentsResponse,
+        items: [{ ...projectAgentsResponse.items[0], agent_id: 0 }],
+      },
+      {
+        ...projectAgentsResponse,
+        items: [{ ...projectAgentsResponse.items[0], agent_generation: "INVALID" }],
+      },
+      { ...projectAgentsResponse, items: [null], total: 1 },
+      {
+        ...projectAgentsResponse,
+        items: [{ ...projectAgentsResponse.items[0], name: 7 }],
+        total: 1,
+      },
+      {
+        ...projectAgentsResponse,
+        items: [{ ...projectAgentsResponse.items[0], display_name: 7 }],
+        total: 1,
+      },
+      {
+        ...projectAgentsResponse,
+        items: [{ ...projectAgentsResponse.items[0], human: true }],
+        total: 1,
+      },
+      { ...projectAgentsResponse, items: [], total: -1 },
+      { ...projectAgentsResponse, items: [], total: 0, debug: true },
+    ];
+    for (const payload of invalidPayloads) {
+      expect(() => parseProjectAgents(payload)).toThrow(TypeError);
+    }
+
+    server.use(
+      http.get("*/mail/api/v1/projects/:projectId/agents", () =>
+        HttpResponse.json({ ...projectAgentsResponse, project_id: projectTwo.id }),
+      ),
+    );
+    await expect(loadProjectAgents(projectOne.id)).rejects.toThrow(TypeError);
   });
 
   it("keeps typed error codes without trusting an invalid proxy body", async () => {
@@ -297,13 +415,23 @@ describe("Durable mail client", () => {
     );
     const composeFailure = await composeMessage(projectOne.id, {
       idempotency_key: "key",
-      recipients: ["GreenDog"],
+      expected_project_generation: projectAgentsResponse.project_generation,
+      recipients: [{
+        agent_id: projectAgentsResponse.items[1]!.agent_id,
+        expected_agent_generation: projectAgentsResponse.items[1]!.agent_generation,
+      }],
       subject: "Subject",
       body_md: "Body",
       thread_id: null,
     }).catch((error: unknown) => error);
     const replyFailure = await replyToMessage(projectOne.id, messageOne.id, {
       idempotency_key: "key",
+      expected_sender_agent_id: messageDetail.reply_target.agent_id,
+      expected_sender_agent_generation:
+        messageDetail.reply_target.agent_generation,
+      expected_sender_project_id: messageDetail.reply_target.project_id,
+      expected_sender_project_generation:
+        messageDetail.reply_target.project_generation,
       body_md: "Body",
     }).catch((error: unknown) => error);
 
@@ -319,6 +447,27 @@ describe("Durable mail client", () => {
 
 async function waitForEnglishPreferences() {
   expect(await screen.findByText("Language saved for your account")).toBeVisible();
+}
+
+function localePickerTrigger(): HTMLButtonElement {
+  const trigger = document.querySelector<HTMLButtonElement>(
+    ".locale-picker-trigger",
+  );
+  expect(trigger).not.toBeNull();
+  return trigger as HTMLButtonElement;
+}
+
+async function selectUiLocale(
+  user: ReturnType<typeof userEvent.setup>,
+  nativeName: string,
+): Promise<void> {
+  await user.click(localePickerTrigger());
+  const listbox = screen.getByRole("listbox");
+  const option = within(listbox)
+    .getAllByRole("option")
+    .find((candidate) => candidate.textContent?.includes(nativeName));
+  expect(option).toBeDefined();
+  await user.click(option as HTMLElement);
 }
 
 class FakeEventSource {
@@ -349,7 +498,7 @@ class FakeEventSource {
   }
 }
 
-describe("Hermes landing shell", () => {
+describe("Iris landing shell", () => {
   beforeEach(async () => {
     window.history.replaceState({}, "", "/mail/");
     document.documentElement.lang = "en";
@@ -370,13 +519,16 @@ describe("Hermes landing shell", () => {
 
     expect(await screen.findByRole("heading", { name: "Inbox" })).toBeVisible();
     expect(await screen.findByText(messageOne.subject)).toBeVisible();
+    expect(screen.getByLabelText("Iris")).toHaveTextContent("🌈Iris");
+    expect(document.querySelector(".brand-mark")).toHaveAttribute("aria-hidden", "true");
     expect(screen.getByText("Durable delivery")).toBeVisible();
     const navigation = screen.getByRole("navigation", { name: "Primary navigation" });
     const links = within(navigation).getAllByRole("link");
-    expect(links).toHaveLength(5);
+    expect(links).toHaveLength(6);
     expect(links.map((link) => link.textContent)).toEqual([
       "Projects",
       "Inbox",
+      "Search",
       "Compose",
       "Account",
       "Administration",
@@ -392,7 +544,8 @@ describe("Hermes landing shell", () => {
     expect(screen.queryByText("Unread message")).not.toBeInTheDocument();
     expect(screen.queryByText("Open inbox")).not.toBeInTheDocument();
     expect(screen.queryByText("Production deployment verified")).not.toBeInTheDocument();
-    expect(screen.getByLabelText("Language")).toHaveAttribute("name", "ui-language");
+    expect(localePickerTrigger()).toHaveAttribute("name", "ui-language");
+    expect(localePickerTrigger()).toHaveAttribute("data-locale", "en");
     const signOut = screen.getByRole("button", { name: "Sign out" });
     const logoutForm = signOut.closest("form");
     expect(signOut).toHaveAttribute("type", "submit");
@@ -440,27 +593,92 @@ describe("Hermes landing shell", () => {
 
     expect(await screen.findByRole("heading", { name: "Compose" })).toBeVisible();
     await user.selectOptions(screen.getByLabelText("Project"), String(projectOne.id));
-    await user.type(screen.getByLabelText("Recipients"), "GreenDog, BlueLake");
+    await user.click(await screen.findByDisplayValue("GreenDog"));
+    await user.click(screen.getByDisplayValue("BlueLake"));
     await user.type(screen.getByLabelText("Subject"), "Review the release");
     await user.type(screen.getByLabelText("Thread ID (optional)"), "release-2026");
     await user.type(screen.getByLabelText("Message in Markdown"), "**Proceed** after UAT.");
-    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await act(async () => {
+      fireEvent.keyDown(screen.getByLabelText("Message in Markdown"), {
+        key: "Enter",
+        ctrlKey: true,
+      });
+    });
+
+    const confirmation = await screen.findByRole("region", {
+      name: "Review message before delivery",
+    });
+    expect(confirmation).toHaveFocus();
+    expect(requestBody).toBeUndefined();
+    expect(within(confirmation).getByText(projectOne.human_key)).toBeVisible();
+    expect(within(confirmation).getByText("Review the release")).toBeVisible();
+    expect(within(confirmation).getByText("release-2026")).toBeVisible();
+    expect(within(confirmation).getByText("High")).toBeVisible();
+    expect(within(confirmation).getByText("Release operator")).toBeVisible();
+    expect(within(confirmation).getByText("GreenDog", { selector: "code" })).toBeVisible();
+    expect(within(confirmation).getByText(/delivered separately to 2 recipients/)).toBeVisible();
+    expect(within(confirmation).getByText("MESSAGE FROM HUMAN OVERSEER")).toBeVisible();
+    expect(within(confirmation).getByText(/prefers replies in English \(en\)/)).toBeVisible();
+    expect(within(confirmation).getByText("Proceed", { selector: "strong" })).toBeVisible();
+    await user.click(within(confirmation).getByRole("button", { name: "Confirm and send" }));
 
     expect(await screen.findByText("Published exactly once.")).toBeVisible();
     expect(screen.getByText(`Delivery reference: ${deliveryResponse.id}`)).toBeVisible();
     expect(requestBody).toEqual({
       idempotency_key: expect.stringMatching(/^human-ui:/u),
-      recipients: ["GreenDog", "BlueLake"],
+      expected_project_generation: projectAgentsResponse.project_generation,
+      recipients: [
+        {
+          agent_id: projectAgentsResponse.items[0]!.agent_id,
+          expected_agent_generation: projectAgentsResponse.items[0]!.agent_generation,
+        },
+        {
+          agent_id: projectAgentsResponse.items[1]!.agent_id,
+          expected_agent_generation: projectAgentsResponse.items[1]!.agent_generation,
+        },
+      ],
       subject: "Review the release",
       body_md: "**Proceed** after UAT.",
       thread_id: "release-2026",
     });
-    expect(screen.getByLabelText("Recipients")).toHaveValue("");
+    expect(screen.getByDisplayValue("GreenDog")).not.toBeChecked();
+    expect(screen.getByDisplayValue("BlueLake")).not.toBeChecked();
     expect(screen.getByLabelText("Subject")).toHaveValue("");
     expect(screen.getByLabelText("Message in Markdown")).toHaveValue("");
   });
 
-  it("replies with only human text while Hermes derives routing", async () => {
+  it("returns to the preserved draft when a locale change invalidates its final preview", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/mail/#compose");
+    server.use(
+      http.patch(preferencesUrl, () =>
+        HttpResponse.json(preferencesResponse("pl")),
+      ),
+    );
+    render(<App />);
+    await waitForEnglishPreferences();
+
+    await user.selectOptions(screen.getByLabelText("Project"), String(projectOne.id));
+    await user.click(await screen.findByDisplayValue("GreenDog"));
+    await user.type(screen.getByLabelText("Subject"), "Preserve this subject");
+    await user.type(screen.getByLabelText("Message in Markdown"), "Preserve this body");
+    await user.click(screen.getByRole("button", { name: "Review message" }));
+    expect(
+      screen.getByRole("region", { name: "Review message before delivery" }),
+    ).toBeVisible();
+
+    await selectUiLocale(user, "Polski");
+
+    expect(
+      screen.queryByRole("region", { name: "Review message before delivery" }),
+    ).not.toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Nowa wiadomość" })).toBeVisible();
+    expect(screen.getByDisplayValue("Preserve this subject")).toBeVisible();
+    expect(screen.getByDisplayValue("Preserve this body")).toBeVisible();
+    expect(screen.getByDisplayValue("GreenDog")).toBeChecked();
+  });
+
+  it("replies with only human text while Iris derives routing", async () => {
     const user = userEvent.setup();
     let requestBody: unknown;
     server.use(
@@ -479,14 +697,692 @@ describe("Hermes landing shell", () => {
       }),
     );
     await user.type(await screen.findByLabelText("Reply in Markdown"), "Approved.");
-    await user.click(screen.getByRole("button", { name: "Send reply" }));
+    await act(async () => {
+      fireEvent.keyDown(screen.getByLabelText("Reply in Markdown"), {
+        key: "Enter",
+        metaKey: true,
+      });
+    });
+
+    const confirmation = await screen.findByRole("region", {
+      name: "Review reply before delivery",
+    });
+    expect(requestBody).toBeUndefined();
+    expect(within(confirmation).getByText("Delivery target")).toBeVisible();
+    expect(
+      within(confirmation).getAllByText("claude-linux-holzera-1"),
+    ).toHaveLength(2);
+    expect(within(confirmation).getByText("Re: Production rollout verified")).toBeVisible();
+    expect(within(confirmation).getByText("release-101")).toBeVisible();
+    expect(within(confirmation).getByText("Gospodarz")).toBeVisible();
+    expect(
+      within(confirmation).getByText("claude-linux-holzera-1", { selector: "code" }),
+    ).toBeVisible();
+    expect(within(confirmation).queryByText(/delivered separately/)).not.toBeInTheDocument();
+    expect(within(confirmation).getByText("MESSAGE FROM HUMAN OVERSEER")).toBeVisible();
+    await user.click(within(confirmation).getByRole("button", { name: "Confirm and send" }));
 
     expect(await screen.findByText("Published exactly once.")).toBeVisible();
     expect(requestBody).toEqual({
       idempotency_key: expect.stringMatching(/^human-ui:/u),
+      expected_sender_agent_id: messageDetail.reply_target.agent_id,
+      expected_sender_agent_generation:
+        messageDetail.reply_target.agent_generation,
+      expected_sender_project_id: messageDetail.reply_target.project_id,
+      expected_sender_project_generation:
+        messageDetail.reply_target.project_generation,
       body_md: "Approved.",
     });
     expect(screen.getByLabelText("Reply in Markdown")).toHaveValue("");
+  });
+
+  it("shows the qualified delivery target for a cross-project reply", async () => {
+    const user = userEvent.setup();
+    server.use(
+      http.get(
+        "*/mail/api/v1/projects/:projectId/messages/:messageId",
+        () => HttpResponse.json({
+          ...messageDetail,
+          sender: "RemoteAgent@remote-project",
+          sender_name: "RemoteAgent",
+          sender_display_name: "Remote operator",
+          reply_target: {
+            agent_id: 73,
+            agent_generation: "7".repeat(64),
+            project_id: 37,
+            project_generation: "8".repeat(64),
+            canonical_name: "RemoteAgent@remote-project",
+          },
+        }),
+      ),
+    );
+    render(<App />);
+    await user.click(
+      await screen.findByRole("link", {
+        name: new RegExp(`Open message.*${messageOne.subject}`),
+      }),
+    );
+    await user.type(await screen.findByLabelText("Reply in Markdown"), "Route safely.");
+    await user.click(screen.getByRole("button", { name: "Review reply" }));
+
+    const confirmation = screen.getByRole("region", {
+      name: "Review reply before delivery",
+    });
+    expect(within(confirmation).getByText("Delivery target")).toBeVisible();
+    expect(
+      within(confirmation).getAllByText("RemoteAgent@remote-project"),
+    ).toHaveLength(2);
+    expect(within(confirmation).getByText("Remote operator")).toBeVisible();
+    expect(within(confirmation).queryByText(projectOne.human_key))
+      .not.toBeInTheDocument();
+  });
+
+  it("renders a typed lifetime conflict without exposing server detail", async () => {
+    const user = userEvent.setup();
+    server.use(
+      http.post(
+        "*/mail/api/v1/projects/:projectId/messages/:messageId/replies",
+        () => HttpResponse.json(
+          { detail: { code: "reply_target_unavailable" } },
+          { status: 409 },
+        ),
+      ),
+    );
+    render(<App />);
+    await user.click(
+      await screen.findByRole("link", {
+        name: new RegExp(`Open message.*${messageOne.subject}`),
+      }),
+    );
+    await user.type(await screen.findByLabelText("Reply in Markdown"), "Stale route.");
+    await user.click(screen.getByRole("button", { name: "Review reply" }));
+    await user.click(screen.getByRole("button", { name: "Confirm and send" }));
+
+    expect(await screen.findByText(/conflicts with an earlier request/)).toBeVisible();
+    expect(screen.queryByText("reply_target_unavailable")).not.toBeInTheDocument();
+  });
+
+  it("previews the exact Polish correspondence preamble and supports returning to compose", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/mail/#compose");
+    server.use(
+      http.get(preferencesUrl, () =>
+        HttpResponse.json(preferencesResponse("en", "pl")),
+      ),
+    );
+    render(<App />);
+    await waitForEnglishPreferences();
+    await user.selectOptions(screen.getByLabelText("Project"), String(projectOne.id));
+    await user.click(await screen.findByDisplayValue("GreenDog"));
+    await user.type(screen.getByLabelText("Subject"), "Polish correspondence");
+    await user.type(screen.getByLabelText("Message in Markdown"), "**Dzień dobry**");
+    await user.click(screen.getByRole("button", { name: "Review message" }));
+
+    const confirmation = screen.getByRole("region", {
+      name: "Review message before delivery",
+    });
+    expect(within(confirmation).getByText("New thread")).toBeVisible();
+    expect(within(confirmation).getByText(/prefers replies in Polish \(pl\)/)).toBeVisible();
+    expect(within(confirmation).getByText("Dzień dobry", { selector: "strong" })).toBeVisible();
+    await user.click(within(confirmation).getByRole("button", { name: "Back to editing" }));
+    expect(screen.queryByRole("region", { name: "Review message before delivery" }))
+      .not.toBeInTheDocument();
+    expect(screen.getByLabelText("Message in Markdown")).toHaveValue("**Dzień dobry**");
+    await user.click(screen.getByRole("button", { name: "Review message" }));
+    await user.type(screen.getByLabelText("Subject"), " updated");
+    expect(screen.queryByRole("region", { name: "Review message before delivery" }))
+      .not.toBeInTheDocument();
+  });
+
+  it("discloses when the exact server preamble is unavailable in compose", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/mail/#compose");
+    server.use(
+      http.get(preferencesUrl, () =>
+        HttpResponse.json({ detail: "private preference failure" }, { status: 503 }),
+      ),
+    );
+    render(<App />);
+    expect(await screen.findByText(/Could not load your saved language/)).toBeVisible();
+    const projectSelect = screen.getByLabelText<HTMLSelectElement>("Project");
+    const staleProjectOption = document.createElement("option");
+    staleProjectOption.value = "999";
+    staleProjectOption.textContent = "Stale project";
+    projectSelect.append(staleProjectOption);
+    fireEvent.change(projectSelect, { target: { value: "999" } });
+    await user.click(await screen.findByDisplayValue("GreenDog"));
+    await user.type(screen.getByLabelText("Subject"), "Fallback preview");
+    await user.type(screen.getByLabelText("Message in Markdown"), "Visible body");
+    await user.click(screen.getByRole("button", { name: "Review message" }));
+
+    const confirmation = screen.getByRole("region", {
+      name: "Review message before delivery",
+    });
+    expect(within(confirmation).getByText("999")).toBeVisible();
+    expect(within(confirmation).getByText(/cannot show the exact language advisory/)).toBeVisible();
+    expect(within(confirmation).queryByText("MESSAGE FROM HUMAN OVERSEER"))
+      .not.toBeInTheDocument();
+    expect(within(confirmation).getByText("Visible body")).toBeVisible();
+  });
+
+  it("previews fallback reply routing and returns to an unchanged draft", async () => {
+    const user = userEvent.setup();
+    server.use(
+      http.get(preferencesUrl, () =>
+        HttpResponse.json({ detail: "private preference failure" }, { status: 503 }),
+      ),
+      http.get(
+        "*/mail/api/v1/projects/:projectId/messages/:messageId",
+        () => HttpResponse.json({
+          ...messageDetail,
+          subject: "Re: Already routed",
+          thread_id: null,
+          sender_display_name: null,
+        }),
+      ),
+      http.get("*/mail/api/v1/projects", () =>
+        HttpResponse.json({ items: [projectTwo], total: 1 }),
+      ),
+    );
+    render(<App />);
+    await user.click(
+      await screen.findByRole("link", {
+        name: new RegExp(`Open message.*${messageOne.subject}`),
+      }),
+    );
+    await user.type(await screen.findByLabelText("Reply in Markdown"), "Unchanged reply.");
+    await user.click(screen.getByRole("button", { name: "Review reply" }));
+
+    const confirmation = screen.getByRole("region", {
+      name: "Review reply before delivery",
+    });
+    expect(within(confirmation).getByText("Delivery target")).toBeVisible();
+    expect(
+      within(confirmation).getAllByText("claude-linux-holzera-1"),
+    ).toHaveLength(2);
+    expect(within(confirmation).getByText("Re: Already routed")).toBeVisible();
+    expect(within(confirmation).getByText(String(messageOne.id))).toBeVisible();
+    expect(within(confirmation).queryByText("claude-linux-holzera-1", { selector: "code" }))
+      .not.toBeInTheDocument();
+    expect(within(confirmation).getByText(/cannot show the exact language advisory/)).toBeVisible();
+    await user.click(within(confirmation).getByRole("button", { name: "Back to editing" }));
+    expect(screen.getByLabelText("Reply in Markdown")).toHaveValue("Unchanged reply.");
+  });
+
+  it("previews compose Markdown through the same fail-closed React renderer", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/mail/#compose");
+    render(<App />);
+    await waitForEnglishPreferences();
+
+    await user.click(screen.getByRole("button", { name: "Preview" }));
+    const emptyPreview = screen.getByRole("region", { name: "Message preview" });
+    expect(within(emptyPreview).getByText("Nothing to preview yet.")).toBeVisible();
+    expect(emptyPreview).not.toHaveAttribute("aria-live");
+    expect(document.querySelector('label[for="compose-body"]')).toBeNull();
+    expect(screen.getByRole("button", { name: "Review message" })).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message in Markdown");
+    expect(screen.getByRole("group", { name: "Markdown formatting" })).toBeVisible();
+    await user.type(textarea, "selected");
+    textarea.setSelectionRange(0, 8);
+    await user.click(screen.getByRole("button", { name: "Bold" }));
+    expect(textarea).toHaveValue("**selected**");
+    expect(textarea).toHaveFocus();
+    expect(textarea.selectionStart).toBe(2);
+    expect(textarea.selectionEnd).toBe(10);
+    await user.keyboard("replacement");
+    expect(textarea).toHaveValue("**replacement**");
+
+    await user.clear(textarea);
+    await user.type(textarea, "Title");
+    textarea.setSelectionRange(0, 5);
+    await user.click(screen.getByRole("button", { name: "Heading" }));
+    expect(textarea).toHaveValue("## Title");
+    expect(textarea.selectionStart).toBe(3);
+    expect(textarea.selectionEnd).toBe(8);
+    await user.clear(textarea);
+    await user.type(textarea, "const answer = 42;");
+    textarea.setSelectionRange(0, textarea.value.length);
+    await user.click(screen.getByRole("button", { name: "Code block" }));
+    expect(textarea).toHaveValue("```\nconst answer = 42;\n```");
+    expect(textarea.selectionStart).toBe(4);
+    expect(textarea.selectionEnd).toBe(22);
+
+    await user.clear(textarea);
+    await user.type(textarea, "x");
+    textarea.setSelectionRange(1, 1);
+    await user.click(screen.getByRole("button", { name: "Inline code" }));
+    expect(textarea).toHaveValue("x``");
+    expect(textarea.selectionStart).toBe(2);
+    expect(textarea.selectionEnd).toBe(2);
+
+    fireEvent.change(textarea, { target: { value: "x".repeat(49_999) } });
+    textarea.setSelectionRange(0, 1);
+    await user.click(screen.getByRole("button", { name: "Bold" }));
+    expect(textarea).toHaveValue("x".repeat(49_999));
+
+    await user.clear(textarea);
+    fireEvent.change(textarea, {
+      target: {
+        value: "**Visible** [blocked](#fragment) ![remote](https://tracker.invalid/pixel.png)\n\n<script>unsafe()</script>",
+      },
+    });
+    await user.click(screen.getByRole("button", { name: "Split" }));
+    const splitPreview = screen.getByRole("region", { name: "Message preview" });
+    expect(screen.getByLabelText("Message in Markdown")).toBeVisible();
+    expect(within(splitPreview).getByText("Visible", { selector: "strong" })).toBeVisible();
+    expect(within(splitPreview).getByText("blocked").closest("a")).toBeNull();
+    expect(within(splitPreview).getByText("remote")).toHaveClass("markdown-image-alt");
+    expect(splitPreview.querySelector("script")).not.toBeInTheDocument();
+    expect(screen.getByText(/\/ 50,000 characters$/u)).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "Preview" }));
+    expect(screen.queryByLabelText("Message in Markdown")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.queryByRole("region", { name: "Message preview" }))
+      .not.toBeInTheDocument();
+  });
+
+  it("offers the same empty, split, and safe Markdown preview while replying", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(
+      await screen.findByRole("link", {
+        name: new RegExp(`Open message.*${messageOne.subject}`),
+      }),
+    );
+
+    await user.click(await screen.findByRole("button", { name: "Preview" }));
+    expect(
+      within(screen.getByRole("region", { name: "Reply preview" })).getByText(
+        "Nothing to preview yet.",
+      ),
+    ).toBeVisible();
+    const reviewReply = screen.getByRole("button", { name: "Review reply" });
+    expect(reviewReply).toBeDisabled();
+    fireEvent.submit(reviewReply);
+    expect(screen.getByText(/could not be submitted/)).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    await user.type(screen.getByLabelText("Reply in Markdown"), "~~Retired~~\nnext");
+    await user.click(screen.getByRole("button", { name: "Split" }));
+    const preview = screen.getByRole("region", { name: "Reply preview" });
+    expect(within(preview).getByText("Retired", { selector: "del" })).toBeVisible();
+    expect(preview.querySelector("br")).toBeInTheDocument();
+    expect(screen.getByLabelText("Reply in Markdown")).toBeVisible();
+  });
+
+  it("searches aliases and canonical agent names and manages a bounded selection", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/mail/#compose");
+    render(<App />);
+    await waitForEnglishPreferences();
+    expect(screen.getByText("Choose a project to load its active agents.")).toBeVisible();
+
+    await user.selectOptions(screen.getByLabelText("Project"), String(projectOne.id));
+    const search = await screen.findByLabelText("Find recipients");
+    expect(screen.getByText("Release operator")).toBeVisible();
+    expect(screen.getByText("GreenDog", { selector: "code" })).toBeVisible();
+    expect(screen.getByText("0 of 100 recipients selected")).toBeVisible();
+
+    await user.click(screen.getByDisplayValue("GreenDog"));
+    await user.type(search, "schema");
+    expect(screen.getByDisplayValue("IndigoBridge")).toBeVisible();
+    expect(screen.queryByDisplayValue("GreenDog")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Select all" }));
+    expect(screen.getByText("2 of 100 recipients selected")).toBeVisible();
+    await user.clear(search);
+    expect(screen.getByDisplayValue("GreenDog")).toBeChecked();
+    expect(screen.getByDisplayValue("IndigoBridge")).toBeChecked();
+    await user.click(screen.getByRole("button", { name: "Clear selection" }));
+    await user.type(search, "missing person");
+    expect(screen.getByText("No active agents match this search.")).toBeVisible();
+    await user.clear(search);
+    await user.type(search, "release");
+    await user.click(screen.getByRole("button", { name: "Select all" }));
+    expect(screen.getByText("1 of 100 recipients selected")).toBeVisible();
+    expect(screen.getByDisplayValue("GreenDog")).toBeChecked();
+    expect(screen.queryByDisplayValue("BlueLake")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Clear selection" }));
+    await user.clear(search);
+
+    const greenDog = screen.getByDisplayValue("GreenDog");
+    await user.click(greenDog);
+    expect(screen.getByText("1 of 100 recipients selected")).toBeVisible();
+    await user.click(greenDog);
+    expect(screen.getByText("0 of 100 recipients selected")).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "Select all" }));
+    expect(screen.getByText("3 of 100 recipients selected")).toBeVisible();
+    for (const agent of projectAgentsResponse.items) {
+      expect(screen.getByDisplayValue(agent.name)).toBeChecked();
+    }
+    await user.click(screen.getByRole("button", { name: "Clear selection" }));
+    expect(screen.getByText("0 of 100 recipients selected")).toBeVisible();
+  });
+
+  it("renders recipient loading failures, empty projects, and session expiry honestly", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/mail/#compose");
+    server.use(
+      http.get("*/mail/api/v1/projects/:projectId/agents", () =>
+        HttpResponse.json({ detail: "private agent failure" }, { status: 500 }),
+      ),
+    );
+    const failed = render(<App />);
+    await waitForEnglishPreferences();
+    await user.selectOptions(screen.getByLabelText("Project"), String(projectOne.id));
+    expect(await screen.findByText(/Active agents could not be loaded/)).toBeVisible();
+    expect(screen.queryByText("private agent failure")).not.toBeInTheDocument();
+    failed.unmount();
+
+    server.use(
+      http.get("*/mail/api/v1/projects/:projectId/agents", ({ params }) =>
+        HttpResponse.json({
+          project_id: Number(params.projectId),
+          project_generation: "d".repeat(64),
+          items: [],
+          total: 0,
+        }),
+      ),
+    );
+    const empty = render(<App />);
+    await waitForEnglishPreferences();
+    await user.selectOptions(screen.getByLabelText("Project"), String(projectOne.id));
+    expect(await screen.findByText("No active agents are available in this project."))
+      .toBeVisible();
+    empty.unmount();
+
+    const onUnauthorized = vi.fn();
+    server.use(
+      http.get("*/mail/api/v1/projects/:projectId/agents", () =>
+        HttpResponse.json({ detail: "expired" }, { status: 401 }),
+      ),
+    );
+    render(<App onUnauthorized={onUnauthorized} />);
+    await waitForEnglishPreferences();
+    await user.selectOptions(screen.getByLabelText("Project"), String(projectOne.id));
+    await waitFor(() => expect(onUnauthorized).toHaveBeenCalledOnce());
+    expect(screen.getByText(/Active agents could not be loaded/)).toBeVisible();
+  });
+
+  it("caps Select all at 100 canonical recipients", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/mail/#compose");
+    const agents = Array.from({ length: 101 }, (_, index) => ({
+      agent_id: index + 1,
+      agent_generation: (index % 16).toString(16).repeat(64),
+      name: `Agent${String(index + 1).padStart(3, "0")}`,
+      display_name: index === 100 ? "Overflow agent" : null,
+    }));
+    server.use(
+      http.get("*/mail/api/v1/projects/:projectId/agents", ({ params }) =>
+        HttpResponse.json({
+          project_id: Number(params.projectId),
+          project_generation: "d".repeat(64),
+          items: agents,
+          total: agents.length,
+        }),
+      ),
+    );
+    render(<App />);
+    await waitForEnglishPreferences();
+    await user.selectOptions(screen.getByLabelText("Project"), String(projectOne.id));
+    await screen.findByDisplayValue("Agent101");
+    expect(
+      screen.getByText(/101 active agents are available.*select up to 100/u),
+    ).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Select all" }));
+    expect(screen.getByText("100 of 100 recipients selected")).toBeVisible();
+    expect(screen.getByDisplayValue("Agent100")).toBeChecked();
+    expect(screen.getByDisplayValue("Agent101")).not.toBeChecked();
+    expect(screen.getByDisplayValue("Agent101")).toBeDisabled();
+  });
+
+  it.each(["resolve", "reject"] as const)(
+    "ignores a stale project-agent directory %s after switching projects",
+    async (outcome) => {
+      const user = userEvent.setup();
+      window.history.replaceState({}, "", "/mail/#compose");
+      const activeProjectTwo = {
+        ...projectTwo,
+        archived_at: null,
+        role: "admin" as const,
+        can_reply: true,
+      };
+      let oldRequests = 0;
+      let resolveOld: (response: Response) => void = () => undefined;
+      let rejectOld: (reason: unknown) => void = () => undefined;
+      const oldDirectory = new Promise<Response>((resolve, reject) => {
+        resolveOld = resolve;
+        rejectOld = reject;
+      });
+      const originalFetch = globalThis.fetch.bind(globalThis);
+      vi.stubGlobal(
+        "fetch",
+        (input: RequestInfo | URL, init?: RequestInit) => {
+          const requestUrl =
+            typeof input === "string"
+              ? input
+              : input instanceof URL
+                ? input.href
+                : input.url;
+          if (requestUrl.endsWith(`/mail/api/v1/projects/${projectOne.id}/agents`)) {
+            oldRequests += 1;
+            return oldDirectory;
+          }
+          return originalFetch(input, init);
+        },
+      );
+      server.use(
+        http.get("*/mail/api/v1/projects", () =>
+          HttpResponse.json({ items: [projectOne, activeProjectTwo], total: 2 }),
+        ),
+      );
+      render(<App />);
+      await waitForEnglishPreferences();
+      await user.selectOptions(screen.getByLabelText("Project"), String(projectOne.id));
+      await waitFor(() => expect(oldRequests).toBe(1));
+      await user.selectOptions(
+        screen.getByLabelText("Project"),
+        String(activeProjectTwo.id),
+      );
+      expect(await screen.findByDisplayValue("GreenDog")).toBeVisible();
+
+      await act(async () => {
+        if (outcome === "resolve") {
+          resolveOld(
+            new Response(
+              JSON.stringify({
+                project_id: projectOne.id,
+                project_generation: "a".repeat(64),
+                items: [{
+                  agent_id: 999,
+                  agent_generation: "b".repeat(64),
+                  name: "OldOnly",
+                  display_name: null,
+                }],
+                total: 1,
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            ),
+          );
+        } else {
+          rejectOld(new TypeError("late old-directory failure"));
+        }
+        await Promise.resolve();
+      });
+      expect(screen.queryByDisplayValue("OldOnly")).not.toBeInTheDocument();
+      expect(screen.getByDisplayValue("GreenDog")).toBeVisible();
+    },
+  );
+
+  it("ignores an aborted project-agent request without replacing the picker", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/mail/#compose");
+    let agentRequests = 0;
+    const originalFetch = globalThis.fetch.bind(globalThis);
+    vi.stubGlobal(
+      "fetch",
+      (input: RequestInfo | URL, init?: RequestInit) => {
+        const requestUrl =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url;
+        if (requestUrl.includes("/mail/api/v1/projects/11/agents")) {
+          agentRequests += 1;
+          return Promise.reject(new DOMException("aborted", "AbortError"));
+        }
+        return originalFetch(input, init);
+      },
+    );
+    render(<App />);
+    await waitForEnglishPreferences();
+    await user.selectOptions(screen.getByLabelText("Project"), String(projectOne.id));
+    await waitFor(() => expect(agentRequests).toBe(1));
+    expect(screen.getByText("Loading active agents…")).toBeVisible();
+    expect(screen.queryByText(/Active agents could not be loaded/)).not.toBeInTheDocument();
+  });
+
+  it("refreshes and reconciles lifetime-bound recipients after a typed 409 without retrying", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/mail/#compose");
+    let directoryReads = 0;
+    let writes = 0;
+    let releaseRefresh: () => void = () => undefined;
+    const refreshGate = new Promise<void>((resolve) => {
+      releaseRefresh = resolve;
+    });
+    server.use(
+      http.get("*/mail/api/v1/projects/:projectId/agents", async () => {
+        directoryReads += 1;
+        if (directoryReads === 1) {
+          return HttpResponse.json(projectAgentsResponse);
+        }
+        await refreshGate;
+        return HttpResponse.json({
+          ...projectAgentsResponse,
+          items: projectAgentsResponse.items.map((agent) =>
+            agent.name === "BlueLake"
+              ? { ...agent, agent_generation: "4".repeat(64) }
+              : agent,
+          ),
+        });
+      }),
+      http.post("*/mail/api/v1/projects/:projectId/messages", () => {
+        writes += 1;
+        return HttpResponse.json(
+          { detail: { code: "recipient_unavailable" } },
+          { status: 409 },
+        );
+      }),
+    );
+    render(<App />);
+    await waitForEnglishPreferences();
+    await user.selectOptions(screen.getByLabelText("Project"), String(projectOne.id));
+    await user.click(await screen.findByDisplayValue("GreenDog"));
+    await user.click(screen.getByDisplayValue("BlueLake"));
+    await user.type(screen.getByLabelText("Subject"), "Keep the draft");
+    await user.type(screen.getByLabelText("Message in Markdown"), "Still valid text.");
+    await user.click(screen.getByRole("button", { name: "Review message" }));
+    await user.click(screen.getByRole("button", { name: "Confirm and send" }));
+
+    expect(await screen.findByText(/Refreshing it before you can review again/)).toBeVisible();
+    expect(writes).toBe(1);
+    expect(screen.queryByRole("region", { name: "Review message before delivery" }))
+      .not.toBeInTheDocument();
+    await act(async () => {
+      releaseRefresh();
+      await refreshGate;
+    });
+    expect(await screen.findByText(/directory was refreshed/)).toBeVisible();
+    expect(await screen.findByDisplayValue("GreenDog")).toBeChecked();
+    expect(screen.getByDisplayValue("BlueLake")).not.toBeChecked();
+    expect(screen.getByText("1 of 100 recipients selected")).toBeVisible();
+    expect(screen.getByLabelText("Subject")).toHaveValue("Keep the draft");
+    expect(screen.getByLabelText("Message in Markdown")).toHaveValue("Still valid text.");
+    expect(directoryReads).toBe(2);
+    expect(writes).toBe(1);
+  });
+
+  it("clears recipient selections when a typed 409 reveals a recreated project", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/mail/#compose");
+    let directoryReads = 0;
+    let writes = 0;
+    server.use(
+      http.get("*/mail/api/v1/projects/:projectId/agents", () => {
+        directoryReads += 1;
+        return HttpResponse.json(
+          directoryReads === 1
+            ? projectAgentsResponse
+            : { ...projectAgentsResponse, project_generation: "e".repeat(64) },
+        );
+      }),
+      http.post("*/mail/api/v1/projects/:projectId/messages", () => {
+        writes += 1;
+        return HttpResponse.json(
+          { detail: { code: "project_recreated" } },
+          { status: 409 },
+        );
+      }),
+    );
+    render(<App />);
+    await waitForEnglishPreferences();
+    await user.selectOptions(screen.getByLabelText("Project"), String(projectOne.id));
+    await user.click(await screen.findByDisplayValue("GreenDog"));
+    await user.type(screen.getByLabelText("Subject"), "Project lifetime");
+    await user.type(screen.getByLabelText("Message in Markdown"), "Preserve this draft.");
+    await user.click(screen.getByRole("button", { name: "Review message" }));
+    await user.click(screen.getByRole("button", { name: "Confirm and send" }));
+
+    expect(await screen.findByText(/directory was refreshed/)).toBeVisible();
+    expect(screen.getByText("0 of 100 recipients selected")).toBeVisible();
+    expect(screen.getByDisplayValue("GreenDog")).not.toBeChecked();
+    expect(screen.getByRole("button", { name: "Review message" })).toBeDisabled();
+    expect(screen.getByLabelText("Subject")).toHaveValue("Project lifetime");
+    expect(screen.getByLabelText("Message in Markdown")).toHaveValue("Preserve this draft.");
+    expect(directoryReads).toBe(2);
+    expect(writes).toBe(1);
+  });
+
+  it("reports a failed directory refresh for lifetime-invalid delivery without retrying", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/mail/#compose");
+    let directoryReads = 0;
+    let writes = 0;
+    server.use(
+      http.get("*/mail/api/v1/projects/:projectId/agents", () => {
+        directoryReads += 1;
+        return directoryReads === 1
+          ? HttpResponse.json(projectAgentsResponse)
+          : HttpResponse.json({ detail: "private refresh failure" }, { status: 503 });
+      }),
+      http.post("*/mail/api/v1/projects/:projectId/messages", () => {
+        writes += 1;
+        return HttpResponse.json(
+          { detail: { code: "agent_lifetime_invalid" } },
+          { status: 409 },
+        );
+      }),
+    );
+    render(<App />);
+    await waitForEnglishPreferences();
+    await user.selectOptions(screen.getByLabelText("Project"), String(projectOne.id));
+    await user.click(await screen.findByDisplayValue("GreenDog"));
+    await user.type(screen.getByLabelText("Subject"), "Refresh failure");
+    await user.type(screen.getByLabelText("Message in Markdown"), "Draft survives.");
+    await user.click(screen.getByRole("button", { name: "Review message" }));
+    await user.click(screen.getByRole("button", { name: "Confirm and send" }));
+
+    expect(await screen.findByText(/directory could not be refreshed/)).toBeVisible();
+    expect(screen.queryByText("private refresh failure")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Message in Markdown")).toHaveValue("Draft survives.");
+    expect(directoryReads).toBe(2);
+    expect(writes).toBe(1);
   });
 
   it("reuses the same compose key through conflict and failed or pending polls", async () => {
@@ -537,14 +1433,15 @@ describe("Hermes landing shell", () => {
     render(<App />);
     await waitForEnglishPreferences();
     await user.selectOptions(screen.getByLabelText("Project"), String(projectOne.id));
-    await user.type(screen.getByLabelText("Recipients"), "GreenDog");
+    await user.click(await screen.findByDisplayValue("GreenDog"));
     await user.type(screen.getByLabelText("Subject"), "Retry safely");
     await user.type(screen.getByLabelText("Message in Markdown"), "Keep this text.");
 
-    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await user.click(screen.getByRole("button", { name: "Review message" }));
+    await user.click(screen.getByRole("button", { name: "Confirm and send" }));
     expect(await screen.findByText(/conflicts with an earlier request/)).toBeVisible();
     expect(screen.getByLabelText("Message in Markdown")).toHaveValue("Keep this text.");
-    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await user.click(screen.getByRole("button", { name: "Confirm and send" }));
     expect(await screen.findByText("Accepted and waiting to publish.")).toBeVisible();
     expect(keys).toHaveLength(2);
     expect(keys[1]).toBe(keys[0]);
@@ -554,7 +1451,8 @@ describe("Hermes landing shell", () => {
     expect(screen.queryByText("private delivery failure")).not.toBeInTheDocument();
     expect(screen.getByLabelText("Message in Markdown")).toHaveValue("Keep this text.");
 
-    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await user.click(screen.getByRole("button", { name: "Review message" }));
+    await user.click(screen.getByRole("button", { name: "Confirm and send" }));
     expect(await screen.findByText("Accepted and waiting to publish.")).toBeVisible();
     expect(keys).toHaveLength(3);
     expect(new Set(keys)).toEqual(new Set([keys[0]]));
@@ -567,6 +1465,45 @@ describe("Hermes landing shell", () => {
     await user.click(screen.getByRole("button", { name: "Check status" }));
     expect(await screen.findByText("Published exactly once.")).toBeVisible();
     expect(screen.queryByRole("button", { name: "Check status" })).not.toBeInTheDocument();
+  });
+
+  it("reuses the same compose key after an ambiguous failure and navigation", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/mail/#compose");
+    const keys: string[] = [];
+    server.use(
+      http.post("*/mail/api/v1/projects/:projectId/messages", async ({ request }) => {
+        const body = (await request.json()) as { idempotency_key: string };
+        keys.push(body.idempotency_key);
+        return keys.length === 1
+          ? HttpResponse.json({ detail: "ambiguous upstream failure" }, { status: 503 })
+          : HttpResponse.json(deliveryResponse);
+      }),
+    );
+    render(<App />);
+    await waitForEnglishPreferences();
+    await user.selectOptions(screen.getByLabelText("Project"), String(projectOne.id));
+    await user.click(await screen.findByDisplayValue("GreenDog"));
+    await user.type(screen.getByLabelText("Subject"), "Do not duplicate");
+    await user.type(screen.getByLabelText("Message in Markdown"), "One durable intent.");
+    await user.click(screen.getByRole("button", { name: "Review message" }));
+    await user.click(screen.getByRole("button", { name: "Confirm and send" }));
+    expect(await screen.findByText(/could not be submitted/)).toBeVisible();
+
+    await user.click(screen.getByRole("link", { name: "Inbox" }));
+    expect(await screen.findByRole("heading", { name: "Inbox" })).toBeVisible();
+    await user.click(screen.getByRole("link", { name: "Compose" }));
+    expect(await screen.findByRole("heading", { name: "Compose" })).toBeVisible();
+    expect(screen.getByLabelText("Project")).toHaveValue(String(projectOne.id));
+    expect(screen.getByLabelText("Subject")).toHaveValue("Do not duplicate");
+    expect(screen.getByLabelText("Message in Markdown")).toHaveValue("One durable intent.");
+    await user.click(await screen.findByDisplayValue("GreenDog"));
+    await user.click(screen.getByRole("button", { name: "Review message" }));
+    await user.click(screen.getByRole("button", { name: "Confirm and send" }));
+
+    expect(await screen.findByText("Published exactly once.")).toBeVisible();
+    expect(keys).toHaveLength(2);
+    expect(keys[1]).toBe(keys[0]);
   });
 
   it("keeps a reply idempotent through submission and status failures", async () => {
@@ -625,12 +1562,13 @@ describe("Hermes landing shell", () => {
     );
     await user.type(await screen.findByLabelText("Reply in Markdown"), "Keep this reply.");
 
-    await user.click(screen.getByRole("button", { name: "Send reply" }));
+    await user.click(screen.getByRole("button", { name: "Review reply" }));
+    await user.click(screen.getByRole("button", { name: "Confirm and send" }));
     expect(await screen.findByText(/could not be submitted/)).toBeVisible();
     expect(screen.queryByText("private reply failure")).not.toBeInTheDocument();
     expect(screen.getByLabelText("Reply in Markdown")).toHaveValue("Keep this reply.");
 
-    await user.click(screen.getByRole("button", { name: "Send reply" }));
+    await user.click(screen.getByRole("button", { name: "Confirm and send" }));
     expect(await screen.findByText("Accepted and waiting to publish.")).toBeVisible();
     expect(keys).toHaveLength(2);
     expect(keys[1]).toBe(keys[0]);
@@ -639,7 +1577,8 @@ describe("Hermes landing shell", () => {
     expect(await screen.findByText(/could not be submitted/)).toBeVisible();
     expect(screen.queryByText("private status failure")).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "Send reply" }));
+    await user.click(screen.getByRole("button", { name: "Review reply" }));
+    await user.click(screen.getByRole("button", { name: "Confirm and send" }));
     expect(await screen.findByText("Accepted and waiting to publish.")).toBeVisible();
     expect(new Set(keys)).toEqual(new Set([keys[0]]));
 
@@ -649,6 +1588,188 @@ describe("Hermes landing shell", () => {
     await user.click(screen.getByRole("button", { name: "Check status" }));
     expect(await screen.findByText("Published exactly once.")).toBeVisible();
     expect(screen.getByLabelText("Reply in Markdown")).toHaveValue("Keep this reply.");
+  });
+
+  it("reuses the same reply key after a pending response and navigation", async () => {
+    const user = userEvent.setup();
+    const keys: string[] = [];
+    server.use(
+      http.post(
+        "*/mail/api/v1/projects/:projectId/messages/:messageId/replies",
+        async ({ request }) => {
+          const body = (await request.json()) as { idempotency_key: string };
+          keys.push(body.idempotency_key);
+          return keys.length === 1
+            ? HttpResponse.json({
+                ...deliveryResponse,
+                status: "pending",
+                message_id: null,
+                commit_sha: null,
+                next_attempt_ts: "2026-08-12T20:34:00Z",
+              })
+            : HttpResponse.json({ ...deliveryResponse, reused: true });
+        },
+      ),
+    );
+    render(<App />);
+    await user.click(
+      await screen.findByRole("link", {
+        name: new RegExp(`Open message.*${messageOne.subject}`),
+      }),
+    );
+    await user.type(await screen.findByLabelText("Reply in Markdown"), "One reply only.");
+    await user.click(screen.getByRole("button", { name: "Review reply" }));
+    await user.click(screen.getByRole("button", { name: "Confirm and send" }));
+    expect(await screen.findByText("Accepted and waiting to publish.")).toBeVisible();
+
+    await user.click(screen.getByRole("link", { name: "Inbox" }));
+    await user.click(
+      await screen.findByRole("link", {
+        name: new RegExp(`Open message.*${messageOne.subject}`),
+      }),
+    );
+    await user.type(await screen.findByLabelText("Reply in Markdown"), "One reply only.");
+    await user.click(screen.getByRole("button", { name: "Review reply" }));
+    await user.click(screen.getByRole("button", { name: "Confirm and send" }));
+
+    expect(await screen.findByText("Published exactly once.")).toBeVisible();
+    expect(keys).toHaveLength(2);
+    expect(keys[1]).toBe(keys[0]);
+  });
+
+  it("multiplexes pending reply attempts across A to B to A navigation", async () => {
+    const user = userEvent.setup();
+    const secondMessage = {
+      ...messageOne,
+      id: 202,
+      subject: "Second immutable reply target",
+      sender: "SecondAgent",
+      sender_name: "SecondAgent",
+      sender_display_name: "Second operator",
+      thread_id: "release-202",
+    };
+    const secondDetail = {
+      ...messageDetail,
+      ...secondMessage,
+      reply_target: {
+        agent_id: 42,
+        agent_generation: "5".repeat(64),
+        project_id: projectOne.id,
+        project_generation: projectAgentsResponse.project_generation,
+        canonical_name: "SecondAgent",
+      },
+    };
+    const attempts: Array<{ messageId: string; key: string }> = [];
+    server.use(
+      http.get("*/mail/api/v1/inbox", () =>
+        HttpResponse.json({
+          items: [messageOne, secondMessage],
+          total: 2,
+          next_cursor: null,
+        }),
+      ),
+      http.get(
+        "*/mail/api/v1/projects/:projectId/messages/:messageId",
+        ({ params }) =>
+          params.messageId === String(messageOne.id)
+            ? HttpResponse.json(messageDetail)
+            : HttpResponse.json(secondDetail),
+      ),
+      http.post(
+        "*/mail/api/v1/projects/:projectId/messages/:messageId/replies",
+        async ({ params, request }) => {
+          const body = (await request.json()) as { idempotency_key: string };
+          attempts.push({
+            messageId: String(params.messageId),
+            key: body.idempotency_key,
+          });
+          return HttpResponse.json({
+            ...deliveryResponse,
+            status: "pending",
+            message_id: null,
+            commit_sha: null,
+            next_attempt_ts: "2026-08-12T20:35:00Z",
+          });
+        },
+      ),
+    );
+    render(<App />);
+
+    const sendPendingReply = async (subject: string, body: string) => {
+      await user.click(
+        await screen.findByRole("link", {
+          name: new RegExp(`Open message.*${subject}`),
+        }),
+      );
+      await user.type(await screen.findByLabelText("Reply in Markdown"), body);
+      await user.click(screen.getByRole("button", { name: "Review reply" }));
+      await user.click(screen.getByRole("button", { name: "Confirm and send" }));
+      expect(await screen.findByText("Accepted and waiting to publish.")).toBeVisible();
+      await user.click(screen.getByRole("link", { name: "Inbox" }));
+    };
+
+    await sendPendingReply(messageOne.subject, "First reply body.");
+    await sendPendingReply(secondMessage.subject, "Second reply body.");
+    await sendPendingReply(messageOne.subject, "First reply body.");
+
+    expect(attempts).toHaveLength(3);
+    expect(attempts[2]!.key).toBe(attempts[0]!.key);
+    expect(attempts[1]!.key).not.toBe(attempts[0]!.key);
+  });
+
+  it("keeps the reply key when only the sender display alias changes", async () => {
+    const user = userEvent.setup();
+    const keys: string[] = [];
+    let senderAlias = "Original alias";
+    server.use(
+      http.get(
+        "*/mail/api/v1/projects/:projectId/messages/:messageId",
+        () => HttpResponse.json({
+          ...messageDetail,
+          sender_display_name: senderAlias,
+        }),
+      ),
+      http.post(
+        "*/mail/api/v1/projects/:projectId/messages/:messageId/replies",
+        async ({ request }) => {
+          const body = (await request.json()) as { idempotency_key: string };
+          keys.push(body.idempotency_key);
+          return HttpResponse.json({
+            ...deliveryResponse,
+            status: "pending",
+            message_id: null,
+            commit_sha: null,
+            next_attempt_ts: "2026-08-12T20:36:00Z",
+          });
+        },
+      ),
+    );
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole("link", {
+        name: new RegExp(`Open message.*${messageOne.subject}`),
+      }),
+    );
+    await user.type(await screen.findByLabelText("Reply in Markdown"), "Alias-safe reply.");
+    await user.click(screen.getByRole("button", { name: "Review reply" }));
+    await user.click(screen.getByRole("button", { name: "Confirm and send" }));
+    expect(await screen.findByText("Accepted and waiting to publish.")).toBeVisible();
+
+    senderAlias = "Renamed alias";
+    await user.click(screen.getByRole("link", { name: "Inbox" }));
+    await user.click(
+      await screen.findByRole("link", {
+        name: new RegExp(`Open message.*${messageOne.subject}`),
+      }),
+    );
+    expect(await screen.findByText(/Renamed alias/)).toBeVisible();
+    await user.type(screen.getByLabelText("Reply in Markdown"), "Alias-safe reply.");
+    await user.click(screen.getByRole("button", { name: "Review reply" }));
+    await user.click(screen.getByRole("button", { name: "Confirm and send" }));
+
+    expect(keys).toHaveLength(2);
+    expect(keys[1]).toBe(keys[0]);
   });
 
   it("renders compose initialization failures and an empty active-project set", async () => {
@@ -676,7 +1797,7 @@ describe("Hermes landing shell", () => {
     expect(
       await screen.findByText("There are no active projects available for compose."),
     ).toBeVisible();
-    expect(screen.queryByRole("button", { name: "Send message" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Review message" })).not.toBeInTheDocument();
   });
 
   it("fails compose validation and preserves text on server or session errors", async () => {
@@ -690,16 +1811,15 @@ describe("Hermes landing shell", () => {
     );
     render(<App onUnauthorized={onUnauthorized} />);
     await waitForEnglishPreferences();
-    const form = screen.getByRole("button", { name: "Send message" }).closest("form");
-    expect(form).not.toBeNull();
-    fireEvent.submit(form!);
+    fireEvent.submit(screen.getByRole("button", { name: "Review message" }));
     expect(await screen.findByText(/could not be submitted/)).toBeVisible();
 
     await user.selectOptions(screen.getByLabelText("Project"), String(projectOne.id));
-    await user.type(screen.getByLabelText("Recipients"), "GreenDog");
+    await user.click(await screen.findByDisplayValue("GreenDog"));
     await user.type(screen.getByLabelText("Subject"), "Stay put");
     await user.type(screen.getByLabelText("Message in Markdown"), "Unsaved text");
-    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await user.click(screen.getByRole("button", { name: "Review message" }));
+    await user.click(screen.getByRole("button", { name: "Confirm and send" }));
     await waitFor(() => expect(onUnauthorized).toHaveBeenCalledOnce());
     expect(screen.getByLabelText("Message in Markdown")).toHaveValue("Unsaved text");
   });
@@ -720,10 +1840,11 @@ describe("Hermes landing shell", () => {
     const adminView = render(<App />);
     await waitForEnglishPreferences();
     await user.selectOptions(screen.getByLabelText("Project"), String(projectOne.id));
-    await user.type(screen.getByLabelText("Recipients"), "GreenDog");
+    await user.click(await screen.findByDisplayValue("GreenDog"));
     await user.type(screen.getByLabelText("Subject"), "Quarantine");
     await user.type(screen.getByLabelText("Message in Markdown"), "Review me");
-    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await user.click(screen.getByRole("button", { name: "Review message" }));
+    await user.click(screen.getByRole("button", { name: "Confirm and send" }));
     expect(await screen.findByText(/quarantined for manual review/)).toBeVisible();
     expect(screen.queryByRole("button", { name: "Check status" })).not.toBeInTheDocument();
     adminView.unmount();
@@ -733,10 +1854,11 @@ describe("Hermes landing shell", () => {
     );
     render(<App />);
     expect(await screen.findByText(/Administrator access is required/)).toBeVisible();
-    expect(screen.queryByRole("button", { name: "Send message" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Review message" })).not.toBeInTheDocument();
   });
 
   it("loads a stored Polish UI locale while keeping correspondence independent", async () => {
+    const user = userEvent.setup();
     server.use(
       http.get(preferencesUrl, () =>
         HttpResponse.json(preferencesResponse("pl", "en")),
@@ -748,11 +1870,27 @@ describe("Hermes landing shell", () => {
     expect(document.documentElement).toHaveAttribute("lang", "pl");
     expect(screen.getByRole("navigation", { name: "Główna nawigacja" })).toBeVisible();
     expect(screen.getByText(messageOne.subject)).toBeVisible();
-    expect(screen.getByLabelText("Język")).toHaveValue("pl");
-    expect(screen.getByLabelText("Język")).toHaveAccessibleDescription(
+    expect(localePickerTrigger()).toHaveAttribute("data-locale", "pl");
+    expect(localePickerTrigger()).toHaveAccessibleDescription(
       "Język zapisany na Twoim koncie",
     );
     expect(screen.getByRole("button", { name: "Wyloguj się" })).toBeVisible();
+
+    await user.click(screen.getByRole("link", { name: "Napisz" }));
+    expect(await screen.findByRole("heading", { name: "Nowa wiadomość" })).toBeVisible();
+    await user.selectOptions(screen.getByLabelText("Projekt"), String(projectOne.id));
+    await user.click(await screen.findByDisplayValue("GreenDog"));
+    await user.type(screen.getByLabelText("Temat"), "Polski interfejs");
+    await user.type(screen.getByLabelText("Wiadomość w Markdown"), "Treść");
+    await user.click(screen.getByRole("button", { name: "Sprawdź wiadomość" }));
+    const confirmation = screen.getByRole("region", {
+      name: "Sprawdź wiadomość przed dostawą",
+    });
+    expect(within(confirmation).getByText(/polecenie Human Overseer o wysokim priorytecie/))
+      .toBeVisible();
+    expect(within(confirmation).getByText(/prefers replies in English \(en\)/)).toBeVisible();
+    expect(within(confirmation).getByRole("button", { name: "Potwierdź i wyślij" }))
+      .toBeVisible();
   });
 
   it("uses correct English and Polish plural forms", async () => {
@@ -791,9 +1929,9 @@ describe("Hermes landing shell", () => {
     render(<App />);
     await waitForEnglishPreferences();
 
-    await user.selectOptions(screen.getByLabelText("Language"), "pl");
+    await selectUiLocale(user, "Polski");
     expect(await screen.findByText("Saving language…")).toBeVisible();
-    expect(screen.getByLabelText("Language")).toBeDisabled();
+    expect(localePickerTrigger()).toBeDisabled();
     expect(screen.getByRole("heading", { name: "Inbox" })).toBeVisible();
 
     expect(capturedRequest?.method).toBe("PATCH");
@@ -808,8 +1946,50 @@ describe("Hermes landing shell", () => {
 
     expect(await screen.findByRole("heading", { name: "Skrzynka" })).toBeVisible();
     expect(preferenceReads).toBe(1);
-    expect(screen.getByLabelText("Język")).toHaveValue("pl");
+    expect(localePickerTrigger()).toHaveAttribute("data-locale", "pl");
     expect(screen.getByRole("status")).toHaveTextContent("Język zapisany na Twoim koncie");
+  });
+
+  it("ignores the current locale and overlapping choices while a catalog is loading", async () => {
+    const user = userEvent.setup();
+    let finishCatalogLoad: () => void = () => undefined;
+    const catalogGate = new Promise<void>((resolve) => {
+      finishCatalogLoad = resolve;
+    });
+    const prepareLocaleCatalog = vi.fn(async (locale: SupportedLocale) => {
+      if (locale === "pl") {
+        await catalogGate;
+      }
+    });
+    let patchRequests = 0;
+    server.use(
+      http.patch(preferencesUrl, () => {
+        patchRequests += 1;
+        return HttpResponse.json(preferencesResponse("pl"));
+      }),
+    );
+
+    render(<App prepareLocaleCatalog={prepareLocaleCatalog} />);
+    await waitForEnglishPreferences();
+
+    await user.click(localePickerTrigger());
+    await user.click(screen.getByRole("option", { name: /current language: english/i }));
+    expect(prepareLocaleCatalog).not.toHaveBeenCalled();
+
+    await user.click(localePickerTrigger());
+    const polish = screen.getByRole("option", { name: /use polski/i });
+    const french = screen.getByRole("option", { name: /use français/i });
+    act(() => {
+      fireEvent.click(polish);
+      fireEvent.click(french);
+    });
+
+    expect(prepareLocaleCatalog).toHaveBeenCalledTimes(1);
+    expect(prepareLocaleCatalog).toHaveBeenCalledWith("pl");
+    expect(patchRequests).toBe(0);
+    act(() => finishCatalogLoad());
+    expect(await screen.findByRole("heading", { name: "Skrzynka" })).toBeVisible();
+    expect(patchRequests).toBe(1);
   });
 
   it("keeps the future API boundary testable through MSW", async () => {
@@ -837,7 +2017,7 @@ describe("Hermes landing shell", () => {
     expect(screen.getByRole("status")).toHaveTextContent(
       "Your session expired. Redirecting to sign in.",
     );
-    expect(screen.getByLabelText("Language")).toBeDisabled();
+    expect(localePickerTrigger()).toBeDisabled();
   });
 
   it("uses same-tab login navigation when no unauthorized callback is supplied", async () => {
@@ -866,7 +2046,7 @@ describe("Hermes landing shell", () => {
         HttpResponse.json({
           ...preferencesResponse("pl"),
           stored: {
-            preferred_ui_locale: "fr",
+            preferred_ui_locale: "not-a-locale",
             preferred_correspondence_locale: null,
           },
         }),
@@ -883,7 +2063,7 @@ describe("Hermes landing shell", () => {
     expect(screen.getByRole("status")).toHaveAttribute("aria-live", "polite");
     expect(document.documentElement).toHaveAttribute("lang", "en");
     expect(screen.getByRole("heading", { name: "Inbox" })).toBeVisible();
-    expect(screen.getByLabelText("Language")).toBeEnabled();
+    expect(localePickerTrigger()).toBeEnabled();
   });
 
   it("keeps language changes local when the preference read fails", async () => {
@@ -906,14 +2086,14 @@ describe("Hermes landing shell", () => {
         "Could not load your saved language. Changes apply only for this visit.",
       ),
     ).toBeVisible();
-    expect(screen.getByLabelText("Language")).toHaveValue("en");
+    expect(localePickerTrigger()).toHaveAttribute("data-locale", "en");
 
-    await user.selectOptions(screen.getByLabelText("Language"), "pl");
+    await selectUiLocale(user, "Polski");
 
     expect(patchRequests).toBe(0);
     expect(document.documentElement).toHaveAttribute("lang", "pl");
     expect(screen.getByRole("heading", { name: "Skrzynka" })).toBeVisible();
-    expect(screen.getByLabelText("Język")).toHaveValue("pl");
+    expect(localePickerTrigger()).toHaveAttribute("data-locale", "pl");
     expect(screen.getByRole("status")).toHaveTextContent(
       "Nie udało się wczytać zapisanego języka. Zmiany obowiązują tylko podczas tej wizyty.",
     );
@@ -929,16 +2109,47 @@ describe("Hermes landing shell", () => {
     render(<App />);
     await waitForEnglishPreferences();
 
-    await user.selectOptions(screen.getByLabelText("Language"), "pl");
+    await selectUiLocale(user, "Polski");
 
     expect(
       await screen.findByText(
         "Could not save your language. Your previous language is still active.",
       ),
     ).toBeVisible();
-    expect(screen.getByLabelText("Language")).toHaveValue("en");
+    expect(localePickerTrigger()).toHaveAttribute("data-locale", "en");
     expect(document.documentElement).toHaveAttribute("lang", "en");
     expect(screen.getByRole("heading", { name: "Inbox" })).toBeVisible();
+  });
+
+  it("loads a locale catalog before persisting the preference", async () => {
+    const user = userEvent.setup();
+    let patchRequests = 0;
+    server.use(
+      http.patch(preferencesUrl, () => {
+        patchRequests += 1;
+        return HttpResponse.json(preferencesResponse("fr"));
+      }),
+    );
+    const prepareLocaleCatalog = vi.fn(async (locale: SupportedLocale) => {
+      if (locale === "fr") {
+        throw new Error("locale chunk unavailable");
+      }
+    });
+
+    render(<App prepareLocaleCatalog={prepareLocaleCatalog} />);
+    await waitForEnglishPreferences();
+
+    await selectUiLocale(user, "Français");
+
+    await waitFor(() =>
+      expect(prepareLocaleCatalog).toHaveBeenCalledWith("fr"),
+    );
+    expect(patchRequests).toBe(0);
+    expect(document.documentElement).toHaveAttribute("lang", "en");
+    expect(screen.getByRole("heading", { name: "Inbox" })).toBeVisible();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Could not save your language. Your previous language is still active.",
+    );
   });
 
   it("rolls back and redirects when the preference write loses authorization", async () => {
@@ -952,11 +2163,11 @@ describe("Hermes landing shell", () => {
     render(<App onUnauthorized={onUnauthorized} />);
     await waitForEnglishPreferences();
 
-    await user.selectOptions(screen.getByLabelText("Language"), "pl");
+    await selectUiLocale(user, "Polski");
 
     await waitFor(() => expect(onUnauthorized).toHaveBeenCalledOnce());
-    expect(screen.getByLabelText("Language")).toHaveValue("en");
-    expect(screen.getByLabelText("Language")).toBeDisabled();
+    expect(localePickerTrigger()).toHaveAttribute("data-locale", "en");
+    expect(localePickerTrigger()).toBeDisabled();
     expect(screen.getByRole("status")).toHaveTextContent(
       "Your session expired. Redirecting to sign in.",
     );
@@ -968,7 +2179,7 @@ describe("Hermes landing shell", () => {
       {
         ...preferencesResponse("en"),
         stored: {
-          preferred_ui_locale: "fr",
+          preferred_ui_locale: "not-a-locale",
           preferred_correspondence_locale: null,
         },
       },
@@ -979,7 +2190,7 @@ describe("Hermes landing shell", () => {
         ...preferencesResponse("en"),
         stored: {
           preferred_ui_locale: "en",
-          preferred_correspondence_locale: "fr",
+          preferred_correspondence_locale: "not-a-locale",
         },
       },
     ],
@@ -987,14 +2198,14 @@ describe("Hermes landing shell", () => {
       "effective UI locale",
       {
         ...preferencesResponse("en"),
-        effective: { ui_locale: "fr", correspondence_locale: "en" },
+        effective: { ui_locale: "not-a-locale", correspondence_locale: "en" },
       },
     ],
     [
       "effective correspondence locale",
       {
         ...preferencesResponse("en"),
-        effective: { ui_locale: "en", correspondence_locale: "fr" },
+        effective: { ui_locale: "en", correspondence_locale: "not-a-locale" },
       },
     ],
   ])("rejects an invalid %s at runtime", (_label, payload) => {
@@ -1045,7 +2256,7 @@ describe("Hermes landing shell", () => {
       "- [x] Reviewed\n- [ ] Pending",
       "First line\nSecond line",
       "> Audited quote",
-      "| Identifier | Result |\n| --- | --- |\n| HERMES-101 | Passed |",
+      "| Identifier | Result |\n| --- | --- |\n| IRIS-101 | Passed |",
       "```ts\nconst delivered = true;\n```",
       "[Safe HTTPS](https://example.test/report) [safe mail](mailto:ops@example.test) [safe Polish](https://example.test/Wrocław) [safe relative](../messages/101)",
       "[blocked fragment](#delivery-report) [blocked routed fragment](/mail/#account) [blocked JavaScript](javascript:alert%281%29)",
@@ -1096,7 +2307,7 @@ describe("Hermes landing shell", () => {
       "tabindex",
       "0",
     );
-    expect(screen.getByRole("cell", { name: "HERMES-101" })).toBeVisible();
+    expect(screen.getByRole("cell", { name: "IRIS-101" })).toBeVisible();
     expect(screen.getByRole("cell", { name: "Passed" })).toBeVisible();
     expect(screen.getByLabelText("Code block")).toHaveAttribute("tabindex", "0");
     expect(screen.getByText("const delivered = true;", { selector: "code" }))
@@ -1434,6 +2645,127 @@ describe("Hermes landing shell", () => {
     expect(cursors).toEqual([null, "opaque-page-2"]);
   });
 
+  it("discards an old project's delayed page when the inbox route changes", async () => {
+    const user = userEvent.setup();
+    let releaseOldPage: (() => void) | undefined;
+    const oldPageCanFinish = new Promise<void>((resolve) => {
+      releaseOldPage = resolve;
+    });
+    const originalFetch = globalThis.fetch.bind(globalThis);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (input, init) => {
+        const url = new URL(
+          input instanceof Request ? input.url : String(input),
+          window.location.origin,
+        );
+        if (url.searchParams.get("cursor") === "old-project-page") {
+          await oldPageCanFinish;
+          return new Response(
+            JSON.stringify({
+              items: [{ ...messageTwo, subject: "Stale project page" }],
+              total: 2,
+              next_cursor: null,
+            }),
+            { headers: { "content-type": "application/json" } },
+          );
+        }
+        return originalFetch(input, init);
+      },
+    );
+    server.use(
+      http.get("*/mail/api/v1/inbox", async ({ request }) => {
+        const url = new URL(request.url);
+        if (url.searchParams.get("project_id") === String(projectTwo.id)) {
+          return HttpResponse.json({
+            items: [{ ...messageTwo, project_id: projectTwo.id }],
+            total: 1,
+            next_cursor: null,
+          });
+        }
+        return HttpResponse.json({
+          items: [messageOne],
+          total: 2,
+          next_cursor: "old-project-page",
+        });
+      }),
+    );
+    render(<App />);
+    await screen.findByText(messageOne.subject);
+
+    await user.click(screen.getByRole("button", { name: "Load more" }));
+    await user.selectOptions(
+      screen.getByLabelText("Filter by project"),
+      String(projectTwo.id),
+    );
+    expect(await screen.findByText(messageTwo.subject)).toBeVisible();
+
+    releaseOldPage?.();
+    await act(async () => oldPageCanFinish);
+    await waitFor(() =>
+      expect(screen.queryByText("Stale project page")).not.toBeInTheDocument(),
+    );
+    expect(screen.getByText(messageTwo.subject)).toBeVisible();
+    expect(screen.queryByText(messageOne.subject)).not.toBeInTheDocument();
+    fetchSpy.mockRestore();
+  });
+
+  it("ignores an old project's delayed page error when the inbox route changes", async () => {
+    const user = userEvent.setup();
+    let rejectOldPage: (() => void) | undefined;
+    const oldPageCanFail = new Promise<void>((resolve) => {
+      rejectOldPage = resolve;
+    });
+    const originalFetch = globalThis.fetch.bind(globalThis);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (input, init) => {
+        const url = new URL(
+          input instanceof Request ? input.url : String(input),
+          window.location.origin,
+        );
+        if (url.searchParams.get("cursor") === "old-project-error") {
+          await oldPageCanFail;
+          throw new Error("stale page failure");
+        }
+        return originalFetch(input, init);
+      },
+    );
+    server.use(
+      http.get("*/mail/api/v1/inbox", ({ request }) => {
+        const url = new URL(request.url);
+        if (url.searchParams.get("project_id") === String(projectTwo.id)) {
+          return HttpResponse.json({
+            items: [{ ...messageTwo, project_id: projectTwo.id }],
+            total: 1,
+            next_cursor: null,
+          });
+        }
+        return HttpResponse.json({
+          items: [messageOne],
+          total: 2,
+          next_cursor: "old-project-error",
+        });
+      }),
+    );
+    render(<App />);
+    await screen.findByText(messageOne.subject);
+
+    await user.click(screen.getByRole("button", { name: "Load more" }));
+    await user.selectOptions(
+      screen.getByLabelText("Filter by project"),
+      String(projectTwo.id),
+    );
+    expect(await screen.findByText(messageTwo.subject)).toBeVisible();
+
+    rejectOldPage?.();
+    await act(async () => oldPageCanFail);
+    await waitFor(() =>
+      expect(screen.queryByText("More messages could not be loaded. Try again."))
+        .not.toBeInTheDocument(),
+    );
+    expect(screen.getByText(messageTwo.subject)).toBeVisible();
+    fetchSpy.mockRestore();
+  });
+
   it("preserves the current inbox behind a generic load-more error", async () => {
     const user = userEvent.setup();
     server.use(
@@ -1669,6 +3001,10 @@ describe("Hermes landing shell", () => {
 
   it("validates message bodies, recipient lists, and safe attachment metadata", () => {
     expect(parseMessageDetail(messageDetail)).toEqual(messageDetail);
+    expect(parseMessageDetail({ ...messageDetail, reply_target: null })).toEqual({
+      ...messageDetail,
+      reply_target: null,
+    });
     const invalidDetails = [
       { ...messageDetail, body_md: null },
       { ...messageDetail, to: null },
@@ -1677,6 +3013,31 @@ describe("Hermes landing shell", () => {
       { ...messageDetail, cc: [7] },
       { ...messageDetail, attachments: null },
       { ...messageDetail, attachments: [null] },
+      { ...messageDetail, reply_target: "agent" },
+      {
+        ...messageDetail,
+        reply_target: { ...messageDetail.reply_target, agent_id: 0 },
+      },
+      {
+        ...messageDetail,
+        reply_target: { ...messageDetail.reply_target, agent_generation: "bad" },
+      },
+      {
+        ...messageDetail,
+        reply_target: { ...messageDetail.reply_target, project_id: 0 },
+      },
+      {
+        ...messageDetail,
+        reply_target: { ...messageDetail.reply_target, project_generation: "bad" },
+      },
+      {
+        ...messageDetail,
+        reply_target: { ...messageDetail.reply_target, canonical_name: 7 },
+      },
+      {
+        ...messageDetail,
+        reply_target: { ...messageDetail.reply_target, debug: true },
+      },
       {
         ...messageDetail,
         attachments: [{ type: 7, media_type: null, size_bytes: null }],
@@ -1712,6 +3073,29 @@ describe("Hermes landing shell", () => {
       projectId: 11,
     });
     expect(parseMailRoute("#projects")).toEqual({ view: "projects" });
+    expect(
+      parseMailRoute("#search?q=rainbow&project=11&scope=body&order=newest"),
+    ).toEqual({
+      view: "search",
+      query: "rainbow",
+      projectId: 11,
+      scope: "body",
+      order: "newest",
+    });
+    expect(parseMailRoute("#search?scope=raw&order=raw")).toEqual({
+      view: "search",
+      query: "",
+      projectId: null,
+      scope: "all",
+      order: "relevance",
+    });
+    expect(parseMailRoute(`#search?q=${"x".repeat(257)}`)).toEqual({
+      view: "search",
+      query: "",
+      projectId: null,
+      scope: "all",
+      order: "relevance",
+    });
     expect(parseMailRoute("#message/11/101")).toEqual({
       view: "message",
       projectId: 11,
@@ -1736,6 +3120,24 @@ describe("Hermes landing shell", () => {
     expect(
       mailRouteHash({ view: "message", projectId: 11, messageId: 101 }),
     ).toBe("#message/11/101");
+    expect(
+      mailRouteHash({
+        view: "search",
+        query: "exact phrase",
+        projectId: 11,
+        scope: "subject",
+        order: "newest",
+      }),
+    ).toBe("#search?q=exact+phrase&project=11&scope=subject&order=newest");
+    expect(
+      mailRouteHash({
+        view: "search",
+        query: "",
+        projectId: null,
+        scope: "all",
+        order: "relevance",
+      }),
+    ).toBe("#search?scope=all&order=relevance");
   });
 
   it("uses exact same-origin endpoints in the standalone mail client", async () => {
@@ -1756,6 +3158,10 @@ describe("Hermes landing shell", () => {
           return HttpResponse.json(messageDetail);
         },
       ),
+      http.get("*/mail/api/v1/search", ({ request }) => {
+        urls.push(request.url);
+        return HttpResponse.json(searchResponse);
+      }),
     );
 
     await expect(loadProjects()).resolves.toEqual(projectsResponse);
@@ -1765,11 +3171,352 @@ describe("Hermes landing shell", () => {
     await expect(
       loadMessage(projectOne.id, messageOne.id),
     ).resolves.toEqual(messageDetail);
+    await expect(
+      loadSearch({
+        query: "release marker",
+        projectId: projectOne.id,
+        scope: "body",
+        order: "newest",
+        cursor: "search-opaque",
+      }),
+    ).resolves.toEqual(searchResponse);
     expect(urls).toEqual([
       "http://localhost:3000/mail/api/v1/projects",
       `http://localhost:3000/mail/api/v1/inbox?limit=${inboxPageSize}&cursor=opaque&project_id=${projectOne.id}`,
       `http://localhost:3000/mail/api/v1/projects/${projectOne.id}/messages/${messageOne.id}`,
+      `http://localhost:3000/mail/api/v1/search?q=release+marker&scope=body&order=newest&limit=50&project_id=${projectOne.id}&cursor=search-opaque`,
     ]);
+  });
+
+  it("renders a full accessible search route and links results to message detail", async () => {
+    const user = userEvent.setup();
+    const requested: URL[] = [];
+    window.history.replaceState(
+      {},
+      "",
+      `/mail/#search?q=rollout&project=${projectOne.id}&scope=body&order=newest`,
+    );
+    server.use(
+      http.get("*/mail/api/v1/search", ({ request }) => {
+        requested.push(new URL(request.url));
+        return HttpResponse.json(searchResponse);
+      }),
+    );
+    render(<App />);
+    await waitForEnglishPreferences();
+
+    expect(await screen.findByRole("heading", { name: "Search" })).toBeVisible();
+    expect(screen.getByLabelText("Search messages")).toHaveValue("rollout");
+    expect(screen.getByLabelText("Project")).toHaveValue(String(projectOne.id));
+    expect(screen.getByLabelText("Search in")).toHaveValue("body");
+    expect(screen.getByLabelText("Order")).toHaveValue("newest");
+    const result = await screen.findByRole("link", {
+      name: `Open search result: ${messageOne.subject}`,
+    });
+    expect(result).toHaveAttribute(
+      "href",
+      `#message/${projectOne.id}/${messageOne.id}`,
+    );
+    expect(screen.getByText(searchResponse.items[0]!.snippet)).toBeVisible();
+    expect(requested.at(-1)?.searchParams.get("q")).toBe("rollout");
+    expect(requested.at(-1)?.searchParams.get("project_id")).toBe(
+      String(projectOne.id),
+    );
+
+    await user.click(screen.getByRole("button", { name: "Search" }));
+    expect(window.location.hash).toContain(`project=${projectOne.id}`);
+
+    await user.clear(screen.getByLabelText("Search messages"));
+    await user.type(screen.getByLabelText("Search messages"), "archive window");
+    await user.selectOptions(screen.getByLabelText("Project"), "");
+    await user.selectOptions(screen.getByLabelText("Search in"), "subject");
+    await user.selectOptions(screen.getByLabelText("Order"), "relevance");
+    await user.click(screen.getByRole("button", { name: "Search" }));
+    expect(window.location.hash).toBe(
+      "#search?q=archive+window&scope=subject&order=relevance",
+    );
+  });
+
+  it("renders prompt, empty, and privacy-minimal blank-snippet search states", async () => {
+    window.history.replaceState({}, "", "/mail/#search");
+    const prompt = render(<App />);
+    expect(
+      await screen.findByText("Enter a search query to find Iris correspondence."),
+    ).toBeVisible();
+    prompt.unmount();
+
+    window.history.replaceState({}, "", "/mail/#search?q=missing");
+    server.use(
+      http.get("*/mail/api/v1/search", () =>
+        HttpResponse.json({ items: [], next_cursor: null }),
+      ),
+    );
+    const empty = render(<App />);
+    expect(
+      await screen.findByText("No visible messages match this search."),
+    ).toBeVisible();
+    empty.unmount();
+
+    const unlistedResult = {
+      ...messageTwo,
+      project_id: 909,
+      project_slug: "unlisted-search-project",
+      snippet: "",
+    };
+    window.history.replaceState({}, "", "/mail/#search?q=plain");
+    server.use(
+      http.get("*/mail/api/v1/search", () =>
+        HttpResponse.json({ items: [unlistedResult], next_cursor: null }),
+      ),
+    );
+    render(<App />);
+    expect(
+      await screen.findByRole("link", {
+        name: `Open search result: ${unlistedResult.subject}`,
+      }),
+    ).toBeVisible();
+    expect(screen.getByText("Project: unlisted-search-project")).toBeVisible();
+  });
+
+  it("redirects safely when an initial search loses authorization", async () => {
+    const onUnauthorized = vi.fn();
+    window.history.replaceState({}, "", "/mail/#search?q=expired");
+    server.use(
+      http.get("*/mail/api/v1/search", () =>
+        HttpResponse.json({ detail: "private search failure" }, { status: 401 }),
+      ),
+    );
+    render(<App onUnauthorized={onUnauthorized} />);
+
+    expect(
+      await screen.findByText("Your session expired. Redirecting to sign in."),
+    ).toBeVisible();
+    expect(onUnauthorized).toHaveBeenCalledOnce();
+    expect(screen.queryByText("private search failure")).not.toBeInTheDocument();
+  });
+
+  it("ignores an aborted initial search without exposing an error", async () => {
+    window.history.replaceState({}, "", "/mail/#search?q=cancelled");
+    let searchRequests = 0;
+    const originalFetch = globalThis.fetch.bind(globalThis);
+    vi.stubGlobal(
+      "fetch",
+      (input: RequestInfo | URL, init?: RequestInit) => {
+        const requestUrl =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url;
+        if (requestUrl.includes("/mail/api/v1/search?")) {
+          searchRequests += 1;
+          return Promise.reject(new DOMException("cancelled", "AbortError"));
+        }
+        return originalFetch(input, init);
+      },
+    );
+    render(<App />);
+
+    await waitFor(() => expect(searchRequests).toBe(1));
+    expect(screen.getByText("Searching messages…")).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it.each(["resolve", "reject"] as const)(
+    "ignores a stale initial search %s after submitting a new query",
+    async (outcome) => {
+      const user = userEvent.setup();
+      window.history.replaceState({}, "", "/mail/#search?q=old-query");
+      let oldRequests = 0;
+      let resolveOld: (response: Response) => void = () => undefined;
+      let rejectOld: (reason: unknown) => void = () => undefined;
+      const oldSearch = new Promise<Response>((resolve, reject) => {
+        resolveOld = resolve;
+        rejectOld = reject;
+      });
+      const originalFetch = globalThis.fetch.bind(globalThis);
+      vi.stubGlobal(
+        "fetch",
+        (input: RequestInfo | URL, init?: RequestInit) => {
+          const requestUrl =
+            typeof input === "string"
+              ? input
+              : input instanceof URL
+                ? input.href
+                : input.url;
+          const url = new URL(requestUrl);
+          if (
+            url.pathname === "/mail/api/v1/search" &&
+            url.searchParams.get("q") === "old-query"
+          ) {
+            oldRequests += 1;
+            return oldSearch;
+          }
+          return originalFetch(input, init);
+        },
+      );
+      render(<App />);
+      await waitFor(() => expect(oldRequests).toBe(1));
+
+      const query = screen.getByLabelText("Search messages");
+      await user.clear(query);
+      await user.type(query, "new-query");
+      await user.click(screen.getByRole("button", { name: "Search" }));
+      expect(await screen.findByText(searchResponse.items[0]!.snippet)).toBeVisible();
+
+      await act(async () => {
+        if (outcome === "resolve") {
+          resolveOld(
+            new Response(
+              JSON.stringify({
+                items: [{ ...searchResponse.items[0], snippet: "Stale search result." }],
+                next_cursor: null,
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            ),
+          );
+        } else {
+          rejectOld(new TypeError("late private search failure"));
+        }
+        await Promise.resolve();
+      });
+      expect(screen.queryByText("Stale search result.")).not.toBeInTheDocument();
+      expect(screen.queryByText("late private search failure")).not.toBeInTheDocument();
+    },
+  );
+
+  it.each([
+    [422, "invalid_search_query", "This query is invalid or too broad"],
+    [503, "search_unavailable", "Search is temporarily unavailable"],
+    [500, null, "Messages could not be searched"],
+  ] as const)(
+    "renders a redacted search failure for HTTP %s",
+    async (status, code, expectedMessage) => {
+      window.history.replaceState({}, "", "/mail/#search?q=private-marker");
+      server.use(
+        http.get("*/mail/api/v1/search", () =>
+          HttpResponse.json(
+            code === null
+              ? { detail: "private-marker server failure" }
+              : { detail: { code } },
+            { status },
+          ),
+        ),
+      );
+      render(<App />);
+      expect(await screen.findByText(new RegExp(expectedMessage))).toBeVisible();
+      expect(screen.queryByText("private-marker server failure")).not.toBeInTheDocument();
+    },
+  );
+
+  it("paginates search results without duplicates", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/mail/#search?q=rollout");
+    server.use(
+      http.get("*/mail/api/v1/search", ({ request }) => {
+        const cursor = new URL(request.url).searchParams.get("cursor");
+        return HttpResponse.json(
+          cursor === null
+            ? { ...searchResponse, next_cursor: "second-page" }
+            : {
+                items: [{ ...messageTwo, snippet: "Second plain result." }],
+                next_cursor: null,
+              },
+        );
+      }),
+    );
+    render(<App />);
+    await screen.findByText(searchResponse.items[0]!.snippet);
+    await user.click(screen.getByRole("button", { name: "Load more results" }));
+    expect(await screen.findByText("Second plain result.")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Load more results" }))
+      .not.toBeInTheDocument();
+  });
+
+  it.each([
+    [401, "Your session expired. Redirecting to sign in."],
+    [500, "More results could not be loaded. Try again."],
+  ] as const)(
+    "renders a safe cursor-search failure for HTTP %s",
+    async (status, expectedMessage) => {
+      const user = userEvent.setup();
+      const onUnauthorized = vi.fn();
+      window.history.replaceState({}, "", "/mail/#search?q=rollout");
+      server.use(
+        http.get("*/mail/api/v1/search", ({ request }) =>
+          new URL(request.url).searchParams.has("cursor")
+            ? HttpResponse.json({ detail: "private cursor failure" }, { status })
+            : HttpResponse.json({ ...searchResponse, next_cursor: "next-page" }),
+        ),
+      );
+      render(<App onUnauthorized={onUnauthorized} />);
+      await screen.findByText(searchResponse.items[0]!.snippet);
+
+      await user.click(screen.getByRole("button", { name: "Load more results" }));
+
+      expect(await screen.findByText(expectedMessage)).toBeVisible();
+      expect(onUnauthorized).toHaveBeenCalledTimes(status === 401 ? 1 : 0);
+      expect(screen.queryByText("private cursor failure")).not.toBeInTheDocument();
+    },
+  );
+
+  it("aborts a pending cursor search on unmount", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/mail/#search?q=rollout");
+    server.use(
+      http.get("*/mail/api/v1/search", () =>
+        HttpResponse.json({ ...searchResponse, next_cursor: "pending-page" }),
+      ),
+    );
+    const view = render(<App />);
+    await screen.findByText(searchResponse.items[0]!.snippet);
+    let cursorRequests = 0;
+    const originalFetch = globalThis.fetch.bind(globalThis);
+    vi.stubGlobal(
+      "fetch",
+      (input: RequestInfo | URL, init?: RequestInit) => {
+        const requestUrl =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url;
+        if (
+          requestUrl.includes("/mail/api/v1/search?") &&
+          new URL(requestUrl).searchParams.has("cursor")
+        ) {
+          cursorRequests += 1;
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () =>
+              reject(new DOMException("cancelled", "AbortError")),
+            );
+          });
+        }
+        return originalFetch(input, init);
+      },
+    );
+
+    await user.click(screen.getByRole("button", { name: "Load more results" }));
+    await waitFor(() => expect(cursorRequests).toBe(1));
+    expect(screen.getByRole("button", { name: "Loading more results…" })).toBeDisabled();
+    view.unmount();
+    await act(async () => Promise.resolve());
+  });
+
+  it("strictly parses privacy-minimal search responses", () => {
+    expect(parseSearchPage(searchResponse)).toEqual(searchResponse);
+    expect(() =>
+      parseSearchPage({ items: {}, next_cursor: null }),
+    ).toThrow(TypeError);
+    expect(() =>
+      parseSearchPage({
+        ...searchResponse,
+        items: [{ ...searchResponse.items[0], body_md: "private body" }],
+      }),
+    ).toThrow(TypeError);
+    expect(() =>
+      parseSearchPage({ ...searchResponse, total: 1 }),
+    ).toThrow(TypeError);
   });
 
   it("ignores aborted project, inbox, and detail requests during cleanup", async () => {
@@ -2105,8 +3852,8 @@ describe("Hermes landing shell", () => {
     server.use(
       http.patch(preferencesUrl, async ({ request }) => {
         const body = (await request.json()) as {
-          preferred_ui_locale?: "en" | "pl";
-          preferred_correspondence_locale?: "en" | "pl" | null;
+          preferred_ui_locale?: SupportedLocale;
+          preferred_correspondence_locale?: SupportedLocale | null;
         };
         bodies.push(body);
         return HttpResponse.json(

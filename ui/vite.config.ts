@@ -7,6 +7,9 @@ const repositoryRoot = fileURLToPath(new URL("../", import.meta.url));
 export default defineConfig({
   base: "/mail/",
   plugins: [react()],
+  build: {
+    manifest: true,
+  },
   test: {
     environment: "jsdom",
     include: ["src/**/*.test.{ts,tsx}"],

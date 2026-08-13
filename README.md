@@ -1,10 +1,10 @@
-# MCP Agent Mail
+# Iris
 
-![Agent Mail Showcase](screenshots/output/agent_mail_showcase.gif)
+![Iris Agent Mail Showcase](screenshots/output/agent_mail_showcase.gif)
 
 > "It's like gmail for your coding agents!"
 
-A mail-like coordination layer for coding agents, exposed as an HTTP-only FastMCP server. It gives agents memorable identities, an inbox/outbox, searchable message history, and voluntary file reservation "leases" to avoid stepping on each other.
+Iris is the human-facing name of MCP Agent Mail: a mail-like coordination layer for coding agents, exposed as an HTTP-only FastMCP server. It gives agents memorable identities, an inbox/outbox, searchable message history, and voluntary file reservation "leases" to avoid stepping on each other. The Python package, CLI, protocol paths, and deployment identifiers remain `mcp_agent_mail` and `mcp-agent-mail`.
 
 Think of it as asynchronous email + directory + change-intent signaling for your agents, backed by Git (for human-auditable artifacts) and SQLite (for indexing and queries).
 
@@ -138,7 +138,7 @@ uv sync
 
 # Configure installed clients at user scope. The same values can instead live
 # in ~/.agent-mail.env as AGENT_MAIL_URL and HTTP_BEARER_TOKEN.
-export INTEGRATION_MCP_URL="https://hermes.example/mcp/"
+export INTEGRATION_MCP_URL="https://mail.example.test/mcp/"
 export INTEGRATION_BEARER_TOKEN="replace-with-the-server-bearer"
 scripts/automatically_detect_all_installed_coding_agents_and_install_mcp_agent_mail_in_all.sh
 
@@ -392,7 +392,7 @@ Auth notes:
 - `MAIL_UI_AUTH_ENABLED=false` is an open test/development mode with no human project boundary. Do not use it as a production reverse-proxy handoff.
 - Health endpoints remain open at `/health/*`.
 
-### Hermes React interface
+### Iris React interface
 
 The responsive interface is served at `/mail`. It uses the signed human session
 and server-side authorization rules; hiding a control in React is never treated
@@ -401,18 +401,27 @@ images are served from the same origin.
 
 - `/mail#inbox` shows the real, project-scoped inbox and message detail views.
 - `/mail#projects` lists only projects visible to the signed-in human.
-- `/mail#account` lets every human choose a display name, select English or
-  Polish for the interface, set an optional correspondence-language preference,
-  and rotate their own password. The correspondence preference is an advisory
-  hint for agents replying to that human, not a project-wide instruction.
+- `/mail#search` performs bounded FTS5 search over subjects and bodies in only
+  the projects visible to the signed-in human. Search results are plain-text,
+  privacy-minimal summaries that link to the existing Iris message view.
+- `/mail#account` lets every human choose a display name, select one of 45
+  localized interfaces from an accessible flag-and-language picker, set an
+  optional correspondence-language preference, and rotate their own password.
+  The correspondence preference is an advisory hint for agents replying to that
+  human, not a project-wide instruction.
 - `/mail#admin` is visible only to global admins. It assigns or revokes
   `viewer` and `operator` access per human and project. Global admins remain
   global and do not receive per-project assignments.
 
-There is one human interface. The former server-rendered routes and the
-versioned `/mail/v2` path return 404; they are not compatibility surfaces.
+There is one human interface. A small, enumerated set of confirmed upstream
+bookmarks (projects, unified inbox, an authorized project, message, or search)
+temporarily redirects to the exact Iris hash view. The `/mail/v2` namespace,
+legacy APIs, and every retired route without an exact successor remain 404;
+there is no wildcard compatibility surface. Human full-text search is exposed
+only through `/mail#search` and the typed, session-bound
+`GET /mail/api/v1/search` endpoint.
 Agents and hooks continue to use MCP and the documented service endpoints;
-mounting Hermes does not replace or intercept the configured MCP transport path.
+mounting Iris does not replace or intercept the configured MCP transport path.
 
 ### Building distributable browser assets
 
@@ -1356,7 +1365,7 @@ age-keygen -o key.txt
 
 The export pipeline supports configurable scrubbing to remove sensitive data:
 
-- `standard`: Clears acknowledgment/read state, removes file reservations and agent links, scrubs secrets (GitHub tokens, Slack tokens, OpenAI keys, bearer tokens, JWTs) from message bodies and attachment metadata. Retains agent names (which are already meaningless pseudonyms like "BlueMountain"), full message bodies, and attachments.
+- `standard`: Clears acknowledgment/read state, removes operational data, scrubs common secret shapes from message bodies, and omits all source attachments because arbitrary file bytes cannot be safely redacted. Retains agent names (which are already meaningless pseudonyms like "BlueMountain") and scrubbed message bodies.
 
 - `strict`: All standard redactions plus replaces entire message bodies with "[Message body redacted]" placeholder and removes all attachments from the bundle.
 
@@ -2212,6 +2221,15 @@ Database schema (automatic):
 # If models change, delete the SQLite DB (and WAL/SHM) and run migrate again.
 uv run python -m mcp_agent_mail.cli migrate
 ```
+
+Locale-schema rollback note: the Iris human UI expands stored locale tags from
+`en`/`pl` to a closed 45-locale set. Once an account saves one of the new
+locales, treat that migration as one-way. Never start an older image against the
+upgraded live database: the older initializer normalizes unfamiliar values back
+to English. Rollback therefore means stopping writes, restoring the verified
+pre-deploy SQLite snapshot and Git bundle together, and then starting the tagged
+older image. Do not restore that snapshot automatically after post-cutover
+writes; reconcile them first and obtain explicit destructive-operation approval.
 
 Run the server (HTTP-only). Use the Typer CLI or module entry:
 

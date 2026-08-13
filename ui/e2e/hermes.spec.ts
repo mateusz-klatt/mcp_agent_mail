@@ -17,8 +17,11 @@ import type {
   InboxPage,
   MailProject,
   MessageDetail,
+  ProjectAgentsPage,
+  SearchPage,
 } from "../src/mail";
 import type { MailUiPreferences } from "../src/preferences";
+import type { SupportedLocale } from "../src/i18n";
 
 const project: MailProject = {
   id: 11,
@@ -51,9 +54,46 @@ const message: MessageDetail = {
   body_md: "# Release\n\nAll checks passed. `<script>` remains plain text.",
   to: ["codex-wsl-home-1"],
   cc: [],
+  reply_target: {
+    agent_id: 901,
+    agent_generation: "a".repeat(64),
+    project_id: project.id,
+    project_generation: "b".repeat(64),
+    canonical_name: messageSummary.sender,
+  },
   attachments: [
     { type: "artifact", media_type: "application/json", size_bytes: 1280 },
   ],
+};
+
+const projectAgents: ProjectAgentsPage = {
+  project_id: project.id,
+  project_generation: "d".repeat(64),
+  items: [
+    {
+      agent_id: 1,
+      agent_generation: "1".repeat(64),
+      name: "BlueLake",
+      display_name: null,
+    },
+    {
+      agent_id: 2,
+      agent_generation: "2".repeat(64),
+      name: "GreenDog",
+      display_name: "Release operator",
+    },
+  ],
+  total: 2,
+};
+
+const searchPage: SearchPage = {
+  items: [
+    {
+      ...messageSummary,
+      snippet: "All rollout checks passed with the release marker.",
+    },
+  ],
+  next_cursor: null,
 };
 
 const accountGeneration = "b".repeat(64);
@@ -80,7 +120,9 @@ type StubActorRole = "admin" | "operator";
 
 interface LocalStubOptions {
   actorRole?: StubActorRole;
+  composeConflictCode?: string;
   composeResult?: DeliveryResult;
+  projectAgentResults?: readonly [ProjectAgentsPage, ...ProjectAgentsPage[]];
   replyResult?: DeliveryResult;
   retryResult?: DeliveryResult;
 }
@@ -95,6 +137,7 @@ interface StubState {
   preferences: MailUiPreferences;
   profile: MailUiProfile;
   admin: AdminAccessSnapshot;
+  agentDirectoryReads: number;
   passwordChanges: number;
   typedWrites: TypedWrite[];
   externalRequests: string[];
@@ -169,6 +212,7 @@ async function installLocalStub(
         },
       ],
     },
+    agentDirectoryReads: 0,
     passwordChanges: 0,
     typedWrites: [],
     externalRequests: [],
@@ -210,8 +254,8 @@ async function installLocalStub(
     if (path === "/mail/api/v1/me/preferences") {
       if (method === "PATCH") {
         const body = request.postDataJSON() as {
-          preferred_ui_locale?: "en" | "pl";
-          preferred_correspondence_locale?: "en" | "pl" | null;
+          preferred_ui_locale?: SupportedLocale;
+          preferred_correspondence_locale?: SupportedLocale | null;
         };
         const uiLocale = body.preferred_ui_locale ?? state.preferences.stored.preferred_ui_locale;
         const correspondenceLocale = Object.hasOwn(body, "preferred_correspondence_locale")
@@ -309,6 +353,25 @@ async function installLocalStub(
     }
 
     if (
+      path === `/mail/api/v1/projects/${project.id}/agents` &&
+      method === "GET"
+    ) {
+      state.agentDirectoryReads += 1;
+      const directoryIndex = Math.min(
+        state.agentDirectoryReads - 1,
+        (options.projectAgentResults?.length ?? 1) - 1,
+      );
+      return json(
+        route,
+        options.projectAgentResults?.[directoryIndex] ?? projectAgents,
+      );
+    }
+
+    if (path === "/mail/api/v1/search" && method === "GET") {
+      return json(route, searchPage);
+    }
+
+    if (
       path ===
         `/mail/api/v1/projects/${project.id}/messages/${messageDetail.id}` &&
       method === "GET"
@@ -329,6 +392,13 @@ async function installLocalStub(
     );
     if (composeMatch !== null && method === "POST") {
       state.typedWrites.push({ method, path, body: request.postDataJSON() });
+      if (options.composeConflictCode !== undefined) {
+        return json(
+          route,
+          { detail: { code: options.composeConflictCode } },
+          409,
+        );
+      }
       return json(route, options.composeResult ?? publishedDelivery);
     }
 
@@ -358,8 +428,6 @@ async function expectMobileLayout(page: Page): Promise<void> {
     .evaluateAll((elements) =>
       elements.flatMap((element) => {
         const target = element as HTMLElement;
-        const rect = target.getBoundingClientRect();
-        const style = getComputedStyle(target);
         const disabled =
           target instanceof HTMLButtonElement ||
           target instanceof HTMLInputElement ||
@@ -367,6 +435,29 @@ async function expectMobileLayout(page: Page): Promise<void> {
           target instanceof HTMLTextAreaElement
             ? target.disabled
             : false;
+        const input = target instanceof HTMLInputElement ? target : null;
+        const needsAssociatedLabel =
+          input !== null && (input.type === "checkbox" || input.type === "radio");
+        const measuredTarget = needsAssociatedLabel ? (input.labels?.item(0) ?? null) : target;
+        const targetRect = target.getBoundingClientRect();
+        const targetStyle = getComputedStyle(target);
+        const targetRendered =
+          targetStyle.display !== "none" &&
+          targetStyle.visibility !== "hidden" &&
+          targetRect.width > 0 &&
+          targetRect.height > 0;
+        if (needsAssociatedLabel && measuredTarget === null) {
+          return targetRendered && !disabled
+            ? [{
+                label: target.getAttribute("aria-label") ?? target.tagName,
+                width: 0,
+                height: 0,
+                issue: "missing associated label",
+              }]
+            : [];
+        }
+        const rect = measuredTarget?.getBoundingClientRect() ?? targetRect;
+        const style = getComputedStyle(measuredTarget ?? target);
         const rendered =
           style.display !== "none" &&
           style.visibility !== "hidden" &&
@@ -374,7 +465,10 @@ async function expectMobileLayout(page: Page): Promise<void> {
           rect.height > 0;
         return rendered && !disabled && (rect.width < 44 || rect.height < 44)
           ? [{
-              label: target.getAttribute("aria-label") ?? target.textContent?.trim() ?? target.tagName,
+              label:
+                target.getAttribute("aria-label") ??
+                measuredTarget?.textContent?.trim() ??
+                target.tagName,
               width: Math.round(rect.width * 10) / 10,
               height: Math.round(rect.height * 10) / 10,
             }]
@@ -384,19 +478,154 @@ async function expectMobileLayout(page: Page): Promise<void> {
   expect(undersizedTargets).toEqual([]);
 }
 
+test("production login controls stay at least 44 CSS pixels", async ({ browser }) => {
+  const template = await readFile(
+    new URL("../../src/mcp_agent_mail/templates/mail_login.html", import.meta.url),
+    "utf8",
+  );
+  const renderedTemplate = template
+    .replace(/\{#[\s\S]*?#\}/gu, "")
+    .replace(/\{%\s*if error\s*%\}[\s\S]*?\{%\s*endif\s*%\}/gu, "")
+    .replaceAll("{{ next_url }}", "/mail");
+
+  for (const device of [
+    { label: "desktop", viewport: { width: 1280, height: 720 }, isMobile: false, hasTouch: false },
+    { label: "mobile", viewport: { width: 375, height: 812 }, isMobile: true, hasTouch: true },
+  ]) {
+    const context = await browser.newContext({
+      viewport: device.viewport,
+      isMobile: device.isMobile,
+      hasTouch: device.hasTouch,
+    });
+    const page = await context.newPage();
+    await page.route("**/mail/login", (route) =>
+      route.fulfill({ status: 200, contentType: "text/html", body: renderedTemplate }),
+    );
+    await page.goto("/mail/login");
+
+    for (const selector of ["#username", "#password", 'button[type="submit"]']) {
+      const control = page.locator(selector);
+      await expect(control).toHaveCSS("min-height", "44px");
+      const box = await control.boundingBox();
+      expect(box, `${device.label} ${selector} must be rendered`).not.toBeNull();
+      expect(box?.width, `${device.label} ${selector} width`).toBeGreaterThanOrEqual(44);
+      expect(box?.height, `${device.label} ${selector} height`).toBeGreaterThanOrEqual(44);
+    }
+    await context.close();
+  }
+});
+
+test("production login form sends a concrete same-origin Origin", async ({ page }) => {
+  const template = await readFile(
+    new URL("../../src/mcp_agent_mail/templates/mail_login.html", import.meta.url),
+    "utf8",
+  );
+  const renderedTemplate = template
+    .replace(/\{#[\s\S]*?#\}/gu, "")
+    .replace(/\{%\s*if error\s*%\}[\s\S]*?\{%\s*endif\s*%\}/gu, "")
+    .replaceAll("{{ next_url }}", "/mail");
+  let submittedOrigin: string | null = null;
+  let submittedFetchSite: string | null = null;
+  await page.route("**/mail/login", async (route) => {
+    const request = route.request();
+    if (request.method() === "POST") {
+      submittedOrigin = await request.headerValue("origin");
+      submittedFetchSite = await request.headerValue("sec-fetch-site");
+      await route.fulfill({
+        status: 401,
+        contentType: "text/html",
+        headers: { "Referrer-Policy": "strict-origin-when-cross-origin" },
+        body: renderedTemplate,
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "text/html",
+      headers: {
+        "Cache-Control": "no-store, no-transform",
+        "Referrer-Policy": "strict-origin-when-cross-origin",
+      },
+      body: renderedTemplate,
+    });
+  });
+  await page.goto("/mail/login");
+  const pageOrigin = await page.evaluate(() => window.location.origin);
+  await page.locator("#username").fill("neutral-user");
+  await page.locator("#password").fill("incorrect-password");
+
+  const responsePromise = page.waitForResponse(
+    (response) =>
+      response.url().endsWith("/mail/login") &&
+      response.request().method() === "POST",
+  );
+  await page.locator('button[type="submit"]').click();
+  const response = await responsePromise;
+
+  expect(response.status()).toBe(401);
+  expect(submittedOrigin).toBe(pageOrigin);
+  expect(submittedOrigin).not.toBe("null");
+  expect(submittedFetchSite).toBe("same-origin");
+});
+
 test("administrator composes through the typed delivery API", async ({ page }) => {
   const state = await installLocalStub(page);
   await page.goto("#compose");
 
   await expect(page.getByRole("heading", { name: "Compose", level: 1 })).toBeVisible();
   await page.getByLabel("Project").selectOption(String(project.id));
-  await page.getByLabel("Recipients").fill("GreenDog, BlueLake");
+  const recipientSearch = page.getByLabel("Find recipients");
+  await recipientSearch.fill("Release");
+  await page.getByRole("button", { name: "Select all" }).click();
+  const greenDog = page.getByRole("checkbox", { name: /Release operator/u });
+  await expect(greenDog).toBeChecked();
+  await recipientSearch.clear();
+  const blueLake = page.getByRole("checkbox", { name: "BlueLake" });
+  await blueLake.focus();
+  await expect(blueLake).toBeFocused();
+  await page.keyboard.press("Space");
+  await expect(blueLake).toBeChecked();
   await page.getByLabel("Subject").fill("Review the release");
   await page.getByLabel("Thread ID (optional)").fill("release-2026");
-  await page.getByLabel("Message in Markdown").fill("**Proceed** after UAT.");
+  const composeBody = page.getByLabel("Message in Markdown");
+  await composeBody.fill("**Proceed** after UAT.");
   await expectMobileLayout(page);
 
-  await page.getByRole("button", { name: "Send message" }).click();
+  await composeBody.focus();
+  await page.keyboard.press("Control+Enter");
+
+  const confirmation = page.getByRole("region", {
+    name: "Review message before delivery",
+  });
+  await expect(confirmation).toBeFocused();
+  await expect(confirmation).toHaveAttribute(
+    "aria-labelledby",
+    "compose-confirmation-heading",
+  );
+  expect(state.typedWrites).toEqual([]);
+  await expect(confirmation.getByText(project.human_key)).toBeVisible();
+  await expect(confirmation.getByText("Review the release", { exact: true })).toBeVisible();
+  await expect(confirmation.getByText("release-2026", { exact: true })).toBeVisible();
+  await expect(confirmation.getByText("High", { exact: true })).toBeVisible();
+  await expect(confirmation.getByText("Release operator", { exact: true })).toBeVisible();
+  await expect(confirmation.locator("code", { hasText: "GreenDog" })).toBeVisible();
+  await expect(
+    confirmation.getByText(/delivered separately to 2 recipients/u),
+  ).toBeVisible();
+  const finalPreview = confirmation.getByRole("region", {
+    name: "Final server-facing preview",
+  });
+  await expect(finalPreview.getByText("MESSAGE FROM HUMAN OVERSEER")).toBeVisible();
+  await expect(
+    finalPreview.getByText(/prefers replies in English \(en\)/u),
+  ).toBeVisible();
+  await expect(finalPreview.getByText("Proceed", { exact: true })).toBeVisible();
+  await expectMobileLayout(page);
+
+  const confirm = confirmation.getByRole("button", { name: "Confirm and send" });
+  await confirm.focus();
+  await expect(confirm).toBeFocused();
+  await page.keyboard.press("Enter");
 
   await expect(page.getByText("Published exactly once.")).toBeVisible();
   await expect(page.getByText(`Delivery reference: ${deliveryId}`)).toBeVisible();
@@ -406,14 +635,25 @@ test("administrator composes through the typed delivery API", async ({ page }) =
       path: `/mail/api/v1/projects/${project.id}/messages`,
       body: {
         idempotency_key: expect.stringMatching(/^human-ui:/u),
-        recipients: ["GreenDog", "BlueLake"],
+        expected_project_generation: projectAgents.project_generation,
+        recipients: [
+          {
+            agent_id: projectAgents.items[0]?.agent_id,
+            expected_agent_generation: projectAgents.items[0]?.agent_generation,
+          },
+          {
+            agent_id: projectAgents.items[1]?.agent_id,
+            expected_agent_generation: projectAgents.items[1]?.agent_generation,
+          },
+        ],
         subject: "Review the release",
         body_md: "**Proceed** after UAT.",
         thread_id: "release-2026",
       },
     },
   ]);
-  await expect(page.getByLabel("Recipients")).toHaveValue("");
+  await expect(blueLake).not.toBeChecked();
+  await expect(greenDog).not.toBeChecked();
   await expect(page.getByLabel("Subject")).toHaveValue("");
   await expect(page.getByLabel("Message in Markdown")).toHaveValue("");
   await expectMobileLayout(page);
@@ -421,10 +661,124 @@ test("administrator composes through the typed delivery API", async ({ page }) =
   expect(state.browserErrors).toEqual([]);
 });
 
+test("lifetime 409 refreshes recipients without resubmitting the preserved draft", async ({
+  page,
+}) => {
+  const refreshedAgents: ProjectAgentsPage = {
+    ...projectAgents,
+    items: projectAgents.items.map((agent) =>
+      agent.name === "BlueLake"
+        ? { ...agent, agent_generation: "4".repeat(64) }
+        : agent,
+    ),
+  };
+  const state = await installLocalStub(page, message, {
+    composeConflictCode: "recipient_unavailable",
+    projectAgentResults: [projectAgents, refreshedAgents],
+  });
+  await page.goto("#compose");
+
+  await page.getByLabel("Project").selectOption(String(project.id));
+  const greenDog = page.getByRole("checkbox", { name: /Release operator/u });
+  const blueLake = page.getByRole("checkbox", { name: "BlueLake" });
+  await greenDog.check();
+  await blueLake.check();
+  await page.getByLabel("Subject").fill("Preserve the lifetime draft");
+  await page.getByLabel("Message in Markdown").fill("**Do not** submit twice.");
+
+  await page.getByRole("button", { name: "Review message" }).click();
+  const confirmation = page.getByRole("region", {
+    name: "Review message before delivery",
+  });
+  await expect(confirmation).toBeFocused();
+  expect(state.typedWrites).toEqual([]);
+  await expectMobileLayout(page);
+  await confirmation.getByRole("button", { name: "Confirm and send" }).click();
+
+  await expect.poll(() => state.agentDirectoryReads).toBe(2);
+  await expect(
+    page.getByText(/active-agent directory was refreshed/u),
+  ).toBeVisible();
+  await expect(confirmation).toHaveCount(0);
+  await expect(page.getByLabel("Subject")).toHaveValue("Preserve the lifetime draft");
+  await expect(page.getByLabel("Message in Markdown")).toHaveValue(
+    "**Do not** submit twice.",
+  );
+  await expect(page.getByText("1 of 100 recipients selected")).toBeVisible();
+  await expect(greenDog).toBeChecked();
+  await expect(blueLake).not.toBeChecked();
+  expect(state.typedWrites).toEqual([
+    {
+      method: "POST",
+      path: `/mail/api/v1/projects/${project.id}/messages`,
+      body: {
+        idempotency_key: expect.stringMatching(/^human-ui:/u),
+        expected_project_generation: projectAgents.project_generation,
+        recipients: [
+          {
+            agent_id: projectAgents.items[0]?.agent_id,
+            expected_agent_generation: projectAgents.items[0]?.agent_generation,
+          },
+          {
+            agent_id: projectAgents.items[1]?.agent_id,
+            expected_agent_generation: projectAgents.items[1]?.agent_generation,
+          },
+        ],
+        subject: "Preserve the lifetime draft",
+        body_md: "**Do not** submit twice.",
+        thread_id: null,
+      },
+    },
+  ]);
+  await page.waitForTimeout(300);
+  expect(state.typedWrites).toHaveLength(1);
+  await expectMobileLayout(page);
+  expect(state.externalRequests).toEqual([]);
+  expect(state.browserErrors).toEqual([
+    "Failed to load resource: the server responded with a status of 409 (Conflict)",
+  ]);
+});
+
+test("Iris human search stays mobile-safe and keyboard-operable", async ({ page }) => {
+  const state = await installLocalStub(page);
+  await page.goto("#search");
+
+  await expect(page.getByRole("heading", { name: "Search", level: 1 })).toBeVisible();
+  await page.getByLabel("Search messages").fill("rollout checks");
+  await page.getByLabel("Project").selectOption(String(project.id));
+  await page.getByLabel("Search in").selectOption("body");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+
+  await expect(page).toHaveURL(/#search\?q=rollout\+checks&project=11&scope=body&order=relevance$/u);
+  await expect(page.getByText(searchPage.items[0]?.snippet ?? "")).toBeVisible();
+  const result = page.getByRole("link", {
+    name: `Open search result: ${message.subject}`,
+  });
+  await result.focus();
+  await expect(result).toBeFocused();
+  await expectMobileLayout(page);
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("heading", { name: message.subject, level: 1 })).toBeVisible();
+
+  expect(state.externalRequests).toEqual([]);
+  expect(state.browserErrors).toEqual([]);
+});
+
 for (const actorRole of ["admin", "operator"] as const) {
   test(`${actorRole} replies through typed delivery writes`, async ({ page }) => {
     const requiresRetry = actorRole === "admin";
-    const state = await installLocalStub(page, message, {
+    const replyMessage = {
+      ...message,
+      sender: `${message.sender_name}@remote-operations`,
+      reply_target: {
+        agent_id: 902,
+        agent_generation: "c".repeat(64),
+        project_id: 22,
+        project_generation: "f".repeat(64),
+        canonical_name: `${message.sender_name}@remote-operations`,
+      },
+    };
+    const state = await installLocalStub(page, replyMessage, {
       actorRole,
       replyResult: requiresRetry ? pendingDelivery : publishedDelivery,
       retryResult: publishedDelivery,
@@ -434,9 +788,56 @@ for (const actorRole of ["admin", "operator"] as const) {
     await expect(
       page.getByRole("heading", { name: message.subject, level: 1 }),
     ).toBeVisible();
-    await page.getByLabel("Reply in Markdown").fill(`Approved by ${actorRole}.`);
+    const replyBody = page.getByLabel("Reply in Markdown");
+    await replyBody.fill(`Approved by ${actorRole}.`);
     await expectMobileLayout(page);
-    await page.getByRole("button", { name: "Send reply" }).click();
+
+    const reviewReply = page.getByRole("button", { name: "Review reply" });
+    await reviewReply.focus();
+    await expect(reviewReply).toBeFocused();
+    await page.keyboard.press("Enter");
+
+    const confirmation = page.getByRole("region", {
+      name: "Review reply before delivery",
+    });
+    await expect(confirmation).toBeFocused();
+    await expect(confirmation).toHaveAttribute(
+      "aria-labelledby",
+      "reply-confirmation-heading",
+    );
+    expect(state.typedWrites).toEqual([]);
+    await expect(
+      confirmation.getByText("Delivery target", { exact: true }),
+    ).toBeVisible();
+    await expect(
+      confirmation.getByText(replyMessage.sender, { exact: true }),
+    ).toHaveCount(2);
+    await expect(confirmation.getByText(project.human_key)).toHaveCount(0);
+    await expect(
+      confirmation.getByText(`Re: ${message.subject}`, { exact: true }),
+    ).toBeVisible();
+    await expect(confirmation.getByText(message.thread_id ?? "", { exact: true })).toBeVisible();
+    await expect(confirmation.getByText("High", { exact: true })).toBeVisible();
+    await expect(confirmation.getByText("Gospodarz", { exact: true })).toBeVisible();
+    await expect(
+      confirmation.locator("code", { hasText: message.sender_name }),
+    ).toBeVisible();
+    await expect(
+      confirmation.getByText(/delivered separately/u),
+    ).toHaveCount(0);
+    const finalPreview = confirmation.getByRole("region", {
+      name: "Final server-facing preview",
+    });
+    await expect(finalPreview.getByText("MESSAGE FROM HUMAN OVERSEER")).toBeVisible();
+    await expect(
+      finalPreview.getByText(/prefers replies in English \(en\)/u),
+    ).toBeVisible();
+    await expect(
+      finalPreview.getByText(`Approved by ${actorRole}.`, { exact: true }),
+    ).toBeVisible();
+    await expectMobileLayout(page);
+
+    await confirmation.getByRole("button", { name: "Confirm and send" }).click();
 
     if (requiresRetry) {
       await expect(page.getByText("Accepted and waiting to publish.")).toBeVisible();
@@ -451,6 +852,12 @@ for (const actorRole of ["admin", "operator"] as const) {
       path: `/mail/api/v1/projects/${project.id}/messages/${message.id}/replies`,
       body: {
         idempotency_key: expect.stringMatching(/^human-ui:/u),
+        expected_sender_agent_id: replyMessage.reply_target.agent_id,
+        expected_sender_agent_generation:
+          replyMessage.reply_target.agent_generation,
+        expected_sender_project_id: replyMessage.reply_target.project_id,
+        expected_sender_project_generation:
+          replyMessage.reply_target.project_generation,
         body_md: `Approved by ${actorRole}.`,
       },
     });
@@ -488,6 +895,31 @@ test("account, admin, inbox, and detail remain mobile-safe and keyboard-operable
   await page.getByRole("link", { name: "Account" }).click();
   await expect(page.getByRole("heading", { name: "Account", level: 1 })).toBeVisible();
   await expectMobileLayout(page);
+
+  const localeTrigger = page.getByRole("button", {
+    name: /Choose language\. Current language: English/i,
+  });
+  await localeTrigger.click();
+  const localeOptions = page.getByRole("listbox", {
+    name: /Choose interface language/i,
+  });
+  await expect(localeOptions.getByRole("option")).toHaveCount(45);
+  await expect(
+    localeOptions.getByRole("option", { name: /Use العربية/i }),
+  ).toContainText("🇸🇦");
+  await localeOptions.getByRole("option", { name: /Use العربية/i }).click();
+  await expect(page.locator("html")).toHaveAttribute("lang", "ar");
+  await expect(page.locator("html")).toHaveAttribute("dir", "rtl");
+  await expect(
+    page.getByRole("button", { name: /اللغة الحالية: العربية/i }),
+  ).toBeVisible();
+  expect(state.preferences.stored.preferred_ui_locale).toBe("ar");
+  await expectMobileLayout(page);
+
+  await page.getByRole("button", { name: /اللغة الحالية: العربية/i }).click();
+  await page.getByRole("option", { name: /استخدم English/i }).click();
+  await expect(page.locator("html")).toHaveAttribute("lang", "en");
+  await expect(page.locator("html")).toHaveAttribute("dir", "ltr");
 
   await page.getByLabel("Display name").fill("Mateusz Klatt");
   await page.getByRole("button", { name: "Save display name" }).click();
@@ -546,7 +978,7 @@ test("renders GFM while Markdown resources and raw HTML stay inert", async ({ pa
       "- [x] Reviewed\n- [ ] Pending",
       "First line\nSecond line",
       "> Audited quote",
-      "| Identifier | A deliberately long result column that must scroll inside the labelled table |\n| --- | --- |\n| HERMES-101 | Passed without widening the mobile document viewport |",
+      "| Identifier | A deliberately long result column that must scroll inside the labelled table |\n| --- | --- |\n| IRIS-101 | Passed without widening the mobile document viewport |",
       "```ts\nconst immutableDelivery = true; const deliberatelyLongCodeLine = 'scroll inside the focusable code block';\n```",
       "[safe HTTPS](https://example.test/report) [safe mail](mailto:ops@example.test) [safe Polish](https://example.test/Wrocław) [safe relative](../messages/101)",
       "[blocked fragment](#markdown-delivery) [blocked routed fragment](/mail/#account) [blocked JavaScript](javascript:alert%281%29) [blocked data](data:text/html,unsafe) [blocked blob](blob:https://example.test/id) [blocked control](https://example.test/%0Aprobe)",

@@ -14,6 +14,7 @@ from typing import Any, TypeVar
 import pytest
 from sqlmodel import SQLModel
 
+from mcp_agent_mail import db as database_module
 from mcp_agent_mail.db import ensure_schema, reset_database_state
 from mcp_agent_mail.models import MessageDelivery, MessageDeliveryRecipient
 
@@ -48,6 +49,90 @@ def _open_database() -> sqlite3.Connection:
     connection = sqlite3.connect(_database_path())
     connection.execute("PRAGMA foreign_keys=ON")
     return connection
+
+
+def _install_legacy_ui_locale_schema(connection: sqlite3.Connection) -> None:
+    """Replace ``ui_users`` with the historical two-locale schema."""
+    connection.execute("PRAGMA foreign_keys=OFF")
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute(
+        """
+        CREATE TABLE ui_users_legacy (
+            id INTEGER PRIMARY KEY,
+            username VARCHAR(64) NOT NULL,
+            password_hash VARCHAR(256) NOT NULL,
+            role VARCHAR(16) NOT NULL,
+            disabled BOOLEAN NOT NULL,
+            session_epoch INTEGER NOT NULL,
+            session_generation VARCHAR(64) NOT NULL,
+            display_name VARCHAR(128),
+            profile_revision INTEGER NOT NULL DEFAULT 1,
+            preferred_ui_locale VARCHAR(2) NOT NULL DEFAULT 'en',
+            preferred_correspondence_locale VARCHAR(2),
+            created_ts DATETIME NOT NULL,
+            last_login_ts DATETIME,
+            CONSTRAINT ck_ui_users_preferred_ui_locale
+                CHECK (preferred_ui_locale IN ('en', 'pl')),
+            CONSTRAINT ck_ui_users_preferred_correspondence_locale
+                CHECK (
+                    preferred_correspondence_locale IS NULL
+                    OR preferred_correspondence_locale IN ('en', 'pl')
+                ),
+            UNIQUE (username)
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO ui_users_legacy (
+            id, username, password_hash, role, disabled, session_epoch,
+            session_generation, display_name, profile_revision,
+            preferred_ui_locale, preferred_correspondence_locale,
+            created_ts, last_login_ts
+        )
+        SELECT
+            id, username, password_hash, role, disabled, session_epoch,
+            session_generation, display_name, profile_revision,
+            'pl', 'en', created_ts, last_login_ts
+        FROM ui_users
+        """
+    )
+    dependent_triggers = connection.execute(
+        """
+        SELECT name, sql
+        FROM sqlite_master
+        WHERE type = 'trigger'
+          AND sql IS NOT NULL
+          AND (tbl_name = 'ui_users' OR instr(lower(sql), 'ui_users') > 0)
+        ORDER BY name
+        """
+    ).fetchall()
+    for trigger_name, _trigger_sql in dependent_triggers:
+        quoted_name = '"' + str(trigger_name).replace('"', '""') + '"'
+        connection.execute(f"DROP TRIGGER {quoted_name}")
+    connection.execute("DROP TABLE ui_users")
+    connection.execute("ALTER TABLE ui_users_legacy RENAME TO ui_users")
+    for _trigger_name, trigger_sql in dependent_triggers:
+        connection.execute(str(trigger_sql))
+    connection.execute(
+        "CREATE INDEX ui_users_custom_role_idx ON ui_users(role, disabled)"
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER ui_users_custom_noop
+        AFTER UPDATE OF disabled ON ui_users
+        BEGIN
+            SELECT new.id;
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE VIEW ui_users_public_names AS
+        SELECT id, username FROM ui_users
+        """
+    )
+    connection.commit()
 
 
 def _seed_identities(connection: sqlite3.Connection) -> None:
@@ -351,6 +436,212 @@ def test_legacy_agents_gain_stable_immutable_generation(isolated_env) -> None:
         assert connection.execute(
             "SELECT agent_generation FROM agents WHERE id = 1"
         ).fetchone()[0] == generation
+
+
+def test_legacy_ui_locale_schema_is_rebuilt_without_losing_account_links(
+    isolated_env,
+) -> None:
+    _run_database(ensure_schema())
+    with closing(_open_database()) as connection:
+        _seed_identities(connection)
+        _install_legacy_ui_locale_schema(connection)
+
+        legacy_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ui_users'"
+        ).fetchone()[0]
+        assert "VARCHAR(2)" in legacy_sql
+        assert "'fr'" not in legacy_sql
+        assert connection.execute(
+            "SELECT role FROM ui_project_assignments WHERE user_id = 20 AND project_id = 1"
+        ).fetchone() == ("operator",)
+
+    _run_database(ensure_schema())
+    with closing(_open_database()) as connection:
+        table_info = {
+            row[1]: row for row in connection.execute("PRAGMA table_info('ui_users')")
+        }
+        assert table_info["preferred_ui_locale"][2].casefold() == "varchar(16)"
+        assert (
+            table_info["preferred_correspondence_locale"][2].casefold()
+            == "varchar(16)"
+        )
+        create_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ui_users'"
+        ).fetchone()[0]
+        assert "'fr'" in create_sql
+        assert "'my-MM'" in create_sql
+        assert "'zh-Hant'" in create_sql
+        assert connection.execute(
+            """
+            SELECT username, preferred_ui_locale, preferred_correspondence_locale
+            FROM ui_users WHERE id = 20
+            """
+        ).fetchone() == ("operator", "pl", "en")
+        assert connection.execute(
+            "SELECT role FROM ui_project_assignments WHERE user_id = 20 AND project_id = 1"
+        ).fetchone() == ("operator",)
+        assert list(connection.execute("PRAGMA foreign_key_check")) == []
+        assert connection.execute("PRAGMA foreign_keys").fetchone() == (1,)
+        preserved_objects = {
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE name IN (
+                    'ui_users_custom_role_idx',
+                    'ui_users_custom_noop',
+                    'ui_users_public_names'
+                )
+                """
+            )
+        }
+        assert preserved_objects == {
+            "ui_users_custom_role_idx",
+            "ui_users_custom_noop",
+            "ui_users_public_names",
+        }
+        assert connection.execute(
+            "SELECT username FROM ui_users_public_names WHERE id = 20"
+        ).fetchone() == ("operator",)
+
+        connection.execute(
+            """
+            UPDATE ui_users
+            SET preferred_ui_locale = 'my-MM',
+                preferred_correspondence_locale = 'zh-Hant'
+            WHERE id = 20
+            """
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="invalid preferred_ui_locale"):
+            connection.execute(
+                "UPDATE ui_users SET preferred_ui_locale = 'MY-mm' WHERE id = 20"
+            )
+        connection.rollback()
+
+    _run_database(ensure_schema())
+    with closing(_open_database()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM ui_users WHERE id = 20"
+        ).fetchone() == (1,)
+
+
+def test_legacy_ui_locale_schema_rebuild_rolls_back_after_late_failure(
+    isolated_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _run_database(ensure_schema())
+    with closing(_open_database()) as connection:
+        _seed_identities(connection)
+        _install_legacy_ui_locale_schema(connection)
+        legacy_table_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ui_users'"
+        ).fetchone()[0]
+        legacy_account = connection.execute(
+            """
+            SELECT id, username, password_hash, role, disabled, session_epoch,
+                   session_generation, display_name, profile_revision,
+                   preferred_ui_locale, preferred_correspondence_locale,
+                   created_ts, last_login_ts
+            FROM ui_users WHERE id = 20
+            """
+        ).fetchone()
+        legacy_objects = connection.execute(
+            """
+            SELECT type, name, tbl_name, sql
+            FROM sqlite_master
+            WHERE name IN (
+                'ui_users_custom_role_idx',
+                'ui_users_custom_noop',
+                'ui_users_public_names'
+            )
+            ORDER BY type, name
+            """
+        ).fetchall()
+        legacy_assignments = connection.execute(
+            """
+            SELECT user_id, project_id, role
+            FROM ui_project_assignments
+            WHERE user_id = 20
+            ORDER BY project_id
+            """
+        ).fetchall()
+
+    original_rebuild = database_module._rebuild_ui_users_locale_schema
+    rebuild_completed = False
+
+    def fail_after_rebuild(connection: Any) -> None:
+        nonlocal rebuild_completed
+        original_rebuild(connection)
+        assert connection.exec_driver_sql(
+            "SELECT name FROM sqlite_master WHERE name = 'ui_users_locale_v2'"
+        ).fetchone() is None
+        migrated_table_sql = connection.exec_driver_sql(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ui_users'"
+        ).scalar_one()
+        assert "'fr'" in str(migrated_table_sql)
+        rebuild_completed = True
+        raise RuntimeError("injected failure after ui_users locale rebuild")
+
+    monkeypatch.setattr(
+        database_module,
+        "_rebuild_ui_users_locale_schema",
+        fail_after_rebuild,
+    )
+
+    async def fail_migration_and_read_foreign_keys() -> int:
+        with pytest.raises(
+            RuntimeError,
+            match="injected failure after ui_users locale rebuild",
+        ):
+            await ensure_schema()
+        async with database_module.get_engine().connect() as connection:
+            result = await connection.exec_driver_sql("PRAGMA foreign_keys")
+            return int(result.scalar_one())
+
+    assert _run_database(fail_migration_and_read_foreign_keys()) == 1
+    assert rebuild_completed is True
+
+    with closing(_open_database()) as connection:
+        assert connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ui_users'"
+        ).fetchone()[0] == legacy_table_sql
+        assert connection.execute(
+            """
+            SELECT id, username, password_hash, role, disabled, session_epoch,
+                   session_generation, display_name, profile_revision,
+                   preferred_ui_locale, preferred_correspondence_locale,
+                   created_ts, last_login_ts
+            FROM ui_users WHERE id = 20
+            """
+        ).fetchone() == legacy_account
+        assert connection.execute(
+            """
+            SELECT type, name, tbl_name, sql
+            FROM sqlite_master
+            WHERE name IN (
+                'ui_users_custom_role_idx',
+                'ui_users_custom_noop',
+                'ui_users_public_names'
+            )
+            ORDER BY type, name
+            """
+        ).fetchall() == legacy_objects
+        assert connection.execute(
+            """
+            SELECT user_id, project_id, role
+            FROM ui_project_assignments
+            WHERE user_id = 20
+            ORDER BY project_id
+            """
+        ).fetchall() == legacy_assignments
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'ui_users_locale_v2'"
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT username FROM ui_users_public_names WHERE id = 20"
+        ).fetchone() == ("operator",)
+        assert list(connection.execute("PRAGMA foreign_key_check")) == []
+        assert connection.execute("PRAGMA foreign_keys").fetchone() == (1,)
 
 
 def test_schema_exposes_due_idempotency_and_audit_guards(isolated_env) -> None:

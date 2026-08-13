@@ -5,6 +5,7 @@ export const mailEventsEndpoint = "/mail/events";
 
 export const inboxPageSize = 50;
 export const searchPageSize = 50;
+export const threadPageSize = 50;
 
 const maximumInlineImageBytes = 2 * 1024 * 1024;
 const maximumInlineImageBase64Length = Math.ceil(maximumInlineImageBytes / 3) * 4;
@@ -194,6 +195,13 @@ export interface SearchPage {
   next_cursor: string | null;
 }
 
+export interface ThreadPage {
+  items: MessageDetail[];
+  next_cursor: string | null;
+  subject: string;
+  total: number;
+}
+
 export interface MessageAttachment {
   type: string | null;
   media_type: string | null;
@@ -253,7 +261,8 @@ export type MailRoute =
       scope: SearchScope;
       order: SearchOrder;
     }
-  | { view: "message"; projectId: number; messageId: number };
+  | { view: "message"; projectId: number; messageId: number }
+  | { view: "thread"; projectId: number; threadId: string };
 
 interface FetchOptions {
   signal?: AbortSignal;
@@ -269,6 +278,10 @@ interface SearchOptions extends FetchOptions {
   projectId?: number;
   scope: SearchScope;
   order: SearchOrder;
+  cursor?: string;
+}
+
+interface ThreadOptions extends FetchOptions {
   cursor?: string;
 }
 
@@ -321,14 +334,22 @@ function nullableString(value: unknown, label: string): string | null {
 }
 
 function positiveInteger(value: unknown, label: string): number {
-  if (!Number.isInteger(value) || typeof value !== "number" || value <= 0) {
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value <= 0
+  ) {
     throw new TypeError(`Invalid ${label}.`);
   }
   return value;
 }
 
 function nonNegativeInteger(value: unknown, label: string): number {
-  if (!Number.isInteger(value) || typeof value !== "number" || value < 0) {
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < 0
+  ) {
     throw new TypeError(`Invalid ${label}.`);
   }
   return value;
@@ -628,6 +649,25 @@ export function parseMessageDetail(payload: unknown): MessageDetail {
   };
 }
 
+export function parseThreadPage(payload: unknown): ThreadPage {
+  const candidate = exactRecord(payload, "thread response", [
+    "items",
+    "next_cursor",
+    "subject",
+    "total",
+  ]);
+  if (!Array.isArray(candidate.items)) {
+    throw new TypeError("Invalid thread items.");
+  }
+  const subject = stringValue(candidate.subject, "thread subject");
+  return {
+    items: candidate.items.map((value) => parseMessageDetail(value)),
+    next_cursor: nullableString(candidate.next_cursor, "thread cursor"),
+    subject,
+    total: nonNegativeInteger(candidate.total, "thread total"),
+  };
+}
+
 export function parseDeliveryResult(payload: unknown): DeliveryResult {
   const candidate = exactRecord(payload, "delivery response", [
     "id",
@@ -753,6 +793,42 @@ export function loadMessage(
   );
 }
 
+export async function loadThread(
+  projectId: number,
+  threadId: string,
+  options: ThreadOptions = {},
+): Promise<ThreadPage> {
+  positiveInteger(projectId, "thread project id");
+  if (!isValidThreadIdentifier(threadId)) {
+    throw new TypeError("Invalid thread id.");
+  }
+  const url = new URL(
+    `/mail/api/v1/projects/${projectId}/threads`,
+    window.location.origin,
+  );
+  url.searchParams.set("thread_id", threadId);
+  url.searchParams.set("limit", String(threadPageSize));
+  if (options.cursor !== undefined) {
+    url.searchParams.set("cursor", options.cursor);
+  }
+  const page = await mailRequest(
+    url.pathname + url.search,
+    parseThreadPage,
+    options,
+  );
+  if (
+    page.items.some(
+      (message) =>
+        message.project_id !== projectId ||
+        (message.thread_id !== threadId &&
+          !isNumericThreadStarter(message, threadId)),
+    )
+  ) {
+    throw new TypeError("Invalid thread message identity.");
+  }
+  return page;
+}
+
 async function mailMutationRequest<T>(
   endpoint: string,
   body: unknown,
@@ -841,8 +917,61 @@ function routeInteger(value: string | undefined): number | null {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
+// URL decoding can otherwise turn malformed or control-bearing path segments
+// into ambiguous route identities.  Count Unicode code points, not UTF-16 code
+// units, so the browser and Python endpoint enforce the same 128-character cap.
+// eslint-disable-next-line no-control-regex
+const threadControlCharacters = /[\u0000-\u001f\u007f-\u009f]/u;
+const canonicalNumericThreadIdentifier = /^[1-9][0-9]{0,18}$/u;
+const maximumSqliteInteger = 9_223_372_036_854_775_807n;
+
+function isNumericThreadStarter(
+  message: MessageDetail,
+  threadId: string,
+): boolean {
+  if (
+    !canonicalNumericThreadIdentifier.test(threadId)
+  ) {
+    return false;
+  }
+  const numericId = BigInt(threadId);
+  if (numericId > maximumSqliteInteger) {
+    return false;
+  }
+  const browserId = Number(numericId);
+  return Number.isSafeInteger(browserId) && message.id === browserId;
+}
+
+function isValidThreadIdentifier(value: string): boolean {
+  if (
+    value.length === 0 ||
+    value === "." ||
+    value === ".." ||
+    [...value].length > 128 ||
+    threadControlCharacters.test(value)
+  ) {
+    return false;
+  }
+  try {
+    encodeURIComponent(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function decodedThreadIdentifier(value: string): string | null {
+  try {
+    const decoded = decodeURIComponent(value);
+    return isValidThreadIdentifier(decoded) ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
 export function parseMailRoute(hash: string): MailRoute {
   const normalized = hash.startsWith("#") ? hash.slice(1) : hash;
+  const hasQueryDelimiter = normalized.includes("?");
   const [path = "", query = ""] = normalized.split("?", 2);
   if (path === "projects") {
     return { view: "projects" };
@@ -873,7 +1002,33 @@ export function parseMailRoute(hash: string): MailRoute {
       return { view: "message", projectId, messageId };
     }
   }
+  if (parts[0] === "thread" && parts.length === 3 && !hasQueryDelimiter) {
+    const projectId = routeInteger(parts[1]);
+    const threadId = decodedThreadIdentifier(parts[2]!);
+    if (
+      projectId !== null &&
+      parts[1] === String(projectId) &&
+      threadId !== null &&
+      parts[2] === encodeURIComponent(threadId)
+    ) {
+      return { view: "thread", projectId, threadId };
+    }
+  }
   return { view: "inbox", projectId: null };
+}
+
+export function mailThreadRouteHash(
+  projectId: number,
+  threadId: string,
+): string | null {
+  if (
+    !Number.isSafeInteger(projectId) ||
+    projectId <= 0 ||
+    !isValidThreadIdentifier(threadId)
+  ) {
+    return null;
+  }
+  return `#thread/${projectId}/${encodeURIComponent(threadId)}`;
 }
 
 export function mailRouteHash(route: MailRoute): string {
@@ -882,6 +1037,13 @@ export function mailRouteHash(route: MailRoute): string {
   }
   if (route.view === "message") {
     return `#message/${route.projectId}/${route.messageId}`;
+  }
+  if (route.view === "thread") {
+    const threadHash = mailThreadRouteHash(route.projectId, route.threadId);
+    if (threadHash === null) {
+      throw new TypeError("Invalid thread route id.");
+    }
+    return threadHash;
   }
   if (route.view === "search") {
     const params = new URLSearchParams();

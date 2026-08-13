@@ -129,6 +129,23 @@ export const messageDetail = {
   ],
 };
 
+export const threadReply = {
+  ...messageDetail,
+  id: 103,
+  subject: "Re: Production rollout verified",
+  body_md: "## Follow-up\n\nDeployment remains healthy.",
+  reply_to: messageOne.id,
+  created_ts: "2026-08-11T11:15:00Z",
+  attachments: [],
+};
+
+export const threadResponse = {
+  items: [threadReply, messageDetail],
+  total: 2,
+  next_cursor: null,
+  subject: messageOne.subject,
+};
+
 export const preferencesResponse = (
   uiLocale: SupportedLocale,
   correspondenceLocale: SupportedLocale | null = null,
@@ -280,6 +297,14 @@ export const server = setupServer(
       params.projectId === String(projectOne.id) &&
       params.messageId === String(messageOne.id)
         ? HttpResponse.json(messageDetail)
+        : HttpResponse.json({ detail: "not found" }, { status: 404 }),
+  ),
+  http.get(
+    "*/mail/api/v1/projects/:projectId/threads",
+    ({ params, request }) =>
+      params.projectId === String(projectOne.id) &&
+      new URL(request.url).searchParams.get("thread_id") === messageOne.thread_id
+        ? HttpResponse.json(threadResponse)
         : HttpResponse.json({ detail: "not found" }, { status: 404 }),
   ),
   http.post("*/mail/api/v1/projects/:projectId/messages", () =>

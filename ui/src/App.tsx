@@ -2,6 +2,7 @@ import {
   type ChangeEvent,
   type FormEvent,
   type KeyboardEvent,
+  type ReactNode,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -44,9 +45,11 @@ import {
   loadProjectAgents,
   loadProjects,
   loadSearch,
+  loadThread,
   mailEventsEndpoint,
   MailHttpError,
   mailRouteHash,
+  mailThreadRouteHash,
   markdownUrlTransform,
   parseMailRoute,
   replyToMessage,
@@ -158,6 +161,51 @@ function SafeMarkdown({ body, components }: SafeMarkdownProps) {
     >
       {body}
     </ReactMarkdown>
+  );
+}
+
+interface CollapsibleThreadMessageProps {
+  children: ReactNode;
+  createdTs: string;
+  defaultOpen: boolean;
+  formattedDate: string;
+  importance: InboxMessage["importance"];
+  importanceLabel: string;
+  senderLabel: string;
+  subject: string;
+}
+
+function CollapsibleThreadMessage({
+  children,
+  createdTs,
+  defaultOpen,
+  formattedDate,
+  importance,
+  importanceLabel,
+  senderLabel,
+  subject,
+}: CollapsibleThreadMessageProps) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <details
+      className="thread-message"
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary>
+        <span className="thread-summary-copy">
+          <strong>{subject}</strong>
+          <small>{senderLabel}</small>
+        </span>
+        <span className="thread-summary-meta">
+          <span className={`status importance-${importance}`}>
+            {importanceLabel}
+          </span>
+          <time dateTime={createdTs}>{formattedDate}</time>
+        </span>
+      </summary>
+      {open ? children : null}
+    </details>
   );
 }
 
@@ -582,6 +630,33 @@ function mergeMessages<T extends InboxMessage>(current: T[], incoming: T[]): T[]
   return [...merged.values()];
 }
 
+function canonicalUtcTimestampSortKey(timestamp: string): string {
+  // Pydantic emits UTC datetimes as either `...:ssZ` or `...:ss.ffffffZ`.
+  // Normalizing whole seconds keeps lexical order exact to the microsecond;
+  // Date.parse would discard the final three fractional digits.
+  const timestampWithoutZone = timestamp.slice(0, -1);
+  return timestampWithoutZone.includes(".")
+    ? timestampWithoutZone
+    : `${timestampWithoutZone}.000000`;
+}
+
+function mergeThreadMessages(
+  current: MessageDetail[],
+  incoming: MessageDetail[],
+): MessageDetail[] {
+  return mergeMessages(current, incoming).sort((left, right) => {
+    const leftTimestamp = canonicalUtcTimestampSortKey(left.created_ts);
+    const rightTimestamp = canonicalUtcTimestampSortKey(right.created_ts);
+    const timestampOrder =
+      leftTimestamp < rightTimestamp
+        ? -1
+        : leftTimestamp > rightTimestamp
+          ? 1
+          : 0;
+    return timestampOrder || left.id - right.id;
+  });
+}
+
 export function App({
   onUnauthorized,
   navigateTo = defaultNavigate,
@@ -723,6 +798,13 @@ export function App({
   );
   const [detail, setDetail] = useState<MessageDetail | null>(null);
   const [detailStatus, setDetailStatus] = useState<DetailStatus>("idle");
+  const [threadMessages, setThreadMessages] = useState<MessageDetail[]>([]);
+  const [threadSubject, setThreadSubject] = useState("");
+  const [threadTotal, setThreadTotal] = useState(0);
+  const [threadNextCursor, setThreadNextCursor] = useState<string | null>(null);
+  const [threadStatus, setThreadStatus] = useState<DetailStatus>("idle");
+  const [threadPaginationStatus, setThreadPaginationStatus] =
+    useState<PaginationStatus>("idle");
   const [composeProjectId, setComposeProjectId] = useState("");
   const [composeRecipients, setComposeRecipients] = useState<string[]>([]);
   const [composeAgents, setComposeAgents] = useState<MailRecipientAgent[]>([]);
@@ -761,6 +843,8 @@ export function App({
   const paginationControllerRef = useRef<AbortController | null>(null);
   const inboxRequestGenerationRef = useRef(0);
   const detailRequestGenerationRef = useRef(0);
+  const threadRequestGenerationRef = useRef(0);
+  const threadPaginationControllerRef = useRef<AbortController | null>(null);
   const searchRequestGenerationRef = useRef(0);
   const searchPaginationControllerRef = useRef<AbortController | null>(null);
   const composeAgentsRequestGenerationRef = useRef(0);
@@ -775,12 +859,17 @@ export function App({
   const mailRouteActive =
     mailNavigation.some((item) => route.view === item) ||
     route.view === "message" ||
+    route.view === "thread" ||
     route.view === "compose";
   const routeProjectId =
-    route.view === "inbox" || route.view === "message" || route.view === "search"
+    route.view === "inbox" ||
+    route.view === "message" ||
+    route.view === "search" ||
+    route.view === "thread"
       ? route.projectId
       : null;
   const routeMessageId = route.view === "message" ? route.messageId : null;
+  const routeThreadId = route.view === "thread" ? route.threadId : null;
 
   const applyLocale = useCallback(
     async (nextLocale: SupportedLocale) => {
@@ -980,6 +1069,50 @@ export function App({
   ]);
 
   useEffect(() => {
+    const requestGeneration = ++threadRequestGenerationRef.current;
+    threadPaginationControllerRef.current?.abort();
+    threadPaginationControllerRef.current = null;
+    setThreadPaginationStatus("idle");
+    if (routeThreadId === null || routeProjectId === null) {
+      setThreadMessages([]);
+      setThreadSubject("");
+      setThreadTotal(0);
+      setThreadNextCursor(null);
+      setThreadStatus("idle");
+      return undefined;
+    }
+    const controller = new AbortController();
+    setThreadMessages([]);
+    setThreadSubject("");
+    setThreadTotal(0);
+    setThreadNextCursor(null);
+    setThreadStatus("loading");
+    void loadThread(routeProjectId, routeThreadId, {
+      signal: controller.signal,
+    })
+      .then((page) => {
+        if (requestGeneration !== threadRequestGenerationRef.current) {
+          return;
+        }
+        setThreadMessages(mergeThreadMessages([], page.items));
+        setThreadSubject(page.subject);
+        setThreadTotal(page.total);
+        setThreadNextCursor(page.next_cursor);
+        setThreadStatus("ready");
+      })
+      .catch((error: unknown) => {
+        if (requestGeneration !== threadRequestGenerationRef.current) {
+          return;
+        }
+        const status = dataFailureStatus(error);
+        if (status !== null) {
+          setThreadStatus(status);
+        }
+      });
+    return () => controller.abort();
+  }, [dataFailureStatus, refreshVersion, routeProjectId, routeThreadId]);
+
+  useEffect(() => {
     const requestGeneration = ++searchRequestGenerationRef.current;
     searchPaginationControllerRef.current?.abort();
     setSearchPaginationStatus("idle");
@@ -1106,6 +1239,7 @@ export function App({
   useEffect(
     () => () => {
       paginationControllerRef.current?.abort();
+      threadPaginationControllerRef.current?.abort();
       searchPaginationControllerRef.current?.abort();
     },
     [],
@@ -1466,6 +1600,45 @@ export function App({
         setSearchPaginationStatus("idle");
       } else if (status === "error") {
         setSearchPaginationStatus("error");
+      }
+    }
+  };
+
+  const handleThreadLoadMore = async (
+    cursor: string,
+    activeRoute: Extract<MailRoute, { view: "thread" }>,
+  ) => {
+    threadPaginationControllerRef.current?.abort();
+    const controller = new AbortController();
+    const requestGeneration = threadRequestGenerationRef.current;
+    threadPaginationControllerRef.current = controller;
+    setThreadPaginationStatus("loading");
+    try {
+      const page = await loadThread(
+        activeRoute.projectId,
+        activeRoute.threadId,
+        { cursor, signal: controller.signal },
+      );
+      if (requestGeneration !== threadRequestGenerationRef.current) {
+        return;
+      }
+      setThreadMessages((current) =>
+        mergeThreadMessages(current, page.items),
+      );
+      setThreadSubject(page.subject);
+      setThreadTotal(page.total);
+      setThreadNextCursor(page.next_cursor);
+      setThreadPaginationStatus("idle");
+    } catch (error) {
+      if (requestGeneration !== threadRequestGenerationRef.current) {
+        return;
+      }
+      const status = dataFailureStatus(error);
+      if (status === "unauthorized") {
+        setThreadStatus("unauthorized");
+        setThreadPaginationStatus("idle");
+      } else if (status === "error") {
+        setThreadPaginationStatus("error");
       }
     }
   };
@@ -2181,6 +2354,8 @@ export function App({
             const sender = message.sender_display_name ?? message.sender_name;
             const senderIdentity = message.sender === sender ? "" : ` · ${message.sender}`;
             const project = projectNames.get(message.project_id) ?? message.project_slug;
+            const threadId = message.thread_id ?? String(message.id);
+            const threadHash = mailThreadRouteHash(message.project_id, threadId);
             return (
               <li key={message.id}>
                 <a
@@ -2206,6 +2381,11 @@ export function App({
                     <time dateTime={message.created_ts}>{formatDate(message.created_ts)}</time>
                   </span>
                 </a>
+                {threadHash === null ? null : (
+                  <a className="message-thread-link" href={threadHash}>
+                    {t("confirmation.thread")}: {threadId}
+                  </a>
+                )}
               </li>
             );
           })}
@@ -2333,6 +2513,8 @@ export function App({
               message.sender === sender ? "" : ` · ${message.sender}`;
             const project =
               projectNames.get(message.project_id) ?? message.project_slug;
+            const threadId = message.thread_id ?? String(message.id);
+            const threadHash = mailThreadRouteHash(message.project_id, threadId);
             return (
               <li key={message.id}>
                 <a
@@ -2367,6 +2549,11 @@ export function App({
                     </time>
                   </span>
                 </a>
+                {threadHash === null ? null : (
+                  <a className="message-thread-link" href={threadHash}>
+                    {t("confirmation.thread")}: {threadId}
+                  </a>
+                )}
               </li>
             );
           })}
@@ -2394,6 +2581,158 @@ export function App({
     </section>
   );
 
+  const renderThread = (
+    activeRoute: Extract<MailRoute, { view: "thread" }>,
+  ) => {
+    const inboxHash = mailRouteHash({
+      view: "inbox",
+      projectId: activeRoute.projectId,
+    });
+    const project = projectNames.get(activeRoute.projectId);
+    const heading = threadSubject === "" ? activeRoute.threadId : threadSubject;
+    return (
+      <section aria-labelledby="thread-heading">
+        <a className="back-link" href={inboxHash}>← {t("message.back")}</a>
+        <div className="page-heading thread-heading">
+          <div>
+            <p className="eyebrow">{t("confirmation.thread")}</p>
+            <h1 id="thread-heading">{heading}</h1>
+            <p className="thread-identifier">
+              <strong>{t("confirmation.thread")}:</strong>{" "}
+              <code>{activeRoute.threadId}</code>
+            </p>
+            {project === undefined ? null : (
+              <p>{t("inbox.project", { project })}</p>
+            )}
+          </div>
+          {threadStatus === "ready" ? (
+            <span className="count-pill">
+              {t("inbox.count", { count: threadTotal })}
+            </span>
+          ) : null}
+        </div>
+        {threadStatus === "loading" ? (
+          <p className="state-panel" role="status">{t("message.loading")}</p>
+        ) : null}
+        {threadStatus === "error" ? (
+          <p className="state-panel state-error" role="alert">
+            {t("errors.message")}
+          </p>
+        ) : null}
+        {threadStatus === "unauthorized" ? (
+          <p className="state-panel" role="status">{t("errors.unauthorized")}</p>
+        ) : null}
+        {threadStatus === "ready" && threadMessages.length === 0 ? (
+          <p className="state-panel">{t("inbox.empty")}</p>
+        ) : null}
+        {threadStatus === "ready" && threadMessages.length > 0 ? (
+          <ol className="thread-list">
+            {threadMessages.map((message, index) => {
+              const sender = message.sender_display_name ?? message.sender_name;
+              const senderIdentity =
+                message.sender === sender ? "" : ` · ${message.sender}`;
+              return (
+                <li key={message.id}>
+                  <CollapsibleThreadMessage
+                    defaultOpen={index === threadMessages.length - 1}
+                    subject={message.subject}
+                    senderLabel={`${t("inbox.from", { sender })}${senderIdentity}`}
+                    importance={message.importance}
+                    importanceLabel={t(`importance.${message.importance}`)}
+                    createdTs={message.created_ts}
+                    formattedDate={formatDate(message.created_ts)}
+                  >
+                    <article className="message-detail">
+                      <header>
+                        <a
+                          className="thread-detail-link"
+                          href={mailRouteHash({
+                            view: "message",
+                            projectId: message.project_id,
+                            messageId: message.id,
+                          })}
+                        >
+                          {t("inbox.openMessage", { subject: message.subject })}
+                        </a>
+                      </header>
+                      <dl className="message-facts">
+                        <div>
+                          <dt>{t("message.to")}</dt>
+                          <dd>
+                            {message.to.length > 0
+                              ? message.to.join(", ")
+                              : t("message.emptyRecipients")}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>{t("message.cc")}</dt>
+                          <dd>
+                            {message.cc.length > 0
+                              ? message.cc.join(", ")
+                              : t("message.emptyRecipients")}
+                          </dd>
+                        </div>
+                      </dl>
+                      <div className="message-body">
+                        <SafeMarkdown
+                          body={message.body_md}
+                          components={markdownComponents}
+                        />
+                      </div>
+                      {message.attachments.length > 0 ? (
+                        <section
+                          className="attachment-panel"
+                          aria-labelledby={`thread-attachments-${message.id}`}
+                        >
+                          <h3 id={`thread-attachments-${message.id}`}>
+                            {t("message.attachments")}
+                          </h3>
+                          <p>
+                            {t("message.attachmentCount", {
+                              count: message.attachments.length,
+                            })}
+                          </p>
+                          <ul>
+                            {message.attachments.map((attachment, itemIndex) => (
+                              <li key={`${attachment.type ?? "attachment"}-${itemIndex}`}>
+                                {attachmentText(attachment)}
+                              </li>
+                            ))}
+                          </ul>
+                        </section>
+                      ) : null}
+                    </article>
+                  </CollapsibleThreadMessage>
+                </li>
+              );
+            })}
+          </ol>
+        ) : null}
+        {threadStatus === "ready" && threadNextCursor !== null ? (
+          <div className="load-more-area">
+            <button
+              type="button"
+              className="primary-button"
+              onClick={() =>
+                void handleThreadLoadMore(threadNextCursor, activeRoute)
+              }
+              disabled={threadPaginationStatus === "loading"}
+            >
+              {t(
+                threadPaginationStatus === "loading"
+                  ? "inbox.loadingMore"
+                  : "inbox.loadMore",
+              )}
+            </button>
+            {threadPaginationStatus === "error" ? (
+              <p role="alert">{t("errors.loadMore")}</p>
+            ) : null}
+          </div>
+        ) : null}
+      </section>
+    );
+  };
+
   const renderMessage = (projectId: number, messageId: number) => {
     const inboxHash = mailRouteHash({ view: "inbox", projectId });
     const currentDetail =
@@ -2406,6 +2745,14 @@ export function App({
       currentDetail.sender !== detailSender
         ? ` · ${currentDetail.sender}`
         : "";
+    const detailThreadId =
+      currentDetail === null
+        ? null
+        : currentDetail.thread_id ?? String(currentDetail.id);
+    const detailThreadHash =
+      currentDetail === null || detailThreadId === null
+        ? null
+        : mailThreadRouteHash(currentDetail.project_id, detailThreadId);
     return (
       <section aria-labelledby="message-heading">
         <a className="back-link" href={inboxHash}>← {t("message.back")}</a>
@@ -2430,6 +2777,16 @@ export function App({
               <div><dt>{t("message.sent")}</dt><dd><time dateTime={currentDetail.created_ts}>{formatDate(currentDetail.created_ts)}</time></dd></div>
               <div><dt>{t("message.to")}</dt><dd>{currentDetail.to.length > 0 ? currentDetail.to.join(", ") : t("message.emptyRecipients")}</dd></div>
               <div><dt>{t("message.cc")}</dt><dd>{currentDetail.cc.length > 0 ? currentDetail.cc.join(", ") : t("message.emptyRecipients")}</dd></div>
+              <div>
+                <dt>{t("confirmation.thread")}</dt>
+                <dd>
+                  {detailThreadHash === null ? detailThreadId : (
+                    <a className="thread-inline-link" href={detailThreadHash}>
+                      {detailThreadId}
+                    </a>
+                  )}
+                </dd>
+              </div>
             </dl>
             <div className="message-body">
               <SafeMarkdown body={currentDetail.body_md} components={markdownComponents} />
@@ -2932,14 +3289,18 @@ export function App({
             {navigationItems.map((item) => (
               <a
                 className={
-                  (route.view === item || (route.view === "message" && item === "inbox"))
+                  (route.view === item ||
+                  ((route.view === "message" || route.view === "thread") &&
+                    item === "inbox"))
                     ? "nav-link is-active"
                     : "nav-link"
                 }
                 href={`#${item}`}
                 key={item}
                 aria-current={
-                  route.view === item || (route.view === "message" && item === "inbox")
+                  route.view === item ||
+                  ((route.view === "message" || route.view === "thread") &&
+                    item === "inbox")
                     ? "page"
                     : undefined
                 }
@@ -2959,6 +3320,7 @@ export function App({
           {route.view === "message"
             ? renderMessage(route.projectId, route.messageId)
             : null}
+          {route.view === "thread" ? renderThread(route) : null}
           {route.view === "account" ? renderAccount() : null}
           {route.view === "admin" ? renderAdmin() : null}
         </main>

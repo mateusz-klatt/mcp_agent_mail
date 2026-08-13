@@ -22,8 +22,6 @@ RETIRED_MAIL_READ_PATHS = (
     "/mail/test-proj/inbox/BlueLake",
     "/mail/test-proj/inbox/BlueLake?page=1&limit=10",
     "/mail/test-proj/inbox/NonexistentAgent",
-    "/mail/test-proj/thread/thread-1",
-    "/mail/test-proj/thread/nonexistent-thread",
     "/mail/test-proj/file_reservations",
     "/mail/test-proj/attachments",
     "/mail/test-proj/overseer/compose",

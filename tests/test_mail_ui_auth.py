@@ -28,6 +28,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import quote
 
 import pytest
 from authlib.jose import jwt
@@ -1690,7 +1691,7 @@ class TestMailReactShell:
     ):
         _install_react_dist(monkeypatch, tmp_path)
         _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
-        project_id, message_id = await _seed_project(
+        project_id, _message_id = await _seed_project(
             "react-cutover-project",
             subject="Legacy route sentinel",
             agent_name="CutoverAgent",
@@ -1703,7 +1704,6 @@ class TestMailReactShell:
             "/mail/v2/settings",
             "/mail/v2/assets/index-test.js",
             "/mail/react-cutover-project/inbox/CutoverAgent",
-            f"/mail/react-cutover-project/thread/{message_id}",
             "/mail/react-cutover-project/file_reservations",
             "/mail/react-cutover-project/attachments",
             "/mail/react-cutover-project/overseer/compose",
@@ -1879,6 +1879,196 @@ class TestMailReactShell:
             assert response.json() == {"detail": "Not Found"}
 
     @pytest.mark.asyncio
+    async def test_thread_bookmark_is_exact_encoded_and_non_disclosing(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        visible_id, starter_message_id = await _seed_project(
+            "thread-bookmark-visible",
+            subject="Visible thread target",
+            agent_name="ThreadBookmarkAgent",
+            sound="soft",
+        )
+        _hidden_id, hidden_message_id = await _seed_project(
+            "thread-bookmark-hidden",
+            subject="Hidden thread target",
+            agent_name="HiddenThreadBookmarkAgent",
+            sound="low",
+        )
+        thread_id = "release-\N{GREEK SMALL LETTER ALPHA} beta?#!~*'()"
+        boundary_thread_id = "\N{RAINBOW}" * 128
+        overlong_thread_id = "\N{RAINBOW}" * 129
+        hidden_thread_id = "hidden-thread"
+        async with get_session() as session:
+            await session.execute(
+                text("UPDATE messages SET thread_id = :thread_id WHERE id = :message_id"),
+                {"thread_id": thread_id, "message_id": starter_message_id},
+            )
+            await session.execute(
+                text("UPDATE messages SET thread_id = :thread_id WHERE id = :message_id"),
+                {"thread_id": hidden_thread_id, "message_id": hidden_message_id},
+            )
+            sender_id = int(
+                (
+                    await session.execute(
+                        text(
+                            "SELECT id FROM agents WHERE project_id = :project_id "
+                            "AND name = 'ThreadBookmarkAgent'"
+                        ),
+                        {"project_id": visible_id},
+                    )
+                ).scalar_one()
+            )
+            await session.execute(
+                text(
+                    "INSERT INTO messages "
+                    "(project_id, sender_id, thread_id, subject, body_md, "
+                    "importance, ack_required, created_ts, attachments) "
+                    "VALUES (:project_id, :sender_id, :thread_id, "
+                    "'Unicode boundary', 'Unicode boundary body', "
+                    "'normal', 0, datetime('now'), '[]')"
+                ),
+                {
+                    "project_id": visible_id,
+                    "sender_id": sender_id,
+                    "thread_id": boundary_thread_id,
+                },
+            )
+            await session.commit()
+
+        epoch = await _make_user("thread-bookmark-member", role=webauth.ROLE_MEMBER)
+        await _assign(
+            "thread-bookmark-member",
+            visible_id,
+            webauth.PROJECT_ROLE_VIEWER,
+        )
+        encoded_thread_id = quote(thread_id, safe="-_.!~*'()")
+        bookmark_path = (
+            f"/mail/thread-bookmark-visible/thread/{encoded_thread_id}"
+        )
+        boundary_bookmark_path = (
+            "/mail/thread-bookmark-visible/thread/"
+            + quote(boundary_thread_id, safe="-_.!~*'()")
+        )
+        overlong_bookmark_path = (
+            "/mail/thread-bookmark-visible/thread/"
+            + quote(overlong_thread_id, safe="-_.!~*'()")
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as anonymous:
+            login_redirect = await anonymous.get(
+                bookmark_path,
+                headers={"Accept": "text/html"},
+            )
+            boundary_login_redirect = await anonymous.get(
+                boundary_bookmark_path,
+                headers={"Accept": "text/html"},
+            )
+            boundary_login = await anonymous.get(
+                boundary_login_redirect.headers["location"]
+            )
+            overlong_login = await anonymous.get(
+                "/mail/login",
+                params={"next": overlong_bookmark_path},
+            )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("thread-bookmark-member", epoch),
+        ) as client:
+            encoded = await client.get(bookmark_path)
+            numeric_starter = await client.get(
+                f"/mail/thread-bookmark-visible/thread/{starter_message_id}"
+            )
+            bookmark_head = await client.head(bookmark_path)
+            hidden = await client.get(
+                f"/mail/thread-bookmark-hidden/thread/{hidden_thread_id}"
+            )
+            missing_project = await client.get(
+                "/mail/thread-bookmark-missing/thread/hidden-thread"
+            )
+            missing_thread = await client.get(
+                "/mail/thread-bookmark-visible/thread/not-a-thread"
+            )
+            unsupported_query = await client.get(
+                bookmark_path,
+                params={"debug": "1"},
+            )
+            unicode_boundary = await client.get(
+                boundary_bookmark_path
+            )
+            unicode_overlong = await client.get(overlong_bookmark_path)
+            hostile = [
+                await client.get(
+                    bookmark_path.replace("/release-", "/%72elease-", 1)
+                ),
+                await client.get(
+                    bookmark_path.replace("%CE%B1", "%ce%b1", 1)
+                ),
+                await client.get("/mail/thread-bookmark-visible/thread/%2E"),
+                await client.get("/mail/thread-bookmark-visible/thread/%2E%2E"),
+                await client.get("/mail/thread-bookmark-visible/thread/%00"),
+                await client.get(
+                    "/mail/thread-bookmark-visible/thread/release%2Fphase"
+                ),
+                await client.get(
+                    f"/mail/thread-bookmark-visible/thread/{'x' * 129}"
+                ),
+                await client.get("/mail/thread-bookmark-visible/thread"),
+                await client.get("/mail/thread-bookmark-visible/thread/"),
+                await client.get("/mail/thread-bookmark-visible/threads/value"),
+                await client.get("/mail/v2/thread/value"),
+                await client.post(
+                    bookmark_path,
+                    headers=SAME_ORIGIN_HEADERS,
+                ),
+            ]
+
+        assert login_redirect.status_code == 303
+        assert login_redirect.headers["location"] == (
+            "/mail/login?next=" + quote(bookmark_path, safe="")
+        )
+        assert boundary_login_redirect.status_code == 303
+        assert boundary_login_redirect.headers["location"] == (
+            "/mail/login?next=" + quote(boundary_bookmark_path, safe="")
+        )
+        assert boundary_login.status_code == 200
+        assert f'value="{boundary_bookmark_path}"' in boundary_login.text
+        assert overlong_login.status_code == 200
+        assert 'value="/mail"' in overlong_login.text
+        expected_location = (
+            f"/mail#thread/{visible_id}/{encoded_thread_id}"
+        )
+        for response in (encoded, bookmark_head):
+            assert response.status_code == 307
+            assert response.headers["location"] == expected_location
+        assert numeric_starter.status_code == 307
+        assert numeric_starter.headers["location"] == (
+            f"/mail#thread/{visible_id}/{starter_message_id}"
+        )
+        assert unicode_boundary.status_code == 307
+        assert unicode_boundary.headers["location"] == (
+            f"/mail#thread/{visible_id}/"
+            + quote(boundary_thread_id, safe="-_.!~*'()")
+        )
+        for response in (
+            hidden,
+            missing_project,
+            missing_thread,
+            unsupported_query,
+            unicode_overlong,
+            *hostile,
+        ):
+            assert response.status_code == 404
+            assert response.json() == {"detail": "Not Found"}
+
+    @pytest.mark.asyncio
     async def test_dynamic_bookmark_login_is_non_disclosing_and_next_is_bounded(
         self,
         isolated_env,
@@ -2009,7 +2199,7 @@ class TestMailUiPreferences:
             "/mail/api/v1/projects/{project_id}/messages",
             "/mail/api/v1/projects/{project_id}/messages/{message_id}",
             "/mail/api/v1/projects/{project_id}/messages/{message_id}/replies",
-            "/mail/api/v1/projects/{project_id}/threads/{thread_id}",
+            "/mail/api/v1/projects/{project_id}/threads",
         }
         assert schema["components"]["securitySchemes"]["MailUiSession"] == {
             "type": "apiKey",
@@ -2142,7 +2332,7 @@ class TestMailUiPreferences:
             "/mail/api/v1/projects/{project_id}/messages/{message_id}": (
                 "MailUiMessageDetail"
             ),
-            "/mail/api/v1/projects/{project_id}/threads/{thread_id}": (
+            "/mail/api/v1/projects/{project_id}/threads": (
                 "MailUiThreadResponse"
             ),
         }
@@ -2151,6 +2341,35 @@ class TestMailUiPreferences:
             assert mail_paths[path]["get"]["responses"]["200"]["content"][
                 "application/json"
             ]["schema"] == {"$ref": f"#/components/schemas/{model_name}"}
+
+        thread_parameters = {
+            parameter["name"]: parameter
+            for parameter in mail_paths[
+                "/mail/api/v1/projects/{project_id}/threads"
+            ]["get"]["parameters"]
+        }
+        assert set(thread_parameters) == {"project_id", "thread_id", "limit", "cursor"}
+        assert thread_parameters["thread_id"]["in"] == "query"
+        assert thread_parameters["thread_id"]["required"] is True
+
+        thread_schema = schema["components"]["schemas"]["MailUiThreadResponse"]
+        assert thread_schema["additionalProperties"] is False
+        assert set(thread_schema["properties"]) == {
+            "subject",
+            "items",
+            "total",
+            "next_cursor",
+        }
+        assert set(thread_schema["required"]) == {
+            "subject",
+            "items",
+            "total",
+            "next_cursor",
+        }
+        assert thread_schema["properties"]["subject"] == {
+            "title": "Subject",
+            "type": "string",
+        }
 
         agent_directory = mail_paths[
             "/mail/api/v1/projects/{project_id}/agents"
@@ -5074,7 +5293,7 @@ class TestMailUiRbacSurface:
             "/mail/api/v1/projects/{project_id}/messages/{message_id}": (
                 "project-guarded"
             ),
-            "/mail/api/v1/projects/{project_id}/threads/{thread_id}": (
+            "/mail/api/v1/projects/{project_id}/threads": (
                 "project-guarded"
             ),
             "/mail/projects": "legacy-bookmark-redirect",
@@ -5084,7 +5303,7 @@ class TestMailUiRbacSurface:
             "/mail/{project}": "legacy-bookmark-redirect",
             "/mail/{project}/inbox/{agent}": "retired-404",
             "/mail/{project}/message/{mid}": "legacy-bookmark-redirect",
-            "/mail/{project}/thread/{thread_id}": "retired-404",
+            "/mail/{project}/thread/{thread_id}": "legacy-bookmark-redirect",
             "/mail/{project}/search": "legacy-bookmark-redirect",
             "/mail/{project}/file_reservations": "retired-404",
             "/mail/{project}/attachments": "retired-404",
@@ -6084,7 +6303,8 @@ class TestMailUiV1ReadApi:
                 f"/mail/api/v1/projects/{visible_id}/messages/{cross_project_message_id}"
             )
             thread = await client.get(
-                f"/mail/api/v1/projects/{visible_id}/threads/api-v1-thread"
+                f"/mail/api/v1/projects/{visible_id}/threads",
+                params={"thread_id": "api-v1-thread"},
             )
             hidden_inbox = await client.get(
                 "/mail/api/v1/inbox",
@@ -6097,7 +6317,8 @@ class TestMailUiV1ReadApi:
                 f"/mail/api/v1/projects/{visible_id}/messages/999999999"
             )
             missing_thread = await client.get(
-                f"/mail/api/v1/projects/{visible_id}/threads/not-a-thread"
+                f"/mail/api/v1/projects/{visible_id}/threads",
+                params={"thread_id": "not-a-thread"},
             )
 
         assert projects.status_code == 200
@@ -6168,6 +6389,7 @@ class TestMailUiV1ReadApi:
         assert cross_detail.status_code == 200
         assert "/api-v1-hidden" not in cross_detail.text
         assert thread.status_code == 200
+        assert thread.json()["subject"] == "Visible body must stay out of the list"
         assert thread.json()["total"] == 2
         assert "BlindAgent" not in thread.text
         assert "bcc" not in thread.text
@@ -6196,6 +6418,298 @@ class TestMailUiV1ReadApi:
             unauthorized = await anonymous.get("/mail/api/v1/projects")
         assert unauthorized.status_code == 401
         assert unauthorized.headers["Cache-Control"] == "no-store"
+
+    @pytest.mark.asyncio
+    async def test_thread_api_round_trips_query_ids_and_limits_numeric_starters(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        project_id, starter_message_id = await _seed_project(
+            "api-v1-thread-identities",
+            subject="Numeric starter",
+            agent_name="ThreadIdentityAgent",
+            sound="soft",
+        )
+        epoch = await _make_user("api-v1-thread-identity-admin")
+        cookie = await _cookie("api-v1-thread-identity-admin", epoch)
+        plus_thread_id = f"+{starter_message_id}"
+        leading_zero_thread_id = f"0{starter_message_id}"
+        unicode_thread_id = str(starter_message_id).translate(
+            str.maketrans(
+                "0123456789",
+                "".join(chr(0x0660 + index) for index in range(10)),
+            )
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=cookie,
+        ) as client:
+            starter = await client.get(
+                f"/mail/api/v1/projects/{project_id}/threads",
+                params={"thread_id": str(starter_message_id)},
+            )
+            noncanonical_numeric = [
+                await client.get(
+                    f"/mail/api/v1/projects/{project_id}/threads",
+                    params={"thread_id": candidate},
+                )
+                for candidate in (
+                    plus_thread_id,
+                    leading_zero_thread_id,
+                    unicode_thread_id,
+                )
+            ]
+
+        assert starter.status_code == 200
+        assert starter.json()["subject"] == "Numeric starter"
+        assert starter.json()["total"] == 1
+        assert starter.json()["items"][0]["id"] == starter_message_id
+        assert starter.json()["items"][0]["thread_id"] is None
+        for response in noncanonical_numeric:
+            assert response.status_code == 404
+            assert response.json() == {"detail": "Thread not found"}
+
+        path_thread_id = "path/\N{GREEK SMALL LETTER BETA} value?#"
+        async with get_session() as session:
+            sender_id = int(
+                (
+                    await session.execute(
+                        text(
+                            "SELECT id FROM agents "
+                            "WHERE project_id = :project_id "
+                            "AND name = 'ThreadIdentityAgent'"
+                        ),
+                        {"project_id": project_id},
+                    )
+                ).scalar_one()
+            )
+            for index, thread_id in enumerate(
+                (plus_thread_id, unicode_thread_id, path_thread_id),
+                start=1,
+            ):
+                await session.execute(
+                    text(
+                        "INSERT INTO messages "
+                        "(project_id, sender_id, thread_id, subject, body_md, "
+                        "importance, ack_required, created_ts, attachments) "
+                        "VALUES (:project_id, :sender_id, :thread_id, :subject, "
+                        ":body, 'normal', 0, :created_ts, '[]')"
+                    ),
+                    {
+                        "project_id": project_id,
+                        "sender_id": sender_id,
+                        "thread_id": thread_id,
+                        "subject": "" if index == 3 else f"Exact thread {index}",
+                        "body": f"Exact body {index}",
+                        "created_ts": f"2042-01-01 00:00:0{index}.000000",
+                    },
+                )
+            await session.commit()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=cookie,
+        ) as client:
+            thread_endpoint = f"/mail/api/v1/projects/{project_id}/threads"
+            exact_threads = {
+                thread_id: await client.get(
+                    thread_endpoint,
+                    params={"thread_id": thread_id},
+                )
+                for thread_id in (plus_thread_id, unicode_thread_id, path_thread_id)
+            }
+            missing_required_thread_id = await client.get(thread_endpoint)
+            retired_path_shape = await client.get(
+                f"{thread_endpoint}/not-a-thread"
+            )
+            invalid_ids = [
+                await client.get(
+                    thread_endpoint,
+                    params={"thread_id": "x" * 129},
+                ),
+                await client.get(
+                    thread_endpoint,
+                    params={"thread_id": "\x00"},
+                ),
+            ]
+
+        expected_subjects = {
+            plus_thread_id: "Exact thread 1",
+            unicode_thread_id: "Exact thread 2",
+            path_thread_id: "",
+        }
+        for thread_id, response in exact_threads.items():
+            assert response.status_code == 200
+            assert response.json()["subject"] == expected_subjects[thread_id]
+            assert response.json()["total"] == 1
+            assert response.json()["items"][0]["thread_id"] == thread_id
+        assert "thread_id=path%2F" in str(
+            exact_threads[path_thread_id].request.url
+        )
+        assert missing_required_thread_id.status_code == 422
+        assert missing_required_thread_id.json()["detail"][0]["loc"] == [
+            "query",
+            "thread_id",
+        ]
+        assert retired_path_shape.status_code == 404
+        assert retired_path_shape.json() == {"detail": "Not Found"}
+        for response in invalid_ids:
+            assert response.status_code == 422
+            assert response.json() == {"detail": "Invalid thread id."}
+        assert http_module._mail_ui_valid_thread_id(".") is False
+        assert http_module._mail_ui_valid_thread_id("..") is False
+
+    @pytest.mark.asyncio
+    async def test_thread_reads_one_snapshot_while_a_writer_replaces_messages(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """COUNT, subject, page, and recipients must share one WAL snapshot."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        project_id, oldest_message_id = await _seed_project(
+            "api-v1-thread-snapshot",
+            subject="Snapshot oldest",
+            agent_name="SnapshotSender",
+            sound="soft",
+        )
+        async with get_session() as session:
+            sender_id = int(
+                (
+                    await session.execute(
+                        text(
+                            "SELECT id FROM agents "
+                            "WHERE project_id = :project_id AND name = 'SnapshotSender'"
+                        ),
+                        {"project_id": project_id},
+                    )
+                ).scalar_one()
+            )
+            await session.execute(
+                text(
+                    "UPDATE messages SET thread_id = 'snapshot-thread', "
+                    "created_ts = '2040-01-01 00:00:01.000000' "
+                    "WHERE id = :message_id"
+                ),
+                {"message_id": oldest_message_id},
+            )
+            newest_result = await session.execute(
+                text(
+                    "INSERT INTO messages "
+                    "(project_id, sender_id, thread_id, subject, body_md, importance, "
+                    "ack_required, created_ts, attachments) "
+                    "VALUES (:project_id, :sender_id, 'snapshot-thread', "
+                    "'Snapshot newest', 'Snapshot newest body', 'normal', 0, "
+                    "'2040-01-01 00:00:02.000000', '[]') RETURNING id"
+                ),
+                {"project_id": project_id, "sender_id": sender_id},
+            )
+            newest_message_id = int(newest_result.scalar_one())
+            await session.commit()
+
+        epoch = await _make_user("api-v1-thread-snapshot-admin")
+        cookie = await _cookie("api-v1-thread-snapshot-admin", epoch)
+        original_get_session = http_module.get_session
+        writer_committed = False
+        replacement_message_id: int | None = None
+
+        @contextlib.asynccontextmanager
+        async def race_after_thread_count(*args: Any, **kwargs: Any):
+            async with original_get_session(*args, **kwargs) as session:
+                original_execute = session.execute
+
+                async def execute_with_concurrent_writer(
+                    statement: Any,
+                    parameters: Any = None,
+                    **execute_kwargs: Any,
+                ) -> Any:
+                    nonlocal replacement_message_id, writer_committed
+                    result = await original_execute(
+                        statement,
+                        parameters,
+                        **execute_kwargs,
+                    )
+                    if (
+                        not writer_committed
+                        and "SELECT COUNT(*) FROM messages m" in str(statement)
+                        and isinstance(parameters, dict)
+                        and parameters.get("thread_id") == "snapshot-thread"
+                    ):
+                        writer_committed = True
+                        async with get_session() as writer:
+                            replacement_result = await writer.execute(
+                                text(
+                                    "INSERT INTO messages "
+                                    "(project_id, sender_id, thread_id, subject, body_md, "
+                                    "importance, ack_required, created_ts, attachments) "
+                                    "VALUES (:project_id, :sender_id, 'snapshot-thread', "
+                                    "'Raced replacement', 'Raced replacement body', "
+                                    "'normal', 0, '2039-01-01 00:00:00.000000', '[]') "
+                                    "RETURNING id"
+                                ),
+                                {"project_id": project_id, "sender_id": sender_id},
+                            )
+                            replacement_message_id = int(
+                                replacement_result.scalar_one()
+                            )
+                            await writer.execute(
+                                text(
+                                    "DELETE FROM messages "
+                                    "WHERE id IN (:oldest_id, :newest_id)"
+                                ),
+                                {
+                                    "oldest_id": oldest_message_id,
+                                    "newest_id": newest_message_id,
+                                },
+                            )
+                            await writer.commit()
+                    return result
+
+                monkeypatch.setattr(
+                    session,
+                    "execute",
+                    execute_with_concurrent_writer,
+                )
+                yield session
+
+        monkeypatch.setattr(http_module, "get_session", race_after_thread_count)
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=cookie,
+        ) as client:
+            response = await client.get(
+                f"/mail/api/v1/projects/{project_id}/threads",
+                params={"thread_id": "snapshot-thread"},
+            )
+
+        assert writer_committed is True
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["subject"] == "Snapshot oldest"
+        assert payload["total"] == 2
+        assert [item["id"] for item in payload["items"]] == [
+            newest_message_id,
+            oldest_message_id,
+        ]
+        assert replacement_message_id is not None
+        async with get_session() as session:
+            current_rows = (
+                await session.execute(
+                    text(
+                        "SELECT id, subject FROM messages "
+                        "WHERE project_id = :project_id "
+                        "AND thread_id = 'snapshot-thread'"
+                    ),
+                    {"project_id": project_id},
+                )
+            ).all()
+        assert current_rows == [(replacement_message_id, "Raced replacement")]
 
     @pytest.mark.asyncio
     async def test_same_timestamp_keyset_pagination_is_stable_and_validated(
@@ -6288,12 +6802,16 @@ class TestMailUiV1ReadApi:
                 },
             )
             thread_first = await client.get(
-                f"/mail/api/v1/projects/{project_id}/threads/stable-thread",
-                params={"limit": 2},
+                f"/mail/api/v1/projects/{project_id}/threads",
+                params={"thread_id": "stable-thread", "limit": 2},
             )
             thread_second = await client.get(
-                f"/mail/api/v1/projects/{project_id}/threads/stable-thread",
-                params={"limit": 2, "cursor": thread_first.json()["next_cursor"]},
+                f"/mail/api/v1/projects/{project_id}/threads",
+                params={
+                    "thread_id": "stable-thread",
+                    "limit": 2,
+                    "cursor": thread_first.json()["next_cursor"],
+                },
             )
             malformed = [
                 await client.get("/mail/api/v1/inbox", params={"cursor": cursor})
@@ -6317,6 +6835,8 @@ class TestMailUiV1ReadApi:
         assert len(paged_ids) == len(set(paged_ids)) == 5
         assert thread_first.status_code == 200
         assert thread_second.status_code == 200
+        assert thread_first.json()["subject"] == "Page item 0"
+        assert thread_second.json()["subject"] == "Page item 0"
         assert thread_first.json()["total"] == 5
         assert thread_second.json()["total"] == 5
         assert not (
@@ -6325,6 +6845,43 @@ class TestMailUiV1ReadApi:
         )
         for response in [*malformed, *invalid_limits]:
             assert response.status_code == 422
+            assert response.headers["Cache-Control"] == "no-store"
+
+    @pytest.mark.asyncio
+    async def test_cursor_message_id_above_sqlite_i64_is_typed_422(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        epoch = await _make_user("api-v1-oversized-cursor-admin")
+        oversized_cursor = http_module._mail_ui_encode_cursor(
+            "2040-02-03 04:05:06.000000",
+            9_223_372_036_854_775_808,
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("api-v1-oversized-cursor-admin", epoch),
+        ) as client:
+            responses = [
+                await client.get(
+                    "/mail/api/v1/inbox",
+                    params={"cursor": oversized_cursor},
+                ),
+                await client.get(
+                    "/mail/api/v1/projects/1/threads",
+                    params={
+                        "thread_id": "stable-thread",
+                        "cursor": oversized_cursor,
+                    },
+                ),
+            ]
+
+        for response in responses:
+            assert response.status_code == 422
+            assert response.json() == {"detail": "Invalid cursor."}
             assert response.headers["Cache-Control"] == "no-store"
 
 

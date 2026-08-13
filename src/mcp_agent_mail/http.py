@@ -24,7 +24,14 @@ from collections.abc import Callable, MutableMapping
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal, NamedTuple, Protocol, TypedDict, cast
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import (
+    parse_qsl,
+    quote,
+    unquote_to_bytes,
+    urlencode,
+    urlsplit,
+    urlunsplit,
+)
 
 import structlog
 import uvicorn
@@ -1602,6 +1609,12 @@ _MAIL_LEGACY_MESSAGE_PATH_RE = re.compile(
     r"^/mail/(?P<project>[a-z0-9](?:[a-z0-9-]{0,253}[a-z0-9])?)/message/"
     r"(?P<message_id>[1-9][0-9]{0,18})$"
 )
+_MAIL_LEGACY_THREAD_PATH_RE = re.compile(
+    r"^/mail/(?P<project>[a-z0-9](?:[a-z0-9-]{0,253}[a-z0-9])?)/thread/"
+    r"(?P<thread_id>[^/]+)$"
+)
+_MAIL_UI_NUMERIC_THREAD_ID_RE = re.compile(r"^[1-9][0-9]{0,18}$")
+_MAIL_UI_ENCODE_COMPONENT_SAFE = "-_.!~*'()"
 _MAIL_LEGACY_SEARCH_PATH_RE = re.compile(
     r"^/mail/(?P<project>[a-z0-9](?:[a-z0-9-]{0,253}[a-z0-9])?)/search$"
 )
@@ -1663,9 +1676,37 @@ MailUiSearchOrder = Literal["relevance", "newest"]
 class _MailUiLegacyBookmark(TypedDict):
     """One explicitly supported upstream bookmark shape."""
 
-    kind: Literal["projects", "inbox", "project", "message", "search"]
+    kind: Literal["projects", "inbox", "project", "message", "thread", "search"]
     project_slug: str | None
     message_id: int | None
+    thread_id: str | None
+
+
+def _mail_ui_valid_thread_id(thread_id: str) -> bool:
+    """Accept one bounded stored thread identifier without control characters."""
+    return (
+        0 < len(thread_id) <= 128
+        and thread_id not in {".", ".."}
+        and not any(
+            unicodedata.category(character) in {"Cc", "Cs"}
+            for character in thread_id
+        )
+    )
+
+
+def _mail_ui_thread_starter_message_id(thread_id: str) -> int | None:
+    """Return the positive SQLite message id represented by a numeric thread id."""
+    if _MAIL_UI_NUMERIC_THREAD_ID_RE.fullmatch(thread_id) is None:
+        return None
+    message_id = int(thread_id)
+    if not 0 < message_id <= 9_223_372_036_854_775_807:
+        return None
+    return message_id
+
+
+def _mail_ui_encode_thread_id(thread_id: str) -> str:
+    """Match JavaScript ``encodeURIComponent`` for one validated identifier."""
+    return quote(thread_id, safe=_MAIL_UI_ENCODE_COMPONENT_SAFE)
 
 
 def _mail_ui_legacy_bookmark(path: str) -> _MailUiLegacyBookmark | None:
@@ -1673,15 +1714,27 @@ def _mail_ui_legacy_bookmark(path: str) -> _MailUiLegacyBookmark | None:
 
     This is intentionally not a catch-all under ``/mail``. In particular the
     temporary development namespace ``/mail/v2`` and all retired APIs,
-    archives, assets, agent inboxes, threads, reservations, attachments, and
-    overseer forms remain outside the allowlist.
+    archives, assets, agent inboxes, reservations, attachments, and overseer
+    forms remain outside the allowlist. The one thread shape below is bounded
+    separately and resolves through project RBAC before it can redirect.
     """
     if path == "/mail/projects":
-        return {"kind": "projects", "project_slug": None, "message_id": None}
+        return {
+            "kind": "projects",
+            "project_slug": None,
+            "message_id": None,
+            "thread_id": None,
+        }
     if path == "/mail/unified-inbox":
-        return {"kind": "inbox", "project_slug": None, "message_id": None}
+        return {
+            "kind": "inbox",
+            "project_slug": None,
+            "message_id": None,
+            "thread_id": None,
+        }
     for pattern, kind in (
         (_MAIL_LEGACY_MESSAGE_PATH_RE, "message"),
+        (_MAIL_LEGACY_THREAD_PATH_RE, "thread"),
         (_MAIL_LEGACY_SEARCH_PATH_RE, "search"),
         (_MAIL_LEGACY_PROJECT_PATH_RE, "project"),
     ):
@@ -1695,15 +1748,82 @@ def _mail_ui_legacy_bookmark(path: str) -> _MailUiLegacyBookmark | None:
         message_id = int(raw_message_id) if raw_message_id is not None else None
         if message_id is not None and message_id > 9_223_372_036_854_775_807:
             return None
+        thread_id = match.groupdict().get("thread_id")
+        if thread_id is not None and not _mail_ui_valid_thread_id(thread_id):
+            return None
         return {
             "kind": cast(
-                Literal["projects", "inbox", "project", "message", "search"],
+                Literal[
+                    "projects",
+                    "inbox",
+                    "project",
+                    "message",
+                    "thread",
+                    "search",
+                ],
                 kind,
             ),
             "project_slug": project_slug,
             "message_id": message_id,
+            "thread_id": thread_id,
         }
     return None
+
+
+def _mail_ui_canonical_legacy_bookmark(
+    *,
+    raw_path: str,
+    decoded_path: str,
+) -> _MailUiLegacyBookmark | None:
+    """Parse one canonical encoded bookmark from its raw and decoded paths."""
+    if not raw_path.isascii():
+        return None
+    decoded_bookmark = _mail_ui_legacy_bookmark(decoded_path)
+    if decoded_bookmark is None:
+        return None
+    if decoded_bookmark["kind"] == "thread":
+        raw_match = _MAIL_LEGACY_THREAD_PATH_RE.fullmatch(raw_path)
+        if raw_match is None:
+            return None
+        project_slug = decoded_bookmark["project_slug"]
+        thread_id = decoded_bookmark["thread_id"]
+        if project_slug is None or thread_id is None:
+            return None
+        if raw_match.group("project") != project_slug:
+            return None
+        if raw_path != f"/mail/{project_slug}/thread/{_mail_ui_encode_thread_id(thread_id)}":
+            return None
+    else:
+        raw_bookmark = _mail_ui_legacy_bookmark(raw_path)
+        if raw_bookmark is None or raw_bookmark != decoded_bookmark:
+            return None
+    return decoded_bookmark
+
+
+def _mail_ui_request_legacy_bookmark(request: Request) -> _MailUiLegacyBookmark | None:
+    """Parse an exact canonical request bookmark after one transport decode."""
+    raw_path_value = request.scope.get("raw_path")
+    decoded_path = request.scope.get("path")
+    if (
+        not isinstance(raw_path_value, bytes)
+        or not raw_path_value.isascii()
+        or not isinstance(decoded_path, str)
+    ):
+        return None
+    return _mail_ui_canonical_legacy_bookmark(
+        raw_path=raw_path_value.decode("ascii"),
+        decoded_path=decoded_path,
+    )
+
+
+def _mail_ui_decode_raw_path(raw_path: str) -> str | None:
+    """Decode one canonical URL path candidate exactly once as strict UTF-8."""
+    if not raw_path.isascii():
+        return None
+    try:
+        return unquote_to_bytes(raw_path).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
 def _mail_ui_active_path(path: str) -> bool:
@@ -2182,6 +2302,7 @@ class MailUiThreadResponse(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    subject: str
     items: list[MailUiMessageDetail]
     total: int
     next_cursor: str | None
@@ -2273,6 +2394,26 @@ _MAIL_UI_CREATED_TS_KEY_SQL = (
     "instr(CAST(m.created_ts AS TEXT), '.') + 1) || '000000', 1, 6) "
     "END"
 )
+
+
+async def _mail_ui_begin_read_snapshot(session: AsyncSession) -> None:
+    """Start one stable read snapshot without taking SQLite's writer lock.
+
+    Python's SQLite driver uses legacy transaction control, where a ``SELECT``
+    does not emit ``BEGIN``.  A sequence of reads can therefore observe several
+    database states unless the transaction is started explicitly.  Plain
+    ``BEGIN`` remains deferred: the first read pins the WAL snapshot while
+    concurrent writers remain free to commit.  Other dialects use their
+    portable serializable isolation level to provide the same multi-statement
+    snapshot contract.
+    """
+    if session.get_bind().dialect.name == "sqlite":
+        connection = await session.connection()
+        await connection.exec_driver_sql("BEGIN")
+        return
+    await session.connection(
+        execution_options={"isolation_level": "SERIALIZABLE"},
+    )
 
 
 def _mail_ui_datetime(value: Any) -> datetime:
@@ -2606,7 +2747,11 @@ def _mail_ui_decode_cursor(cursor: str) -> tuple[str, int]:
         if not isinstance(created_ts, str) or not created_ts or len(created_ts) > 64:
             raise ValueError("invalid timestamp key")
         _mail_ui_datetime(created_ts)
-        if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0:
+        if (
+            isinstance(message_id, bool)
+            or not isinstance(message_id, int)
+            or not 0 < message_id <= 9_223_372_036_854_775_807
+        ):
             raise ValueError("invalid message id")
     except (
         UnicodeEncodeError,
@@ -3049,7 +3194,14 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
         path = request.url.path
         if not (path == "/mail" or path.startswith("/mail/")):
             return await call_next(request)
-        legacy_bookmark = _mail_ui_legacy_bookmark(path)
+        raw_legacy_bookmark = _mail_ui_legacy_bookmark(path)
+        legacy_bookmark = _mail_ui_request_legacy_bookmark(request)
+        if raw_legacy_bookmark is not None and legacy_bookmark is None:
+            return JSONResponse(
+                {"detail": "Not Found"},
+                status_code=status.HTTP_404_NOT_FOUND,
+                headers=_MAIL_REACT_INDEX_HEADERS,
+            )
         if not _mail_ui_active_path(path):
             return JSONResponse(
                 {"detail": "Not Found"},
@@ -3140,10 +3292,15 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
                 finally:
                     _mail_ui_template_user.reset(token)
             if self._wants_html(request):
-                target = request.url.path
+                raw_path = request.scope.get("raw_path")
+                target = (
+                    raw_path.decode("ascii")
+                    if isinstance(raw_path, bytes)
+                    and raw_path.isascii()
+                    else request.url.path
+                )
                 if request.url.query:
                     target = f"{target}?{request.url.query}"
-                from urllib.parse import quote
 
                 return Response(
                     status_code=status.HTTP_303_SEE_OTHER,
@@ -3869,6 +4026,33 @@ async def _mail_ui_legacy_bookmark_redirect(
                     if message_exists is None:
                         raise LookupError("message not found")
                     fragment = f"#message/{project_id}/{message_id}"
+                elif kind == "thread":
+                    if query_items:
+                        raise LookupError("thread bookmark has unsupported query")
+                    thread_id = bookmark["thread_id"]
+                    if thread_id is None:
+                        raise LookupError("thread id missing")
+                    starter_message_id = _mail_ui_thread_starter_message_id(thread_id)
+                    thread_exists = (
+                        await session.execute(
+                            text(
+                                "SELECT 1 FROM messages m "
+                                "WHERE m.project_id = :project_id "
+                                "AND (m.thread_id = :thread_id "
+                                "OR (:starter_message_id IS NOT NULL "
+                                "AND m.id = :starter_message_id)) "
+                                "LIMIT 1"
+                            ),
+                            {
+                                "project_id": project_id,
+                                "thread_id": thread_id,
+                                "starter_message_id": starter_message_id,
+                            },
+                        )
+                    ).first()
+                    if thread_exists is None:
+                        raise LookupError("thread not found")
+                    fragment = f"#thread/{project_id}/{_mail_ui_encode_thread_id(thread_id)}"
                 else:
                     search_hash = _mail_ui_legacy_search_hash(
                         bookmark=bookmark,
@@ -6096,7 +6280,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 return urlunsplit(("", "", "/mail", parsed.query, parsed.fragment))
             if parsed.fragment:
                 return "/mail"
-            bookmark = _mail_ui_legacy_bookmark(parsed.path)
+            decoded_path = _mail_ui_decode_raw_path(parsed.path)
+            if decoded_path is None:
+                return "/mail"
+            bookmark = _mail_ui_canonical_legacy_bookmark(
+                raw_path=parsed.path,
+                decoded_path=decoded_path,
+            )
             if bookmark is None:
                 return "/mail"
             try:
@@ -7249,13 +7439,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             return _mail_ui_delivery_status_response(processing)
 
         @fastapi_app.get(
-            "/mail/api/v1/projects/{project_id}/threads/{thread_id}",
+            "/mail/api/v1/projects/{project_id}/threads",
             response_model=MailUiThreadResponse,
         )
         async def mail_ui_thread_v1(
             project_id: int,
-            thread_id: str,
             request: Request,
+            thread_id: str = Query(),
             limit: int = Query(default=50, ge=1, le=100),
             cursor: str | None = Query(
                 default=None,
@@ -7264,14 +7454,16 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             ),
         ) -> MailUiThreadResponse:
             """Return a bounded, newest-first page from one visible thread."""
-            if not thread_id or len(thread_id) > 128:
+            if not _mail_ui_valid_thread_id(thread_id):
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail="Invalid thread id.",
                 )
+            starter_message_id = _mail_ui_thread_starter_message_id(thread_id)
             cursor_key = _mail_ui_decode_cursor(cursor) if cursor is not None else None
             await ensure_schema()
             async with get_session() as session:
+                await _mail_ui_begin_read_snapshot(session)
                 visible_roles = await _mail_ui_visible_project_roles(
                     settings=settings,
                     request=request,
@@ -7282,18 +7474,43 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 total_result = await session.execute(
                     text(
                         "SELECT COUNT(*) FROM messages m "
-                        "WHERE m.project_id = :project_id AND m.thread_id = :thread_id"
+                        "WHERE m.project_id = :project_id "
+                        "AND (m.thread_id = :thread_id "
+                        "OR (:starter_message_id IS NOT NULL "
+                        "AND m.id = :starter_message_id))"
                     ),
-                    {"project_id": project_id, "thread_id": thread_id},
+                    {
+                        "project_id": project_id,
+                        "thread_id": thread_id,
+                        "starter_message_id": starter_message_id,
+                    },
                 )
                 total = int(total_result.scalar_one())
                 if total == 0:
                     raise HTTPException(status_code=404, detail="Thread not found")
+                subject_result = await session.execute(
+                    text(
+                        "SELECT m.subject FROM messages m "
+                        "WHERE m.project_id = :project_id "
+                        "AND (m.thread_id = :thread_id "
+                        "OR (:starter_message_id IS NOT NULL "
+                        "AND m.id = :starter_message_id)) "
+                        f"ORDER BY {_MAIL_UI_CREATED_TS_KEY_SQL} ASC, m.id ASC "
+                        "LIMIT 1"
+                    ),
+                    {
+                        "project_id": project_id,
+                        "thread_id": thread_id,
+                        "starter_message_id": starter_message_id,
+                    },
+                )
+                thread_subject = str(subject_result.scalar_one())
 
                 cursor_predicate = ""
                 page_parameters: dict[str, Any] = {
                     "project_id": project_id,
                     "thread_id": thread_id,
+                    "starter_message_id": starter_message_id,
                     "page_limit": limit + 1,
                 }
                 if cursor_key is not None:
@@ -7356,7 +7573,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         "AND delivery.project_generation_snapshot = p.project_generation "
                         "LEFT JOIN agents sender ON sender.id = m.sender_id "
                         "LEFT JOIN projects sender_project ON sender_project.id = sender.project_id "
-                        "WHERE m.project_id = :project_id AND m.thread_id = :thread_id"
+                        "WHERE m.project_id = :project_id "
+                        "AND (m.thread_id = :thread_id "
+                        "OR (:starter_message_id IS NOT NULL "
+                        "AND m.id = :starter_message_id))"
                         f"{cursor_predicate} "
                         f"ORDER BY {_MAIL_UI_CREATED_TS_KEY_SQL} DESC, m.id DESC "
                         "LIMIT :page_limit"
@@ -7387,6 +7607,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     else None
                 )
             return MailUiThreadResponse(
+                subject=thread_subject,
                 items=items,
                 total=total,
                 next_cursor=next_cursor,

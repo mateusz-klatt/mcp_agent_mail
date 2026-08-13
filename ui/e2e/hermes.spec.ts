@@ -19,6 +19,7 @@ import type {
   MessageDetail,
   ProjectAgentsPage,
   SearchPage,
+  ThreadPage,
 } from "../src/mail";
 import type { MailUiPreferences } from "../src/preferences";
 import type { SupportedLocale } from "../src/i18n";
@@ -125,6 +126,7 @@ interface LocalStubOptions {
   projectAgentResults?: readonly [ProjectAgentsPage, ...ProjectAgentsPage[]];
   replyResult?: DeliveryResult;
   retryResult?: DeliveryResult;
+  threadResult?: ThreadPage;
 }
 
 interface TypedWrite {
@@ -373,6 +375,25 @@ async function installLocalStub(
 
     if (
       path ===
+        `/mail/api/v1/projects/${project.id}/threads` &&
+      url.searchParams.get("thread_id") === messageDetail.thread_id &&
+      url.searchParams.get("limit") === "50" &&
+      !url.searchParams.has("cursor") &&
+      method === "GET"
+    ) {
+      return json(
+        route,
+        options.threadResult ?? {
+          items: [messageDetail],
+          next_cursor: null,
+          subject: messageDetail.subject,
+          total: 1,
+        },
+      );
+    }
+
+    if (
+      path ===
         `/mail/api/v1/projects/${project.id}/messages/${messageDetail.id}` &&
       method === "GET"
     ) {
@@ -424,7 +445,7 @@ async function expectMobileLayout(page: Page): Promise<void> {
   expect(overflow.content).toBeLessThanOrEqual(overflow.viewport);
 
   const undersizedTargets = await page
-    .locator("a[href], button, input, select, textarea")
+    .locator("a[href], button, input, select, summary, textarea")
     .evaluateAll((elements) =>
       elements.flatMap((element) => {
         const target = element as HTMLElement;
@@ -956,6 +977,102 @@ test("account, admin, inbox, and detail remain mobile-safe and keyboard-operable
   await expect(page.getByText("<script>", { exact: false })).toBeVisible();
   await expectMobileLayout(page);
 
+  expect(state.externalRequests).toEqual([]);
+  expect(state.browserErrors).toEqual([]);
+});
+
+test("thread view preserves the conversation and keeps Markdown inert", async ({
+  page,
+}) => {
+  const threadStarter: MessageDetail = {
+    ...message,
+    body_md: [
+      "# Release evidence",
+      "![remote tracker](https://tracker.invalid/thread-pixel.png)",
+      '<script>window.__threadXss = "script"</script>',
+    ].join("\n\n"),
+  };
+  const threadReply: MessageDetail = {
+    ...message,
+    id: 102,
+    subject: "Re: Production rollout verified",
+    body_md: "## Latest state\n\nDeployment remains healthy.",
+    reply_to: message.id,
+    created_ts: "2026-08-11T11:15:00Z",
+    attachments: [],
+  };
+  const state = await installLocalStub(page, threadStarter, {
+    threadResult: {
+      // The typed endpoint is newest-first; the UI presents the conversation
+      // chronologically without duplicating messages.
+      items: [threadReply, threadStarter],
+      next_cursor: null,
+      subject: threadStarter.subject,
+      total: 2,
+    },
+  });
+
+  await page.goto("#inbox");
+  await page
+    .getByRole("link", { name: `Thread: ${threadStarter.thread_id}` })
+    .click();
+
+  await expect(
+    page.getByRole("heading", { name: threadStarter.subject, level: 1 }),
+  ).toBeVisible();
+  await expect(
+    page.getByText(threadStarter.thread_id ?? "", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText("2 messages", { exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Inbox", exact: true })).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+
+  const cards = page.locator("details.thread-message");
+  await expect(cards).toHaveCount(2);
+  await expect(cards.nth(0)).not.toHaveAttribute("open", "");
+  await expect(cards.nth(1)).toHaveAttribute("open", "");
+  await expect(
+    cards.nth(1).getByRole("heading", { name: "Latest state", level: 3 }),
+  ).toBeVisible();
+  await expect(
+    cards.locator(":scope > summary strong"),
+  ).toHaveText([
+    threadStarter.subject,
+    threadReply.subject,
+  ]);
+
+  const starterSummary = cards.nth(0).locator(":scope > summary");
+  const closedChevronTransform = await starterSummary.evaluate((element) =>
+    getComputedStyle(element, "::before").transform,
+  );
+  expect(closedChevronTransform).not.toBe("none");
+  await starterSummary.focus();
+  await page.keyboard.press("Tab");
+  await page.keyboard.press("Shift+Tab");
+  await expect(starterSummary).toBeFocused();
+  const summaryFocusStyle = await starterSummary.evaluate((element) => ({
+    offset: getComputedStyle(element).outlineOffset,
+    style: getComputedStyle(element).outlineStyle,
+  }));
+  expect(summaryFocusStyle.style).not.toBe("none");
+  expect(Number.parseFloat(summaryFocusStyle.offset)).toBeLessThan(0);
+  await page.keyboard.press("Enter");
+  await expect(cards.nth(0)).toHaveAttribute("open", "");
+  const openChevronTransform = await starterSummary.evaluate((element) =>
+    getComputedStyle(element, "::before").transform,
+  );
+  expect(openChevronTransform).not.toBe(closedChevronTransform);
+  await expect(
+    cards.nth(0).getByRole("heading", { name: "Release evidence", level: 2 }),
+  ).toBeVisible();
+  await expect(cards.nth(0).getByText("remote tracker", { exact: true }))
+    .toHaveClass("markdown-image-alt");
+  await expect(cards.nth(0).locator("img, script")).toHaveCount(0);
+  expect(await page.evaluate(() => "__threadXss" in window)).toBe(false);
+
+  await expectMobileLayout(page);
   expect(state.externalRequests).toEqual([]);
   expect(state.browserErrors).toEqual([]);
 });

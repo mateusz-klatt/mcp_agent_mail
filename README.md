@@ -433,6 +433,11 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 </details>
 
 - `/mail#inbox` shows the real, project-scoped inbox and message detail views.
+  Every message links to a typed conversation view at
+  `/mail#thread/<project-id>/<encoded-thread-id>`; legacy starters without a
+  stored thread id use their positive message id. Conversations keep the
+  server-selected subject stable across pages, render oldest to newest, and
+  reuse the same fail-closed Markdown renderer as message detail.
 - `/mail#projects` lists only projects visible to the signed-in human.
 - `/mail#search` performs bounded FTS5 search over subjects and bodies in only
   the projects visible to the signed-in human. Search results are plain-text,
@@ -447,11 +452,11 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
   global and do not receive per-project assignments.
 
 There is one human interface. A small, enumerated set of confirmed upstream
-bookmarks (projects, unified inbox, an authorized project, message, or search)
-temporarily redirects to the exact Iris hash view. The `/mail/v2` namespace,
-legacy APIs, and every retired route without an exact successor remain 404;
-there is no wildcard compatibility surface. Human full-text search is exposed
-only through `/mail#search` and the typed, session-bound
+bookmarks (projects, unified inbox, an authorized project, message, thread, or
+search) temporarily redirects to the exact Iris hash view. The `/mail/v2`
+namespace, legacy APIs, and every retired route without an exact successor
+remain 404; there is no wildcard compatibility surface. Human full-text search
+is exposed only through `/mail#search` and the typed, session-bound
 `GET /mail/api/v1/search` endpoint.
 Agents and hooks continue to use MCP and the documented service endpoints;
 mounting Iris does not replace or intercept the configured MCP transport path.

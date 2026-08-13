@@ -29,8 +29,10 @@ import {
   loadProjectAgents,
   loadProjects,
   loadSearch,
+  loadThread,
   MailHttpError,
   mailRouteHash,
+  mailThreadRouteHash,
   markdownUrlTransform,
   parseInboxPage,
   parseDeliveryResult,
@@ -39,9 +41,11 @@ import {
   parseProjectAgents,
   parseProjects,
   parseSearchPage,
+  parseThreadPage,
   replyIdempotencyKeyFor,
   replyToMessage,
   retryDelivery,
+  threadPageSize,
 } from "./mail";
 import {
   loadPreferences,
@@ -68,6 +72,8 @@ import {
   projectTwo,
   searchResponse,
   server,
+  threadReply,
+  threadResponse,
 } from "./test/server";
 
 const preferencesUrl = "*/mail/api/v1/me/preferences";
@@ -2242,6 +2248,731 @@ describe("Iris landing shell", () => {
     );
   });
 
+  it("renders message detail without linking a malformed persisted thread", async () => {
+    const malformedThreadId = "\ud800";
+    window.history.replaceState(
+      {},
+      "",
+      `/mail/#message/${projectOne.id}/${messageOne.id}`,
+    );
+    server.use(
+      http.get("*/mail/api/v1/projects/:projectId/messages/:messageId", () =>
+        HttpResponse.json({ ...messageDetail, thread_id: malformedThreadId }),
+      ),
+    );
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: messageOne.subject, level: 1 }),
+    ).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Release", level: 2 })).toBeVisible();
+    expect(document.querySelector(".thread-inline-link")).not.toBeInTheDocument();
+  });
+
+  it("omits malformed inbox thread links but keeps the numeric fallback", async () => {
+    server.use(
+      http.get("*/mail/api/v1/inbox", () =>
+        HttpResponse.json({
+          ...inboxResponse,
+          items: [{ ...messageOne, thread_id: "" }, messageTwo],
+        }),
+      ),
+    );
+    render(<App />);
+
+    expect(await screen.findByText(messageOne.subject)).toBeVisible();
+    expect(screen.getByText(messageTwo.subject)).toBeVisible();
+    expect(
+      screen.queryByRole("link", { name: "Thread:" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: `Thread: ${messageTwo.id}` }),
+    ).toHaveAttribute("href", `#thread/${projectTwo.id}/${messageTwo.id}`);
+  });
+
+  it("opens a linked thread as an accessible oldest-to-newest conversation", async () => {
+    const user = userEvent.setup();
+    const unsafeThreadResponse = {
+      ...threadResponse,
+      items: [
+        threadReply,
+        {
+          ...messageDetail,
+          body_md: [
+            "# Release",
+            "![remote tracker](https://tracker.invalid/pixel.png)",
+            "<script>window.__threadExecuted = true</script>",
+          ].join("\n\n"),
+          cc: ["release-observer"],
+          created_ts: threadReply.created_ts,
+          sender_display_name: null,
+          sender_name: messageDetail.sender,
+          to: [],
+        },
+      ],
+    };
+    server.use(
+      http.get("*/mail/api/v1/projects/:projectId/threads", () =>
+        HttpResponse.json(unsafeThreadResponse),
+      ),
+    );
+    render(<App />);
+
+    const threadLink = await screen.findByRole("link", {
+      name: `Thread: ${messageOne.thread_id}`,
+    });
+    expect(threadLink).toHaveAttribute(
+      "href",
+      `#thread/${projectOne.id}/${messageOne.thread_id}`,
+    );
+    expect(
+      screen.getByRole("link", { name: `Thread: ${messageTwo.id}` }),
+    ).toHaveAttribute(
+      "href",
+      `#thread/${projectTwo.id}/${messageTwo.id}`,
+    );
+    await user.click(threadLink);
+
+    expect(
+      await screen.findByRole("heading", { name: messageOne.subject, level: 1 }),
+    ).toBeVisible();
+    expect(
+      screen.getByText(messageOne.thread_id, { selector: "code" }),
+    ).toBeVisible();
+    expect(screen.getByText("2 messages")).toBeVisible();
+    const cards = document.querySelectorAll<HTMLDetailsElement>(".thread-message");
+    expect(cards).toHaveLength(2);
+    expect(cards[0]).not.toHaveAttribute("open");
+    expect(cards[1]).toHaveAttribute("open");
+    expect(screen.getByRole("heading", { name: "Follow-up", level: 3 }))
+      .toBeVisible();
+    expect(screen.queryByRole("heading", { name: "Release" }))
+      .not.toBeInTheDocument();
+
+    await user.click(within(cards[0]!).getByText(messageOne.subject));
+    expect(cards[0]).toHaveAttribute("open");
+    expect(await screen.findByRole("heading", { name: "Release", level: 2 }))
+      .toBeVisible();
+    expect(screen.getByText("remote tracker", { exact: true })).toHaveClass(
+      "markdown-image-alt",
+    );
+    expect(document.querySelector(".thread-message img")).not.toBeInTheDocument();
+    expect(document.querySelector(".thread-message script")).not.toBeInTheDocument();
+    expect(
+      within(cards[0]!).getByRole("link", {
+        name: `Open message: ${messageOne.subject}`,
+      }),
+    ).toHaveAttribute(
+      "href",
+      `#message/${projectOne.id}/${messageOne.id}`,
+    );
+    expect(screen.getByRole("link", { name: /Back to inbox/ })).toHaveAttribute(
+      "href",
+      `#inbox?project=${projectOne.id}`,
+    );
+  });
+
+  it("orders canonical UTC thread timestamps by microsecond and then exact id", async () => {
+    const earlierMicrosecond = {
+      ...messageDetail,
+      id: 902,
+      subject: "Earlier microsecond",
+      created_ts: "2026-08-11T11:15:00.000001Z",
+    };
+    const laterMicrosecond = {
+      ...threadReply,
+      id: 101,
+      subject: "Later microsecond",
+      created_ts: "2026-08-11T11:15:00.000002Z",
+    };
+    const equalTimestampLowerId = {
+      ...messageDetail,
+      id: 303,
+      subject: "Equal instant lower id",
+      created_ts: "2026-08-11T11:15:00.000003Z",
+    };
+    const equalTimestampHigherId = {
+      ...threadReply,
+      id: 404,
+      subject: "Equal instant higher id",
+      created_ts: equalTimestampLowerId.created_ts,
+    };
+    window.history.replaceState(
+      {},
+      "",
+      `/mail/#thread/${projectOne.id}/${messageOne.thread_id}`,
+    );
+    server.use(
+      http.get("*/mail/api/v1/projects/:projectId/threads", () =>
+        HttpResponse.json({
+          items: [
+            earlierMicrosecond,
+            laterMicrosecond,
+            equalTimestampHigherId,
+            equalTimestampLowerId,
+          ],
+          total: 4,
+          next_cursor: null,
+          subject: messageOne.subject,
+        }),
+      ),
+    );
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: messageOne.subject, level: 1 }),
+    ).toBeVisible();
+    const summaries = [
+      ...document.querySelectorAll(".thread-message > summary strong"),
+    ].map((element) => element.textContent);
+    expect(summaries).toEqual([
+      "Earlier microsecond",
+      "Later microsecond",
+      "Equal instant lower id",
+      "Equal instant higher id",
+    ]);
+  });
+
+  it(
+    "paginates a newest-first thread without duplicates and displays it oldest-first",
+    async () => {
+      const user = userEvent.setup();
+      const cursors: Array<string | null> = [];
+      window.history.replaceState(
+        {},
+        "",
+        `/mail/#thread/${projectOne.id}/${messageOne.thread_id}`,
+      );
+      server.use(
+        http.get(
+          "*/mail/api/v1/projects/:projectId/threads",
+          ({ request }) => {
+            const cursor = new URL(request.url).searchParams.get("cursor");
+            cursors.push(cursor);
+            return cursor === null
+              ? HttpResponse.json({
+                  items: [threadReply],
+                  total: 2,
+                  next_cursor: "older-page",
+                  subject: messageOne.subject,
+                })
+              : HttpResponse.json({
+                  items: [messageDetail, threadReply],
+                  total: 2,
+                  next_cursor: null,
+                  subject: messageOne.subject,
+                });
+          },
+        ),
+      );
+      render(<App />);
+
+      expect(
+        await screen.findByRole("heading", {
+          name: messageOne.subject,
+          level: 1,
+        }),
+      ).toBeVisible();
+      await user.click(screen.getByRole("button", { name: "Load more" }));
+      expect(
+        await screen.findByRole("heading", {
+          name: messageOne.subject,
+          level: 1,
+        }),
+      ).toBeVisible();
+      const summaries = [
+        ...document.querySelectorAll(".thread-message > summary strong"),
+      ].map((element) => element.textContent);
+      expect(summaries).toEqual([messageOne.subject, threadReply.subject]);
+      expect(document.querySelectorAll(".thread-message")).toHaveLength(2);
+      expect(screen.queryByRole("button", { name: "Load more" }))
+        .not.toBeInTheDocument();
+      expect(cursors).toEqual([null, "older-page"]);
+    },
+  );
+
+  it.each([
+    [
+      "empty",
+      200,
+      { items: [], total: 0, next_cursor: null, subject: "" },
+      "There are no messages in this view.",
+    ],
+    ["error", 500, { detail: "private failure" }, "This message could not be loaded."],
+  ] as const)("renders the thread %s state without reflecting private errors", async (
+    _state,
+    status,
+    payload,
+    expected,
+  ) => {
+    window.history.replaceState(
+      {},
+      "",
+      `/mail/#thread/${projectOne.id}/${messageOne.thread_id}`,
+    );
+    server.use(
+      http.get("*/mail/api/v1/projects/:projectId/threads", () =>
+        HttpResponse.json(payload, { status }),
+      ),
+    );
+    render(<App />);
+
+    expect(await screen.findByText(expected)).toBeVisible();
+    expect(screen.queryByText("private failure")).not.toBeInTheDocument();
+    if (_state === "empty") {
+      expect(
+        screen.getByRole("heading", {
+          name: messageOne.thread_id,
+          level: 1,
+        }),
+      ).toBeVisible();
+    }
+  });
+
+  it("keeps loaded thread messages when an older-page request fails", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState(
+      {},
+      "",
+      `/mail/#thread/${projectOne.id}/${messageOne.thread_id}`,
+    );
+    server.use(
+      http.get(
+        "*/mail/api/v1/projects/:projectId/threads",
+        ({ request }) =>
+          new URL(request.url).searchParams.has("cursor")
+            ? HttpResponse.json({ detail: "private page failure" }, { status: 500 })
+            : HttpResponse.json({
+                items: [threadReply],
+                total: 2,
+                next_cursor: "failure-cursor",
+                subject: messageOne.subject,
+              }),
+      ),
+    );
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: messageOne.subject, level: 1 }),
+    ).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Load more" }));
+    expect(
+      await screen.findByText("More messages could not be loaded. Try again."),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("heading", { name: messageOne.subject, level: 1 }),
+    ).toBeVisible();
+    expect(screen.queryByText("private page failure")).not.toBeInTheDocument();
+  });
+
+  it.each(["resolve", "reject"] as const)(
+    "ignores a stale initial thread %s after navigating to another thread",
+    async (outcome) => {
+      const oldThreadId = "old-thread";
+      const newThreadId = "new-thread";
+      let oldRequests = 0;
+      let resolveOld: (response: Response) => void = () => undefined;
+      let rejectOld: (reason: unknown) => void = () => undefined;
+      const oldThread = new Promise<Response>((resolve, reject) => {
+        resolveOld = resolve;
+        rejectOld = reject;
+      });
+      const originalFetch = globalThis.fetch.bind(globalThis);
+      vi.stubGlobal(
+        "fetch",
+        (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = new URL(
+            input instanceof Request ? input.url : String(input),
+            window.location.origin,
+          );
+          if (
+            url.pathname.endsWith("/threads") &&
+            url.searchParams.get("thread_id") === oldThreadId
+          ) {
+            oldRequests += 1;
+            return oldThread;
+          }
+          return originalFetch(input, init);
+        },
+      );
+      window.history.replaceState(
+        {},
+        "",
+        `/mail/#thread/${projectOne.id}/${oldThreadId}`,
+      );
+      server.use(
+        http.get(
+          "*/mail/api/v1/projects/:projectId/threads",
+          ({ request }) =>
+            new URL(request.url).searchParams.get("thread_id") === newThreadId
+              ? HttpResponse.json({
+                  items: [{
+                    ...messageDetail,
+                    subject: "Current thread subject",
+                    thread_id: newThreadId,
+                  }],
+                  total: 1,
+                  next_cursor: null,
+                  subject: "Current thread subject",
+                })
+              : HttpResponse.json({ detail: "not found" }, { status: 404 }),
+        ),
+      );
+      render(<App />);
+      await waitFor(() => expect(oldRequests).toBe(1));
+
+      window.history.pushState(
+        {},
+        "",
+        mailRouteHash({
+          view: "thread",
+          projectId: projectOne.id,
+          threadId: newThreadId,
+        }),
+      );
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+      expect(
+        await screen.findByRole("heading", {
+          name: "Current thread subject",
+          level: 1,
+        }),
+      ).toBeVisible();
+
+      await act(async () => {
+        if (outcome === "resolve") {
+          resolveOld(
+            new Response(
+              JSON.stringify({
+                items: [{
+                  ...messageDetail,
+                  subject: "Stale thread subject",
+                  thread_id: oldThreadId,
+                }],
+                total: 1,
+                next_cursor: null,
+                subject: "Stale thread subject",
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            ),
+          );
+        } else {
+          rejectOld(new Error("private stale thread failure"));
+        }
+        await Promise.resolve();
+      });
+
+      expect(screen.queryByText("Stale thread subject")).not.toBeInTheDocument();
+      expect(screen.queryByText("private stale thread failure"))
+        .not.toBeInTheDocument();
+      expect(
+        screen.getByRole("heading", { name: "Current thread subject", level: 1 }),
+      ).toBeVisible();
+    },
+  );
+
+  it.each(["resolve", "reject"] as const)(
+    "aborts and ignores a stale thread page %s after a project switch",
+    async (outcome) => {
+      const user = userEvent.setup();
+      const currentThreadId = "current-project-thread";
+      let pageSignal: AbortSignal | null = null;
+      let resolvePage: (response: Response) => void = () => undefined;
+      let rejectPage: (reason: unknown) => void = () => undefined;
+      const oldPage = new Promise<Response>((resolve, reject) => {
+        resolvePage = resolve;
+        rejectPage = reject;
+      });
+      const originalFetch = globalThis.fetch.bind(globalThis);
+      vi.stubGlobal(
+        "fetch",
+        (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = new URL(
+            input instanceof Request ? input.url : String(input),
+            window.location.origin,
+          );
+          if (
+            url.pathname.endsWith("/threads") &&
+            url.searchParams.get("thread_id") === messageOne.thread_id &&
+            url.searchParams.get("cursor") === "delayed-page"
+          ) {
+            pageSignal = init?.signal ?? null;
+            return oldPage;
+          }
+          return originalFetch(input, init);
+        },
+      );
+      window.history.replaceState(
+        {},
+        "",
+        `/mail/#thread/${projectOne.id}/${messageOne.thread_id}`,
+      );
+      server.use(
+        http.get(
+          "*/mail/api/v1/projects/:projectId/threads",
+          ({ params, request }) =>
+            params.projectId === String(projectTwo.id) &&
+            new URL(request.url).searchParams.get("thread_id") === currentThreadId
+              ? HttpResponse.json({
+                  items: [{
+                    ...messageDetail,
+                    id: messageTwo.id,
+                    project_id: projectTwo.id,
+                    project_slug: projectTwo.slug,
+                    subject: "Current project thread",
+                    thread_id: currentThreadId,
+                  }],
+                  total: 1,
+                  next_cursor: null,
+                  subject: "Current project thread",
+                })
+              : HttpResponse.json({
+                  items: [threadReply],
+                  total: 2,
+                  next_cursor: "delayed-page",
+                  subject: messageOne.subject,
+                }),
+        ),
+      );
+      render(<App />);
+      expect(await screen.findByRole("button", { name: "Load more" }))
+        .toBeVisible();
+      await user.click(screen.getByRole("button", { name: "Load more" }));
+      await waitFor(() => expect(pageSignal).not.toBeNull());
+
+      window.history.pushState(
+        {},
+        "",
+        mailRouteHash({
+          view: "thread",
+          projectId: projectTwo.id,
+          threadId: currentThreadId,
+        }),
+      );
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+      expect(
+        await screen.findByRole("heading", {
+          name: "Current project thread",
+          level: 1,
+        }),
+      ).toBeVisible();
+      expect((pageSignal as AbortSignal | null)?.aborted).toBe(true);
+
+      await act(async () => {
+        if (outcome === "resolve") {
+          resolvePage(
+            new Response(
+              JSON.stringify({
+                items: [{
+                  ...messageDetail,
+                  id: 99,
+                  subject: "Stale older thread page",
+                }],
+                total: 2,
+                next_cursor: null,
+                subject: messageOne.subject,
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            ),
+          );
+        } else {
+          rejectPage(new Error("private stale page failure"));
+        }
+        await Promise.resolve();
+      });
+
+      expect(screen.queryByText("Stale older thread page"))
+        .not.toBeInTheDocument();
+      expect(screen.queryByText("More messages could not be loaded. Try again."))
+        .not.toBeInTheDocument();
+      expect(
+        screen.getByRole("heading", { name: "Current project thread", level: 1 }),
+      ).toBeVisible();
+    },
+  );
+
+  it("aborts a pending older thread page on unmount", async () => {
+    const user = userEvent.setup();
+    let pageSignal: AbortSignal | null = null;
+    const originalFetch = globalThis.fetch.bind(globalThis);
+    window.history.replaceState(
+      {},
+      "",
+      `/mail/#thread/${projectOne.id}/${messageOne.thread_id}`,
+    );
+    server.use(
+      http.get("*/mail/api/v1/projects/:projectId/threads", () =>
+        HttpResponse.json({
+          items: [threadReply],
+          total: 2,
+          next_cursor: "pending-page",
+          subject: messageOne.subject,
+        }),
+      ),
+    );
+    const view = render(<App />);
+    expect(await screen.findByRole("button", { name: "Load more" }))
+      .toBeVisible();
+    vi.stubGlobal(
+      "fetch",
+      (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(
+          input instanceof Request ? input.url : String(input),
+          window.location.origin,
+        );
+        if (
+          url.pathname.endsWith("/threads") &&
+          url.searchParams.get("thread_id") === messageOne.thread_id &&
+          url.searchParams.get("cursor") === "pending-page"
+        ) {
+          pageSignal = init?.signal ?? null;
+          return new Promise<Response>((_resolve, reject) => {
+            pageSignal?.addEventListener("abort", () =>
+              reject(new DOMException("cancelled", "AbortError")),
+            );
+          });
+        }
+        return originalFetch(input, init);
+      },
+    );
+
+    await user.click(screen.getByRole("button", { name: "Load more" }));
+    await waitFor(() => expect(pageSignal).not.toBeNull());
+    expect((pageSignal as AbortSignal | null)?.aborted).toBe(false);
+    view.unmount();
+
+    expect((pageSignal as AbortSignal | null)?.aborted).toBe(true);
+    await act(async () => Promise.resolve());
+  });
+
+  it("redirects exactly once when a thread read loses authorization", async () => {
+    const onUnauthorized = vi.fn();
+    window.history.replaceState(
+      {},
+      "",
+      `/mail/#thread/${projectOne.id}/${messageOne.thread_id}`,
+    );
+    server.use(
+      http.get("*/mail/api/v1/projects/:projectId/threads", () =>
+        HttpResponse.json({ detail: "expired" }, { status: 401 }),
+      ),
+    );
+    render(<App onUnauthorized={onUnauthorized} />);
+
+    expect(
+      await screen.findByText("Your session expired. Redirecting to sign in."),
+    ).toBeVisible();
+    expect(onUnauthorized).toHaveBeenCalledOnce();
+    expect(onUnauthorized).toHaveBeenCalledWith(
+      `/mail/login?next=%2Fmail%2F%23thread%2F${projectOne.id}%2F${messageOne.thread_id}`,
+    );
+    expect(
+      within(screen.getByRole("navigation", { name: "Primary navigation" }))
+        .getByRole("link", { name: "Inbox" }),
+    ).toHaveAttribute("aria-current", "page");
+  });
+
+  it("ignores an aborted initial thread read without exposing an error", async () => {
+    let threadRequests = 0;
+    const originalFetch = globalThis.fetch.bind(globalThis);
+    vi.stubGlobal(
+      "fetch",
+      (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(
+          input instanceof Request ? input.url : String(input),
+          window.location.origin,
+        );
+        if (
+          url.pathname.endsWith("/threads") &&
+          url.searchParams.get("thread_id") === messageOne.thread_id
+        ) {
+          threadRequests += 1;
+          return Promise.reject(new DOMException("cancelled", "AbortError"));
+        }
+        return originalFetch(input, init);
+      },
+    );
+    window.history.replaceState(
+      {},
+      "",
+      `/mail/#thread/${projectOne.id}/${messageOne.thread_id}`,
+    );
+    render(<App />);
+
+    await waitFor(() => expect(threadRequests).toBe(1));
+    expect(screen.getByText("Loading message…")).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it.each(["unauthorized", "aborted"] as const)(
+    "handles an %s older-page thread request without losing loaded messages",
+    async (outcome) => {
+      const user = userEvent.setup();
+      const onUnauthorized = vi.fn();
+      window.history.replaceState(
+        {},
+        "",
+        `/mail/#thread/${projectOne.id}/${messageOne.thread_id}`,
+      );
+      server.use(
+        http.get(
+          "*/mail/api/v1/projects/:projectId/threads",
+          ({ request }) => {
+            const cursor = new URL(request.url).searchParams.get("cursor");
+            if (cursor !== null) {
+              return outcome === "unauthorized"
+                ? HttpResponse.json({ detail: "expired" }, { status: 401 })
+                : HttpResponse.error();
+            }
+            return HttpResponse.json({
+              items: [threadReply],
+              total: 2,
+              next_cursor: "next-page",
+              subject: messageOne.subject,
+            });
+          },
+        ),
+      );
+      if (outcome === "aborted") {
+        const originalFetch = globalThis.fetch.bind(globalThis);
+        vi.stubGlobal(
+          "fetch",
+          (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = new URL(
+              input instanceof Request ? input.url : String(input),
+              window.location.origin,
+            );
+            if (url.searchParams.get("cursor") === "next-page") {
+              return Promise.reject(new DOMException("cancelled", "AbortError"));
+            }
+            return originalFetch(input, init);
+          },
+        );
+      }
+      render(<App onUnauthorized={onUnauthorized} />);
+
+      expect(
+        await screen.findByRole("heading", { name: messageOne.subject, level: 1 }),
+      ).toBeVisible();
+      await user.click(screen.getByRole("button", { name: "Load more" }));
+      if (outcome === "unauthorized") {
+        await waitFor(() => expect(onUnauthorized).toHaveBeenCalledOnce());
+        expect(
+          screen.getByText("Your session expired. Redirecting to sign in."),
+        ).toBeVisible();
+      } else {
+        await waitFor(() =>
+          expect(screen.getByRole("button", { name: "Loading more…" }))
+            .toBeDisabled(),
+        );
+        expect(onUnauthorized).not.toHaveBeenCalled();
+        expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      }
+      expect(document.querySelectorAll(".thread-message")).toHaveLength(
+        outcome === "unauthorized" ? 0 : 1,
+      );
+    },
+  );
+
   it("renders GFM as accessible React elements behind fail-closed URLs", async () => {
     const user = userEvent.setup();
     const png = `data:image/png;base64,${window.btoa("\x89PNG\r\n\x1a\nrest")}`;
@@ -2997,6 +3728,14 @@ describe("Iris landing shell", () => {
     expect(() =>
       parseInboxPage({ items: [], next_cursor: null, total: 0, debug: true }),
     ).toThrow(TypeError);
+    expect(() =>
+      parseInboxPage({
+        items: [],
+        next_cursor: null,
+        subject: "Thread-only field",
+        total: 0,
+      }),
+    ).toThrow(TypeError);
   });
 
   it("validates message bodies, recipient lists, and safe attachment metadata", () => {
@@ -3066,6 +3805,50 @@ describe("Iris landing shell", () => {
     }
   });
 
+  it("validates every thread page field through the shared message parser", () => {
+    expect(parseThreadPage(threadResponse)).toEqual(threadResponse);
+    for (const payload of [
+      null,
+      { items: {}, next_cursor: null, subject: "Subject", total: 0 },
+      { items: [messageOne], next_cursor: null, subject: "Subject", total: 1 },
+      { items: [], next_cursor: 7, subject: "Subject", total: 0 },
+      { items: [], next_cursor: null, subject: "Subject", total: -1 },
+      {
+        items: [],
+        next_cursor: null,
+        subject: "Subject",
+        total: Number.MAX_SAFE_INTEGER + 1,
+      },
+      {
+        items: [{ ...messageDetail, id: Number.MAX_SAFE_INTEGER + 1 }],
+        next_cursor: null,
+        subject: "Subject",
+        total: 1,
+      },
+      { items: [], next_cursor: null, subject: 7, total: 0 },
+      { items: [], next_cursor: null, subject: "Subject", total: 0, debug: true },
+    ]) {
+      expect(() => parseThreadPage(payload)).toThrow(TypeError);
+    }
+  });
+
+  it.each([
+    ["empty", ""],
+    ["dot segment", "."],
+    ["control character", "bad\u0000thread"],
+    ["overlong", "x".repeat(129)],
+    ["lone surrogate", "\ud800"],
+  ])("declines a noncanonical %s thread link without throwing", (_label, threadId) => {
+    expect(mailThreadRouteHash(projectOne.id, threadId)).toBeNull();
+  });
+
+  it.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+    "declines an unsafe thread project id %s",
+    (projectId) => {
+      expect(mailThreadRouteHash(projectId, "valid-thread")).toBeNull();
+    },
+  );
+
   it("round-trips valid hashes and rejects malformed deep links", () => {
     expect(parseMailRoute("")).toEqual({ view: "inbox", projectId: null });
     expect(parseMailRoute("inbox?project=11")).toEqual({
@@ -3101,6 +3884,21 @@ describe("Iris landing shell", () => {
       projectId: 11,
       messageId: 101,
     });
+    expect(parseMailRoute("#thread/11/release%2F%E2%9C%A8")).toEqual({
+      view: "thread",
+      projectId: 11,
+      threadId: "release/✨",
+    });
+    expect(parseMailRoute("#thread/11/%250a")).toEqual({
+      view: "thread",
+      projectId: 11,
+      threadId: "%0a",
+    });
+    expect(parseMailRoute("#thread/11/%252F")).toEqual({
+      view: "thread",
+      projectId: 11,
+      threadId: "%2F",
+    });
     for (const hash of [
       "#inbox?project=nope",
       "#inbox?project=0",
@@ -3108,6 +3906,19 @@ describe("Iris landing shell", () => {
       "#message/0/1",
       "#message/1/0",
       "#message/9007199254740992/1",
+      "#thread/01/release",
+      "#thread/11/",
+      "#thread/11/%",
+      "#thread/11/%00",
+      "#thread/11/%C2%85",
+      "#thread/11/%72elease",
+      "#thread/11/release%2fchild",
+      "#thread/11/release✨",
+      "#thread/11/.",
+      "#thread/11/..",
+      "#thread/11/release?ambiguous",
+      "#thread/11/release?",
+      `#thread/11/${encodeURIComponent("x".repeat(129))}`,
       "#unknown",
     ]) {
       expect(parseMailRoute(hash)).toEqual({ view: "inbox", projectId: null });
@@ -3120,6 +3931,17 @@ describe("Iris landing shell", () => {
     expect(
       mailRouteHash({ view: "message", projectId: 11, messageId: 101 }),
     ).toBe("#message/11/101");
+    expect(
+      mailRouteHash({ view: "thread", projectId: 11, threadId: "release/✨" }),
+    ).toBe("#thread/11/release%2F%E2%9C%A8");
+    for (const threadId of ["", ".", "..", "bad\u0000id", "x".repeat(129), "\ud800"]) {
+      expect(() =>
+        mailRouteHash({ view: "thread", projectId: 11, threadId }),
+      ).toThrow(TypeError);
+    }
+    expect(() =>
+      mailRouteHash({ view: "thread", projectId: 0, threadId: "release" }),
+    ).toThrow(TypeError);
     expect(
       mailRouteHash({
         view: "search",
@@ -3142,6 +3964,14 @@ describe("Iris landing shell", () => {
 
   it("uses exact same-origin endpoints in the standalone mail client", async () => {
     const urls: string[] = [];
+    const encodedThreadId = "release/✨";
+    const encodedThreadResponse = {
+      ...threadResponse,
+      items: threadResponse.items.map((message) => ({
+        ...message,
+        thread_id: encodedThreadId,
+      })),
+    };
     server.use(
       http.get("*/mail/api/v1/projects", ({ request }) => {
         urls.push(request.url);
@@ -3162,6 +3992,10 @@ describe("Iris landing shell", () => {
         urls.push(request.url);
         return HttpResponse.json(searchResponse);
       }),
+      http.get("*/mail/api/v1/projects/:projectId/threads", ({ request }) => {
+        urls.push(request.url);
+        return HttpResponse.json(encodedThreadResponse);
+      }),
     );
 
     await expect(loadProjects()).resolves.toEqual(projectsResponse);
@@ -3180,12 +4014,54 @@ describe("Iris landing shell", () => {
         cursor: "search-opaque",
       }),
     ).resolves.toEqual(searchResponse);
+    await expect(
+      loadThread(projectOne.id, encodedThreadId, { cursor: "thread-opaque" }),
+    ).resolves.toEqual(encodedThreadResponse);
     expect(urls).toEqual([
       "http://localhost:3000/mail/api/v1/projects",
       `http://localhost:3000/mail/api/v1/inbox?limit=${inboxPageSize}&cursor=opaque&project_id=${projectOne.id}`,
       `http://localhost:3000/mail/api/v1/projects/${projectOne.id}/messages/${messageOne.id}`,
       `http://localhost:3000/mail/api/v1/search?q=release+marker&scope=body&order=newest&limit=50&project_id=${projectOne.id}&cursor=search-opaque`,
+      `http://localhost:3000/mail/api/v1/projects/${projectOne.id}` +
+        `/threads?thread_id=release%2F%E2%9C%A8&limit=${threadPageSize}&cursor=thread-opaque`,
     ]);
+  });
+
+  it("accepts only the exact numeric starter exception in a thread page", async () => {
+    const numericStarter = {
+      ...messageDetail,
+      id: 101,
+      // Legacy numeric starter semantics are row-id based even when that row
+      // has since acquired a different explicit thread identifier.
+      thread_id: "different-explicit-thread",
+    };
+    server.use(
+      http.get("*/mail/api/v1/projects/:projectId/threads", () =>
+        HttpResponse.json({
+          items: [numericStarter],
+          total: 1,
+          next_cursor: null,
+          subject: numericStarter.subject,
+        }),
+      ),
+    );
+
+    await expect(loadThread(projectOne.id, "101")).resolves.toEqual({
+      items: [numericStarter],
+      total: 1,
+      next_cursor: null,
+      subject: numericStarter.subject,
+    });
+    for (const threadId of ["0101", "+101", "１０１", "9223372036854775808"] ) {
+      await expect(loadThread(projectOne.id, threadId)).rejects.toThrow(
+        "Invalid thread message identity.",
+      );
+    }
+    await expect(loadThread(projectOne.id, "9007199254740993")).rejects.toThrow(
+      "Invalid thread message identity.",
+    );
+    await expect(loadThread(0, "101")).rejects.toThrow("Invalid thread project id.");
+    await expect(loadThread(projectOne.id, ".")).rejects.toThrow("Invalid thread id.");
   });
 
   it("renders a full accessible search route and links results to message detail", async () => {
@@ -3235,6 +4111,32 @@ describe("Iris landing shell", () => {
     expect(window.location.hash).toBe(
       "#search?q=archive+window&scope=subject&order=relevance",
     );
+  });
+
+  it("renders search results without linking malformed persisted threads", async () => {
+    window.history.replaceState(
+      {},
+      "",
+      "/mail/#search?q=rollout&scope=all&order=relevance",
+    );
+    server.use(
+      http.get("*/mail/api/v1/search", () =>
+        HttpResponse.json({
+          ...searchResponse,
+          items: [{ ...searchResponse.items[0], thread_id: "." }],
+        }),
+      ),
+    );
+    render(<App />);
+
+    expect(
+      await screen.findByRole("link", {
+        name: `Open search result: ${messageOne.subject}`,
+      }),
+    ).toBeVisible();
+    expect(
+      document.querySelector(".search-result-list .message-thread-link"),
+    ).not.toBeInTheDocument();
   });
 
   it("renders prompt, empty, and privacy-minimal blank-snippet search states", async () => {

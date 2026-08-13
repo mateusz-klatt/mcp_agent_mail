@@ -9,3 +9,7 @@
 # producing anything. Treat them as opaque bytes, because that is what they are.
 src/mcp_agent_mail/viewer_assets/vendor/** -text
 src/mcp_agent_mail/viewer_assets/coi-serviceworker.js -text
+
+# The Windows flag fallback is hash-pinned by the UI build hook.  Keep Git from
+# applying any text conversion before that byte-for-byte validation runs.
+ui/public/assets/TwemojiCountryFlags.woff2 -text

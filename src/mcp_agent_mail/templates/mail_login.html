@@ -26,7 +26,7 @@
                    flex items-center gap-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
             aria-label="{{ login_text.language }}"
           >
-            <span aria-hidden="true" class="text-xl">{{ login_locale_presentation.flag }}</span>
+            <span aria-hidden="true" class="locale-flag text-xl">{{ login_locale_presentation.flag }}</span>
             <span>{{ login_text.language }}: {{ login_locale_presentation.native_name }}</span>
           </summary>
           <nav
@@ -45,7 +45,7 @@
                      {% if option.is_current %}bg-indigo-100 dark:bg-indigo-950 font-semibold{% else %}hover:bg-slate-200 dark:hover:bg-slate-800{% endif %}
                      text-slate-700 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500"
             >
-              <span aria-hidden="true" class="text-lg">{{ option.flag }}</span>
+              <span aria-hidden="true" class="locale-flag text-lg">{{ option.flag }}</span>
               <span>{{ option.native_name }}</span>
             </a>
             {% endfor %}

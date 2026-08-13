@@ -38,6 +38,9 @@ _UI_DIST_WHEEL = "mcp_agent_mail/ui_dist"
 _UI_DIST_SDIST = _UI_DIST_SOURCE.as_posix()
 _DIST_HASHES_KEY = "files"
 _VITE_MANIFEST = ".vite/manifest.json"
+_COUNTRY_FLAG_FONT = "assets/TwemojiCountryFlags.woff2"
+_COUNTRY_FLAG_FONT_SHA256 = "9f04f14429bb6a9f415c7a4dd902a918d7e81a4f7526c415496fdb063954e3b8"
+_COUNTRY_FLAG_FONT_URL = f"/mail/{_COUNTRY_FLAG_FONT}?v={_COUNTRY_FLAG_FONT_SHA256[:8]}"
 _FINGERPRINTED_ASSET_RE = re.compile(r"^assets/[A-Za-z0-9_.-]+-[A-Za-z0-9_-]{8,}\.(?:css|js)$")
 _CSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 _CSS_ESCAPE_RE = re.compile(
@@ -631,7 +634,9 @@ def _validate_stylesheet(stylesheet: Path) -> None:
             reference = raw_reference[1:-1].strip()
         else:
             reference = raw_reference
-        if not reference.casefold().startswith("data:image/"):
+        if reference != _COUNTRY_FLAG_FONT_URL and not reference.casefold().startswith(
+            "data:image/"
+        ):
             raise HermesUiBuildError(f"Iris UI stylesheet contains a non-inline runtime URL: {stylesheet.name}")
         cursor = end + 1
 
@@ -643,10 +648,18 @@ def _validate_dist(dist_root: Path, *, repository_root: Path) -> None:
     required = (
         dist_root / "index.html",
         dist_root / "assets" / "legacy.css",
+        dist_root / _COUNTRY_FLAG_FONT,
         dist_root / _BUILD_MANIFEST,
     )
     if any(not path.is_file() or path.is_symlink() or path.stat().st_size == 0 for path in required):
-        raise HermesUiBuildError("Iris UI output is missing index.html, login styles, or its build manifest.")
+        raise HermesUiBuildError(
+            "Iris UI output is missing index.html, login styles, the country flag font, "
+            "or its build manifest."
+        )
+    if hashlib.sha256((dist_root / _COUNTRY_FLAG_FONT).read_bytes()).hexdigest() != (
+        _COUNTRY_FLAG_FONT_SHA256
+    ):
+        raise HermesUiBuildError("Iris UI country flag font does not match the pinned asset.")
 
     (
         entry_javascript,
@@ -661,6 +674,7 @@ def _validate_dist(dist_root: Path, *, repository_root: Path) -> None:
         _BUILD_MANIFEST,
         _VITE_MANIFEST,
         "assets/legacy.css",
+        _COUNTRY_FLAG_FONT,
         *reachable_assets,
     }
     for candidate in dist_root.rglob("*"):

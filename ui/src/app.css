@@ -1,3 +1,12 @@
+@font-face {
+  font-family: "Twemoji Country Flags";
+  src: url("/mail/assets/TwemojiCountryFlags.woff2?v=9f04f144") format("woff2");
+  font-display: swap;
+  unicode-range:
+    U+1F1E6-1F1FF, U+1F3F4, U+E0062-E0063, U+E0065, U+E0067, U+E006C,
+    U+E006E, U+E0073-E0074, U+E0077, U+E007F;
+}
+
 :root {
   color: #1b1c36;
   background: #f6f7fb;
@@ -296,6 +305,18 @@ select {
   font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
   font-size: 1.25rem;
   line-height: 1;
+}
+
+html[data-flag-polyfill="true"] .locale-picker-flag {
+  font-family:
+    "Twemoji Country Flags", "Apple Color Emoji", "Segoe UI Emoji",
+    "Noto Color Emoji", sans-serif;
+}
+
+html[data-flag-polyfill="true"] select {
+  font-family:
+    "Twemoji Country Flags", Inter, ui-sans-serif, system-ui, -apple-system,
+    BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
 .locale-hint {

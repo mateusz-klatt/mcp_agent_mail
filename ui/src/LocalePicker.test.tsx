@@ -26,11 +26,15 @@ describe("LocalePicker", () => {
     const trigger = screen.getByRole("button", { name: /current language: english/i });
     expect(trigger).toHaveAttribute("aria-describedby", "saved-language-status");
     expect(trigger).toHaveAttribute("aria-haspopup", "listbox");
+    const triggerFlag = within(trigger).getByText(localeMetadata.en.flag);
+    expect(triggerFlag).toHaveClass("locale-picker-flag");
+    expect(triggerFlag).toHaveAttribute("aria-hidden", "true");
     await user.click(trigger);
 
     const listbox = screen.getByRole("listbox", { name: /choose interface language/i });
     const options = within(listbox).getAllByRole("option");
     expect(options).toHaveLength(45);
+    expect(listbox.querySelectorAll(".locale-picker-flag")).toHaveLength(45);
     expect(options.filter((option) => option.tabIndex === 0)).toEqual([
       within(listbox).getByRole("option", { name: /current language: english/i }),
     ]);
@@ -40,7 +44,9 @@ describe("LocalePicker", () => {
       const option = within(listbox).getByRole("option", {
         name: new RegExp(metadata.nativeName, "i"),
       });
-      expect(option).toHaveTextContent(metadata.flag);
+      const flag = within(option).getByText(metadata.flag);
+      expect(flag).toHaveClass("locale-picker-flag");
+      expect(flag).toHaveAttribute("aria-hidden", "true");
       expect(option).toHaveTextContent(metadata.nativeName);
       expect(within(option).getByText(metadata.nativeName)).toHaveAttribute("lang", locale);
     }

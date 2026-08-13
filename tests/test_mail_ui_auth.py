@@ -78,6 +78,8 @@ GUARDED = "/mail/api/v1/projects"
 PROFILE_PATH = "/mail/api/v1/me/profile"
 PASSWORD_PATH = "/mail/api/v1/me/password"
 ADMIN_ACCESS_PATH = "/mail/api/v1/admin/access"
+COUNTRY_FLAG_FONT_PATH = "/mail/assets/TwemojiCountryFlags.woff2"
+COUNTRY_FLAG_FONT_BYTES = b"wOF2test-country-flags"
 SAME_ORIGIN_HEADERS = {
     "Origin": "http://test",
     "Referer": "http://test/",
@@ -721,6 +723,9 @@ def _install_react_dist(monkeypatch, tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     (assets_root / "legacy.css").write_bytes(b"[x-cloak] { display: none !important; }\n")
+    (assets_root / "TwemojiCountryFlags.woff2").write_bytes(
+        COUNTRY_FLAG_FONT_BYTES
+    )
     monkeypatch.setattr(http_module, "_mail_react_dist_root", lambda: dist_root)
     return dist_root
 
@@ -1170,8 +1175,15 @@ class TestMailReactShell:
             login_stylesheet_head = await anonymous_client.head(
                 "/mail/assets/legacy.css"
             )
+            login_flag_font = await anonymous_client.get(COUNTRY_FLAG_FONT_PATH)
+            login_flag_font_head = await anonymous_client.head(
+                COUNTRY_FLAG_FONT_PATH
+            )
             protected_runtime = await anonymous_client.get(
                 "/mail/assets/legacy.js"
+            )
+            protected_other_font = await anonymous_client.get(
+                "/mail/assets/UnexpectedCountryFlags.woff2"
             )
         async with AsyncClient(
             transport=ASGITransport(app=app),
@@ -1190,6 +1202,7 @@ class TestMailReactShell:
         assert '<span aria-hidden="true">🌈</span> Iris' in login.text
         assert FAVICON_LINK in login.text
         assert 'href="/mail/assets/legacy.css"' in login.text
+        assert login.text.count('class="locale-flag ') == len(MailUiLocale) + 1
         assert "/mail/v2" not in login.text
 
         assert inbox.status_code == 200
@@ -1205,7 +1218,17 @@ class TestMailReactShell:
             assert response.headers["X-Content-Type-Options"] == "nosniff"
         assert login_stylesheet.text == "[x-cloak] { display: none !important; }\n"
         assert login_stylesheet_head.content == b""
+        immutable = "public, max-age=31536000, immutable, no-transform"
+        assert login_flag_font.status_code == 200
+        assert login_flag_font.content == COUNTRY_FLAG_FONT_BYTES
+        assert login_flag_font_head.status_code == 200
+        assert login_flag_font_head.content == b""
+        for response in (login_flag_font, login_flag_font_head):
+            assert response.headers["Cache-Control"] == immutable
+            assert response.headers["Content-Type"].split(";", 1)[0] == "font/woff2"
+            assert response.headers["X-Content-Type-Options"] == "nosniff"
         assert protected_runtime.status_code == 401
+        assert protected_other_font.status_code == 401
 
     def test_login_catalog_matches_the_closed_locale_and_flag_contract(self):
         assert tuple(http_module._MAIL_LOGIN_TEXT) == tuple(MailUiLocale)
@@ -1545,6 +1568,10 @@ class TestMailReactShell:
                 "/mail/assets/%2e%2flegacy.js"
             )
             legacy_stylesheet = await client.get("/mail/assets/legacy.css")
+            country_flag_font = await client.get(COUNTRY_FLAG_FONT_PATH)
+            aliased_country_flag_font = await client.get(
+                "/mail/assets/%2e%2fTwemojiCountryFlags.woff2"
+            )
             missing = await client.get("/mail/assets/not-built.js")
             bare_namespace = await client.get("/mail/assets")
             encoded_namespace = await client.get("/mail/%61ssets")
@@ -1568,6 +1595,12 @@ class TestMailReactShell:
         assert legacy_stylesheet.status_code == 200
         assert legacy_stylesheet.headers["Cache-Control"] == "no-cache, no-transform"
         assert legacy_stylesheet.headers["X-Content-Type-Options"] == "nosniff"
+        assert country_flag_font.status_code == 200
+        assert country_flag_font.content == COUNTRY_FLAG_FONT_BYTES
+        assert country_flag_font.headers["Cache-Control"] == immutable
+        assert country_flag_font.headers["Content-Type"].split(";", 1)[0] == "font/woff2"
+        assert country_flag_font.headers["X-Content-Type-Options"] == "nosniff"
+        assert aliased_country_flag_font.status_code == 404
         assert missing.status_code == 404
         for response in (bare_namespace, encoded_namespace, directory):
             assert response.status_code == 404

@@ -399,6 +399,39 @@ and server-side authorization rules; hiding a control in React is never treated
 as an authorization boundary. All production JavaScript, CSS, fonts, icons, and
 images are served from the same origin.
 
+Country flags use the self-hosted `Twemoji Country Flags` webfont from
+[`country-flag-emoji-polyfill`](https://github.com/talkjs/country-flag-emoji-polyfill).
+The sign-in page applies that fallback directly because its security policy
+permits no scripts; the React interface activates it only when the browser lacks
+native flag rendering. The font is bundled and served from
+`/mail/assets/TwemojiCountryFlags.woff2?v=9f04f144` with no CDN or other runtime
+third-party request; the hash-derived query changes with future font revisions
+so the immutable browser cache cannot retain stale glyphs. Its emoji artwork
+comes from Twemoji and is redistributed under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) without modification;
+the adapted feature detector is Copyright (c) 2022 TalkJS and is used under the
+[upstream MIT license](https://github.com/talkjs/country-flag-emoji-polyfill/blob/master/LICENSE.md).
+
+<details>
+<summary>MIT notice for the adapted flag feature detector</summary>
+
+Copyright (c) 2022 TalkJS. Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated documentation files
+(the "Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish, distribute,
+sublicense, and/or sell copies of the Software, and to permit persons to whom
+the Software is furnished to do so, subject to the following conditions: the
+above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software. THE SOFTWARE IS PROVIDED "AS
+IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE
+AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+</details>
+
 - `/mail#inbox` shows the real, project-scoped inbox and message detail views.
 - `/mail#projects` lists only projects visible to the signed-in human.
 - `/mail#search` performs bounded FTS5 search over subjects and bodies in only

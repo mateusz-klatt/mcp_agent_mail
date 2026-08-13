@@ -920,6 +920,9 @@ _MAIL_ACCOUNT_API_PATHS = frozenset(
 )
 _MAIL_REACT_BASE_PATH = "/mail"
 _MAIL_LOGIN_STYLESHEET_PATH = f"{_MAIL_REACT_BASE_PATH}/assets/legacy.css"
+_MAIL_LOGIN_FLAG_FONT_PATH = (
+    f"{_MAIL_REACT_BASE_PATH}/assets/TwemojiCountryFlags.woff2"
+)
 _IRIS_FAVICON_PATH = "/favicon.ico"
 _IRIS_FAVICON_SVG = (
     b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">\n'
@@ -3099,12 +3102,17 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
                 _mail_ui_template_user.reset(token)
 
         # The standalone login page needs exactly one locally built stylesheet
-        # before a browser can possess a session cookie.  Keep this exception
-        # deliberately narrower than the asset namespace: the legacy runtime
-        # JavaScript and every hashed application asset remain session-gated.
+        # and its exact self-hosted flag font before a browser can possess a
+        # session cookie. Keep this exception deliberately narrower than the
+        # asset namespace: the legacy runtime JavaScript and every hashed
+        # application asset remain session-gated.
         if (
             request.method in {"GET", "HEAD"}
-            and path == _MAIL_LOGIN_STYLESHEET_PATH
+            and path
+            in {
+                _MAIL_LOGIN_STYLESHEET_PATH,
+                _MAIL_LOGIN_FLAG_FONT_PATH,
+            }
         ):
             request.state.mail_ui_authenticated = True
             token = _mail_ui_template_user.set(None)

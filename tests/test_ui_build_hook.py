@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
 import tarfile
 from pathlib import Path
 from typing import Any, cast
@@ -27,7 +28,11 @@ def _build_hook(root: Path, output: Path, target_name: str) -> hatch_build.Custo
     )
 
 
-def _write_vite_output(dist_root: Path) -> None:
+def _write_vite_output(
+    dist_root: Path,
+    *,
+    include_country_flag_font: bool = True,
+) -> None:
     assets = dist_root / "assets"
     assets.mkdir(parents=True, exist_ok=True)
     (dist_root / "index.html").write_text(
@@ -40,8 +45,19 @@ def _write_vite_output(dist_root: Path) -> None:
         "/* English-only Iris entry */\n",
         encoding="utf-8",
     )
-    for name in ("index-testhash.css", "legacy.css"):
-        (assets / name).write_text(f"/* {name} */\n", encoding="utf-8")
+    (assets / "index-testhash.css").write_text(
+        "/* index-testhash.css */\n",
+        encoding="utf-8",
+    )
+    (assets / "legacy.css").write_text(
+        '@font-face { src: url("/mail/assets/TwemojiCountryFlags.woff2?v=9f04f144") '
+        'format("woff2"); }\n',
+        encoding="utf-8",
+    )
+    if include_country_flag_font:
+        (dist_root / hatch_build._COUNTRY_FLAG_FONT).write_bytes(
+            (REPOSITORY_ROOT / "ui" / "public" / hatch_build._COUNTRY_FLAG_FONT).read_bytes()
+        )
 
     locale_records: dict[str, dict[str, object]] = {}
     for locale_key in hatch_build._EXPECTED_LOCALE_MANIFEST_KEYS:
@@ -79,8 +95,16 @@ def _write_vite_output(dist_root: Path) -> None:
     )
 
 
-def _write_valid_dist(dist_root: Path, *, repository_root: Path) -> None:
-    _write_vite_output(dist_root)
+def _write_valid_dist(
+    dist_root: Path,
+    *,
+    repository_root: Path,
+    include_country_flag_font: bool = True,
+) -> None:
+    _write_vite_output(
+        dist_root,
+        include_country_flag_font=include_country_flag_font,
+    )
     (dist_root / hatch_build._BUILD_MANIFEST).write_text(
         json.dumps(
             {
@@ -489,7 +513,12 @@ def test_generated_dist_rejects_missing_index_asset(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "unexpected_name",
-    ["orphan-localehash.js", "orphan-stylehash.css", "legacy.js"],
+    [
+        "orphan-localehash.js",
+        "orphan-stylehash.css",
+        "legacy.js",
+        "UnexpectedCountryFlags.woff2",
+    ],
 )
 def test_generated_dist_rejects_unreferenced_or_legacy_runtime_files(
     tmp_path: Path,
@@ -501,6 +530,58 @@ def test_generated_dist_rejects_unreferenced_or_legacy_runtime_files(
         "/* unexpected runtime asset */\n",
         encoding="utf-8",
     )
+
+    with pytest.raises(hatch_build.HermesUiBuildError, match="unexpected file"):
+        hatch_build._validate_dist(dist_root, repository_root=REPOSITORY_ROOT)
+
+
+def test_generated_dist_requires_the_pinned_country_flag_font(tmp_path: Path) -> None:
+    dist_root = tmp_path / "dist"
+    _write_valid_dist(
+        dist_root,
+        repository_root=REPOSITORY_ROOT,
+        include_country_flag_font=False,
+    )
+
+    with pytest.raises(hatch_build.HermesUiBuildError, match="country flag font"):
+        hatch_build._validate_dist(dist_root, repository_root=REPOSITORY_ROOT)
+
+
+def test_pinned_country_flag_font_is_not_rewritten_by_git() -> None:
+    font_path = "ui/public/assets/TwemojiCountryFlags.woff2"
+    result = subprocess.run(
+        ["git", "check-attr", "text", "--", font_path],
+        cwd=REPOSITORY_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout.strip() == f"{font_path}: text: unset"
+
+
+def test_generated_dist_rejects_a_rehashed_but_tampered_country_flag_font(
+    tmp_path: Path,
+) -> None:
+    dist_root = tmp_path / "dist"
+    _write_valid_dist(dist_root, repository_root=REPOSITORY_ROOT)
+    font = dist_root / hatch_build._COUNTRY_FLAG_FONT
+    font.write_bytes(font.read_bytes() + b"tampered")
+    _refresh_build_manifest(dist_root)
+
+    with pytest.raises(hatch_build.HermesUiBuildError, match="pinned asset"):
+        hatch_build._validate_dist(dist_root, repository_root=REPOSITORY_ROOT)
+
+
+def test_generated_dist_rejects_a_duplicate_nested_country_flag_font(
+    tmp_path: Path,
+) -> None:
+    dist_root = tmp_path / "dist"
+    _write_valid_dist(dist_root, repository_root=REPOSITORY_ROOT)
+    nested_font = dist_root / "assets" / hatch_build._COUNTRY_FLAG_FONT
+    nested_font.parent.mkdir(parents=True)
+    nested_font.write_bytes((dist_root / hatch_build._COUNTRY_FLAG_FONT).read_bytes())
+    _refresh_build_manifest(dist_root)
 
     with pytest.raises(hatch_build.HermesUiBuildError, match="unexpected file"):
         hatch_build._validate_dist(dist_root, repository_root=REPOSITORY_ROOT)
@@ -653,6 +734,30 @@ def test_generated_dist_rejects_external_stylesheet_url(tmp_path: Path) -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["files"] = hatch_build._dist_file_hashes(dist_root)
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(hatch_build.HermesUiBuildError, match="non-inline runtime URL"):
+        hatch_build._validate_dist(dist_root, repository_root=REPOSITORY_ROOT)
+
+
+@pytest.mark.parametrize(
+    "font_url",
+    [
+        "/mail/assets/UnexpectedCountryFlags.woff2",
+        "/mail/assets/TwemojiCountryFlags.woff2?v=1",
+        "TwemojiCountryFlags.woff2",
+    ],
+)
+def test_generated_dist_rejects_non_allowlisted_local_font_urls(
+    tmp_path: Path,
+    font_url: str,
+) -> None:
+    dist_root = tmp_path / "dist"
+    _write_valid_dist(dist_root, repository_root=REPOSITORY_ROOT)
+    (dist_root / "assets" / "legacy.css").write_text(
+        f'@font-face {{ src: url("{font_url}") format("woff2"); }}\n',
+        encoding="utf-8",
+    )
+    _refresh_build_manifest(dist_root)
 
     with pytest.raises(hatch_build.HermesUiBuildError, match="non-inline runtime URL"):
         hatch_build._validate_dist(dist_root, repository_root=REPOSITORY_ROOT)

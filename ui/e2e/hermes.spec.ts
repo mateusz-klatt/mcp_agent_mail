@@ -1189,18 +1189,74 @@ test("production login form preserves a same-origin Origin header", async ({ pag
   });
 
   await page.goto("/mail/login");
-  await page.getByLabel("Username").fill("invalid-user");
-  await page.getByLabel("Password").fill("invalid-password");
-  await Promise.all([
-    page.waitForResponse(
-      (response) =>
-        response.url().endsWith("/mail/login") &&
-        response.request().method() === "POST",
-    ),
-    page.getByRole("button", { name: "Sign in" }).click(),
-  ]);
+  const pageOrigin = await page.evaluate(() => window.location.origin);
+  await page.locator("#username").fill("invalid-user");
+  await page.locator("#password").fill("invalid-password");
+  const responsePromise = page.waitForResponse(
+    (response) =>
+      response.url().endsWith("/mail/login") &&
+      response.request().method() === "POST",
+  );
+  await page.locator('button[type="submit"]').click();
+  const response = await responsePromise;
 
-  expect(submittedOrigin).toBe(new URL(page.url()).origin);
+  expect(response.status()).toBe(401);
+  expect(submittedOrigin).toBe(pageOrigin);
   expect(submittedOrigin).not.toBe("null");
   expect(submittedSite).toBe("same-origin");
+});
+
+test("Windows flag fallback loads only the bundled same-origin font", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(HTMLCanvasElement.prototype, "getContext", {
+      configurable: true,
+      value: () => {
+        let glyph = "";
+        let color = "";
+        return {
+          clearRect: () => undefined,
+          fillText: (text: string) => {
+            glyph = text;
+          },
+          get fillStyle() {
+            return color;
+          },
+          set fillStyle(value: string) {
+            color = value;
+          },
+          font: "",
+          getImageData: () => {
+            const red = glyph === "😊" ? 1 : color === "#fff" ? 2 : 3;
+            return { data: Uint8ClampedArray.from([red, red, red, 255]) };
+          },
+          scale: () => undefined,
+          textBaseline: "",
+        };
+      },
+    });
+  });
+  const state = await installLocalStub(page);
+  const fontResponse = page.waitForResponse((response) =>
+    new URL(response.url()).pathname ===
+      "/mail/assets/TwemojiCountryFlags.woff2",
+  );
+  await page.goto("#inbox");
+
+  const flag = page.locator(".locale-picker-flag").first();
+  await expect(flag).toBeVisible();
+  await expect(page.locator("html")).toHaveAttribute(
+    "data-flag-polyfill",
+    "true",
+  );
+  const response = await fontResponse;
+
+  expect(response.status()).toBe(200);
+  expect(new URL(response.url()).origin).toBe(new URL(page.url()).origin);
+  expect(new URL(response.url()).search).toBe("?v=9f04f144");
+  await expect(flag).toHaveCSS(
+    "font-family",
+    /Twemoji Country Flags/u,
+  );
+  expect(state.externalRequests).toEqual([]);
+  expect(state.browserErrors).toEqual([]);
 });

@@ -118,7 +118,9 @@ export default function LocalePicker({
         disabled={disabled}
         onClick={() => setOpen((current) => !current)}
       >
-        <span aria-hidden="true">{metadata.flag}</span>
+        <span className="locale-picker-flag" aria-hidden="true">
+          {metadata.flag}
+        </span>
         <span lang={locale}>{metadata.nativeName}</span>
         <span aria-hidden="true">▾</span>
       </button>

@@ -4,7 +4,7 @@
 
 Durable mailboxes · execution-scoped file reservations · authenticated real-time wake-ups · human operator console · Windows, WSL, macOS and Linux
 
-![Iris Agent Mail Showcase](screenshots/output/agent_mail_showcase.gif)
+![The Iris inbox, showing messages from several projects](screenshots/webp/iris_inbox.webp)
 
 Iris is the human-facing name of MCP Agent Mail: a mail-like coordination layer for coding agents, exposed as an HTTP-only FastMCP server. Run several agents on the same repository — across machines, worktrees and vendors — and give them one durable identity each, one inbox, and a way to announce what they are about to edit before they edit it.
 
@@ -396,13 +396,30 @@ graph LR
 
 Iris serves a React single-page interface at `/mail` for people reviewing and
 steering agent activity. It provides projects, a unified inbox, message and
-thread detail, full-text search with FTS5 and a SQL LIKE fallback, composing
-and replying, account preferences, and administration of human users and
-project roles.
+thread detail, full-text search with FTS5 and a SQL LIKE fallback, file
+reservations, composing and replying, account preferences, and administration
+of human users and project roles.
 
 - Where it lives: `ui/`, built into `mcp_agent_mail.http` and served under
   `/mail`.
 - Who it is for: human users. Agents use the MCP tools and resources.
+
+### What it looks like
+
+Every image below is a capture of this interface running against seeded
+demonstration data. No screenshot shows a real project.
+
+| | |
+|---|---|
+| **File reservations** — who is holding which paths, and under what kind of claim.<br>![The reservations view](screenshots/webp/iris_reservations.webp) | **Message detail** — routing, thread, and the Markdown body as the agent sent it.<br>![A message in detail](screenshots/webp/iris_message_detail.webp) |
+| **Compose** — an administrator instructing named agents, with a live Markdown preview.<br>![The compose view](screenshots/webp/iris_compose.webp) | **Search** — full-text across every project the account can reach.<br>![The search view](screenshots/webp/iris_search.webp) |
+| **Thread** — a conversation collapsed to its messages.<br>![A thread](screenshots/webp/iris_thread.webp) | **Projects** — the projects an account has been assigned.<br>![The projects view](screenshots/webp/iris_projects.webp) |
+| **Administration** — per-project viewer or operator access for member accounts.<br>![The administration view](screenshots/webp/iris_administration.webp) | **Account** — display name, interface language, and correspondence language.<br>![The account view](screenshots/webp/iris_account.webp) |
+
+The **Reservations** view carries the same warning the rest of the system does:
+a reservation is an advisory signal, not a lock. It tells you who intends to
+edit a path, and `Legacy claim` or `Inactive owner` tells you when that
+intention is no longer backed by a running execution.
 
 ### Launching the Web UI
 
@@ -420,6 +437,10 @@ uv run python -m mcp_agent_mail.http --host 127.0.0.1 --port 8765
 # or:
 uv run uvicorn mcp_agent_mail.http:create_app --factory --host 127.0.0.1 --port 8765
 ```
+
+Either way, `/mail` opens on a sign-in page rather than on your correspondence:
+
+![The Iris sign-in page](screenshots/webp/iris_sign_in.webp)
 
 Auth notes:
 - Human access uses the `/mail/login` session cookie. Set a long random `MAIL_UI_SESSION_SECRET`, keep `MAIL_UI_AUTH_ENABLED=true`, and create the first admin explicitly with `mcp-agent-mail ui-users add <name> --role admin`.
@@ -542,7 +563,7 @@ or route handling. Every unlisted path returns 404.
 
 | Surface | What you can do |
 |---|---|
-| `/mail` | Use the interface: projects, inbox, search, message and thread detail, compose and reply, account, and administration. |
+| `/mail` | Use the interface: projects, inbox, search, message and thread detail, file reservations, compose and reply, account, and administration. |
 | `/mail/login`, `/mail/logout` | Sign in and out. |
 | `/mail/events` | Receive server-sent events used by the interface. |
 | `/mail/api/v1/**` | Use the typed JSON API consumed by the interface. Every response has a declared Pydantic model, and every route has an explicit security class. |
@@ -555,11 +576,13 @@ interface. These are the only legacy paths that still resolve.
 #### Retired surfaces
 
 The source still contains the former per-agent inbox, attachments browser,
-file-reservations page, archive explorer, and UI write routes. The allowlist
-returns 404 for those paths.
+server-rendered file-reservations page, archive explorer, and UI write routes.
+The allowlist returns 404 for those paths.
 
-- **File reservations** are available to operators and administrators through
-  `GET /mail/api/v1/reservations`, and through MCP tools and
+- **File reservations** returned as a **Reservations** view in the interface,
+  rebuilt on `GET /mail/api/v1/reservations`. It is visible to operators and
+  administrators; a viewer-only account does not see it. The same data is
+  available through MCP tools and
   `iris file_reservations active|list|soon`.
 - **Attachment metadata** appears in message detail, but attachments cannot be
   downloaded there.

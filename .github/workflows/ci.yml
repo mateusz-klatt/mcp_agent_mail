@@ -101,7 +101,11 @@ jobs:
           # allowed to skip when a host browser is unavailable.
           AGENT_MAIL_BROWSER_UAT_REQUIRED: "1"
         run: |
-          uv run -m pytest -q --cov-report=xml:coverage.xml
+          # A hard per-test ceiling turns silent multi-hour crawls and event-loop
+          # deadlocks into named failures with thread dumps, and the durations
+          # report ranks the offenders — without it a leg that exceeds the job
+          # timeout is killed before pytest prints anything at all.
+          uv run -m pytest -q --cov-report=xml:coverage.xml --timeout=300 --timeout-method=thread --durations=50
 
       - name: Run AgentExecution integration showcase
         shell: bash
@@ -302,7 +306,11 @@ jobs:
         env:
           PYTHONUTF8: "1"
         run: |
-          uv run -m pytest -q --no-cov
+          # Same per-test ceiling as the Ubuntu leg. On Windows the suite has
+          # crawled at up to 32 s/test in the CLI band and been killed by the
+          # job timeout with zero output; the ceiling plus durations report is
+          # what makes those runs diagnosable at all.
+          uv run -m pytest -q --no-cov --timeout=300 --timeout-method=thread --durations=50
 
   sonar:
     name: SonarCloud

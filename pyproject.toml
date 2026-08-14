@@ -61,6 +61,7 @@ dependencies = [
   "ruff>=0.14.1,<0.15",
   "pynacl>=1.6.0",
   "psutil>=6.1.1",
+  "alembic>=1.19.1",
 ]
 
 [project.optional-dependencies]
@@ -69,7 +70,6 @@ postgres = [
 ]
 dev = [
   "ruff>=0.5.7,<0.15",
-  "mypy>=1.11.1",
   "pytest>=8.3.3",
   "pytest-asyncio>=0.23.8",
   "pytest-cov>=5.0.0",
@@ -141,16 +141,17 @@ ignore = [
 known-first-party = ["mcp_agent_mail"]
 combine-as-imports = true
 
-[tool.mypy]
-python_version = "3.14"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = true
-disallow_incomplete_defs = true
-check_untyped_defs = true
-no_implicit_optional = true
-strict_optional = true
-plugins = []
+# There is deliberately no [tool.mypy] section. This project type-checks with
+# `ty` (pinned in .github/workflows/ci.yml and the Makefile, run as
+# `ty check --python-version 3.14 --python-platform all`), and that is the only
+# type checker in the gate.
+#
+# A `[tool.mypy]` block declaring `disallow_untyped_defs` and friends used to
+# live here while nothing ever invoked mypy -- not CI, not `make typecheck`,
+# not a pre-commit hook. Configuration that looks like a guarantee and enforces
+# nothing is worse than no configuration: it invites a reader to assume a
+# standard the code has never been held to. Run two checkers or one, but do not
+# advertise a second one that never runs.
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

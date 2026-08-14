@@ -9,7 +9,6 @@ it. Measured as the cause of three production corruptions on 2026-08-14.
 
 from __future__ import annotations
 
-import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -107,6 +106,6 @@ def test_walk_still_persists_the_archive_files(tmp_path: Path) -> None:
         document.write_text("body\n", encoding="utf-8")
         _fsync_archive_initialization_tree_sync(root, database)
         assert document.read_text(encoding="utf-8") == "body\n"
-        assert os.path.exists(root / ".gitattributes")
+        assert (root / ".gitattributes").exists()
     finally:
         connection.close()

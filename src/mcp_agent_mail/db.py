@@ -33,7 +33,10 @@ from pathlib import Path
 from typing import Any, Final, TypeVar, cast
 
 import anyio
-from sqlalchemy import CheckConstraint, MetaData
+from alembic import command as alembic_command
+from alembic.config import Config as AlembicConfig
+from alembic.runtime.migration import MigrationContext
+from sqlalchemy import CheckConstraint, MetaData, inspect as sa_inspect
 from sqlalchemy.exc import OperationalError, TimeoutError as SATimeoutError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.schema import CreateIndex, CreateTable
@@ -1336,6 +1339,49 @@ async def _migrate_ui_users_locale_schema(engine: AsyncEngine) -> None:
             await connection.commit()
 
 
+_BASELINE_REVISION: Final[str] = "0001baseline"
+
+
+def _alembic_config(connection: Any) -> AlembicConfig:
+    """Build an Alembic config bound to an already-open connection.
+
+    The connection is handed through ``attributes`` rather than letting Alembic
+    open its own: migrations must run on the same engine, inside the same
+    transaction, as the schema work that precedes them.
+    """
+    config = AlembicConfig()
+    config.set_main_option(
+        "script_location", str(Path(__file__).resolve().parent / "migrations")
+    )
+    config.attributes["connection"] = connection
+    return config
+
+
+def _align_alembic_version(connection: Any, *, was_fresh: bool) -> None:
+    """Bring ``alembic_version`` in line with what ``ensure_schema`` just built.
+
+    The two cases are not interchangeable and getting them the wrong way round
+    is the classic failure of introducing Alembic into a live project:
+
+    * **fresh database** -- ``create_all`` built it from *current* models, so it
+      already contains every column any existing revision would add. It is
+      stamped at **head**; replaying revisions would fail on columns that are
+      already there.
+    * **pre-existing database** -- it predates Alembic and matches the baseline,
+      so it is stamped at the **baseline** and every later revision applies to
+      it in order.
+
+    Once stamped, both run ``upgrade head``, which is a no-op for the fresh case
+    and the actual migration path for the old one.
+    """
+    context = MigrationContext.configure(connection)
+    already_tracked = context.get_current_revision() is not None
+    config = _alembic_config(connection)
+    if not already_tracked:
+        alembic_command.stamp(config, "head" if was_fresh else _BASELINE_REVISION)
+    alembic_command.upgrade(config, "head")
+
+
 @retry_on_db_lock(max_retries=7, base_delay=0.1, max_delay=8.0, use_circuit_breaker=False)
 async def ensure_schema(settings: Settings | None = None) -> None:
     """Ensure database schema exists (creates tables from SQLModel definitions).
@@ -1361,6 +1407,12 @@ async def ensure_schema(settings: Settings | None = None) -> None:
         init_engine(settings)
         engine = get_engine()
         async with engine.begin() as conn:
+            # Observed BEFORE create_all, because afterwards every database
+            # looks alike. It decides where Alembic is stamped at the end, and
+            # that decision cannot be recovered later.
+            was_fresh = not await conn.run_sync(
+                lambda sync_conn: sa_inspect(sync_conn).has_table("agents")
+            )
             # Pure SQLModel: create tables from metadata
             # (WAL mode is set automatically via event listener in _build_engine)
             await conn.run_sync(SQLModel.metadata.create_all)
@@ -1385,6 +1437,11 @@ async def ensure_schema(settings: Settings | None = None) -> None:
         await _migrate_ui_users_locale_schema(engine)
         async with engine.begin() as conn:
             await conn.run_sync(_setup_fts)
+        # Last, so that a revision can rely on everything above having run.
+        async with engine.begin() as conn:
+            await conn.run_sync(
+                lambda sync_conn: _align_alembic_version(sync_conn, was_fresh=was_fresh)
+            )
         _schema_ready = True
 
 

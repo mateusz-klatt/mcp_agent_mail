@@ -446,6 +446,21 @@ def test_copilot_runtime_path_dedupe_is_bash_32_nounset_safe() -> None:
 
 def _bash(script: str, *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     process_env = os.environ.copy()
+    # The hooks honour "environment wins" over the shared env file, so any
+    # Agent Mail value inherited from the HOST leaks straight into an
+    # assertion: on a machine whose repo `.env` holds a live bearer (leaked
+    # into this process by an import-time load_dotenv), the token printed by a
+    # fixture is the production one, not the fixture's. Green on CI, red on
+    # every operator machine — and the diff prints the real secret. Neutralize
+    # here; a test that wants one of these sets it explicitly via `env`.
+    for leaked in (
+        "HTTP_BEARER_TOKEN",
+        "AGENT_MAIL_TOKEN",
+        "AGENT_MAIL_URL",
+        "AGENT_MAIL_STATE_DIR",
+        "AGENT_MAIL_ENV_FILE",
+    ):
+        process_env.pop(leaked, None)
     process_env.update(env or {})
     return subprocess.run(
         [BASH, "--noprofile", "--norc", "-c", script],

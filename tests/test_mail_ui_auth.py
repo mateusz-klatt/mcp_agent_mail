@@ -2202,6 +2202,7 @@ class TestMailUiPreferences:
             "/mail/api/v1/me/profile",
             "/mail/api/v1/projects",
             "/mail/api/v1/projects/{project_id}/agents",
+            "/mail/api/v1/reservations",
             "/mail/api/v1/search",
             "/mail/api/v1/deliveries/{delivery_id}",
             "/mail/api/v1/deliveries/{delivery_id}/retry",
@@ -2337,6 +2338,7 @@ class TestMailUiPreferences:
                 "MailUiProjectAgentsResponse"
             ),
             "/mail/api/v1/inbox": "MailUiInboxResponse",
+            "/mail/api/v1/reservations": "MailUiReservationsResponse",
             "/mail/api/v1/search": "MailUiSearchResponse",
             "/mail/api/v1/projects/{project_id}/messages/{message_id}": (
                 "MailUiMessageDetail"
@@ -5436,6 +5438,10 @@ class TestMailUiRbacSurface:
             "/mail/api/v1/me/preferences": "self-only",
             "/mail/api/v1/projects": "aggregate-scoped",
             "/mail/api/v1/projects/{project_id}/agents": "admin-only",
+            # Operator or admin, never a plain viewer: a claim carries a
+            # path pattern and a reason, and the live set of them
+            # describes what is being worked on where.
+            "/mail/api/v1/reservations": "aggregate-scoped",
             "/mail/api/v1/deliveries/{delivery_id}": "self-only",
             "/mail/api/v1/projects/{project_id}/messages/{message_id}": (
                 "project-guarded"

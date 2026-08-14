@@ -2261,6 +2261,51 @@ class MailUiAgentDirectoryItem(BaseModel):
     notify_sound: str | None = None
 
 
+MailUiReservationScopeState = Literal[
+    "execution_scoped", "legacy_unscoped", "orphaned"
+]
+
+
+class MailUiReservationItem(BaseModel):
+    """One live advisory claim, shaped for a human operator.
+
+    Deliberately smaller than the row behind it. `execution_id`, its ancestry
+    and the execution's raw status are session topology: they let a reader
+    reconstruct who is running what, where, and are not needed to answer the
+    only question this view exists for -- who is holding which path, since when,
+    and until when. `scope_state` carries the part that *is* actionable.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int = Field(gt=0)
+    project_id: int = Field(gt=0)
+    project_slug: str
+    # Null once the owning agent row is gone; the claim outlives it on purpose
+    # so the sweeper can still release it rather than pinning the path forever.
+    holder_name: str | None
+    holder_display_name: str | None
+    path_pattern: str
+    exclusive: bool
+    reason: str
+    created_ts: str
+    # Null only when the stored value cannot be parsed. Reporting the claim
+    # without its expiry beats dropping it: a warning that turns out to be stale
+    # costs a glance, a claim that vanishes costs a collision.
+    expires_ts: str | None
+    origin: str
+    scope_state: MailUiReservationScopeState
+
+
+class MailUiReservationsResponse(BaseModel):
+    """Keyset page of live advisory claims across the operator's projects."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[MailUiReservationItem]
+    next_cursor: str | None
+
+
 class MailUiProjectAgentsResponse(BaseModel):
     """Privacy-minimal recipient directory for one active project."""
 
@@ -2447,16 +2492,60 @@ class MailUiDeliveryResponse(BaseModel):
 
 _MAIL_UI_CURSOR_VERSION = 1
 _MAIL_UI_CURSOR_MAX_LENGTH = 512
-_MAIL_UI_CREATED_TS_KEY_SQL = (
-    "CASE "
-    "WHEN instr(CAST(m.created_ts AS TEXT), '.') = 0 "
-    "THEN CAST(m.created_ts AS TEXT) || '.000000' "
-    "ELSE substr(CAST(m.created_ts AS TEXT), 1, "
-    "instr(CAST(m.created_ts AS TEXT), '.') - 1) || '.' || "
-    "substr(substr(CAST(m.created_ts AS TEXT), "
-    "instr(CAST(m.created_ts AS TEXT), '.') + 1) || '000000', 1, 6) "
-    "END"
+def _mail_ui_timestamp_key_sql(column: str) -> str:
+    """Normalise one SQLite timestamp column to `YYYY-MM-DD HH:MM:SS.ffffff`.
+
+    SQLite stores these as TEXT and whole-second values arrive without a
+    fractional part, so `'…:34' < '…:34.000001'` compares short strings against
+    long ones. Padding to a fixed width makes lexical order exact, which is what
+    both keyset pagination and an expiry comparison need.
+    """
+    text_column = f"CAST({column} AS TEXT)"
+    return (
+        "CASE "
+        f"WHEN instr({text_column}, '.') = 0 "
+        f"THEN {text_column} || '.000000' "
+        f"ELSE substr({text_column}, 1, instr({text_column}, '.') - 1) || '.' || "
+        f"substr(substr({text_column}, instr({text_column}, '.') + 1) || '000000', 1, 6) "
+        "END"
+    )
+
+
+_MAIL_UI_CREATED_TS_KEY_SQL = _mail_ui_timestamp_key_sql("m.created_ts")
+_MAIL_UI_TIMESTAMP_KEY_PATTERN = re.compile(
+    r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6}$"
 )
+
+
+def _mail_ui_optional_timestamp_key(raw: Any) -> str | None:
+    """Return a normalised timestamp, or None when the stored value is not one.
+
+    The row is kept either way -- see the expiry predicate in
+    `mail_ui_reservations_v1` -- so the client is told "this claim is live and
+    its expiry is unreadable" rather than being shown nothing at all.
+    """
+    if raw is None:
+        return None
+    candidate = str(raw)
+    return candidate if _MAIL_UI_TIMESTAMP_KEY_PATTERN.match(candidate) else None
+
+
+def _mail_ui_reservation_scope_state(row: Any) -> MailUiReservationScopeState:
+    """Classify how firmly one claim is tied to a run that still exists.
+
+    None of these mean the claim is void. Compatibility checks still observe it
+    until it is released or expires, so the vocabulary avoids words like stale
+    or invalid: an operator acting on "this one is dead" would be wrong.
+    """
+    if row["execution_id"] is None:
+        # Predates the execution model. Valid, unattributable to a single run,
+        # and the population that has to reach zero before the rollout can move
+        # from observe to enforce.
+        return "legacy_unscoped"
+    if row["execution_status"] != "active" or row["holder_name"] is None:
+        # The run that took it has finished, or the agent row is gone entirely.
+        return "orphaned"
+    return "execution_scoped"
 
 
 async def _mail_ui_begin_read_snapshot(session: AsyncSession) -> None:
@@ -6881,6 +6970,158 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 items=items,
                 total=len(items),
             )
+
+        @fastapi_app.get(
+            "/mail/api/v1/reservations",
+            response_model=MailUiReservationsResponse,
+            responses=_MAIL_UI_DELIVERY_ERROR_RESPONSES,
+        )
+        async def mail_ui_reservations_v1(
+            request: Request,
+            project_id: Annotated[int | None, Query(gt=0)] = None,
+            limit: Annotated[int, Query(ge=1, le=100)] = 50,
+            cursor: Annotated[
+                str | None,
+                Query(min_length=1, max_length=_MAIL_UI_CURSOR_MAX_LENGTH),
+            ] = None,
+        ) -> MailUiReservationsResponse:
+            """Return live advisory claims for projects the caller may operate.
+
+            Restricted to operator and admin rather than everyone who can view a
+            project: a claim carries a path pattern and a free-text reason, and
+            the set of them at a moment in time describes what is being worked
+            on where. That is repository structure and current activity, which a
+            viewer has no need for.
+            """
+            cursor_key = _mail_ui_decode_cursor(cursor) if cursor is not None else None
+            await ensure_schema()
+            async with get_session() as session:
+                # Deliberately NOT `_mail_ui_revalidated_admin_user`: that
+                # revalidates an *admin* claim, and this view is for operators
+                # too. Visibility and the operate check below carry the
+                # authorization instead.
+                visible_roles = await _mail_ui_visible_project_roles(
+                    settings=settings,
+                    request=request,
+                    session=session,
+                )
+                operable = {
+                    pid
+                    for pid, role in visible_roles.items()
+                    # `None` is the administrator (and the explicit
+                    # auth-disabled development mode), which sees every project.
+                    if role is None or webauth.project_role_allows_operate(role)
+                }
+                if project_id is not None:
+                    if project_id not in operable:
+                        # Deliberately 404 rather than 403: a viewer must not be
+                        # able to distinguish "no such project" from "a project
+                        # you may see but not operate".
+                        raise HTTPException(
+                            status_code=status.HTTP_404_NOT_FOUND,
+                            detail="Project not found",
+                        )
+                    visible_ids = [project_id]
+                else:
+                    visible_ids = sorted(operable)
+                if not visible_ids:
+                    return MailUiReservationsResponse(items=[], next_cursor=None)
+
+                predicate, parameters = _mail_ui_visible_project_predicate(
+                    visible_ids,
+                    column="c.project_id",
+                    parameter_prefix="reservations_v1_pid",
+                )
+                created_key = _mail_ui_timestamp_key_sql("c.created_ts")
+                expires_key = _mail_ui_timestamp_key_sql("c.expires_ts")
+                # The expiry comparison happens in SQL so the keyset page stays
+                # exact -- filtering after the fact would let a page come back
+                # short and its cursor skip rows. It is safe here only because
+                # both sides are normalised to the same fixed-width text: see
+                # `mail_active_file_reservations`, where comparing a bound
+                # ISO-8601 value with a `T` separator against SQLite's
+                # space-separated storage made the predicate always false.
+                #
+                # A stored value that is not a timestamp at all is KEPT, matching
+                # that endpoint: an unparseable expiry is reported rather than
+                # silently dropped.
+                page_parameters: dict[str, Any] = {
+                    **parameters,
+                    "now_key": datetime.now(timezone.utc)
+                    .replace(tzinfo=None)
+                    .strftime("%Y-%m-%d %H:%M:%S.%f"),
+                    "page_limit": limit + 1,
+                }
+                cursor_predicate = ""
+                if cursor_key is not None:
+                    cursor_created, cursor_id = cursor_key
+                    cursor_predicate = (
+                        f" AND ({created_key} < :cursor_created "
+                        f"OR ({created_key} = :cursor_created AND c.id < :cursor_id))"
+                    )
+                    page_parameters["cursor_created"] = cursor_created
+                    page_parameters["cursor_id"] = cursor_id
+
+                rows = await session.execute(
+                    text(
+                        "SELECT c.id, c.project_id, p.slug AS project_slug, "
+                        "c.path_pattern, c.exclusive, c.reason, c.origin, "
+                        f"{created_key} AS created_key, "
+                        f"{expires_key} AS expires_key, "
+                        "c.execution_id, a.name AS holder_name, "
+                        "a.display_name AS holder_display_name, "
+                        "e.status AS execution_status "
+                        "FROM file_reservations c "
+                        "JOIN projects p ON p.id = c.project_id "
+                        "LEFT JOIN agents a ON a.id = c.agent_id "
+                        "LEFT JOIN agent_executions e ON e.id = c.execution_id "
+                        f"WHERE {predicate} AND c.released_ts IS NULL "
+                        f"AND ({expires_key} > :now_key "
+                        f"OR {expires_key} NOT LIKE '____-__-__ __:__:__.______')"
+                        f"{cursor_predicate} "
+                        f"ORDER BY {created_key} DESC, c.id DESC "
+                        "LIMIT :page_limit"
+                    ),
+                    page_parameters,
+                )
+                page_rows = list(rows.mappings().all())
+
+            has_more = len(page_rows) > limit
+            response_rows = page_rows[:limit]
+            items = [
+                MailUiReservationItem(
+                    id=int(row["id"]),
+                    project_id=int(row["project_id"]),
+                    project_slug=str(row["project_slug"]),
+                    holder_name=(
+                        str(row["holder_name"])
+                        if row["holder_name"] is not None
+                        else None
+                    ),
+                    holder_display_name=(
+                        str(row["holder_display_name"])
+                        if row["holder_display_name"] is not None
+                        else None
+                    ),
+                    path_pattern=str(row["path_pattern"]),
+                    exclusive=bool(row["exclusive"]),
+                    reason=str(row["reason"] or ""),
+                    created_ts=str(row["created_key"]),
+                    expires_ts=_mail_ui_optional_timestamp_key(row["expires_key"]),
+                    origin=str(row["origin"]),
+                    scope_state=_mail_ui_reservation_scope_state(row),
+                )
+                for row in response_rows
+            ]
+            next_cursor = (
+                _mail_ui_encode_cursor(
+                    str(response_rows[-1]["created_key"]),
+                    int(response_rows[-1]["id"]),
+                )
+                if has_more and response_rows
+                else None
+            )
+            return MailUiReservationsResponse(items=items, next_cursor=next_cursor)
 
         @fastapi_app.get(
             "/mail/api/v1/inbox",

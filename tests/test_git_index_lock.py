@@ -352,7 +352,11 @@ class TestCommitRetryIntegration:
 
         monkeypatch.setattr(Repo, "clone_from", capture_clone)
 
-        storage_module._restore_bundle_into_archive(bundle, target)
+        # `None` because this fixture's target is an empty temporary
+        # directory with no database inside it -- the one case the
+        # parameter's contract allows it. It is required rather than
+        # defaulted precisely so this decision is made at every call.
+        storage_module._restore_bundle_into_archive(bundle, target, None)
 
         assert clone_calls == [
             (

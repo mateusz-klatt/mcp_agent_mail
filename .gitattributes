@@ -1,3 +1,28 @@
+# Store and check out every text file with LF, on every platform.
+#
+# This must be the FIRST rule: Git applies the LAST matching pattern, so the
+# binary and per-type exceptions below deliberately follow it.
+#
+# `*.sh text eol=lf` was added for bash, but the problem is not specific to
+# shell. Git for Windows ships `core.autocrlf=true` system-wide, so every other
+# tracked text file still smudges to CRLF on checkout while the Git object
+# stays LF. Measured on a Windows checkout: `ui/src/app.css` carried 2336 CR
+# bytes in the working tree and 0 in the object, and
+# `ui/src/flagPolyfill.test.ts` — which asserts a `\n` literal against the file
+# it reads at runtime — failed there and only there. Python, TypeScript and CSS
+# were all unprotected: 186, 61 and 5 tracked files respectively.
+#
+# `text=auto` leaves content Git detects as binary alone, and the explicit
+# exceptions below state that intent rather than relying on the detection.
+* text=auto eol=lf
+
+# Bytes, not text. Several are hash-pinned and any conversion breaks the hash.
+*.png binary
+*.gif binary
+*.mp4 binary
+*.webp binary
+*.woff2 binary
+*.wasm binary
 
 # Use bd merge for beads JSONL files
 .beads/issues.jsonl merge=beads

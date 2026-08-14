@@ -109,11 +109,23 @@ AGENT_MAIL_HOOKS=(
   # plugin being installed.
   inbox_watch_monitor.sh
 )
+
+# A native Windows checkout may contain CRLF hook sources because of the
+# operator's Git settings.  Claude executes the installed copies with Git Bash,
+# so canonicalize only CRLF terminators while streaming each source.  This
+# leaves any embedded carriage return untouched and guarantees LF hook files.
+_normalized_hook_source() {
+  local source="$1" line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    printf '%s\n' "${line%$'\r'}"
+  done < "$source"
+}
+
 _hooks_missing=()
 for _h in "${AGENT_MAIL_HOOKS[@]}"; do
   if [[ ! -f "${ROOT_DIR}/scripts/hooks/${_h}" ]]; then
     _hooks_missing+=("${_h}")
-  elif ! bash -n "${ROOT_DIR}/scripts/hooks/${_h}"; then
+  elif ! _normalized_hook_source "${ROOT_DIR}/scripts/hooks/${_h}" | bash -n; then
     log_err "Required hook script has invalid shell syntax: ${_h}"
     log_err "No user configuration was changed."
     exit 1
@@ -587,7 +599,8 @@ write_shared_agent_mail_env "${_URL}" "${_TOKEN}" || {
 log_step "Installing the hook scripts"
 _hooks_installed=0
 for _h in "${AGENT_MAIL_HOOKS[@]}"; do
-  write_atomic "${HOOKS_DIR}/${_h}" < "${ROOT_DIR}/scripts/hooks/${_h}"
+  _normalized_hook_source "${ROOT_DIR}/scripts/hooks/${_h}" | \
+    write_atomic "${HOOKS_DIR}/${_h}"
   if [[ "${_h}" == "agent_mail_common.sh" ]]; then
     set_secure_file "${HOOKS_DIR}/${_h}" || exit 1
   else

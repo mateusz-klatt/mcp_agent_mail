@@ -1012,6 +1012,89 @@ def _integration_env(home: Path, fake_bin: Path) -> dict[str, str]:
     }
 
 
+@pytest.mark.parametrize("client", ["claude", "codex"])
+def test_integrators_install_lf_only_hooks_from_crlf_sources(
+    tmp_path: Path,
+    client: str,
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    fake_bin = tmp_path / "bin"
+    source_root = tmp_path / f"{client}-crlf-source"
+    source_scripts = source_root / "scripts"
+    source_hooks = source_scripts / "hooks"
+    for directory in (home, project, fake_bin, source_hooks):
+        directory.mkdir(parents=True)
+
+    integrator = source_scripts / INTEGRATORS[client].name
+    integrator.write_bytes(INTEGRATORS[client].read_bytes())
+    (source_scripts / "lib.sh").write_bytes(LIB.read_bytes())
+    hook_names = (
+        (
+            "agent_mail_common.sh",
+            "session_start.sh",
+            "inbox_check.sh",
+            "reservations_warn.sh",
+            "autoreserve.sh",
+            "session_end.sh",
+            "inbox_watch.sh",
+            "inbox_watch_monitor.sh",
+        )
+        if client == "claude"
+        else ("codex_notify.sh", "agent_mail_common.sh")
+    )
+    for hook_name in hook_names:
+        source = ROOT / "scripts" / "hooks" / hook_name
+        source_bytes = source.read_bytes()
+        assert b"\r" not in source_bytes
+        crlf_bytes = source_bytes.replace(b"\n", b"\r\n")
+        assert b"\r\n" in crlf_bytes
+        (source_hooks / hook_name).write_bytes(crlf_bytes)
+
+    env = {**os.environ, **_integration_env(home, fake_bin)}
+    if os.name == "nt":
+        # Keep this regression focused on line-ending publication.  Native
+        # launcher discovery has a separate simulated-Windows contract below.
+        env["AGENT_MAIL_GIT_BASH_PATH"] = _git_bash_path(BASH)
+    result = subprocess.run(
+        [
+            BASH,
+            _git_bash_path(integrator),
+            "--yes",
+            "--project-dir",
+            _git_bash_path(project),
+        ],
+        cwd=source_root,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    installed_dir = (
+        home / ".claude" / "hooks" / "mcp-agent-mail"
+        if client == "claude"
+        else home / ".codex" / "hooks" / "mcp-agent-mail"
+    )
+    installed_hooks = sorted(installed_dir.glob("*.sh"))
+    expected_installed_names = (
+        set(hook_names)
+        if client == "claude"
+        else {"agent_mail_common.sh", "agent_mail_hook.sh", "hook_wrapper.sh"}
+    )
+    assert {path.name for path in installed_hooks} == expected_installed_names
+    for installed_hook in installed_hooks:
+        assert b"\r" not in installed_hook.read_bytes(), installed_hook.name
+        syntax = subprocess.run(
+            [BASH, "-n", _git_bash_path(installed_hook)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert syntax.returncode == 0, f"{installed_hook.name}: {syntax.stderr}"
+
+
 def test_client_integration_environment_hides_language_toolchains(
     tmp_path: Path,
 ) -> None:
@@ -3410,6 +3493,8 @@ case "$1" in
     case "$2" in
       'D:\Profiles\Codex') printf '%s\n' "$FAKE_CODEX_POSIX" ;;
       'Q:\AgentMail\shared.env') printf '%s\n' "$FAKE_AGENT_MAIL_ENV_POSIX" ;;
+      'D:\Portable Git\bin\bash.exe'|'D:/Portable Git/bin/bash.exe')
+        printf '%s\n' "$FAKE_OVERRIDE_BASH" ;;
       *) printf '%s\n' "$2" ;;
     esac ;;
   -m)
@@ -3422,6 +3507,7 @@ case "$1" in
     esac ;;
   -w)
     case "$2" in
+      "$FAKE_DETECTED_BASH") printf '%s\n' 'D:\Portable Git\bin\bash.exe' ;;
       */bash|*/bash.exe|*/portable-git-bash)
         printf '%s\n' 'D:\Portable Git\usr\bin\bash.exe' ;;
       *) printf '%s\n' 'D:\Profiles\Codex\hooks\mcp-agent-mail\hook_wrapper.sh' ;;
@@ -3451,6 +3537,7 @@ esac
         "FAKE_AGENT_MAIL_ENV_POSIX": _git_bash_path(agent_mail_env),
         "FAKE_CODEX_POSIX": _git_bash_path(codex_dir),
         "FAKE_DETECTED_BASH": detected_bash_path,
+        "FAKE_OVERRIDE_BASH": _git_bash_path(portable_bash),
         "FAKE_GIT_BIN_MIXED": fake_git_mixed,
         "FAKE_GIT_BIN_POSIX": fake_git_posix,
         "PATH": f"{_git_bash_path(git_bin)}:{integration_env['PATH']}",
@@ -3462,7 +3549,11 @@ esac
             }
         )
     if use_override:
-        env["AGENT_MAIL_GIT_BASH_PATH"] = _git_bash_path(portable_bash)
+        env["AGENT_MAIL_GIT_BASH_PATH"] = (
+            r"D:\Portable Git\bin\bash.exe"
+            if client == "codex"
+            else _git_bash_path(portable_bash)
+        )
     if debug_resolution:
         env["AGENT_MAIL_DEBUG_BASH_RESOLUTION"] = "1"
 
@@ -3518,8 +3609,18 @@ esac
             if "mcp-agent-mail" in handler.get("command", "")
         ]
         assert len(managed_handlers) == 6
+        expected_bash = (
+            "D:/Portable Git/bin/bash.exe"
+            if use_override
+            else r"D:\Portable Git\bin\bash.exe"
+        )
         assert all(
-            "D:\\Portable Git\\usr\\bin\\bash.exe" in handler["commandWindows"]
+            expected_bash in handler["commandWindows"]
+            for handler in managed_handlers
+        )
+        assert all(
+            r"D:\Portable Git\usr\bin\bash.exe" not in handler["commandWindows"]
+            and "D:/Portable Git/usr/bin/bash.exe" not in handler["commandWindows"]
             for handler in managed_handlers
         )
 

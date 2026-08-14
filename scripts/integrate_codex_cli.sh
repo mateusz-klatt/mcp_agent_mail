@@ -133,6 +133,17 @@ _TOKEN="$(resolve_global_integration_bearer_token)" || {
 log_ok "Using MCP endpoint: ${_URL}"
 log_ok "Codex identity template: ${_AGENT}"
 
+# Git may materialize tracked shell sources with CRLF in a native Windows
+# checkout.  The installed copies are executed by Git Bash, so publish a
+# canonical LF stream instead of copying checkout bytes verbatim.  Strip only
+# the CR that terminates a CRLF line; an embedded carriage return remains data.
+_normalized_hook_source() {
+  local source="$1" line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    printf '%s\n' "${line%$'\r'}"
+  done < "$source"
+}
+
 # Validate all source and destination inputs before the first write.  This is
 # what makes both --dry-run and a refused merge genuinely side-effect free.
 for _source in \
@@ -142,7 +153,7 @@ for _source in \
     log_err "Missing required hook script: ${_source}"
     exit 1
   fi
-  if ! bash -n "${_source}"; then
+  if ! _normalized_hook_source "${_source}" | bash -n; then
     log_err "Required hook script has invalid shell syntax: ${_source}"
     log_err "No user configuration was changed."
     exit 1
@@ -266,8 +277,17 @@ case "$(uname -s 2>/dev/null || printf unknown)" in
           _candidate="$(cygpath -u "$AGENT_MAIL_GIT_BASH_PATH" 2>/dev/null)" || {
             log_err "Could not normalize AGENT_MAIL_GIT_BASH_PATH."
             exit 1
+          }
+          # Preserve the explicitly named Windows executable.  A Git Bash
+          # cygpath round trip is not identity-preserving here: Git/bin maps to
+          # /bin, which maps back to the different Git/usr/bin raw shell.
+          _WINDOWS_BASH="${AGENT_MAIL_GIT_BASH_PATH//\\//}" ;;
+        /*)
+          _candidate="$AGENT_MAIL_GIT_BASH_PATH"
+          _WINDOWS_BASH="$(cygpath -w "$_candidate" 2>/dev/null)" || {
+            log_err "Could not translate AGENT_MAIL_GIT_BASH_PATH for Windows."
+            exit 1
           } ;;
-        /*) _candidate="$AGENT_MAIL_GIT_BASH_PATH" ;;
         *)
           log_err "AGENT_MAIL_GIT_BASH_PATH must be an absolute Windows or Git Bash path."
           exit 1 ;;
@@ -276,14 +296,27 @@ case "$(uname -s 2>/dev/null || printf unknown)" in
         log_err "AGENT_MAIL_GIT_BASH_PATH is not an executable Git Bash: ${AGENT_MAIL_GIT_BASH_PATH}"
         exit 1
       fi
-      _WINDOWS_BASH="$(cygpath -w "$_candidate" 2>/dev/null)" || {
-        log_err "Could not translate AGENT_MAIL_GIT_BASH_PATH for Windows."
-        exit 1
-      }
     else
-      _current_bash="$(command -v bash 2>/dev/null || true)"
-      for _candidate in "$_current_bash" "/c/Program Files/Git/bin/bash.exe" "/c/Program Files (x86)/Git/bin/bash.exe"; do
-        if [[ -n "$_candidate" && -x "$_candidate" ]]; then
+      # `command -v bash` inside Git Bash normally returns /usr/bin/bash: the
+      # raw MSYS shell.  Codex launches commandWindows outside that environment,
+      # where the raw shell does not initialise MSYSTEM or Git's runtime PATH.
+      # Locate the Git installation from git.exe and deliberately choose its
+      # bin/bash.exe launcher.  Requiring both shipped shells identifies the
+      # install root and avoids mistaking Git/usr for it.
+      _git_bin="$(command -v git 2>/dev/null || true)"
+      _git_root=""
+      _git_roots=()
+      if [[ -n "$_git_bin" ]]; then
+        _git_root="$(cygpath -m "$_git_bin" 2>/dev/null || true)"
+      fi
+      while [[ -n "$_git_root" && "$_git_root" == */* ]]; do
+        _git_root="${_git_root%/*}"
+        _git_roots+=("$_git_root")
+      done
+      for _candidate_root in ${_git_roots[@]+"${_git_roots[@]}"}; do
+        if [[ -x "${_candidate_root}/bin/bash.exe" && \
+              -x "${_candidate_root}/usr/bin/bash.exe" ]]; then
+          _candidate="${_candidate_root}/bin/bash.exe"
           _WINDOWS_BASH="$(cygpath -w "$_candidate" 2>/dev/null)" || {
             log_err "Could not translate Git Bash for Windows."
             exit 1
@@ -291,6 +324,19 @@ case "$(uname -s 2>/dev/null || printf unknown)" in
           break
         fi
       done
+      if [[ -z "$_WINDOWS_BASH" ]]; then
+        for _candidate in \
+          "/c/Program Files/Git/bin/bash.exe" \
+          "/c/Program Files (x86)/Git/bin/bash.exe"; do
+          if [[ -x "$_candidate" ]]; then
+            _WINDOWS_BASH="$(cygpath -w "$_candidate" 2>/dev/null)" || {
+              log_err "Could not translate Git Bash for Windows."
+              exit 1
+            }
+            break
+          fi
+        done
+      fi
     fi
     if [[ -z "$_WINDOWS_BASH" ]]; then
       log_err "Windows detected but Git for Windows bash.exe was not found."
@@ -1137,10 +1183,11 @@ write_shared_agent_mail_env "${_URL}" "${_TOKEN}" || {
 }
 
 log_step "Installing Codex lifecycle scripts"
-write_atomic "$HOOK_RUNTIME" < "${ROOT_DIR}/scripts/hooks/codex_notify.sh"
+_normalized_hook_source "${ROOT_DIR}/scripts/hooks/codex_notify.sh" | \
+  write_atomic "$HOOK_RUNTIME"
 set_secure_exec "$HOOK_RUNTIME" || exit 1
-write_atomic "${HOOKS_DIR}/agent_mail_common.sh" \
-  < "${ROOT_DIR}/scripts/hooks/agent_mail_common.sh"
+_normalized_hook_source "${ROOT_DIR}/scripts/hooks/agent_mail_common.sh" | \
+  write_atomic "${HOOKS_DIR}/agent_mail_common.sh"
 set_secure_file "${HOOKS_DIR}/agent_mail_common.sh" || exit 1
 write_atomic "$HOOK_WRAPPER" <<<"$CODEX_WRAPPER_CONTENT"
 set_secure_exec "$HOOK_WRAPPER" || exit 1

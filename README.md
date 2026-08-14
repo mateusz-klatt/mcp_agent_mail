@@ -495,8 +495,9 @@ mounting Iris does not replace or intercept the configured MCP transport path.
 
 Generated browser bundles are not tracked in `ui/dist` or
 `src/mcp_agent_mail/ui_dist`. A standard source build requires exactly Node
-22.22.2 with npm 10.9.7 and runs both Vite builds in an isolated temporary
-directory:
+26.7.0 with npm 11.19.0 — the version the NodeSource `node_26.x` apt channel
+installs, so no second Node beside your distribution's is needed — and runs
+both Vite builds in an isolated temporary directory:
 
 ```bash
 uv build --out-dir /absolute/path/to/artifacts

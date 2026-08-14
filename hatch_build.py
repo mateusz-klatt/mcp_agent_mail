@@ -28,8 +28,18 @@ from zipfile import BadZipFile, ZipFile
 
 from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 
-_NODE_VERSION = "v22.22.2"
-_NPM_VERSION = "10.9.7"
+# Pinned to the toolchain the development hosts actually run, so that a
+# maintainer can build a wheel without installing a second Node beside the one
+# their distribution ships. Both hosts install Node from the NodeSource
+# `node_26.x` apt channel; pinning below that made the wheel unbuildable
+# everywhere except CI, which is the wrong way round for a reproducibility pin.
+#
+# Moving this REQUIRES moving `.github/workflows/ci.yml` in the same commit:
+# every `setup-node` step there feeds the same build, and a disagreement
+# between the two turns the pin from a guarantee into a trap that only fires in
+# one place.
+_NODE_VERSION = "v26.7.0"
+_NPM_VERSION = "11.19.0"
 _STAGE_PREFIX = "mcp-agent-mail-ui-build-"
 _STAGE_SENTINEL = ".mcp-agent-mail-ui-stage"
 _BUILD_MANIFEST = ".hermes-ui-build.json"

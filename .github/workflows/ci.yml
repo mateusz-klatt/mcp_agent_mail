@@ -49,10 +49,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
           allow-prereleases: true
 
-      - name: Set up Node.js 22.22.2 for distribution builds
+      - name: Set up Node.js 26.7.0 for distribution builds
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          node-version: '22.22.2'
+          node-version: '26.7.0'
           cache: npm
           cache-dependency-path: ui/package-lock.json
 
@@ -168,7 +168,7 @@ jobs:
           retention-days: 30
 
   frontend:
-    name: Frontend lint, type check, test, and build (Node 22.22.2)
+    name: Frontend lint, type check, test, and build (Node 26.7.0)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -179,10 +179,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Set up Node.js 22.22.2
+      - name: Set up Node.js 26.7.0
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          node-version: '22.22.2'
+          node-version: '26.7.0'
           cache: npm
           cache-dependency-path: ui/package-lock.json
 
@@ -213,7 +213,7 @@ jobs:
           retention-days: 7
 
   frontend-webkit:
-    name: Iris React WebKit UAT (Node 22.22.2)
+    name: Iris React WebKit UAT (Node 26.7.0)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -224,10 +224,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Set up Node.js 22.22.2
+      - name: Set up Node.js 26.7.0
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          node-version: '22.22.2'
+          node-version: '26.7.0'
           cache: npm
           cache-dependency-path: ui/package-lock.json
 
@@ -272,10 +272,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
           allow-prereleases: true
 
-      - name: Set up Node.js 22.22.2 for distribution builds
+      - name: Set up Node.js 26.7.0 for distribution builds
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          node-version: '22.22.2'
+          node-version: '26.7.0'
           cache: npm
           cache-dependency-path: ui/package-lock.json
 

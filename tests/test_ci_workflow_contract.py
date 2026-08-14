@@ -129,8 +129,16 @@ def test_sonar_uses_ubuntu_gate_while_portability_remains_required() -> None:
         assert any(line.strip() == command for line in ubuntu)
         assert any(line.strip() == command for line in portability)
 
-    assert any(line.strip() == "uv run -m pytest -q --cov-report=xml:coverage.xml" for line in ubuntu)
-    assert any(line.strip() == "uv run -m pytest -q --no-cov" for line in portability)
+    assert any(
+        line.strip()
+        == "uv run -m pytest -q --cov-report=xml:coverage.xml --timeout=300 --timeout-method=thread --durations=50"
+        for line in ubuntu
+    )
+    assert any(
+        line.strip()
+        == "uv run -m pytest -q --no-cov --timeout=300 --timeout-method=thread --durations=50"
+        for line in portability
+    )
     assert not any("--cov-report" in line for line in portability)
     assert any("tests/benchmarks/bench_*.py" in line for line in ubuntu)
     assert any("uv run python scripts/integration_showcase.py" in line for line in ubuntu)

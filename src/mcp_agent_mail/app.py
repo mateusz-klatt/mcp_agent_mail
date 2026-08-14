@@ -9578,6 +9578,63 @@ def build_mcp_server() -> FastMCP:
         await ctx.info(f"whois for '{agent_name}' in '{project.human_key}' returned {len(recent)} commits")
         return profile
 
+    @mcp.tool(name="rotate_registration_token")
+    @_instrument_tool("rotate_registration_token", cluster=CLUSTER_IDENTITY, capabilities={"identity"}, agent_arg="agent_name", project_arg="project_key")
+    async def rotate_registration_token(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        registration_token: str,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Replace this agent's registration token with a freshly minted one.
+
+        When to use
+        -----------
+        - The current token has been exposed: printed to a transcript, pasted
+          into a log, echoed by an error. Until 2026-08-14 there was no way to
+          answer that, so an exposed token stayed valid forever.
+
+        How it works
+        ------------
+        - Authenticates with the token being replaced, so only its holder can
+          rotate it, and mints the replacement atomically.
+        - **The old token stops working the moment this returns.** There is no
+          grace period, so the caller MUST persist the new value before doing
+          anything else -- the hook library's `am_cred_put` is the supported
+          way, and `agent_mail_common.sh` already implements it with locking.
+          A caller that drops the returned value locks this identity out and
+          only a human can re-register it.
+
+        Returns
+        -------
+        dict
+            { "agent": str, "project": str, "registration_token": str }
+        """
+        project = await _get_project_by_identifier(project_key)
+        agent = await _authenticate_agent(
+            ctx,
+            project,
+            agent_name,
+            registration_token,
+            token_param="registration_token",
+            action="rotate_registration_token",
+        )
+        _, token = await _ensure_agent_registration_token(
+            agent,
+            rotate=True,
+            project=project,
+        )
+        await ctx.info(
+            f"rotated the registration token for '{agent.name}' in '{project.human_key}'"
+        )
+        return {
+            "agent": agent.name,
+            "project": project.human_key,
+            "registration_token": token,
+        }
+
     @mcp.tool(name="create_agent_identity")
     @_instrument_tool("create_agent_identity", cluster=CLUSTER_IDENTITY, capabilities={"identity"}, agent_arg="name_hint", project_arg="project_key")
     async def create_agent_identity(

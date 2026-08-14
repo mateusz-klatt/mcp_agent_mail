@@ -140,6 +140,21 @@ Keep the derived `<host>-<platform>-N` as the immutable key; add an alias for
 display only. `Agent.display_name` (nullable, 128) plus one line in the
 idempotent migration list in `db.py`.
 
+### Next session: automatic friendly aliases during provisioning
+
+When a **new** Agent is provisioned and the caller omits `display_name`, assign
+an adjective+noun display alias such as `BlueCastle`. This deliberately brings
+back the memorable legacy vocabulary only in the non-addressable presentation
+layer. The canonical `Agent.name` remains the explicit
+`<client>-<os>-<host>-<slot>` identity and remains the sole key for routing,
+authentication, reservations, executions, and lifecycle ownership.
+
+Generate the alias only for the successful insert winner, never during
+authentication or resume. An explicitly supplied display name wins. Reuse the
+existing display-name validation and project-wide collision checks, retrying a
+generated candidate transactionally if it collides. Neither credentials nor
+execution identifiers may be derived from the friendly alias.
+
 **The alias must never be accepted in `to:`.** Name resolution is not one
 function — it is a dozen `func.lower(Agent.name) == ...` sites in the hottest
 part of `app.py`, and a partial fallback makes behaviour differ per call path.

@@ -485,7 +485,7 @@ am_project_has_local_state() {
         type == "object"
         and ((.[$project]? // null) | type == "object")
         and any(.[$project][]?; type == "string" and length > 0)
-    ' < "$AM_CRED_FILE" >/dev/null 2>&1; then
+    ' >/dev/null 2>&1 < "$AM_CRED_FILE"; then
         return 0
     fi
 
@@ -513,7 +513,7 @@ am_repository_opted_in() {
 
     marker="${root}/.agent-mail-project-id"
     # The committed identity marker is meaningful only when it contains an id.
-    [ -r "$marker" ] && grep -Eq '[^[:space:]]' < "$marker" 2>/dev/null && return 0
+    [ -r "$marker" ] && grep -Eq '[^[:space:]]' 2>/dev/null < "$marker" && return 0
 
     discovery="${root}/.agent-mail.yaml"
     # Discovery YAML is an opt-in only when it declares the documented project
@@ -590,7 +590,7 @@ am_identity_migration_pair() {
     [ -n "$previous_short_gf" ] && set -- "$@" "$previous_short_gf"
     for candidate_file in "$@"; do
         [ -r "$candidate_file" ] || continue
-        resolved="$(tr -d '\r\n' < "$candidate_file" 2>/dev/null)"
+        resolved="$(tr -d '\r\n' 2>/dev/null < "$candidate_file")"
         [ -n "$resolved" ] || continue
         [ "$resolved" = "$new" ] && continue
         case "$resolved" in
@@ -608,7 +608,7 @@ am_identity_migration_pair() {
 
     old_gf="$(am_legacy_granted_name_file "$project")"
     if [ -z "$old" ] && [ -r "$old_gf" ]; then
-        resolved="$(tr -d '\r\n' < "$old_gf" 2>/dev/null)"
+        resolved="$(tr -d '\r\n' 2>/dev/null < "$old_gf")"
         case "$resolved" in
             "$legacy_name"|"$old_order_name"|"$short_order_name") old="$resolved" ;;
             "${stem}-"[1-9]* )
@@ -1088,7 +1088,7 @@ am_cred_get() {
     # opened (measured: installers hold exactly that form).  The file therefore
     # arrives via REDIRECTION: the shell opens it, understands every dialect,
     # and jq reads stdin — each half gets the treatment it needs.
-    MSYS_NO_PATHCONV=1 jq -r --arg p "$1" --arg a "$2" '.[$p][$a] // empty' < "$AM_CRED_FILE" 2>/dev/null
+    MSYS_NO_PATHCONV=1 jq -r --arg p "$1" --arg a "$2" '.[$p][$a] // empty' 2>/dev/null < "$AM_CRED_FILE"
 }
 
 am_lock_has_live_publisher() {
@@ -1389,11 +1389,11 @@ am_execution_manifest_add() {
               .session_id == $session_id and
               .lifecycle_generation == $generation and
               (.state_files | type == "array")
-            ' < "$manifest_file" >/dev/null 2>&1 \
+            ' >/dev/null 2>&1 < "$manifest_file" \
             && jq --arg state_file "$state_name" '
               .state_files = ((.state_files + [$state_file]) | unique) |
               .updated_at = (now | todateiso8601)
-            ' < "$manifest_file" > "$tmp" 2>/dev/null; then
+            ' > "$tmp" 2>/dev/null < "$manifest_file"; then
             rc=0
         fi
     elif jq -nc --arg client "$client" --arg session_id "$session_id" \
@@ -1441,7 +1441,7 @@ am_execution_manifest_state_files() {
                      .lifecycle_generation == $generation and
                      (.state_files | type == "array")) |
               .state_files[] | select(type == "string")
-            ' < "$manifest_file" 2>/dev/null
+            ' 2>/dev/null < "$manifest_file"
     )
 }
 
@@ -1483,7 +1483,7 @@ am_session_lifecycle_generation() {
         then .generation
         elif .version == 1 and .status == "ended" then 1
         else empty end
-      ' < "$intent_file" 2>/dev/null)"
+      ' 2>/dev/null < "$intent_file")"
     [ -n "$generation" ] || generation=1
     printf '%s' "$generation"
 }
@@ -1593,7 +1593,7 @@ am_session_end_intent_exists() {
          (if $expected_generation == "" then .status == "ended"
           else ($generation != ($expected_generation | tonumber)) or
                .status == "ended" end))
-      ' < "$intent_file" >/dev/null 2>&1
+      ' >/dev/null 2>&1 < "$intent_file"
 }
 
 # Rewrite a confirmed terminal state to the small non-secret resume/audit
@@ -1607,9 +1607,9 @@ am_execution_terminalize_local_locked() {
         *) return 1 ;;
     esac
     [ -r "$state_file" ] || return 1
-    project="$(jq -r '.project // empty' < "$state_file" 2>/dev/null)"
-    agent="$(jq -r '.agent // empty' < "$state_file" 2>/dev/null)"
-    execution_id="$(jq -r '.execution_id // empty' < "$state_file" 2>/dev/null)"
+    project="$(jq -r '.project // empty' 2>/dev/null < "$state_file")"
+    agent="$(jq -r '.agent // empty' 2>/dev/null < "$state_file")"
+    execution_id="$(jq -r '.execution_id // empty' 2>/dev/null < "$state_file")"
     stamp="$(am_execution_heartbeat_stamp_file \
         "$project" "$agent" "$execution_id" 2>/dev/null)"
     token_file="${state_file}.token"
@@ -1648,7 +1648,7 @@ am_execution_manifest_mark_terminal() {
     local now horizon retain_until bucket marker_dir marker_file marker_tmp
     while IFS= read -r state_file; do
         [ -r "$state_file" ] || continue
-        status="$(jq -r '.status // empty' < "$state_file" 2>/dev/null)"
+        status="$(jq -r '.status // empty' 2>/dev/null < "$state_file")"
         case "$status" in completed|failed|cancelled|expired) ;;
             *) return 1 ;;
         esac
@@ -1675,7 +1675,7 @@ am_execution_manifest_mark_terminal() {
           .status = "terminal" |
           .ended_at = (now | todateiso8601) |
           .retain_until_epoch = $retain_until
-        ' < "$manifest_file" > "$tmp" 2>/dev/null \
+        ' > "$tmp" 2>/dev/null < "$manifest_file" \
         || ! chmod 600 "$tmp" 2>/dev/null \
         || ! mv -f "$tmp" "$manifest_file" 2>/dev/null; then
         rm -f "$tmp" 2>/dev/null || true
@@ -1712,12 +1712,12 @@ am_execution_retention_prune_marker() {
     local marker_file="$1" now="$2" client session_id generation retain_until
     local manifest_name intent_name manifest_file intent_file state_file state_lock
     local state_status state_generation project agent execution_id stamp manifest_lock
-    client="$(jq -r '.client // empty' < "$marker_file" 2>/dev/null)"
-    session_id="$(jq -r '.session_id // empty' < "$marker_file" 2>/dev/null)"
-    generation="$(jq -r '.lifecycle_generation // empty' < "$marker_file" 2>/dev/null)"
-    retain_until="$(jq -r '.retain_until_epoch // empty' < "$marker_file" 2>/dev/null)"
-    manifest_name="$(jq -r '.manifest_file // empty' < "$marker_file" 2>/dev/null)"
-    intent_name="$(jq -r '.intent_file // empty' < "$marker_file" 2>/dev/null)"
+    client="$(jq -r '.client // empty' 2>/dev/null < "$marker_file")"
+    session_id="$(jq -r '.session_id // empty' 2>/dev/null < "$marker_file")"
+    generation="$(jq -r '.lifecycle_generation // empty' 2>/dev/null < "$marker_file")"
+    retain_until="$(jq -r '.retain_until_epoch // empty' 2>/dev/null < "$marker_file")"
+    manifest_name="$(jq -r '.manifest_file // empty' 2>/dev/null < "$marker_file")"
+    intent_name="$(jq -r '.intent_file // empty' 2>/dev/null < "$marker_file")"
     case "$generation" in ''|*[!0-9]*) return 1 ;; esac
     case "$retain_until" in ''|*[!0-9]*) return 1 ;; esac
     [ "$retain_until" -le "$now" ] || return 1
@@ -1737,7 +1737,7 @@ am_execution_retention_prune_marker() {
           .session_id == $session_id and
           .lifecycle_generation == $generation and .status == "terminal" and
           .retain_until_epoch == $retain_until
-        ' < "$manifest_file" >/dev/null 2>&1; then
+        ' >/dev/null 2>&1 < "$manifest_file"; then
         am_lock_release "$manifest_lock"
         return 1
     fi
@@ -1749,7 +1749,7 @@ am_execution_retention_prune_marker() {
             am_lock_release "$manifest_lock"
             return 1
         fi
-        state_status="$(jq -r '.status // empty' < "$state_file" 2>/dev/null)"
+        state_status="$(jq -r '.status // empty' 2>/dev/null < "$state_file")"
         state_generation="$(jq -r '.lifecycle_generation // 1' \
             "$state_file" 2>/dev/null)"
         if [ "$state_generation" != "$generation" ]; then
@@ -1764,9 +1764,9 @@ am_execution_retention_prune_marker() {
                 return 1
                 ;;
         esac
-        project="$(jq -r '.project // empty' < "$state_file" 2>/dev/null)"
-        agent="$(jq -r '.agent // empty' < "$state_file" 2>/dev/null)"
-        execution_id="$(jq -r '.execution_id // empty' < "$state_file" 2>/dev/null)"
+        project="$(jq -r '.project // empty' 2>/dev/null < "$state_file")"
+        agent="$(jq -r '.agent // empty' 2>/dev/null < "$state_file")"
+        execution_id="$(jq -r '.execution_id // empty' 2>/dev/null < "$state_file")"
         stamp="$(am_execution_heartbeat_stamp_file \
             "$project" "$agent" "$execution_id" 2>/dev/null)"
         rm -f "${state_file}.token" "$state_file" 2>/dev/null || true
@@ -1779,7 +1779,7 @@ am_execution_retention_prune_marker() {
         --argjson retain_until "$retain_until" '
           .lifecycle_generation == $generation and .status == "terminal" and
           .retain_until_epoch == $retain_until
-        ' < "$manifest_file" >/dev/null 2>&1; then
+        ' >/dev/null 2>&1 < "$manifest_file"; then
         rm -f "$manifest_file" 2>/dev/null || true
     else
         am_lock_release "$manifest_lock"
@@ -1796,7 +1796,7 @@ am_execution_retention_prune_marker() {
                 --argjson generation "$generation" '
                   .client == $client and .session_id == $session_id and
                   .generation == $generation and .status == "ended"
-                ' < "$intent_file" >/dev/null 2>&1; then
+                ' >/dev/null 2>&1 < "$intent_file"; then
                 rm -f "$intent_file" 2>/dev/null || true
             fi
             am_lock_release "$state_lock"
@@ -1979,7 +1979,7 @@ am_execution_marker_touch() {
     [ -r "$marker" ] || return 1
     lock_dir="${marker}.lock"
     am_lock_acquire "$lock_dir" || return 1
-    current_id="$(jq -r '.execution_id // empty' < "$marker" 2>/dev/null)"
+    current_id="$(jq -r '.execution_id // empty' 2>/dev/null < "$marker")"
     if [ "$current_id" != "$execution_id" ] \
         && ! printf '%s' "$compatible_ids" | jq -e --arg id "$current_id" \
             'type == "array" and index($id) != null' >/dev/null 2>&1; then
@@ -1995,7 +1995,7 @@ am_execution_marker_touch() {
     tmp="${marker}.${BASHPID:-$$}.tmp"
     if jq --arg heartbeat_ts "$now" \
         '.status = "active" | .heartbeat_ts = $heartbeat_ts' \
-        < "$marker" > "$tmp" 2>/dev/null \
+        > "$tmp" 2>/dev/null < "$marker" \
         && chmod 600 "$tmp" 2>/dev/null \
         && mv -f "$tmp" "$marker" 2>/dev/null; then
         rc=0
@@ -2011,7 +2011,7 @@ am_execution_marker_end() {
     [ -r "$marker" ] || return 1
     lock_dir="${marker}.lock"
     am_lock_acquire "$lock_dir" || return 1
-    current_id="$(jq -r '.execution_id // empty' < "$marker" 2>/dev/null)"
+    current_id="$(jq -r '.execution_id // empty' 2>/dev/null < "$marker")"
     if [ "$current_id" != "$execution_id" ]; then
         am_lock_release "$lock_dir"
         return 1
@@ -2022,7 +2022,7 @@ am_execution_marker_end() {
             (.status == "completed" or .status == "failed" or
              .status == "cancelled" or .status == "expired")
          then . else .status = $status end' \
-        < "$marker" > "$tmp" 2>/dev/null \
+        > "$tmp" 2>/dev/null < "$marker" \
         && chmod 600 "$tmp" 2>/dev/null \
         && mv -f "$tmp" "$marker" 2>/dev/null; then
         rc=0
@@ -2348,7 +2348,7 @@ am_execution_start() {
         ancestors="$(jq -nc --arg parent "$parent_execution_id" '[$parent]')"
     fi
     am_lock_acquire "$lock_dir" || return 1
-    status="$(jq -r '.status // empty' < "$state_file" 2>/dev/null)"
+    status="$(jq -r '.status // empty' 2>/dev/null < "$state_file")"
     if [ "$status" = "end_requested" ] \
         || am_session_end_intent_exists "$client" "$session_id" "$generation"; then
         # SessionEnd can race the unlocked start RPC. Persist the exact server
@@ -2368,7 +2368,7 @@ am_execution_start() {
             return 1
         fi
         requested_end_status="$(jq -r \
-            '.requested_end_status // "completed"' < "$state_file" 2>/dev/null)"
+            '.requested_end_status // "completed"' 2>/dev/null < "$state_file")"
         am_lock_release "$lock_dir"
         if am_execution_end "$project" "$agent" "$token" "$client" "$kind" \
             "$native_id" "$requested_end_status" "$generation" \
@@ -2409,7 +2409,7 @@ am_execution_state_value() {
     state_file="$(am_execution_state_file "$project" "$agent" "$client" \
         "$session_id" "$kind" "$native_id")" || return 1
     [ -r "$state_file" ] || return 1
-    jq -r "$query // empty" < "$state_file" 2>/dev/null
+    jq -r "$query // empty" 2>/dev/null < "$state_file"
 }
 
 am_execution_state_token() {
@@ -2483,8 +2483,8 @@ am_execution_compatible_ids_for_payload() {
         (.heartbeat_ts | type == "string") and
         ((.heartbeat_ts | fromdateiso8601) as $heartbeat |
           $heartbeat >= (now - $max_age) and $heartbeat <= (now + 300))
-      ' < "$marker" >/dev/null 2>&1 || return 1
-    marker_id="$(jq -r '.execution_id' < "$marker" 2>/dev/null)"
+      ' >/dev/null 2>&1 < "$marker" || return 1
+    marker_id="$(jq -r '.execution_id' 2>/dev/null < "$marker")"
     printf '%s' "$compatible_ids" | jq -e --arg id "$marker_id" \
         'index($id) != null' >/dev/null 2>&1 || return 1
     # State lineage came from the authenticated start response. The marker is
@@ -2521,7 +2521,7 @@ am_subagent_execution_request_stop() {
     [ -r "$state_file" ] || return 0
     lock_dir="${state_file}.lock"
     am_lock_acquire "$lock_dir" || return 1
-    status="$(jq -r '.status // empty' < "$state_file" 2>/dev/null)"
+    status="$(jq -r '.status // empty' 2>/dev/null < "$state_file")"
     if [ "$status" != "active" ] && [ "$status" != "stopping" ]; then
         am_lock_release "$lock_dir"
         return 0
@@ -2551,7 +2551,7 @@ am_execution_resume_for_payload() {
     [ -r "$state_file" ] || return 0
     lock_dir="${state_file}.lock"
     am_lock_acquire "$lock_dir" || return 1
-    status="$(jq -r '.status // empty' < "$state_file" 2>/dev/null)"
+    status="$(jq -r '.status // empty' 2>/dev/null < "$state_file")"
     if [ "$status" != "stopping" ]; then
         am_lock_release "$lock_dir"
         return 0
@@ -2723,7 +2723,7 @@ am_execution_end() {
     [ -r "$state_file" ] || return 0
     lock_dir="${state_file}.lock"
     am_lock_acquire "$lock_dir" || return 1
-    current_status="$(jq -r '.status // empty' < "$state_file" 2>/dev/null)"
+    current_status="$(jq -r '.status // empty' 2>/dev/null < "$state_file")"
     if [ "$current_status" = "starting" ]; then
         # The start RPC deliberately runs without this lock. Record the native
         # SessionEnd intent durably so its eventual response cannot publish an
@@ -2757,7 +2757,7 @@ am_execution_end() {
         am_lock_release "$lock_dir"
         return 0
     fi
-    execution_id="$(jq -r '.execution_id // empty' < "$state_file" 2>/dev/null)"
+    execution_id="$(jq -r '.execution_id // empty' 2>/dev/null < "$state_file")"
     if [ -z "$execution_id" ]; then
         am_lock_release "$lock_dir"
         return 0
@@ -2765,7 +2765,7 @@ am_execution_end() {
     effective_end_status="$end_status"
     if [ "$current_status" = "end_requested" ]; then
         effective_end_status="$(jq -r --arg fallback "$end_status" \
-            '.requested_end_status // $fallback' < "$state_file" 2>/dev/null)"
+            '.requested_end_status // $fallback' 2>/dev/null < "$state_file")"
     fi
     execution_token="$(am_execution_state_token \
         "$project" "$agent" "$client" "$kind" "$native_id" "$generation")"
@@ -2820,7 +2820,7 @@ am_execution_finalize_stopping_children() {
                      (.lifecycle_generation // 1) == $generation and
                      .kind == "subagent" and .status == "stopping") |
               .native_id // empty
-            ' < "$state_file" 2>/dev/null)"
+            ' 2>/dev/null < "$state_file")"
         [ -n "$native_id" ] || continue
         am_execution_end "$project" "$agent" "$token" "$client" \
             subagent "$native_id" completed "$generation" \
@@ -2844,10 +2844,10 @@ am_execution_finalize_stopping_children_all_for_payload() {
                      (.lifecycle_generation // 1) == $generation and
                      .kind == "subagent" and .status == "stopping") |
               .native_id // empty
-            ' < "$state_file" 2>/dev/null)"
+            ' 2>/dev/null < "$state_file")"
         [ -n "$native_id" ] || continue
-        project="$(jq -r '.project // empty' < "$state_file" 2>/dev/null)"
-        agent="$(jq -r '.agent // empty' < "$state_file" 2>/dev/null)"
+        project="$(jq -r '.project // empty' 2>/dev/null < "$state_file")"
+        agent="$(jq -r '.agent // empty' 2>/dev/null < "$state_file")"
         [ -n "$project" ] && [ -n "$agent" ] || continue
         token="$(am_cred_get "$project" "$agent")"
         [ -n "$token" ] || continue
@@ -2877,8 +2877,8 @@ am_subagent_executions_request_stop_all_for_payload() {
             ' "$state_file" >/dev/null 2>&1; then
             continue
         fi
-        project="$(jq -r '.project // empty' < "$state_file" 2>/dev/null)"
-        agent="$(jq -r '.agent // empty' < "$state_file" 2>/dev/null)"
+        project="$(jq -r '.project // empty' 2>/dev/null < "$state_file")"
+        agent="$(jq -r '.agent // empty' 2>/dev/null < "$state_file")"
         [ -n "$project" ] && [ -n "$agent" ] || continue
         am_subagent_execution_request_stop "$project" "$agent" "$client" \
             >/dev/null 2>&1 || true
@@ -2908,8 +2908,8 @@ am_root_executions_heartbeat_all_for_payload() {
             ' "$state_file" >/dev/null 2>&1; then
             continue
         fi
-        project="$(jq -r '.project // empty' < "$state_file" 2>/dev/null)"
-        agent="$(jq -r '.agent // empty' < "$state_file" 2>/dev/null)"
+        project="$(jq -r '.project // empty' 2>/dev/null < "$state_file")"
+        agent="$(jq -r '.agent // empty' 2>/dev/null < "$state_file")"
         [ -n "$project" ] && [ -n "$agent" ] || continue
         token="$(am_cred_get "$project" "$agent")"
         [ -n "$token" ] || continue
@@ -2943,8 +2943,8 @@ am_root_executions_end_all_for_payload() {
             ' "$state_file" >/dev/null 2>&1; then
             continue
         fi
-        project="$(jq -r '.project // empty' < "$state_file" 2>/dev/null)"
-        agent="$(jq -r '.agent // empty' < "$state_file" 2>/dev/null)"
+        project="$(jq -r '.project // empty' 2>/dev/null < "$state_file")"
+        agent="$(jq -r '.agent // empty' 2>/dev/null < "$state_file")"
         [ -n "$project" ] && [ -n "$agent" ] || continue
         token="$(am_cred_get "$project" "$agent")"
         [ -n "$token" ] || continue
@@ -2992,16 +2992,16 @@ am_execution_mark_session_children_terminal_local() {
                      .kind == "subagent" and
                      (.status == "active" or .status == "stopping")) |
               .native_id // empty
-            ' < "$state_file" 2>/dev/null)"
+            ' 2>/dev/null < "$state_file")"
         [ -n "$native_id" ] || continue
         lock_dir="${state_file}.lock"
         am_lock_acquire "$lock_dir" || continue
-        current="$(jq -r '.status // empty' < "$state_file" 2>/dev/null)"
+        current="$(jq -r '.status // empty' 2>/dev/null < "$state_file")"
         if [ "$current" != "active" ] && [ "$current" != "stopping" ]; then
             am_lock_release "$lock_dir"
             continue
         fi
-        execution_id="$(jq -r '.execution_id // empty' < "$state_file" 2>/dev/null)"
+        execution_id="$(jq -r '.execution_id // empty' 2>/dev/null < "$state_file")"
         marker_cwd="$(jq -r '.worktree_path // .cwd // empty' \
             "$state_file" 2>/dev/null)"
         if am_execution_terminalize_local_locked \

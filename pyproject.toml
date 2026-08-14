@@ -8,14 +8,20 @@ version = "0.4.0"
 description = "Iris: coordinated multi-agent messaging and coordination MCP server."
 readme = "README.md"
 requires-python = ">=3.14,<3.15"
-license = { text = "MIT" }
+# NOT plain MIT, and the distinction is load-bearing. LICENSE is "MIT License
+# (with OpenAI/Anthropic Rider)": the rider withholds all rights from a named
+# set of parties and terminates permission on breach. A licence that
+# discriminates against specific persons or groups is not OSI-approved, so
+# declaring `text = "MIT"` with the OSI MIT classifier misstated the terms.
+# Point at the file instead of restating terms that do not fit any SPDX id.
+license = { file = "LICENSE" }
 authors = [
   { name = "mcp-agent-mail maintainers" },
 ]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
-  "License :: OSI Approved :: MIT License",
+  "License :: Other/Proprietary License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.14",
   "Topic :: Software Development :: Libraries",
@@ -71,8 +77,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://example.com/mcp-agent-mail"
-Repository = "https://example.com/mcp-agent-mail"
+Homepage = "https://github.com/mateusz-klatt/mcp_agent_mail"
+Repository = "https://github.com/mateusz-klatt/mcp_agent_mail"
+Issues = "https://github.com/mateusz-klatt/mcp_agent_mail/issues"
+Upstream = "https://github.com/Dicklesworthstone/mcp_agent_mail"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mcp_agent_mail"]

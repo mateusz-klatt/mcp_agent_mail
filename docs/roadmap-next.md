@@ -26,6 +26,44 @@ what does not fit the render caps is named on one line or counted and held over
 rather than dropped. A bare integer on disk migrates as a set of one, so the
 first check after the change re-announces everything still unread.
 
+**The operator could not see who was holding which path.** The former file-reservations page was
+retired with the server-rendered interface and the allowlist 404s it, leaving the data reachable
+only through the API and `iris file_reservations`. A **Reservations** view is back in the React
+interface (`a09b3fa`), on `GET /mail/api/v1/reservations`, visible to operators and administrators
+and hidden from viewer-only accounts. Each row names the path, the holder, the claim's kind and
+whether its owning execution is still alive — `Active run`, `Legacy claim`, `Inactive owner`.
+
+Reaching those three states is worth recording, because the schema fights you and it is right to.
+`orphaned` cannot be constructed: the database refuses to bind a claim to an ended execution, and
+the terminal guard refuses to end an execution that still holds a live **`auto`** claim. So an
+orphan is only reachable by transition, and only for `explicit` claims. That is the policy — claims
+filed incidentally by a hook die with their execution; deliberate holds may outlive it. Terminal
+executions are immutable, and a project's slug cannot be rewritten once message deliveries exist.
+
+**Validation errors quoted credentials back.** Pydantic reports the offending value, so sending a
+token to a tool that does not declare that parameter printed the token. `a164c6b` added middleware
+that renders these failures itself; it collapsed pydantic's two-line layout and broke
+`test_agent_name_validation.py` on three platforms, which `9c8c4d1` fixed by restoring the layout
+while keeping the redaction. Verified on the deployed server: the call that leaked now answers
+`input=<redacted>` for the token while still showing a non-credential value, so the errors stayed
+useful. **What is not fixed is rotation** — see "Still open".
+
+**`scripts/run_server_with_token.sh` could not start a server.** Upstream rewrote it to exec a Rust
+`am` binary; this fork builds no such binary (no `Cargo.toml`, no `rust/`), so it exited 1 on every
+machine following the README — which presented it as the recommended launch. Rewritten for this
+fork, and it now warns when `MAIL_UI_SESSION_SECRET` is unset, because the server starts fine
+without it and only `/mail` fails, so nothing goes wrong until a browser is pointed at it.
+
+**The container lost its database on `docker rm`.** `DATABASE_URL` defaulted to
+`sqlite+aiosqlite:///./storage.sqlite3`, which resolves against `/app` — so the documented
+`-v iris-data:/data` looked like it was persisting and was not. The image now defaults it under
+`/data` alongside `STORAGE_ROOT`.
+
+**Images are published.** `release.yml` already built two architectures and smoked both digests
+before promoting any tag, but it had never run: no `v*.*.*` tag was ever pushed. Docker Hub is now
+a second promotion target — `klattm/iris`, the same digests copied by `imagetools`, no rebuild —
+and missing credentials fail in `validate-release` rather than after an hour of building.
+
 ## 1. Instant delivery
 
 `inbox_check.sh` is polling: `SessionStart` always, then `PostToolUse` at most
@@ -193,6 +231,37 @@ names that cannot be keys.
 files reservations looks dead after `FILE_RESERVATION_INACTIVITY_SECONDS` and
 has its holds swept. `register_agent` does not clear `retired_at` when an
 existing agent re-registers with a valid token.
+
+**A registration token cannot be rotated, and this now outranks the leak it
+follows.** Measured 2026-08-14: no rotation command in the CLI, nothing
+reachable in `src/`; `migrate-agent-state` moves a local credential key after a
+rename and `rename-agent` is offline and never calls MCP. The only way to a new
+token is abandoning the mailbox address the fleet routes to — identity
+migration, not rotation. Three agents were told to rotate before anyone checked
+it was possible. Redaction removes the cause going forward; there is still no
+remedy for a leak that already happened, so any exposure is permanent.
+
+**The Reservations view renders `expires_ts` raw** (`2026-08-14 20:41:21.000000`)
+where every other surface formats dates for humans. Cosmetic, visible in the
+README screenshots, and a one-line fix in the same place the other dates are
+formatted.
+
+**The Claude plugin installs the monitor but not the hooks.** `plugin.json`
+declares only `experimental.monitors`, so identity and delivery still depend on
+running `scripts/integrate_claude_code.sh`. The scripts do ship in the plugin
+cache, so no clone is needed, but the user has to know to run them.
+`snapper-mcp` shows the shape of the fix: declare `mcpServers` plus a
+`userConfig` for the endpoint and token. It changes install behaviour for
+everyone, so it wants an explicit decision first.
+
+**The licence is unresolved and the obvious escape does not exist.** `LICENSE`
+is "MIT with OpenAI/Anthropic Rider"; the rider withholds all rights from named
+parties and must travel unmodified with every distribution. Rebasing onto
+pre-rider code sounds cheap because `7c1fe5b` changed only `LICENSE`, but 147
+upstream commits followed it and this fork contains all of them — 128 files,
++24 471/−3 512, concentrated in `app.py`, `http.py`, `cli.py` and `storage.py`.
+That is a rebuild, not a flag. The realistic options are keeping the rider or
+asking the copyright holder for a parallel grant.
 
 ## Sequencing
 

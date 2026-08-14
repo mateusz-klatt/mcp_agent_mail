@@ -14,7 +14,6 @@ Reference: mcp_agent_mail-9z5
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import sys
 import time
@@ -23,6 +22,10 @@ from typing import Any, cast
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+
+from mcp_agent_mail import config as _config
+from mcp_agent_mail.app import build_mcp_server
+from mcp_agent_mail.http import build_http_app
 
 
 class _ControlledClock:
@@ -44,11 +47,6 @@ class _ControlledClock:
 
     def advance(self, seconds: float) -> None:
         self._now += seconds
-
-
-from mcp_agent_mail import config as _config
-from mcp_agent_mail.app import build_mcp_server
-from mcp_agent_mail.http import build_http_app
 
 
 def _rpc(method: str, params: dict) -> dict:

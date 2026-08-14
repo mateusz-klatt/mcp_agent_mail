@@ -883,7 +883,14 @@ def test_docker_build_is_locked_and_rejects_unvalidated_ui_sources() -> None:
     dockerfile = (REPOSITORY_ROOT / "Dockerfile").read_text(encoding="utf-8")
     dockerignore = (REPOSITORY_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
 
-    assert dockerfile.count("COPY pyproject.toml uv.lock README.md hatch_build.py ./") == 2
+    # LICENSE is copied into both wheel stages because `pyproject.toml`
+    # declares `license = { file = "LICENSE" }` and hatchling resolves that
+    # path at build time -- without it the image build fails where nothing
+    # else would notice.
+    assert (
+        dockerfile.count("COPY pyproject.toml uv.lock README.md LICENSE hatch_build.py ./")
+        == 2
+    )
     assert "RUN uv sync --frozen --no-dev --no-install-project" in dockerfile
     assert "RUN uv sync --frozen --no-dev" in dockerfile
     assertion = "RUN test ! -e ./src/mcp_agent_mail/ui_dist"

@@ -46,8 +46,7 @@ AGENT_MAIL_URL="$_URL"
 HTTP_BEARER_TOKEN="$_TOKEN"
 
 # Validate the private credential destination before changing any user file.
-# shellcheck disable=SC1090
-. "${ROOT_DIR}/scripts/hooks/agent_mail_common.sh"
+source_hook_library_without_pathconv "${ROOT_DIR}/scripts/hooks/agent_mail_common.sh"
 if [[ "${AM_PATH_CONFIGURATION_VALID:-0}" != "1" ]]; then
   log_err "Agent Mail credential state must be an absolute user path outside Git."
   exit 1
@@ -119,18 +118,18 @@ set_secure_file "$USER_CONFIG" || exit 1
 _SLOT="$(integration_slot "${AGENT_MAIL_WINDSURF_SLOT:-1}")" || exit 1
 _AGENT="$(integration_agent_name windsurf "$_SLOT")" || exit 1
 _REG_TOKEN="$(am_cred_get "$PROJECT_KEY" "$_AGENT")"
-_ENSURE_ARGS=$(jq -nc --arg key "$PROJECT_KEY" '{human_key:$key}')
+_ENSURE_ARGS=$(MSYS_NO_PATHCONV=1 jq -nc --arg key "$PROJECT_KEY" '{human_key:$key}')
 if ! am_call ensure_project "$_ENSURE_ARGS" >/dev/null 2>&1; then
   log_warn "Windsurf config installed; server bootstrap is deferred because the endpoint is unavailable."
   exit 0
 fi
 if [[ -n "$_REG_TOKEN" ]]; then
-  _REGISTER_ARGS=$(AGENT_MAIL_JQ_REGISTRATION_TOKEN="$_REG_TOKEN" jq -nc \
+  _REGISTER_ARGS=$(MSYS_NO_PATHCONV=1 AGENT_MAIL_JQ_REGISTRATION_TOKEN="$_REG_TOKEN" jq -nc \
     --arg key "$PROJECT_KEY" --arg name "$_AGENT" \
     '{project_key:$key,program:"windsurf",model:"default",name:$name,
       task_description:"user integration",registration_token:env.AGENT_MAIL_JQ_REGISTRATION_TOKEN}')
 else
-  _REGISTER_ARGS=$(jq -nc --arg key "$PROJECT_KEY" --arg name "$_AGENT" \
+  _REGISTER_ARGS=$(MSYS_NO_PATHCONV=1 jq -nc --arg key "$PROJECT_KEY" --arg name "$_AGENT" \
     '{project_key:$key,program:"windsurf",model:"default",name:$name,
       task_description:"user integration"}')
 fi

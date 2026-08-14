@@ -208,6 +208,37 @@ normalize_agent_mail_state_dir() {
   printf '%s\n' "$normalized"
 }
 
+# Source the hook library for its path-validation side effects WITHOUT
+# inheriting its process-global MSYS_NO_PATHCONV.
+#
+# That export is correct for hooks and wrong for us, and the two needs are in
+# direct conflict inside a single command — measured on native Windows:
+#
+#   jq -nc --arg k "/owner/repo" ...        without: "C:/Program Files/Git/owner/repo"
+#                                           with:    "/owner/repo"          <- hooks need this
+#   jq -r ... "$SOME_FILE"                  without: opens the file
+#                                           with:    "Could not open file"  <- we need this
+#
+# Hooks pass a project key of "/owner/repo" to a native jq.exe and must not let
+# Git Bash rewrite it into a phantom project no other machine can join; their
+# own file arguments go through am_normalize_runtime_user_path, so they are
+# safe. Installers pass real file paths and no project key, so for them the
+# variable is pure damage: it made jq unable to read the client config, which
+# surfaced as "Existing settings are not a mergeable JSON object".
+#
+# Saving and restoring around the source keeps each side with the setting it
+# actually needs, and keeps the decision in one place rather than six.
+source_hook_library_without_pathconv() {
+  local lib="$1" _had_pathconv="${MSYS_NO_PATHCONV+set}" _old_pathconv="${MSYS_NO_PATHCONV:-}"
+  # shellcheck disable=SC1090
+  . "$lib"
+  if [[ "$_had_pathconv" == "set" ]]; then
+    export MSYS_NO_PATHCONV="$_old_pathconv"
+  else
+    unset MSYS_NO_PATHCONV
+  fi
+}
+
 # Answer "is this directory inside a Git worktree or gitdir?", failing CLOSED.
 #
 # Exit 0 means REFUSE: it either is inside Git, or we could not find out.

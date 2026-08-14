@@ -443,11 +443,19 @@ intention is no longer backed by a running execution.
 
 ### Launching the Web UI
 
-Recommended (simple):
+Recommended — the published image, which needs no toolchain:
+
+```bash
+docker run -d --name iris -p 8765:8765 -v iris-data:/data \
+  -e MAIL_UI_SESSION_SECRET="$(openssl rand -hex 32)" klattm/iris
+# then open http://127.0.0.1:8765/mail
+```
+
+From a checkout, the helper resolves a bearer token for you — reading `.env`,
+or generating one for the run and printing it:
 
 ```bash
 scripts/run_server_with_token.sh
-# then open http://127.0.0.1:8765/mail
 ```
 
 Advanced (manual commands):

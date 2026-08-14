@@ -6973,12 +6973,15 @@ def _redacted_validation_message(
             return "<redacted>"
         return rendered if len(rendered) <= 120 else f"{rendered[:117]}..."
 
+    # Pydantic's own layout is kept -- location on its own line, message
+    # indented beneath it -- because callers and tests read these errors and
+    # only the VALUE needed to change here.
     lines = [f"{len(error.errors())} validation error(s) for {tool_name}"]
     for entry in error.errors():
         location = tuple(entry.get("loc", ()))
-        where = ".".join(str(part) for part in location) or "<call>"
+        lines.append(".".join(str(part) for part in location) or "<call>")
         lines.append(
-            f"  {where}: {entry.get('msg', 'invalid')} "
+            f"  {entry.get('msg', 'invalid')} "
             f"[type={entry.get('type', 'unknown')}, input={_safe_input(location, entry.get('input'))}]"
         )
     return "\n".join(lines)

@@ -24,7 +24,12 @@ async def test_tooling_directory_and_metrics_populate(isolated_env):
 
         await client.call_tool(
             "register_agent",
-            {"project_key": project_slug, "program": "codex", "model": "gpt-5"},
+            {
+                "project_key": project_slug,
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-tooling-1",
+            },
         )
 
         project_blocks = await client.read_resource(f"resource://project/{project_slug}")
@@ -66,7 +71,12 @@ async def test_tooling_recent_filters(isolated_env):
 
         await client.call_tool(
             "register_agent",
-            {"project_key": project_slug, "program": "codex", "model": "gpt-5"},
+            {
+                "project_key": project_slug,
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-tooling-2",
+            },
         )
 
         project_blocks = await client.read_resource(f"resource://project/{project_slug}")
@@ -93,7 +103,7 @@ async def test_tooling_recent_filters(isolated_env):
         for e in entries:
             assert "tool" in e and isinstance(e["tool"], str)
             if e.get("agent") is not None:
-                assert e["agent"] == "Alpha"
+                assert e["agent"] == agent_name
 
 
 @pytest.mark.asyncio

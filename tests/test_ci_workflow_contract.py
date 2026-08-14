@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 
 WORKFLOWS_DIR = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+REPOSITORY_ROOT = WORKFLOWS_DIR.parents[1]
 USES_LINE = re.compile(
     r"^\s*(?:-\s*)?uses:\s*(?P<target>[^#\s]+)\s*(?:#\s*(?P<comment>.*))?$"
 )
@@ -15,6 +16,10 @@ BOUNDED_JOBS = (
     ("ci.yml", "build-and-test", 120),
     ("ci.yml", "portability", 180),
     ("sonarcloud.yml", "scan", 15),
+    ("release.yml", "validate-release", 15),
+    ("release.yml", "build-candidates", 120),
+    ("release.yml", "container-smoke", 90),
+    ("release.yml", "publish", 120),
 )
 
 
@@ -118,7 +123,7 @@ def test_sonar_uses_ubuntu_gate_while_portability_remains_required() -> None:
     common_commands = (
         "uv sync --dev --frozen",
         "uv run ruff check",
-        "uvx ty check --python-version 3.14 --python-platform all",
+        'uvx --from "ty==${TY_VERSION}" ty check --python-version 3.14 --python-platform all',
     )
     for command in common_commands:
         assert any(line.strip() == command for line in ubuntu)
@@ -128,6 +133,7 @@ def test_sonar_uses_ubuntu_gate_while_portability_remains_required() -> None:
     assert any(line.strip() == "uv run -m pytest -q --no-cov" for line in portability)
     assert not any("--cov-report" in line for line in portability)
     assert any("tests/benchmarks/bench_*.py" in line for line in ubuntu)
+    assert any("uv run python scripts/integration_showcase.py" in line for line in ubuntu)
     assert "          name: coverage-${{ github.sha }}" in ubuntu
     assert not any("coverage-${{ github.sha }}" in line for line in portability)
     assert "    needs: [build-and-test, frontend, frontend-webkit]" in sonar
@@ -143,6 +149,8 @@ def test_reusable_sonar_caller_grants_requested_permissions() -> None:
     caller_permissions = _job_permissions(caller, "sonar")
     called_permissions = _job_permissions(called, "scan")
 
+    assert 'git ls-remote origin "$REMOTE_REF" "${REMOTE_REF}^{}"' in called
+
     for permission, requested_access in called_permissions.items():
         if requested_access == "none":
             continue
@@ -151,3 +159,93 @@ def test_reusable_sonar_caller_grants_requested_permissions() -> None:
             f"reusable Sonar job requests {permission}: {requested_access}, but "
             f"the caller grants {granted_access}"
         )
+
+
+def test_ty_version_is_explicit_and_shared_by_ci_and_makefile() -> None:
+    workflow = _read_workflow(WORKFLOWS_DIR / "ci.yml")
+    makefile = (REPOSITORY_ROOT / "Makefile").read_text()
+
+    assert '  TY_VERSION: "0.0.71"' in workflow
+    assert "TY_VERSION=0.0.71" in makefile
+    assert 'uvx --from "ty==$(TY_VERSION)" ty check --python-version 3.14 --python-platform all' in makefile
+
+
+def test_release_reuses_exact_sha_gates_before_publication() -> None:
+    workflow = _read_workflow(WORKFLOWS_DIR / "release.yml")
+    quality_gate = _job_block(workflow, "quality-gate")
+    secret_gate = _job_block(workflow, "secret-gate")
+    validation = _job_block(workflow, "validate-release")
+    candidates = _job_block(workflow, "build-candidates")
+    smoke = _job_block(workflow, "container-smoke")
+    publish = _job_block(workflow, "publish")
+
+    assert "    uses: ./.github/workflows/ci.yml" in quality_gate
+    assert "    secrets: inherit" in quality_gate
+    assert "    uses: ./.github/workflows/secret-scan.yml" in secret_gate
+    assert "    needs: [quality-gate, secret-gate]" in validation
+    assert "          ref: ${{ github.sha }}" in validation
+    assert "        run: uv sync --dev --frozen" in validation
+    assert any("git rev-parse HEAD" in line for line in validation)
+    assert any("pyproject.toml version" in line for line in validation)
+
+    assert "    needs: validate-release" in candidates
+    assert "      packages: write" in candidates
+    assert "      amd64_digest: ${{ steps.build-amd64.outputs.digest }}" in candidates
+    assert "      arm64_digest: ${{ steps.build-arm64.outputs.digest }}" in candidates
+    assert sum("docker/build-push-action@" in line for line in candidates) == 2
+    assert "          platforms: linux/amd64" in candidates
+    assert "          platforms: linux/arm64" in candidates
+    assert sum("push-by-digest=true" in line for line in candidates) == 2
+    assert sum("name-canonical=true" in line for line in candidates) == 2
+    assert sum("provenance: false" in line for line in candidates) == 2
+    assert sum("sbom: false" in line for line in candidates) == 2
+    assert not any(re.fullmatch(r"\s+tags:\s+.+", line) for line in candidates)
+
+    assert "    needs: [validate-release, build-candidates]" in smoke
+    assert "      packages: read" in smoke
+    assert any('IMAGE: ${{ needs.build-candidates.outputs.registry_image }}' in line for line in smoke)
+    assert any('AMD64_DIGEST: ${{ needs.build-candidates.outputs.amd64_digest }}' in line for line in smoke)
+    assert any('ARM64_DIGEST: ${{ needs.build-candidates.outputs.arm64_digest }}' in line for line in smoke)
+    assert any('docker pull --quiet --platform "$platform" "$candidate"' in line for line in smoke)
+    assert any('pulled_repo_digests="$(docker image inspect' in line for line in smoke)
+    assert any('--arg expected "$candidate"' in line for line in smoke)
+    assert any("index($expected) != null" in line for line in smoke)
+    assert any("smoke_candidate linux/amd64" in line for line in smoke)
+    assert any("smoke_candidate linux/arm64" in line for line in smoke)
+    assert any("mcp_agent_mail.cli migrate" in line for line in smoke)
+    assert any("/health/liveness" in line for line in smoke)
+    assert any("/health/readiness" in line for line in smoke)
+    assert not any("docker/build-push-action@" in line for line in smoke)
+
+    assert "    needs: [validate-release, build-candidates, container-smoke]" in publish
+    assert any("docker/login-action" in line for line in publish)
+    assert any("type=sha,format=long,prefix=sha-" in line for line in publish)
+    assert any("docker buildx imagetools create" in line for line in publish)
+    assert any('"$IMAGE@$AMD64_DIGEST"' in line for line in publish)
+    assert any('"$IMAGE@$ARM64_DIGEST"' in line for line in publish)
+    assert any("Candidate output is not an exact sha256 digest" in line for line in publish)
+    assert any(".platform.architecture == \"amd64\"" in line for line in publish)
+    assert any(".platform.architecture == \"arm64\"" in line for line in publish)
+    assert any(".manifests | length" in line for line in publish)
+    assert any('"$tag_digest" != "$manifest_digest"' in line for line in publish)
+    assert any("steps.promote.outputs.digest" in line for line in publish)
+    assert not any("docker/build-push-action@" in line for line in publish)
+
+    all_release_builds = [
+        line for line in workflow.splitlines() if "docker/build-push-action@" in line
+    ]
+    assert len(all_release_builds) == 2
+    assert sum("docker/metadata-action@" in line for line in workflow.splitlines()) == 1
+
+
+def test_secret_scan_pins_binary_and_gates_current_tree() -> None:
+    workflow = _read_workflow(WORKFLOWS_DIR / "secret-scan.yml")
+
+    assert "  workflow_call:" in workflow
+    assert 'version="8.18.4"' in workflow
+    assert "ba6dbb656933921c775ee5a2d1c13a91046e7952e9d919f9bac4cec61d628e7d" in workflow
+    assert "Gitleaks failed to reject its synthetic GitHub-token canary" in workflow
+    current_tree = workflow.index("gitleaks detect --no-git --source .")
+    report_only = workflow.index("continue-on-error: true")
+    assert current_tree < report_only
+    assert "gitleaks detect --source ." in workflow

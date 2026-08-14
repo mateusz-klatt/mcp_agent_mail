@@ -27,6 +27,8 @@ from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.config import get_settings
 from tests.keys import pkey
 
+IMAGE_EDGE_AGENT = "codex-wsl-image-edge-1"
+
 
 @pytest.fixture(autouse=True)
 def _allow_absolute_attachment_paths(monkeypatch):
@@ -67,15 +69,20 @@ async def test_corrupt_image_file_gracefully_fails(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {
+                "project_key": "Backend",
+                "program": "codex",
+                "model": "gpt-5",
+                "name": IMAGE_EDGE_AGENT,
+            },
         )
         body_md = f"![img]({corrupt_path})"
         res = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": IMAGE_EDGE_AGENT,
+                "to": [IMAGE_EDGE_AGENT],
                 "subject": "Corrupt Image",
                 "body_md": body_md,
                 "idempotency_key": "image-edge-corrupt",
@@ -100,15 +107,15 @@ async def test_zero_byte_image_file(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": IMAGE_EDGE_AGENT},
         )
         body_md = f"![img]({empty_path})"
         res = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": IMAGE_EDGE_AGENT,
+                "to": [IMAGE_EDGE_AGENT],
                 "subject": "Empty Image",
                 "body_md": body_md,
                 "idempotency_key": "image-edge-empty",
@@ -134,15 +141,15 @@ async def test_truncated_png_header_only(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": IMAGE_EDGE_AGENT},
         )
         body_md = f"![img]({truncated_path})"
         res = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": IMAGE_EDGE_AGENT,
+                "to": [IMAGE_EDGE_AGENT],
                 "subject": "Truncated PNG",
                 "body_md": body_md,
                 "idempotency_key": "image-edge-truncated",
@@ -175,14 +182,14 @@ async def test_palette_mode_image(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": IMAGE_EDGE_AGENT},
         )
         res = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": IMAGE_EDGE_AGENT,
+                "to": [IMAGE_EDGE_AGENT],
                 "subject": "Palette Image",
                 "body_md": f"![img]({palette_path})",
                 "idempotency_key": "image-edge-palette",
@@ -207,14 +214,14 @@ async def test_la_mode_image(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": IMAGE_EDGE_AGENT},
         )
         res = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": IMAGE_EDGE_AGENT,
+                "to": [IMAGE_EDGE_AGENT],
                 "subject": "LA Image",
                 "body_md": f"![img]({la_path})",
                 "idempotency_key": "image-edge-la",
@@ -241,14 +248,14 @@ async def test_rgba_mode_image_preserves_alpha(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": IMAGE_EDGE_AGENT},
         )
         res = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": IMAGE_EDGE_AGENT,
+                "to": [IMAGE_EDGE_AGENT],
                 "subject": "RGBA Image",
                 "body_md": f"![img]({rgba_path})",
                 "idempotency_key": "image-edge-rgba",
@@ -273,14 +280,14 @@ async def test_grayscale_mode_image(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": IMAGE_EDGE_AGENT},
         )
         res = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": IMAGE_EDGE_AGENT,
+                "to": [IMAGE_EDGE_AGENT],
                 "subject": "Grayscale Image",
                 "body_md": f"![img]({gray_path})",
                 "idempotency_key": "image-edge-grayscale",
@@ -305,14 +312,14 @@ async def test_1bit_mode_image(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": IMAGE_EDGE_AGENT},
         )
         res = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": IMAGE_EDGE_AGENT,
+                "to": [IMAGE_EDGE_AGENT],
                 "subject": "1-bit Image",
                 "body_md": f"![img]({bw_path})",
                 "idempotency_key": "image-edge-1bit",
@@ -339,7 +346,7 @@ async def test_malformed_data_uri_missing_comma(isolated_env, monkeypatch):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": IMAGE_EDGE_AGENT},
         )
         # Malformed: no comma after base64
         body = "![img](data:image/pngbase64ABC123)"
@@ -348,8 +355,8 @@ async def test_malformed_data_uri_missing_comma(isolated_env, monkeypatch):
                 "send_message",
                 {
                     "project_key": "Backend",
-                    "sender_name": "BlueLake",
-                    "to": ["BlueLake"],
+                    "sender_name": IMAGE_EDGE_AGENT,
+                    "to": [IMAGE_EDGE_AGENT],
                     "subject": "Malformed URI",
                     "body_md": body,
                     "convert_images": False,
@@ -370,7 +377,7 @@ async def test_data_uri_empty_base64(isolated_env, monkeypatch):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": IMAGE_EDGE_AGENT},
         )
         body = "![img](data:image/png;base64,)"
         with pytest.raises(ToolError, match="bounded canonical inline representation"):
@@ -378,8 +385,8 @@ async def test_data_uri_empty_base64(isolated_env, monkeypatch):
                 "send_message",
                 {
                     "project_key": "Backend",
-                    "sender_name": "BlueLake",
-                    "to": ["BlueLake"],
+                    "sender_name": IMAGE_EDGE_AGENT,
+                    "to": [IMAGE_EDGE_AGENT],
                     "subject": "Empty Base64",
                     "body_md": body,
                     "convert_images": False,
@@ -400,7 +407,7 @@ async def test_data_uri_invalid_base64(isolated_env, monkeypatch):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": IMAGE_EDGE_AGENT},
         )
         body = "![img](data:image/png;base64,!!!not-valid-base64!!!)"
         with pytest.raises(ToolError, match="bounded canonical inline representation"):
@@ -408,8 +415,8 @@ async def test_data_uri_invalid_base64(isolated_env, monkeypatch):
                 "send_message",
                 {
                     "project_key": "Backend",
-                    "sender_name": "BlueLake",
-                    "to": ["BlueLake"],
+                    "sender_name": IMAGE_EDGE_AGENT,
+                    "to": [IMAGE_EDGE_AGENT],
                     "subject": "Invalid Base64",
                     "body_md": body,
                     "convert_images": False,
@@ -430,7 +437,7 @@ async def test_data_uri_unusual_media_type(isolated_env, monkeypatch):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": IMAGE_EDGE_AGENT},
         )
         payload = base64.b64encode(b"fake").decode()
         body = f"![img](data:image/x-custom-format;base64,{payload})"
@@ -439,8 +446,8 @@ async def test_data_uri_unusual_media_type(isolated_env, monkeypatch):
                 "send_message",
                 {
                     "project_key": "Backend",
-                    "sender_name": "BlueLake",
-                    "to": ["BlueLake"],
+                    "sender_name": IMAGE_EDGE_AGENT,
+                    "to": [IMAGE_EDGE_AGENT],
                     "subject": "Unusual Media Type",
                     "body_md": body,
                     "convert_images": False,
@@ -471,14 +478,14 @@ async def test_image_without_extension(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": IMAGE_EDGE_AGENT},
         )
         res = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": IMAGE_EDGE_AGENT,
+                "to": [IMAGE_EDGE_AGENT],
                 "subject": "No Extension",
                 "body_md": f"![img]({no_ext_path})",
                 "idempotency_key": "image-edge-no-extension",
@@ -505,14 +512,14 @@ async def test_image_wrong_extension(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": IMAGE_EDGE_AGENT},
         )
         res = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": IMAGE_EDGE_AGENT,
+                "to": [IMAGE_EDGE_AGENT],
                 "subject": "Wrong Extension",
                 "body_md": f"![img]({wrong_ext_path})",
                 "idempotency_key": "image-edge-wrong-extension",
@@ -537,14 +544,14 @@ async def test_image_uppercase_extension(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": IMAGE_EDGE_AGENT},
         )
         res = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": IMAGE_EDGE_AGENT,
+                "to": [IMAGE_EDGE_AGENT],
                 "subject": "Uppercase Extension",
                 "body_md": f"![img]({upper_path})",
                 "idempotency_key": "image-edge-uppercase-extension",
@@ -576,15 +583,15 @@ async def test_multiple_images_in_body(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": IMAGE_EDGE_AGENT},
         )
         body = "\n".join([f"![img{i}]({p})" for i, p in enumerate(img_paths)])
         res = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": IMAGE_EDGE_AGENT,
+                "to": [IMAGE_EDGE_AGENT],
                 "subject": "Multiple Images",
                 "body_md": body,
                 "idempotency_key": "image-edge-multiple",
@@ -619,15 +626,15 @@ async def test_mixed_valid_and_invalid_images(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": IMAGE_EDGE_AGENT},
         )
         body = f"![valid]({valid_path})\n![invalid]({invalid_path})\n![missing]({missing_path})"
         res = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": IMAGE_EDGE_AGENT,
+                "to": [IMAGE_EDGE_AGENT],
                 "subject": "Mixed Images",
                 "body_md": body,
                 "idempotency_key": "image-edge-mixed",
@@ -661,15 +668,15 @@ async def test_attachment_path_with_spaces(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": IMAGE_EDGE_AGENT},
         )
         with pytest.raises(ToolError, match="bounded canonical inline representation"):
             await client.call_tool(
                 "send_message",
                 {
                     "project_key": "Backend",
-                    "sender_name": "BlueLake",
-                    "to": ["BlueLake"],
+                    "sender_name": IMAGE_EDGE_AGENT,
+                    "to": [IMAGE_EDGE_AGENT],
                     "subject": "Spaced Path",
                     "body_md": "check attachment",
                     "attachment_paths": [str(spaced_path)],
@@ -695,15 +702,15 @@ async def test_attachment_path_unicode(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": IMAGE_EDGE_AGENT},
         )
         with pytest.raises(ToolError, match="bounded canonical inline representation"):
             await client.call_tool(
                 "send_message",
                 {
                     "project_key": "Backend",
-                    "sender_name": "BlueLake",
-                    "to": ["BlueLake"],
+                    "sender_name": IMAGE_EDGE_AGENT,
+                    "to": [IMAGE_EDGE_AGENT],
                     "subject": "Unicode Path",
                     "body_md": "check attachment",
                     "attachment_paths": [str(unicode_path)],
@@ -735,14 +742,14 @@ async def test_attachment_symlink(isolated_env, tmp_path):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": IMAGE_EDGE_AGENT},
         )
         res = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": IMAGE_EDGE_AGENT,
+                "to": [IMAGE_EDGE_AGENT],
                 "subject": "Symlink Attachment",
                 "body_md": f"![img]({link_path})",
                 "idempotency_key": "image-edge-symlink-markdown",
@@ -773,14 +780,14 @@ async def test_gif_image_conversion(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": IMAGE_EDGE_AGENT},
         )
         res = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": IMAGE_EDGE_AGENT,
+                "to": [IMAGE_EDGE_AGENT],
                 "subject": "GIF Image",
                 "body_md": f"![img]({gif_path})",
                 "idempotency_key": "image-edge-gif",
@@ -807,14 +814,14 @@ async def test_bmp_image_conversion(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": IMAGE_EDGE_AGENT},
         )
         res = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": IMAGE_EDGE_AGENT,
+                "to": [IMAGE_EDGE_AGENT],
                 "subject": "BMP Image",
                 "body_md": f"![img]({bmp_path})",
                 "idempotency_key": "image-edge-bmp",
@@ -839,14 +846,14 @@ async def test_jpeg_image_conversion(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": IMAGE_EDGE_AGENT},
         )
         res = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": IMAGE_EDGE_AGENT,
+                "to": [IMAGE_EDGE_AGENT],
                 "subject": "JPEG Image",
                 "body_md": f"![img]({jpeg_path})",
                 "idempotency_key": "image-edge-jpeg",
@@ -876,14 +883,14 @@ async def test_single_pixel_image(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": IMAGE_EDGE_AGENT},
         )
         res = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": IMAGE_EDGE_AGENT,
+                "to": [IMAGE_EDGE_AGENT],
                 "subject": "Tiny Image",
                 "body_md": f"![img]({tiny_path})",
                 "idempotency_key": "image-edge-single-pixel",
@@ -916,14 +923,14 @@ async def test_moderately_large_image(isolated_env, monkeypatch):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": IMAGE_EDGE_AGENT},
         )
         res = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": IMAGE_EDGE_AGENT,
+                "to": [IMAGE_EDGE_AGENT],
                 "subject": "Large Image",
                 "body_md": f"![img]({large_path})",
                 "idempotency_key": "image-edge-large",

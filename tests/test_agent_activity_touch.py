@@ -24,6 +24,7 @@ from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import get_session
 
 KEY = "/test/activity"
+AGENT_NAME = "codex-linux-activity-1"
 
 
 def _data(result):
@@ -67,13 +68,18 @@ async def test_authenticating_refreshes_activity(server):
         me = _data(
             await client.call_tool(
                 "register_agent",
-                {"project_key": KEY, "name": "worker-1", "program": "probe", "model": "probe"},
+                {
+                    "project_key": KEY,
+                    "name": AGENT_NAME,
+                    "program": "probe",
+                    "model": "probe",
+                },
             )
         )
         token = me["registration_token"]
 
-        await _backdate("worker-1", "2020-01-01 00:00:00")
-        stale = await _last_active("worker-1")
+        await _backdate(AGENT_NAME, "2020-01-01 00:00:00")
+        stale = await _last_active(AGENT_NAME)
         assert stale.startswith("2020")
 
         # A second session, so this goes through token verification rather than
@@ -83,14 +89,14 @@ async def test_authenticating_refreshes_activity(server):
                 "file_reservation_paths",
                 {
                     "project_key": KEY,
-                    "agent_name": "worker-1",
+                    "agent_name": AGENT_NAME,
                     "registration_token": token,
                     "paths": ["src/thing.py"],
                     "ttl_seconds": 60,
                 },
             )
 
-        assert not (await _last_active("worker-1")).startswith("2020")
+        assert not (await _last_active(AGENT_NAME)).startswith("2020")
 
 
 @pytest.mark.asyncio
@@ -101,23 +107,28 @@ async def test_a_rejected_call_does_not_count_as_activity(server):
         await client.call_tool("ensure_project", {"human_key": KEY})
         await client.call_tool(
             "register_agent",
-            {"project_key": KEY, "name": "worker-1", "program": "probe", "model": "probe"},
+            {
+                "project_key": KEY,
+                "name": AGENT_NAME,
+                "program": "probe",
+                "model": "probe",
+            },
         )
 
-        await _backdate("worker-1", "2020-01-01 00:00:00")
+        await _backdate(AGENT_NAME, "2020-01-01 00:00:00")
         async with Client(server) as attacker:
             with contextlib.suppress(Exception):
                 await attacker.call_tool(
                     "file_reservation_paths",
                     {
                         "project_key": KEY,
-                        "agent_name": "worker-1",
+                        "agent_name": AGENT_NAME,
                         "registration_token": "wrong",
                         "paths": ["src/thing.py"],
                         "ttl_seconds": 60,
                     },
                 )
-        assert (await _last_active("worker-1")).startswith("2020")
+        assert (await _last_active(AGENT_NAME)).startswith("2020")
 
 
 @pytest.mark.asyncio
@@ -130,7 +141,12 @@ async def test_the_throttle_actually_suppresses_writes(server):
         me = _data(
             await client.call_tool(
                 "register_agent",
-                {"project_key": KEY, "name": "worker-1", "program": "probe", "model": "probe"},
+                {
+                    "project_key": KEY,
+                    "name": AGENT_NAME,
+                    "program": "probe",
+                    "model": "probe",
+                },
             )
         )
         token = me["registration_token"]
@@ -141,22 +157,22 @@ async def test_the_throttle_actually_suppresses_writes(server):
                     "file_reservation_paths",
                     {
                         "project_key": KEY,
-                        "agent_name": "worker-1",
+                        "agent_name": AGENT_NAME,
                         "registration_token": token,
                         "paths": [path],
                         "ttl_seconds": 60,
                     },
                 )
 
-            await _backdate("worker-1", "2020-01-01 00:00:00")
+            await _backdate(AGENT_NAME, "2020-01-01 00:00:00")
             await reserve("a.py")
-            first = await _last_active("worker-1")
+            first = await _last_active(AGENT_NAME)
             assert not first.startswith("2020"), "the first call must refresh"
 
             # Immediately again: inside the throttle window, so the stored value
             # must be untouched — not merely close, identical.
             await reserve("b.py")
-            assert await _last_active("worker-1") == first
+            assert await _last_active(AGENT_NAME) == first
 
             # "Unchanged" is consistent with two very different things, and this
             # test used to stop before separating them:
@@ -172,9 +188,9 @@ async def test_the_throttle_actually_suppresses_writes(server):
             # age the row past the window and require a refresh. A dead function
             # cannot produce one, so this is the positive control for the line
             # above rather than an extra case.
-            await _backdate("worker-1", "2020-01-01 00:00:00")
+            await _backdate(AGENT_NAME, "2020-01-01 00:00:00")
             await reserve("c.py")
-            revived = await _last_active("worker-1")
+            revived = await _last_active(AGENT_NAME)
             assert not revived.startswith("2020"), (
                 "the throttle assertion above cannot tell 'suppressed the write' "
                 f"from 'crashed and was swallowed' unless this refreshes: {revived}"
@@ -202,7 +218,12 @@ async def test_an_aware_timestamp_does_not_break_authentication(server):
         me = _data(
             await client.call_tool(
                 "register_agent",
-                {"project_key": KEY, "name": "worker-1", "program": "probe", "model": "probe"},
+                {
+                    "project_key": KEY,
+                    "name": AGENT_NAME,
+                    "program": "probe",
+                    "model": "probe",
+                },
             )
         )
         token = me["registration_token"]
@@ -212,7 +233,8 @@ async def test_an_aware_timestamp_does_not_break_authentication(server):
         from datetime import datetime, timedelta, timezone
 
         await _backdate(
-            "worker-1", (datetime.now(timezone.utc) - timedelta(seconds=600)).isoformat()
+            AGENT_NAME,
+            (datetime.now(timezone.utc) - timedelta(seconds=600)).isoformat(),
         )
 
         async with Client(server) as other:
@@ -220,7 +242,7 @@ async def test_an_aware_timestamp_does_not_break_authentication(server):
                 "file_reservation_paths",
                 {
                     "project_key": KEY,
-                    "agent_name": "worker-1",
+                    "agent_name": AGENT_NAME,
                     "registration_token": token,
                     "paths": ["src/thing.py"],
                     "ttl_seconds": 60,
@@ -230,7 +252,7 @@ async def test_an_aware_timestamp_does_not_break_authentication(server):
         # Refreshed, not merely "did not raise": a version that swallowed the
         # TypeError in the surrounding suppress() would also not raise, and would
         # leave the field stale forever.
-        refreshed = await _last_active("worker-1")
+        refreshed = await _last_active(AGENT_NAME)
         assert (datetime.now(timezone.utc) - datetime.fromisoformat(refreshed).replace(
             tzinfo=timezone.utc
         )).total_seconds() < 120, f"last_active_ts not refreshed: {refreshed}"

@@ -63,6 +63,7 @@ async def _seed_project(client, project_key: str, count: int) -> list[str]:
                 "project_key": project_key,
                 "program": "test-prog",
                 "model": "test-model",
+                "name": f"codex-wsl-unread-{i + 1}",
                 "task_description": f"agent-{i}",
             },
         )

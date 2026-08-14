@@ -81,31 +81,58 @@ recipient. Revisit only once a client has a reservation-state pull path;
 
 ## 2. Two sessions on one host share one identity
 
-Decided: **keep the identity model as it is.** Not a session discriminator.
+Implemented: **keep the durable Agent identity and model concurrency as
+AgentExecution**, not as more mailbox rows.
 
-A session-suffixed identity (`<host>-<platform>-<hex of session_id>`) covers
-nothing actually run here — same-host different-project is already isolated end
-to end by `(project_id, name)` uniqueness — and does not cover the case that
-does collide, ultracode fan-out, because subagents share one `session_id`.
-Against that it would break the property the fleet most depends on: identity
-outliving the process, which is the only reason mail sent to an absent machine
-is picked up at its next `SessionStart`. It would also commit one agent
-directory and one archive commit per terminal, forever.
+The durable address remains `<client>-<os>-<host>-<slot>`. `SessionStart`
+creates a root execution under that Agent. Native `SubagentStart` creates a
+child using the client's stable `agent_id`; `SubagentStop` records a provisional
+stop because another provider hook may continue the child, the next child tool
+cancels it, and a later parent event finalizes it. `SessionEnd` ends the root
+and descendants. Codex explicitly reports the parent `session_id` on
+subagent hooks, so the child lookup is deterministic rather than inferred from
+names. Claude Code additionally carries `agent_id` on edit-tool hooks inside
+the child.
 
-The real defect is narrower and has a client-side fix.
-`reservations_warn.sh` suppresses on *"is the holder me?"* when it means
-*"did this session reserve it?"* — and the per-session path log already on disk
-answers the second question. Warn when the holder is another agent, or when it
-is our own name with no matching entry in this session's log, wording that case
-as "reserved under this host's identity by another session". `session_start.sh`
-carries the same self-filter and wants the same treatment as a separate line.
+The local start transaction is also ordered against `SessionEnd`: an end that
+arrives while `start_agent_execution` is in flight records `end_requested`.
+When the server UUID returns, the hook uses it only to authenticate the matching
+end call and never publishes an active execution or guard marker for the ended
+native lifecycle. SessionEnd first persists a client/session tombstone before
+enumerating projects. Concurrent first-touch enrollment checks that barrier
+before local state and after the start RPC, so a project absent from the scan
+cannot outlive the native session.
 
-Then, for ultracode: key the session log `<session_id>.<agent_id>` when the
-payload carries one and widen the `am_session_logs` glob to `"${slug}*__*.list"`
-so `SessionEnd`, which only ever sees `session_id`, still finds every subagent's
-log. Backward compatible. **Verify first** that `agent_id` is stable per
-subagent rather than per tool call — if it churns, the log fragments and every
-second edit warns spuriously.
+Reservations now carry `execution_id`. Conflict self-suppression and release
+therefore mean "this execution", not "anything using this host mailbox".
+Ending an execution releases only its automatic claims atomically; explicit
+claims retain their TTL and require explicit release. The earlier per-session
+path-log proposal is no longer the ownership model.
+
+The per-worktree guard marker follows the execution that most recently proved
+activity in that checkout. `SubagentStart` alone does not displace the root;
+the first successful child heartbeat/automatic claim publishes the child plus
+ancestor chain, and the next parent event restores the root. Invalid or stale
+markers warn and continue during observe/warn rollout, but fail closed in
+execution-enforce mode.
+
+Cross-project attribution follows tool-defined file metadata. Claude starts the
+target execution chain before autoreserving the edited path. Codex PostToolUse
+does the same lazy start and heartbeat when `file_path` or `notebook_path` is
+present, without filing a claim and without guessing from `turn_id`. SessionEnd
+fans out exact per-project ends concurrently and reconciles each successful
+result independently, keeping the multi-project path within the provider's
+bounded hook deadline.
+
+Cross-project edits establish the same deterministic durable host-slot Agent
+and a separate execution chain in the target project. Session teardown ends all
+exact roots matching the native client/session pair across touched projects.
+
+Lifecycle hooks record `cwd`, repository root, Git common directory, worktree
+path, branch, and HEAD as execution context. A worktree is not a Project or an
+Agent, and this change deliberately does not turn on `WORKTREES_ENABLED` or
+allocate a worktree for every read-only subagent. Orchestration may create an
+isolated worktree for concurrent writers when their edit surfaces require it.
 
 ## 3. Display names
 
@@ -128,7 +155,9 @@ the key is what must be typed into `to:`.
 Do **not** build this on `WindowIdentity`. It looks like a fit, but its uuid
 comes from the *server process's* own environment at config load, so on a shared
 remote server every caller resolves to one window identity or none. It is a
-local-stdio single-user feature.
+local-stdio window-history feature and is never accepted as authentication
+proof. New sessions authenticate with a registration token; only the current
+session's existing Agent binding may omit it.
 
 Smallest shape: model field + migration line, `_agent_to_dict` emits it (its ten
 call sites cover register, whois, contacts, the agents resource and the archive

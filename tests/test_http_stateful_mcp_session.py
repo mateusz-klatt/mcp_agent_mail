@@ -30,12 +30,12 @@ def _initialize_payload() -> dict:
     }
 
 
-def _tools_call_payload(name: str) -> dict:
+def _tools_call_payload(name: str, arguments: dict | None = None) -> dict:
     return {
         "jsonrpc": "2.0",
         "id": "call-1",
         "method": "tools/call",
-        "params": {"name": name, "arguments": {}},
+        "params": {"name": name, "arguments": arguments or {}},
     }
 
 
@@ -110,6 +110,79 @@ async def test_api_mount_stays_stateless_for_one_shot_clients(http_app):
         assert r.status_code == 200, r.text
         body = r.json()
         assert body.get("result", {}).get("structuredContent", {}).get("status") == "ok"
+
+
+@pytest.mark.asyncio
+async def test_server_window_uuid_never_authenticates_stateless_http_request(
+    isolated_env,
+    monkeypatch,
+):
+    """A process-wide WindowIdentity cannot authenticate an unrelated HTTP call."""
+    monkeypatch.setenv("HTTP_BEARER_TOKEN", "token250")
+    monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "false")
+    monkeypatch.setenv("HTTP_RBAC_ENABLED", "false")
+    monkeypatch.setenv("HTTP_PATH", "/api/")
+    monkeypatch.setenv(
+        "MCP_AGENT_MAIL_WINDOW_ID",
+        "f5ce984c-ad96-4f93-bb3b-b25abca4d15b",
+    )
+    with contextlib.suppress(Exception):
+        _config.clear_settings_cache()
+    settings = _config.get_settings()
+    app = build_http_app(settings, build_mcp_server())
+    project_key = "/test/http-window-auth"
+    agent_name = "codex-wsl-http-window-1"
+    registration_arguments = {
+        "project_key": project_key,
+        "program": "codex",
+        "model": "gpt-5",
+        "name": agent_name,
+    }
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        ensured = await client.post(
+            "/api/",
+            headers=AUTH,
+            json=_tools_call_payload(
+                "ensure_project",
+                {"human_key": project_key},
+            ),
+        )
+        assert ensured.status_code == 200, ensured.text
+
+        registered = await client.post(
+            "/api/",
+            headers=AUTH,
+            json=_tools_call_payload("register_agent", registration_arguments),
+        )
+        assert registered.status_code == 200, registered.text
+        registration_token = registered.json()["result"]["structuredContent"][
+            "registration_token"
+        ]
+
+        unauthenticated = await client.post(
+            "/api/",
+            headers=AUTH,
+            json=_tools_call_payload("register_agent", registration_arguments),
+        )
+        assert unauthenticated.status_code == 200, unauthenticated.text
+        assert unauthenticated.json()["result"]["isError"] is True
+        assert "requires registration_token" in unauthenticated.text
+
+        authenticated = await client.post(
+            "/api/",
+            headers=AUTH,
+            json=_tools_call_payload(
+                "register_agent",
+                {
+                    **registration_arguments,
+                    "registration_token": registration_token,
+                },
+            ),
+        )
+        assert authenticated.status_code == 200, authenticated.text
+        assert authenticated.json()["result"]["isError"] is False
 
 
 @pytest.mark.asyncio

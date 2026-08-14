@@ -240,6 +240,7 @@ class TestDisasterRecoveryE2E:
                     "project_key": project_key,
                     "program": "disaster-test",
                     "model": "test-model",
+                    "name_hint": "codex-wsl-disaster-primary-1",
                     "task_description": "Primary agent",
                 },
             )
@@ -256,6 +257,7 @@ class TestDisasterRecoveryE2E:
                     "project_key": project_key,
                     "program": "disaster-test",
                     "model": "test-model",
+                    "name_hint": "codex-wsl-disaster-secondary-2",
                     "task_description": "Secondary agent",
                 },
             )
@@ -268,6 +270,7 @@ class TestDisasterRecoveryE2E:
                     "project_key": project_key,
                     "program": "disaster-test",
                     "model": "test-model",
+                    "name_hint": "codex-wsl-disaster-tertiary-3",
                     "task_description": "Tertiary agent",
                 },
             )
@@ -531,6 +534,7 @@ class TestArchiveIntegrity:
                     "project_key": project_key,
                     "program": "integrity-test",
                     "model": "test",
+                    "name_hint": "codex-wsl-archive-integrity-1",
                 },
             )
             await client.call_tool(
@@ -601,6 +605,7 @@ class TestPartialRecovery:
                     "project_key": project_key,
                     "program": "empty-restore",
                     "model": "test",
+                    "name_hint": "codex-wsl-empty-restore-1",
                 },
             )
             agent_name = agent.data["name"]
@@ -672,6 +677,7 @@ class TestMultipleArchives:
                     "project_key": project_key,
                     "program": "multi-archive",
                     "model": "test",
+                    "name_hint": "codex-wsl-multi-archive-1",
                 },
             )
             agent_name = agent.data["name"]
@@ -785,6 +791,7 @@ class TestStorageRepoIntegrity:
                     "project_key": project_key,
                     "program": "git-test",
                     "model": "test",
+                    "name_hint": "codex-wsl-git-archive-1",
                 },
             )
             agent_name = agent.data["name"]

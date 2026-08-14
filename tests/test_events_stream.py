@@ -28,6 +28,10 @@ TOKEN = "events-bearer"
 PROJECT = "/test/events"
 PROJECT_GENERATION = "a" * 64
 AGENT_GENERATION = "b" * 64
+EVENT_AGENT = "codex-wsl-events-1"
+EVENT_SENDER = "codex-wsl-events-2"
+EVENT_HIDDEN = "codex-wsl-events-3"
+EVENT_VISIBLE = "codex-wsl-events-4"
 HEADERS = {
     "Authorization": f"Bearer {TOKEN}",
     "Content-Type": "application/json",
@@ -346,7 +350,7 @@ class TestTransport:
         settings, app = _build(monkeypatch)
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
-            me = await self._register(client, settings.http.path, "box-1")
+            me = await self._register(client, settings.http.path, EVENT_AGENT)
             token = me["registration_token"]
 
             frames: list[str] = []
@@ -355,7 +359,7 @@ class TestTransport:
                 async with client.stream(
                     "GET",
                     "/events",
-                    params={"project": PROJECT, "agent": "box-1"},
+                    params={"project": PROJECT, "agent": EVENT_AGENT},
                     headers={**HEADERS, "X-Agent-Mail-Registration-Token": token},
                 ) as response:
                     assert response.status_code == 200
@@ -379,8 +383,8 @@ class TestTransport:
             await _subscribed(
                 self.slug,
                 self.project_generation,
-                "box-1",
-                self.agent_generations["box-1"],
+                EVENT_AGENT,
+                self.agent_generations[EVENT_AGENT],
             )
 
             sent = await client.post(
@@ -390,9 +394,9 @@ class TestTransport:
                     "send_message",
                     {
                         "project_key": PROJECT,
-                        "sender_name": "box-1",
+                        "sender_name": EVENT_AGENT,
                         "sender_token": token,
-                        "to": ["box-1"],
+                        "to": [EVENT_AGENT],
                         "subject": "wake me",
                         "body_md": "body",
                         "idempotency_key": "events-wake-self",
@@ -411,7 +415,7 @@ class TestTransport:
             assert data, f"no data frame; got {frames}"
             hint = json.loads(data[0][len("data: "):])
             assert hint["kind"] == "message"
-            assert hint["agent"] == "box-1"
+            assert hint["agent"] == EVENT_AGENT
             # The join between the two halves of instant delivery: the hint must
             # point at the message that was actually stored, not merely at
             # something. A hint carrying an id the mailbox will not return is
@@ -429,9 +433,9 @@ class TestTransport:
         settings, app = _build(monkeypatch)
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
-            sender = await self._register(client, settings.http.path, "sender-1")
-            hidden = await self._register(client, settings.http.path, "hidden-1")
-            await self._register(client, settings.http.path, "visible-1")
+            sender = await self._register(client, settings.http.path, EVENT_SENDER)
+            hidden = await self._register(client, settings.http.path, EVENT_HIDDEN)
+            await self._register(client, settings.http.path, EVENT_VISIBLE)
 
             frames: list[str] = []
 
@@ -439,7 +443,7 @@ class TestTransport:
                 async with client.stream(
                     "GET",
                     "/events",
-                    params={"project": PROJECT, "agent": "hidden-1"},
+                    params={"project": PROJECT, "agent": EVENT_HIDDEN},
                     headers={
                         **HEADERS,
                         "X-Agent-Mail-Registration-Token": hidden["registration_token"],
@@ -455,8 +459,8 @@ class TestTransport:
             await _subscribed(
                 self.slug,
                 self.project_generation,
-                "hidden-1",
-                self.agent_generations["hidden-1"],
+                EVENT_HIDDEN,
+                self.agent_generations[EVENT_HIDDEN],
             )
 
             await client.post(
@@ -466,10 +470,10 @@ class TestTransport:
                     "send_message",
                     {
                         "project_key": PROJECT,
-                        "sender_name": "sender-1",
+                        "sender_name": EVENT_SENDER,
                         "sender_token": sender["registration_token"],
-                        "to": ["visible-1"],
-                        "bcc": ["hidden-1"],
+                        "to": [EVENT_VISIBLE],
+                        "bcc": [EVENT_HIDDEN],
                         "subject": "quietly",
                         "body_md": "body",
                         "idempotency_key": "events-bcc-wake",
@@ -490,7 +494,7 @@ class TestTransport:
         settings, app = _build(monkeypatch)
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
-            me = await self._register(client, settings.http.path, "box-1")
+            me = await self._register(client, settings.http.path, EVENT_AGENT)
             token = me["registration_token"]
             seen: list[list[str]] = [[], []]
 
@@ -498,7 +502,7 @@ class TestTransport:
                 async with client.stream(
                     "GET",
                     "/events",
-                    params={"project": PROJECT, "agent": "box-1"},
+                    params={"project": PROJECT, "agent": EVENT_AGENT},
                     headers={**HEADERS, "X-Agent-Mail-Registration-Token": token},
                 ) as response:
                     async for line in response.aiter_lines():
@@ -511,8 +515,8 @@ class TestTransport:
             await _subscribed(
                 self.slug,
                 self.project_generation,
-                "box-1",
-                self.agent_generations["box-1"],
+                EVENT_AGENT,
+                self.agent_generations[EVENT_AGENT],
                 count=2,
             )
 
@@ -523,9 +527,9 @@ class TestTransport:
                     "send_message",
                     {
                         "project_key": PROJECT,
-                        "sender_name": "box-1",
+                        "sender_name": EVENT_AGENT,
                         "sender_token": token,
-                        "to": ["box-1"],
+                        "to": [EVENT_AGENT],
                         "subject": "both",
                         "body_md": "body",
                         "idempotency_key": "events-two-connections",
@@ -548,16 +552,16 @@ class TestTransport:
         settings, app = _build(monkeypatch)
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
-            old = await self._register(client, settings.http.path, "box-1")
+            old = await self._register(client, settings.http.path, EVENT_AGENT)
             old_project_generation = self.project_generation
-            old_agent_generation = self.agent_generations["box-1"]
+            old_agent_generation = self.agent_generations[EVENT_AGENT]
             frames: list[str] = []
 
             async def listen() -> None:
                 async with client.stream(
                     "GET",
                     "/events",
-                    params={"project": PROJECT, "agent": "box-1"},
+                    params={"project": PROJECT, "agent": EVENT_AGENT},
                     headers={
                         **HEADERS,
                         "X-Agent-Mail-Registration-Token": old["registration_token"],
@@ -572,7 +576,7 @@ class TestTransport:
             await _subscribed(
                 self.slug,
                 old_project_generation,
-                "box-1",
+                EVENT_AGENT,
                 old_agent_generation,
             )
 
@@ -606,13 +610,14 @@ class TestTransport:
                         "(id, project_id, name, agent_generation, program, model, "
                         "task_description, inception_ts, last_active_ts, "
                         "attachments_policy, contact_policy, registration_token) "
-                        "VALUES (:id, :project_id, 'box-1', :generation, 'probe', "
+                        "VALUES (:id, :project_id, :name, :generation, 'probe', "
                         "'probe', 'replacement', datetime('now'), datetime('now'), "
                         "'auto', 'auto', :token)"
                     ),
                     {
                         "id": int(old["id"]),
                         "project_id": int(old["project_id"]),
+                        "name": EVENT_AGENT,
                         "generation": replacement_agent_generation,
                         "token": "replacement-registration-token",
                     },
@@ -622,12 +627,12 @@ class TestTransport:
             assert hub.publish(
                 self.slug,
                 replacement_project_generation,
-                "box-1",
+                EVENT_AGENT,
                 replacement_agent_generation,
                 {
                     "kind": "message",
                     "project": self.slug,
-                    "agent": "box-1",
+                    "agent": EVENT_AGENT,
                     "id": 999,
                 },
             ) == 0
@@ -638,6 +643,6 @@ class TestTransport:
         assert hub.listener_count(
             self.slug,
             old_project_generation,
-            "box-1",
+            EVENT_AGENT,
             old_agent_generation,
         ) == 0

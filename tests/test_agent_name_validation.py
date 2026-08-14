@@ -1,10 +1,10 @@
-"""P0 Regression Tests: Agent Name Validation.
+"""P0 regression tests for legacy labels and durable Agent identities.
 
 These tests verify that agent name validation correctly:
-1. Accepts valid adjective+noun combinations
-2. Rejects invalid names (descriptive, program names, etc.)
-3. Handles case insensitivity properly
-4. Works correctly in registration and identity creation flows
+1. Keeps legacy adjective+noun helper behavior isolated from mailbox creation
+2. Requires explicit client-os-host-slot names for newly created Agents
+3. Rejects invalid creation without mutating the Agent table
+4. Preserves authentication continuity for existing legacy Agent rows
 
 Reference: mcp_agent_mail-2xf
 """
@@ -130,6 +130,7 @@ class TestValidateClientPlatformHostAgentId:
         [
             "claude-wsl-home-1",
             "codex-wsl-home-1",
+            "cursor-wsl-home-1",
             "copilot-win-home-1",
             "gemini-linux-build-box-7-12",
             "claude-mac-MacBook-Pro.mac-2",
@@ -145,7 +146,6 @@ class TestValidateClientPlatformHostAgentId:
             "codex-wsl-home-session",
             "claude-solaris-home-1",
             "unknown-wsl-home-1",
-            "cursor-wsl-home-1",
             "CLAUDE-wsl-home-1",
             "claude-WSL-home-1",
             "claude-wsl-1",
@@ -267,29 +267,36 @@ class TestSanitizeAgentName:
 
 
 @pytest.mark.asyncio
-async def test_register_agent_auto_generates_valid_name(isolated_env):
-    """register_agent should auto-generate a valid name when name is omitted."""
+async def test_register_agent_requires_explicit_name_without_mutation(isolated_env):
+    """Omitting a durable identity must fail without creating an Agent row."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": pkey("test/names")})
-
-        result = await client.call_tool(
-            "register_agent",
-            {
-                "project_key": pkey("test/names"),
-                "program": "test-program",
-                "model": "test-model",
-            },
+        project = await client.call_tool(
+            "ensure_project", {"human_key": pkey("test/names")}
         )
 
-        agent_name = result.data["name"]
-        assert agent_name is not None
-        assert validate_agent_name_format(agent_name), f"Auto-generated '{agent_name}' should be valid"
+        with pytest.raises(ToolError, match=r"name\n\s+Missing required argument"):
+            await client.call_tool(
+                "register_agent",
+                {
+                    "project_key": pkey("test/names"),
+                    "program": "test-program",
+                    "model": "test-model",
+                },
+            )
+
+    async with get_session() as session:
+        rows = (
+            await session.execute(
+                select(Agent).where(Agent.project_id == project.data["id"])
+            )
+        ).scalars().all()
+    assert rows == []
 
 
 @pytest.mark.asyncio
-async def test_register_agent_with_explicit_valid_name(isolated_env):
-    """register_agent should accept explicit valid names."""
+async def test_register_agent_with_explicit_durable_name(isolated_env):
+    """register_agent accepts an explicit client-os-host-slot identity."""
     server = build_mcp_server()
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": pkey("test/names")})
@@ -300,11 +307,40 @@ async def test_register_agent_with_explicit_valid_name(isolated_env):
                 "project_key": pkey("test/names"),
                 "program": "test-program",
                 "model": "test-model",
-                "name": "BlueMountain",
+                "name": "codex-wsl-names-1",
             },
         )
 
-        assert result.data["name"] == "BlueMountain"
+        assert result.data["name"] == "codex-wsl-names-1"
+        assert result.data["registration_token"]
+
+
+@pytest.mark.asyncio
+async def test_register_agent_never_re_echoes_existing_token(isolated_env):
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": pkey("test/bootstrap-token")})
+        created = await client.call_tool(
+            "register_agent",
+            {
+                "project_key": pkey("test/bootstrap-token"),
+                "program": "test-program",
+                "model": "test-model",
+                "name": "codex-wsl-bootstrap-token-1",
+            },
+        )
+        resumed = await client.call_tool(
+            "register_agent",
+            {
+                "project_key": pkey("test/bootstrap-token"),
+                "program": "test-program",
+                "model": "test-model",
+                "name": "codex-wsl-bootstrap-token-1",
+                "registration_token": created.data["registration_token"],
+            },
+        )
+        assert "registration_token" not in resumed.data
+        assert resumed.data["registration_token_issued"] is False
 
 
 @pytest.mark.asyncio
@@ -321,10 +357,10 @@ async def test_register_agent_case_insensitive_uniqueness(isolated_env):
                 "project_key": pkey("test/case"),
                 "program": "test",
                 "model": "test",
-                "name": "GreenLake",
+                "name": "codex-wsl-case-1",
             },
         )
-        assert result1.data["name"] == "GreenLake"
+        assert result1.data["name"] == "codex-wsl-case-1"
 
         # Re-register with different case should update, not create new
         result2 = await client.call_tool(
@@ -333,7 +369,7 @@ async def test_register_agent_case_insensitive_uniqueness(isolated_env):
                 "project_key": pkey("test/case"),
                 "program": "test-updated",
                 "model": "test-updated",
-                "name": "greenlake",
+                "name": "CODEX-WSL-CASE-1",
             },
         )
         # Should return the same agent (same ID), with updated program
@@ -341,54 +377,66 @@ async def test_register_agent_case_insensitive_uniqueness(isolated_env):
 
 
 # ============================================================================
-# Integration Tests: Agent Registration with Invalid Names (Coerce Mode - Default)
+# Integration Tests: Invalid durable Agent creation
 # ============================================================================
 
 
 @pytest.mark.asyncio
-async def test_register_agent_coerces_invalid_descriptive_name(isolated_env):
-    """In coerce mode (default), invalid names auto-generate valid ones."""
+async def test_register_agent_rejects_descriptive_name_without_mutation(isolated_env):
+    """A descriptive name is not coerced into a random durable identity."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": pkey("test/coerce")})
-
-        # In coerce mode, invalid name should trigger auto-generation
-        result = await client.call_tool(
-            "register_agent",
-            {
-                "project_key": pkey("test/coerce"),
-                "program": "test",
-                "model": "test",
-                "name": "BackendHarmonizer",  # Invalid descriptive name
-            },
+        project = await client.call_tool(
+            "ensure_project", {"human_key": pkey("test/invalid-descriptive")}
         )
 
-        # Should get a valid auto-generated name, not the invalid one
-        agent_name = result.data["name"]
-        assert agent_name != "BackendHarmonizer", "Should not accept invalid name"
-        assert validate_agent_name_format(agent_name), f"Auto-generated '{agent_name}' should be valid"
+        with pytest.raises(ToolError, match="must match client-os-host-slot"):
+            await client.call_tool(
+                "register_agent",
+                {
+                    "project_key": pkey("test/invalid-descriptive"),
+                    "program": "test",
+                    "model": "test",
+                    "name": "BackendHarmonizer",
+                },
+            )
+
+    async with get_session() as session:
+        rows = (
+            await session.execute(
+                select(Agent).where(Agent.project_id == project.data["id"])
+            )
+        ).scalars().all()
+    assert rows == []
 
 
 @pytest.mark.asyncio
-async def test_register_agent_coerces_program_name_as_agent(isolated_env):
-    """In coerce mode, program names as agent names get auto-generated."""
+async def test_register_agent_rejects_program_name_without_mutation(isolated_env):
+    """A program name cannot silently create a random Agent mailbox."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": pkey("test/coerce")})
-
-        result = await client.call_tool(
-            "register_agent",
-            {
-                "project_key": pkey("test/coerce"),
-                "program": "claude-code",
-                "model": "opus",
-                "name": "claude-code",  # Using program name as agent name
-            },
+        project = await client.call_tool(
+            "ensure_project", {"human_key": pkey("test/invalid-program")}
         )
 
-        agent_name = result.data["name"]
-        assert agent_name != "claude-code", "Should not accept program name as agent name"
-        assert validate_agent_name_format(agent_name), f"Auto-generated '{agent_name}' should be valid"
+        with pytest.raises(ToolError, match="must match client-os-host-slot"):
+            await client.call_tool(
+                "register_agent",
+                {
+                    "project_key": pkey("test/invalid-program"),
+                    "program": "claude-code",
+                    "model": "opus",
+                    "name": "claude-code",
+                },
+            )
+
+    async with get_session() as session:
+        rows = (
+            await session.execute(
+                select(Agent).where(Agent.project_id == project.data["id"])
+            )
+        ).scalars().all()
+    assert rows == []
 
 
 @pytest.mark.asyncio
@@ -399,21 +447,26 @@ async def test_register_agent_coerces_program_name_as_agent(isolated_env):
         "codex-wsl-home-1",
         "copilot-win-home-1",
         "gemini-linux-build-box-7-2",
+        "factory-linux-build-box-1",
+        "cursor-mac-laptop-1",
+        "cline-win-home-2",
+        "windsurf-wsl-home-1",
+        "opencode-other-lab-3",
     ],
 )
-async def test_register_agent_preserves_canonical_identity_in_coerce_mode(
+async def test_register_agent_preserves_canonical_identity(
     isolated_env,
     canonical_name: str,
 ):
     """Program/model-name substrings do not replace canonical addresses."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": pkey("test/canonical-coerce")})
+        await client.call_tool("ensure_project", {"human_key": pkey("test/canonical")})
 
         result = await client.call_tool(
             "register_agent",
             {
-                "project_key": pkey("test/canonical-coerce"),
+                "project_key": pkey("test/canonical"),
                 "program": "claude-code",
                 "model": "claude-sonnet",
                 "name": canonical_name,
@@ -424,63 +477,76 @@ async def test_register_agent_preserves_canonical_identity_in_coerce_mode(
 
 
 # ============================================================================
-# Integration Tests: Agent Registration with Invalid Names (Strict Mode)
+# Integration Tests: Existing legacy Agent authentication
 # ============================================================================
 
 
 @pytest.mark.asyncio
-async def test_register_agent_strict_rejects_invalid_descriptive_name(isolated_env, monkeypatch):
-    """In strict mode, register_agent should reject descriptive names."""
-    monkeypatch.setenv("AGENT_NAME_ENFORCEMENT_MODE", "strict")
-    # Clear cached settings to pick up the new env var
-    from mcp_agent_mail.config import clear_settings_cache
-
-    clear_settings_cache()
-
+async def test_register_agent_authenticates_existing_legacy_name(isolated_env):
+    """Strict creation rules do not orphan an already-provisioned legacy mailbox."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": pkey("test/strict")})
+        project = await client.call_tool(
+            "ensure_project", {"human_key": pkey("test/legacy-existing")}
+        )
 
-        with pytest.raises(Exception) as exc_info:
-            await client.call_tool(
-                "register_agent",
-                {
-                    "project_key": pkey("test/strict"),
-                    "program": "test",
-                    "model": "test",
-                    "name": "BackendHarmonizer",
-                },
-            )
+    async with get_session() as session:
+        legacy = Agent(
+            project_id=project.data["id"],
+            name="BlueLake",
+            program="legacy-client",
+            model="legacy-model",
+            registration_token="legacy-registration-token",
+        )
+        session.add(legacy)
+        await session.commit()
+        await session.refresh(legacy)
+        legacy_id = legacy.id
 
-        error_msg = str(exc_info.value).lower()
-        assert "descriptive" in error_msg or "adjective" in error_msg or "invalid" in error_msg
+    async with Client(server) as client:
+        result = await client.call_tool(
+            "register_agent",
+            {
+                "project_key": pkey("test/legacy-existing"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "BlueLake",
+                "registration_token": "legacy-registration-token",
+            },
+        )
+
+    assert result.data["id"] == legacy_id
+    assert result.data["name"] == "BlueLake"
+    assert result.data["program"] == "codex"
 
 
 @pytest.mark.asyncio
-async def test_register_agent_strict_rejects_program_name_as_agent(isolated_env, monkeypatch):
-    """In strict mode, register_agent should reject program names as agent names."""
-    monkeypatch.setenv("AGENT_NAME_ENFORCEMENT_MODE", "strict")
-    from mcp_agent_mail.config import clear_settings_cache
-
-    clear_settings_cache()
-
+async def test_register_agent_rejects_malformed_canonical_name(isolated_env):
+    """A nearly-canonical new name remains invalid and creates no row."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": pkey("test/strict")})
+        project = await client.call_tool(
+            "ensure_project", {"human_key": pkey("test/malformed-canonical")}
+        )
 
-        with pytest.raises(Exception) as exc_info:
+        with pytest.raises(ToolError, match="must match client-os-host-slot"):
             await client.call_tool(
                 "register_agent",
                 {
-                    "project_key": pkey("test/strict"),
+                    "project_key": pkey("test/malformed-canonical"),
                     "program": "claude-code",
                     "model": "opus",
-                    "name": "claude-code",
+                    "name": "claude-wsl-home-session",
                 },
             )
 
-        error_msg = str(exc_info.value).lower()
-        assert "program" in error_msg or "adjective" in error_msg or "invalid" in error_msg
+    async with get_session() as session:
+        rows = (
+            await session.execute(
+                select(Agent).where(Agent.project_id == project.data["id"])
+            )
+        ).scalars().all()
+    assert rows == []
 
 
 @pytest.mark.asyncio
@@ -493,16 +559,11 @@ async def test_register_agent_strict_rejects_program_name_as_agent(isolated_env,
         "gemini-linux-build-box-7-2",
     ],
 )
-async def test_register_agent_preserves_canonical_identity_in_strict_mode(
+async def test_register_agent_accepts_each_supported_durable_client(
     isolated_env,
-    monkeypatch,
     canonical_name: str,
 ):
-    """Strict validation also honors the caller's explicit address."""
-    monkeypatch.setenv("AGENT_NAME_ENFORCEMENT_MODE", "strict")
-    from mcp_agent_mail.config import clear_settings_cache
-
-    clear_settings_cache()
+    """Each supported client can own a separate durable mailbox."""
     server = build_mcp_server()
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": pkey("test/canonical-strict")})
@@ -526,16 +587,16 @@ async def test_register_agent_preserves_canonical_identity_in_strict_mode(
 
 
 @pytest.mark.asyncio
-async def test_create_agent_identity_generates_unique_names(isolated_env):
-    """create_agent_identity should generate unique valid names."""
+async def test_create_agent_identity_requires_name_hint_without_mutation(isolated_env):
+    """Provisioning cannot invent a durable identity when name_hint is absent."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": pkey("test/identity")})
+        project = await client.call_tool(
+            "ensure_project", {"human_key": pkey("test/identity")}
+        )
 
-        # Create multiple identities - all should have unique valid names
-        names = set()
-        for _ in range(5):
-            result = await client.call_tool(
+        with pytest.raises(ToolError, match=r"name_hint\n\s+Missing required argument"):
+            await client.call_tool(
                 "create_agent_identity",
                 {
                     "project_key": pkey("test/identity"),
@@ -543,15 +604,19 @@ async def test_create_agent_identity_generates_unique_names(isolated_env):
                     "model": "test",
                 },
             )
-            name = result.data["name"]
-            assert validate_agent_name_format(name), f"'{name}' should be valid"
-            assert name not in names, f"'{name}' should be unique"
-            names.add(name)
+
+    async with get_session() as session:
+        rows = (
+            await session.execute(
+                select(Agent).where(Agent.project_id == project.data["id"])
+            )
+        ).scalars().all()
+    assert rows == []
 
 
 @pytest.mark.asyncio
-async def test_create_agent_identity_with_valid_hint(isolated_env):
-    """create_agent_identity should accept valid name hints."""
+async def test_create_agent_identity_with_durable_hint(isolated_env):
+    """create_agent_identity accepts an available client-os-host-slot hint."""
     server = build_mcp_server()
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": pkey("test/hint")})
@@ -562,39 +627,45 @@ async def test_create_agent_identity_with_valid_hint(isolated_env):
                 "project_key": pkey("test/hint"),
                 "program": "test",
                 "model": "test",
-                "name_hint": "SilentCave",
+                "name_hint": "codex-wsl-identity-1",
             },
         )
 
-        assert result.data["name"] == "SilentCave"
+        assert result.data["name"] == "codex-wsl-identity-1"
 
 
 @pytest.mark.asyncio
-async def test_create_agent_identity_coerces_invalid_hint(isolated_env):
-    """In coerce mode, create_agent_identity auto-generates for invalid hints."""
+async def test_create_agent_identity_rejects_invalid_hint_without_mutation(isolated_env):
+    """Invalid hints are rejected instead of being silently randomized."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": pkey("test/hint")})
-
-        # In coerce mode, invalid hint should trigger auto-generation
-        result = await client.call_tool(
-            "create_agent_identity",
-            {
-                "project_key": pkey("test/hint"),
-                "program": "test",
-                "model": "test",
-                "name_hint": "InvalidDescriptiveName",
-            },
+        project = await client.call_tool(
+            "ensure_project", {"human_key": pkey("test/invalid-hint")}
         )
 
-        agent_name = result.data["name"]
-        assert agent_name != "InvalidDescriptiveName", "Should not accept invalid hint"
-        assert validate_agent_name_format(agent_name), f"Auto-generated '{agent_name}' should be valid"
+        with pytest.raises(ToolError, match="must match client-os-host-slot"):
+            await client.call_tool(
+                "create_agent_identity",
+                {
+                    "project_key": pkey("test/invalid-hint"),
+                    "program": "test",
+                    "model": "test",
+                    "name_hint": "InvalidDescriptiveName",
+                },
+            )
+
+    async with get_session() as session:
+        rows = (
+            await session.execute(
+                select(Agent).where(Agent.project_id == project.data["id"])
+            )
+        ).scalars().all()
+    assert rows == []
 
 
 @pytest.mark.asyncio
-async def test_create_agent_identity_returns_token_by_default(isolated_env):
-    """Default behavior preserves existing contract (issue #154)."""
+async def test_create_agent_identity_returns_one_time_token(isolated_env):
+    """A fresh durable identity returns the credential needed for persistence."""
     server = build_mcp_server()
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": pkey("test/token-default")})
@@ -604,70 +675,49 @@ async def test_create_agent_identity_returns_token_by_default(isolated_env):
                 "project_key": pkey("test/token-default"),
                 "program": "test",
                 "model": "test",
+                "name_hint": "codex-wsl-token-default-1",
             },
-        )
-        assert "registration_token" in result.data, (
-            "Default response must include registration_token for backwards compatibility"
         )
         assert isinstance(result.data["registration_token"], str)
-        assert result.data["registration_token"], "Token must be non-empty"
-        assert "registration_token_returned" not in result.data, (
-            "The opt-out flag should not appear when the token is included"
-        )
+        assert result.data["registration_token"]
 
 
 @pytest.mark.asyncio
-async def test_create_agent_identity_omits_token_when_opted_out(isolated_env):
-    """`return_registration_token=False` keeps the token off the wire (issue #154)."""
+async def test_create_agent_identity_rejects_duplicate_durable_hint(isolated_env):
+    """Provisioning is create-only and never mutates an existing durable Agent."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": pkey("test/token-opt-out")})
-        result = await client.call_tool(
+        await client.call_tool("ensure_project", {"human_key": pkey("test/duplicate-hint")})
+        first = await client.call_tool(
             "create_agent_identity",
             {
-                "project_key": pkey("test/token-opt-out"),
+                "project_key": pkey("test/duplicate-hint"),
                 "program": "test",
                 "model": "test",
-                "return_registration_token": False,
+                "name_hint": "codex-wsl-duplicate-1",
             },
         )
-        assert "registration_token" not in result.data, (
-            "Opt-out caller must not see registration_token in tool result"
-        )
-        assert result.data.get("registration_token_returned") is False, (
-            "Result must explicitly signal that the token was withheld"
-        )
-        # The agent must still be fully created and the response must still
-        # carry enough metadata for the caller to identify the new identity.
-        for required_field in ("id", "name", "program", "model"):
-            assert required_field in result.data, f"Missing required field {required_field}"
 
-
-@pytest.mark.asyncio
-async def test_create_agent_identity_strict_rejects_invalid_hint(isolated_env, monkeypatch):
-    """In strict mode, create_agent_identity should reject invalid name hints."""
-    monkeypatch.setenv("AGENT_NAME_ENFORCEMENT_MODE", "strict")
-    from mcp_agent_mail.config import clear_settings_cache
-
-    clear_settings_cache()
-
-    server = build_mcp_server()
-    async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": pkey("test/strict-hint")})
-
-        with pytest.raises(Exception) as exc_info:
+        with pytest.raises(ToolError, match="already in use"):
             await client.call_tool(
                 "create_agent_identity",
                 {
-                    "project_key": pkey("test/strict-hint"),
-                    "program": "test",
-                    "model": "test",
-                    "name_hint": "InvalidDescriptiveName",
+                    "project_key": pkey("test/duplicate-hint"),
+                    "program": "changed",
+                    "model": "changed",
+                    "name_hint": "codex-wsl-duplicate-1",
                 },
             )
 
-        error_msg = str(exc_info.value).lower()
-        assert "adjective" in error_msg or "invalid" in error_msg or "format" in error_msg
+    async with get_session() as session:
+        rows = (
+            await session.execute(
+                select(Agent).where(Agent.project_id == first.data["project_id"])
+            )
+        ).scalars().all()
+    assert [(agent.id, agent.program, agent.model) for agent in rows] == [
+        (first.data["id"], "test", "test")
+    ]
 
 
 # ============================================================================
@@ -689,6 +739,7 @@ async def test_send_message_validates_recipient_names(isolated_env):
                 "project_key": pkey("test/msg"),
                 "program": "test",
                 "model": "test",
+                "name": "codex-wsl-msg-1",
             },
         )
         sender_name = sender_result.data["name"]
@@ -700,7 +751,7 @@ async def test_send_message_validates_recipient_names(isolated_env):
                 {
                     "project_key": pkey("test/msg"),
                     "sender_name": sender_name,
-                    "to": ["SilentGlacier"],  # Valid format but doesn't exist
+                    "to": ["claude-wsl-missing-1"],
                     "subject": "Test",
                     "body_md": "Test message",
                     "idempotency_key": "agent-name-missing-recipient",
@@ -726,6 +777,7 @@ async def test_send_message_with_valid_agents(isolated_env):
                 "project_key": pkey("test/valid"),
                 "program": "test",
                 "model": "test",
+                "name": "codex-wsl-valid-1",
             },
         )
         sender_name = sender_result.data["name"]
@@ -736,6 +788,7 @@ async def test_send_message_with_valid_agents(isolated_env):
                 "project_key": pkey("test/valid"),
                 "program": "test",
                 "model": "test",
+                "name": "claude-wsl-valid-1",
             },
         )
         recipient_name = recipient_result.data["name"]

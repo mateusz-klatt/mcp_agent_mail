@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import re
 import sys
 import threading
 import time
@@ -41,6 +42,15 @@ def test_safe_build_path_component_is_portable_and_bounded(value: str) -> None:
     assert component == _safe_build_path_component(value)
     assert component.partition(".")[0].upper() not in {"CON", "NUL", "LPT1"}
     assert component.rsplit("-", 1)[-1] == hashlib.sha256(value.encode()).hexdigest()[:32]
+
+
+def test_safe_build_path_component_keeps_distinct_logical_names_distinct() -> None:
+    values = ["a/b", "a_b", ".", "..", "ż" * 100]
+    components = [_safe_build_path_component(value) for value in values]
+
+    assert len(set(components)) == len(values)
+    assert all(component not in {"", ".", ".."} for component in components)
+    assert all(len(component.encode("utf-8")) <= 80 for component in components)
 
 
 def test_am_run_creates_lease_when_enabled(tmp_path: Path, monkeypatch) -> None:
@@ -246,6 +256,34 @@ class _StaticJsonResponse:
         return None
 
 
+_TEST_AM_RUN_EXECUTION_ID = "11111111-2222-4333-8444-555555555555"
+
+
+def _am_run_lifecycle_response(tool_name: object) -> _StaticJsonResponse | None:
+    if tool_name == "start_agent_execution":
+        return _StaticJsonResponse(
+            {
+                "jsonrpc": "2.0",
+                "id": "am-run-execution-start",
+                "result": {
+                    "structuredContent": {
+                        "id": _TEST_AM_RUN_EXECUTION_ID,
+                        "status": "active",
+                    }
+                },
+            }
+        )
+    if tool_name == "end_agent_execution":
+        return _StaticJsonResponse(
+            {
+                "jsonrpc": "2.0",
+                "id": "am-run-execution-end",
+                "result": {"structuredContent": {"already_ended": False}},
+            }
+        )
+    return None
+
+
 class _InvalidJsonResponse:
     def json(self):
         raise ValueError("invalid json")
@@ -323,6 +361,9 @@ def test_am_run_blocks_on_structured_content_conflicts(tmp_path: Path, monkeypat
 
     def fake_post(self, url, json=None, headers=None):
         tool_name = ((json or {}).get("params") or {}).get("name")
+        lifecycle = _am_run_lifecycle_response(tool_name)
+        if lifecycle is not None:
+            return lifecycle
         if tool_name == "acquire_build_slot":
             return _StaticJsonResponse(
                 {
@@ -380,6 +421,9 @@ def test_am_run_blocks_on_existing_exclusive_conflicts_even_for_shared_request(t
 
     def fake_post(self, url, json=None, headers=None):
         tool_name = ((json or {}).get("params") or {}).get("name")
+        lifecycle = _am_run_lifecycle_response(tool_name)
+        if lifecycle is not None:
+            return lifecycle
         if tool_name == "acquire_build_slot":
             return _StaticJsonResponse(
                 {
@@ -437,6 +481,9 @@ def test_am_run_surfaces_server_error_without_local_fallback(tmp_path: Path, mon
     def fake_post(self, url, json=None, headers=None):
         tool_name = ((json or {}).get("params") or {}).get("name")
         seen_tools.append(str(tool_name))
+        lifecycle = _am_run_lifecycle_response(tool_name)
+        if lifecycle is not None:
+            return lifecycle
         if tool_name == "acquire_build_slot":
             return _StaticJsonResponse(
                 {
@@ -484,6 +531,9 @@ def test_am_run_includes_registration_token_in_server_requests(tmp_path: Path, m
     def fake_post(self, url, json=None, headers=None):
         tool_name = ((json or {}).get("params") or {}).get("name")
         arguments = ((json or {}).get("params") or {}).get("arguments") or {}
+        lifecycle = _am_run_lifecycle_response(tool_name)
+        if lifecycle is not None:
+            return lifecycle
         if tool_name in {"acquire_build_slot", "release_build_slot"}:
             seen_tokens.append((tool_name, arguments.get("registration_token")))
         return _StaticJsonResponse({"jsonrpc": "2.0", "id": "ok", "result": {"structuredContent": {}}})
@@ -507,6 +557,78 @@ def test_am_run_includes_registration_token_in_server_requests(tmp_path: Path, m
     assert ("release_build_slot", "secret-token") in seen_tokens
 
 
+def test_am_run_owns_server_slot_with_one_ephemeral_execution(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
+    monkeypatch.setenv("WORKTREES_ENABLED", "1")
+    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "block")
+    monkeypatch.setenv("AGENT_NAME", "TestAgent")
+    get_settings.cache_clear()
+
+    project = tmp_path / "project"
+    project.mkdir(parents=True)
+    _seed_project_agent(project, "TestAgent", "secret-token")
+    calls: list[tuple[str, dict[str, Any]]] = []
+    child_env: dict[str, str] = {}
+
+    def fake_post(self, url, json=None, headers=None):
+        tool_name = str(((json or {}).get("params") or {}).get("name") or "")
+        arguments = dict(((json or {}).get("params") or {}).get("arguments") or {})
+        calls.append((tool_name, arguments))
+        lifecycle = _am_run_lifecycle_response(tool_name)
+        if lifecycle is not None:
+            return lifecycle
+        return _StaticJsonResponse(
+            {"jsonrpc": "2.0", "id": "ok", "result": {"structuredContent": {}}}
+        )
+
+    class _CompletedProcess:
+        returncode = 0
+
+    def fake_run(cmd, env=None, check=False, **kwargs):
+        child_env.update(cast(dict[str, str], env or {}))
+        return _CompletedProcess()
+
+    monkeypatch.setattr("httpx.Client.post", fake_post)
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    am_run(
+        slot="frontend-build",
+        cmd=[sys.executable, "-c", "raise SystemExit(0)"],
+        project_path=project,
+        agent="TestAgent",
+        ttl_seconds=120,
+        shared=False,
+    )
+
+    tool_names = [name for name, _ in calls]
+    assert tool_names == [
+        "ensure_project",
+        "start_agent_execution",
+        "acquire_build_slot",
+        "release_build_slot",
+        "end_agent_execution",
+    ]
+    by_name = dict(calls)
+    start = by_name["start_agent_execution"]
+    assert start["kind"] == "session"
+    assert start["client_name"] == "am-run"
+    assert start["lifecycle_protocol_version"] == 1
+    assert re.fullmatch(r"[0-9a-f]{64}", start["execution_token"])
+    assert start["registration_token"] == "secret-token"
+    for tool_name in ("acquire_build_slot", "release_build_slot"):
+        assert by_name[tool_name]["execution_id"] == _TEST_AM_RUN_EXECUTION_ID
+        assert by_name[tool_name]["execution_token"] == start["execution_token"]
+        assert by_name[tool_name]["lifecycle_protocol_version"] == 1
+    end = by_name["end_agent_execution"]
+    assert end["execution_id"] == _TEST_AM_RUN_EXECUTION_ID
+    assert end["execution_token"] == start["execution_token"]
+    assert end["status"] == "completed"
+    assert child_env["AGENT_EXECUTION_ID"] == _TEST_AM_RUN_EXECUTION_ID
+
+
 def test_am_run_resolves_registration_token_case_insensitively(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
     monkeypatch.setenv("WORKTREES_ENABLED", "1")
@@ -523,6 +645,9 @@ def test_am_run_resolves_registration_token_case_insensitively(tmp_path: Path, m
     def fake_post(self, url, json=None, headers=None):
         tool_name = ((json or {}).get("params") or {}).get("name")
         arguments = ((json or {}).get("params") or {}).get("arguments") or {}
+        lifecycle = _am_run_lifecycle_response(tool_name)
+        if lifecycle is not None:
+            return lifecycle
         if tool_name in {"acquire_build_slot", "release_build_slot"}:
             seen_tokens.append((tool_name, arguments.get("registration_token")))
         return _StaticJsonResponse({"jsonrpc": "2.0", "id": "ok", "result": {"structuredContent": {}}})
@@ -657,6 +782,7 @@ def test_am_run_uses_repo_root_identity_for_subdirectory_path(tmp_path: Path, mo
 
     assert captured["env"]["SLUG"] == root_ident["slug"]
     assert captured["env"]["PROJECT_UID"] == root_ident["project_uid"]
+    assert "AGENT_EXECUTION_ID" not in captured["env"]
     expected_artifact_dir = (
         Path(get_settings().storage.root).expanduser().resolve()
         / "projects"
@@ -666,6 +792,64 @@ def test_am_run_uses_repo_root_identity_for_subdirectory_path(tmp_path: Path, mo
         / captured["env"]["BRANCH"]
     )
     assert captured["env"]["ARTIFACT_DIR"] == str(expected_artifact_dir)
+
+
+def test_am_run_lifecycle_is_independent_of_worktree_gate_and_redacts_argv(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
+    monkeypatch.setenv("WORKTREES_ENABLED", "0")
+    monkeypatch.setenv("AGENT_NAME", "TestAgent")
+    get_settings.cache_clear()
+
+    project = tmp_path / "project"
+    project.mkdir(parents=True)
+    _seed_project_agent(project, "TestAgent", "secret-token")
+    calls: list[tuple[str, dict[str, Any]]] = []
+    child_env: dict[str, str] = {}
+
+    def fake_post(self, url, json=None, headers=None):
+        tool_name = str(((json or {}).get("params") or {}).get("name") or "")
+        arguments = dict(((json or {}).get("params") or {}).get("arguments") or {})
+        calls.append((tool_name, arguments))
+        lifecycle = _am_run_lifecycle_response(tool_name)
+        if lifecycle is not None:
+            return lifecycle
+        return _StaticJsonResponse(
+            {"jsonrpc": "2.0", "id": "ok", "result": {"structuredContent": {}}}
+        )
+
+    class _CompletedProcess:
+        returncode = 0
+
+    def fake_run(cmd, env=None, check=False, **kwargs):
+        child_env.update(cast(dict[str, str], env or {}))
+        return _CompletedProcess()
+
+    monkeypatch.setattr("httpx.Client.post", fake_post)
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    am_run(
+        slot="no-slot-gate",
+        cmd=[sys.executable, "--token", "TOP_SECRET_ARG"],
+        project_path=project,
+        agent="TestAgent",
+        ttl_seconds=120,
+        shared=False,
+    )
+
+    assert [name for name, _arguments in calls] == [
+        "ensure_project",
+        "start_agent_execution",
+        "end_agent_execution",
+    ]
+    start_arguments = dict(calls)["start_agent_execution"]
+    assert start_arguments["task_description"] == "am-run build slot: no-slot-gate"
+    assert "TOP_SECRET_ARG" not in json.dumps(start_arguments)
+    assert child_env["AGENT_EXECUTION_ID"] == _TEST_AM_RUN_EXECUTION_ID
+    assert "TOP_SECRET_ARG" not in capsys.readouterr().out
 
 
 def test_am_run_local_fallback_normalizes_short_ttl_before_running_child(tmp_path: Path, monkeypatch) -> None:
@@ -931,6 +1115,9 @@ def test_am_run_server_uses_effective_ttl_for_build_slot_requests(tmp_path: Path
     def fake_post(self, url, json=None, headers=None):
         tool_name = ((json or {}).get("params") or {}).get("name")
         arguments = ((json or {}).get("params") or {}).get("arguments") or {}
+        lifecycle = _am_run_lifecycle_response(tool_name)
+        if lifecycle is not None:
+            return lifecycle
         if tool_name == "acquire_build_slot":
             acquire_ttls.append(int(arguments["ttl_seconds"]))
         return _StaticJsonResponse({"jsonrpc": "2.0", "id": "ok", "result": {"structuredContent": {}}})
@@ -969,6 +1156,9 @@ def test_am_run_stops_server_renewer_before_release(tmp_path: Path, monkeypatch)
 
     def fake_post(self, url, json=None, headers=None):
         tool_name = ((json or {}).get("params") or {}).get("name")
+        lifecycle = _am_run_lifecycle_response(tool_name)
+        if lifecycle is not None:
+            return lifecycle
         if tool_name == "release_build_slot":
             release_started.set()
             time.sleep(0.05)
@@ -996,6 +1186,113 @@ def test_am_run_stops_server_renewer_before_release(tmp_path: Path, monkeypatch)
     assert not renewed_during_release.is_set()
 
 
+def test_am_run_server_renew_failure_never_creates_local_lease(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
+    monkeypatch.setenv("WORKTREES_ENABLED", "1")
+    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "block")
+    monkeypatch.setenv("AGENT_NAME", "TestAgent")
+    get_settings.cache_clear()
+
+    project = tmp_path / "project"
+    project.mkdir(parents=True)
+    _seed_project_agent(project, "TestAgent", "secret-token")
+    renew_attempted = threading.Event()
+
+    def fake_post(self, url, json=None, headers=None):
+        tool_name = ((json or {}).get("params") or {}).get("name")
+        lifecycle = _am_run_lifecycle_response(tool_name)
+        if lifecycle is not None:
+            return lifecycle
+        if tool_name == "renew_build_slot":
+            renew_attempted.set()
+            raise httpx.ConnectError("renew unavailable")
+        return _StaticJsonResponse(
+            {"jsonrpc": "2.0", "id": "ok", "result": {"structuredContent": {}}}
+        )
+
+    class _CompletedProcess:
+        returncode = 0
+
+    def fake_run(*args, **kwargs):
+        assert renew_attempted.wait(timeout=1)
+        return _CompletedProcess()
+
+    monkeypatch.setattr("httpx.Client.post", fake_post)
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "mcp_agent_mail.cli._build_slot_renew_interval_seconds", lambda _: 0.01
+    )
+
+    am_run(
+        slot="unittest-slot",
+        cmd=[sys.executable, "-c", "raise SystemExit(0)"],
+        project_path=project,
+        agent="TestAgent",
+        ttl_seconds=120,
+        shared=False,
+    )
+
+    assert renew_attempted.is_set()
+    storage_root = Path(get_settings().storage.root).expanduser().resolve()
+    assert list(storage_root.glob("projects/*/build_slots/**/*.json")) == []
+
+
+def test_am_run_ambiguous_server_acquire_fails_closed_without_local_lease(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
+    monkeypatch.setenv("WORKTREES_ENABLED", "1")
+    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "block")
+    monkeypatch.setenv("AGENT_NAME", "TestAgent")
+    get_settings.cache_clear()
+
+    project = tmp_path / "project"
+    project.mkdir(parents=True)
+    _seed_project_agent(project, "TestAgent", "secret-token")
+    seen_tools: list[str] = []
+
+    def fake_post(self, url, json=None, headers=None):
+        tool_name = str(((json or {}).get("params") or {}).get("name") or "")
+        seen_tools.append(tool_name)
+        lifecycle = _am_run_lifecycle_response(tool_name)
+        if lifecycle is not None:
+            return lifecycle
+        if tool_name == "acquire_build_slot":
+            raise httpx.ConnectError("ambiguous acquire")
+        return _StaticJsonResponse(
+            {"jsonrpc": "2.0", "id": "ok", "result": {"structuredContent": {}}}
+        )
+
+    def unexpected_run(*args, **kwargs):
+        raise AssertionError("child must not run after an ambiguous server acquire")
+
+    monkeypatch.setattr("httpx.Client.post", fake_post)
+    monkeypatch.setattr("subprocess.run", unexpected_run)
+
+    with pytest.raises(click.ClickException, match="remote acquisition result is ambiguous"):
+        am_run(
+            slot="unittest-slot",
+            cmd=[sys.executable, "-c", "raise SystemExit(0)"],
+            project_path=project,
+            agent="TestAgent",
+            ttl_seconds=120,
+            shared=False,
+        )
+
+    assert seen_tools == [
+        "ensure_project",
+        "start_agent_execution",
+        "acquire_build_slot",
+        "end_agent_execution",
+    ]
+    storage_root = Path(get_settings().storage.root).expanduser().resolve()
+    assert list(storage_root.glob("projects/*/build_slots/**/*.json")) == []
+
+
 def test_am_run_server_requests_include_stable_branch(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
     monkeypatch.setenv("WORKTREES_ENABLED", "1")
@@ -1008,12 +1305,19 @@ def test_am_run_server_requests_include_stable_branch(tmp_path: Path, monkeypatc
     _seed_project_agent(proj, "TestAgent", "secret-token")
 
     seen_branches: list[tuple[str, str | None]] = []
+    seen_protocols: list[tuple[str, int | None]] = []
 
     def fake_post(self, url, json=None, headers=None):
         tool_name = ((json or {}).get("params") or {}).get("name")
         arguments = ((json or {}).get("params") or {}).get("arguments") or {}
+        lifecycle = _am_run_lifecycle_response(tool_name)
+        if lifecycle is not None:
+            return lifecycle
         if tool_name in {"acquire_build_slot", "renew_build_slot", "release_build_slot"}:
             seen_branches.append((str(tool_name), arguments.get("branch")))
+            seen_protocols.append(
+                (str(tool_name), arguments.get("lifecycle_protocol_version"))
+            )
         return _StaticJsonResponse({"jsonrpc": "2.0", "id": "ok", "result": {"structuredContent": {}}})
 
     class _CompletedProcess:
@@ -1039,6 +1343,12 @@ def test_am_run_server_requests_include_stable_branch(tmp_path: Path, monkeypatc
     assert ("acquire_build_slot", "unknown") in seen_branches
     assert ("release_build_slot", "unknown") in seen_branches
     assert any(tool_name == "renew_build_slot" and branch == "unknown" for tool_name, branch in seen_branches)
+    assert ("acquire_build_slot", 1) in seen_protocols
+    assert ("release_build_slot", 1) in seen_protocols
+    assert any(
+        tool_name == "renew_build_slot" and protocol == 1
+        for tool_name, protocol in seen_protocols
+    )
 
 
 def test_am_run_server_release_fallback_without_local_lease_is_noop(tmp_path: Path, monkeypatch) -> None:
@@ -1065,6 +1375,9 @@ def test_am_run_server_release_fallback_without_local_lease_is_noop(tmp_path: Pa
         tool_name = str(((json or {}).get("params") or {}).get("name") or "")
         if tool_name:
             seen_tools.append(tool_name)
+        lifecycle = _am_run_lifecycle_response(tool_name)
+        if lifecycle is not None:
+            return lifecycle
         if tool_name == "release_build_slot":
             raise httpx.ConnectError("release unavailable")
         return _StaticJsonResponse({"jsonrpc": "2.0", "id": "ok", "result": {"structuredContent": {}}})

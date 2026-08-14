@@ -55,20 +55,20 @@ async def test_sweep_retires_only_agents_past_threshold(isolated_env):
         stale_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": pkey("Staleagents"),
+                "project_key": pkey("staleagents"),
                 "program": "claude-code",
                 "model": "opus-4",
-                "name": "DustyMountain",
+                "name": "claude-linux-stale-1",
                 "task_description": "Long-since-quiet agent",
             },
         )
         active_result = await client.call_tool(
             "register_agent",
             {
-                "project_key": pkey("Staleagents"),
+                "project_key": pkey("staleagents"),
                 "program": "claude-code",
                 "model": "opus-4",
-                "name": "BrightForest",
+                "name": "claude-linux-active-1",
                 "task_description": "Currently working agent",
             },
         )
@@ -125,10 +125,10 @@ async def test_sweep_is_idempotent(isolated_env):
         result = await client.call_tool(
             "register_agent",
             {
-                "project_key": pkey("Staleidempo"),
+                "project_key": pkey("staleidempo"),
                 "program": "claude-code",
                 "model": "opus-4",
-                "name": "QuietRiver",
+                "name": "claude-linux-idempotent-1",
                 "task_description": "Will be backdated",
             },
         )
@@ -171,10 +171,10 @@ async def test_sweep_threshold_floor(isolated_env):
         await client.call_tool(
             "register_agent",
             {
-                "project_key": pkey("Stalefloor"),
+                "project_key": pkey("stalefloor"),
                 "program": "claude-code",
                 "model": "opus-4",
-                "name": "FuzzyCloud",
+                "name": "claude-linux-floor-1",
                 "task_description": "Just registered",
             },
         )
@@ -197,7 +197,7 @@ async def test_on_demand_sweep_is_project_scoped_and_never_retires_caller(isolat
                 "project_key": pkey("sweep/project-a"),
                 "program": "codex",
                 "model": "gpt-5",
-                "name": "BrightRiver",
+                "name": "codex-linux-sweep-caller-1",
             },
         )
         stale_local = await client.call_tool(
@@ -206,7 +206,7 @@ async def test_on_demand_sweep_is_project_scoped_and_never_retires_caller(isolat
                 "project_key": pkey("sweep/project-a"),
                 "program": "codex",
                 "model": "gpt-5",
-                "name": "QuietMountain",
+                "name": "codex-linux-sweep-local-1",
             },
         )
         stale_other = await client.call_tool(
@@ -215,7 +215,7 @@ async def test_on_demand_sweep_is_project_scoped_and_never_retires_caller(isolat
                 "project_key": pkey("sweep/project-b"),
                 "program": "codex",
                 "model": "gpt-5",
-                "name": "DustyForest",
+                "name": "codex-linux-sweep-remote-1",
             },
         )
 
@@ -265,7 +265,7 @@ async def test_on_demand_sweep_skips_unexpired_reservations_by_default(isolated_
                 "project_key": pkey("sweep/reservations"),
                 "program": "codex",
                 "model": "gpt-5",
-                "name": "SilverLake",
+                "name": "codex-linux-reservations-caller-1",
             },
         )
         stale = await client.call_tool(
@@ -274,7 +274,7 @@ async def test_on_demand_sweep_skips_unexpired_reservations_by_default(isolated_
                 "project_key": pkey("sweep/reservations"),
                 "program": "codex",
                 "model": "gpt-5",
-                "name": "SilentValley",
+                "name": "codex-linux-reservations-stale-1",
             },
         )
 

@@ -111,7 +111,10 @@ def _create_test_database(tmp_path: Path, name: str, num_messages: int, body_siz
         conn.execute("INSERT INTO projects (id, slug, human_key) VALUES (1, 'perf-test', 'Performance Test')")
 
         # Insert test agents
-        conn.execute("INSERT INTO agents (id, project_id, name, program, model) VALUES (1, 1, 'TestAgent', 'test', 'test-model')")
+        conn.execute(
+            "INSERT INTO agents (id, project_id, name, program, model) "
+            "VALUES (1, 1, 'codex-wsl-perf-share-1', 'test', 'test-model')"
+        )
 
         # Insert messages with realistic size
         # Use a repeating pattern to ensure compressibility
@@ -778,6 +781,7 @@ class TestMessageSendLatency:
                     "project_key": project_key,
                     "program": "benchmark",
                     "model": "test",
+                    "name_hint": "codex-wsl-perf-send-1",
                     "task_description": "Message send benchmark",
                 },
             )
@@ -845,6 +849,7 @@ class TestInboxFetchLatency:
                     "project_key": project_key,
                     "program": "benchmark",
                     "model": "test",
+                    "name_hint": "codex-wsl-perf-inbox-1",
                     "task_description": "Inbox fetch benchmark",
                 },
             )
@@ -923,6 +928,7 @@ class TestSearchLatency:
                     "project_key": project_key,
                     "program": "benchmark",
                     "model": "test",
+                    "name_hint": "codex-wsl-perf-search-1",
                     "task_description": "Search benchmark",
                 },
             )
@@ -1001,6 +1007,7 @@ class TestFileReservationLatency:
                     "project_key": project_key,
                     "program": "benchmark",
                     "model": "test",
+                    "name_hint": "codex-wsl-perf-conflict-1",
                     "task_description": "Reserving agent",
                 },
             )
@@ -1012,6 +1019,7 @@ class TestFileReservationLatency:
                     "project_key": project_key,
                     "program": "benchmark",
                     "model": "test",
+                    "name_hint": "codex-wsl-perf-conflict-2",
                     "task_description": "Conflict checking agent",
                 },
             )
@@ -1119,6 +1127,7 @@ class TestPerformanceSummary:
                     "project_key": project_key,
                     "program": "benchmark",
                     "model": "test",
+                    "name_hint": "codex-wsl-perf-summary-1",
                     "task_description": "Summary benchmark agent",
                 },
             )

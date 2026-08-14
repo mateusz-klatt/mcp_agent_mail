@@ -9,6 +9,7 @@ import importlib.metadata as importlib_metadata
 import json
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import stat
@@ -17,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import warnings
 import webbrowser
 from contextlib import contextmanager, nullcontext, suppress
@@ -53,8 +55,6 @@ from .app import (
     _LIKE_ESCAPE_CHAR,
     _canonicalize_project_identifier,
     _extract_like_terms,
-    _hard_delete_agent_database_rows,
-    _hard_delete_project_database_rows,
     _like_escape,
     _sanitize_fts_query,
     _sender_display_name,
@@ -102,18 +102,18 @@ from .share import (
 )
 from .storage import (
     ProjectArchive,
+    _project_archive_lock_path,
+    _resolved_git_common_dir,
+    _write_json_atomic_sync,
     archive_write_lock,
-    commit_archive_path_deletions,
-    commit_archive_subtree_deletion,
-    delete_archive_tree_contents,
     ensure_archive,
-    get_agent_reservation_archive_paths,
     inspect_agent_archive_rename,
     migrate_agent_archive,
 )
 from .utils import (
     parse_client_platform_host_agent_id,
     pid_is_alive as _pid_is_alive,
+    safe_build_path_component as _safe_build_path_component,
     slugify,
     validate_agent_name_format,
     validate_client_platform_host_agent_id,
@@ -252,6 +252,7 @@ async def _lookup_agent_registration_token(project_human_key: str, agent_name: s
             .where(
                 cast(ColumnElement[bool], Project.human_key == project_human_key),
                 func.lower(Agent.name) == agent_name.lower(),
+                cast(ColumnElement[bool], Agent.provisioning_state == "active"),
             )
         )
         token = result.scalar_one_or_none()
@@ -284,6 +285,7 @@ async def _lookup_product_registration_token(product_key: str, agent_name: str) 
             .where(
                 cast(ColumnElement[bool], ProductProjectLink.product_id == product.id),
                 func.lower(Agent.name) == agent_name.lower(),
+                cast(ColumnElement[bool], Agent.provisioning_state == "active"),
             )
         )
         tokens = {
@@ -326,6 +328,7 @@ async def _resolve_local_product_agents(
             .where(
                 cast(ColumnElement[bool], ProductProjectLink.product_id == product.id),
                 func.lower(Agent.name) == agent_name.lower(),
+                cast(ColumnElement[bool], Agent.provisioning_state == "active"),
             )
         )
         project_agents = list(rows.all())
@@ -355,9 +358,19 @@ def _require_cli_product_auth(command_name: str, product_key: str, agent_name: s
     if effective_token:
         return effective_token
     raise click.ClickException(
-        f"{command_name} requires --registration-token / $AGENT_MAIL_REGISTRATION_TOKEN for agent '{agent_name}' "
+        f"{command_name} requires $AGENT_MAIL_REGISTRATION_TOKEN for agent '{agent_name}' "
         f"or a single unambiguous locally stored token linked to product '{product_key}'."
     )
+
+
+def _ambient_registration_token() -> str | None:
+    """Read a registration capability from process env without an argv flag."""
+    value = DecoupleConfig(RepositoryEmpty())(
+        "AGENT_MAIL_REGISTRATION_TOKEN",
+        default=None,
+    )
+    normalized = str(value or "").strip()
+    return normalized or None
 
 
 def _run_async(coro: Any) -> Any:
@@ -1204,6 +1217,7 @@ async def _get_agent_record(project: Project, agent_name: str) -> Agent:
                 and_(
                     cast(ColumnElement[bool], Agent.project_id == project.id),
                     func.lower(Agent.name) == agent_name.lower(),
+                    cast(ColumnElement[bool], Agent.provisioning_state == "active"),
                 )
             )
         )
@@ -1420,14 +1434,6 @@ def products_search(
         Optional[str],
         typer.Option("--agent", "-a", envvar="AGENT_NAME", help="Agent name (defaults to $AGENT_NAME)"),
     ] = None,
-    registration_token: Annotated[
-        Optional[str],
-        typer.Option(
-            "--registration-token",
-            envvar="AGENT_MAIL_REGISTRATION_TOKEN",
-            help="Agent registration token (defaults to a unique local linked-project token lookup or $AGENT_MAIL_REGISTRATION_TOKEN)",
-        ),
-    ] = None,
     limit: Annotated[int, typer.Option("--limit", "-l", help="Max results",)] = 20,
 ) -> None:
     """
@@ -1445,7 +1451,8 @@ def products_search(
         "products search",
         product_key,
         agent_name,
-        registration_token or _run_async(_lookup_product_registration_token(product_key, agent_name)),
+        _ambient_registration_token()
+        or _run_async(_lookup_product_registration_token(product_key, agent_name)),
     )
 
     settings = get_settings()
@@ -1605,14 +1612,6 @@ def products_search(
 def products_inbox(
     product_key: Annotated[str, typer.Argument(..., help="Product uid or name")],
     agent: Annotated[str, typer.Argument(..., help="Agent name")],
-    registration_token: Annotated[
-        Optional[str],
-        typer.Option(
-            "--registration-token",
-            envvar="AGENT_MAIL_REGISTRATION_TOKEN",
-            help="Agent registration token (defaults to a unique local linked-project token lookup or $AGENT_MAIL_REGISTRATION_TOKEN)",
-        ),
-    ] = None,
     limit: Annotated[int, typer.Option("--limit", "-l", help="Max messages",)] = 20,
     urgent_only: Annotated[bool, typer.Option("--urgent-only/--all", help="Only high/urgent")] = False,
     include_bodies: Annotated[bool, typer.Option("--include-bodies/--no-bodies", help="Include body_md")] = False,
@@ -1629,7 +1628,8 @@ def products_inbox(
         "products inbox",
         product_key,
         agent,
-        registration_token or _run_async(_lookup_product_registration_token(product_key, agent)),
+        _ambient_registration_token()
+        or _run_async(_lookup_product_registration_token(product_key, agent)),
     )
     # Try server first
     rows: list[dict[str, Any]] | None = None
@@ -1694,6 +1694,7 @@ def products_inbox(
                                 and_(
                                     cast(ColumnElement[bool], Agent.project_id == proj.id),
                                     func.lower(Agent.name) == agent.lower(),
+                                    cast(ColumnElement[bool], Agent.provisioning_state == "active"),
                                 )
                             )
                         )
@@ -1785,14 +1786,6 @@ def products_summarize_thread(
         Optional[str],
         typer.Option("--agent", "-a", envvar="AGENT_NAME", help="Agent name (defaults to $AGENT_NAME)"),
     ] = None,
-    registration_token: Annotated[
-        Optional[str],
-        typer.Option(
-            "--registration-token",
-            envvar="AGENT_MAIL_REGISTRATION_TOKEN",
-            help="Agent registration token (defaults to a unique local linked-project token lookup or $AGENT_MAIL_REGISTRATION_TOKEN)",
-        ),
-    ] = None,
     per_thread_limit: Annotated[int, typer.Option("--per-thread-limit", "-n", help="Max messages per thread",)] = 50,
     no_llm: Annotated[bool, typer.Option("--no-llm", help="Disable LLM refinement")] = False,
 ) -> None:
@@ -1809,7 +1802,8 @@ def products_summarize_thread(
         "products summarize-thread",
         product_key,
         agent_name,
-        registration_token or _run_async(_lookup_product_registration_token(product_key, agent_name)),
+        _ambient_registration_token()
+        or _run_async(_lookup_product_registration_token(product_key, agent_name)),
     )
     # Try server
     try:
@@ -2256,7 +2250,10 @@ def _open_existing_project_archive(
         slug=project_slug,
         root=project_root,
         repo=repo,
-        lock_path=project_root / ".archive.lock",
+        lock_path=_project_archive_lock_path(
+            _resolved_git_common_dir(storage_root, repo),
+            project_slug,
+        ),
         repo_root=storage_root,
     )
 
@@ -5131,268 +5128,6 @@ def clear_and_reset_everything(
         console.print(f"[dim]Cleared storage root entries:[/] {', '.join(str(p.name) for p in deleted_storage)}")
 
 
-@app.command("hard-delete-agent")
-def hard_delete_agent(
-    project: Annotated[str, typer.Argument(help="Project slug or human key.")],
-    agent_name: Annotated[str, typer.Argument(help="Name of the agent to permanently delete.")],
-    confirmation: Annotated[
-        str,
-        typer.Option(
-            "--confirm",
-            help="Must be exactly 'I UNDERSTAND' to proceed. This operation is IRREVERSIBLE.",
-        ),
-    ] = "",
-    registration_token: Annotated[
-        Optional[str],
-        typer.Option("--token", "-t", help="Registration token for token-protected agents."),
-    ] = None,
-    legacy_cleanup: Annotated[
-        bool,
-        typer.Option(
-            "--legacy-cleanup",
-            help=(
-                "Bypass the registration_token check for agents whose token is NULL "
-                "(pre-token legacy rows that accumulated before tokens were mandatory). "
-                "Only honored when the target agent's registration_token is genuinely empty; "
-                "token-bearing agents still require --token."
-            ),
-        ),
-    ] = False,
-) -> None:
-    """Permanently delete an agent and ALL associated data (messages, files, database records).
-
-    This is NOT soft-delete. Data is physically destroyed and cannot be recovered.
-    Requires --confirm='I UNDERSTAND' to proceed.
-    """
-    if confirmation != "I UNDERSTAND":
-        console.print(
-            "[red]Hard delete requires --confirm='I UNDERSTAND' (case-sensitive).[/]\n"
-            "[yellow]This operation is IRREVERSIBLE — all messages, files, and database records "
-            "for this agent will be permanently destroyed.[/]"
-        )
-        raise typer.Exit(code=1)
-
-    settings = get_settings()
-
-    async def _execute() -> dict[str, Any]:
-        import hmac as _hmac
-
-        await ensure_schema(settings)
-        proj = await _get_project_record(project)
-        agent = await _get_agent_record(proj, agent_name)
-
-        if not agent.registration_token:
-            if not legacy_cleanup:
-                raise ValueError(
-                    "Agent has no registration_token, so hard delete cannot be authenticated. "
-                    "Re-register or mint a token locally before retrying, or re-run with "
-                    "--legacy-cleanup to delete this tokenless legacy row without a token."
-                )
-            console.print(
-                f"[yellow]--legacy-cleanup: deleting tokenless legacy agent "
-                f"'{agent_name}' in project '{project}' without token check.[/]"
-            )
-        elif not _hmac.compare_digest(registration_token or "", agent.registration_token):
-            raise ValueError("Invalid registration_token — only the agent's owner can hard-delete it")
-
-        agent_id = agent.id
-        if agent_id is None:
-            raise ValueError("Agent must have an id before hard delete")
-        project_id = proj.id
-
-        # Phase 1: Database cleanup in a single transaction
-        async with get_immediate_session() as session:
-            deleted_counts = await _hard_delete_agent_database_rows(
-                session,
-                project_id=cast(int, project_id),
-                agent_id=agent_id,
-                agent_name=agent_name,
-            )
-            await session.commit()
-
-        # Phase 2: Filesystem cleanup (best-effort)
-        files_removed = 0
-        dirs_removed = 0
-        fs_errors: list[str] = []
-        reservation_files_removed = 0
-        try:
-            archive = await ensure_archive(settings, proj.slug)
-            agent_dir = archive.root / "agents" / agent_name
-            async with archive_write_lock(archive):
-                reservation_paths = await get_agent_reservation_archive_paths(
-                    archive,
-                    agent_id,
-                    agent_name,
-                )
-                if agent_dir.exists():
-                    for item in agent_dir.rglob("*"):
-                        if item.is_file():
-                            files_removed += 1
-                        elif item.is_dir():
-                            dirs_removed += 1
-                    shutil.rmtree(agent_dir)
-                for reservation_path in reservation_paths:
-                    reservation_path.unlink()
-                    files_removed += 1
-                    reservation_files_removed += 1
-                await commit_archive_path_deletions(
-                    archive,
-                    [agent_dir, *reservation_paths],
-                    f"hard_delete: agent {agent_name}",
-                )
-        except Exception as exc:
-            fs_errors.append(str(exc))
-
-        deleted_counts["archive_files_removed"] = files_removed
-        deleted_counts["archive_dirs_removed"] = dirs_removed
-        deleted_counts["archive_reservation_files_removed"] = reservation_files_removed
-        return {"deleted_counts": deleted_counts, "fs_errors": fs_errors}
-
-    try:
-        result = _run_async(_execute())
-    except ValueError as exc:
-        console.print(f"[red]{exc}[/]")
-        raise typer.Exit(code=1) from exc
-
-    counts = result["deleted_counts"]
-    fs_errors = result["fs_errors"]
-    console.print(f"[green]Hard-deleted agent '{agent_name}' from project '{project}'.[/]")
-    console.print(
-        f"[dim]Database:[/] {counts.get('messages_sent', 0)} messages, "
-        f"{counts.get('message_recipients', 0) + counts.get('sent_message_recipients', 0)} recipient records, "
-        f"{counts.get('file_reservations', 0)} file reservations, "
-        f"{counts.get('agent_links', 0)} agent links, "
-        f"{counts.get('window_identities', 0)} window identities"
-    )
-    console.print(
-        f"[dim]Filesystem:[/] {counts.get('archive_files_removed', 0)} files and "
-        f"{counts.get('archive_dirs_removed', 0)} directories removed"
-    )
-    if fs_errors:
-        for err in fs_errors:
-            console.print(f"[yellow]Filesystem warning:[/] {err}")
-
-
-@app.command("hard-delete-project")
-def hard_delete_project(
-    project: Annotated[str, typer.Argument(help="Project slug or human key.")],
-    confirmation: Annotated[
-        str,
-        typer.Option(
-            "--confirm",
-            help="Must be exactly 'I UNDERSTAND' to proceed. This operation is IRREVERSIBLE.",
-        ),
-    ] = "",
-    registration_token: Annotated[
-        Optional[str],
-        typer.Option("--token", "-t", help="Registration token (must match a registered agent in the project)."),
-    ] = None,
-) -> None:
-    """Permanently delete a project and ALL associated data (agents, messages, files, database records).
-
-    This is NOT soft-delete. The entire project is physically destroyed and cannot be recovered.
-    Requires --confirm='I UNDERSTAND' to proceed.
-    """
-    if confirmation != "I UNDERSTAND":
-        console.print(
-            "[red]Hard delete requires --confirm='I UNDERSTAND' (case-sensitive).[/]\n"
-            "[yellow]This operation is IRREVERSIBLE — ALL agents, messages, files, and database records "
-            "for this project will be permanently destroyed.[/]"
-        )
-        raise typer.Exit(code=1)
-
-    settings = get_settings()
-
-    async def _execute() -> dict[str, Any]:
-        import hmac as _hmac
-
-        await ensure_schema(settings)
-        proj = await _get_project_record(project)
-        project_id = proj.id
-        project_slug = proj.slug
-
-        # Verify caller owns at least one token-bearing agent in this project
-        async with get_session() as session:
-            agents_result = await session.execute(
-                select(Agent).where(
-                    cast(Any, Agent.project_id) == project_id,
-                    cast(Any, Agent.registration_token).isnot(None),
-                )
-            )
-            token_agents = agents_result.scalars().all()
-            if not token_agents:
-                raise ValueError(
-                    "Project has no token-bearing agents, so hard delete cannot be authenticated. "
-                    "Register or create an agent identity first."
-                )
-            if not registration_token or not any(
-                _hmac.compare_digest(registration_token, a.registration_token)
-                for a in token_agents
-                if a.registration_token
-            ):
-                raise ValueError("Invalid registration_token — must match a registered agent in the project")
-
-        # Phase 1: Database cleanup in a single transaction
-        async with get_immediate_session() as session:
-            deleted_counts = await _hard_delete_project_database_rows(
-                session,
-                project_id=cast(int, project_id),
-            )
-            await session.commit()
-
-        # Phase 2: Filesystem cleanup (best-effort)
-        files_removed = 0
-        dirs_removed = 0
-        fs_errors: list[str] = []
-        try:
-            archive = await ensure_archive(settings, project_slug)
-            async with archive_write_lock(archive):
-                files_removed, dirs_removed = await asyncio.to_thread(
-                    delete_archive_tree_contents,
-                    archive.root,
-                )
-                await commit_archive_subtree_deletion(
-                    archive,
-                    archive.root,
-                    f"hard_delete: project {project_slug}",
-                )
-            await asyncio.to_thread(archive.root.rmdir)
-        except Exception as exc:
-            fs_errors.append(str(exc))
-
-        deleted_counts["archive_files_removed"] = files_removed
-        deleted_counts["archive_dirs_removed"] = dirs_removed
-        return {"deleted_counts": deleted_counts, "fs_errors": fs_errors, "slug": project_slug}
-
-    try:
-        result = _run_async(_execute())
-    except ValueError as exc:
-        console.print(f"[red]{exc}[/]")
-        raise typer.Exit(code=1) from exc
-
-    counts = result["deleted_counts"]
-    fs_errors = result["fs_errors"]
-    console.print(f"[green]Hard-deleted project '{project}' (slug: {result['slug']}).[/]")
-    console.print(
-        f"[dim]Database:[/] {counts.get('agents', 0)} agents, "
-        f"{counts.get('messages', 0)} messages, "
-        f"{counts.get('message_recipients', 0)} recipient records, "
-        f"{counts.get('file_reservations', 0)} file reservations, "
-        f"{counts.get('agent_links', 0)} agent links, "
-        f"{counts.get('window_identities', 0)} window identities, "
-        f"{counts.get('message_summaries', 0)} message summaries, "
-        f"{counts.get('sibling_suggestions', 0)} sibling suggestions, "
-        f"{counts.get('product_links', 0)} product links"
-    )
-    console.print(
-        f"[dim]Filesystem:[/] {counts.get('archive_files_removed', 0)} files and "
-        f"{counts.get('archive_dirs_removed', 0)} directories removed"
-    )
-    if fs_errors:
-        for err in fs_errors:
-            console.print(f"[yellow]Filesystem warning:[/] {err}")
-
-
 @app.command("migrate")
 def migrate() -> None:
     """Create database schema from SQLModel definitions (pure SQLModel approach)."""
@@ -5645,57 +5380,6 @@ def amctl_env(
     typer.echo(f"ARTIFACT_DIR={artifact_dir}")
 
 
-_BUILD_PATH_COMPONENT_MAX_BYTES = 80
-_BUILD_PATH_COMPONENT_HASH_LENGTH = 32
-_WINDOWS_RESERVED_COMPONENT_STEMS = frozenset(
-    {"CON", "PRN", "AUX", "NUL"}
-    | {f"COM{index}" for index in range(1, 10)}
-    | {f"LPT{index}" for index in range(1, 10)}
-)
-
-
-def _truncate_utf8_component(value: str, max_bytes: int) -> str:
-    """Truncate on a character boundary to a portable component byte budget."""
-    result: list[str] = []
-    used = 0
-    for char in value:
-        encoded_size = len(char.encode("utf-8", errors="surrogatepass"))
-        if used + encoded_size > max_bytes:
-            break
-        result.append(char)
-        used += encoded_size
-    return "".join(result)
-
-
-def _safe_build_path_component(value: str) -> str:
-    """Return a readable, portable component without lossy-name collisions."""
-    original = value
-    unsafe_chars = frozenset('/\\:*?"<>|')
-    sanitized = "".join(
-        "_" if char in unsafe_chars or char.isspace() or ord(char) < 32 else char
-        for char in original.strip()
-    ).rstrip(" .")
-    if sanitized in {"", ".", ".."}:
-        sanitized = "unknown"
-
-    reserved_on_windows = sanitized.partition(".")[0].upper() in _WINDOWS_RESERVED_COMPONENT_STEMS
-    if reserved_on_windows:
-        # A suffix does not make names such as ``CON.txt`` portable on Windows:
-        # the device-name rule is applied to the stem before the first dot.
-        sanitized = f"safe-{sanitized}"
-
-    encoded = sanitized.encode("utf-8", errors="surrogatepass")
-    transformed = sanitized != original or reserved_on_windows or len(encoded) > _BUILD_PATH_COMPONENT_MAX_BYTES
-    if not transformed:
-        return sanitized
-
-    digest = hashlib.sha256(original.encode("utf-8", errors="surrogatepass")).hexdigest()
-    suffix = f"-{digest[:_BUILD_PATH_COMPONENT_HASH_LENGTH]}"
-    prefix_budget = _BUILD_PATH_COMPONENT_MAX_BYTES - len(suffix)
-    prefix = _truncate_utf8_component(sanitized, prefix_budget).rstrip(" ._-") or "value"
-    return f"{prefix}{suffix}"
-
-
 def _resolved_build_path_within(root: Path, candidate: Path, *, label: str) -> Path:
     """Resolve a build path and reject symlink or traversal escapes."""
     resolved_root = root.resolve()
@@ -5721,14 +5405,6 @@ def am_run(
     cmd: Annotated[list[str], typer.Argument(help="Command to run")],
     project_path: Annotated[Path, typer.Option("--path", "-p", help="Path to repo/worktree",)] = Path(),
     agent: Annotated[Optional[str], typer.Option("--agent", "-a", help="Agent name (defaults to $AGENT_NAME)")] = None,
-    registration_token: Annotated[
-        Optional[str],
-        typer.Option(
-            "--registration-token",
-            envvar="AGENT_MAIL_REGISTRATION_TOKEN",
-            help="Agent registration token (defaults to local DB lookup or $AGENT_MAIL_REGISTRATION_TOKEN)",
-        ),
-    ] = None,
     ttl_seconds: Annotated[int, typer.Option("--ttl-seconds", help="Lease TTL seconds (default 3600)")] = 3600,
     shared: Annotated[bool, typer.Option("--shared/--exclusive", help="Shared (non-exclusive) lease",)] = False,
     block_on_conflicts: Annotated[bool, typer.Option("--block-on-conflicts/--no-block-on-conflicts", help="Exit 1 if exclusive conflicts are present")] = False,
@@ -5746,6 +5422,9 @@ def am_run(
     slug = ident["slug"]
     project_uid = ident["project_uid"]
     branch = ident.get("branch") or ""
+    execution_id = str(uuid.uuid4())
+    execution_external_id = f"am-run:{execution_id}"
+    execution_token = secrets.token_hex(32)
     if not branch:
         repo = None
         try:
@@ -5812,13 +5491,21 @@ def am_run(
                 if isinstance(data, dict) and _is_active_lease(data, now):
                     results.append(data)
             except Exception:
-                continue
+                results.append(
+                    {
+                        "slot": slot_dir.name,
+                        "agent": "<unreadable lease>",
+                        "exclusive": True,
+                        "malformed": True,
+                        "lease_file": f.name,
+                    }
+                )
         return results
 
     def _lease_path(slot_dir: Path) -> Path:
         build_slots_root = _resolved_build_path_within(archive_root, build_slots_path, label="build slots")
         resolved_slot_dir = _resolved_build_path_within(build_slots_root, slot_dir, label="build slot")
-        holder = _safe_build_path_component(f"{agent_name}__{branch or 'unknown'}")
+        holder = _safe_build_path_component(execution_id)
         return _resolved_build_path_within(
             resolved_slot_dir,
             resolved_slot_dir / f"{holder}.json",
@@ -5832,7 +5519,7 @@ def am_run(
             return
         data.update({"released_ts": now.isoformat(), "expires_ts": now.isoformat()})
         with suppress(Exception):
-            path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            _write_json_atomic_sync(path, data)
 
     def _write_local_renew(path: Path) -> None:
         now = datetime.now(timezone.utc)
@@ -5844,7 +5531,7 @@ def am_run(
         new_exp = base + timedelta(seconds=effective_ttl_seconds)
         current.update({"slot": slot, "agent": agent_name, "branch": branch, "expires_ts": new_exp.isoformat()})
         with suppress(Exception):
-            path.write_text(json.dumps(current, indent=2), encoding="utf-8")
+            _write_json_atomic_sync(path, current)
 
     async def _acquire_local_lease_with_lock() -> tuple[list[dict[str, Any]], Path, dict[str, Any]]:
         async with archive_write_lock(archive):
@@ -5852,7 +5539,7 @@ def am_run(
             active = await asyncio.to_thread(_read_active, slot_dir)
             conflicts = [
                 entry for entry in active
-                if not (entry.get("agent") == agent_name and entry.get("branch") == branch)
+                if entry.get("execution_id") != execution_id
                 and ((not shared) or entry.get("exclusive", True))
             ]
             lease_path = _lease_path(slot_dir)
@@ -5864,13 +5551,20 @@ def am_run(
             payload = {
                 "slot": slot,
                 "agent": agent_name,
+                "project_uid": project_uid,
+                "authority": "local",
+                "execution_id": execution_id,
                 "branch": branch,
                 "exclusive": (not shared),
                 "acquired_ts": cast(str, active_current.get("acquired_ts")) if active_current is not None and isinstance(active_current.get("acquired_ts"), str) else now.isoformat(),
                 "expires_ts": max(requested_exp, current_exp).isoformat() if current_exp is not None else requested_exp.isoformat(),
             }
             with suppress(Exception):
-                await asyncio.to_thread(lease_path.write_text, json.dumps(payload, indent=2), encoding="utf-8")
+                await asyncio.to_thread(
+                    _write_json_atomic_sync,
+                    lease_path,
+                    payload,
+                )
             return conflicts, lease_path, payload
 
     async def _renew_local_lease_with_lock(path: Path) -> None:
@@ -5902,9 +5596,116 @@ def am_run(
     })
     renew_stop = threading.Event()
     renew_thread: Optional[threading.Thread] = None
-    resolved_registration_token = registration_token
+    resolved_registration_token = _ambient_registration_token()
     slot_acquired = False
+    slot_authority = "none"
+    server_execution_started = False
+    server_start_attempted = False
+    execution_end_status = "cancelled"
+    renew_warning_emitted = threading.Event()
+
+    def _server_headers() -> dict[str, str]:
+        return {"Authorization": f"Bearer {bearer}"} if bearer else {}
+
+    def _start_server_execution() -> str:
+        nonlocal server_execution_started, server_start_attempted
+        server_start_attempted = True
+        assert resolved_registration_token is not None
+        with httpx.Client(timeout=server_request_timeout_seconds) as client:
+            req = {
+                "jsonrpc": "2.0",
+                "id": "am-run-execution-start",
+                "method": "tools/call",
+                "params": {
+                    "name": "start_agent_execution",
+                    "arguments": {
+                        "project_key": str(p),
+                        "agent_name": agent_name,
+                        "external_id": execution_external_id,
+                        "client_name": "am-run",
+                        "execution_token": execution_token,
+                        "lifecycle_protocol_version": 1,
+                        "kind": "session",
+                        "task_description": f"am-run build slot: {slot}"[:2048],
+                        "cwd": str(p),
+                        "repo_root": str(p),
+                        "worktree_path": str(p),
+                        "branch": branch or None,
+                        "registration_token": resolved_registration_token,
+                    },
+                },
+            }
+            resp = client.post(server_url, json=req, headers=_server_headers())
+            result = _parse_jsonrpc_response(
+                resp,
+                request_name="am-run start_agent_execution",
+            )
+        if not isinstance(result, dict) or not isinstance(result.get("id"), str):
+            raise click.ClickException(
+                "am-run start_agent_execution: server response is missing execution id"
+            )
+        server_execution_started = True
+        return cast(str, result["id"])
+
+    def _end_server_execution() -> None:
+        nonlocal execution_id, server_execution_started
+        if not server_execution_started:
+            return
+        assert resolved_registration_token is not None
+        with httpx.Client(timeout=server_request_timeout_seconds) as client:
+            req = {
+                "jsonrpc": "2.0",
+                "id": "am-run-execution-end",
+                "method": "tools/call",
+                "params": {
+                    "name": "end_agent_execution",
+                    "arguments": {
+                        "project_key": str(p),
+                        "agent_name": agent_name,
+                        "execution_id": execution_id,
+                        "execution_token": execution_token,
+                        "lifecycle_protocol_version": 1,
+                        "status": execution_end_status,
+                        "registration_token": resolved_registration_token,
+                    },
+                },
+            }
+            resp = client.post(server_url, json=req, headers=_server_headers())
+            _parse_jsonrpc_response(resp, request_name="am-run end_agent_execution")
+        server_execution_started = False
     try:
+        if not worktrees_enabled:
+            if not resolved_registration_token:
+                resolved_registration_token = _run_async(
+                    _lookup_agent_registration_token(str(p), agent_name)
+                )
+            if resolved_registration_token:
+                try:
+                    with httpx.Client(timeout=server_request_timeout_seconds) as client:
+                        req = {
+                            "jsonrpc": "2.0",
+                            "id": "am-run-ensure",
+                            "method": "tools/call",
+                            "params": {
+                                "name": "ensure_project",
+                                "arguments": {"human_key": str(p)},
+                            },
+                        }
+                        resp = client.post(
+                            server_url,
+                            json=req,
+                            headers=_server_headers(),
+                        )
+                        _parse_jsonrpc_response(
+                            resp,
+                            request_name="am-run ensure_project",
+                        )
+                    execution_id = _start_server_execution()
+                    env["AGENT_EXECUTION_ID"] = execution_id
+                except httpx.TransportError:
+                    # AgentExecution is authoritative only after a confirmed
+                    # server start. Offline runs deliberately expose no fake ID.
+                    pass
         if worktrees_enabled:
             # Prefer server tools (authority); fallback to local FS leases
             use_server = True
@@ -5930,14 +5731,20 @@ def am_run(
                 if not resolved_registration_token:
                     raise click.ClickException(
                         "am-run requires a registered agent with a registration token when the server is reachable. "
-                        "Register the agent first, or pass --registration-token / $AGENT_MAIL_REGISTRATION_TOKEN."
+                        "Register the agent first or set $AGENT_MAIL_REGISTRATION_TOKEN."
                     )
+                try:
+                    execution_id = _start_server_execution()
+                    env["AGENT_EXECUTION_ID"] = execution_id
+                except httpx.TransportError as exc:
+                    raise click.ClickException(
+                        "am-run could not confirm start_agent_execution after the "
+                        "server became authoritative; refusing a local lease because "
+                        "the remote start result is ambiguous"
+                    ) from exc
                 conflicts: list[dict[str, Any]] = []
                 try:
                     with httpx.Client(timeout=server_request_timeout_seconds) as client:
-                        headers = {}
-                        if bearer:
-                            headers["Authorization"] = f"Bearer {bearer}"
                         req = {
                             "jsonrpc": "2.0",
                             "id": "am-run-acquire",
@@ -5951,16 +5758,24 @@ def am_run(
                                     "branch": branch or None,
                                     "ttl_seconds": effective_ttl_seconds,
                                     "exclusive": (not shared),
+                                    "execution_id": execution_id,
+                                    "execution_token": execution_token,
+                                    "lifecycle_protocol_version": 1,
                                     "registration_token": resolved_registration_token,
                                 },
                             },
                         }
-                        resp = client.post(server_url, json=req, headers=headers)
+                        resp = client.post(server_url, json=req, headers=_server_headers())
                         result = _parse_jsonrpc_response(resp, request_name="am-run acquire_build_slot") or {}
                         conflicts = list(result.get("conflicts") or [])
                         slot_acquired = True
-                except httpx.TransportError:
-                    use_server = False
+                        slot_authority = "server"
+                except httpx.TransportError as exc:
+                    raise click.ClickException(
+                        "am-run could not confirm acquire_build_slot after starting "
+                        "the server execution; refusing a local lease because the "
+                        "remote acquisition result is ambiguous"
+                    ) from exc
 
                 if conflicts and guard_mode == "warn":
                     console.print("[yellow]Build slot conflicts (server advisory, proceeding):[/]")
@@ -5973,15 +5788,10 @@ def am_run(
                     console.print("[red]Build slot conflicts detected and --block-on-conflicts set; aborting.[/]")
                     raise typer.Exit(code=1)
 
-                lease_path = _lease_path(_run_async(_ensure_slot_paths()))
-
                 def _renewer_srv() -> None:
                     while not renew_stop.wait(renew_interval_seconds):
                         try:
                             with httpx.Client(timeout=server_request_timeout_seconds) as client:
-                                headers = {}
-                                if bearer:
-                                    headers["Authorization"] = f"Bearer {bearer}"
                                 req = {
                                     "jsonrpc": "2.0",
                                     "id": "am-run-renew",
@@ -5994,15 +5804,23 @@ def am_run(
                                             "slot": slot,
                                             "branch": branch or None,
                                             "extend_seconds": effective_ttl_seconds,
+                                            "execution_id": execution_id,
+                                            "execution_token": execution_token,
+                                            "lifecycle_protocol_version": 1,
                                             "registration_token": resolved_registration_token,
                                         },
                                     },
                                 }
-                                resp = client.post(server_url, json=req, headers=headers)
+                                resp = client.post(server_url, json=req, headers=_server_headers())
                                 _parse_jsonrpc_response(resp, request_name="am-run renew_build_slot")
-                        except Exception:
-                            if lease_path:
-                                _run_async(_renew_local_lease_with_lock(lease_path))
+                        except Exception as exc:
+                            if not renew_warning_emitted.is_set():
+                                renew_warning_emitted.set()
+                                console.print(
+                                    "[yellow]Server build-slot renewal failed; "
+                                    "keeping server authority and retrying without "
+                                    f"creating a local lease: {exc}[/]"
+                                )
                             continue
 
                 renew_thread = threading.Thread(target=_renewer_srv, name="am-run-renew", daemon=True)
@@ -6010,6 +5828,7 @@ def am_run(
 
             if not use_server:
                 conflicts, lease_path, _payload = _run_async(_acquire_local_lease_with_lock())
+                env["AGENT_EXECUTION_ID"] = execution_id
                 if conflicts and guard_mode == "warn":
                     console.print("[yellow]Build slot conflicts (advisory, proceeding):[/]")
                     for c in conflicts:
@@ -6021,6 +5840,7 @@ def am_run(
                     console.print("[red]Build slot conflicts detected and --block-on-conflicts set; aborting.[/]")
                     raise typer.Exit(code=1)
                 slot_acquired = True
+                slot_authority = "local"
 
                 def _renewer() -> None:
                     while not renew_stop.wait(renew_interval_seconds):
@@ -6031,42 +5851,68 @@ def am_run(
                             continue
                 renew_thread = threading.Thread(target=_renewer, name="am-run-renew", daemon=True)
                 renew_thread.start()
-        console.print(f"[cyan]$ {' '.join(cmd)}[/]  [dim](slot={slot})[/]")
+        console.print(
+            f"[cyan]$ <command redacted: {len(cmd)} argv item(s)>[/]  "
+            f"[dim](slot={slot})[/]"
+        )
         rc = subprocess.run(list(cmd), env=env, check=False).returncode
+        execution_end_status = "completed" if rc == 0 else "failed"
     except FileNotFoundError:
         rc = 127
+        execution_end_status = "failed"
     finally:
         if worktrees_enabled and slot_acquired:
             renew_stop.set()
             if renew_thread and renew_thread.is_alive():
                 renew_thread.join(timeout=server_request_timeout_seconds + 1.0)
-            # Attempt server release; fallback to local lease release
-            try:
-                with httpx.Client(timeout=server_request_timeout_seconds) as client:
-                    headers = {}
-                    if bearer:
-                        headers["Authorization"] = f"Bearer {bearer}"
-                    req = {
-                        "jsonrpc": "2.0",
-                        "id": "am-run-release",
-                        "method": "tools/call",
-                        "params": {
-                            "name": "release_build_slot",
-                            "arguments": {
-                                "project_key": str(p),
-                                "agent_name": agent_name,
-                                "slot": slot,
-                                "branch": branch or None,
-                                "registration_token": resolved_registration_token,
+            if slot_authority == "server":
+                try:
+                    with httpx.Client(timeout=server_request_timeout_seconds) as client:
+                        req = {
+                            "jsonrpc": "2.0",
+                            "id": "am-run-release",
+                            "method": "tools/call",
+                            "params": {
+                                "name": "release_build_slot",
+                                "arguments": {
+                                    "project_key": str(p),
+                                    "agent_name": agent_name,
+                                    "slot": slot,
+                                    "branch": branch or None,
+                                    "execution_id": execution_id,
+                                    "execution_token": execution_token,
+                                    "lifecycle_protocol_version": 1,
+                                    "registration_token": resolved_registration_token,
+                                },
                             },
-                        },
-                    }
-                    resp = client.post(server_url, json=req, headers=headers)
-                    _parse_jsonrpc_response(resp, request_name="am-run release_build_slot")
-            except Exception:
-                if lease_path:
-                    with suppress(Exception):
-                        _run_async(_release_local_lease_with_lock(lease_path))
+                        }
+                        resp = client.post(server_url, json=req, headers=_server_headers())
+                        _parse_jsonrpc_response(
+                            resp, request_name="am-run release_build_slot"
+                        )
+                except Exception as exc:
+                    console.print(
+                        "[yellow]Server build-slot release failed; the execution "
+                        f"end/reaper remains authoritative: {exc}[/]"
+                    )
+            elif slot_authority == "local" and lease_path:
+                with suppress(Exception):
+                    _run_async(_release_local_lease_with_lock(lease_path))
+        if server_start_attempted and not server_execution_started and resolved_registration_token:
+            # A transport failure may happen after the server committed start.
+            # Retry the same native external id and capability so the idempotent
+            # start either recovers that row or creates one row that is ended
+            # immediately below.
+            with suppress(Exception):
+                execution_id = _start_server_execution()
+        if server_execution_started:
+            try:
+                _end_server_execution()
+            except Exception as exc:
+                console.print(
+                    "[yellow]AgentExecution cleanup will rely on expiry after "
+                    f"the server rejected end: {exc}[/]"
+                )
     if rc != 0:
         raise typer.Exit(code=rc)
 
@@ -6989,7 +6835,16 @@ def list_acks(
                 raise typer.BadParameter(str(exc)) from exc
             assert project.id is not None
             agent_result = await session.execute(
-                select(Agent).where(and_(cast(ColumnElement[bool], Agent.project_id == project.id), func.lower(Agent.name) == agent_name.lower()))
+                select(Agent).where(
+                    and_(
+                        cast(ColumnElement[bool], Agent.project_id == project.id),
+                        func.lower(Agent.name) == agent_name.lower(),
+                        cast(
+                            ColumnElement[bool],
+                            Agent.provisioning_state == "active",
+                        ),
+                    )
+                )
             )
             agent = agent_result.scalars().first()
             if not agent:

@@ -26,7 +26,7 @@ from typer.testing import CliRunner
 from mcp_agent_mail import cli as cli_module, storage as storage_module, utils as utils_module
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.cli import app
-from mcp_agent_mail.config import clear_settings_cache, get_settings
+from mcp_agent_mail.config import get_settings
 from mcp_agent_mail.db import ensure_schema, get_session, reset_database_state
 from mcp_agent_mail.models import (
     Agent,
@@ -848,11 +848,8 @@ def test_historical_snapshot_uses_the_rename_commit_as_exact_boundary(
     assert exact["commit_sha"] == _git(seeded.repo_root, "rev-parse", "HEAD")
 
 
-@pytest.mark.parametrize("enforcement_mode", ["coerce", "always_auto"])
-def test_tombstone_blocks_raw_old_name_before_enforcement_mode(
+def test_tombstone_blocks_raw_old_name_before_durable_name_validation(
     isolated_env,
-    monkeypatch,
-    enforcement_mode: str,
 ) -> None:
     old_name = "home-wsl-claude-1"
     new_name = "claude-wsl-home-1"
@@ -870,9 +867,6 @@ def test_tombstone_blocks_raw_old_name_before_enforcement_mode(
         ],
     )
     assert applied.exit_code == 0, applied.output
-    monkeypatch.setenv("AGENT_NAME_ENFORCEMENT_MODE", enforcement_mode)
-    clear_settings_cache()
-
     async def attempt_registration() -> str:
         server = build_mcp_server()
         async with Client(server) as client:
@@ -951,7 +945,7 @@ def test_rename_agent_leaves_pre_platform_identity_out_of_scope(isolated_env) ->
     "old_name",
     ["home-wsl-codex-1", "home-wsl-cx-1", "MaroonPuma"],
 )
-def test_rename_agent_accepts_evidenced_transitional_and_server_coerced_sources(
+def test_rename_agent_accepts_evidenced_transitional_and_legacy_random_sources(
     isolated_env,
     old_name: str,
 ) -> None:

@@ -12,6 +12,10 @@ from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.utils import slugify
 from tests.keys import pkey
 
+POLICY_AGENT_ONE = "codex-wsl-policy-1"
+POLICY_AGENT_TWO = "codex-wsl-policy-2"
+POLICY_AGENT_THREE = "codex-wsl-policy-3"
+
 
 @pytest.mark.asyncio
 async def test_contact_blocked_and_contacts_only(isolated_env, monkeypatch):
@@ -23,7 +27,7 @@ async def test_contact_blocked_and_contacts_only(isolated_env, monkeypatch):
     server = build_mcp_server()
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
-        for name in ("GreenCastle", "BlueLake"):
+        for name in (POLICY_AGENT_ONE, POLICY_AGENT_TWO):
             await client.call_tool(
                 "register_agent",
                 {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": name},
@@ -31,15 +35,16 @@ async def test_contact_blocked_and_contacts_only(isolated_env, monkeypatch):
 
         # Beta blocks all
         await client.call_tool(
-            "set_contact_policy", {"project_key": "Backend", "agent_name": "BlueLake", "policy": "block_all"}
+            "set_contact_policy",
+            {"project_key": "Backend", "agent_name": POLICY_AGENT_TWO, "policy": "block_all"},
         )
         with pytest.raises(ToolError) as excinfo:
             await client.call_tool(
                 "send_message",
                 {
                     "project_key": "Backend",
-                    "sender_name": "GreenCastle",
-                    "to": ["BlueLake"],
+                    "sender_name": POLICY_AGENT_ONE,
+                    "to": [POLICY_AGENT_TWO],
                     "subject": "Hi",
                     "body_md": "ping",
                     "idempotency_key": "contact-policy-block-all",
@@ -50,14 +55,14 @@ async def test_contact_blocked_and_contacts_only(isolated_env, monkeypatch):
         # Beta requires contacts_only
         await client.call_tool(
             "set_contact_policy",
-            {"project_key": "Backend", "agent_name": "BlueLake", "policy": "contacts_only"},
+            {"project_key": "Backend", "agent_name": POLICY_AGENT_TWO, "policy": "contacts_only"},
         )
         r2 = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "GreenCastle",
-                "to": ["BlueLake"],
+                "sender_name": POLICY_AGENT_ONE,
+                "to": [POLICY_AGENT_TWO],
                 "subject": "Hi",
                 "body_md": "ping",
                 "idempotency_key": "contact-policy-contacts-only",
@@ -79,14 +84,15 @@ async def test_contact_auto_allows_file_reservation_overlap(isolated_env, monkey
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_ONE},
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_TWO},
         )
         await client.call_tool(
-            "set_contact_policy", {"project_key": "Backend", "agent_name": "BlueLake", "policy": "contacts_only"}
+            "set_contact_policy",
+            {"project_key": "Backend", "agent_name": POLICY_AGENT_TWO, "policy": "contacts_only"},
         )
 
         # Overlapping file reservations: Alpha holds src/*, Beta holds src/app.py
@@ -94,7 +100,7 @@ async def test_contact_auto_allows_file_reservation_overlap(isolated_env, monkey
             "file_reservation_paths",
             {
                 "project_key": "Backend",
-                "agent_name": "GreenCastle",
+                "agent_name": POLICY_AGENT_ONE,
                 "paths": ["src/*"],
                 "ttl_seconds": 600,
                 "exclusive": True,
@@ -105,7 +111,7 @@ async def test_contact_auto_allows_file_reservation_overlap(isolated_env, monkey
             "file_reservation_paths",
             {
                 "project_key": "Backend",
-                "agent_name": "BlueLake",
+                "agent_name": POLICY_AGENT_TWO,
                 "paths": ["src/app.py"],
                 "ttl_seconds": 600,
                 "exclusive": True,
@@ -117,8 +123,8 @@ async def test_contact_auto_allows_file_reservation_overlap(isolated_env, monkey
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "GreenCastle",
-                "to": ["BlueLake"],
+                "sender_name": POLICY_AGENT_ONE,
+                "to": [POLICY_AGENT_TWO],
                 "subject": "Heuristic",
                 "body_md": "file reservations overlap allows",
                 "idempotency_key": "contact-policy-reservation-overlap",
@@ -135,23 +141,27 @@ async def test_cross_project_contact_and_delivery(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("frontend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_ONE},
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": "Frontend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Frontend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_TWO},
         )
 
         await client.call_tool(
             "request_contact",
-            {"project_key": "Backend", "from_agent": "GreenCastle", "to_agent": "project:Frontend#BlueLake"},
+            {
+                "project_key": "Backend",
+                "from_agent": POLICY_AGENT_ONE,
+                "to_agent": f"project:Frontend#{POLICY_AGENT_TWO}",
+            },
         )
         await client.call_tool(
             "respond_contact",
             {
                 "project_key": "Frontend",
-                "to_agent": "BlueLake",
-                "from_agent": "GreenCastle",
+                "to_agent": POLICY_AGENT_TWO,
+                "from_agent": POLICY_AGENT_ONE,
                 "from_project": "Backend",
                 "accept": True,
             },
@@ -161,8 +171,8 @@ async def test_cross_project_contact_and_delivery(isolated_env):
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "GreenCastle",
-                "to": ["project:Frontend#BlueLake"],
+                "sender_name": POLICY_AGENT_ONE,
+                "to": [f"project:Frontend#{POLICY_AGENT_TWO}"],
                 "subject": "XProj",
                 "body_md": "hello",
                 "idempotency_key": "contact-policy-cross-project",
@@ -171,8 +181,27 @@ async def test_cross_project_contact_and_delivery(isolated_env):
         deliveries = sent.data.get("deliveries") or []
         assert deliveries and any(d.get("project") in {"Frontend", pkey("frontend")} for d in deliveries)
 
+        alternate = await client.call_tool(
+            "send_message",
+            {
+                "project_key": "Backend",
+                "sender_name": POLICY_AGENT_ONE,
+                "to": [f"{POLICY_AGENT_TWO}@Frontend"],
+                "subject": "XProj alternate address",
+                "body_md": "hello again",
+                "idempotency_key": "contact-policy-cross-project-alternate",
+            },
+        )
+        alternate_deliveries = alternate.data.get("deliveries") or []
+        assert alternate_deliveries and any(
+            delivery.get("project") in {"Frontend", pkey("frontend")}
+            for delivery in alternate_deliveries
+        )
+
         # Verify appears in Frontend inbox
-        inbox_blocks = await client.read_resource("resource://inbox/BlueLake?project=Frontend&limit=10")
+        inbox_blocks = await client.read_resource(
+            f"resource://inbox/{POLICY_AGENT_TWO}?project=Frontend&limit=10"
+        )
         raw = inbox_blocks[0].text if inbox_blocks else "{}"
         data = json.loads(raw)
         assert any(item.get("subject") == "XProj" for item in data.get("messages", []))
@@ -185,19 +214,19 @@ async def test_macro_contact_handshake_welcome(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_ONE},
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_TWO},
         )
 
         res = await client.call_tool(
             "macro_contact_handshake",
             {
                 "project_key": "Backend",
-                "requester": "GreenCastle",
-                "target": "BlueLake",
+                "requester": POLICY_AGENT_ONE,
+                "target": POLICY_AGENT_TWO,
                 "reason": "let's sync",
                 "auto_accept": True,
                 "welcome_subject": "Welcome",
@@ -219,11 +248,11 @@ async def test_macro_contact_handshake_rejects_partial_welcome(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_ONE},
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_TWO},
         )
 
         with pytest.raises(Exception, match="welcome_subject and welcome_body"):
@@ -231,8 +260,8 @@ async def test_macro_contact_handshake_rejects_partial_welcome(isolated_env):
                 "macro_contact_handshake",
                 {
                     "project_key": "Backend",
-                    "requester": "GreenCastle",
-                    "target": "BlueLake",
+                    "requester": POLICY_AGENT_ONE,
+                    "target": POLICY_AGENT_TWO,
                     "auto_accept": True,
                     "welcome_subject": "Welcome only",
                 },
@@ -246,11 +275,11 @@ async def test_macro_contact_handshake_rejects_welcome_without_auto_accept(isola
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_ONE},
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_TWO},
         )
 
         with pytest.raises(Exception, match="require auto_accept=True"):
@@ -258,14 +287,16 @@ async def test_macro_contact_handshake_rejects_welcome_without_auto_accept(isola
                 "macro_contact_handshake",
                 {
                     "project_key": "Backend",
-                    "requester": "GreenCastle",
-                    "target": "BlueLake",
+                    "requester": POLICY_AGENT_ONE,
+                    "target": POLICY_AGENT_TWO,
                     "welcome_subject": "Welcome",
                     "welcome_body": "hello before approval",
                 },
             )
 
-        inbox_blocks = await client.read_resource("resource://inbox/BlueLake?project=Backend&limit=10")
+        inbox_blocks = await client.read_resource(
+            f"resource://inbox/{POLICY_AGENT_TWO}?project=Backend&limit=10"
+        )
         raw = inbox_blocks[0].text if inbox_blocks else "{}"
         data = json.loads(raw)
         assert not data.get("messages")
@@ -278,7 +309,7 @@ async def test_macro_contact_handshake_rejects_same_agent_same_project(isolated_
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_TWO},
         )
 
         with pytest.raises(Exception, match="self-contact"):
@@ -286,13 +317,15 @@ async def test_macro_contact_handshake_rejects_same_agent_same_project(isolated_
                 "macro_contact_handshake",
                 {
                     "project_key": "Backend",
-                    "requester": "BlueLake",
-                    "target": "BlueLake",
+                    "requester": POLICY_AGENT_TWO,
+                    "target": POLICY_AGENT_TWO,
                     "auto_accept": True,
                 },
             )
 
-        inbox_blocks = await client.read_resource("resource://inbox/BlueLake?project=Backend&limit=10")
+        inbox_blocks = await client.read_resource(
+            f"resource://inbox/{POLICY_AGENT_TWO}?project=Backend&limit=10"
+        )
         raw = inbox_blocks[0].text if inbox_blocks else "{}"
         data = json.loads(raw)
         assert not data.get("messages")
@@ -308,19 +341,19 @@ async def test_macro_contact_handshake_cross_project_welcome(isolated_env):
         await client.call_tool("ensure_project", {"human_key": frontend})
         await client.call_tool(
             "register_agent",
-            {"project_key": backend, "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {"project_key": backend, "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_ONE},
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": frontend, "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": frontend, "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_TWO},
         )
 
         res = await client.call_tool(
             "macro_contact_handshake",
             {
                 "project_key": backend,
-                "requester": "GreenCastle",
-                "target": "BlueLake",
+                "requester": POLICY_AGENT_ONE,
+                "target": POLICY_AGENT_TWO,
                 "to_project": frontend,
                 "auto_accept": True,
                 "welcome_subject": "Cross-project welcome",
@@ -331,7 +364,9 @@ async def test_macro_contact_handshake_cross_project_welcome(isolated_env):
         welcome = res.data.get("welcome_message") or {}
         assert welcome.get("deliveries"), res.data.get("welcome_error")
 
-        inbox_blocks = await client.read_resource("resource://inbox/BlueLake?project=/data/projects/frontend&limit=10")
+        inbox_blocks = await client.read_resource(
+            f"resource://inbox/{POLICY_AGENT_TWO}?project=/data/projects/frontend&limit=10"
+        )
         raw = inbox_blocks[0].text if inbox_blocks else "{}"
         data = json.loads(raw)
         assert any(item.get("subject") == "Cross-project welcome" for item in data.get("messages", []))
@@ -344,11 +379,11 @@ async def test_macro_contact_handshake_auto_accept_requires_target_auth(isolated
         await bootstrap_client.call_tool("ensure_project", {"human_key": pkey("backend")})
         green = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_ONE},
         )
         blue = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_TWO},
         )
         green_token = green.data["registration_token"]
         blue_token = blue.data["registration_token"]
@@ -358,8 +393,8 @@ async def test_macro_contact_handshake_auto_accept_requires_target_auth(isolated
             "macro_contact_handshake",
             {
                 "project_key": "Backend",
-                "requester": "GreenCastle",
-                "target": "BlueLake",
+                "requester": POLICY_AGENT_ONE,
+                "target": POLICY_AGENT_TWO,
                 "auto_accept": True,
                 "welcome_subject": "Welcome",
                 "welcome_body": "this should not send yet",
@@ -380,12 +415,12 @@ async def test_macro_contact_handshake_auto_accept_requires_target_auth(isolated
             "list_contacts",
             {
                 "project_key": "Backend",
-                "agent_name": "GreenCastle",
+                "agent_name": POLICY_AGENT_ONE,
                 "registration_token": green_token,
             },
         )
         contact_items = contacts.structured_content["result"]
-        pending = next(item for item in contact_items if item["to"] == "BlueLake")
+        pending = next(item for item in contact_items if item["to"] == POLICY_AGENT_TWO)
         assert pending["status"] == "pending"
         assert not pending["allows_messaging"]
 
@@ -394,14 +429,14 @@ async def test_macro_contact_handshake_auto_accept_requires_target_auth(isolated
             "fetch_inbox",
             {
                 "project_key": "Backend",
-                "agent_name": "BlueLake",
+                "agent_name": POLICY_AGENT_TWO,
                 "registration_token": blue_token,
                 "include_bodies": True,
             },
         )
         messages = inbox.structured_content["result"]
         subjects = {item["subject"] for item in messages}
-        assert "Contact request from GreenCastle" in subjects
+        assert f"Contact request from {POLICY_AGENT_ONE}" in subjects
         assert "Welcome" not in subjects
 
 
@@ -412,11 +447,21 @@ async def test_macro_contact_handshake_reuses_existing_approval_without_target_a
         await bootstrap_client.call_tool("ensure_project", {"human_key": pkey("backend-reuse-approved")})
         green = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": pkey("backend-reuse-approved"), "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {
+                "project_key": pkey("backend-reuse-approved"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": POLICY_AGENT_ONE,
+            },
         )
         blue = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": pkey("backend-reuse-approved"), "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {
+                "project_key": pkey("backend-reuse-approved"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": POLICY_AGENT_TWO,
+            },
         )
         green_token = green.data["registration_token"]
         blue_token = blue.data["registration_token"]
@@ -425,8 +470,8 @@ async def test_macro_contact_handshake_reuses_existing_approval_without_target_a
             "request_contact",
             {
                 "project_key": pkey("backend-reuse-approved"),
-                "from_agent": "GreenCastle",
-                "to_agent": "BlueLake",
+                "from_agent": POLICY_AGENT_ONE,
+                "to_agent": POLICY_AGENT_TWO,
                 "registration_token": green_token,
             },
         )
@@ -434,8 +479,8 @@ async def test_macro_contact_handshake_reuses_existing_approval_without_target_a
             "respond_contact",
             {
                 "project_key": pkey("backend-reuse-approved"),
-                "to_agent": "BlueLake",
-                "from_agent": "GreenCastle",
+                "to_agent": POLICY_AGENT_TWO,
+                "from_agent": POLICY_AGENT_ONE,
                 "accept": True,
                 "registration_token": blue_token,
             },
@@ -446,8 +491,8 @@ async def test_macro_contact_handshake_reuses_existing_approval_without_target_a
             "macro_contact_handshake",
             {
                 "project_key": pkey("backend-reuse-approved"),
-                "requester": "GreenCastle",
-                "target": "BlueLake",
+                "requester": POLICY_AGENT_ONE,
+                "target": POLICY_AGENT_TWO,
                 "auto_accept": True,
                 "welcome_subject": "Welcome back",
                 "welcome_body": "existing approval should be enough",
@@ -466,7 +511,7 @@ async def test_macro_contact_handshake_reuses_existing_approval_without_target_a
             "fetch_inbox",
             {
                 "project_key": pkey("backend-reuse-approved"),
-                "agent_name": "BlueLake",
+                "agent_name": POLICY_AGENT_TWO,
                 "registration_token": blue_token,
                 "include_bodies": True,
             },
@@ -476,7 +521,7 @@ async def test_macro_contact_handshake_reuses_existing_approval_without_target_a
 
 
 @pytest.mark.asyncio
-async def test_macro_contact_handshake_registers_missing_target(isolated_env):
+async def test_macro_contact_handshake_requires_registered_target(isolated_env):
     backend = "/data/projects/backend"
     frontend = "/data/projects/frontend"
     server = build_mcp_server()
@@ -485,54 +530,18 @@ async def test_macro_contact_handshake_registers_missing_target(isolated_env):
         await client.call_tool("ensure_project", {"human_key": frontend})
         await client.call_tool(
             "register_agent",
-            {"project_key": backend, "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": backend, "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_ONE},
         )
 
-        await client.call_tool(
-            "macro_contact_handshake",
-            {
-                "project_key": backend,
-                "requester": "BlueLake",
-                "target": "RedDog",
-                "to_project": frontend,
-                "register_if_missing": True,
-                "program": "codex-cli",
-                "model": "gpt-5",
-                "task_description": "auto-created via handshake",
-                "auto_accept": True,
-            },
-        )
-
-        agents_blocks = await client.read_resource(f"resource://agents/{slugify(frontend)}")
-        raw = agents_blocks[0].text if agents_blocks else "{}"
-        data = json.loads(raw)
-        names = {agent.get("name") for agent in data.get("agents", [])}
-        assert "RedDog" in names
-
-
-@pytest.mark.asyncio
-async def test_macro_contact_handshake_respects_register_if_missing_false(isolated_env):
-    backend = "/data/projects/backend"
-    frontend = "/data/projects/frontend"
-    server = build_mcp_server()
-    async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": backend})
-        await client.call_tool("ensure_project", {"human_key": frontend})
-        await client.call_tool(
-            "register_agent",
-            {"project_key": backend, "program": "codex", "model": "gpt-5", "name": "BlueLake"},
-        )
-
-        with pytest.raises(Exception, match="not found"):
+        with pytest.raises(ToolError, match="target must self-register"):
             await client.call_tool(
                 "macro_contact_handshake",
                 {
                     "project_key": backend,
-                    "requester": "BlueLake",
-                    "target": "RedDog",
+                    "requester": POLICY_AGENT_ONE,
+                    "target": POLICY_AGENT_THREE,
                     "to_project": frontend,
-                    "register_if_missing": False,
-                    "auto_accept": False,
+                    "auto_accept": True,
                 },
             )
 
@@ -540,7 +549,38 @@ async def test_macro_contact_handshake_respects_register_if_missing_false(isolat
         raw = agents_blocks[0].text if agents_blocks else "{}"
         data = json.loads(raw)
         names = {agent.get("name") for agent in data.get("agents", [])}
-        assert "RedDog" not in names
+        assert POLICY_AGENT_THREE not in names
+
+
+@pytest.mark.asyncio
+async def test_request_contact_requires_registered_target(isolated_env):
+    backend = "/data/projects/backend"
+    frontend = "/data/projects/frontend"
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": backend})
+        await client.call_tool("ensure_project", {"human_key": frontend})
+        await client.call_tool(
+            "register_agent",
+            {"project_key": backend, "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_ONE},
+        )
+
+        with pytest.raises(ToolError, match="target must self-register"):
+            await client.call_tool(
+                "request_contact",
+                {
+                    "project_key": backend,
+                    "from_agent": POLICY_AGENT_ONE,
+                    "to_agent": POLICY_AGENT_THREE,
+                    "to_project": frontend,
+                },
+            )
+
+        agents_blocks = await client.read_resource(f"resource://agents/{slugify(frontend)}")
+        raw = agents_blocks[0].text if agents_blocks else "{}"
+        data = json.loads(raw)
+        names = {agent.get("name") for agent in data.get("agents", [])}
+        assert POLICY_AGENT_THREE not in names
 
 
 @pytest.mark.asyncio
@@ -554,19 +594,19 @@ async def test_send_message_supports_at_address(isolated_env):
         await client.call_tool("ensure_project", {"human_key": frontend})
         await client.call_tool(
             "register_agent",
-            {"project_key": backend, "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": backend, "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_ONE},
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": frontend, "program": "codex", "model": "gpt-5", "name": "PinkDog"},
+            {"project_key": frontend, "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_TWO},
         )
 
         await client.call_tool(
             "macro_contact_handshake",
             {
                 "project_key": backend,
-                "requester": "BlueLake",
-                "target": "PinkDog",
+                "requester": POLICY_AGENT_ONE,
+                "target": POLICY_AGENT_TWO,
                 "to_project": frontend,
                 "auto_accept": True,
             },
@@ -576,8 +616,8 @@ async def test_send_message_supports_at_address(isolated_env):
             "send_message",
             {
                 "project_key": backend,
-                "sender_name": "BlueLake",
-                "to": [f"PinkDog@{frontend_slug}"],
+                "sender_name": POLICY_AGENT_ONE,
+                "to": [f"{POLICY_AGENT_TWO}@{frontend_slug}"],
                 "subject": "AT Route",
                 "body_md": "hello",
                 "idempotency_key": "contact-policy-at-address",

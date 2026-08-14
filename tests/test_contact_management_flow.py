@@ -33,6 +33,16 @@ from sqlalchemy import text
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import get_session
 
+CONTACT_FLOW_AGENT_ONE = "codex-wsl-contact-flow-1"
+CONTACT_FLOW_AGENT_TWO = "codex-wsl-contact-flow-2"
+CONTACT_FLOW_SELF_REQUEST = "codex-wsl-contact-flow-3"
+CONTACT_FLOW_SELF_RESPONSE = "codex-wsl-contact-flow-4"
+CONTACT_FLOW_LIST_CROSS_ONE = "codex-wsl-contact-flow-5"
+CONTACT_FLOW_LIST_CROSS_TWO = "codex-wsl-contact-flow-6"
+CONTACT_FLOW_CROSS_ONE = "codex-wsl-contact-flow-7"
+CONTACT_FLOW_CROSS_TWO = "codex-wsl-contact-flow-8"
+CONTACT_FLOW_POLICY = "codex-wsl-contact-flow-9"
+
 # ============================================================================
 # Helper: Direct SQL verification
 # ============================================================================
@@ -227,13 +237,23 @@ async def setup_two_agents(client, project_key: str) -> tuple[str, str]:
 
     agent_a_result = await client.call_tool(
         "register_agent",
-        {"project_key": project_key, "program": "test", "model": "test"},
+        {
+            "project_key": project_key,
+            "program": "test",
+            "model": "test",
+            "name": CONTACT_FLOW_AGENT_ONE,
+        },
     )
     agent_a_name = agent_a_result.data["name"]
 
     agent_b_result = await client.call_tool(
         "register_agent",
-        {"project_key": project_key, "program": "test", "model": "test"},
+        {
+            "project_key": project_key,
+            "program": "test",
+            "model": "test",
+            "name": CONTACT_FLOW_AGENT_TWO,
+        },
     )
     agent_b_name = agent_b_result.data["name"]
 
@@ -287,7 +307,12 @@ async def test_request_contact_rejects_same_agent_same_project(isolated_env):
         await client.call_tool("ensure_project", {"human_key": project_key})
         await client.call_tool(
             "register_agent",
-            {"project_key": project_key, "program": "test", "model": "test", "name": "BlueLake"},
+            {
+                "project_key": project_key,
+                "program": "test",
+                "model": "test",
+                "name": CONTACT_FLOW_SELF_REQUEST,
+            },
         )
 
         with pytest.raises(Exception, match="self-contact"):
@@ -295,12 +320,12 @@ async def test_request_contact_rejects_same_agent_same_project(isolated_env):
                 "request_contact",
                 {
                     "project_key": project_key,
-                    "from_agent": "BlueLake",
-                    "to_agent": "BlueLake",
+                    "from_agent": CONTACT_FLOW_SELF_REQUEST,
+                    "to_agent": CONTACT_FLOW_SELF_REQUEST,
                 },
             )
 
-        agent_id = await get_agent_id(project_key, "BlueLake")
+        agent_id = await get_agent_id(project_key, CONTACT_FLOW_SELF_REQUEST)
         assert agent_id is not None
         assert await get_agent_link_from_db(agent_id, agent_id) is None
 
@@ -308,7 +333,7 @@ async def test_request_contact_rejects_same_agent_same_project(isolated_env):
             "fetch_inbox",
             {
                 "project_key": project_key,
-                "agent_name": "BlueLake",
+                "agent_name": CONTACT_FLOW_SELF_REQUEST,
                 "include_bodies": True,
             },
         )
@@ -737,7 +762,12 @@ async def test_respond_contact_rejects_same_agent_same_project(isolated_env):
         await client.call_tool("ensure_project", {"human_key": project_key})
         await client.call_tool(
             "register_agent",
-            {"project_key": project_key, "program": "test", "model": "test", "name": "BlueLake"},
+            {
+                "project_key": project_key,
+                "program": "test",
+                "model": "test",
+                "name": CONTACT_FLOW_SELF_RESPONSE,
+            },
         )
 
         with pytest.raises(Exception, match="self-contact"):
@@ -745,13 +775,13 @@ async def test_respond_contact_rejects_same_agent_same_project(isolated_env):
                 "respond_contact",
                 {
                     "project_key": project_key,
-                    "to_agent": "BlueLake",
-                    "from_agent": "BlueLake",
+                    "to_agent": CONTACT_FLOW_SELF_RESPONSE,
+                    "from_agent": CONTACT_FLOW_SELF_RESPONSE,
                     "accept": True,
                 },
             )
 
-        agent_id = await get_agent_id(project_key, "BlueLake")
+        agent_id = await get_agent_id(project_key, CONTACT_FLOW_SELF_RESPONSE)
         assert agent_id is not None
         assert await get_agent_link_from_db(agent_id, agent_id) is None
 
@@ -1183,13 +1213,23 @@ async def test_list_contacts_shows_cross_project_target(isolated_env):
 
         agent_a_result = await client.call_tool(
             "register_agent",
-            {"project_key": project_a, "program": "test", "model": "test"},
+            {
+                "project_key": project_a,
+                "program": "test",
+                "model": "test",
+                "name": CONTACT_FLOW_LIST_CROSS_ONE,
+            },
         )
         agent_a_name = agent_a_result.data["name"]
 
         agent_b_result = await client.call_tool(
             "register_agent",
-            {"project_key": project_b, "program": "test", "model": "test"},
+            {
+                "project_key": project_b,
+                "program": "test",
+                "model": "test",
+                "name": CONTACT_FLOW_LIST_CROSS_TWO,
+            },
         )
         agent_b_name = agent_b_result.data["name"]
 
@@ -1273,13 +1313,23 @@ async def test_cross_project_contact_request(isolated_env):
 
         agent_a_result = await client.call_tool(
             "register_agent",
-            {"project_key": project_a, "program": "test", "model": "test"},
+            {
+                "project_key": project_a,
+                "program": "test",
+                "model": "test",
+                "name": CONTACT_FLOW_CROSS_ONE,
+            },
         )
         agent_a_name = agent_a_result.data["name"]
 
         agent_b_result = await client.call_tool(
             "register_agent",
-            {"project_key": project_b, "program": "test", "model": "test"},
+            {
+                "project_key": project_b,
+                "program": "test",
+                "model": "test",
+                "name": CONTACT_FLOW_CROSS_TWO,
+            },
         )
         agent_b_name = agent_b_result.data["name"]
 
@@ -1431,7 +1481,12 @@ async def test_set_contact_policy_persists(isolated_env):
 
         agent_result = await client.call_tool(
             "register_agent",
-            {"project_key": project_key, "program": "test", "model": "test"},
+            {
+                "project_key": project_key,
+                "program": "test",
+                "model": "test",
+                "name": CONTACT_FLOW_POLICY,
+            },
         )
         agent_name = agent_result.data["name"]
 

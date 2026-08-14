@@ -15,9 +15,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
+import uuid
 from typing import Any
 
+from decouple import Config as DecoupleConfig, RepositoryEnv
 from fastmcp import Client
+
+decouple_config = DecoupleConfig(RepositoryEnv(".env"))
 
 
 def _select_cluster(directory_payload: dict[str, Any], cluster_name: str) -> dict[str, Any]:
@@ -28,10 +33,19 @@ def _select_cluster(directory_payload: dict[str, Any], cluster_name: str) -> dic
 
 
 async def main() -> None:
-    # Supply capability tokens for this agent (examples/capability template in
-    # deploy/capabilities/agent_capabilities.example.yaml). Most MCP client
-    # libraries accept metadata at connection time; refer to your client docs.
-    async with Client("http://127.0.0.1:8765/api/") as client:
+    endpoint = decouple_config("AGENT_MAIL_URL", default="http://127.0.0.1:8765/api/")
+    project_key = decouple_config("AGENT_MAIL_PROJECT", default="/owner/backend")
+    agent_name = decouple_config("AGENT_MAIL_AGENT", default="codex-linux-bootstrap-1")
+    registration_token = decouple_config("AGENT_MAIL_REGISTRATION_TOKEN", default="")
+    if not registration_token:
+        raise RuntimeError(
+            "Provision the durable Agent first, then set "
+            "AGENT_MAIL_REGISTRATION_TOKEN in a private environment/state store."
+        )
+
+    execution_token = secrets.token_hex(32)
+    execution_id: str | None = None
+    async with Client(endpoint) as client:
         directory_blocks = await client.read_resource("resource://tooling/directory")
         directory_payload = json.loads(getattr(directory_blocks[0], "text", "{}"))
         print("==> Loaded tooling directory; clusters available:")
@@ -69,17 +83,50 @@ async def main() -> None:
 
         # Finally run whatever workflow you need. As an example, call the macro
         # to bootstrap a session.
-        response = await client.call_tool(
-            "macro_start_session",
-            {
-                "human_key": "/abs/path/backend",
-                "program": "codex",
-                "model": "gpt-5-small",
-                "reserve_paths": ["src/app.py"],
-            },
-        )
-        print("==> macro_start_session result:")
-        print(response.content)
+        try:
+            response = await client.call_tool(
+                "macro_start_session",
+                {
+                    "human_key": project_key,
+                    "program": "codex",
+                    "model": "gpt-5-small",
+                    "agent_name": agent_name,
+                    "external_id": f"bootstrap-{uuid.uuid4()}",
+                    "client_name": "codex",
+                    "execution_token": execution_token,
+                    "registration_token": registration_token,
+                    "file_reservation_paths": ["src/app.py"],
+                },
+            )
+            result = response.data
+            execution_id = str(result["execution"]["id"])
+            print("==> Session ready (credentials intentionally omitted):")
+            print(
+                json.dumps(
+                    {
+                        "project": result["project"],
+                        "agent": result["agent"],
+                        "execution": result["execution"],
+                        "file_reservations": result["file_reservations"],
+                        "inbox_count": len(result["inbox"]),
+                    },
+                    indent=2,
+                )
+            )
+        finally:
+            if execution_id is not None:
+                await client.call_tool(
+                    "end_agent_execution",
+                    {
+                        "project_key": project_key,
+                        "agent_name": agent_name,
+                        "execution_id": execution_id,
+                        "execution_token": execution_token,
+                        "lifecycle_protocol_version": 1,
+                        "status": "completed",
+                        "registration_token": registration_token,
+                    },
+                )
 
 
 if __name__ == "__main__":

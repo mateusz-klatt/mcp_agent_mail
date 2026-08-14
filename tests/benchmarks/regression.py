@@ -14,6 +14,7 @@ Reference: mcp_agent_mail-tty (CI performance regression detection task)
 from __future__ import annotations
 
 import json
+import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +28,7 @@ from rich.text import Text
 BASELINES_PATH = Path(__file__).parent / "baselines.json"
 RESULTS_DIR = Path(__file__).parent / "results"
 REGRESSION_REPORT_DIR = Path(__file__).parent / "regression_reports"
+MIN_GIT_SHA_LENGTH = 7
 
 
 @dataclass(slots=True)
@@ -101,6 +103,39 @@ def load_all_latest_results() -> dict[str, dict[str, Any]]:
             results[tool] = result
 
     return results
+
+
+def _get_current_git_sha() -> str:
+    """Return the full SHA for the checkout whose results are being checked."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+    return result.stdout.strip() or "unknown"
+
+
+def _normalize_git_sha(value: object) -> str | None:
+    """Normalize a full or abbreviated hexadecimal Git SHA."""
+    if not isinstance(value, str):
+        return None
+    sha = value.strip().lower()
+    if len(sha) < MIN_GIT_SHA_LENGTH or any(character not in "0123456789abcdef" for character in sha):
+        return None
+    return sha
+
+
+def _git_shas_match(expected: str, actual: object) -> bool:
+    """Return whether two full/abbreviated SHAs identify the same commit."""
+    expected_sha = _normalize_git_sha(expected)
+    actual_sha = _normalize_git_sha(actual)
+    if expected_sha is None or actual_sha is None:
+        return False
+    return expected_sha.startswith(actual_sha) or actual_sha.startswith(expected_sha)
 
 
 def _check_latency_thresholds(
@@ -202,12 +237,16 @@ def _check_query_thresholds(
 def check_regressions(
     baselines: dict[str, Any] | None = None,
     results: dict[str, dict[str, Any]] | None = None,
+    *,
+    expected_git_sha: str | None = None,
 ) -> RegressionReport:
     """Check all benchmarks for regressions against baselines.
 
     Args:
         baselines: Baseline config dict (loads from file if None)
         results: Dict of tool -> result (loads latest if None)
+        expected_git_sha: Checkout SHA that every result must identify. Defaults
+            to the current Git HEAD.
 
     Returns:
         RegressionReport with all violations and warnings
@@ -217,12 +256,7 @@ def check_regressions(
     if results is None:
         results = load_all_latest_results()
 
-    # Get git SHA from any result
-    git_sha = "unknown"
-    for result in results.values():
-        if "git_sha" in result:
-            git_sha = result["git_sha"]
-            break
+    git_sha = expected_git_sha or _get_current_git_sha()
 
     report = RegressionReport(
         timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -231,22 +265,54 @@ def check_regressions(
     )
 
     baseline_configs = baselines.get("baselines", {})
+    normalized_git_sha = _normalize_git_sha(git_sha)
+    if normalized_git_sha is None:
+        report.violations.append(
+            RegressionViolation(
+                benchmark="benchmark_run",
+                metric="current_git_sha",
+                baseline_value=0,
+                current_value=0,
+                threshold=0,
+                severity="error",
+                message="Cannot determine the current checkout Git SHA; benchmark results are not attributable",
+            )
+        )
 
     for tool, config in baseline_configs.items():
         result = results.get(tool)
         if not result:
-            report.warnings.append(
+            report.violations.append(
                 RegressionViolation(
                     benchmark=tool,
                     metric="missing_result",
                     baseline_value=0,
                     current_value=0,
                     threshold=0,
-                    severity="warning",
+                    severity="error",
                     message=f"No benchmark result found for {tool}",
                 )
             )
             continue
+
+        result_git_sha = result.get("git_sha")
+        git_sha_matches = normalized_git_sha is not None and _git_shas_match(normalized_git_sha, result_git_sha)
+        if not git_sha_matches:
+            result_sha_text = result_git_sha if isinstance(result_git_sha, str) else "missing"
+            report.violations.append(
+                RegressionViolation(
+                    benchmark=tool,
+                    metric="git_sha_mismatch",
+                    baseline_value=0,
+                    current_value=0,
+                    threshold=0,
+                    severity="error",
+                    message=(
+                        f"Benchmark result Git SHA ({result_sha_text}) does not identify "
+                        f"the current checkout ({git_sha})"
+                    ),
+                )
+            )
 
         # Check latency
         latency_violations = _check_latency_thresholds(tool, config, result)
@@ -265,7 +331,7 @@ def check_regressions(
                 report.warnings.append(v)
 
         # Track passed checks
-        if not latency_violations and not query_violations:
+        if git_sha_matches and not latency_violations and not query_violations:
             report.passed_checks.append(tool)
 
     return report
@@ -412,6 +478,8 @@ def write_report_json(report: RegressionReport, output_path: Path | None = None)
 def assert_no_regressions(
     baselines: dict[str, Any] | None = None,
     results: dict[str, dict[str, Any]] | None = None,
+    *,
+    expected_git_sha: str | None = None,
 ) -> None:
     """Assert no regressions, raising AssertionError if any found.
 
@@ -420,11 +488,13 @@ def assert_no_regressions(
     Args:
         baselines: Baseline config (loads from file if None)
         results: Benchmark results (loads latest if None)
+        expected_git_sha: Checkout SHA that every result must identify. Defaults
+            to the current Git HEAD.
 
     Raises:
         AssertionError: If any violations (errors) are found
     """
-    report = check_regressions(baselines, results)
+    report = check_regressions(baselines, results, expected_git_sha=expected_git_sha)
     console = Console()
 
     # Always render the report for CI logs

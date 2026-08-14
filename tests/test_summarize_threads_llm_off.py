@@ -22,15 +22,20 @@ async def test_summarize_threads_without_llm_path(isolated_env, monkeypatch):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "x", "model": "y", "name": "BlueLake"},
+            {
+                "project_key": "Backend",
+                "program": "x",
+                "model": "y",
+                "name": "codex-wsl-summarize-off-1",
+            },
         )
         # Create messages in two threads to trigger multi-thread mode
         await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": "codex-wsl-summarize-off-1",
+                "to": ["codex-wsl-summarize-off-1"],
                 "subject": "Thread 1 msg",
                 "body_md": "- TODO one",
                 "thread_id": "T-1",
@@ -41,8 +46,8 @@ async def test_summarize_threads_without_llm_path(isolated_env, monkeypatch):
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": "codex-wsl-summarize-off-1",
+                "to": ["codex-wsl-summarize-off-1"],
                 "subject": "Thread 2 msg",
                 "body_md": "- ACTION go",
                 "thread_id": "T-2",
@@ -57,4 +62,3 @@ async def test_summarize_threads_without_llm_path(isolated_env, monkeypatch):
         )
         data = res.data
         assert data.get("threads") and data.get("aggregate") is not None
-

@@ -21,7 +21,7 @@ import re
 import threading
 import unicodedata
 from collections.abc import Callable, MutableMapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal, NamedTuple, Protocol, TypedDict, cast
 from urllib.parse import (
@@ -52,8 +52,11 @@ from starlette.types import Receive, Scope, Send
 
 from . import webauth
 from .app import (
+    _agent_to_dict,
     _expire_stale_file_reservations,
     _format_cross_project_agent_address,
+    _reconcile_pending_file_reservation_artifacts,
+    _revalidate_agent_lifetime_in_session,
     _sender_display_name,
     _tool_metrics_snapshot,
     build_mcp_server,
@@ -84,6 +87,7 @@ from .delivery import (
 from .models import (
     MAIL_UI_LOCALE_ENGLISH_NAMES,
     Agent,
+    FileReservation,
     MailUiLocale,
     Message,
     MessageDelivery,
@@ -94,6 +98,8 @@ from .storage import (
     AsyncFileLock,
     ProjectArchive,
     _commit_lock_path,
+    _project_archive_lock_path,
+    _resolved_git_common_dir,
     _to_thread_cancellation_safe,
     archive_write_lock,
     collect_lock_status,
@@ -112,7 +118,6 @@ from .storage import (
     get_timeline_commits,
     proactive_fd_cleanup,
     write_agent_profile,
-    write_file_reservation_record,
 )
 from .ui_access import (
     UiAccessMutationError,
@@ -136,14 +141,11 @@ async def _project_slug_from_id(pid: int | None) -> str | None:
 async def _ensure_ack_escalation_holder(
     *,
     settings: Settings,
-    project_id: int,
-    project_slug: str | None,
-    recipient_agent_id: int,
-    recipient_name: str,
+    project: Project,
+    recipient_agent: Agent,
     claim_name: str,
-    now: datetime,
     now_naive: datetime,
-) -> tuple[int, str]:
+) -> Agent:
     """Return the holder identity for ACK escalation, creating the ops holder if needed.
 
     When a synthetic holder must be created, the DB insert happens first and the
@@ -151,63 +153,98 @@ async def _ensure_ack_escalation_holder(
     the ACK worker out of the DB->archive lock ordering that can deadlock mixed
     HTTP and MCP traffic.
     """
-    holder_agent_id = int(recipient_agent_id)
-    holder_agent_name = recipient_name
-    holder_profile_payload: dict[str, Any] | None = None
+    if project.id is None or recipient_agent.id is None:
+        raise ValueError("ACK escalation requires persisted project and Agent rows.")
+    archive = await ensure_archive(settings, project.slug)
+    holder: Agent | None = None
+    created = False
 
-    async with get_session() as s_holder:
-        hid_row = await s_holder.execute(
-            text("SELECT id FROM agents WHERE project_id = :pid AND name = :name"),
-            {"pid": project_id, "name": claim_name},
+    async with get_immediate_session() as session:
+        await _revalidate_agent_lifetime_in_session(
+            session,
+            project=project,
+            agent=recipient_agent,
+            action="ACK escalation holder selection",
         )
-        hid = hid_row.scalar_one_or_none()
-        if isinstance(hid, int):
-            return hid, claim_name
+        holder = (
+            await session.execute(
+                select(Agent).where(
+                    col(Agent.project_id) == project.id,
+                    col(Agent.name) == claim_name,
+                    col(Agent.provisioning_state) == "active",
+                )
+            )
+        ).scalars().first()
+        if holder is None:
+            holder = Agent(
+                project_id=project.id,
+                name=claim_name,
+                program="ops",
+                model="system",
+                task_description="ops-escalation",
+                inception_ts=now_naive,
+                last_active_ts=now_naive,
+                attachments_policy="auto",
+                contact_policy="auto",
+            )
+            session.add(holder)
+            await session.flush()
+            created = True
+        await session.commit()
+        await session.refresh(holder)
 
-        await s_holder.execute(
-            text(
-                "INSERT OR IGNORE INTO agents(project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) VALUES (:pid, :name, :program, :model, :task, :ts, :ts, :attachments_policy, :contact_policy)"
-            ),
-            {
-                "pid": project_id,
-                "name": claim_name,
-                "program": "ops",
-                "model": "system",
-                "task": "ops-escalation",
-                "ts": now_naive,
-                "attachments_policy": "auto",
-                "contact_policy": "auto",
-            },
+    if not created:
+        return holder
+
+    async with archive_write_lock(archive):
+        async with get_session() as session:
+            _current_project, current_holder, _current_execution = (
+                await _revalidate_agent_lifetime_in_session(
+                    session,
+                    project=project,
+                    agent=holder,
+                    action="ACK escalation holder profile publication",
+                )
+            )
+        await write_agent_profile(archive, _agent_to_dict(current_holder))
+    return current_holder
+
+
+async def _create_ack_escalation_reservation(
+    *,
+    project: Project,
+    holder: Agent,
+    path_pattern: str,
+    exclusive: bool,
+    now_naive: datetime,
+    ttl_seconds: int,
+) -> FileReservation:
+    """Persist an ACK claim and publish it through the revision outbox."""
+    if project.id is None or holder.id is None:
+        raise ValueError("ACK escalation requires persisted project and holder rows.")
+    async with get_immediate_session() as session:
+        await _revalidate_agent_lifetime_in_session(
+            session,
+            project=project,
+            agent=holder,
+            action="ACK escalation reservation",
         )
-        await s_holder.commit()
-        hid_row2 = await s_holder.execute(
-            text("SELECT id FROM agents WHERE project_id = :pid AND name = :name"),
-            {"pid": project_id, "name": claim_name},
+        reservation = FileReservation(
+            project_id=project.id,
+            agent_id=holder.id,
+            execution_id=None,
+            origin="auto",
+            path_pattern=path_pattern,
+            exclusive=exclusive,
+            reason="ack-overdue",
+            created_ts=now_naive,
+            expires_ts=now_naive + timedelta(seconds=ttl_seconds),
         )
-        hid2 = hid_row2.scalar_one_or_none()
-        if isinstance(hid2, int):
-            holder_agent_id = hid2
-            holder_agent_name = claim_name
-            if project_slug:
-                holder_profile_payload = {
-                    "id": holder_agent_id,
-                    "name": holder_agent_name,
-                    "program": "ops",
-                    "model": "system",
-                    "task_description": "ops-escalation",
-                    "inception_ts": now.isoformat(),
-                    "last_active_ts": now.isoformat(),
-                    "project_id": project_id,
-                    "attachments_policy": "auto",
-                    "contact_policy": "auto",
-                }
-
-    if holder_profile_payload is not None and project_slug:
-        archive = await ensure_archive(settings, project_slug)
-        async with archive_write_lock(archive):
-            await write_agent_profile(archive, holder_profile_payload)
-
-    return holder_agent_id, holder_agent_name
+        session.add(reservation)
+        await session.commit()
+        await session.refresh(reservation)
+    await _reconcile_pending_file_reservation_artifacts(project)
+    return reservation
 
 
 def _http_sender_identity(
@@ -387,12 +424,17 @@ async def _open_existing_project_archive(settings: Settings, slug: str) -> Proje
     if not await asyncio.to_thread(_path_exists, project_root):
         return None
     repo = await asyncio.to_thread(_open_git_repo, repo_root)
+    git_common_dir = await asyncio.to_thread(
+        _resolved_git_common_dir,
+        repo_root,
+        repo,
+    )
     return ProjectArchive(
         settings=settings,
         slug=slug,
         root=project_root,
         repo=repo,
-        lock_path=project_root / ".archive.lock",
+        lock_path=_project_archive_lock_path(git_common_dir, slug),
         repo_root=repo_root,
     )
 
@@ -2601,6 +2643,7 @@ async def _mail_ui_delivery_context(
         select(Agent).where(
             cast(Any, Agent.project_id == project_id),
             cast(Any, Agent.name == "HumanOverseer"),
+            cast(Any, Agent.provisioning_state == "active"),
         )
     )
     sender = sender_result.scalar_one_or_none()
@@ -4828,8 +4871,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     # Second, STATEFUL MCP sub-app (issue #250): stateless mode creates a new
     # transport per request and never issues an ``Mcp-Session-Id`` header, so
     # session-bound agent authentication (#148) could never persist across
-    # HTTP tool calls — ``create_agent_identity(return_registration_token=false)``
-    # followed by any protected call failed with AUTHENTICATION_REQUIRED.
+    # HTTP tool calls. Provisioning returns a credential once, while ordinary
+    # resume calls rely on that credential or a stateful session binding.
     # A bare flip to ``stateless_http=False`` would break handshake-skipping
     # clients (e.g. ntm's HTTP client), so we mount BOTH: the stateful app at
     # '/mcp' for spec-compliant MCP clients that keep a session, and the
@@ -4956,73 +4999,47 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                     try:
                                         y_dir = created_ts.strftime("%Y")
                                         m_dir = created_ts.strftime("%m")
-                                        # Resolve recipient name
+                                        # Resolve the exact project/recipient lifetimes.
                                         async with get_session() as s_lookup:
-                                            name_row = await s_lookup.execute(
-                                                text("SELECT name FROM agents WHERE id = :aid"), {"aid": agent_id}
+                                            project_snapshot = await s_lookup.get(
+                                                Project,
+                                                int(project_id),
                                             )
-                                            name_res = name_row.fetchone()
-                                        recipient_name = name_res[0] if name_res and name_res[0] else "*"
+                                            recipient_snapshot = await s_lookup.get(
+                                                Agent,
+                                                int(agent_id),
+                                            )
+                                        if (
+                                            project_snapshot is None
+                                            or recipient_snapshot is None
+                                            or recipient_snapshot.project_id
+                                            != project_snapshot.id
+                                        ):
+                                            raise ValueError(
+                                                "ACK escalation project or recipient lifetime no longer exists."
+                                            )
+                                        recipient_name = recipient_snapshot.name
                                         pattern = (
                                             f"agents/{recipient_name}/inbox/{y_dir}/{m_dir}/*.md"
-                                            if recipient_name != "*"
-                                            else f"agents/*/inbox/{y_dir}/{m_dir}/*.md"
                                         )
-                                        project_slug = await _project_slug_from_id(project_id)
-                                        holder_agent_id = int(agent_id)
-                                        holder_agent_name = recipient_name
+                                        holder = recipient_snapshot
                                         if settings.ack_escalation_claim_holder_name:
                                             claim_name = settings.ack_escalation_claim_holder_name
-                                            holder_agent_id, holder_agent_name = await _ensure_ack_escalation_holder(
+                                            holder = await _ensure_ack_escalation_holder(
                                                 settings=settings,
-                                                project_id=int(project_id),
-                                                project_slug=project_slug,
-                                                recipient_agent_id=int(agent_id),
-                                                recipient_name=recipient_name,
+                                                project=project_snapshot,
+                                                recipient_agent=recipient_snapshot,
                                                 claim_name=claim_name,
-                                                now=now,
                                                 now_naive=now_naive,
                                             )
-                                        async with get_session() as s2:
-                                            await s2.execute(
-                                                text(
-                                                    """
-                                                INSERT INTO file_reservations(project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts)
-                                                VALUES (:pid, :holder, :pattern, :exclusive, :reason, :cts, :ets)
-                                                """
-                                                ),
-                                                {
-                                                    "pid": project_id,
-                                                    "holder": holder_agent_id,
-                                                    "pattern": pattern,
-                                                    "exclusive": 1 if settings.ack_escalation_claim_exclusive else 0,
-                                                    "reason": "ack-overdue",
-                                                    "cts": now_naive,
-                                                    "ets": now_naive
-                                                    + _dt.timedelta(seconds=settings.ack_escalation_claim_ttl_seconds),
-                                                },
-                                            )
-                                            await s2.commit()
-                                        # Also write JSON artifact to archive
-                                        if not project_slug:
-                                            raise ValueError(f"Project id {project_id} has no slug; cannot write archive artifacts.")
-                                        archive = await ensure_archive(settings, project_slug)
-                                        expires_at = now + _dt.timedelta(
-                                            seconds=settings.ack_escalation_claim_ttl_seconds
+                                        await _create_ack_escalation_reservation(
+                                            project=project_snapshot,
+                                            holder=holder,
+                                            path_pattern=pattern,
+                                            exclusive=settings.ack_escalation_claim_exclusive,
+                                            now_naive=now_naive,
+                                            ttl_seconds=settings.ack_escalation_claim_ttl_seconds,
                                         )
-                                        async with archive_write_lock(archive):
-                                            await write_file_reservation_record(
-                                                archive,
-                                                {
-                                                    "project": project_slug,
-                                                    "agent": holder_agent_name,
-                                                    "path_pattern": pattern,
-                                                    "exclusive": settings.ack_escalation_claim_exclusive,
-                                                    "reason": "ack-overdue",
-                                                    "created_ts": now.isoformat(),
-                                                    "expires_ts": expires_at.isoformat(),
-                                                },
-                                            )
                                     except Exception:
                                         pass
                 except Exception:
@@ -5937,8 +5954,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     await session.execute(
                         text(
                             "SELECT c.id, a.name, c.path_pattern, c.exclusive, c.reason, "
-                            "c.expires_ts, a.display_name "
+                            "c.expires_ts, a.display_name, c.execution_id, c.origin, "
+                            "e.status AS execution_status "
                             "FROM file_reservations c LEFT JOIN agents a ON a.id = c.agent_id "
+                            "LEFT JOIN agent_executions e ON e.id = c.execution_id "
                             "WHERE c.project_id = :pid AND c.released_ts IS NULL "
                             "ORDER BY c.created_ts DESC"
                         ),
@@ -5979,6 +5998,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     "exclusive": bool(r[3]),
                     "reason": r[4] or "",
                     "expires_ts": str(r[5]),
+                    "execution_id": r[7],
+                    "origin": r[8] or "explicit",
+                    "execution_status": r[9],
+                    "orphaned": r[1] is None
+                    or (r[7] is not None and r[9] != "active"),
+                    "legacy_unscoped": r[7] is None,
                 }
                 for r in rows
                 if _still_active(r[5])
@@ -7211,6 +7236,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     select(Agent).where(
                         cast(Any, Agent.project_id == project_id),
                         col(Agent.id).in_(recipient_ids),
+                        col(Agent.provisioning_state) == "active",
                         col(Agent.retired_at).is_(None),
                         col(Agent.contact_policy) != "block_all",
                         col(Agent.name) != "HumanOverseer",

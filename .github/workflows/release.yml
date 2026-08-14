@@ -5,15 +5,38 @@ on:
     tags:
       - 'v*.*.*'
 
+concurrency:
+  # Publishing `latest` and creating a GitHub release are repository-global
+  # mutations. Serialize them so two tags cannot race those pointers.
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
-  build-and-push:
-    runs-on: ubuntu-latest
+  quality-gate:
     permissions:
-      contents: write
-      packages: write
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
+
+  secret-gate:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/secret-scan.yml
+
+  validate-release:
+    needs: [quality-gate, secret-gate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
 
       - name: Setup Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -22,38 +45,217 @@ jobs:
           allow-prereleases: true
 
       - name: Install uv
-        run: curl -Ls https://astral.sh/uv/install.sh | sh
-
-      - name: Add uv to PATH
-        run: echo "$HOME/.local/bin" >> $GITHUB_PATH
-
-      - name: Cache uv
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
-          path: |
-            ~/.cache/uv
-            .venv
-          key: release-uv-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'uv.lock') }}
-          restore-keys: |
-            release-uv-${{ runner.os }}-
+          version: "0.11.2"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
 
       - name: Sync dependencies (dev)
-        run: uv sync --dev
+        run: uv sync --dev --frozen
 
-      - name: Ruff Lint
-        run: uv run ruff check --output-format=github
+      - name: Verify exact tag, checkout, and project version
+        id: version
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          if [[ "$actual_sha" != "$EXPECTED_SHA" ]]; then
+            echo "::error::Checkout $actual_sha does not match release SHA $EXPECTED_SHA"
+            exit 1
+          fi
 
-      - name: Ty Type Check
-        # Same flags as ci.yml:68 and ci.yml:170, and the flags are the whole
-        # point. Bare `ty check` assumes the platform it runs on, and this job
-        # runs on ubuntu-latest, so every `if sys.platform == "win32"` branch in
-        # the tree is unreachable code it never analyses. Measured by
-        # claude-wsl-home-1 with a planted msvcrt error: bare `ty check` reports
-        # "All checks passed", `--python-platform all` reports the diagnostic.
-        # A release gate that cannot see the failures this project spent a week
-        # finding is worse than no gate, because it signs off on them.
-        run: uvx ty check --python-version 3.14 --python-platform all
+          project_version="$(uv run python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+          if [[ "$RELEASE_TAG" != "v${project_version}" ]]; then
+            echo "::error::Tag $RELEASE_TAG does not match pyproject.toml version v${project_version}"
+            exit 1
+          fi
 
+          prerelease="$(uv run python -c 'import sys; from packaging.version import Version; print(str(Version(sys.argv[1]).is_prerelease).lower())' "$project_version")"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+  build-candidates:
+    needs: validate-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      registry_image: ${{ steps.image.outputs.name }}
+      amd64_digest: ${{ steps.build-amd64.outputs.digest }}
+      arm64_digest: ${{ steps.build-arm64.outputs.digest }}
+    steps:
+      - name: Checkout exact release SHA
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Normalize registry image name
+        id: image
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU (multi-arch)
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      # Push only content-addressed candidates here. Release, SHA, and latest
+      # tags do not exist until both exact digests pass the smoke job below.
+      - name: Build and push immutable amd64 candidate
+        id: build-amd64
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          build-args: |
+            TOON_RUST_REF=cb256dcf73ab78c248a14f65840a3fa722ec8682
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
+          outputs: type=image,name=${{ steps.image.outputs.name }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+          cache-from: type=gha,scope=release-amd64
+          cache-to: type=gha,mode=max,scope=release-amd64
+
+      - name: Build and push immutable arm64 candidate
+        id: build-arm64
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          build-args: |
+            TOON_RUST_REF=cb256dcf73ab78c248a14f65840a3fa722ec8682
+          platforms: linux/arm64
+          provenance: false
+          sbom: false
+          outputs: type=image,name=${{ steps.image.outputs.name }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+          cache-from: type=gha,scope=release-arm64
+          cache-to: type=gha,mode=max,scope=release-arm64
+
+  container-smoke:
+    needs: [validate-release, build-candidates]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU for arm64 smoke
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - name: Pull and smoke the exact platform digests
+        shell: bash
+        env:
+          IMAGE: ${{ needs.build-candidates.outputs.registry_image }}
+          AMD64_DIGEST: ${{ needs.build-candidates.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ needs.build-candidates.outputs.arm64_digest }}
+        run: |
+          set -euo pipefail
+          for digest in "$AMD64_DIGEST" "$ARM64_DIGEST"; do
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Candidate output is not an exact sha256 digest: $digest"
+              exit 1
+            fi
+          done
+
+          active_container=""
+          cleanup() {
+            if [[ -n "$active_container" ]]; then
+              docker logs "$active_container" || true
+              docker stop "$active_container" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup EXIT
+
+          smoke_candidate() {
+            local platform="$1"
+            local digest="$2"
+            local architecture="$3"
+            local host_port="$4"
+            local candidate="$IMAGE@$digest"
+            local pulled_repo_digests
+
+            docker pull --quiet --platform "$platform" "$candidate"
+            # Docker's local image `.Id` is the config-object digest, not the
+            # registry manifest digest addressed by IMAGE@sha256.  Prove that
+            # the pulled local image records the exact immutable registry
+            # reference instead of comparing two different OCI object kinds.
+            pulled_repo_digests="$(docker image inspect "$candidate" --format '{{json .RepoDigests}}')"
+            jq -e --arg expected "$candidate" 'index($expected) != null' \
+              <<< "$pulled_repo_digests" >/dev/null || {
+                echo "::error::Pulled $architecture image does not retain exact digest reference $candidate"
+                exit 1
+              }
+
+            docker run --rm --platform "$platform" \
+              -e DATABASE_URL="sqlite+aiosqlite:////data/mailbox/release-smoke-$architecture.sqlite3" \
+              -e STORAGE_ROOT=/data/mailbox \
+              "$candidate" /app/.venv/bin/python -m mcp_agent_mail.cli migrate
+
+            active_container="iris-release-smoke-${architecture}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            docker run --detach --rm --platform "$platform" --name "$active_container" \
+              -p "127.0.0.1:${host_port}:8765" \
+              -e DATABASE_URL="sqlite+aiosqlite:////data/mailbox/release-smoke-$architecture.sqlite3" \
+              -e STORAGE_ROOT=/data/mailbox \
+              "$candidate"
+
+            local ready=false
+            for _ in {1..90}; do
+              if curl --fail --silent --show-error "http://127.0.0.1:${host_port}/health/liveness" >/dev/null; then
+                ready=true
+                break
+              fi
+              if [[ "$(docker inspect --format '{{.State.Running}}' "$active_container")" != "true" ]]; then
+                echo "::error::$architecture candidate exited before becoming live"
+                exit 1
+              fi
+              sleep 1
+            done
+            if [[ "$ready" != "true" ]]; then
+              echo "::error::$architecture candidate did not become live within 90 seconds"
+              exit 1
+            fi
+            curl --fail --silent --show-error "http://127.0.0.1:${host_port}/health/readiness" >/dev/null
+            docker stop "$active_container" >/dev/null
+            active_container=""
+          }
+
+          smoke_candidate linux/amd64 "$AMD64_DIGEST" amd64 8765
+          smoke_candidate linux/arm64 "$ARM64_DIGEST" arm64 8766
+
+  publish:
+    needs: [validate-release, build-candidates, container-smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+      packages: write
+    steps:
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
@@ -67,33 +269,82 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ needs.validate-release.outputs.prerelease == 'false' }}
             type=ref,event=tag
+            type=sha,format=long,prefix=sha-
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
-      - name: Set up QEMU (multi-arch)
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - name: Promote exact candidates to release tags
+        id: promote
+        shell: bash
+        env:
+          IMAGE: ${{ needs.build-candidates.outputs.registry_image }}
+          AMD64_DIGEST: ${{ needs.build-candidates.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ needs.build-candidates.outputs.arm64_digest }}
+          RELEASE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          tag_args=()
+          primary_tag=""
+          while IFS= read -r tag; do
+            if [[ -n "$tag" ]]; then
+              tag_args+=(--tag "$tag")
+              if [[ -z "$primary_tag" ]]; then
+                primary_tag="$tag"
+              fi
+            fi
+          done <<< "$RELEASE_TAGS"
+          if [[ -z "$primary_tag" ]]; then
+            echo "::error::Metadata action produced no release tags"
+            exit 1
+          fi
 
-      - name: Build and push
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
-        with:
-          context: .
-          build-args: |
-            TOON_RUST_REF=cb256dcf73ab78c248a14f65840a3fa722ec8682
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          for digest in "$AMD64_DIGEST" "$ARM64_DIGEST"; do
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Candidate output is not an exact sha256 digest: $digest"
+              exit 1
+            fi
+          done
+
+          docker buildx imagetools create \
+            "${tag_args[@]}" \
+            "$IMAGE@$AMD64_DIGEST" \
+            "$IMAGE@$ARM64_DIGEST"
+
+          manifest_json="$(docker buildx imagetools inspect "$primary_tag" --format '{{json .Manifest}}')"
+          manifest_digest="$(jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))' <<< "$manifest_json")"
+          jq -e --arg digest "$AMD64_DIGEST" \
+            '.manifests | any(.digest == $digest and .platform.os == "linux" and .platform.architecture == "amd64")' \
+            <<< "$manifest_json" >/dev/null
+          jq -e --arg digest "$ARM64_DIGEST" \
+            '.manifests | any(.digest == $digest and .platform.os == "linux" and .platform.architecture == "arm64")' \
+            <<< "$manifest_json" >/dev/null
+          if [[ "$(jq '.manifests | length' <<< "$manifest_json")" -ne 2 ]]; then
+            echo "::error::Published manifest contains entries other than the two smoked candidates"
+            exit 1
+          fi
+
+          while IFS= read -r tag; do
+            if [[ -z "$tag" ]]; then
+              continue
+            fi
+            tag_digest="$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' | jq -er '.digest')"
+            if [[ "$tag_digest" != "$manifest_digest" ]]; then
+              echo "::error::$tag resolves to $tag_digest instead of promoted digest $manifest_digest"
+              exit 1
+            fi
+          done <<< "$RELEASE_TAGS"
+          echo "digest=$manifest_digest" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           generate_release_notes: true
           draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ needs.validate-release.outputs.prerelease == 'true' }}
+          body: |
+            Container digest: `${{ steps.promote.outputs.digest }}`
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

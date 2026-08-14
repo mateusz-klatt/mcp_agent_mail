@@ -17,6 +17,10 @@ from mcp_agent_mail.models import AgentLink, Message, MessageDelivery, Project
 from mcp_agent_mail.storage import MessageDeliveryPendingError
 from tests.keys import pkey
 
+ATOMIC_SENDER = "codex-wsl-atomic-1"
+ATOMIC_RECIPIENT = "codex-wsl-atomic-2"
+ATOMIC_OBSERVER = "codex-wsl-atomic-3"
+
 
 async def _register_open_agent(
     client: Client[Any],
@@ -78,8 +82,8 @@ async def test_send_stays_invisible_until_retry_finalizes_verified_git(
 
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": project_key})
-        await _register_open_agent(client, project_key, "GreenCastle")
-        await _register_open_agent(client, project_key, "BlueLake")
+        await _register_open_agent(client, project_key, ATOMIC_SENDER)
+        await _register_open_agent(client, project_key, ATOMIC_RECIPIENT)
 
         async def transient_publisher(
             _archive: Any,
@@ -98,8 +102,8 @@ async def test_send_stays_invisible_until_retry_finalizes_verified_git(
             "send_message",
             {
                 "project_key": project_key,
-                "sender_name": "GreenCastle",
-                "to": ["BlueLake"],
+                "sender_name": ATOMIC_SENDER,
+                "to": [ATOMIC_RECIPIENT],
                 "subject": "Atomic boundary",
                 "body_md": "not visible before the receipt",
                 "idempotency_key": "mcp-pending-1",
@@ -130,7 +134,7 @@ async def test_send_stays_invisible_until_retry_finalizes_verified_git(
             "get_message_delivery",
             {
                 "project_key": project_key,
-                "agent_name": "GreenCastle",
+                "agent_name": ATOMIC_SENDER,
                 "delivery_id": first_delivery["id"],
                 "retry_pending": True,
             },
@@ -139,7 +143,7 @@ async def test_send_stays_invisible_until_retry_finalizes_verified_git(
         assert recovered.data["message"]["delivery_id"] == first_delivery["id"]
         assert await _count_rows(MessageDelivery) == 1
         assert await _count_rows(Message) == 1
-        assert wake_events == [("mcp-atomic-pending", "BlueLake")]
+        assert wake_events == [("mcp-atomic-pending", ATOMIC_RECIPIENT)]
 
         async with get_immediate_session() as session:
             finalized = await session.get(MessageDelivery, first_delivery["id"])
@@ -155,8 +159,8 @@ async def test_send_stays_invisible_until_retry_finalizes_verified_git(
             "send_message",
             {
                 "project_key": project_key,
-                "sender_name": "GreenCastle",
-                "to": ["BlueLake"],
+                "sender_name": ATOMIC_SENDER,
+                "to": [ATOMIC_RECIPIENT],
                 "subject": "Atomic boundary",
                 "body_md": "not visible before the receipt",
                 "idempotency_key": "mcp-pending-1",
@@ -167,7 +171,7 @@ async def test_send_stays_invisible_until_retry_finalizes_verified_git(
         assert repeated_delivery["delivery"]["reused"] is True
         assert repeated_delivery["message"]["id"] == recovered.data["message"]["id"]
         assert await _count_rows(Message) == 1
-        assert wake_events == [("mcp-atomic-pending", "BlueLake")]
+        assert wake_events == [("mcp-atomic-pending", ATOMIC_RECIPIENT)]
 
 
 @pytest.mark.asyncio
@@ -178,15 +182,15 @@ async def test_local_reply_uses_atomic_parent_edge_and_distinct_idempotency(
     server = build_mcp_server()
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": project_key})
-        await _register_open_agent(client, project_key, "GreenCastle")
-        await _register_open_agent(client, project_key, "BlueLake")
+        await _register_open_agent(client, project_key, ATOMIC_SENDER)
+        await _register_open_agent(client, project_key, ATOMIC_RECIPIENT)
 
         sent = await client.call_tool(
             "send_message",
             {
                 "project_key": project_key,
-                "sender_name": "GreenCastle",
-                "to": ["BlueLake"],
+                "sender_name": ATOMIC_SENDER,
+                "to": [ATOMIC_RECIPIENT],
                 "subject": "Plan",
                 "body_md": "body",
                 "idempotency_key": "mcp-reply-parent",
@@ -199,7 +203,7 @@ async def test_local_reply_uses_atomic_parent_edge_and_distinct_idempotency(
                 {
                     "project_key": project_key,
                     "message_id": original["id"],
-                    "sender_name": "BlueLake",
+                    "sender_name": ATOMIC_RECIPIENT,
                     "body_md": "missing operation key",
                 },
             )
@@ -210,7 +214,7 @@ async def test_local_reply_uses_atomic_parent_edge_and_distinct_idempotency(
             {
                 "project_key": project_key,
                 "message_id": original["id"],
-                "sender_name": "BlueLake",
+                "sender_name": ATOMIC_RECIPIENT,
                 "body_md": "ack",
                 "idempotency_key": "mcp-reply-child",
             },
@@ -237,8 +241,8 @@ async def test_repeated_pending_contact_request_reuses_one_event_intent(
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": source_key})
         await client.call_tool("ensure_project", {"human_key": target_key})
-        await _register_open_agent(client, source_key, "GreenCastle")
-        await _register_open_agent(client, target_key, "BlueLake")
+        await _register_open_agent(client, source_key, ATOMIC_SENDER)
+        await _register_open_agent(client, target_key, ATOMIC_RECIPIENT)
 
         async def transient_publisher(
             _archive: Any,
@@ -257,8 +261,8 @@ async def test_repeated_pending_contact_request_reuses_one_event_intent(
             "request_contact",
             {
                 "project_key": source_key,
-                "from_agent": "GreenCastle",
-                "to_agent": "BlueLake",
+                "from_agent": ATOMIC_SENDER,
+                "to_agent": ATOMIC_RECIPIENT,
                 "to_project": target_key,
                 "reason": "first immutable reason",
             },
@@ -267,8 +271,8 @@ async def test_repeated_pending_contact_request_reuses_one_event_intent(
             "request_contact",
             {
                 "project_key": source_key,
-                "from_agent": "GreenCastle",
-                "to_agent": "BlueLake",
+                "from_agent": ATOMIC_SENDER,
+                "to_agent": ATOMIC_RECIPIENT,
                 "to_project": target_key,
                 "reason": "must not fork the active pending event",
             },
@@ -298,16 +302,16 @@ async def test_send_requires_idempotency_and_rejects_attachment_options_before_i
     server = build_mcp_server()
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": project_key})
-        await _register_open_agent(client, project_key, "GreenCastle")
-        await _register_open_agent(client, project_key, "BlueLake")
+        await _register_open_agent(client, project_key, ATOMIC_SENDER)
+        await _register_open_agent(client, project_key, ATOMIC_RECIPIENT)
 
         with pytest.raises(Exception, match="idempotency_key"):
             await client.call_tool(
                 "send_message",
                 {
                     "project_key": project_key,
-                    "sender_name": "GreenCastle",
-                    "to": ["BlueLake"],
+                    "sender_name": ATOMIC_SENDER,
+                    "to": [ATOMIC_RECIPIENT],
                     "subject": "missing key",
                     "body_md": "must fail",
                 },
@@ -317,8 +321,8 @@ async def test_send_requires_idempotency_and_rejects_attachment_options_before_i
                 "send_message",
                 {
                     "project_key": project_key,
-                    "sender_name": "GreenCastle",
-                    "to": ["BlueLake"],
+                    "sender_name": ATOMIC_SENDER,
+                    "to": [ATOMIC_RECIPIENT],
                     "subject": "attachment",
                     "body_md": "must fail",
                     "idempotency_key": "mcp-attachment-reject",
@@ -330,8 +334,8 @@ async def test_send_requires_idempotency_and_rejects_attachment_options_before_i
                 "send_message",
                 {
                     "project_key": project_key,
-                    "sender_name": "GreenCastle",
-                    "to": ["BlueLake"],
+                    "sender_name": ATOMIC_SENDER,
+                    "to": [ATOMIC_RECIPIENT],
                     "subject": "conversion override",
                     "body_md": "must fail",
                     "idempotency_key": "mcp-convert-reject",
@@ -350,8 +354,8 @@ async def test_send_rejects_an_unauthenticated_sender_before_accepting_intent(
     server = build_mcp_server()
     async with Client(server) as setup_client:
         await setup_client.call_tool("ensure_project", {"human_key": project_key})
-        sender = await _register_open_agent(setup_client, project_key, "GreenCastle")
-        await _register_open_agent(setup_client, project_key, "BlueLake")
+        sender = await _register_open_agent(setup_client, project_key, ATOMIC_SENDER)
+        await _register_open_agent(setup_client, project_key, ATOMIC_RECIPIENT)
 
     async with Client(server) as unbound_client:
         with pytest.raises(Exception, match="Invalid sender_token"):
@@ -359,9 +363,9 @@ async def test_send_rejects_an_unauthenticated_sender_before_accepting_intent(
                 "send_message",
                 {
                     "project_key": project_key,
-                    "sender_name": "GreenCastle",
+                    "sender_name": ATOMIC_SENDER,
                     "sender_token": "definitely-wrong",
-                    "to": ["BlueLake"],
+                    "to": [ATOMIC_RECIPIENT],
                     "subject": "unauthorized",
                     "body_md": "must not persist",
                     "idempotency_key": "mcp-auth-rejected",
@@ -373,9 +377,9 @@ async def test_send_rejects_an_unauthenticated_sender_before_accepting_intent(
             "send_message",
             {
                 "project_key": project_key,
-                "sender_name": "GreenCastle",
+                "sender_name": ATOMIC_SENDER,
                 "sender_token": sender["registration_token"],
-                "to": ["BlueLake"],
+                "to": [ATOMIC_RECIPIENT],
                 "subject": "authorized",
                 "body_md": "persist this",
                 "idempotency_key": "mcp-auth-accepted",
@@ -394,16 +398,16 @@ async def test_cross_project_send_preserves_source_lifetime_and_status_authoriza
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": source_key})
         target = await client.call_tool("ensure_project", {"human_key": target_key})
-        await _register_open_agent(client, source_key, "GreenCastle")
-        await _register_open_agent(client, target_key, "BlueLake")
-        await _register_open_agent(client, target_key, "RedStone")
+        await _register_open_agent(client, source_key, ATOMIC_SENDER)
+        await _register_open_agent(client, target_key, ATOMIC_RECIPIENT)
+        await _register_open_agent(client, target_key, ATOMIC_OBSERVER)
 
         await client.call_tool(
             "request_contact",
             {
                 "project_key": source_key,
-                "from_agent": "GreenCastle",
-                "to_agent": "BlueLake",
+                "from_agent": ATOMIC_SENDER,
+                "to_agent": ATOMIC_RECIPIENT,
                 "to_project": target_key,
                 "reason": "allow atomic cross-project delivery",
             },
@@ -412,8 +416,8 @@ async def test_cross_project_send_preserves_source_lifetime_and_status_authoriza
             "respond_contact",
             {
                 "project_key": target_key,
-                "to_agent": "BlueLake",
-                "from_agent": "GreenCastle",
+                "to_agent": ATOMIC_RECIPIENT,
+                "from_agent": ATOMIC_SENDER,
                 "from_project": source_key,
                 "accept": True,
             },
@@ -423,8 +427,8 @@ async def test_cross_project_send_preserves_source_lifetime_and_status_authoriza
             "send_message",
             {
                 "project_key": source_key,
-                "sender_name": "GreenCastle",
-                "to": [f"project:{target.data['slug']}#BlueLake"],
+                "sender_name": ATOMIC_SENDER,
+                "to": [f"project:{target.data['slug']}#{ATOMIC_RECIPIENT}"],
                 "subject": "cross-project",
                 "body_md": "source identity must survive",
                 "idempotency_key": "mcp-cross-project-1",
@@ -433,19 +437,19 @@ async def test_cross_project_send_preserves_source_lifetime_and_status_authoriza
         delivered = sent.data["deliveries"][0]
         assert delivered["project"] == target_key
         assert delivered["delivery"]["status"] == "published"
-        assert delivered["message"]["from"] == "GreenCastle"
+        assert delivered["message"]["from"] == ATOMIC_SENDER
         assert delivered["message"]["from_project"] == source_key
         async with get_immediate_session() as session:
             intent = await session.get(MessageDelivery, delivered["delivery"]["id"])
             assert intent is not None
             assert intent.sender_project_id_snapshot != intent.project_id
-            assert intent.sender_name_snapshot == "GreenCastle"
+            assert intent.sender_name_snapshot == ATOMIC_SENDER
 
         sender_status = await client.call_tool(
             "get_message_delivery",
             {
                 "project_key": source_key,
-                "agent_name": "GreenCastle",
+                "agent_name": ATOMIC_SENDER,
                 "delivery_id": delivered["delivery"]["id"],
             },
         )
@@ -453,7 +457,7 @@ async def test_cross_project_send_preserves_source_lifetime_and_status_authoriza
             "get_message_delivery",
             {
                 "project_key": target_key,
-                "agent_name": "BlueLake",
+                "agent_name": ATOMIC_RECIPIENT,
                 "delivery_id": delivered["delivery"]["id"],
             },
         )
@@ -466,7 +470,7 @@ async def test_cross_project_send_preserves_source_lifetime_and_status_authoriza
                 "get_message_delivery",
                 {
                     "project_key": target_key,
-                    "agent_name": "RedStone",
+                    "agent_name": ATOMIC_OBSERVER,
                     "delivery_id": delivered["delivery"]["id"],
                 },
             )
@@ -480,17 +484,17 @@ async def test_bcc_is_private_in_git_but_receives_private_inbox_copy(
     server = build_mcp_server()
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": project_key})
-        await _register_open_agent(client, project_key, "GreenCastle")
-        await _register_open_agent(client, project_key, "BlueLake")
-        await _register_open_agent(client, project_key, "RedStone")
+        await _register_open_agent(client, project_key, ATOMIC_SENDER)
+        await _register_open_agent(client, project_key, ATOMIC_RECIPIENT)
+        await _register_open_agent(client, project_key, ATOMIC_OBSERVER)
 
         sent = await client.call_tool(
             "send_message",
             {
                 "project_key": project_key,
-                "sender_name": "GreenCastle",
-                "to": ["BlueLake"],
-                "bcc": ["RedStone"],
+                "sender_name": ATOMIC_SENDER,
+                "to": [ATOMIC_RECIPIENT],
+                "bcc": [ATOMIC_OBSERVER],
                 "subject": "blind copy",
                 "body_md": "private routing",
                 "idempotency_key": "mcp-bcc-1",
@@ -500,14 +504,14 @@ async def test_bcc_is_private_in_git_but_receives_private_inbox_copy(
         async with get_immediate_session() as session:
             intent = await session.get(MessageDelivery, delivery_id)
             assert intent is not None
-            assert "RedStone" not in intent.archive_document
+            assert ATOMIC_OBSERVER not in intent.archive_document
             assert '"bcc":{"count":1' in intent.archive_document
 
         inbox = await client.call_tool(
             "fetch_inbox",
             {
                 "project_key": project_key,
-                "agent_name": "RedStone",
+                "agent_name": ATOMIC_OBSERVER,
                 "limit": 10,
             },
         )
@@ -526,14 +530,14 @@ async def test_cross_project_reply_uses_thread_route_without_reverse_contact_gra
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": source_key})
         target = await client.call_tool("ensure_project", {"human_key": target_key})
-        await _register_open_agent(client, source_key, "GreenCastle")
-        await _register_open_agent(client, target_key, "BlueLake")
+        await _register_open_agent(client, source_key, ATOMIC_SENDER)
+        await _register_open_agent(client, target_key, ATOMIC_RECIPIENT)
         await client.call_tool(
             "request_contact",
             {
                 "project_key": source_key,
-                "from_agent": "GreenCastle",
-                "to_agent": "BlueLake",
+                "from_agent": ATOMIC_SENDER,
+                "to_agent": ATOMIC_RECIPIENT,
                 "to_project": target_key,
                 "reason": "one-way contact grant",
             },
@@ -542,8 +546,8 @@ async def test_cross_project_reply_uses_thread_route_without_reverse_contact_gra
             "respond_contact",
             {
                 "project_key": target_key,
-                "to_agent": "BlueLake",
-                "from_agent": "GreenCastle",
+                "to_agent": ATOMIC_RECIPIENT,
+                "from_agent": ATOMIC_SENDER,
                 "from_project": source_key,
                 "accept": True,
             },
@@ -552,8 +556,8 @@ async def test_cross_project_reply_uses_thread_route_without_reverse_contact_gra
             "send_message",
             {
                 "project_key": source_key,
-                "sender_name": "GreenCastle",
-                "to": [f"project:{target.data['slug']}#BlueLake"],
+                "sender_name": ATOMIC_SENDER,
+                "to": [f"project:{target.data['slug']}#{ATOMIC_RECIPIENT}"],
                 "subject": "external thread",
                 "body_md": "please reply",
                 "idempotency_key": "mcp-external-thread-parent",
@@ -566,7 +570,7 @@ async def test_cross_project_reply_uses_thread_route_without_reverse_contact_gra
             {
                 "project_key": target_key,
                 "message_id": original["id"],
-                "sender_name": "BlueLake",
+                "sender_name": ATOMIC_RECIPIENT,
                 "body_md": "thread-scoped return",
                 "idempotency_key": "mcp-external-thread-reply",
             },

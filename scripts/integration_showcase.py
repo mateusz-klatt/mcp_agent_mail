@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -80,6 +81,9 @@ class AgentHandle:
     project: ProjectHandle
     attachments_policy: str = "auto"
     record: dict[str, Any] | None = None
+    registration_token: str | None = None
+    execution_id: str | None = None
+    execution_token: str | None = None
 
 
 @dataclass(slots=True)
@@ -127,6 +131,24 @@ def _syntax_blob(payload: Any, lexer: str = "json") -> Syntax:
     return Syntax(_json_dump(payload), lexer, theme="monokai", word_wrap=True)
 
 
+def _redact_sensitive(value: Any) -> Any:
+    """Return a display-only copy without credentials or capabilities."""
+    if isinstance(value, dict):
+        return {
+            str(key): (
+                "<redacted>"
+                if any(marker in str(key).casefold() for marker in ("token", "secret", "capability"))
+                else _redact_sensitive(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_sensitive(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_sensitive(item) for item in value)
+    return value
+
+
 def _section(title: str, subtitle: str | None = None, border_style: str = "bright_cyan") -> Panel:
     """Return a stylised panel for major sections."""
     return Panel.fit(
@@ -160,6 +182,7 @@ def _build_environment() -> dict[str, Any]:
         "HTTP_RBAC_ENABLED": "false",
         "LLM_ENABLED": "false",
         "FILE_RESERVATIONS_ENFORCEMENT_ENABLED": "true",
+        "AGENT_EXECUTION_ENFORCEMENT_MODE": "enforce",
         "CONTACT_ENFORCEMENT_ENABLED": "false",
         "TOOL_METRICS_EMIT_ENABLED": "false",
     }
@@ -209,7 +232,13 @@ class Stepper:
         header.add_row("Intent", description)
 
         self.console.print(Panel(header, title="Executing", border_style="bright_magenta"))
-        self.console.print(Panel(_syntax_blob(arguments, lexer=highlight_language), title="Payload →", border_style="cyan"))
+        self.console.print(
+            Panel(
+                _syntax_blob(_redact_sensitive(arguments), lexer=highlight_language),
+                title="Payload →",
+                border_style="cyan",
+            )
+        )
 
         try:
             result = await self.client.call_tool(tool, arguments)
@@ -217,8 +246,12 @@ class Stepper:
             self.console.print(Panel.fit(str(exc), title="Tool Failure", border_style="red"))
             raise
 
-        structured = result.structured_content or {}
-        renderable = JSON.from_data(structured) if structured else _syntax_blob(result.data or {})
+        structured = _redact_sensitive(result.structured_content or {})
+        renderable = (
+            JSON.from_data(structured)
+            if structured
+            else _syntax_blob(_redact_sensitive(result.data or {}))
+        )
         self.console.print(Panel(renderable, title="Result ←", border_style="green"))
 
         return result
@@ -331,7 +364,7 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
 
     agents = {
         "blue": AgentHandle(
-            codename="BlueLake",
+            codename="codex-linux-backend-1",
             program="codex-cli",
             model="gpt-5-codex",
             task="Guardian for backend auth refactor",
@@ -339,28 +372,28 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
             attachments_policy="inline",
         ),
         "green": AgentHandle(
-            codename="GreenStone",
+            codename="codex-linux-backend-2",
             program="codex-cli",
             model="gpt-5-codex",
             task="Implements payment webhooks in backend",
             project=projects["backend"],
         ),
         "orange": AgentHandle(
-            codename="OrangeHill",
+            codename="claude-linux-frontend-1",
             program="claude-code",
             model="opus-4.1",
             task="Frontend navigation overhaul",
             project=projects["frontend"],
         ),
         "purple": AgentHandle(
-            codename="PurpleBear",
+            codename="gemini-linux-frontend-1",
             program="gemini-cli",
             model="gemini-2.5-pro",
             task="Frontend accessibility QA",
             project=projects["frontend"],
         ),
         "black": AgentHandle(
-            codename="BlackSnow",
+            codename="opencode-linux-data-1",
             program="open-code",
             model="atlas-1",
             task="ETL reliability sweeps",
@@ -436,6 +469,26 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
                 },
             )
             agent.record = response.data
+            agent.registration_token = str(response.data["registration_token"])
+            agent.execution_token = secrets.token_hex(32)
+            execution = await stepper.call_tool(
+                actor=agent.codename,
+                project_label=agent.project.label,
+                tool="start_agent_execution",
+                description="Bind this run to the durable mailbox.",
+                arguments={
+                    "project_key": agent.project.human_key,
+                    "agent_name": agent.codename,
+                    "external_id": f"integration-showcase-{agent.codename}",
+                    "client_name": agent.program,
+                    "execution_token": agent.execution_token,
+                    "lifecycle_protocol_version": 1,
+                    "kind": "session",
+                    "task_description": agent.task,
+                    "registration_token": agent.registration_token,
+                },
+            )
+            agent.execution_id = str(execution.data["id"])
             whois = await stepper.call_tool(
                 actor=agent.codename,
                 project_label=agent.project.label,
@@ -458,7 +511,7 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
             actor=agents["blue"].codename,
             project_label=projects["backend"].label,
             tool="file_reservation_paths",
-            description="BlueLake stakes an exclusive file reservation on backend auth routes.",
+            description="codex-linux-backend-1 stakes an exclusive file reservation on backend auth routes.",
             arguments={
                 "project_key": projects["backend"].human_key,
                 "agent_name": agents["blue"].codename,
@@ -466,6 +519,10 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
                 "ttl_seconds": 2 * 3600,
                 "exclusive": True,
                 "reason": "Implementing session token hardening.",
+                "execution_id": agents["blue"].execution_id,
+                "execution_token": agents["blue"].execution_token,
+                "lifecycle_protocol_version": 1,
+                "registration_token": agents["blue"].registration_token,
             },
         )
         reservation_payload = reservation_result.data
@@ -475,22 +532,26 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
             actor=agents["green"].codename,
             project_label=projects["backend"].label,
             tool="file_reservation_paths",
-            description="GreenStone attempts to reserve the same files to illustrate conflict detection.",
+            description="codex-linux-backend-2 attempts to reserve the same files to illustrate conflict detection.",
             arguments={
                 "project_key": projects["backend"].human_key,
                 "agent_name": agents["green"].codename,
                 "paths": ["services/backend/auth/*.py"],
                 "ttl_seconds": 3600,
+                "execution_id": agents["green"].execution_id,
+                "execution_token": agents["green"].execution_token,
+                "lifecycle_protocol_version": 1,
+                "registration_token": agents["green"].registration_token,
             },
         )
         console.print(Panel(_syntax_blob(conflict_attempt.data), title="Conflict response", border_style="red"))
 
-        # GreenStone picks a different surface.
+        # codex-linux-backend-2 picks a different surface.
         await stepper.call_tool(
             actor=agents["green"].codename,
             project_label=projects["backend"].label,
             tool="file_reservation_paths",
-            description="GreenStone pivots to payment webhook files to avoid conflict.",
+            description="codex-linux-backend-2 pivots to payment webhook files to avoid conflict.",
             arguments={
                 "project_key": projects["backend"].human_key,
                 "agent_name": agents["green"].codename,
@@ -498,6 +559,10 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
                 "ttl_seconds": 3600,
                 "exclusive": True,
                 "reason": "Shipping Stripe webhook handlers.",
+                "execution_id": agents["green"].execution_id,
+                "execution_token": agents["green"].execution_token,
+                "lifecycle_protocol_version": 1,
+                "registration_token": agents["green"].registration_token,
             },
         )
 
@@ -505,7 +570,7 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
             actor=agents["blue"].codename,
             project_label=projects["backend"].label,
             tool="send_message",
-            description="BlueLake shares a refactor plan with GreenStone, requiring acknowledgement.",
+            description="codex-linux-backend-1 shares a refactor plan with codex-linux-backend-2, requiring acknowledgement.",
             arguments={
                 "project_key": projects["backend"].human_key,
                 "sender_name": agents["blue"].codename,
@@ -518,6 +583,7 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
                     "- add regression suite seeded from `/tests/auth/*.yaml`\n\n"
                     "Please acknowledge once you've synced the new fixtures."
                 ),
+                "idempotency_key": "showcase-backend-auth-kickoff-v1",
                 "importance": "high",
                 "ack_required": True,
                 "thread_id": "backend-auth-hardening",
@@ -526,8 +592,11 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
 
         deliveries = backend_message.data.get("deliveries", [])
         for delivery in deliveries:
+            message = delivery.get("message")
+            if message is None:
+                continue
             stepper.capture_message(
-                payload=delivery["payload"],
+                payload=message,
                 project=delivery["project"],
                 summary="Auth refactor kickoff with explicit ack.",
             )
@@ -536,7 +605,7 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
             actor=agents["green"].codename,
             project_label=projects["backend"].label,
             tool="fetch_inbox",
-            description="GreenStone fetches inbox to read BlueLake's instructions.",
+            description="codex-linux-backend-2 fetches inbox to read codex-linux-backend-1's instructions.",
             arguments={
                 "project_key": projects["backend"].human_key,
                 "agent_name": agents["green"].codename,
@@ -551,7 +620,7 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
                 actor=agents["green"].codename,
                 project_label=projects["backend"].label,
                 tool="acknowledge_message",
-                description="GreenStone acknowledges the refactor plan.",
+                description="codex-linux-backend-2 acknowledges the refactor plan.",
                 arguments={
                     "project_key": projects["backend"].human_key,
                     "agent_name": agents["green"].codename,
@@ -563,7 +632,7 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
                 actor=agents["green"].codename,
                 project_label=projects["backend"].label,
                 tool="reply_message",
-                description="GreenStone confirms readiness and shares test coverage notes.",
+                description="codex-linux-backend-2 confirms readiness and shares test coverage notes.",
                 arguments={
                     "project_key": projects["backend"].human_key,
                     "message_id": first_msg["id"],
@@ -572,9 +641,15 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
                         "Synced ✅ — I'll extend the webhook regression cases while you handle key rotation. "
                         "Ping if you need Stripe fixtures regenerated."
                     ),
+                    "idempotency_key": "showcase-backend-auth-reply-v1",
                 },
             )
-            stepper.capture_message(payload=reply.data, project=projects["backend"].label, summary="GreenStone confirms task ownership.")
+            reply_payload = reply.data["deliveries"][0]["message"]
+            stepper.capture_message(
+                payload=reply_payload,
+                project=projects["backend"].label,
+                summary="codex-linux-backend-2 confirms task ownership.",
+            )
 
         # ------------------------------------------------------------------ #
         # Cross-project contact (backend ↔ frontend)
@@ -585,7 +660,7 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
             actor=agents["blue"].codename,
             project_label=projects["backend"].label,
             tool="request_contact",
-            description="BlueLake requests permission to coordinate with OrangeHill in the frontend repo.",
+            description="codex-linux-backend-1 requests permission to coordinate with claude-linux-frontend-1.",
             arguments={
                 "project_key": projects["backend"].human_key,
                 "from_agent": agents["blue"].codename,
@@ -613,7 +688,7 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
             actor=agents["orange"].codename,
             project_label=projects["frontend"].label,
             tool="fetch_inbox",
-            description="OrangeHill checks inbox to review the contact request.",
+            description="claude-linux-frontend-1 checks inbox to review the contact request.",
             arguments={
                 "project_key": projects["frontend"].human_key,
                 "agent_name": agents["orange"].codename,
@@ -626,7 +701,7 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
             actor=agents["orange"].codename,
             project_label=projects["frontend"].label,
             tool="respond_contact",
-            description="OrangeHill approves the contact request, allowing backend ↔ frontend messages.",
+            description="claude-linux-frontend-1 approves the contact request, allowing backend ↔ frontend messages.",
             arguments={
                 "project_key": projects["frontend"].human_key,
                 "to_agent": agents["orange"].codename,
@@ -641,7 +716,7 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
             actor=agents["orange"].codename,
             project_label=projects["frontend"].label,
             tool="request_contact",
-            description="OrangeHill reciprocates by requesting direct contact back to the backend project.",
+            description="claude-linux-frontend-1 reciprocates by requesting direct contact back to the backend project.",
             arguments={
                 "project_key": projects["frontend"].human_key,
                 "from_agent": agents["orange"].codename,
@@ -655,7 +730,7 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
             actor=agents["blue"].codename,
             project_label=projects["backend"].label,
             tool="respond_contact",
-            description="BlueLake approves the reciprocal contact request.",
+            description="codex-linux-backend-1 approves the reciprocal contact request.",
             arguments={
                 "project_key": projects["backend"].human_key,
                 "to_agent": agents["blue"].codename,
@@ -670,7 +745,7 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
             actor=agents["blue"].codename,
             project_label=projects["backend"].label,
             tool="list_contacts",
-            description="BlueLake audits approved outbound contacts.",
+            description="codex-linux-backend-1 audits approved outbound contacts.",
             arguments={
                 "project_key": projects["backend"].human_key,
                 "agent_name": agents["blue"].codename,
@@ -681,7 +756,7 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
             actor=agents["blue"].codename,
             project_label=projects["backend"].label,
             tool="send_message",
-            description="BlueLake briefs OrangeHill on backend auth token UX implications.",
+            description="codex-linux-backend-1 briefs claude-linux-frontend-1 on backend auth token UX implications.",
             arguments={
                 "project_key": projects["backend"].human_key,
                 "sender_name": agents["blue"].codename,
@@ -694,13 +769,17 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
                     "- fallback MFA dialog should surface backend error codes verbatim\n\n"
                     "Let's target a coordinated release Thursday 10:00 UTC."
                 ),
+                "idempotency_key": "showcase-auth-ui-sync-v1",
                 "importance": "normal",
                 "thread_id": "auth-ui-sync",
             },
         )
         for delivery in cross_project.data.get("deliveries", []):
+            message = delivery.get("message")
+            if message is None:
+                continue
             stepper.capture_message(
-                payload=delivery["payload"],
+                payload=message,
                 project=delivery["project"],
                 summary="Backend → Frontend coordination note.",
             )
@@ -709,7 +788,7 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
             actor=agents["orange"].codename,
             project_label=projects["frontend"].label,
             tool="fetch_inbox",
-            description="OrangeHill receives the cross-project message after contact approval.",
+            description="claude-linux-frontend-1 receives the cross-project message after contact approval.",
             arguments={
                 "project_key": projects["frontend"].human_key,
                 "agent_name": agents["orange"].codename,
@@ -724,17 +803,19 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
                 actor=agents["orange"].codename,
                 project_label=projects["frontend"].label,
                 tool="reply_message",
-                description="OrangeHill replies from the frontend project back to BlueLake.",
+                description="claude-linux-frontend-1 replies to codex-linux-backend-1.",
                 arguments={
                     "project_key": projects["frontend"].human_key,
                     "message_id": target_msg["id"],
                     "sender_name": agents["orange"].codename,
                     "body_md": "Copy that — I'll push MFA copy updates and flag QA for Thursday AM.",
+                    "idempotency_key": "showcase-auth-ui-reply-v1",
                     "to": [f"project:{projects['backend'].slug}#{agents['blue'].codename}"],
                 },
             )
+            reply_payload = reply_frontend.data["deliveries"][0]["message"]
             stepper.capture_message(
-                payload=reply_frontend.data,
+                payload=reply_payload,
                 project=projects["frontend"].label,
                 summary="Frontend acknowledges auth change timeline.",
             )
@@ -747,7 +828,7 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
             actor=agents["black"].codename,
             project_label=projects["data"].label,
             tool="send_message",
-            description="BlackSnow publishes a standalone data pipeline status email (should not leak elsewhere).",
+            description="opencode-linux-data-1 publishes a standalone data pipeline status email (should not leak elsewhere).",
             arguments={
                 "project_key": projects["data"].human_key,
                 "sender_name": agents["black"].codename,
@@ -758,6 +839,7 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
                     "- ⚠️ 2 delayed events: investigating source `ingest-api`\n"
                     "- 📊 dashboards refreshed @ 08:05 UTC\n"
                 ),
+                "idempotency_key": "showcase-daily-etl-v1",
                 "thread_id": "daily-etl-digest",
             },
         )
@@ -801,6 +883,26 @@ Every tool call is narrated before execution, inputs/outputs are syntax highligh
                 "include_examples": True,
             },
         )
+
+        # End every execution explicitly. Its automatic reservations are
+        # released with the terminal transition, while explicit claims remain
+        # independently auditable until their own release/expiry.
+        for agent in agents.values():
+            await stepper.call_tool(
+                actor=agent.codename,
+                project_label=agent.project.label,
+                tool="end_agent_execution",
+                description="Complete the integration execution and release automatic claims.",
+                arguments={
+                    "project_key": agent.project.human_key,
+                    "agent_name": agent.codename,
+                    "execution_id": agent.execution_id,
+                    "execution_token": agent.execution_token,
+                    "lifecycle_protocol_version": 1,
+                    "status": "completed",
+                    "registration_token": agent.registration_token,
+                },
+            )
 
         # ------------------------------------------------------------------ #
         # Recap timeline

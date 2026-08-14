@@ -222,6 +222,13 @@ class Settings:
     file_reservation_activity_grace_seconds: int
     # Server-side enforcement
     file_reservations_enforcement_enabled: bool
+    # Fleet rollout for execution-owned reservation lifetimes.
+    agent_execution_enforcement_mode: str  # "observe" | "enforce"
+    # Process-lifetime reaper. This is independent from rollout enforcement:
+    # observe mode still needs to close executions whose client crashed.
+    agent_execution_reaper_enabled: bool
+    agent_execution_reaper_interval_seconds: int
+    agent_execution_reaper_threshold_seconds: int
     # Ack TTL warnings
     ack_ttl_enabled: bool
     ack_ttl_seconds: int
@@ -274,15 +281,7 @@ class Settings:
     quota_inbox_limit_count: int
     # Retention/project listing filters
     retention_ignore_project_patterns: list[str]
-    # Agent identity naming policy
-    # Values: "strict" | "coerce" | "always_auto"
-    # - strict: reject invalid provided names (current hard-fail behavior)
-    # - coerce: ignore invalid provided names and auto-generate a valid one (default)
-    # - always_auto: ignore any provided name and always auto-generate
-    agent_name_enforcement_mode: str
     # Messaging ergonomics
-    # When true, attempt to register missing local recipients during send_message
-    messaging_auto_register_recipients: bool
     # When true, attempt a contact handshake automatically if delivery is blocked
     messaging_auto_handshake_on_block: bool
     # Window-based agent identity
@@ -377,6 +376,7 @@ def _enum(value: str, *, default: str, allowed: frozenset[str], key: str) -> str
 def _build_settings() -> Settings:
     decouple_config = _get_decouple_config()
     environment = decouple_config("APP_ENVIRONMENT", default="development")
+    production_environment = environment.strip().lower() in {"prod", "production"}
 
     def _csv(name: str, default: str) -> list[str]:
         raw = decouple_config(name, default=default)
@@ -405,6 +405,16 @@ def _build_settings() -> Settings:
         if not raw:
             return default
         return _int_optional(raw, key=name)
+
+    allow_localhost_unauthenticated = _b(
+        "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED",
+        default=not production_environment,
+    )
+    if production_environment and allow_localhost_unauthenticated:
+        raise ConfigError(
+            "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED cannot be enabled when "
+            "APP_ENVIRONMENT is production; configure bearer or JWT authentication."
+        )
 
     http_settings = HttpSettings(
         host=decouple_config("HTTP_HOST", default="127.0.0.1"),
@@ -447,7 +457,7 @@ def _build_settings() -> Settings:
             "HTTP_RBAC_READONLY_TOOLS",
             default="health_check,fetch_inbox,whois,search_messages,summarize_thread",
         ),
-        allow_localhost_unauthenticated=_b("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", default=True),
+        allow_localhost_unauthenticated=allow_localhost_unauthenticated,
     )
 
     database_settings = DatabaseSettings(
@@ -552,14 +562,6 @@ def _build_settings() -> Settings:
         debounce_ms=_i("NOTIFICATIONS_DEBOUNCE_MS", default=100),
     )
 
-    def _agent_name_mode(value: str) -> str:
-        return _enum(
-            value,
-            default="coerce",
-            allowed=frozenset({"strict", "coerce", "always_auto"}),
-            key="AGENT_NAME_ENFORCEMENT_MODE",
-        )
-
     return Settings(
         environment=environment,
         # Gate: allow either legacy WORKTREES_ENABLED or new GIT_IDENTITY_ENABLED to enable features
@@ -582,6 +584,21 @@ def _build_settings() -> Settings:
         file_reservation_inactivity_seconds=_i("FILE_RESERVATION_INACTIVITY_SECONDS", default=1800),
         file_reservation_activity_grace_seconds=_i("FILE_RESERVATION_ACTIVITY_GRACE_SECONDS", default=900),
         file_reservations_enforcement_enabled=_b("FILE_RESERVATIONS_ENFORCEMENT_ENABLED", default=True),
+        agent_execution_enforcement_mode=_enum(
+            decouple_config("AGENT_EXECUTION_ENFORCEMENT_MODE", default=""),
+            default="observe",
+            allowed=frozenset({"observe", "enforce"}),
+            key="AGENT_EXECUTION_ENFORCEMENT_MODE",
+        ),
+        agent_execution_reaper_enabled=_b(
+            "AGENT_EXECUTION_REAPER_ENABLED", default=True
+        ),
+        agent_execution_reaper_interval_seconds=_i(
+            "AGENT_EXECUTION_REAPER_INTERVAL_SECONDS", default=60
+        ),
+        agent_execution_reaper_threshold_seconds=_i(
+            "AGENT_EXECUTION_REAPER_THRESHOLD_SECONDS", default=86400
+        ),
         ack_ttl_enabled=_b("ACK_TTL_ENABLED", default=False),
         ack_ttl_seconds=_i("ACK_TTL_SECONDS", default=1800),
         ack_ttl_scan_interval_seconds=_i("ACK_TTL_SCAN_INTERVAL_SECONDS", default=60),
@@ -626,8 +643,6 @@ def _build_settings() -> Settings:
             "RETENTION_IGNORE_PROJECT_PATTERNS",
             default="demo,test*,testproj*,testproject,backendproj*,frontendproj*",
         ),
-        agent_name_enforcement_mode=_agent_name_mode(decouple_config("AGENT_NAME_ENFORCEMENT_MODE", default="")),
-        messaging_auto_register_recipients=_b("MESSAGING_AUTO_REGISTER_RECIPIENTS", default=False),
         messaging_auto_handshake_on_block=_b("MESSAGING_AUTO_HANDSHAKE_ON_BLOCK", default=True),
         window_identity_uuid=decouple_config("MCP_AGENT_MAIL_WINDOW_ID", default="").strip(),
         window_identity_ttl_days=_i("MCP_AGENT_MAIL_WINDOW_TTL_DAYS", default=30),

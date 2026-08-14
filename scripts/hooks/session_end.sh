@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# SessionEnd: release the reservations THIS session filed.
+# SessionEnd ends the root AgentExecution. SubagentStop records a provisional
+# stop because another matching provider hook can block it and continue the
+# child; a later child tool cancels it, while the first parent event finalizes
+# it. The server releases only automatic reservations owned by an execution;
+# explicit reservations keep their TTL and require explicit release.
 #
-# Path-scoped, not wholesale. release_file_reservations with no paths drops
-# everything the agent holds — and the identity is shared by every CLI on this
-# host for this project, so a bare release would strip a concurrent session of
-# protection the moment an unrelated terminal was closed.
-#
-# The identity and its credential survive; only the holds go. The next session on
-# this host reclaims the same mailbox instead of appearing as a new agent.
+# The identity and its credential survive. Automatic holds go at confirmed end;
+# explicit holds retain their TTL. The next session on this host reclaims the
+# same mailbox instead of appearing as a new agent.
 #
 # Cannot fail: nothing useful happens after this hook, so an error here would
 # only surface as a spurious failure at the end of otherwise good work.
@@ -18,46 +18,14 @@ set -uo pipefail
 
 am_read_payload
 AM_SESSION_ID="$(am_payload_field '.session_id')"
-
-# Release across EVERY repository this session touched, not just the one its
-# working directory happens to sit in. autoreserve keys each log by the project
-# of the edited FILE, so a session that edited a second repository wrote a log
-# this hook would otherwise never look for — and those reservations would then
-# sit until their TTL, which is exactly the stale-hold problem the hook exists
-# to prevent.
-found=0
-while IFS= read -r log; do
-    [ -r "$log" ] || continue
-    paths="$(am_session_paths "$log")"
-    [ -n "$paths" ] && [ "$paths" != "[]" ] || { printf '' > "$log" 2>/dev/null || true; continue; }
-
-    # New logs carry the exact project key in a JSON header.  Legacy logs are
-    # accepted only when their old lossy slug resolves to exactly one key.
-    project="$(am_session_project "$log")" || continue
-    [ -n "$project" ] || continue
-    export AM_PROJECT_FOR_NAME="$project"
-    if am_identity_migration_pair "$project" claude "${AGENT_MAIL_CLAUDE_SLOT:-1}" >/dev/null; then
-        continue
-    fi
-    agent="$(am_agent_name claude "${AGENT_MAIL_CLAUDE_SLOT:-1}")" || continue
-    token="$(am_cred_get "$project" "$agent")"
-    [ -n "$token" ] || continue
-
-    response="$(am_call release_file_reservations "$(
-        AGENT_MAIL_JQ_REGISTRATION_TOKEN="$token" \
-        jq -nc --arg p "$project" --arg a "$agent" --argjson paths "$paths" \
-        '{project_key:$p,agent_name:$a,registration_token:env.AGENT_MAIL_JQ_REGISTRATION_TOKEN,paths:$paths}'
-    )")"
-    if [ $? -eq 0 ]; then
-        # Keep an empty state file rather than deleting evidence after a failed
-        # release.  am_session_log_add recreates its exact project header before
-        # the next path is appended.
-        printf '' > "$log" 2>/dev/null || true
-        found=$((found+1))
-    fi
-done <<EOF
-$(am_session_logs)
-EOF
+HOOK_EVENT="$(am_payload_field '.hook_event_name')"
+if [ "$HOOK_EVENT" = "SubagentStop" ]; then
+    am_subagent_executions_request_stop_all_for_payload claude \
+        >/dev/null 2>&1 || true
+else
+    am_root_executions_end_all_for_payload claude completed \
+        >/dev/null 2>&1 || true
+fi
 
 # Drop the derived bearer copy am_call writes for curl. It is a cache, not
 # configuration, so its lifetime should be the session's — and unlike
@@ -69,4 +37,5 @@ EOF
 # file whenever its contents do not match the current bearer, and a missing file
 # reads as empty, so the worst case is one extra write in the other session.
 rm -f "${AM_STATE_DIR}/curl-headers.conf" 2>/dev/null
+[ "$HOOK_EVENT" = "SubagentStop" ] && printf '{}\n'
 exit 0

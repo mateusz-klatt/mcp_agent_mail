@@ -1,7 +1,7 @@
 """Filesystem and Git archive helpers for MCP Agent Mail.
 
 Concurrency Architecture:
-- Per-project archive locks (.archive.lock) serialize archive mutations
+- Per-project archive locks in private Git metadata serialize archive mutations
 - One repository-global commit lock (.commit.lock) serializes every shared
   Git index and HEAD mutation across all projects
 - Commit queue with batching reduces lock contention under high load
@@ -42,7 +42,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator, Iterable, Sequence, TypeVar, cast
 from uuid import UUID, uuid4
 
-from filelock import SoftFileLock, Timeout
+from filelock import FileLock, SoftFileLock, Timeout
 from git import NULL_TREE, Git, Repo
 from git.exc import GitCommandError
 from git.objects.tree import Tree
@@ -523,22 +523,22 @@ class MessageDeliveryPendingError(MessageDeliveryPublicationError):
 
 
 def delete_archive_tree_contents(root: Path) -> tuple[int, int]:
-    """Remove a project archive's contents while preserving its active lock."""
+    """Remove a project archive's contents.
+
+    The active project lock lives below the archive repository's private Git
+    metadata rather than inside ``root``, so maintenance code never mistakes
+    an advisory lock artifact for project content.
+    """
     if not root.exists():
         return 0, 0
-    preserved_names = {".archive.lock", ".archive.lock.owner.json"}
     files_removed = 0
     dirs_removed = 0
     for item in root.rglob("*"):
-        if item.parent == root and item.name in preserved_names:
-            continue
         if item.is_file() or item.is_symlink():
             files_removed += 1
         elif item.is_dir():
             dirs_removed += 1
     for item in root.iterdir():
-        if item.name in preserved_names:
-            continue
         if item.is_dir() and not item.is_symlink():
             shutil.rmtree(item)
         else:
@@ -1065,6 +1065,7 @@ class AsyncFileLock:
         self._max_retries = max_retries
         self._pid = os.getpid()
         self._metadata_path = self._path.parent / f"{self._path.name}.owner.json"
+        self._recovery_path = self._path.parent / f"{self._path.name}.recovery"
         self._held = False
         self._lock_key = str(self._path.resolve())
         self._acquisition_start: float | None = None
@@ -1331,8 +1332,11 @@ class AsyncFileLock:
     def _cleanup_if_stale(self) -> bool:
         """Remove lock and metadata when the lock is stale.
 
-        A lock is normally considered stale if its owner is dead or its age
-        exceeds the timeout. The repository-global ``.commit.lock`` is stricter:
+        A lock is stale when its recorded owner is dead, or when its ownership
+        metadata is unavailable and its age exceeds the timeout. A live PID is
+        authoritative regardless of age: long commits and project deletion may
+        legitimately outlast the stale timeout. The repository-global
+        ``.commit.lock`` is stricter:
         it is never auto-healed. Recovery of that shared Git boundary requires
         an explicit offline operator action after proving no writer is active.
 
@@ -1343,51 +1347,67 @@ class AsyncFileLock:
         distinguish the dead generation they inspected from a successor that
         acquired the same pathname before their unlink.
         """
-        if not self._path.exists():
-            return False
         if self._path.name == ".commit.lock":
             return False
-        now = time.time()
-        metadata: dict[str, Any] = {}
-        if self._metadata_path.exists():
-            try:
-                metadata = json.loads(self._metadata_path.read_text(encoding="utf-8"))
-            except Exception:
-                metadata = {}
-        pid_val = metadata.get("pid")
-        pid_int: int | None = None
-        if pid_val is not None:
-            with contextlib.suppress(Exception):
-                pid_int = int(pid_val)
-        owner_alive: bool | None = None
-        if pid_int is not None:
-            owner_alive = self._pid_alive(pid_int)
-        created_ts = metadata.get("created_ts")
-        age = None
-        if isinstance(created_ts, (int, float)):
-            age = now - float(created_ts)
-        else:
-            with contextlib.suppress(Exception):
-                age = now - self._path.stat().st_mtime
+        # Stale detection followed by unlink is otherwise an ABA race: two
+        # healers can inspect one dead generation, the first can remove it, a
+        # successor can acquire the pathname, and the second can then unlink
+        # the live successor.  A persistent OS-backed recovery mutex serializes
+        # the complete re-read-and-remove decision.  The recovery file itself
+        # is never auto-healed and does not match the ``*.lock`` diagnostics
+        # scan, so it cannot recurse into the same protocol.
+        recovery_lock = FileLock(str(self._recovery_path))
+        try:
+            with recovery_lock.acquire(timeout=1.0):
+                if not self._path.exists():
+                    return False
+                now = time.time()
+                metadata: dict[str, Any] = {}
+                if self._metadata_path.exists():
+                    try:
+                        metadata = json.loads(
+                            self._metadata_path.read_text(encoding="utf-8")
+                        )
+                    except Exception:
+                        metadata = {}
+                pid_val = metadata.get("pid")
+                pid_int: int | None = None
+                if pid_val is not None:
+                    with contextlib.suppress(Exception):
+                        pid_int = int(pid_val)
+                owner_alive: bool | None = None
+                if pid_int is not None:
+                    owner_alive = self._pid_alive(pid_int)
+                created_ts = metadata.get("created_ts")
+                age = None
+                if isinstance(created_ts, (int, float)):
+                    age = now - float(created_ts)
+                else:
+                    with contextlib.suppress(Exception):
+                        age = now - self._path.stat().st_mtime
 
-        age_expired = (
-            self._stale_timeout > 0
-            and isinstance(age, (int, float))
-            and age >= self._stale_timeout
-        )
-        is_stale = owner_alive is False or age_expired
+                age_expired = (
+                    self._stale_timeout > 0
+                    and isinstance(age, (int, float))
+                    and age >= self._stale_timeout
+                )
+                is_stale = owner_alive is False or (
+                    owner_alive is None and age_expired
+                )
 
-        if not is_stale:
+                if not is_stale:
+                    return False
+
+                # Remove the sidecar before the lock pathname. The recovery
+                # mutex remains held until both operations finish, and no work
+                # on this generation occurs after the pathname handoff.
+                with contextlib.suppress(Exception):
+                    self._metadata_path.unlink(missing_ok=True)
+                with contextlib.suppress(Exception):
+                    self._path.unlink(missing_ok=True)
+                return True
+        except Timeout:
             return False
-
-        # Remove the old sidecar before the lock pathname. Once the pathname is
-        # gone a successor may acquire immediately and create a new sidecar;
-        # no stale-cleaner writes or deletes are allowed after that handoff.
-        with contextlib.suppress(Exception):
-            self._metadata_path.unlink(missing_ok=True)
-        with contextlib.suppress(Exception):
-            self._path.unlink(missing_ok=True)
-        return True
 
     def _write_metadata(self) -> None:
         payload = {
@@ -1482,6 +1502,11 @@ async def archive_write_lock(archive: ProjectArchive, *, timeout_seconds: float 
     tb: object | None = None
     try:
         await lock.__aenter__()
+        await _to_thread_cancellation_safe(
+            _validate_archive_directory_chain_sync,
+            archive.repo_root,
+            (archive.repo_root / "projects", archive.root),
+        )
         yield
     except BaseException as raised:
         exc_type = type(raised)
@@ -1609,20 +1634,41 @@ def collect_lock_status(settings: Settings, project_slug: str | None = None) -> 
     """Return structured metadata about active archive locks."""
 
     root = Path(settings.storage.root).expanduser().resolve()
-    if project_slug:
-        root = root / "projects" / project_slug
+    try:
+        git_common_dir = _resolved_git_common_dir(root)
+    except Exception:
+        git_common_dir = root / ".git"
     locks: list[dict[str, Any]] = []
     summary = {"total": 0, "active": 0, "stale": 0, "metadata_missing": 0}
 
-    if root.exists():
+    scan_roots: tuple[Path, ...]
+    if project_slug:
+        canonical_slug = _validate_project_archive_slug(project_slug)
+        scan_roots = (
+            _project_archive_lock_path(git_common_dir, canonical_slug),
+            # Diagnose a stale pre-migration artifact if one is still present.
+            root / "projects" / canonical_slug,
+        )
+    else:
+        scan_roots = (root, git_common_dir / "agent-mail-locks")
+
+    candidates: set[Path] = set()
+    for scan_root in scan_roots:
+        if scan_root.is_file():
+            candidates.add(scan_root)
+        elif scan_root.exists():
+            candidates.update(scan_root.rglob("*.lock"))
+
+    if candidates:
         now = time.time()
-        for lock_path in sorted(root.rglob("*.lock"), key=lambda p: str(p)):
+        for lock_path in sorted(candidates, key=lambda p: str(p)):
             metadata_path = lock_path.parent / f"{lock_path.name}.owner.json"
             if not lock_path.exists():
                 continue
             metadata_present = metadata_path.exists()
             if (
-                lock_path.name not in {".archive.lock", ".commit.lock"}
+                not lock_path.name.endswith(".archive.lock")
+                and lock_path.name != ".commit.lock"
                 and not metadata_present
             ):
                 continue
@@ -1634,7 +1680,7 @@ def collect_lock_status(settings: Settings, project_slug: str | None = None) -> 
                 "metadata_present": metadata_present,
                 "category": (
                     "archive"
-                    if lock_path.name == ".archive.lock"
+                    if lock_path.name.endswith(".archive.lock")
                     else "commit"
                     if lock_path.name == ".commit.lock"
                     else "custom"
@@ -1687,7 +1733,9 @@ def collect_lock_status(settings: Settings, project_slug: str | None = None) -> 
             if lock_path.name == ".commit.lock":
                 is_stale = pid_int is not None and owner_alive is False
             else:
-                is_stale = owner_alive is False or age_expired
+                is_stale = owner_alive is False or (
+                    owner_alive is None and age_expired
+                )
             info["stale_suspected"] = is_stale
 
             summary["total"] += 1
@@ -1738,7 +1786,34 @@ def _validate_project_archive_slug(slug: str) -> str:
     return slug
 
 
+def _resolved_git_common_dir(repo_root: Path, repo: Repo | None = None) -> Path:
+    """Resolve Git's shared administrative directory for a working tree."""
+    owned_repo = repo is None
+    active_repo = repo or Repo(str(repo_root))
+    try:
+        common_dir = Path(active_repo.common_dir)
+        if not common_dir.is_absolute():
+            common_dir = repo_root / common_dir
+        return common_dir.resolve()
+    finally:
+        if owned_repo:
+            active_repo.close()
+
+
+def _project_archive_lock_path(git_common_dir: Path, slug: str) -> Path:
+    """Return the stable project lock outside the deletable archive subtree."""
+    canonical_slug = _validate_project_archive_slug(slug)
+    digest = hashlib.sha256(canonical_slug.encode("utf-8")).hexdigest()
+    readable_prefix = canonical_slug[:96]
+    return (
+        git_common_dir
+        / "agent-mail-locks"
+        / f"{readable_prefix}-{digest}.archive.lock"
+    )
+
+
 async def ensure_archive(settings: Settings, slug: str) -> ProjectArchive:
+    """Resolve and durably materialize one canonical project archive."""
     slug = _validate_project_archive_slug(slug)
     lexical_repo_root = Path(settings.storage.root).expanduser().absolute()
     lexical_projects_root = lexical_repo_root / "projects"
@@ -1749,36 +1824,36 @@ async def ensure_archive(settings: Settings, slug: str) -> ProjectArchive:
         (lexical_projects_root, lexical_project_root),
     )
     repo_root, repo = await ensure_archive_root(settings)
+    git_common_dir = await _to_thread(_resolved_git_common_dir, repo_root, repo)
     projects_root = repo_root / "projects"
     project_root = projects_root / slug
+    lock_path = _project_archive_lock_path(git_common_dir, slug)
 
-    def _create_project_archive_directories_sync() -> None:
+    def _create_archive_parent_directories_sync() -> None:
         _validate_archive_directory_chain_sync(
             repo_root,
             (projects_root, project_root),
         )
         projects_created = not projects_root.exists()
+        project_created = not project_root.exists()
         projects_root.mkdir(exist_ok=True)
         _validate_archive_directory_chain_sync(repo_root, (projects_root,))
         if projects_created:
             _fsync_message_delivery_directory_sync(repo_root)
-        project_created = not project_root.exists()
         project_root.mkdir(exist_ok=True)
-        _validate_archive_directory_chain_sync(
-            repo_root,
-            (projects_root, project_root),
-        )
+        _validate_archive_directory_chain_sync(repo_root, (projects_root, project_root))
         if project_created:
             _fsync_message_delivery_directory_sync(projects_root)
 
-    await _to_thread(_create_project_archive_directories_sync)
+    await _to_thread(_create_archive_parent_directories_sync)
+    await _to_thread(lock_path.parent.mkdir, parents=True, exist_ok=True)
     return ProjectArchive(
         settings=settings,
         slug=slug,
         root=project_root,
         repo=repo,
-        # Use a per-project advisory lock to avoid cross-project contention
-        lock_path=project_root / ".archive.lock",
+        # Keep lock files in Git's shared private metadata, never in project data.
+        lock_path=lock_path,
         repo_root=repo_root,
     )
 
@@ -3940,7 +4015,14 @@ async def _append_attachment_audit(archive: ProjectArchive, digest: str, event: 
 def _commit_lock_path(repo_root: Path, rel_paths: Sequence[str]) -> Path:
     """Serialize every shared-index/HEAD mutation in one archive repository."""
     del rel_paths
-    return repo_root / ".commit.lock"
+    try:
+        git_common_dir = _resolved_git_common_dir(repo_root)
+    except Exception:
+        # Unit-level/custom callers may use the primitive before a repository
+        # exists. Keep that standalone lock local; real archives always have a
+        # Git common directory and therefore share the repository-wide lock.
+        return repo_root / ".commit.lock"
+    return git_common_dir / "agent-mail-locks" / ".commit.lock"
 
 
 def _is_git_index_lock_error(exc: BaseException) -> bool:
@@ -4334,20 +4416,35 @@ async def heal_archive_locks(settings: Settings, project_slug: str | None = None
 
     root = await _to_thread(_expanduser_resolve_path, Path(settings.storage.root))
     await _to_thread(root.mkdir, parents=True, exist_ok=True)
+    try:
+        git_common_dir = await _to_thread(_resolved_git_common_dir, root)
+    except Exception:
+        git_common_dir = root / ".git"
+    scan_roots: tuple[Path, ...]
     if project_slug:
-        root = root / "projects" / project_slug
+        canonical_slug = _validate_project_archive_slug(project_slug)
+        scan_roots = (
+            _project_archive_lock_path(git_common_dir, canonical_slug),
+            # A pre-migration in-tree lock remains diagnostic state until healed.
+            root / "projects" / canonical_slug,
+        )
+    else:
+        scan_roots = (root, git_common_dir / "agent-mail-locks")
     summary: dict[str, Any] = {
         "locks_scanned": 0,
         "locks_removed": [],
         "metadata_removed": [],
     }
-    if not await _to_thread(_path_exists, root):
+    if not any(await asyncio.gather(*(_to_thread(_path_exists, path) for path in scan_roots))):
         return summary
 
-    lock_paths = sorted(await _to_thread(_list_rglob_paths, root, "*.lock"), key=str)
-    for lock_path_item in lock_paths:
-        # rglob returns Path objects at runtime; cast for type checker
-        lock_path = cast(Path, lock_path_item)
+    lock_paths: set[Path] = set()
+    for scan_root in scan_roots:
+        if await _to_thread(scan_root.is_file):
+            lock_paths.add(scan_root)
+        elif await _to_thread(_path_exists, scan_root):
+            lock_paths.update(await _to_thread(_list_rglob_paths, scan_root, "*.lock"))
+    for lock_path in sorted(lock_paths, key=str):
         summary["locks_scanned"] += 1
         try:
             # Share the same rule as acquisition and ``collect_lock_status``.
@@ -4360,10 +4457,23 @@ async def heal_archive_locks(settings: Settings, project_slug: str | None = None
         except FileNotFoundError:
             continue
 
-    metadata_paths = sorted(await _to_thread(_list_rglob_paths, root, "*.lock.owner.json"), key=str)
-    for metadata_path_item in metadata_paths:
-        # rglob returns Path objects at runtime; cast for type checker
-        metadata_path = cast(Path, metadata_path_item)
+    metadata_paths: set[Path] = set()
+    for scan_root in scan_roots:
+        if scan_root.is_file():
+            metadata_candidate = scan_root.with_name(
+                f"{scan_root.name}.owner.json"
+            )
+            if await _to_thread(_path_exists, metadata_candidate):
+                metadata_paths.add(metadata_candidate)
+        elif await _to_thread(_path_exists, scan_root):
+            metadata_paths.update(
+                await _to_thread(
+                    _list_rglob_paths,
+                    scan_root,
+                    "*.lock.owner.json",
+                )
+            )
+    for metadata_path in sorted(metadata_paths, key=str):
         name = metadata_path.name
         if not name.endswith(".owner.json"):
             continue

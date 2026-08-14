@@ -95,7 +95,13 @@ async def test_bench_file_reservation_conflict_detection():
     async def operation(_i: int) -> None:
         for path in paths:
             for reservation in reservations:
-                _file_reservations_conflict(reservation, path, True, candidate_agent)
+                _file_reservations_conflict(
+                    reservation,
+                    path,
+                    True,
+                    None,
+                    int(candidate_agent.id),
+                )
 
     await run_benchmark(
         name="file_reservation_conflict",

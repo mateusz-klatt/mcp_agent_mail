@@ -11,6 +11,8 @@ from mcp_agent_mail.config import clear_settings_cache
 from tests.e2e.utils import make_console, render_phase, write_log
 from tests.keys import pkey
 
+TOON_AGENT = "codex-wsl-toon-e2e-1"
+
 
 def _fake_completed(stdout: str, stderr: str = "", returncode: int = 0) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(args=["tru", "--encode"], returncode=returncode, stdout=stdout, stderr=stderr)
@@ -48,7 +50,7 @@ async def test_toon_format_e2e_flow(isolated_env, monkeypatch):
                 "project_key": "Backend",
                 "program": "codex",
                 "model": "gpt-5",
-                "name": "BlueLake",
+                "name": TOON_AGENT,
                 "format": "toon",
             },
         )
@@ -56,7 +58,9 @@ async def test_toon_format_e2e_flow(isolated_env, monkeypatch):
         steps.append(step)
         render_phase(console, "register_agent", {"response_format": agent.data.get("format")})
 
-        inbox = await client.read_resource("resource://inbox/BlueLake?project=/backend&format=toon")
+        inbox = await client.read_resource(
+            f"resource://inbox/{TOON_AGENT}?project=/backend&format=toon"
+        )
         step = {"resource": "resource://inbox/{agent}", "format": "toon", "response": inbox[0].text}
         steps.append(step)
         render_phase(console, "inbox_resource", {"response_bytes": len(inbox[0].text or "")})

@@ -872,7 +872,9 @@ async def test_new_archive_directories_are_parent_fsynced(
     archive = await ensure_archive(settings, "durable-project-directory")
 
     assert archive.root == repo_root / "projects" / "durable-project-directory"
-    assert calls[-2:] == [repo_root, repo_root / "projects"]
+    assert calls[-1] == repo_root / "projects"
+    assert repo_root in calls
+    assert archive.root.is_dir()
     assert repo_root.parent in calls
 
 
@@ -951,10 +953,10 @@ async def test_two_projects_share_global_commit_lock_and_both_publish(
     first_document = _document(first_id, body="One")
     second_document = _document(second_id, body="Two")
     assert _commit_lock_path(first_archive.repo_root, ["projects/one/a.md"]) == (
-        first_archive.repo_root / ".commit.lock"
+        first_archive.lock_path.parent / ".commit.lock"
     )
     assert _commit_lock_path(second_archive.repo_root, ["projects/two/b.md"]) == (
-        first_archive.repo_root / ".commit.lock"
+        first_archive.lock_path.parent / ".commit.lock"
     )
     original_commit = _commit_message_delivery_sync
     active_commits = 0

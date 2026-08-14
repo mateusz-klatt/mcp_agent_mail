@@ -7,6 +7,35 @@ from fastmcp.exceptions import ToolError
 from mcp_agent_mail.app import build_mcp_server
 from tests.keys import pkey
 
+CLAIMS_SESSION_AGENT = "claude-wsl-claims-session-1"
+NO_CLAIMS_SESSION_AGENT = "codex-wsl-claims-session-2"
+EMPTY_CLAIMS_SESSION_AGENT = "codex-wsl-claims-session-3"
+CLAIMS_SESSION_TOKEN = "a" * 64
+NO_CLAIMS_SESSION_TOKEN = "b" * 64
+EMPTY_CLAIMS_SESSION_TOKEN = "c" * 64
+
+
+async def _provision_agent(
+    client: Client,
+    *,
+    project_key: str,
+    agent_name: str,
+    program: str,
+    model: str,
+) -> str:
+    """Provision the durable mailbox before exercising the session-only macro."""
+    await client.call_tool("ensure_project", {"human_key": project_key})
+    result = await client.call_tool(
+        "register_agent",
+        {
+            "project_key": project_key,
+            "program": program,
+            "model": model,
+            "name": agent_name,
+        },
+    )
+    return result.data["registration_token"]
+
 
 @pytest.mark.asyncio
 async def test_macro_start_session_with_file_reservation_paths(isolated_env):
@@ -23,13 +52,25 @@ async def test_macro_start_session_with_file_reservation_paths(isolated_env):
     """
     server = build_mcp_server()
     async with Client(server) as client:
+        project_key = pkey("test/project")
+        registration_token = await _provision_agent(
+            client,
+            project_key=project_key,
+            agent_name=CLAIMS_SESSION_AGENT,
+            program="claude-code",
+            model="sonnet-4.5",
+        )
         res = await client.call_tool(
             "macro_start_session",
             {
-                "human_key": pkey("test/project"),
+                "human_key": project_key,
                 "program": "claude-code",
                 "model": "sonnet-4.5",
-                "agent_name": "BlueLake",  # ← Must be adjective+noun format
+                "agent_name": CLAIMS_SESSION_AGENT,
+                "external_id": "claims-session-1",
+                "client_name": "claude",
+                "execution_token": CLAIMS_SESSION_TOKEN,
+                "registration_token": registration_token,
                 "task_description": "Testing file reservations functionality",
                 "file_reservation_paths": ["src/**/*.py", "tests/**/*.py"],
                 "file_reservation_reason": "Testing macro_start_session with file reservations",
@@ -47,7 +88,7 @@ async def test_macro_start_session_with_file_reservation_paths(isolated_env):
 
         # Verify agent was registered
         assert "agent" in data
-        assert data["agent"]["name"] == "BlueLake"
+        assert data["agent"]["name"] == CLAIMS_SESSION_AGENT
         assert data["agent"]["program"] == "claude-code"
         assert data["agent"]["model"] == "sonnet-4.5"
 
@@ -80,13 +121,25 @@ async def test_macro_start_session_without_file_reservations_still_works(isolate
     """Verify that macro_start_session still works when file_reservation_paths is omitted."""
     server = build_mcp_server()
     async with Client(server) as client:
+        project_key = pkey("test/project2")
+        registration_token = await _provision_agent(
+            client,
+            project_key=project_key,
+            agent_name=NO_CLAIMS_SESSION_AGENT,
+            program="codex",
+            model="gpt-5",
+        )
         res = await client.call_tool(
             "macro_start_session",
             {
-                "human_key": pkey("test/project2"),
+                "human_key": project_key,
                 "program": "codex",
                 "model": "gpt-5",
-                "agent_name": "RedStone",  # ← Must be adjective+noun format
+                "agent_name": NO_CLAIMS_SESSION_AGENT,
+                "external_id": "claims-session-2",
+                "client_name": "codex",
+                "execution_token": NO_CLAIMS_SESSION_TOKEN,
+                "registration_token": registration_token,
                 "task_description": "No file reservations test",
                 # file_reservation_paths intentionally omitted
                 "inbox_limit": 5,
@@ -100,7 +153,7 @@ async def test_macro_start_session_without_file_reservations_still_works(isolate
         # drive-letter prefix off POSIX, and identity of the project is what this
         # line is for.
         assert data["project"]["slug"].endswith("test-project2")
-        assert data["agent"]["name"] == "RedStone"
+        assert data["agent"]["name"] == NO_CLAIMS_SESSION_AGENT
 
         # file_reservations should be empty dict when not requested (not None - function returns {"granted": [], "conflicts": []})
         assert data["file_reservations"] == {"granted": [], "conflicts": []}
@@ -116,14 +169,26 @@ async def test_macro_start_session_rejects_explicit_empty_file_reservation_paths
     """Explicit empty reservation paths should be validated, not treated as omitted."""
     server = build_mcp_server()
     async with Client(server) as client:
+        project_key = pkey("test/project-empty-claims")
+        registration_token = await _provision_agent(
+            client,
+            project_key=project_key,
+            agent_name=EMPTY_CLAIMS_SESSION_AGENT,
+            program="codex",
+            model="gpt-5",
+        )
         with pytest.raises(ToolError, match=r"path|empty|required"):
             await client.call_tool(
                 "macro_start_session",
                 {
-                    "human_key": pkey("test/project-empty-claims"),
+                    "human_key": project_key,
                     "program": "codex",
                     "model": "gpt-5",
-                    "agent_name": "BlueLake",
+                    "agent_name": EMPTY_CLAIMS_SESSION_AGENT,
+                    "external_id": "claims-session-3",
+                    "client_name": "codex",
+                    "execution_token": EMPTY_CLAIMS_SESSION_TOKEN,
+                    "registration_token": registration_token,
                     "file_reservation_paths": [],
                 },
             )

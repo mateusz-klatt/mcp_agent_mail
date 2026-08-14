@@ -482,7 +482,7 @@ Sample:
 ```
 ✖ Commit blocked by active exclusive reservation
 
-Holder: BlueLake  (branch: feature/auth, worktree: frontend-wt)
+Holder: codex-wsl-home-1  (branch: feature/auth, worktree: frontend-wt)
 Reason: bd-123  •  Expires: 2025-11-10T18:14:09Z
 
 Matched pattern(s):
@@ -1227,7 +1227,7 @@ git rev-parse --show-prefix      # get current subdir (for path normalization)
 Per-worktree environment via direnv (`.envrc`):
 
 ```bash
-export AGENT_NAME="PurpleLake"  # Valid adjective+noun format
+export AGENT_NAME="codex-wsl-home-1"  # Stable client-os-host-slot identity
 # Optional client-side hint if needed later
 export AGENT_MAIL_PROJECT_IDENTITY_MODE="git-common-dir"
 ```

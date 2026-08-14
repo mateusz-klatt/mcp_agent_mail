@@ -190,7 +190,7 @@ async def test_file_reservation_statuses_cleanup_on_exception(isolated_env, tmp_
                 "project_key": str(workspace),
                 "program": "test-cli",
                 "model": "test-model",
-                "name": "GreenLake",
+                "name": "codex-linux-cleanup-status-1",
             },
         )
 
@@ -199,7 +199,7 @@ async def test_file_reservation_statuses_cleanup_on_exception(isolated_env, tmp_
             "file_reservation_paths",
             {
                 "project_key": str(workspace),
-                "agent_name": "GreenLake",
+                "agent_name": "codex-linux-cleanup-status-1",
                 "paths": ["test.py"],
                 "ttl_seconds": 3600,
                 "exclusive": True,
@@ -236,7 +236,7 @@ async def test_file_reservation_release_works(isolated_env, tmp_path: Path):
                 "project_key": str(workspace),
                 "program": "test-cli",
                 "model": "test-model",
-                "name": "BlueDog",
+                "name": "codex-linux-cleanup-release-1",
             },
         )
 
@@ -245,7 +245,7 @@ async def test_file_reservation_release_works(isolated_env, tmp_path: Path):
             "file_reservation_paths",
             {
                 "project_key": str(workspace),
-                "agent_name": "BlueDog",
+                "agent_name": "codex-linux-cleanup-release-1",
                 "paths": ["*.py"],
                 "ttl_seconds": 3600,
             },
@@ -256,7 +256,10 @@ async def test_file_reservation_release_works(isolated_env, tmp_path: Path):
         # Release
         res2 = await client.call_tool(
             "release_file_reservations",
-            {"project_key": str(workspace), "agent_name": "BlueDog"},
+            {
+                "project_key": str(workspace),
+                "agent_name": "codex-linux-cleanup-release-1",
+            },
         )
         assert res2.data.get("released", 0) > 0
 
@@ -279,8 +282,7 @@ async def _make_workspace_with_git(tmp_path: Path, name: str) -> Path:
 
 
 async def _register_agent(client: Client, workspace: Path, name: str) -> str:
-    """Register an agent and return whatever name the server actually issued
-    (may be a suffixed variant when the requested name collides)."""
+    """Register an agent with the exact durable name supplied by the fixture."""
     reg = await client.call_tool(
         "register_agent",
         {
@@ -298,7 +300,8 @@ async def _register_agent(client: Client, workspace: Path, name: str) -> str:
 # this signal to warn the operator that server-side exclusivity does not
 # fully cover code paths and the pre-commit guard is the authoritative gate.
 # Archive paths (agents/, messages/, attachments/, threads/, file_reservations/)
-# are enforced server-side and must NOT produce a warning. (#162)
+# are enforced server-side and must NOT produce the code-path warning. Execution
+# rollout diagnostics are independent and may still be present. (#162)
 @pytest.mark.asyncio
 async def test_file_reservation_warns_on_code_repo_paths(isolated_env, tmp_path: Path):
     server = build_mcp_server()
@@ -306,7 +309,9 @@ async def test_file_reservation_warns_on_code_repo_paths(isolated_env, tmp_path:
 
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": str(workspace)})
-        agent_name = await _register_agent(client, workspace, "WarnCode")
+        agent_name = await _register_agent(
+            client, workspace, "codex-linux-warning-code-1"
+        )
 
         result = await client.call_tool(
             "file_reservation_paths",
@@ -336,7 +341,9 @@ async def test_file_reservation_silent_on_archive_only_paths(
 
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": str(workspace)})
-        agent_name = await _register_agent(client, workspace, "WarnArchive")
+        agent_name = await _register_agent(
+            client, workspace, "codex-linux-warning-archive-1"
+        )
 
         result = await client.call_tool(
             "file_reservation_paths",
@@ -348,8 +355,12 @@ async def test_file_reservation_silent_on_archive_only_paths(
             },
         )
         warnings_list = result.data.get("warnings") or []
-        assert warnings_list == [], (
-            f"archive-only reservation must not produce warnings: {warnings_list!r}"
+        assert not any(
+            isinstance(w, str) and w.startswith("enforcement_off_for_code_paths")
+            for w in warnings_list
+        ), (
+            "archive-only reservation must not produce a code-path warning: "
+            f"{warnings_list!r}"
         )
 
 
@@ -362,7 +373,9 @@ async def test_file_reservation_warns_on_mixed_paths(isolated_env, tmp_path: Pat
 
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": str(workspace)})
-        agent_name = await _register_agent(client, workspace, "WarnMixed")
+        agent_name = await _register_agent(
+            client, workspace, "codex-linux-warning-mixed-1"
+        )
 
         result = await client.call_tool(
             "file_reservation_paths",

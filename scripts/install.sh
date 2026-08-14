@@ -24,7 +24,6 @@ YES=0
 NO_START=0
 START_ONLY=0
 PROJECT_DIR=""
-INTEGRATION_TOKEN="${INTEGRATION_BEARER_TOKEN:-}"
 HTTP_PORT_OVERRIDE=""
 SKIP_BEADS=0
 SKIP_BV=0
@@ -48,8 +47,12 @@ Options:
   --no-start             Do not run integration/start; just set up venv + deps
   --start-only           Skip clone/setup; run integration/start in current repo
   --project-dir PATH     Pass-through to integration (where to write client configs)
-  --token HEX            Use/set INTEGRATION_BEARER_TOKEN for this run
   -h, --help             Show help
+
+Authentication:
+  Put AGENT_MAIL_URL and HTTP_BEARER_TOKEN in ~/.agent-mail.env (mode 0600),
+  or export them before running this installer. Secrets are not accepted as
+  command-line arguments.
 
 Examples:
   ./scripts/install.sh --yes
@@ -73,12 +76,10 @@ while [[ $# -gt 0 ]]; do
     --start-only) START_ONLY=1 ;;
     --project-dir) shift; PROJECT_DIR="${1:-}" ;;
     --project-dir=*) PROJECT_DIR="${1#*=}" ;;
-    --token) shift; INTEGRATION_TOKEN="${1:-}" ;;
-    --token=*) INTEGRATION_TOKEN="${1#*=}" ;;
     --skip-beads) SKIP_BEADS=1 ;;
     --skip-bv) SKIP_BV=1 ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
+    *) echo "Unknown option: ${1%%=*}" >&2; usage; exit 2 ;;
   esac
   shift || true
 done
@@ -795,7 +796,6 @@ run_integration_and_start() {
     cd "${REPO_DIR}"
     # Child script uses `uv run python` which auto-detects the venv, so
     # we skip `source .venv/bin/activate` (Unix-only path, see GH#144).
-    export INTEGRATION_BEARER_TOKEN="${INTEGRATION_TOKEN}"
     args=()
     if [[ "${YES}" -eq 1 ]]; then args+=("--yes"); fi
     if [[ -n "${PROJECT_DIR}" ]]; then args+=("--project-dir" "${PROJECT_DIR}"); fi
@@ -886,7 +886,7 @@ cat <<'MSG'
 ║                                                                              ║
 ║   ❌ INCORRECT USAGE:                                                        ║
 ║      Running shell commands like:                                           ║
-║        • mcp-agent-mail send --to BlueLake ...                              ║
+║        • mcp-agent-mail send --to codex-wsl-home-1 ...                      ║
 ║        • mcp-agent-mail --help                                              ║
 ║                                                                              ║
 ║   📚 For documentation, see:                                                 ║

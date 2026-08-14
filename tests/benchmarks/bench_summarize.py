@@ -22,6 +22,7 @@ async def test_bench_summarize_thread(bench_factory):
                 "project_key": harness.project_key,
                 "program": "benchmark",
                 "model": "test",
+                "name_hint": "codex-wsl-bench-summarize-1",
                 "task_description": "Secondary participant",
             },
         )

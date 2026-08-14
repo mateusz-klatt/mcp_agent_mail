@@ -21,15 +21,19 @@ Reference: mcp_agent_mail-e4m
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import random
 import string
 from contextlib import asynccontextmanager, contextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
 import pytest
 from fastmcp import Client
+from fastmcp.exceptions import ToolError
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
 from mcp_agent_mail import app as app_module, config as _config, delivery as delivery_module
@@ -146,12 +150,14 @@ async def setup_project(client: Client, project_key: str) -> str:
 
 async def setup_agent(client: Client, project_key: str, suffix: str = "") -> str:
     """Register a new agent in the project, return agent name."""
+    durable_suffix = suffix or "agent"
     result = await client.call_tool(
         "register_agent",
         {
             "project_key": project_key,
             "program": "test-concurrent",
             "model": "test",
+            "name": f"codex-wsl-concurrency-{durable_suffix}-1",
             "task_description": f"Concurrency test agent {suffix}",
         },
     )
@@ -534,6 +540,7 @@ class TestConcurrentArchiveWrites:
                         "project_key": project_key,
                         "program": f"test-{idx}",
                         "model": "test",
+                        "name_hint": f"codex-wsl-concurrent-register-{idx + 1}",
                         "task_description": f"Concurrent registration {idx}",
                     },
                 )
@@ -974,9 +981,8 @@ class TestRaceConditions:
         assert len(set(project_ids)) == 1, "All should get same project ID"
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("entrypoint", ["register_agent", "macro_start_session"])
-    async def test_simultaneous_agent_registration_same_name(self, isolated_env, entrypoint):
-        """Only one token-returning entrypoint may claim a new explicit name."""
+    async def test_simultaneous_agent_registration_same_name(self, isolated_env):
+        """Only one provisioning call may claim a new explicit durable name."""
         await ensure_schema()
         project_key = f"/test/concurrent/agent-register/{random_id()}"
         num_attempts = 10
@@ -992,20 +998,17 @@ class TestRaceConditions:
                     "model": "test",
                     "task_description": f"simultaneous registration {idx}",
                 }
-                if entrypoint == "register_agent":
-                    arguments.update({"project_key": project_key, "name": "GreenLake"})
-                else:
-                    arguments.update({"human_key": project_key, "agent_name": "GreenLake"})
+                arguments.update(
+                    {
+                        "project_key": project_key,
+                        "name": "codex-wsl-concurrent-race-1",
+                    }
+                )
                 result = await client.call_tool(
-                    entrypoint,
+                    "register_agent",
                     arguments,
                 )
-                if entrypoint == "register_agent":
-                    return result.data
-                return {
-                    **result.data["agent"],
-                    "registration_token": result.data["registration_token"],
-                }
+                return result.data
 
         results = await asyncio.gather(
             *[register_agent_same_name(idx) for idx in range(num_attempts)],
@@ -1014,7 +1017,7 @@ class TestRaceConditions:
 
         # Exactly one attempt may create the identity. `4cf20f1` made
         # register_agent authenticate against an existing name, so the nine
-        # that arrive second cannot claim "GreenLake" without its token —
+        # that arrive second cannot claim the durable name without its token —
         # which is the point: an unauthenticated caller naming an existing
         # agent is indistinguishable from someone taking it over.
         #
@@ -1026,17 +1029,16 @@ class TestRaceConditions:
         assert len(created) == 1, f"exactly one creation, got {len(created)}"
         assert len(refused) == num_attempts - 1
 
-        # Two refusals are possible and which one arrives is a matter of
-        # timing: a caller that reaches the check before the winner's token is
-        # provisioned is told the agent "does not have a registration token",
-        # and one that arrives after is told the call "requires
-        # registration_token". Both mean the same thing to the caller, so this
-        # accepts either rather than pinning whichever the machine happened to
-        # produce — the alternative is a test that passes on one box and not
-        # the next.
+        # A caller racing the winner may observe either the deliberately hidden
+        # provisioning row ("not found") or the now-active mailbox requiring
+        # its token. Both are fail-closed and neither exposes the winner's
+        # one-time credential.
         for r in refused:
             message = str(r).lower()
-            assert "registration" in message and "token" in message, (
+            assert (
+                ("registration" in message and "token" in message)
+                or "not found" in message
+            ), (
                 f"refused for the wrong reason: {r}"
             )
 
@@ -1047,13 +1049,436 @@ class TestRaceConditions:
 
         async with get_session() as session:
             rows = (
-                await session.execute(select(Agent).where(cast(Any, Agent.name == "GreenLake")))
+                await session.execute(
+                    select(Agent).where(
+                        cast(Any, Agent.name == "codex-wsl-concurrent-race-1")
+                    )
+                )
             ).scalars().all()
         assert len(rows) == 1, f"one name, one row, got {len(rows)}"
         assert rows[0].registration_token
         assert rows[0].registration_token == created[0]["registration_token"]
         assert rows[0].program == created[0]["program"]
         assert rows[0].task_description == created[0]["task_description"]
+
+    @pytest.mark.asyncio
+    async def test_provisioning_agent_is_invisible_until_profile_succeeds(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """No caller can address or attach state to a half-published mailbox."""
+        project_key = f"/test/concurrent/provisioning-barrier/{random_id()}"
+        target_name = "codex-wsl-provisioning-barrier-1"
+        entered_profile_write = asyncio.Event()
+        release_profile_write = asyncio.Event()
+        target_profile_payloads: list[dict[str, object]] = []
+        original_write_agent_profile = app_module.write_agent_profile
+
+        async def blocked_write_agent_profile(archive, payload):
+            if payload.get("name") == target_name:
+                target_profile_payloads.append(dict(payload))
+                entered_profile_write.set()
+                await release_profile_write.wait()
+            await original_write_agent_profile(archive, payload)
+
+        server = build_mcp_server()
+        async with Client(server) as sender_client:
+            project = await sender_client.call_tool(
+                "ensure_project", {"human_key": project_key}
+            )
+            await sender_client.call_tool(
+                "register_agent",
+                {
+                    "project_key": project_key,
+                    "program": "pytest",
+                    "model": "pytest",
+                    "name": "codex-wsl-provisioning-sender-1",
+                },
+            )
+            monkeypatch.setattr(
+                app_module,
+                "write_agent_profile",
+                blocked_write_agent_profile,
+            )
+            async with Client(server) as target_client:
+                provisioning = asyncio.create_task(
+                    target_client.call_tool(
+                        "register_agent",
+                        {
+                            "project_key": project_key,
+                            "program": "pytest",
+                            "model": "pytest",
+                            "name": target_name,
+                            "attachments_policy": "inline",
+                        },
+                    )
+                )
+                await asyncio.wait_for(entered_profile_write.wait(), timeout=5)
+
+                async with get_session() as session:
+                    target = (
+                        await session.execute(
+                            select(Agent).where(Agent.name == target_name)
+                        )
+                    ).scalar_one()
+                    assert target.provisioning_state == "provisioning"
+                    assert target.registration_token
+                    assert target.attachments_policy == "inline"
+                    target_id = target.id
+
+                with pytest.raises(ToolError, match="not registered"):
+                    await sender_client.call_tool(
+                        "send_message",
+                        {
+                            "project_key": project_key,
+                            "sender_name": "codex-wsl-provisioning-sender-1",
+                            "to": [target_name],
+                            "subject": "must not deliver early",
+                            "body_md": "profile publication is still blocked",
+                            "idempotency_key": "provisioning-barrier-before-active",
+                        },
+                    )
+
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                with pytest.raises(IntegrityError, match="active Agent"):
+                    async with get_session() as session:
+                        await session.execute(
+                            text(
+                                "INSERT INTO file_reservations "
+                                "(project_id, agent_id, origin, path_pattern, exclusive, "
+                                "reason, created_ts, expires_ts, archive_revision, "
+                                "archive_synced_revision) "
+                                "VALUES (:project_id, :agent_id, 'explicit', 'blocked.py', "
+                                "1, 'provisioning barrier', :created_ts, :expires_ts, 1, 0)"
+                            ),
+                            {
+                                "project_id": project.data["id"],
+                                "agent_id": target_id,
+                                "created_ts": now,
+                                "expires_ts": now + timedelta(minutes=5),
+                            },
+                        )
+                        await session.commit()
+
+                release_profile_write.set()
+                created = await asyncio.wait_for(provisioning, timeout=10)
+                assert created.data["registration_token"]
+                assert created.data["attachments_policy"] == "inline"
+                assert target_profile_payloads[-1]["attachments_policy"] == "inline"
+
+                async with get_session() as session:
+                    target = (
+                        await session.execute(
+                            select(Agent).where(Agent.name == target_name)
+                        )
+                    ).scalar_one()
+                    assert target.provisioning_state == "active"
+                    assert target.attachments_policy == "inline"
+                    target.contact_policy = "open"
+                    session.add(target)
+                    await session.commit()
+
+                archive = await app_module.ensure_archive(
+                    app_module.get_settings(),
+                    project.data["slug"],
+                )
+                profile = json.loads(
+                    (archive.root / "agents" / target_name / "profile.json").read_text()
+                )
+                assert profile["attachments_policy"] == "inline"
+
+                delivered = await sender_client.call_tool(
+                    "send_message",
+                    {
+                        "project_key": project_key,
+                        "sender_name": "codex-wsl-provisioning-sender-1",
+                        "to": [target_name],
+                        "subject": "delivery after activation",
+                        "body_md": "profile publication completed",
+                        "idempotency_key": "provisioning-barrier-after-active",
+                    },
+                )
+                assert delivered.data["deliveries"][0]["message"]["id"]
+
+    @pytest.mark.asyncio
+    async def test_profile_failure_removes_unpublished_agent_lifetime(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        project_key = f"/test/concurrent/provisioning-failure/{random_id()}"
+        target_name = "codex-wsl-provisioning-failure-1"
+        original_write_agent_profile = app_module.write_agent_profile
+
+        async def failing_write_agent_profile(archive, payload):
+            if payload.get("name") == target_name:
+                raise OSError("simulated profile publication failure")
+            await original_write_agent_profile(archive, payload)
+
+        server = build_mcp_server()
+        async with Client(server) as client:
+            project = await client.call_tool(
+                "ensure_project", {"human_key": project_key}
+            )
+            monkeypatch.setattr(
+                app_module,
+                "write_agent_profile",
+                failing_write_agent_profile,
+            )
+            with pytest.raises(ToolError, match="profile publication failure"):
+                await client.call_tool(
+                    "register_agent",
+                    {
+                        "project_key": project_key,
+                        "program": "pytest",
+                        "model": "pytest",
+                        "name": target_name,
+                    },
+                )
+
+            async with get_session() as session:
+                rows = (
+                    await session.execute(
+                        select(Agent).where(
+                            Agent.project_id == project.data["id"],
+                            Agent.name == target_name,
+                        )
+                    )
+                ).scalars().all()
+            assert rows == []
+
+            monkeypatch.setattr(
+                app_module,
+                "write_agent_profile",
+                original_write_agent_profile,
+            )
+            retried = await client.call_tool(
+                "register_agent",
+                {
+                    "project_key": project_key,
+                    "program": "pytest",
+                    "model": "pytest",
+                    "name": target_name,
+                },
+            )
+            assert retried.data["registration_token"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("entrypoint", "name_argument"),
+        [
+            ("register_agent", "name"),
+            ("create_agent_identity", "name_hint"),
+        ],
+    )
+    async def test_activation_failure_does_not_burn_agent_name_or_token(
+        self,
+        isolated_env,
+        monkeypatch,
+        entrypoint,
+        name_argument,
+    ):
+        project_key = f"/test/concurrent/activation-failure/{random_id()}"
+        target_name = f"codex-wsl-{entrypoint.replace('_', '-')}-failure-1"
+        original_activate = app_module._activate_provisioned_agent_lifetime
+
+        async def failing_activation(*, project, agent):
+            if agent.name == target_name:
+                raise OSError("simulated Agent activation failure")
+            return await original_activate(project=project, agent=agent)
+
+        server = build_mcp_server()
+        async with Client(server) as client:
+            project = await client.call_tool(
+                "ensure_project",
+                {"human_key": project_key},
+            )
+            monkeypatch.setattr(
+                app_module,
+                "_activate_provisioned_agent_lifetime",
+                failing_activation,
+            )
+            with pytest.raises(ToolError, match="activation failure"):
+                await client.call_tool(
+                    entrypoint,
+                    {
+                        "project_key": project_key,
+                        "program": "pytest",
+                        "model": "pytest",
+                        name_argument: target_name,
+                        "attachments_policy": "inline",
+                    },
+                )
+
+            async with get_session() as session:
+                rows = (
+                    await session.execute(
+                        select(Agent).where(
+                            Agent.project_id == project.data["id"],
+                            Agent.name == target_name,
+                        )
+                    )
+                ).scalars().all()
+            assert rows == []
+
+            monkeypatch.setattr(
+                app_module,
+                "_activate_provisioned_agent_lifetime",
+                original_activate,
+            )
+            retried = await client.call_tool(
+                entrypoint,
+                {
+                    "project_key": project_key,
+                    "program": "pytest",
+                    "model": "pytest",
+                    name_argument: target_name,
+                    "attachments_policy": "inline",
+                },
+            )
+            assert retried.data["registration_token"]
+            assert retried.data["attachments_policy"] == "inline"
+
+    @pytest.mark.asyncio
+    async def test_new_registration_has_no_fallible_token_lookup_after_activation(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        project_key = f"/test/concurrent/token-handoff/{random_id()}"
+        target_name = "codex-wsl-token-handoff-1"
+        token_lookup_calls = 0
+
+        async def forbidden_token_lookup(*args, **kwargs):
+            nonlocal token_lookup_calls
+            token_lookup_calls += 1
+            raise OSError("post-activation token lookup must not run")
+
+        async def failing_context_info(self, message):
+            raise OSError("simulated context logging failure")
+
+        monkeypatch.setattr(
+            app_module,
+            "_ensure_agent_registration_token",
+            forbidden_token_lookup,
+        )
+
+        server = build_mcp_server()
+        async with Client(server) as client:
+            await client.call_tool(
+                "ensure_project",
+                {"human_key": project_key},
+            )
+            monkeypatch.setattr(app_module.Context, "info", failing_context_info)
+            created = await client.call_tool(
+                "register_agent",
+                {
+                    "project_key": project_key,
+                    "program": "pytest",
+                    "model": "pytest",
+                    "name": target_name,
+                    "attachments_policy": "file",
+                },
+            )
+
+        assert token_lookup_calls == 0
+        assert created.data["registration_token"]
+        assert created.data["attachments_policy"] == "file"
+
+    @pytest.mark.asyncio
+    async def test_existing_profile_update_rolls_back_db_on_publication_failure(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        project_key = f"/test/concurrent/profile-update-failure/{random_id()}"
+        target_name = "codex-wsl-profile-update-failure-1"
+        original_write_agent_profile = app_module.write_agent_profile
+
+        server = build_mcp_server()
+        async with Client(server) as client:
+            project = await client.call_tool(
+                "ensure_project",
+                {"human_key": project_key},
+            )
+            created = await client.call_tool(
+                "register_agent",
+                {
+                    "project_key": project_key,
+                    "program": "pytest-original",
+                    "model": "pytest",
+                    "name": target_name,
+                    "attachments_policy": "auto",
+                },
+            )
+            archive = await app_module.ensure_archive(
+                app_module.get_settings(),
+                project.data["slug"],
+            )
+
+            async def failing_policy_profile(archive, payload):
+                if (
+                    payload.get("name") == target_name
+                    and payload.get("attachments_policy") == "inline"
+                ):
+                    raise OSError("simulated existing profile publication failure")
+                await original_write_agent_profile(archive, payload)
+
+            monkeypatch.setattr(
+                app_module,
+                "write_agent_profile",
+                failing_policy_profile,
+            )
+            with pytest.raises(ToolError, match="profile publication failure"):
+                await client.call_tool(
+                    "register_agent",
+                    {
+                        "project_key": project_key,
+                        "program": "pytest-updated",
+                        "model": "pytest",
+                        "name": target_name,
+                        "attachments_policy": "inline",
+                        "registration_token": created.data["registration_token"],
+                    },
+                )
+
+            async with get_session() as session:
+                target = (
+                    await session.execute(
+                        select(Agent).where(
+                            Agent.project_id == project.data["id"],
+                            Agent.name == target_name,
+                        )
+                    )
+                ).scalar_one()
+                assert target.program == "pytest-original"
+                assert target.attachments_policy == "auto"
+            profile_path = archive.root / "agents" / target_name / "profile.json"
+            profile = json.loads(profile_path.read_text())
+            assert profile["program"] == "pytest-original"
+            assert profile["attachments_policy"] == "auto"
+
+            monkeypatch.setattr(
+                app_module,
+                "write_agent_profile",
+                original_write_agent_profile,
+            )
+            updated = await client.call_tool(
+                "register_agent",
+                {
+                    "project_key": project_key,
+                    "program": "pytest-updated",
+                    "model": "pytest",
+                    "name": target_name,
+                    "attachments_policy": "inline",
+                    "registration_token": created.data["registration_token"],
+                },
+            )
+            assert updated.data["attachments_policy"] == "inline"
+            profile = json.loads(profile_path.read_text())
+            assert profile["program"] == "pytest-updated"
+            assert profile["attachments_policy"] == "inline"
 
     @pytest.mark.asyncio
     async def test_simultaneous_mark_read(self, isolated_env):

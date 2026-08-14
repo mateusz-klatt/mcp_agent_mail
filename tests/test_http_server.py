@@ -22,6 +22,7 @@ from typing import Any
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import text
 
 from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
@@ -858,17 +859,149 @@ class TestHTTPLockScope:
         monkeypatch.setattr(http_module, "get_session", tracking_get_session)
         monkeypatch.setattr(http_module, "write_agent_profile", tracking_write_agent_profile)
         settings = _config.get_settings()
-        holder_id, holder_name = await http_module._ensure_ack_escalation_holder(
+        holder = await http_module._ensure_ack_escalation_holder(
             settings=settings,
-            project_id=int(project.id),
-            project_slug=project.slug,
-            recipient_agent_id=int(agent.id),
-            recipient_name=agent.name,
+            project=project,
+            recipient_agent=agent,
             claim_name="RedStone",
-            now=datetime.now(timezone.utc),
             now_naive=datetime.now(timezone.utc).replace(tzinfo=None),
         )
 
-        assert holder_id != agent.id
-        assert holder_name == "RedStone"
+        assert holder.id != agent.id
+        assert holder.name == "RedStone"
         assert archive_write_depths == [0]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("delete_project", [False, True])
+    async def test_ack_escalation_profile_refuses_deleted_lifetime_before_publish(
+        self,
+        isolated_env,
+        monkeypatch,
+        delete_project,
+    ):
+        import mcp_agent_mail.http as http_module
+        from mcp_agent_mail.db import get_immediate_session, get_session
+        from mcp_agent_mail.models import Agent, Project
+
+        await ensure_schema()
+        slug = f"http-ack-stale-{'project' if delete_project else 'agent'}"
+        async with get_session() as session:
+            project = Project(slug=slug, human_key=pkey(f"tmp/{slug}"))
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+            assert project.id is not None
+            recipient = Agent(
+                project_id=project.id,
+                name="BlueLake",
+                program="test",
+                model="test",
+                task_description="recipient",
+            )
+            session.add(recipient)
+            await session.commit()
+            await session.refresh(recipient)
+
+        profile_writes = 0
+
+        @contextlib.asynccontextmanager
+        async def delete_after_holder_commit(_archive, *args, **kwargs):
+            async with get_immediate_session() as session:
+                holder = (
+                    await session.execute(
+                        text(
+                            "SELECT id FROM agents "
+                            "WHERE project_id = :pid AND name = 'RedStone'"
+                        ),
+                        {"pid": project.id},
+                    )
+                ).scalar_one()
+                await session.execute(
+                    text("DELETE FROM agents WHERE id = :holder"),
+                    {"holder": holder},
+                )
+                if delete_project:
+                    await session.execute(
+                        text("DELETE FROM agents WHERE project_id = :pid"),
+                        {"pid": project.id},
+                    )
+                    await session.execute(
+                        text("DELETE FROM projects WHERE id = :pid"),
+                        {"pid": project.id},
+                    )
+                await session.commit()
+            yield
+
+        async def unexpected_profile_write(*args, **kwargs):
+            nonlocal profile_writes
+            profile_writes += 1
+
+        monkeypatch.setattr(http_module, "archive_write_lock", delete_after_holder_commit)
+        monkeypatch.setattr(http_module, "write_agent_profile", unexpected_profile_write)
+
+        with pytest.raises(Exception, match="lifetime no longer exists"):
+            await http_module._ensure_ack_escalation_holder(
+                settings=_config.get_settings(),
+                project=project,
+                recipient_agent=recipient,
+                claim_name="RedStone",
+                now_naive=datetime.now(timezone.utc).replace(tzinfo=None),
+            )
+
+        archive = await ensure_archive(_config.get_settings(), slug)
+        assert profile_writes == 0
+        assert archive.root.is_dir()
+        assert not (archive.root / "agents" / "RedStone" / "profile.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_ack_escalation_reservation_uses_revision_publication(
+        self,
+        isolated_env,
+    ):
+        import mcp_agent_mail.http as http_module
+        from mcp_agent_mail.db import get_session
+        from mcp_agent_mail.models import Agent, FileReservation, Project
+
+        await ensure_schema()
+        async with get_session() as session:
+            project = Project(
+                slug="http-ack-reservation",
+                human_key=pkey("tmp/http-ack-reservation"),
+            )
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+            assert project.id is not None
+            holder = Agent(
+                project_id=project.id,
+                name="RedStone",
+                program="ops",
+                model="system",
+                task_description="ops-escalation",
+            )
+            session.add(holder)
+            await session.commit()
+            await session.refresh(holder)
+
+        reservation = await http_module._create_ack_escalation_reservation(
+            project=project,
+            holder=holder,
+            path_pattern="agents/BlueLake/inbox/2026/08/*.md",
+            exclusive=True,
+            now_naive=datetime.now(timezone.utc).replace(tzinfo=None),
+            ttl_seconds=600,
+        )
+
+        async with get_session() as session:
+            persisted = await session.get(FileReservation, reservation.id)
+            assert persisted is not None
+            assert persisted.archive_revision == persisted.archive_synced_revision
+            assert persisted.reason == "ack-overdue"
+            assert persisted.agent_id == holder.id
+
+        archive = await ensure_archive(_config.get_settings(), project.slug)
+        assert (
+            archive.root
+            / "file_reservations"
+            / f"id-{reservation.id}.json"
+        ).is_file()

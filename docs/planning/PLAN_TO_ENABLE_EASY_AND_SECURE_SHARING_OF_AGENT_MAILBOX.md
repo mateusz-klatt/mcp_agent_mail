@@ -1,5 +1,10 @@
 # Plan to Enable Easy and Secure Sharing of Agent Mailbox
 
+> **Historical planning record.** Where this plan discusses random or
+> meaningless Agent pseudonyms, the current identity contract supersedes it:
+> durable mailbox addresses use `client-os-host-slot` and may identify a host
+> role in exported metadata. The active sharing contract lives in `README.md`.
+
 ## Objectives
 - Allow maintainers to publish a curated, read‑only snapshot of one or more MCP Agent Mail projects as static assets (suitable for GitHub Pages, Cloudflare Pages, etc.).
 - Preserve the rich browsing and search UX of the existing Web UI without requiring a live FastMCP server.

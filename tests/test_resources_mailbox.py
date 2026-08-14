@@ -18,18 +18,28 @@ async def test_views_ack_required_and_ack_overdue_resources(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {
+                "project_key": "Backend",
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-mailbox-1",
+            },
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "RedStone"},
+            {
+                "project_key": "Backend",
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-mailbox-2",
+            },
         )
         m1 = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "GreenCastle",
-                "to": ["RedStone"],
+                "sender_name": "codex-wsl-mailbox-1",
+                "to": ["codex-wsl-mailbox-2"],
                 "subject": "NeedsAck",
                 "body_md": "hello",
                 "ack_required": True,
@@ -40,7 +50,9 @@ async def test_views_ack_required_and_ack_overdue_resources(isolated_env):
         mid = int(msg.get("id"))
 
         # ack-required view should include it
-        blocks = await client.read_resource("resource://views/ack-required/RedStone?project=Backend&limit=10")
+        blocks = await client.read_resource(
+            "resource://views/ack-required/codex-wsl-mailbox-2?project=Backend&limit=10"
+        )
         assert blocks and "NeedsAck" in (blocks[0].text or "")
 
         # Backdate created_ts in DB to ensure it's older than 1 minute
@@ -50,15 +62,23 @@ async def test_views_ack_required_and_ack_overdue_resources(isolated_env):
             await session.commit()
 
         # ack-overdue with ttl_minutes=1 should include it
-        blocks2 = await client.read_resource("resource://views/ack-overdue/RedStone?project=Backend&ttl_minutes=1&limit=10")
+        blocks2 = await client.read_resource(
+            "resource://views/ack-overdue/codex-wsl-mailbox-2?project=Backend&ttl_minutes=1&limit=10"
+        )
         assert blocks2 and "NeedsAck" in (blocks2[0].text or "")
 
         # After acknowledgement, it should disappear from ack-required
         await client.call_tool(
             "acknowledge_message",
-            {"project_key": "Backend", "agent_name": "RedStone", "message_id": mid},
+            {
+                "project_key": "Backend",
+                "agent_name": "codex-wsl-mailbox-2",
+                "message_id": mid,
+            },
         )
-        blocks3 = await client.read_resource("resource://views/ack-required/RedStone?project=Backend&limit=10")
+        blocks3 = await client.read_resource(
+            "resource://views/ack-required/codex-wsl-mailbox-2?project=Backend&limit=10"
+        )
         # Either empty or not containing the subject
         content = "\n".join(b.text or "" for b in blocks3)
         assert "NeedsAck" not in content
@@ -71,14 +91,19 @@ async def test_mailbox_and_mailbox_with_commits(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {
+                "project_key": "Backend",
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-mailbox-1",
+            },
         )
         await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": "codex-wsl-mailbox-1",
+                "to": ["codex-wsl-mailbox-1"],
                 "subject": "CommitMeta",
                 "body_md": "body",
                 "idempotency_key": "resource-mailbox-commit-meta",
@@ -86,11 +111,15 @@ async def test_mailbox_and_mailbox_with_commits(isolated_env):
         )
 
         # Basic mailbox
-        blocks = await client.read_resource("resource://mailbox/BlueLake?project=Backend&limit=5")
+        blocks = await client.read_resource(
+            "resource://mailbox/codex-wsl-mailbox-1?project=Backend&limit=5"
+        )
         assert blocks and "CommitMeta" in (blocks[0].text or "")
 
         # With commits metadata
-        blocks2 = await client.read_resource("resource://mailbox-with-commits/BlueLake?project=Backend&limit=5")
+        blocks2 = await client.read_resource(
+            "resource://mailbox-with-commits/codex-wsl-mailbox-1?project=Backend&limit=5"
+        )
         assert blocks2 and "CommitMeta" in (blocks2[0].text or "")
 
 
@@ -101,14 +130,19 @@ async def test_outbox_and_message_resource(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {
+                "project_key": "Backend",
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-mailbox-1",
+            },
         )
         m = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "GreenCastle",
-                "to": ["GreenCastle"],
+                "sender_name": "codex-wsl-mailbox-1",
+                "to": ["codex-wsl-mailbox-1"],
                 "subject": "OutboxMsg",
                 "body_md": "B",
                 "idempotency_key": "resource-mailbox-outbox",
@@ -118,7 +152,9 @@ async def test_outbox_and_message_resource(isolated_env):
         mid = message.get("id")
 
         # Outbox should list it
-        blocks = await client.read_resource("resource://outbox/GreenCastle?project=Backend&limit=5")
+        blocks = await client.read_resource(
+            "resource://outbox/codex-wsl-mailbox-1?project=Backend&limit=5"
+        )
         assert blocks and "OutboxMsg" in (blocks[0].text or "")
 
         # Message resource returns full payload with body

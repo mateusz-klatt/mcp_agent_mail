@@ -463,12 +463,16 @@ EXISTING_SETTINGS="$(printf '%s' "$EXISTING_SETTINGS" | jq '
 }
 
 # Build hook configs as JSON
-# The four events, in the shape that is running on the fleet today. Matchers
+# The lifecycle and edit events, in the shape Claude Code documents. Matchers
 # included: PreToolUse and PostToolUse fire on file-writing tools, not on Bash —
 # a reservation warning is only useful immediately before an edit, and firing it
 # on every shell command is how a warning becomes noise nobody reads.
 SESSION_START_HOOK=$(jq -nc --arg a "$(_hook_cmd session_start.sh)" --arg b "$(_hook_cmd inbox_check.sh)" \
   '{matcher:"",hooks:[{type:"command",command:$a},{type:"command",command:$b}]}')
+SUBAGENT_START_HOOK=$(jq -nc --arg a "$(_hook_cmd session_start.sh)" \
+  '{matcher:"",hooks:[{type:"command",command:$a}]}')
+SUBAGENT_STOP_HOOK=$(jq -nc --arg a "$(_hook_cmd session_end.sh)" \
+  '{matcher:"",hooks:[{type:"command",command:$a}]}')
 PRE_TOOL_USE_HOOK=$(jq -nc --arg a "$(_hook_cmd reservations_warn.sh)" \
   '{matcher:"Edit|Write|NotebookEdit",hooks:[{type:"command",command:$a}]}')
 # PostToolUse is split in two, because the two hooks under it want opposite
@@ -505,6 +509,8 @@ SESSION_END_HOOK=$(jq -nc --arg a "$(_hook_cmd session_end.sh)" \
 # this script writes, or a re-run appends a second copy of every hook.
 MERGED_SETTINGS="$EXISTING_SETTINGS"
 MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "SessionStart" "$SESSION_START_HOOK" "mcp-agent-mail/session_start.sh")
+MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "SubagentStart" "$SUBAGENT_START_HOOK" "mcp-agent-mail/session_start.sh")
+MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "SubagentStop" "$SUBAGENT_STOP_HOOK" "mcp-agent-mail/session_end.sh")
 MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "PreToolUse" "$PRE_TOOL_USE_HOOK" "mcp-agent-mail/reservations_warn.sh")
 MERGED_SETTINGS=$(json_append_hook "$MERGED_SETTINGS" "PostToolUse" "$POST_TOOL_USE_HOOK" "mcp-agent-mail/autoreserve.sh")
 # Its own marker keeps the two PostToolUse entries distinct.  The managed-hook

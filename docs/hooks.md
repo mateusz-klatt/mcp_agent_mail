@@ -13,11 +13,11 @@ agent about to edit a file somebody else is already in.
 
 | Hook | Event | Speaks when |
 |---|---|---|
-| `session_start.sh` | SessionStart | always: identity, and who else holds what |
+| `session_start.sh` | SessionStart, SubagentStart | identity/execution context |
 | `inbox_check.sh` | SessionStart, PostToolUse | there is unread mail it has not announced |
 | `reservations_warn.sh` | PreToolUse (Edit\|Write\|NotebookEdit) | somebody else holds the file you are opening |
 | `autoreserve.sh` | PostToolUse (same matcher) | never, on success |
-| `session_end.sh` | SessionEnd | never |
+| `session_end.sh` | SubagentStop, SessionEnd | never |
 | `inbox_watch.sh` | not a hook — a Claude background task | it exits, which is the Claude wake |
 | `inbox_watch_monitor.sh` | not a hook — a Claude plugin monitor | one line per message; silence otherwise |
 
@@ -114,6 +114,14 @@ is unavailable; Git Bash itself does not guarantee it. Verify `curl --version`
 and `jq --version` in that same shell before installing. The generated Codex
 `commandWindows` also points directly to Git for Windows `bash.exe`.
 
+Installed Git guards are deliberately standalone programs. They read the
+short-lived process signals `AGENT_NAME`, `AGENT_EXECUTION_ID`,
+`AGENT_EXECUTION_ANCESTOR_IDS`, `AGENT_EXECUTION_MARKER_MAX_AGE_SECONDS`, and
+`AGENT_EXECUTION_ENFORCEMENT_MODE` directly from the committing shell because
+they must run without importing the server, Python environment, or `.env`.
+Server configuration remains exclusively owned by `python-decouple`; these
+guard-only runtime signals are the explicit exception.
+
 User scope, once per machine, in `~/.claude/settings.json`:
 
 ```json
@@ -121,6 +129,10 @@ User scope, once per machine, in `~/.claude/settings.json`:
   "SessionStart": [{"matcher": "", "hooks": [
     {"type": "command", "command": "\"C:/Program Files/Git/bin/bash.exe\" -c \"'/c/Users/you/.claude/hooks/mcp-agent-mail/session_start.sh' || true\""},
     {"type": "command", "command": "\"C:/Program Files/Git/bin/bash.exe\" -c \"'/c/Users/you/.claude/hooks/mcp-agent-mail/inbox_check.sh' || true\""}]}],
+  "SubagentStart": [{"matcher": "", "hooks": [
+    {"type": "command", "command": "…/session_start.sh || true"}]}],
+  "SubagentStop": [{"matcher": "", "hooks": [
+    {"type": "command", "command": "…/session_end.sh || true"}]}],
   "PreToolUse": [{"matcher": "Edit|Write|NotebookEdit", "hooks": [
     {"type": "command", "command": "…/reservations_warn.sh || true"}]}],
   "PostToolUse": [{"matcher": "Edit|Write|NotebookEdit", "hooks": [
@@ -190,7 +202,7 @@ looked like.
 | `autoreserve.sh` | the reservation was filed |
 | `reservations_warn.sh` | nobody else holds this file |
 | `inbox_check.sh` | no new mail **or** the 120 s rate limit cut it short |
-| `session_end.sh` | the reservations were released |
+| `session_end.sh` | root automatic reservations were released, or a child stop was recorded provisionally |
 
 Failures now announce themselves — "could not check the inbox … this is NOT 'no
 new messages'" and so on — because a server that is down, refusing, or
@@ -200,8 +212,10 @@ told nothing, and each read that as "no conflict".
 
 Two silences still mean something you cannot see:
 
-- `inbox_check.sh` announces each id once. A message you have been told about
-  and have not acted on is not repeated; only the count of older unread is.
+- `inbox_check.sh` announces each id once per root/child execution. A child's
+  `.seen` state cannot consume the root's announcement. A message one execution
+  has been told about and has not acted on is not repeated there; only the count
+  of older unread is.
 - `autoreserve.sh` reserves the file **after** the edit. It cannot warn you
   before, and its reservation replaces whatever reason a deliberate
   `file_reservation_paths` had set. Reserve deliberately, announce, then write
@@ -267,6 +281,124 @@ carry a non-empty `.agent-mail-project-id` or an `.agent-mail.yaml` declaring
 per-agent registration token in the private `credentials.json` state store. The
 registration token is never copied into `~/.agent-mail.env`.
 
+When an origin exists, the global hook derives and sends its canonical
+synthetic `/owner/repo` key; it does not pass a checkout path through the local
+marker-precedence resolver. Marker/discovery opt-in is therefore the activation
+gate for a new checkout, while path-based CLI/MCP inspection is the surface
+that resolves marker precedence and persists `project_uid`.
+
+The durable Agent is not the execution identity. After registration,
+`SessionStart` calls `start_agent_execution` and stores the returned UUID in a
+private, per-project/per-session state record under `AGENT_MAIL_STATE_DIR`.
+Repeated start events for an active native session reuse that record. After
+`SessionEnd`, a fresh provider id starts generation one of another lifecycle;
+Codex alone can genuinely resume the same id and then advances its private run
+generation without creating a new Agent. The first root execution
+`external_id` is the native `session_id`; a resumed Codex run uses the bounded
+`<session_id>#run-N` form. A child uses its native `agent_id`; hooks never
+synthesize an Agent name.
+`SessionEnd` calls `end_agent_execution`, whose server transaction ends the
+execution and releases only its automatic reservations. Explicit reservations
+keep their TTL and require an explicit release.
+
+The current [Claude Code hooks reference](https://code.claude.com/docs/en/hooks)
+documents `agent_id` and `agent_type` on `SubagentStart`, and those fields plus
+`stop_hook_active`, `agent_transcript_path`, and `last_assistant_message` on
+`SubagentStop`. It also includes `agent_id` and `agent_type` on tool hooks
+executed inside a subagent. The start hook therefore creates a child execution
+beneath the root;
+autoreserve sends that child `execution_id`. Claude explicitly permits another
+matching `SubagentStop` hook to return `decision: "block"` and keep the child
+running, so this hook records only a provisional stop. Any later child tool
+event cancels it; the first parent event after the child really returns ends the
+execution. A
+subagent never registers a mailbox. The recorded `cwd`, repository root, Git
+common directory, worktree path, branch, and HEAD describe where that execution
+ran; none participates in Agent identity. The integration does not enable
+`WORKTREES_ENABLED` or create worktrees by itself.
+
+Physical placement is likewise not identity. A linked worktree beside the
+checkout, under `/tmp`, or below a nested directory resolves to the same
+Project and the same repository-relative reservation paths. Prefer a durable
+sibling such as `~/worktrees/<repo>/<task>` for ordinary work and `/tmp` for
+disposable gates. Git permits `repo/.worktrees/<task>`, but the parent checkout
+then sees `.worktrees/` as untracked and a broad `git add` can stage an embedded
+gitlink unless the directory is explicitly ignored; nested worktrees are
+therefore supported by the lifecycle code but are not the recommended default.
+
+Before calling the server, the hook generates a 256-bit capability and writes
+it directly to a final `*.json.token` file beside the private metadata state,
+with mode `0600`. A retry after a
+process/network failure reuses exactly that token; the server stores only its
+hash. The token is never copied to hook output, a temporary file, or Git
+metadata. Every lifecycle call declares `lifecycle_protocol_version: 1`.
+This capability prevents accidental cross-execution mutation; it is not an
+adversarial same-user boundary. Codex and Claude intentionally share the WSL
+user's private state, and any process running as that user can read it. No
+per-client Windows ACL isolation is installed.
+`AGENT_MAIL_STATE_DIR` must be an absolute path outside every Git worktree and
+Git directory. Hooks reject even a not-yet-created state path whose nearest
+existing ancestor is inside Git, so registration and execution capabilities
+cannot become stageable. A lock left empty by a crash between directory
+creation and PID publication is reclaimed after a bounded one-second grace.
+The start RPC runs without holding the state lock. If `SessionEnd` arrives while
+that RPC is in flight, it atomically changes local `starting` state to
+`end_requested`. The start response may then persist its returned UUID only for
+the authenticated `end_agent_execution` call: it never publishes `active` or an
+active guard marker. A failed cleanup remains `end_requested` with the same
+capability so an exact SessionEnd retry can finish it; it cannot be replayed as
+a new native lifecycle. Before enumerating its exact lifecycle manifest,
+`SessionEnd` also writes a private tombstone keyed by the client and native
+`session_id`. Manifest enrollment and that barrier share the tombstone lock, so
+a concurrent first-touch hook is either included in the exact
+client/session/generation manifest or rejected before it can create state.
+Hooks never scan unrelated execution records. Starts check the tombstone again
+after the unlocked RPC; a raced server response is ended with its original
+capability and is never published to the guard marker.
+
+After a terminal server result is confirmed, the hook destroys the raw
+execution token and heartbeat throttle stamp immediately, then rewrites the
+execution state as a compact non-secret terminal record. That record, its exact
+manifest, and the lifecycle tombstone remain resumable/auditable for
+`AGENT_MAIL_EXECUTION_RESUME_HORIZON_SECONDS` (30 days by default, with a
+one-day minimum). Date-bucketed retention work removes expired records only
+after revalidating their exact generation under the existing locks and handles
+at most `AGENT_MAIL_EXECUTION_RETENTION_GC_BATCH` markers per hook invocation
+(64 by default, capped at 256). A resumed newer generation always preserves its
+shared tombstone.
+
+The root start also writes a private guard handoff at the path returned by
+`git rev-parse --path-format=absolute --git-path agent-mail/execution-id`. Its JSON shape is
+`{"execution_id":"<uuid>","status":"active","kind":"session|subagent","worktree_path":"...","heartbeat_ts":"<UTC-ISO-8601>","ancestor_execution_ids":[]}`.
+This marker is a short-lived guard hint, never durable identity: recreating a
+linked worktree can change its physical Git-dir path, and every start still
+revalidates the native execution id and capability with the server.
+A child overwrites that marker at start only when it runs in a different
+worktree; a same-checkout `SubagentStart` leaves the root marker intact. The
+child's first successful heartbeat or automatic reservation then hands the
+marker to the exact child execution (with its root ancestry); the next parent
+event restores the root marker. Thus a read-only child does not perturb commit
+context, while a writer's own child claim is never misreported as a sibling
+conflict. A confirmed end retains the
+marker as terminal audit/handoff state; the server has released automatic
+claims, while explicit claims retain their TTL. A provisional child stop keeps
+the marker active until a parent event confirms the return. Failed server
+validation marks it `unverified`; a later successful heartbeat or claim can
+restore it. The next start overwrites it atomically. Successful heartbeats
+refresh `heartbeat_ts`; a confirmed end changes `status` to the terminal
+execution state. Guards
+prefer `AGENT_EXECUTION_ID` when explicitly exported and may take its lineage
+from comma-separated `AGENT_EXECUTION_ANCESTOR_IDS`; otherwise they read this
+marker. An active marker is accepted only while its heartbeat age is at most
+`AGENT_EXECUTION_MARKER_MAX_AGE_SECONDS` (default `1800`; deliberately stricter
+than the server's 24-hour expiry threshold). Old plain-UUID markers have no
+freshness proof and are not safe for self-suppression. Timestamps more than five
+minutes in the future also fail closed for self-suppression, so clock corruption
+cannot make a marker immortal. During observe/warn rollout an invalid marker is
+reported and the Git operation continues;
+`AGENT_EXECUTION_ENFORCEMENT_MODE=enforce` blocks until an active marker is
+restored.
+
 ## Codex lifecycle integration
 
 `scripts/integrate_codex_cli.sh` respects an explicit `CODEX_HOME` and otherwise
@@ -274,7 +406,7 @@ uses `~/.codex`. It installs:
 
 - the authenticated MCP server in `${CODEX_HOME:-~/.codex}/config.toml`
 - the runtime and wrapper in `${CODEX_HOME:-~/.codex}/hooks/mcp-agent-mail`
-- `SessionStart`, `Stop`, and `SessionEnd` in
+- `SessionStart`, `SubagentStart`, `SubagentStop`, `PostToolUse`, `Stop`, and `SessionEnd` in
   `${CODEX_HOME:-~/.codex}/hooks.json`
 
 The JSON merge removes only prior Agent Mail handlers and preserves unrelated
@@ -289,14 +421,92 @@ The wire formats and trust behavior follow the current
 `SessionStart` establishes the repository-scoped identity only after the same
 local activation gate and contributes the unread count as developer context.
 An unactivated repository makes no Agent Mail request and creates no project or
-Agent row. `Stop` checks unread mail no more than once
+Agent row. It also starts the root execution. Codex may emit `SessionEnd` after
+an open conversation has been idle and later resume the same `session_id`; the
+private lifecycle barrier therefore retains an integer generation. A genuine
+`SessionStart(source=resume)` advances an ended generation and starts a distinct
+server execution (`<session_id>#run-N`) without removing the prior end barrier.
+An old in-flight start is generation-checked after its RPC and cannot publish or
+end the resumed generation. Codex documents that subagent
+hooks carry the parent `session_id` plus a native `agent_id` and `agent_type`;
+`SubagentStart` creates a child execution using those fields, `turn_id`, the
+active model and permission mode, plus the Git metadata captured locally, and
+`SubagentStop` records the same provisional two-phase stop used for Claude,
+because Codex also permits another matching stop hook to continue the child.
+Both stop events emit valid JSON, and neither path calls `register_agent`. A
+broad `PostToolUse` handler reconciles provisional children and performs a
+locally rate-limited asynchronous execution heartbeat (at most once per 60 seconds), resolving the
+child when the payload provides `agent_id` and otherwise the root. When that
+tool's input provides `file_path` or `notebook_path` in another opted-in Git
+project, the hook lazily establishes the same durable Codex mailbox and native
+root/child execution chain in that target project, then heartbeats it. This is
+lifecycle attribution only: it does not infer ownership from `turn_id` and does
+not file an automatic reservation. Codex documents `cwd` as the session working
+directory, not a per-tool target. If a hook event actually arrives with another
+opted-in repository as `cwd`, that repository is enrolled; otherwise
+`apply_patch` and `Bash` expose only an opaque `command`, which is deliberately
+not parsed for paths. The first such ambiguous event in each lifecycle emits a
+warning: cross-repository writes must run with that repository as the session
+working directory or be coordinated and reserved explicitly. `Stop` also
+heartbeats the root on its existing polling cadence before checking mail. This
+keeps long read-only sessions alive without tying liveness to reservations.
+`Stop` checks unread mail no more than once
 per 120 seconds, always emits valid JSON, and creates a continuation only for
 message ids that are both newly observed and high/urgent. A repeated urgent
 message or ordinary unread mail is a UI `systemMessage`, avoiding continuation
-loops. `SessionEnd` has the documented three-second ceiling and only releases
-paths recorded for that exact session; because the Codex integration does not
-install autoreserve, it is normally a local no-op and never performs a wholesale
-release for the shared slot identity.
+loops. `SessionEnd` resolves private client/session state before Git project
+discovery or opt-in checks, so a non-Git payload cwd or removed opt-in marker
+cannot skip cleanup. It has the documented three-second ceiling and ends the root
+execution for that lifecycle; the server atomically cascades the end through
+its descendants. Ending an execution atomically releases its own automatic
+reservations and cannot strip a sibling execution's holds;
+explicit reservations retain their TTL until explicitly released. The Codex
+integration does not install autoreserve. Its hook calls use the stateless
+`/api/` mount, while ordinary MCP tool calls use a separate session; therefore a
+manual Codex reservation cannot inherit the hook's execution binding or private
+capability. Until a secure handoff or broker is implemented, automatic
+execution-owned claims are supported by the Claude edit hook, not by Codex's
+ordinary MCP session.
+
+Claude's existing broad `PostToolUse` inbox hook performs the same bounded
+heartbeat after its rate gate. Its edit autoreserve carries `execution_id`, and
+a successful reserve/renew also refreshes execution liveness server-side. If a
+heartbeat fails, hooks fail open and retry after the local interval. If an
+execution expires inside the same active lifecycle generation, ordinary tool
+events do not replay it as a new execution. A genuinely resumed Codex
+`SessionStart(source=resume)` advances the retained generation and uses
+`<session_id>#run-N`; otherwise the provider must emit a new `session_id` or
+`agent_id`, producing a new immutable audit lifetime.
+
+An edit can target a file in another Git project. Claude autoreserve uses the
+file's canonical project, deterministically establishes the same durable
+host-slot mailbox there, and starts the root/child execution chain before
+claiming the path. Codex's broad PostToolUse hook performs the same lazy
+execution setup and heartbeat when the tool input exposes the target file, but
+does not claim it because the Codex integration has no autoreserve hook.
+`SessionEnd` scans private lifecycle state and ends every exact root execution
+for that native `session_id` and client, across all touched projects; it cannot
+end another client's execution. Those independent authenticated end calls run
+in parallel and are joined once, so two slow project endpoints remain inside
+Codex's three-second SessionEnd ceiling; each successful result reconciles only
+its own project's descendant state.
+
+The server reaper runs from the FastMCP lifespan for stdio and HTTP transports.
+`AGENT_EXECUTION_REAPER_ENABLED=true` scans every
+`AGENT_EXECUTION_REAPER_INTERVAL_SECONDS=60` and expires executions whose last
+activity is older than `AGENT_EXECUTION_REAPER_THRESHOLD_SECONDS=86400` (24
+hours). Hook heartbeat attempts are locally rate-limited to at most once per 60
+seconds but remain event-driven; a shorter server threshold is safe only for a
+client that guarantees timer-driven heartbeats. The local 30-minute marker is
+stricter so guards fail closed after a workstation sleep long before the server
+reaper cleans up the execution.
+
+If the private execution state (and therefore its capability) is lost, hooks do
+not invent a replacement execution for the same provider id. Stop the affected
+provider lifecycle and start a new one. Any remaining explicit reservation
+keeps its TTL and can be inspected and, once the server's inactivity heuristics
+consider it abandoned, cleared with `force_release_file_reservation`; automatic
+claims are released by normal end/expiry handling.
 
 Every hook has a POSIX Bash command and a `commandWindows` beginning with a
 concrete Git for Windows `bash.exe`. When `CODEX_HOME` is shared from WSL under
@@ -308,6 +518,11 @@ Codex currently exposes lifecycle hooks, not Claude-style managed monitor
 processes. The integration therefore does not auto-spawn a daemon. Mail is
 delivered at the next lifecycle boundary; a completed background terminal does
 not start a new Codex turn by itself.
+
+All shipped bootstrap integrators request deterministic
+`<client>-<os>-<host>-<slot>` mailbox names, including Gemini, Factory Droid,
+Cursor, Cline, Windsurf, and OpenCode. None relies on strict-mode-incompatible
+adjective+noun generation or the local `$USER` name.
 
 ## GitHub Copilot CLI lifecycle integration
 
@@ -337,8 +552,9 @@ activation and legacy-migration gates as Codex before any network request, then
 injects identity and unread counts through Copilot's direct `additionalContext`
 output. `Stop` checks at most once per 120 seconds and returns `decision: block`
 only for newly observed high/urgent message ids. Ordinary unread mail never
-forces another turn. `SessionEnd` releases only session-recorded paths and is
-normally a local no-op because this integration does not install autoreserve.
+forces another turn. `SessionEnd` ends the root execution and releases only its
+automatic reservations; it is normally a local release no-op because this
+integration does not install autoreserve.
 
 Copilot CLI loads user hook files only at startup, so restart the CLI after
 installing or changing them. There is deliberately no automatically spawned

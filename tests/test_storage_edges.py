@@ -11,12 +11,14 @@ import sqlite3
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 from fastmcp import Client
+from git import Repo
 from PIL import Image
 
 from mcp_agent_mail import config as _config
@@ -25,6 +27,7 @@ from mcp_agent_mail.config import get_settings
 from mcp_agent_mail.db import get_sqlite_pre_restore_path, get_sqlite_sidecar_paths
 from mcp_agent_mail.storage import (
     AsyncFileLock,
+    archive_write_lock,
     cleanup_leaked_lockfile_fds,
     collect_lock_status,
     create_diagnostic_backup,
@@ -51,7 +54,12 @@ async def test_data_uri_embed_without_conversion(isolated_env, monkeypatch):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {
+                "project_key": "Backend",
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-storage-edges-1",
+            },
         )
         # Craft tiny red dot webp data URI
         payload = base64.b64encode(b"dummy").decode("ascii")
@@ -60,8 +68,8 @@ async def test_data_uri_embed_without_conversion(isolated_env, monkeypatch):
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": "codex-wsl-storage-edges-1",
+                "to": ["codex-wsl-storage-edges-1"],
                 "subject": "InlineImg",
                 "body_md": body,
                 "idempotency_key": "storage-inline-data-uri",
@@ -91,15 +99,20 @@ async def test_missing_file_path_in_markdown_and_originals_toggle(isolated_env, 
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         reg = await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {
+                "project_key": "Backend",
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-storage-edges-1",
+            },
         )
         registration_token = reg.data["registration_token"]
         res = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "GreenCastle",
-                "to": ["GreenCastle"],
+                "sender_name": "codex-wsl-storage-edges-1",
+                "to": ["codex-wsl-storage-edges-1"],
                 "subject": "MissingPath",
                 "body_md": f"![x]({image_path})",
                 "idempotency_key": "storage-missing-markdown-path-originals-off",
@@ -119,7 +132,7 @@ async def test_missing_file_path_in_markdown_and_originals_toggle(isolated_env, 
                 "project_key": "Backend",
                 "program": "codex",
                 "model": "gpt-5",
-                "name": "GreenCastle",
+                "name": "codex-wsl-storage-edges-1",
                 "registration_token": registration_token,
             },
         )
@@ -127,9 +140,9 @@ async def test_missing_file_path_in_markdown_and_originals_toggle(isolated_env, 
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "GreenCastle",
+                "sender_name": "codex-wsl-storage-edges-1",
                 "sender_token": registration_token,
-                "to": ["GreenCastle"],
+                "to": ["codex-wsl-storage-edges-1"],
                 "subject": "MissingPath2",
                 "body_md": f"![x]({image_path})",
                 "idempotency_key": "storage-missing-markdown-path-originals-on",
@@ -165,14 +178,19 @@ async def test_create_and_list_diagnostic_backups(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {
+                "project_key": "Backend",
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-storage-edges-1",
+            },
         )
         res = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": "codex-wsl-storage-edges-1",
+                "to": ["codex-wsl-storage-edges-1"],
                 "subject": "Backup Seed",
                 "body_md": "seed archive repo",
                 "idempotency_key": "storage-backup-seed",
@@ -197,14 +215,19 @@ async def test_restore_from_backup_stages_bundle_inside_storage_root(isolated_en
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {
+                "project_key": "Backend",
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-storage-edges-1",
+            },
         )
         res = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": "codex-wsl-storage-edges-1",
+                "to": ["codex-wsl-storage-edges-1"],
                 "subject": "Restore Seed",
                 "body_md": "seed archive repo",
                 "idempotency_key": "storage-restore-seed",
@@ -1018,12 +1041,14 @@ async def test_archive_write_lock_releases_on_body_exception(tmp_path: Path, mon
     from mcp_agent_mail.storage import ProjectArchive, archive_write_lock
 
     lock_path = tmp_path / ".archive.lock"
+    project_root = tmp_path / "projects" / "t"
+    project_root.mkdir(parents=True)
     # Only lock_path is exercised by archive_write_lock; the other fields satisfy
     # the dataclass constructor (repo is never dereferenced on this path).
     archive = ProjectArchive(
         settings=get_settings(),
         slug="t",
-        root=tmp_path,
+        root=project_root,
         repo=cast(Any, None),  # never dereferenced on this path, see above
         lock_path=lock_path,
         repo_root=tmp_path,
@@ -1043,15 +1068,8 @@ async def test_archive_write_lock_releases_on_body_exception(tmp_path: Path, mon
 
 
 @pytest.mark.asyncio
-async def test_doctor_check_and_repair_agree_on_aged_live_lock(tmp_path: Path, monkeypatch) -> None:
-    """doctor check (collect_lock_status) and doctor repair (heal_archive_locks) must agree (#166).
-
-    An aged lock whose owner process is still alive (the wedged-server case) was
-    flagged stale by ``collect_lock_status`` but skipped by ``heal_archive_locks``
-    ("No stale locks to heal") because repair forced ``stale_timeout=0`` whenever
-    the ``.owner.json`` sidecar was present. After reconciliation both apply the
-    same age threshold.
-    """
+async def test_doctor_never_steals_aged_lock_from_live_owner(tmp_path: Path, monkeypatch) -> None:
+    """A long-running live archive writer remains authoritative regardless of age."""
     settings = get_settings()
     root = Path(settings.storage.root).expanduser().resolve()
     proj_dir = root / "projects" / "wedged-proj"
@@ -1066,20 +1084,80 @@ async def test_doctor_check_and_repair_agree_on_aged_live_lock(tmp_path: Path, m
     # ...but owned by THIS still-alive process (the wedged-server shape).
     metadata_path.write_text(json.dumps({"pid": os.getpid(), "created_ts": aged}))
 
-    # doctor check: must flag it as stale (age-based).
+    # doctor check must not call a live owner stale merely because it is old.
     status = collect_lock_status(settings, project_slug="wedged-proj")
     flagged = [
         lock_info for lock_info in status["locks"]
         if lock_info.get("stale_suspected") and lock_info.get("path") == str(lock_path)
     ]
-    assert flagged, "doctor check should flag an aged lock as stale even with a live owner"
+    assert not flagged
 
-    # doctor repair: must actually heal the very same lock.
+    # doctor repair must preserve the same live lock.
     result = await heal_archive_locks(settings, project_slug="wedged-proj")
-    assert str(lock_path) in result["locks_removed"], (
-        "doctor repair must heal the aged lock that doctor check flagged (#166)"
+    assert str(lock_path) not in result["locks_removed"]
+    assert lock_path.exists()
+
+
+def test_archive_stale_recovery_rereads_before_touching_successor(
+    tmp_path: Path,
+) -> None:
+    """A second healer must not act on the dead generation seen by the first."""
+    lock_path = tmp_path / "project.archive.lock"
+    metadata_path = lock_path.with_name(f"{lock_path.name}.owner.json")
+    lock_path.write_text("", encoding="utf-8")
+    metadata_path.write_text(
+        json.dumps({"pid": 999_999_999, "created_ts": 0}),
+        encoding="utf-8",
     )
-    assert not lock_path.exists()
+    first_healer = AsyncFileLock(lock_path, stale_timeout_seconds=0.01)
+    second_healer = AsyncFileLock(lock_path, stale_timeout_seconds=0.01)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert pool.submit(first_healer._cleanup_if_stale).result(timeout=5) is True
+
+        successor = AsyncFileLock(lock_path, stale_timeout_seconds=3600)
+        successor._lock.acquire(timeout=5)
+        successor._write_metadata()
+        try:
+            assert pool.submit(second_healer._cleanup_if_stale).result(timeout=5) is False
+            assert lock_path.exists()
+            assert json.loads(metadata_path.read_text(encoding="utf-8"))["pid"] == os.getpid()
+        finally:
+            successor._release_strict()
+
+
+@pytest.mark.asyncio
+async def test_linked_worktree_storage_uses_git_common_directory_for_locks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid linked worktree has a .git file and remains a supported archive."""
+    primary = tmp_path / "primary"
+    linked = tmp_path / "linked"
+    repo = Repo.init(primary)
+    try:
+        with repo.config_writer() as config:
+            config.set_value("user", "name", "Test")
+            config.set_value("user", "email", "test@example.com")
+        seed = primary / "seed.txt"
+        seed.write_text("seed\n", encoding="utf-8")
+        repo.index.add(["seed.txt"])
+        repo.index.commit("seed")
+        repo.git.worktree("add", "-b", "linked-storage-test", str(linked))
+        common_dir = Path(repo.common_dir).resolve()
+    finally:
+        repo.close()
+
+    monkeypatch.setenv("STORAGE_ROOT", str(linked))
+    _config.clear_settings_cache()
+    archive = await ensure_archive(get_settings(), "linked-project")
+    try:
+        assert (linked / ".git").is_file()
+        assert archive.lock_path.parent == common_dir / "agent-mail-locks"
+        async with archive_write_lock(archive):
+            assert archive.lock_path.exists()
+    finally:
+        archive.repo.close()
 
 
 # ============================================================================
@@ -1236,9 +1314,14 @@ async def test_mcp_send_message_preserves_markdown_image_without_normalization(i
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         reg = await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {
+                "project_key": "Backend",
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-storage-edges-1",
+            },
         )
-        agent_name = reg.data.get("name", "BlueLake")
+        agent_name = reg.data.get("name", "codex-wsl-storage-edges-1")
         body_md = f"![img]({img_path})"
         res = await client.call_tool(
             "send_message",

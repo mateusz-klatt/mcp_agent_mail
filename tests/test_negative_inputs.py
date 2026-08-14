@@ -7,13 +7,26 @@ from fastmcp.exceptions import ToolError
 from mcp_agent_mail.app import build_mcp_server
 from tests.keys import pkey
 
+MISSING_PROJECT_AGENT = "codex-wsl-missing-1"
+UNKNOWN_AGENT = "codex-wsl-ghost-1"
+NEGATIVE_SENDER = "codex-wsl-negative-1"
+NEGATIVE_RECIPIENT = "codex-wsl-negative-2"
+
 
 @pytest.mark.asyncio
 async def test_invalid_project_or_agent_errors(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
         # Missing project — use non-raising MCP call to inspect error payload
-        res = await client.call_tool_mcp("register_agent", {"project_key": "Missing", "program": "x", "model": "y", "name": "A"})
+        res = await client.call_tool_mcp(
+            "register_agent",
+            {
+                "project_key": "Missing",
+                "program": "x",
+                "model": "y",
+                "name": MISSING_PROJECT_AGENT,
+            },
+        )
         assert res.isError is True
         # Now create project and try sending from unknown agent
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
@@ -21,8 +34,8 @@ async def test_invalid_project_or_agent_errors(isolated_env):
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "Ghost",
-                "to": ["Ghost"],
+                "sender_name": UNKNOWN_AGENT,
+                "to": [UNKNOWN_AGENT],
                 "subject": "x",
                 "body_md": "y",
                 "idempotency_key": "negative-unknown-sender",
@@ -39,7 +52,7 @@ async def test_unknown_recipient_reports_structured_error(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": NEGATIVE_SENDER},
         )
 
         # Unknown recipient returns structured error
@@ -48,47 +61,49 @@ async def test_unknown_recipient_reports_structured_error(isolated_env):
                 "send_message",
                 {
                     "project_key": "Backend",
-                    "sender_name": "GreenCastle",
-                    "to": ["BlueLake"],
+                    "sender_name": NEGATIVE_SENDER,
+                    "to": [NEGATIVE_RECIPIENT],
                     "subject": "Hello",
                     "body_md": "testing unknown recipient",
                     "idempotency_key": "negative-unknown-recipient-raising",
                 },
             )
 
-        # Retrieve again via non-raising call — implementation may auto-handshake;
-        # accept either structured error or success
+        # A sender never provisions somebody else's durable mailbox. The
+        # non-raising transport must expose the same fail-closed result.
         res = await client.call_tool_mcp(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "GreenCastle",
-                "to": ["BlueLake"],
+                "sender_name": NEGATIVE_SENDER,
+                "to": [NEGATIVE_RECIPIENT],
                 "subject": "Hello",
                 "body_md": "testing unknown recipient",
                 "idempotency_key": "negative-unknown-recipient-mcp",
             },
         )
-        if res.isError:
-            # structured error path
-            text = " ".join(getattr(c, "text", "") for c in res.content)
-            assert "BlueLake" in text
-        else:
-            # success path (auto-handshake)
-            text = " ".join(getattr(c, "text", "") for c in res.content)
-            assert "deliveries" in text
+        assert res.isError is True
+        text = " ".join(getattr(c, "text", "") for c in res.content)
+        assert NEGATIVE_RECIPIENT in text
+        assert "must self-register" in text
 
-        # Register and ensure sanitized inputs (hyphen stripped/lowercased) route
+        # Register and ensure an alternate separator/case spelling routes through
+        # the same sanitized canonical identity.
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {
+                "project_key": "Backend",
+                "program": "codex",
+                "model": "gpt-5",
+                "name": NEGATIVE_RECIPIENT,
+            },
         )
         success = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "GreenCastle",
-                "to": ["blue-lake"],
+                "sender_name": NEGATIVE_SENDER,
+                "to": ["Codex_WSL_Negative_2"],
                 "subject": "Hello again",
                 "body_md": "now routed",
                 "idempotency_key": "negative-sanitized-recipient",

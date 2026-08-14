@@ -172,3 +172,91 @@ def test_prepush_fallback_matches_backslash_pattern(tmp_path: Path) -> None:
         text=True,
     ).returncode
     assert rc == 1
+
+
+def test_prepush_ignores_exact_and_ancestor_execution_but_blocks_siblings(tmp_path: Path) -> None:
+    remote = tmp_path / "remote4.git"
+    _git(tmp_path, "init", "--bare", str(remote))
+    repo = tmp_path / "repo4"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.name", "Unit Test")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "remote", "add", "origin", str(remote))
+    (repo / "src").mkdir()
+    (repo / "src" / "owned.txt").write_text("owned\n", encoding="utf-8")
+    _git(repo, "add", "src/owned.txt")
+    _git(repo, "commit", "-m", "add owned path")
+    _git(repo, "branch", "-M", "main")
+
+    owner_execution = "55555555-5555-4555-8555-555555555555"
+    sibling_execution = "66666666-6666-4666-8666-666666666666"
+    archive_root = tmp_path / "archive4" / "projects" / "slug"
+    fr_dir = archive_root / "file_reservations"
+    fr_dir.mkdir(parents=True)
+    (fr_dir / "lock.json").write_text(
+        json.dumps(
+            {
+                "agent": "codex-wsl-home-1",
+                "execution_id": owner_execution,
+                "exclusive": True,
+                "path_pattern": "src/owned.txt",
+                "expires_ts": _future_iso(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    hook = repo / "pre-push-test.py"
+    hook.write_text(
+        render_prepush_script(cast(ProjectArchive, _DummyArchive(archive_root))),
+        encoding="utf-8",
+    )
+    local_sha = _git(repo, "rev-parse", "HEAD")
+    stdin_payload = (
+        f"refs/heads/main {local_sha} refs/heads/main {'0' * 40}\n"
+    )
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "WORKTREES_ENABLED": "1",
+            "AGENT_MAIL_GUARD_MODE": "block",
+            "AGENT_NAME": "codex-wsl-home-1",
+            "AGENT_EXECUTION_ID": owner_execution,
+        }
+    )
+    owner = subprocess.run(
+        [sys.executable, str(hook), "origin"],
+        cwd=str(repo),
+        env=env,
+        input=stdin_payload,
+        capture_output=True,
+        text=True,
+    )
+    assert owner.returncode == 0, owner.stderr
+
+    child_execution = "99999999-9999-4999-8999-999999999999"
+    env["AGENT_EXECUTION_ID"] = child_execution
+    env["AGENT_EXECUTION_ANCESTOR_IDS"] = owner_execution
+    child = subprocess.run(
+        [sys.executable, str(hook), "origin"],
+        cwd=str(repo),
+        env=env,
+        input=stdin_payload,
+        capture_output=True,
+        text=True,
+    )
+    assert child.returncode == 0, child.stderr
+
+    env["AGENT_EXECUTION_ID"] = sibling_execution
+    env.pop("AGENT_EXECUTION_ANCESTOR_IDS")
+    sibling = subprocess.run(
+        [sys.executable, str(hook), "origin"],
+        cwd=str(repo),
+        env=env,
+        input=stdin_payload,
+        capture_output=True,
+        text=True,
+    )
+    assert sibling.returncode == 1
+    assert owner_execution in sibling.stderr

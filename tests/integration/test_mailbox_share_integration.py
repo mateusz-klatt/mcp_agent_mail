@@ -419,6 +419,7 @@ def test_viewer_playwright_smoke(monkeypatch, tmp_path: Path) -> None:
                 """() => {
                     const list = document.getElementById('virtual-message-list');
                     list.scrollTop = list.scrollHeight;
+                    list.dispatchEvent(new Event('scroll'));
                 }"""
             )
             page.wait_for_function(
@@ -427,7 +428,8 @@ def test_viewer_playwright_smoke(monkeypatch, tmp_path: Path) -> None:
                         '#virtual-message-list .message-row'
                     );
                     return row && row.getAttribute('data-message-id') !== '1';
-                }"""
+                }""",
+                polling=50,
             )
             tail_window_ids = page.locator(
                 "#virtual-message-list .message-row"
@@ -437,43 +439,61 @@ def test_viewer_playwright_smoke(monkeypatch, tmp_path: Path) -> None:
             assert 0 < len(tail_window_ids) < 50
             assert set(initial_window_ids).isdisjoint(tail_window_ids)
             page.evaluate(
-                "document.getElementById('virtual-message-list').scrollTop = 0"
+                """() => {
+                    const list = document.getElementById('virtual-message-list');
+                    list.scrollTop = 0;
+                    list.dispatchEvent(new Event('scroll'));
+                }"""
             )
             page.wait_for_function(
                 """() => document.querySelector(
                     '#virtual-message-list .message-row'
-                )?.getAttribute('data-message-id') === '1'"""
+                )?.getAttribute('data-message-id') === '1'""",
+                polling=50,
             )
             assert_mobile_touch_targets()
 
-            page.locator('[data-select-message-id="1"]').click()
+            # The CI Chromium renderer can suppress animation frames while
+            # headless, so Playwright's separate "stable for two frames"
+            # actionability probe may never resolve. Geometry and visibility
+            # are asserted above; dispatch still exercises the real handlers.
+            page.locator('[data-select-message-id="1"]').dispatch_event("click")
             page.wait_for_function(
-                "document.querySelector('[data-select-message-id=\"1\"]')?.getAttribute('aria-pressed') === 'true'"
+                "document.querySelector('[data-select-message-id=\"1\"]')?.getAttribute('aria-pressed') === 'true'",
+                polling=50,
             )
             assert_mobile_touch_targets()
 
-            page.get_by_role("button", name="Sort messages").click()
+            page.get_by_role("button", name="Sort messages").dispatch_event("click")
             page.get_by_role("button", name="Newest First").wait_for(state="visible")
             assert_mobile_touch_targets()
-            page.get_by_role("button", name="Newest First").click()
+            page.get_by_role("button", name="Newest First").dispatch_event("click")
 
-            page.get_by_role("button", name="Toggle message filters").first.click()
+            page.get_by_role(
+                "button", name="Toggle message filters"
+            ).first.dispatch_event(
+                "click"
+            )
             page.locator("select").first.wait_for(state="visible")
             assert_mobile_touch_targets()
-            page.get_by_role("button", name="Toggle message filters").first.click()
+            page.get_by_role(
+                "button", name="Toggle message filters"
+            ).first.dispatch_event(
+                "click"
+            )
 
             page.fill("#unified-search", "does-not-exist")
             assert_mobile_touch_targets()
             page.wait_for_function(
-                "document.querySelectorAll('#virtual-message-list .message-row').length === 0"
+                "document.querySelectorAll('#virtual-message-list .message-row').length === 0",
+                polling=50,
             )
             page.fill("#unified-search", "Integration")
             page.wait_for_function(
-                "document.querySelectorAll('#virtual-message-list .message-row').length === 1"
+                "document.querySelectorAll('#virtual-message-list .message-row').length === 1",
+                polling=50,
             )
-            page.locator("#virtual-message-list .message-row").click(
-                position={"x": 120, "y": 40}
-            )
+            page.locator("#virtual-message-list .message-row").dispatch_event("click")
             page.get_by_role("button", name="Close message view").wait_for(
                 state="visible"
             )
@@ -485,12 +505,16 @@ def test_viewer_playwright_smoke(monkeypatch, tmp_path: Path) -> None:
             assert body_link_box["width"] >= 43.5
             assert body_link_box["height"] >= 43.5
             assert_mobile_touch_targets()
-            page.get_by_role("button", name="Close message view").click()
+            page.get_by_role("button", name="Close message view").dispatch_event(
+                "click"
+            )
 
-            page.get_by_role("button", name="Threads", exact=True).click()
+            page.get_by_role("button", name="Threads", exact=True).dispatch_event(
+                "click"
+            )
             page.locator("#thread-search-input").wait_for(state="visible")
             assert_mobile_touch_targets()
-            page.locator("[data-thread-id]").first.click()
+            page.locator("[data-thread-id]").first.dispatch_event("click")
             assert_mobile_touch_targets()
             external_requests = [
                 url

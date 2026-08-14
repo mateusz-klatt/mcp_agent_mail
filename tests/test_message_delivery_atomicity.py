@@ -1065,7 +1065,7 @@ def test_cross_project_sender_and_agent_actor_keep_independent_source_lifetime(
             """,
             (delivery_id,),
         ).fetchone() == (1, 2, 2)
-        with pytest.raises(sqlite3.IntegrityError, match="immutable message delivery"):
+        with pytest.raises(sqlite3.IntegrityError, match="project has pending message delivery"):
             connection.execute("DELETE FROM projects WHERE id = 2")
         connection.rollback()
 
@@ -1443,12 +1443,11 @@ def test_publish_requires_materialized_message_exact_recipients_and_receipt(
         connection.execute("DELETE FROM agent_links")
         connection.execute("DELETE FROM agents WHERE id IN (10, 11)")
         connection.commit()
-        with pytest.raises(
-            sqlite3.IntegrityError,
-            match="immutable message delivery history",
-        ):
-            connection.execute("DELETE FROM projects WHERE id = 1")
-        connection.rollback()
+        connection.execute("DELETE FROM projects WHERE id = 1")
+        connection.commit()
+        assert connection.execute(
+            "SELECT id FROM projects WHERE id = 1"
+        ).fetchone() is None
         assert connection.execute(
             """
             SELECT state, project_slug_snapshot, sender_name_snapshot,
@@ -1516,7 +1515,7 @@ def test_pending_delivery_blocks_parent_deletion_and_snapshot_mutation(isolated_
         connection.commit()
 
         for statement, expected in [
-            ("DELETE FROM projects WHERE id = 1", "immutable message delivery"),
+            ("DELETE FROM projects WHERE id = 1", "project has pending message delivery"),
             ("DELETE FROM agents WHERE id = 10", "agent has pending"),
             ("DELETE FROM agents WHERE id = 11", "agent has pending"),
             ("DELETE FROM ui_users WHERE id = 20", "user has pending"),

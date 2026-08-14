@@ -29,6 +29,13 @@ INLINE_PNG_BASE64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMA"
     "ASsJTYQAAAAASUVORK5CYII="
 )
+ISOMORPH_ALPHA_SENDER = "codex-wsl-isomorphism-alpha-1"
+ISOMORPH_ALPHA_RECIPIENT = "codex-wsl-isomorphism-alpha-2"
+ISOMORPH_ALPHA_COLLABORATOR = "codex-wsl-isomorphism-alpha-3"
+ISOMORPH_ALPHA_OBSERVER = "codex-wsl-isomorphism-alpha-4"
+ISOMORPH_BETA_CONTACT = "codex-wsl-isomorphism-beta-5"
+ISOMORPH_BETA_DENIED = "codex-wsl-isomorphism-beta-6"
+ISOMORPH_PERF_AGENT = "codex-wsl-isomorphism-perf-7"
 
 # Frozen source bytes, not Image.new(...).save(...).
 #
@@ -164,6 +171,44 @@ def _scrub_commit_meta(payload: dict[str, Any]) -> None:
                 else line
                 for line in excerpt
             ]
+
+
+def _scrub_execution_reservation_meta(payload: Any) -> None:
+    """Remove runtime execution diagnostics from the deterministic legacy fixture."""
+    execution_keys = {
+        "ancestor_execution_ids",
+        "execution_id",
+        "execution_parent_id",
+        "execution_status",
+        "last_execution_activity_ts",
+        "legacy_unscoped",
+        "origin",
+        "orphaned",
+    }
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for key in execution_keys:
+                value.pop(key, None)
+            warnings = value.get("warnings")
+            if isinstance(warnings, list):
+                value["warnings"] = [
+                    warning
+                    for warning in warnings
+                    if not str(warning).startswith(
+                        (
+                            "execution_required_after_rollout:",
+                            "execution_protocol_upgrade_required:",
+                        )
+                    )
+                ]
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(payload)
 
 
 def _scrub_delivery_meta(payload: Any) -> None:
@@ -378,8 +423,17 @@ async def test_isomorphism_e2e_suite(
             }
         )
 
-        agents_alpha = ["BlueLake", "RedStone", "GreenCastle", "StormyCanyon"]
-        agents_beta = ["PurpleBear", "JadePond", "BlueLake"]
+        agents_alpha = [
+            ISOMORPH_ALPHA_SENDER,
+            ISOMORPH_ALPHA_RECIPIENT,
+            ISOMORPH_ALPHA_COLLABORATOR,
+            ISOMORPH_ALPHA_OBSERVER,
+        ]
+        agents_beta = [
+            ISOMORPH_BETA_CONTACT,
+            ISOMORPH_BETA_DENIED,
+            ISOMORPH_ALPHA_SENDER,
+        ]
         for name in agents_alpha:
             await client.call_tool(
                 "register_agent",
@@ -392,13 +446,21 @@ async def test_isomorphism_e2e_suite(
             )
         await client.call_tool(
             "set_contact_policy",
-            {"project_key": beta_key, "agent_name": "BlueLake", "policy": "open"},
+            {
+                "project_key": beta_key,
+                "agent_name": ISOMORPH_ALPHA_SENDER,
+                "policy": "open",
+            },
         )
         # Alpha recipients accept unsolicited mail (open policy) so the messaging
         # phase's sends aren't blocked by contact gating, which is enforced even
         # within a project. The contacts phase below exercises the gated
         # request/approve/deny flow separately (with auto-handshake disabled).
-        for name in ("RedStone", "GreenCastle", "StormyCanyon"):
+        for name in (
+            ISOMORPH_ALPHA_RECIPIENT,
+            ISOMORPH_ALPHA_COLLABORATOR,
+            ISOMORPH_ALPHA_OBSERVER,
+        ):
             await client.call_tool(
                 "set_contact_policy",
                 {"project_key": alpha_key, "agent_name": name, "policy": "open"},
@@ -412,10 +474,10 @@ async def test_isomorphism_e2e_suite(
         body_md = "Launch kickoff\n\n![inline](data:image/png;base64,{})\n".format(INLINE_PNG_BASE64)
         launch_request = {
             "project_key": alpha_key,
-            "sender_name": "BlueLake",
-            "to": ["RedStone"],
-            "cc": ["GreenCastle"],
-            "bcc": ["StormyCanyon"],
+            "sender_name": ISOMORPH_ALPHA_SENDER,
+            "to": [ISOMORPH_ALPHA_RECIPIENT],
+            "cc": [ISOMORPH_ALPHA_COLLABORATOR],
+            "bcc": [ISOMORPH_ALPHA_OBSERVER],
             "subject": "Launch Plan",
             "body_md": body_md,
             "ack_required": True,
@@ -439,8 +501,8 @@ async def test_isomorphism_e2e_suite(
                 "send_message",
                 {
                     "project_key": alpha_key,
-                    "sender_name": "BlueLake",
-                    "to": ["RedStone"],
+                    "sender_name": ISOMORPH_ALPHA_SENDER,
+                    "to": [ISOMORPH_ALPHA_RECIPIENT],
                     "subject": "Follow Up",
                     "body_md": "Follow up details",
                     "thread_id": "THREAD-1",
@@ -450,16 +512,30 @@ async def test_isomorphism_e2e_suite(
         )
         followup_id = int((send_followup.get("deliveries") or [{}])[0].get("message", {}).get("id"))
 
-        await client.call_tool("mark_message_read", {"project_key": alpha_key, "agent_name": "RedStone", "message_id": message_id})
-        await client.call_tool("acknowledge_message", {"project_key": alpha_key, "agent_name": "RedStone", "message_id": message_id})
+        await client.call_tool(
+            "mark_message_read",
+            {
+                "project_key": alpha_key,
+                "agent_name": ISOMORPH_ALPHA_RECIPIENT,
+                "message_id": message_id,
+            },
+        )
+        await client.call_tool(
+            "acknowledge_message",
+            {
+                "project_key": alpha_key,
+                "agent_name": ISOMORPH_ALPHA_RECIPIENT,
+                "message_id": message_id,
+            },
+        )
 
         beta_message = _tool_data(
             await client.call_tool(
                 "send_message",
                 {
                     "project_key": beta_key,
-                    "sender_name": "PurpleBear",
-                    "to": ["BlueLake"],
+                    "sender_name": ISOMORPH_BETA_CONTACT,
+                    "to": [ISOMORPH_ALPHA_SENDER],
                     "subject": "Beta Hello",
                     "body_md": "beta side",
                     "thread_id": "THREAD-1",
@@ -483,7 +559,7 @@ async def test_isomorphism_e2e_suite(
                 "file_reservation_paths",
                 {
                     "project_key": alpha_key,
-                    "agent_name": "BlueLake",
+                    "agent_name": ISOMORPH_ALPHA_SENDER,
                     "paths": ["src/core.py"],
                     "ttl_seconds": 600,
                     "exclusive": True,
@@ -496,7 +572,7 @@ async def test_isomorphism_e2e_suite(
                 "file_reservation_paths",
                 {
                     "project_key": alpha_key,
-                    "agent_name": "GreenCastle",
+                    "agent_name": ISOMORPH_ALPHA_COLLABORATOR,
                     "paths": ["src/core.py"],
                     "ttl_seconds": 600,
                     "exclusive": True,
@@ -506,18 +582,27 @@ async def test_isomorphism_e2e_suite(
         )
         await client.call_tool(
             "renew_file_reservations",
-            {"project_key": alpha_key, "agent_name": "BlueLake", "paths": ["src/core.py"], "extend_seconds": 600},
+            {
+                "project_key": alpha_key,
+                "agent_name": ISOMORPH_ALPHA_SENDER,
+                "paths": ["src/core.py"],
+                "extend_seconds": 600,
+            },
         )
         await client.call_tool(
             "release_file_reservations",
-            {"project_key": alpha_key, "agent_name": "BlueLake", "paths": ["src/core.py"]},
+            {
+                "project_key": alpha_key,
+                "agent_name": ISOMORPH_ALPHA_SENDER,
+                "paths": ["src/core.py"],
+            },
         )
         post_release = _tool_data(
             await client.call_tool(
                 "file_reservation_paths",
                 {
                     "project_key": alpha_key,
-                    "agent_name": "GreenCastle",
+                    "agent_name": ISOMORPH_ALPHA_COLLABORATOR,
                     "paths": ["src/core.py"],
                     "ttl_seconds": 600,
                     "exclusive": True,
@@ -559,6 +644,7 @@ async def test_isomorphism_e2e_suite(
                     "program": "codex",
                     "model": "gpt-5",
                     "task_description": "phase2 commit batching check",
+                    "name_hint": ISOMORPH_PERF_AGENT,
                 },
             )
         )
@@ -576,14 +662,18 @@ async def test_isomorphism_e2e_suite(
         phase2_commit_delta = commit_delta
         phase2_project = perf_key
 
-        render_phase(console, "contacts", {"from": "BlueLake", "to": "PurpleBear"})
+        render_phase(
+            console,
+            "contacts",
+            {"from": ISOMORPH_ALPHA_SENDER, "to": ISOMORPH_BETA_CONTACT},
+        )
         request_contact = _tool_data(
             await client.call_tool(
                 "request_contact",
                 {
                     "project_key": alpha_key,
-                    "from_agent": "BlueLake",
-                    "to_agent": "PurpleBear",
+                    "from_agent": ISOMORPH_ALPHA_SENDER,
+                    "to_agent": ISOMORPH_BETA_CONTACT,
                     "to_project": beta_key,
                     "reason": "e2e",
                 },
@@ -594,8 +684,8 @@ async def test_isomorphism_e2e_suite(
                 "respond_contact",
                 {
                     "project_key": beta_key,
-                    "to_agent": "PurpleBear",
-                    "from_agent": "BlueLake",
+                    "to_agent": ISOMORPH_BETA_CONTACT,
+                    "from_agent": ISOMORPH_ALPHA_SENDER,
                     "from_project": alpha_key,
                     "accept": True,
                     "ttl_seconds": 3600,
@@ -607,8 +697,8 @@ async def test_isomorphism_e2e_suite(
                 "request_contact",
                 {
                     "project_key": alpha_key,
-                    "from_agent": "BlueLake",
-                    "to_agent": "JadePond",
+                    "from_agent": ISOMORPH_ALPHA_SENDER,
+                    "to_agent": ISOMORPH_BETA_DENIED,
                     "to_project": beta_key,
                     "reason": "deny-case",
                 },
@@ -619,8 +709,8 @@ async def test_isomorphism_e2e_suite(
                 "respond_contact",
                 {
                     "project_key": beta_key,
-                    "to_agent": "JadePond",
-                    "from_agent": "BlueLake",
+                    "to_agent": ISOMORPH_BETA_DENIED,
+                    "from_agent": ISOMORPH_ALPHA_SENDER,
                     "from_project": alpha_key,
                     "accept": False,
                 },
@@ -631,8 +721,8 @@ async def test_isomorphism_e2e_suite(
                 "send_message",
                 {
                     "project_key": alpha_key,
-                    "sender_name": "BlueLake",
-                    "to": [f"PurpleBear@{beta_key}"],
+                    "sender_name": ISOMORPH_ALPHA_SENDER,
+                    "to": [f"{ISOMORPH_BETA_CONTACT}@{beta_key}"],
                     "subject": "Cross Project",
                     "body_md": "approved path",
                     "idempotency_key": "isomorphism-cross-project",
@@ -645,8 +735,8 @@ async def test_isomorphism_e2e_suite(
                 "send_message",
                 {
                     "project_key": alpha_key,
-                    "sender_name": "BlueLake",
-                    "to": [f"JadePond@{beta_key}"],
+                    "sender_name": ISOMORPH_ALPHA_SENDER,
+                    "to": [f"{ISOMORPH_BETA_DENIED}@{beta_key}"],
                     "subject": "Should Fail",
                     "body_md": "blocked path",
                     "idempotency_key": "isomorphism-cross-project-denied",
@@ -704,7 +794,11 @@ async def test_isomorphism_e2e_suite(
         whois = _tool_data(
             await client.call_tool(
                 "whois",
-                {"project_key": alpha_key, "agent_name": "BlueLake", "include_recent_commits": False},
+                {
+                    "project_key": alpha_key,
+                    "agent_name": ISOMORPH_ALPHA_SENDER,
+                    "include_recent_commits": False,
+                },
             )
         )
         phases.append({"phase": "identity", "whois": whois})
@@ -715,6 +809,14 @@ async def test_isomorphism_e2e_suite(
         beta_resource = _parse_resource_json(
             await client.read_resource(f"resource://project/{beta_key}")
         )
+        for project_payload in (project_resource, beta_resource):
+            agents = project_payload.get("agents")
+            if isinstance(agents, list):
+                agents.sort(
+                    key=lambda entry: (
+                        entry.get("id", 0) if isinstance(entry, dict) else 0
+                    )
+                )
         message_resource = _parse_resource_json(
             await client.read_resource(f"resource://message/{message_id}?project={alpha_key}")
         )
@@ -722,21 +824,33 @@ async def test_isomorphism_e2e_suite(
             await client.read_resource(f"resource://message/{followup_id}?project={alpha_key}")
         )
         beta_message_resource = _parse_resource_json(
-            await client.read_resource(f"resource://message/{beta_message_id}?project={beta_key}&agent=BlueLake")
+            await client.read_resource(
+                f"resource://message/{beta_message_id}?project={beta_key}&agent={ISOMORPH_ALPHA_SENDER}"
+            )
         )
 
         inbox_since_ts = (base_time + timedelta(seconds=200 + followup_id - 1)).isoformat()
         inbox = _tool_data(
             await client.call_tool(
                 "fetch_inbox",
-                {"project_key": alpha_key, "agent_name": "RedStone", "include_bodies": True, "since_ts": inbox_since_ts, "limit": 10},
+                {
+                    "project_key": alpha_key,
+                    "agent_name": ISOMORPH_ALPHA_RECIPIENT,
+                    "include_bodies": True,
+                    "since_ts": inbox_since_ts,
+                    "limit": 10,
+                },
             )
         )
         mailbox = _parse_resource_json(
-            await client.read_resource(f"resource://mailbox/RedStone?project={alpha_key}&limit=5")
+            await client.read_resource(
+                f"resource://mailbox/{ISOMORPH_ALPHA_RECIPIENT}?project={alpha_key}&limit=5"
+            )
         )
         outbox = _parse_resource_json(
-            await client.read_resource(f"resource://outbox/BlueLake?project={alpha_key}&limit=5")
+            await client.read_resource(
+                f"resource://outbox/{ISOMORPH_ALPHA_SENDER}?project={alpha_key}&limit=5"
+            )
         )
         _scrub_commit_meta(mailbox)
         _scrub_commit_meta(outbox)
@@ -790,7 +904,10 @@ async def test_isomorphism_e2e_suite(
         )
         contacts_raw = _coerce_list(
             _tool_data(
-                await client.call_tool("list_contacts", {"project_key": alpha_key, "agent_name": "BlueLake"})
+                await client.call_tool(
+                    "list_contacts",
+                    {"project_key": alpha_key, "agent_name": ISOMORPH_ALPHA_SENDER},
+                )
             )
         )
         contacts: list[dict[str, Any]] = []
@@ -815,7 +932,12 @@ async def test_isomorphism_e2e_suite(
                 entry["expires_ts"] = _iso_at(base_time, offset_seconds=600 + res_id)
                 if entry.get("released_ts") is not None:
                     entry["released_ts"] = _iso_at(base_time, offset_seconds=700 + res_id)
-        contacts.sort(key=lambda entry: entry.get("to") or "")
+            contacts.sort(
+                key=lambda entry: (
+                    entry.get("reason") or "",
+                    entry.get("to") or "",
+                )
+            )
         for idx, entry in enumerate(contacts, start=1):
             if "updated_ts" in entry:
                 entry["updated_ts"] = _iso_at(base_time, offset_seconds=900 + idx)
@@ -828,7 +950,12 @@ async def test_isomorphism_e2e_suite(
         product_inbox = _tool_data(
             await client.call_tool(
                 "fetch_inbox_product",
-                {"product_key": product["product_uid"], "agent_name": "BlueLake", "limit": 10, "include_bodies": True},
+                {
+                    "product_key": product["product_uid"],
+                    "agent_name": ISOMORPH_ALPHA_SENDER,
+                    "limit": 10,
+                    "include_bodies": True,
+                },
             )
         )
         product_thread = _tool_data(
@@ -1058,6 +1185,7 @@ async def test_isomorphism_e2e_suite(
             },
         },
     }
+    _scrub_execution_reservation_meta(result["file_reservations"])
     _scrub_delivery_meta(result)
 
     update = os.getenv("E2E_UPDATE", "") == "1"

@@ -68,6 +68,7 @@ async def _setup_project_with_agents(client, project_key: str, count: int) -> li
                 "program": "test-prog",
                 "model": "test-model",
                 "task_description": f"agent-{i}",
+                "name": f"codex-wsl-broadcast-{i + 1}",
             },
         )
         data = _get_data(result)

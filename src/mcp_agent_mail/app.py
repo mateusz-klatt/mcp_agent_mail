@@ -75,7 +75,10 @@ from .guard import install_guard as install_guard_script, uninstall_guard as uni
 from .llm import complete_system_user
 from .models import (
     Agent,
+    AgentExecution,
     AgentLink,
+    BuildSlotArtifactPath,
+    BuildSlotArtifactProjection,
     FileReservation,
     Message,
     MessageDelivery,
@@ -86,33 +89,28 @@ from .models import (
     ProjectSiblingSuggestion,
     Product,
     ProductProjectLink,
-    UiProjectAssignment,
     WindowIdentity,
 )
 from .storage import (
+    _write_json_atomic_sync,
     GitIndexLockError,
     ProjectArchive,
     archive_write_lock,
     clear_notification_signal,
     clear_repo_cache,
     collect_lock_status,
-    commit_archive_path_deletions,
-    commit_archive_subtree_deletion,
-    delete_archive_tree_contents,
     ensure_archive,
-    get_agent_reservation_archive_paths,
     get_identity_rename_tombstone,
     heal_archive_locks,
     write_agent_profile,
     write_file_reservation_records,
 )
 from .utils import (
-    generate_agent_name,
+    safe_build_path_component,
     sanitize_agent_name,
     slugify,
     validate_agent_name_format,
     validate_client_platform_host_agent_id,
-    validate_explicit_agent_id,
     validate_thread_id_format,
 )
 
@@ -124,6 +122,36 @@ except Exception:  # pragma: no cover - optional dependency fallback
     PathSpec = None
 
 logger = logging.getLogger(__name__)
+
+_EXECUTION_LIFECYCLE_PROTOCOL_VERSION = 1
+_EXECUTION_TOKEN_PATTERN = re.compile(r"[0-9a-f]{64}")
+_REDACTED_TOOL_ARGUMENT = "***"
+_SENSITIVE_TOOL_LOG_KEY_FRAGMENTS = ("token", "secret", "capability")
+
+
+def _redact_tool_log_value(value: Any) -> Any:
+    """Return a recursively redacted copy suitable only for diagnostic logs."""
+    if isinstance(value, dict):
+        return {
+            key: (
+                _REDACTED_TOOL_ARGUMENT
+                if any(
+                    fragment in str(key).casefold()
+                    for fragment in _SENSITIVE_TOOL_LOG_KEY_FRAGMENTS
+                )
+                else _redact_tool_log_value(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_tool_log_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_tool_log_value(item) for item in value)
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        with suppress(Exception):
+            return _redact_tool_log_value(model_dump())
+    return value
 
 
 def _absolute_project_key_path(value: str) -> PurePosixPath | PureWindowsPath | None:
@@ -265,6 +293,13 @@ CLUSTER_MACROS = "workflow_macros"
 CLUSTER_BUILD_SLOTS = "build_slots"
 CLUSTER_PRODUCT = "product_bus"
 
+# Keep crash recovery memory and lock hold time independent of audit history.
+# A pass may drain several batches, but every DB read and artifact projection
+# has a fixed upper bound.
+_EXECUTION_REAPER_BATCH_SIZE = 256
+_FILE_RESERVATION_ARCHIVE_BATCH_SIZE = 256
+_BUILD_SLOT_RECONCILIATION_BATCH_SIZE = 256
+
 # -------------------------------------------------------------------------------------------------
 # Tool Filtering: Predefined profiles for context reduction
 # -------------------------------------------------------------------------------------------------
@@ -401,6 +436,46 @@ class ToolExecutionError(Exception):
         }
 
 
+def _legacy_execution_rollout_allowed(settings: Settings) -> bool:
+    return settings.agent_execution_enforcement_mode == "observe"
+
+
+def _execution_protocol_warning(version: int) -> str | None:
+    if version == _EXECUTION_LIFECYCLE_PROTOCOL_VERSION:
+        return None
+    return (
+        "execution_protocol_upgrade_required: expected lifecycle_protocol_version="
+        f"{_EXECUTION_LIFECYCLE_PROTOCOL_VERSION}, received {version}."
+    )
+
+
+def _validate_execution_protocol(
+    version: int | None,
+    *,
+    settings: Settings,
+) -> tuple[int, str | None]:
+    normalized = 0 if version is None else int(version)
+    if normalized < 0:
+        raise ToolExecutionError(
+            "INVALID_EXECUTION_PROTOCOL",
+            "lifecycle_protocol_version must be a non-negative integer.",
+            recoverable=False,
+            data={"lifecycle_protocol_version": version},
+        )
+    warning = _execution_protocol_warning(normalized)
+    if warning is not None and not _legacy_execution_rollout_allowed(settings):
+        raise ToolExecutionError(
+            "UNSUPPORTED_EXECUTION_PROTOCOL",
+            warning,
+            recoverable=True,
+            data={
+                "supported": [_EXECUTION_LIFECYCLE_PROTOCOL_VERSION],
+                "received": normalized,
+            },
+        )
+    return normalized, warning
+
+
 def _record_tool_error(tool_name: str, exc: Exception) -> None:
     logger.warning(
         "tool_error",
@@ -524,7 +599,13 @@ def _instrument_tool(
 
             if log_enabled:
                 try:
-                    clean_kwargs = {k: v for k, v in bound.arguments.items() if k != "ctx"}
+                    clean_kwargs = _redact_tool_log_value(
+                        {
+                            key: value
+                            for key, value in bound.arguments.items()
+                            if key != "ctx"
+                        }
+                    )
                     log_ctx = rich_logger.ToolCallContext(
                         tool_name=tool_name,
                         args=[],
@@ -763,7 +844,7 @@ def _instrument_tool(
                 if log_ctx is not None:
                     try:
                         log_ctx.end_time = time.perf_counter()
-                        log_ctx.result = result
+                        log_ctx.result = _redact_tool_log_value(result)
                         log_ctx.error = error
                         log_ctx.success = error is None
                         if query_stats:
@@ -855,9 +936,19 @@ def _lifespan_factory(settings: Settings) -> Callable[[FastMCP], AsyncContextMan
                 },
             )
         await ensure_schema(settings)
+        execution_reaper_task: asyncio.Task[None] | None = None
+        if settings.agent_execution_reaper_enabled:
+            execution_reaper_task = asyncio.create_task(
+                _agent_execution_reaper_worker(settings),
+                name="agent-execution-reaper",
+            )
         try:
             yield
         finally:
+            if execution_reaper_task is not None:
+                execution_reaper_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await execution_reaper_task
             cancelled: BaseException | None = None
             with suppress(Exception):
                 engine = get_engine()
@@ -1362,6 +1453,13 @@ class FileReservationStatus:
     stale: bool
     stale_reasons: list[str]
     last_agent_activity: Optional[datetime]
+    execution_id: Optional[str]
+    execution_status: Optional[str]
+    execution_parent_id: Optional[str]
+    ancestor_execution_ids: list[str]
+    orphaned: bool
+    legacy_unscoped: bool
+    last_execution_activity: Optional[datetime]
     last_mail_activity: Optional[datetime]
     last_fs_activity: Optional[datetime]
     last_git_activity: Optional[datetime]
@@ -1913,6 +2011,7 @@ def _project_to_dict(project: Project) -> dict[str, Any]:
         "id": project.id,
         "slug": project.slug,
         "human_key": project.human_key,
+        "project_uid": project.project_uid,
         "created_at": _iso(project.created_at),
     }
     if getattr(project, "archived_at", None) is not None:
@@ -1945,6 +2044,69 @@ def _agent_to_dict(agent: Agent) -> dict[str, Any]:
     return d
 
 
+def _agent_execution_to_dict(
+    execution: AgentExecution,
+    *,
+    ancestor_execution_ids: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Serialize an execution lifetime without exposing ORM implementation details."""
+    return {
+        "id": execution.id,
+        "project_id": execution.project_id,
+        "agent_id": execution.agent_id,
+        "parent_execution_id": execution.parent_execution_id,
+        "ancestor_execution_ids": list(ancestor_execution_ids),
+        "external_id": execution.external_id,
+        "client_name": execution.client_name,
+        "turn_id": execution.turn_id,
+        "agent_type": execution.agent_type,
+        "model": execution.model,
+        "permission_mode": execution.permission_mode,
+        "lifecycle_protocol_version": execution.lifecycle_protocol_version,
+        "kind": execution.kind,
+        "status": execution.status,
+        "task_description": execution.task_description,
+        "cwd": execution.cwd,
+        "repo_root": execution.repo_root,
+        "git_common_dir": execution.git_common_dir,
+        "worktree_path": execution.worktree_path,
+        "branch": execution.branch,
+        "head_sha": execution.head_sha,
+        "started_ts": _iso(execution.started_ts),
+        "last_active_ts": _iso(execution.last_active_ts),
+        "ended_ts": _iso(execution.ended_ts),
+    }
+
+
+def _bounded_execution_text(
+    field: str,
+    value: str | None,
+    max_length: int,
+    *,
+    required: bool = False,
+) -> str | None:
+    """Normalize execution metadata before it reaches DB CHECK constraints."""
+    if value is None:
+        normalized = None
+    else:
+        normalized = value.strip()
+        if not normalized:
+            normalized = None
+    if required and normalized is None:
+        raise ToolExecutionError(
+            "INVALID_EXECUTION",
+            f"{field} must be non-empty.",
+            data={"field": field},
+        )
+    if normalized is not None and len(normalized) > max_length:
+        raise ToolExecutionError(
+            "EXECUTION_METADATA_TOO_LONG",
+            f"{field} exceeds the maximum length of {max_length} characters.",
+            data={"field": field, "max_length": max_length},
+        )
+    return normalized
+
+
 def _message_to_dict(message: Message, include_body: bool = True) -> dict[str, Any]:
     data = {
         "id": message.id,
@@ -1965,6 +2127,16 @@ def _message_to_dict(message: Message, include_body: bool = True) -> dict[str, A
     if include_body:
         data["body_md"] = message.body_md
     return data
+
+
+def _public_runtime_descriptor(settings: Settings) -> dict[str, Any]:
+    """Return only non-secret runtime coordinates safe for public diagnostics."""
+    return {
+        "environment": settings.environment,
+        "http_host": settings.http.host,
+        "http_port": settings.http.port,
+        "http_path": settings.http.path,
+    }
 
 
 def _format_cross_project_agent_address(project_slug: str, agent_name: str) -> str:
@@ -2488,34 +2660,214 @@ def _normalize_project_human_key(human_key: str) -> str:
     return os.path.normpath(human_key)
 
 
-async def _ensure_project(human_key: str) -> Project:
+def _validated_project_uid(value: Any) -> str:
+    """Return a DB-safe durable project UID or reject the identity source."""
+    if not isinstance(value, str):
+        raise ValueError("Resolved project_uid must be a string.")
+    project_uid = value.strip()
+    if not project_uid:
+        raise ValueError("Resolved project_uid cannot be empty.")
+    if len(project_uid) > 255:
+        raise ValueError("Resolved project_uid cannot exceed 255 characters.")
+    if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in project_uid):
+        raise ValueError("Resolved project_uid cannot contain whitespace or control characters.")
+    return project_uid
+
+
+def _project_identity_conflict(
+    identity: dict[str, Any],
+    projects: Sequence[Project],
+    *,
+    reason: str,
+) -> ToolExecutionError:
+    """Build the fail-closed error for an ambiguous durable identity."""
+    distinct: dict[int | str, Project] = {}
+    for project in projects:
+        key: int | str = project.id if project.id is not None else f"new:{id(project)}"
+        distinct[key] = project
+    return ToolExecutionError(
+        "PROJECT_IDENTITY_CONFLICT",
+        "Project identity is ambiguous; refusing to merge existing project history automatically.",
+        recoverable=False,
+        data={
+            "reason": reason,
+            "resolved_project_uid": identity["project_uid"],
+            "resolved_slug": identity["slug"],
+            "resolved_human_key": identity["human_key"],
+            "conflicting_projects": [
+                {
+                    "id": project.id,
+                    "project_uid": project.project_uid,
+                    "slug": project.slug,
+                    "human_key": project.human_key,
+                }
+                for project in distinct.values()
+            ],
+        },
+    )
+
+
+async def _ensure_project(
+    human_key: str,
+    identity_mode: Optional[str] = None,
+) -> Project:
     await ensure_schema()
-    # Normalize the path (collapse //, .., trailing slashes) WITHOUT following
-    # symlinks so that distinct user-visible paths keep distinct project identities.
-    # Using os.path.normpath instead of Path.resolve() — the latter calls
-    # realpath() which follows symlinks and can collapse unrelated projects
-    # onto the same DB row (see GitHub issue #126).
-    human_key = _normalize_project_human_key(human_key)
-    slug = _compute_project_slug(human_key)
+    # Identity must be resolved before touching the DB.  In particular, a
+    # per-call identity_mode override changes which durable Project row is
+    # selected; it is not merely response metadata.
+    normalized_human_key = _normalize_project_human_key(human_key)
+    identity = await asyncio.to_thread(
+        _resolve_project_identity,
+        normalized_human_key,
+        identity_mode,
+    )
+    project_uid = _validated_project_uid(identity.get("project_uid"))
+    identity["project_uid"] = project_uid
+    resolved_human_key = str(identity["human_key"])
+    resolved_slug = str(identity["slug"])
+
     for attempt in range(6):
         try:
             async with get_session() as session:
-                result = await session.execute(select(Project).where(Project.slug == slug))
-                project = result.scalars().first()
-                if project:
-                    return project
-                project = Project(slug=slug, human_key=human_key)
+                uid_projects = (
+                    await session.execute(
+                        select(Project).where(
+                            cast(Any, Project.project_uid) == project_uid
+                        )
+                    )
+                ).scalars().all()
+                human_projects = (
+                    await session.execute(
+                        select(Project).where(
+                            cast(Any, Project.human_key) == resolved_human_key
+                        )
+                    )
+                ).scalars().all()
+                slug_project = (
+                    await session.execute(
+                        select(Project).where(
+                            cast(Any, Project.slug) == resolved_slug
+                        )
+                    )
+                ).scalars().first()
+
+                if len(uid_projects) > 1 or len(human_projects) > 1:
+                    raise _project_identity_conflict(
+                        identity,
+                        [*uid_projects, *human_projects],
+                        reason="multiple database rows match one durable identity",
+                    )
+
+                uid_project = uid_projects[0] if uid_projects else None
+                human_project = human_projects[0] if human_projects else None
+
+                if uid_project is not None:
+                    aliases = [
+                        candidate
+                        for candidate in (human_project, slug_project)
+                        if candidate is not None and candidate.id != uid_project.id
+                    ]
+                    if aliases:
+                        raise _project_identity_conflict(
+                            identity,
+                            [uid_project, *aliases],
+                            reason="durable UID and path/slug resolve to different rows",
+                        )
+                    return uid_project
+
+                if human_project is not None:
+                    if slug_project is not None and slug_project.id != human_project.id:
+                        raise _project_identity_conflict(
+                            identity,
+                            [human_project, slug_project],
+                            reason="path and slug resolve to different legacy rows",
+                        )
+                    if human_project.project_uid is not None:
+                        # The UID, path and slug reads above are separate SQL
+                        # statements.  A concurrent creator can commit after
+                        # the UID read but before the path read, so this branch
+                        # may observe the newly-created canonical row even
+                        # though ``uid_projects`` was empty.  Exact UID equality
+                        # is the idempotent success case; only a different UID
+                        # is an identity conflict.
+                        if human_project.project_uid == project_uid:
+                            return human_project
+                        raise _project_identity_conflict(
+                            identity,
+                            [human_project],
+                            reason="path is already bound to a different durable UID",
+                        )
+                    # Safe lazy migration: only the one exact normalized legacy
+                    # path is claimed.  No historical rows are bulk-merged.
+                    human_project.project_uid = project_uid
+                    session.add(human_project)
+                    try:
+                        await session.commit()
+                    except IntegrityError:
+                        await session.rollback()
+                        if attempt >= 5:
+                            raise
+                        await asyncio.sleep(0)
+                        continue
+                    await session.refresh(human_project)
+                    return human_project
+
+                if slug_project is not None:
+                    if slug_project.project_uid is not None:
+                        # As above, an exact UID can become visible between the
+                        # earlier UID lookup and this slug lookup.  Treat the
+                        # same durable identity as the concurrent winner.
+                        if slug_project.project_uid == project_uid:
+                            return slug_project
+                        raise _project_identity_conflict(
+                            identity,
+                            [slug_project],
+                            reason="slug is already bound to a different durable UID",
+                        )
+                    # A legacy worktree row can be claimed by slug only when its
+                    # own persisted path independently resolves to this exact
+                    # UID.  If that path is no longer inspectable we fail closed.
+                    legacy_identity = await asyncio.to_thread(
+                        _resolve_project_identity,
+                        slug_project.human_key,
+                        identity_mode,
+                    )
+                    legacy_uid = _validated_project_uid(legacy_identity.get("project_uid"))
+                    if legacy_uid != project_uid:
+                        raise _project_identity_conflict(
+                            identity,
+                            [slug_project],
+                            reason="legacy slug cannot be proven to represent this durable UID",
+                        )
+                    slug_project.project_uid = project_uid
+                    session.add(slug_project)
+                    try:
+                        await session.commit()
+                    except IntegrityError:
+                        await session.rollback()
+                        if attempt >= 5:
+                            raise
+                        await asyncio.sleep(0)
+                        continue
+                    await session.refresh(slug_project)
+                    return slug_project
+
+                project = Project(
+                    slug=resolved_slug,
+                    human_key=resolved_human_key,
+                    project_uid=project_uid,
+                )
                 session.add(project)
                 try:
                     await session.commit()
                 except IntegrityError:
-                    # Concurrent ensure_project: another caller created the row. Treat as idempotent.
+                    # Concurrent callers are re-evaluated against all three
+                    # identity dimensions on the next iteration.
                     await session.rollback()
-                    result = await session.execute(select(Project).where(Project.slug == slug))
-                    project = result.scalars().first()
-                    if project:
-                        return project
-                    raise
+                    if attempt >= 5:
+                        raise
+                    await asyncio.sleep(0)
+                    continue
                 await session.refresh(project)
                 return project
         except OperationalError as exc:
@@ -2561,7 +2913,10 @@ async def _find_similar_agents(project: Project, name: str, limit: int = 5, min_
     suggestions: list[tuple[str, float]] = []
     async with get_session() as session:
         result = await session.execute(
-            select(Agent).where(cast(Any, Agent.project_id == project.id))
+            select(Agent).where(
+                cast(Any, Agent.project_id == project.id),
+                cast(Any, Agent.provisioning_state == "active"),
+            )
         )
         agents = result.scalars().all()
         for a in agents:
@@ -2576,7 +2931,12 @@ async def _list_project_agents(project: Project, limit: int = 10) -> list[str]:
     """List agent names in a project."""
     async with get_session() as session:
         result = await session.execute(
-            select(Agent.name).where(cast(Any, Agent.project_id == project.id)).limit(limit)
+            select(Agent.name)
+            .where(
+                cast(Any, Agent.project_id == project.id),
+                cast(Any, Agent.provisioning_state == "active"),
+            )
+            .limit(limit)
         )
         return [row[0] for row in result.all()]
 
@@ -2625,20 +2985,150 @@ async def _get_project_by_identifier(identifier: str) -> Project:
                 },
             )
 
-    slug = slugify(canonical_identifier)
+    identity: dict[str, Any] | None = None
+    if _is_absolute_project_key(raw_identifier):
+        identity = await asyncio.to_thread(
+            _resolve_project_identity,
+            canonical_identifier,
+        )
+        identity["project_uid"] = _validated_project_uid(identity.get("project_uid"))
+        slug = str(identity["slug"])
+    else:
+        slug = slugify(canonical_identifier)
+
     async with get_session() as session:
-        result = await session.execute(
-            select(Project).where(
-                or_(
-                    Project.slug == slug,
-                    Project.human_key == canonical_identifier,
-                    Project.human_key == raw_identifier,
+        if identity is not None:
+            project_uid = str(identity["project_uid"])
+            uid_projects = (
+                await session.execute(
+                    select(Project).where(
+                        cast(Any, Project.project_uid) == project_uid
+                    )
+                )
+            ).scalars().all()
+            human_projects = (
+                await session.execute(
+                    select(Project).where(
+                        or_(
+                            cast(Any, Project.human_key) == canonical_identifier,
+                            cast(Any, Project.human_key) == raw_identifier,
+                        )
+                    )
+                )
+            ).scalars().all()
+            slug_project = (
+                await session.execute(
+                    select(Project).where(cast(Any, Project.slug) == slug)
+                )
+            ).scalars().first()
+
+            if len(uid_projects) > 1 or len(human_projects) > 1:
+                raise _project_identity_conflict(
+                    identity,
+                    [*uid_projects, *human_projects],
+                    reason="multiple database rows match one durable identity",
+                )
+
+            uid_project = uid_projects[0] if uid_projects else None
+            human_project = human_projects[0] if human_projects else None
+            if uid_project is not None:
+                aliases = [
+                    candidate
+                    for candidate in (human_project, slug_project)
+                    if candidate is not None and candidate.id != uid_project.id
+                ]
+                if aliases:
+                    raise _project_identity_conflict(
+                        identity,
+                        [uid_project, *aliases],
+                        reason="durable UID and path/slug resolve to different rows",
+                    )
+                return uid_project
+
+            if human_project is not None:
+                if slug_project is not None and slug_project.id != human_project.id:
+                    raise _project_identity_conflict(
+                        identity,
+                        [human_project, slug_project],
+                        reason="path and slug resolve to different legacy rows",
+                    )
+                if human_project.project_uid is not None:
+                    raise _project_identity_conflict(
+                        identity,
+                        [human_project],
+                        reason="path is already bound to a different durable UID",
+                    )
+                human_project.project_uid = project_uid
+                session.add(human_project)
+                try:
+                    await session.commit()
+                except IntegrityError as exc:
+                    await session.rollback()
+                    raise _project_identity_conflict(
+                        identity,
+                        [human_project],
+                        reason="legacy path was concurrently bound to another project",
+                    ) from exc
+                await session.refresh(human_project)
+                return human_project
+
+            if slug_project is not None:
+                if slug_project.project_uid is not None:
+                    raise _project_identity_conflict(
+                        identity,
+                        [slug_project],
+                        reason="slug is already bound to a different durable UID",
+                    )
+                legacy_identity = await asyncio.to_thread(
+                    _resolve_project_identity,
+                    slug_project.human_key,
+                )
+                legacy_uid = _validated_project_uid(legacy_identity.get("project_uid"))
+                if legacy_uid != project_uid:
+                    raise _project_identity_conflict(
+                        identity,
+                        [slug_project],
+                        reason="legacy slug cannot be proven to represent this durable UID",
+                    )
+                slug_project.project_uid = project_uid
+                session.add(slug_project)
+                try:
+                    await session.commit()
+                except IntegrityError as exc:
+                    await session.rollback()
+                    raise _project_identity_conflict(
+                        identity,
+                        [slug_project],
+                        reason="legacy slug was concurrently bound to another project",
+                    ) from exc
+                await session.refresh(slug_project)
+                return slug_project
+        else:
+            result = await session.execute(
+                select(Project).where(
+                    or_(
+                        cast(Any, Project.project_uid) == raw_identifier,
+                        cast(Any, Project.slug) == slug,
+                        cast(Any, Project.human_key) == canonical_identifier,
+                        cast(Any, Project.human_key) == raw_identifier,
+                    )
                 )
             )
-        )
-        project = result.scalars().first()
-        if project:
-            return project
+            projects = result.scalars().all()
+            if len(projects) > 1:
+                # A slug/UID identifier must never choose an arbitrary row.
+                generic_identity = {
+                    "project_uid": raw_identifier,
+                    "slug": slug,
+                    "human_key": raw_identifier,
+                }
+                raise _project_identity_conflict(
+                    generic_identity,
+                    projects,
+                    reason="identifier matches multiple project rows",
+                )
+            if projects:
+                return projects[0]
 
     # Project not found - provide helpful suggestions
     suggestions = await _find_similar_projects(raw_identifier)
@@ -2717,7 +3207,7 @@ def _looks_like_broadcast(value: str) -> bool:
 
 
 def _looks_like_descriptive_name(value: str) -> bool:
-    """Check if value looks like a descriptive role name instead of adjective+noun."""
+    """Check if value looks like a role label instead of a stable host identity."""
     v = value.lower()
     # Common suffixes for descriptive agent names
     descriptive_patterns = (
@@ -2730,28 +3220,18 @@ def _looks_like_descriptive_name(value: str) -> bool:
 
 def _looks_like_unix_username(value: str) -> bool:
     """
-    Check if value looks like a Unix username rather than an adjective+noun agent name.
+    Check if value looks like a Unix username rather than a durable Agent id.
 
     This helps detect when hooks or scripts pass $USER instead of the actual agent name.
-    Unix usernames typically:
-    - Are all lowercase
-    - Don't contain capital letters (unlike CamelCase agent names)
-    - Are short (3-12 chars typically)
-    - Often match common first name patterns
+    Unix usernames are commonly one short lowercase alphanumeric component,
+    whereas canonical durable Agent ids have four explicit hyphenated parts.
     """
     v = value.strip()
     if not v:
         return False
 
-    # Agent names are PascalCase (e.g., "GreenLake"), usernames are usually all lowercase
-    # If there are no uppercase letters and it's a single "word", it's likely a username
-    if v.islower() and v.isalnum() and 2 <= len(v) <= 16:
-        # Additional check: if it doesn't match any adjective or noun, more likely a username
-        from mcp_agent_mail.utils import ADJECTIVES, NOUNS
-        if v.lower() not in {a.lower() for a in ADJECTIVES} and v.lower() not in {n.lower() for n in NOUNS}:
-            return True
-
-    return False
+    # A lowercase single word cannot be a canonical client-os-host-slot id.
+    return v.islower() and v.isalnum() and 2 <= len(v) <= 16
 
 
 def _detect_agent_name_mistake(value: str) -> tuple[str, str] | None:
@@ -2765,21 +3245,22 @@ def _detect_agent_name_mistake(value: str) -> tuple[str, str] | None:
         return (
             "PROGRAM_NAME_AS_AGENT",
             f"'{value}' looks like a program name, not an agent name. "
-            f"Agent names must be adjective+noun combinations like 'BlueLake' or 'GreenCastle'. "
-            f"Use the 'program' parameter for program names, and omit 'name' to auto-generate a valid agent name."
+            "Use the 'program' parameter for program names and pass a durable "
+            "client-os-host-slot name such as 'codex-wsl-home-1'."
         )
     if _looks_like_model_name(value):
         return (
             "MODEL_NAME_AS_AGENT",
             f"'{value}' looks like a model name, not an agent name. "
-            f"Agent names must be adjective+noun combinations like 'RedStone' or 'PurpleBear'. "
-            f"Use the 'model' parameter for model names, and omit 'name' to auto-generate a valid agent name."
+            "Use the 'model' parameter for model names and pass a durable "
+            "client-os-host-slot name such as 'claude-linux-ci-1'."
         )
     if _looks_like_email(value):
         return (
             "EMAIL_AS_AGENT",
-            f"'{value}' looks like an email address. Agent names are simple identifiers like 'BlueDog', "
-            f"not email addresses. Check the 'to' parameter format."
+            f"'{value}' looks like an email address. Agent names are durable "
+            "client-os-host-slot identifiers such as 'codex-wsl-home-1', not "
+            "email addresses. Check the 'to' parameter format."
         )
     if _looks_like_broadcast(value):
         return (
@@ -2790,20 +3271,31 @@ def _detect_agent_name_mistake(value: str) -> tuple[str, str] | None:
     if _looks_like_descriptive_name(value):
         return (
             "DESCRIPTIVE_NAME",
-            f"'{value}' looks like a descriptive role name. Agent names must be randomly generated "
-            f"adjective+noun combinations like 'WhiteMountain' or 'BrownCreek', NOT descriptive of the agent's task. "
-            f"Omit the 'name' parameter to auto-generate a valid name."
+            f"'{value}' looks like a descriptive role name. New Agent names must be "
+            "stable client-os-host-slot identities, not task descriptions."
         )
     if _looks_like_unix_username(value):
         return (
             "UNIX_USERNAME_AS_AGENT",
             f"'{value}' looks like a Unix username (possibly from $USER environment variable). "
-            f"Agent names must be adjective+noun combinations like 'BlueLake' or 'GreenCastle'. "
-            f"When you called register_agent, the system likely auto-generated a valid name for you. "
-            f"To find your actual agent name, check the response from register_agent or use "
+            "Agent names must be explicit client-os-host-slot identities. "
+            "To find an existing durable Agent, check its provisioning record or use "
             f"resource://agents/{{project_key}} to list all registered agents in this project."
         )
     return None
+
+
+def _recipient_agent_fragment(value: str) -> str:
+    """Extract the Agent part of either supported qualified recipient syntax."""
+    candidate = value.strip()
+    if candidate.startswith("project:") and "#" in candidate:
+        _project_prefix, _separator, agent_name = candidate.partition("#")
+        return agent_name.strip()
+    if "@" in candidate:
+        agent_name, _separator, project_identifier = candidate.partition("@")
+        if agent_name.strip() and project_identifier.strip():
+            return agent_name.strip()
+    return candidate
 
 
 def _detect_suspicious_file_reservation(pattern: str) -> str | None:
@@ -2887,6 +3379,197 @@ async def _archive_write_lock(archive: ProjectArchive, *, timeout_seconds: float
                 "timeout_seconds": timeout_seconds,
             },
         ) from exc
+
+
+async def _revalidate_project_lifetime_in_session(
+    session: Any,
+    *,
+    project: Project,
+    action: str,
+) -> Project:
+    """Return the exact project row or reject a stale pre-delete snapshot."""
+    if project.id is None:
+        raise ValueError("Project must have an id before lifetime revalidation.")
+    current_project = await session.get(Project, project.id)
+    if (
+        current_project is None
+        or current_project.slug != project.slug
+        or current_project.project_generation != project.project_generation
+    ):
+        raise ToolExecutionError(
+            "PROJECT_IDENTITY_STALE",
+            f"The exact project lifetime no longer exists; refusing {action}.",
+            recoverable=True,
+            data={"project_key": project.human_key, "action": action},
+        )
+    return current_project
+
+
+async def _revalidate_agent_lifetime_in_session(
+    session: Any,
+    *,
+    project: Project,
+    agent: Agent,
+    action: str,
+    execution: AgentExecution | None = None,
+    require_active_execution: bool = False,
+    touch_execution_ts: datetime | None = None,
+) -> tuple[Project, Agent, AgentExecution | None]:
+    """Revalidate immutable project, Agent and optional execution lifetimes."""
+    current_project = await _revalidate_project_lifetime_in_session(
+        session,
+        project=project,
+        action=action,
+    )
+    if agent.id is None:
+        raise ValueError("Agent must have an id before lifetime revalidation.")
+    current_agent = await session.get(Agent, agent.id)
+    if (
+        current_agent is None
+        or current_agent.project_id != project.id
+        or current_agent.name != agent.name
+        or current_agent.agent_generation != agent.agent_generation
+    ):
+        raise ToolExecutionError(
+            "AGENT_IDENTITY_STALE",
+            f"The exact Agent lifetime no longer exists; refusing {action}.",
+            recoverable=True,
+            data={
+                "project_key": project.human_key,
+                "agent_name": agent.name,
+                "action": action,
+            },
+        )
+
+    current_execution: AgentExecution | None = None
+    if execution is not None:
+        current_execution = await session.get(AgentExecution, execution.id)
+        if (
+            current_execution is None
+            or current_execution.project_id != project.id
+            or current_execution.agent_id != agent.id
+        ):
+            raise ToolExecutionError(
+                "EXECUTION_OWNERSHIP_MISMATCH",
+                f"The exact execution lifetime no longer belongs to the Agent; refusing {action}.",
+                recoverable=False,
+                data={"execution_id": execution.id, "action": action},
+            )
+        if require_active_execution and current_execution.status != "active":
+            raise ToolExecutionError(
+                "EXECUTION_NOT_ACTIVE",
+                f"Agent execution '{execution.id}' is '{current_execution.status}', not active.",
+                recoverable=True,
+                data={
+                    "execution_id": execution.id,
+                    "status": current_execution.status,
+                    "action": action,
+                },
+            )
+        if touch_execution_ts is not None and current_execution.status == "active":
+            current_execution.last_active_ts = touch_execution_ts
+            session.add(current_execution)
+    return current_project, current_agent, current_execution
+
+
+async def _revalidate_agent_profile_lifetime(
+    *,
+    project: Project,
+    agent: Agent,
+) -> Agent:
+    """Return the current row only while the exact project/Agent lifetime exists.
+
+    Callers invoke this while holding the project's archive lock immediately
+    before publishing ``profile.json``. Revalidating the opaque project and
+    Agent generations prevents a queued DB-first writer from publishing an
+    artifact for a superseded lifetime during controlled maintenance.
+    """
+    if project.id is None or agent.id is None:
+        raise ValueError("Project and Agent must have ids before publishing a profile.")
+    async with get_session() as session:
+        _current_project, current_agent, _current_execution = (
+            await _revalidate_agent_lifetime_in_session(
+                session,
+                project=project,
+                agent=agent,
+                action="archive profile publication",
+            )
+        )
+        return current_agent
+
+
+async def _rollback_created_agent_lifetime(
+    *,
+    project: Project,
+    agent: Agent,
+) -> None:
+    """Remove only the exact just-created lifetime after profile publication fails."""
+    if project.id is None or agent.id is None:
+        return
+    async with get_immediate_session() as session:
+        current_project = await session.get(Project, project.id)
+        current_agent = await session.get(Agent, agent.id)
+        if (
+            current_project is None
+            or current_project.project_generation != project.project_generation
+            or current_agent is None
+            or current_agent.project_id != project.id
+            or current_agent.agent_generation != agent.agent_generation
+            or current_agent.provisioning_state != "provisioning"
+        ):
+            return
+        await session.delete(current_agent)
+        await session.commit()
+
+
+async def _activate_provisioned_agent_lifetime(
+    *,
+    project: Project,
+    agent: Agent,
+) -> Agent:
+    """Publish one exact Agent lifetime after its token and profile exist."""
+    if project.id is None or agent.id is None:
+        raise ValueError("Project and Agent must have ids before activation.")
+    async with get_immediate_session() as session:
+        current_project = await session.get(Project, project.id)
+        current_agent = await session.get(Agent, agent.id)
+        if (
+            current_project is None
+            or current_project.slug != project.slug
+            or current_project.project_generation != project.project_generation
+            or current_agent is None
+            or current_agent.project_id != project.id
+            or current_agent.name != agent.name
+            or current_agent.agent_generation != agent.agent_generation
+        ):
+            raise ToolExecutionError(
+                "AGENT_IDENTITY_STALE",
+                "The exact provisioning Agent lifetime no longer exists.",
+                recoverable=True,
+                data={"project_key": project.human_key, "agent_name": agent.name},
+            )
+        if current_agent.provisioning_state != "provisioning":
+            raise ToolExecutionError(
+                "AGENT_PROVISIONING_STATE_INVALID",
+                "The Agent lifetime is no longer awaiting activation.",
+                recoverable=False,
+                data={
+                    "project_key": project.human_key,
+                    "agent_name": agent.name,
+                    "provisioning_state": current_agent.provisioning_state,
+                },
+            )
+        if not (current_agent.registration_token or "").strip():
+            raise ToolExecutionError(
+                "AGENT_PROVISIONING_TOKEN_MISSING",
+                "The Agent cannot be activated without its registration credential.",
+                recoverable=False,
+                data={"project_key": project.human_key, "agent_name": agent.name},
+            )
+        current_agent.provisioning_state = "active"
+        session.add(current_agent)
+        await session.commit()
+        return current_agent
 
 
 async def _read_file_preview(path: Path, *, max_chars: int) -> str:
@@ -3021,7 +3704,11 @@ async def refresh_project_sibling_suggestions(*, max_pairs: int = _PROJECT_SIBLI
         if len(projects) < 2:
             return
 
-        agents_rows = await session.execute(select(Agent.project_id, Agent.name))
+        agents_rows = await session.execute(
+            select(Agent.project_id, Agent.name).where(
+                cast(Any, Agent.provisioning_state == "active")
+            )
+        )
         agent_map: dict[int, list[str]] = defaultdict(list)
         for proj_id, name in agents_rows.fetchall():
             agent_map[int(proj_id)].append(name)
@@ -3174,7 +3861,8 @@ async def update_project_sibling_status(project_id: int, other_id: int, status: 
             project_map = {proj.id: proj for proj in projects if proj.id is not None}
             agents_rows = await session.execute(
                 select(Agent.project_id, Agent.name).where(
-                    or_(Agent.project_id == pair[0], cast(Any, Agent.project_id) == pair[1])
+                    or_(Agent.project_id == pair[0], cast(Any, Agent.project_id) == pair[1]),
+                    cast(Any, Agent.provisioning_state == "active"),
                 )
             )
             agent_map: dict[int, list[str]] = defaultdict(list)
@@ -3338,54 +4026,34 @@ async def _generate_unique_agent_name(
     async def available(candidate: str) -> bool:
         if await _agent_name_exists(project, candidate):
             return False
-        if await get_identity_rename_tombstone(archive, candidate) is not None:
-            return False
-        candidate_path = archive.root / "agents" / candidate
-        return not await asyncio.to_thread(candidate_path.exists)
+        # The database and permanent rename tombstones own identity.  A profile
+        # is a projection and can outlive a failed pre-activation attempt; it
+        # must not burn the durable name after the provisioning row rolls back.
+        return await get_identity_rename_tombstone(archive, candidate) is None
 
-    mode = getattr(settings, "agent_name_enforcement_mode", "coerce").lower()
-    if name_hint:
-        # A structurally valid explicit ID is an address chosen by the caller,
-        # not a natural-language display name.  Model-name substring guesses
-        # must not silently replace addresses such as host-linux-claude-1.
-        _is_reserved = _looks_like_program_name(name_hint)
-        if mode == "always_auto":
-            pass  # skip all caller-supplied names, fall through to auto-gen
-        elif validate_explicit_agent_id(name_hint) and not _is_reserved:
-            # Caller supplied a valid explicit identity (e.g. "alpha-one",
-            # "cc-0", "worker_42").  Honor it in strict/coerce modes (#140).
-            if not await available(name_hint):
-                if mode == "strict":
-                    raise ValueError(f"Agent identity '{name_hint}' is already in use.")
-                # coerce: fall through to auto-gen
-            else:
-                return name_hint
-        else:
-            # Not a valid explicit ID — try legacy adjective+noun path
-            sanitized = sanitize_agent_name(name_hint)
-            if sanitized:
-                if validate_agent_name_format(sanitized):
-                    if not await available(sanitized):
-                        if mode == "strict":
-                            raise ValueError(f"Agent name '{sanitized}' is already in use.")
-                    else:
-                        return sanitized
-                else:
-                    if mode == "strict":
-                        raise ValueError(
-                            f"Invalid agent name format: '{sanitized}'. "
-                            f"Use an explicit identity (e.g., 'alpha-one', 'cc-0') "
-                            f"or omit the name to auto-generate an adjective+noun name."
-                        )
-            else:
-                if mode == "strict":
-                    raise ValueError("Name hint must contain alphanumeric characters.")
-
-    for _ in range(1024):
-        candidate = sanitize_agent_name(generate_agent_name())
-        if candidate and await available(candidate):
-            return candidate
-    raise RuntimeError("Unable to generate a unique agent name.")
+    if not name_hint:
+        raise ToolExecutionError(
+            "NAME_REQUIRED",
+            "A durable Agent requires an explicit client-os-host-slot identity.",
+            data={"field": "name"},
+        )
+    candidate = name_hint.strip()
+    if not validate_client_platform_host_agent_id(candidate):
+        raise ToolExecutionError(
+            "INVALID_DURABLE_AGENT_NAME",
+            (
+                f"New durable Agent '{candidate}' must match client-os-host-slot, "
+                "for example 'codex-wsl-home-1'."
+            ),
+            data={"provided_name": candidate},
+        )
+    if not await available(candidate):
+        raise ToolExecutionError(
+            "AGENT_ALREADY_EXISTS",
+            f"Agent identity '{candidate}' is already in use.",
+            data={"provided_name": candidate},
+        )
+    return candidate
 
 
 async def _create_agent_record(
@@ -3394,21 +4062,30 @@ async def _create_agent_record(
     program: str,
     model: str,
     task_description: str,
+    registration_token: str,
+    attachments_policy: str,
 ) -> Agent:
     if project.id is None:
         raise ValueError("Project must have an id before creating agents.")
     await ensure_schema()
-    async with get_session() as session:
+    async with get_immediate_session() as session:
+        await _revalidate_project_lifetime_in_session(
+            session,
+            project=project,
+            action="Agent creation",
+        )
         agent = Agent(
             project_id=project.id,
             name=name,
             program=program,
             model=model,
             task_description=task_description,
+            attachments_policy=attachments_policy,
+            registration_token=registration_token,
+            provisioning_state="provisioning",
         )
         session.add(agent)
         await session.commit()
-        await session.refresh(agent)
         return agent
 
 
@@ -3421,8 +4098,11 @@ async def _get_or_create_agent(
     settings: Settings,
     *,
     registration_token_on_create: str | None = None,
+    attachments_policy: str | None = None,
     update_existing: bool = True,
     expected_existing_agent_id: int | None = None,
+    expected_existing_agent_generation: str | None = None,
+    expected_project_generation: str | None = None,
 ) -> tuple[Agent, bool]:
     if project.id is None:
         raise ValueError("Project must have an id before creating agents.")
@@ -3448,88 +4128,61 @@ async def _get_or_create_agent(
             },
         )
 
-    # Check the caller's address before enforcement, model-name heuristics or
-    # always-auto mode can transform it.  A tombstoned old address must never
-    # be laundered into a fresh random Agent row.
-    if name is not None and name.strip():
-        await reject_renamed_identity(name.strip())
+    if name is None or not name.strip():
+        raise ToolExecutionError(
+            "NAME_REQUIRED",
+            (
+                "A durable Agent requires an explicit stable name. Random "
+                "adjective+noun identities are no longer generated; use a "
+                "client-os-host-slot identity such as 'codex-wsl-home-1'."
+            ),
+            recoverable=True,
+            data={"field": "name"},
+        )
+    requested_name = name.strip()
+    await reject_renamed_identity(requested_name)
+    if not validate_thread_id_format(requested_name):
+        raise ToolExecutionError(
+            "INVALID_AGENT_NAME",
+            (
+                f"Invalid agent name '{requested_name}'. Use a stable explicit "
+                "identifier containing '-', '_' or '.', such as "
+                "'codex-wsl-home-1'."
+            ),
+            recoverable=True,
+            data={
+                "provided_name": requested_name,
+                "valid_examples": ["codex-wsl-home-1", "claude-linux-ci-1"],
+            },
+        )
 
-    mode = getattr(settings, "agent_name_enforcement_mode", "coerce").lower()
-    explicit_name_used = False
+    desired_name = requested_name
+    explicit_name_used = True
     window_uuid = getattr(settings, "window_identity_uuid", "") or ""
     ttl_days = getattr(settings, "window_identity_ttl_days", 30)
     window_identity: Optional[WindowIdentity] = None
-
-    # Priority chain per bead bd-1tz:
-    # 1. Explicit agent_name parameter -> use as-is (highest priority)
-    # 2. MCP_AGENT_MAIL_WINDOW_ID set + window identity exists -> use window display_name
-    # 3. MCP_AGENT_MAIL_WINDOW_ID set + window identity NOT in DB -> create new, use generated name
-    # 4. No window ID, no explicit name -> auto-generate (current behavior)
-
-    if mode == "always_auto" and not window_uuid:
-        desired_name = await _generate_unique_agent_name(project, settings, None)
-    elif name is not None and mode != "always_auto":
-        # Priority 1: Explicit name/identity provided
-        _is_reserved = _looks_like_program_name(name)
-        if validate_explicit_agent_id(name) and not _is_reserved:
-            # Caller supplied a valid explicit identity (e.g. "alpha-one",
-            # "cc-0", "worker_42") — honor it directly (#140).
-            desired_name = name
-            explicit_name_used = True
-        else:
-            # Legacy adjective+noun path
-            sanitized = sanitize_agent_name(name)
-            if not sanitized:
-                if mode == "strict":
-                    raise ValueError("Agent name must contain alphanumeric characters.")
-                desired_name = await _generate_unique_agent_name(project, settings, None)
-            elif validate_agent_name_format(sanitized):
-                desired_name = sanitized
-                explicit_name_used = True
-            else:
-                if mode == "strict":
-                    mistake = _detect_agent_name_mistake(sanitized)
-                    if mistake:
-                        raise ToolExecutionError(
-                            mistake[0],
-                            mistake[1],
-                            recoverable=True,
-                            data={"provided_name": sanitized, "valid_examples": ["BlueLake", "GreenCastle", "RedStone", "alpha-one", "cc-0"]},
-                        )
-                    raise ToolExecutionError(
-                        "INVALID_AGENT_NAME",
-                        f"Invalid agent name format: '{sanitized}'. "
-                        f"Use an explicit identity (e.g., 'alpha-one', 'cc-0') "
-                        f"or omit the 'name' parameter to auto-generate a valid name.",
-                        recoverable=True,
-                        data={"provided_name": sanitized, "valid_examples": ["BlueLake", "GreenCastle", "RedStone", "alpha-one", "cc-0"]},
-                    )
-                desired_name = await _generate_unique_agent_name(project, settings, None)
-    elif window_uuid:
-        # Priority 2/3: Window identity resolution
-        if not _validate_window_uuid(window_uuid):
-            logger.warning("MCP_AGENT_MAIL_WINDOW_ID is not a valid UUID: %s", window_uuid)
-            desired_name = await _generate_unique_agent_name(project, settings, None)
-        else:
-            window_identity = await _get_window_identity(project, window_uuid)
-            if window_identity:
-                # Priority 2: existing window identity -> reuse its display_name
-                desired_name = window_identity.display_name
-                explicit_name_used = True  # treat as explicit to avoid collision retries
-                await _touch_window_identity(window_identity, ttl_days)
-            else:
-                # Priority 3: new window identity -> generate name and create identity
-                desired_name = await _generate_unique_agent_name(project, settings, None)
-                window_identity = await _create_window_identity(
-                    project, window_uuid, desired_name, ttl_days,
-                )
-    else:
-        # Priority 4: no name, no window ID -> auto-generate
-        desired_name = await _generate_unique_agent_name(project, settings, None)
     await reject_renamed_identity(desired_name)
     await ensure_schema()
     newly_created = False
-    async with get_session() as session:
+    existing_update_pending = False
+    async with get_immediate_session() as session:
+        current_project = await session.get(Project, project.id)
+        if (
+            current_project is None
+            or current_project.slug != project.slug
+            or current_project.project_generation != project.project_generation
+            or (
+                expected_project_generation is not None
+                and current_project.project_generation
+                != expected_project_generation
+            )
+        ):
+            raise ToolExecutionError(
+                "PROJECT_IDENTITY_STALE",
+                "The authenticated project lifetime no longer exists.",
+                recoverable=True,
+                data={"project_key": project.human_key},
+            )
         for _attempt in range(5):
             # Use case-insensitive matching to be consistent with _agent_name_exists() and _get_agent()
             result = await session.execute(
@@ -3540,27 +4193,33 @@ async def _get_or_create_agent(
             )
             agent = result.scalars().first()
             if agent:
-                if not explicit_name_used:
-                    # A generated name became occupied after the availability
-                    # check.  It is not an idempotent request for that identity;
-                    # select another name instead of authenticating as, or
-                    # updating, the concurrent winner.
-                    desired_name = await _generate_unique_agent_name(project, settings, None)
-                    continue
-                if expected_existing_agent_id is not None and agent.id != expected_existing_agent_id:
+                if (
+                    expected_existing_agent_id is not None
+                    and agent.id != expected_existing_agent_id
+                ) or (
+                    expected_existing_agent_generation is not None
+                    and agent.agent_generation
+                    != expected_existing_agent_generation
+                ):
                     raise RuntimeError(
-                        f"Agent identity '{desired_name}' changed while registration was authenticated."
+                        f"Agent lifetime '{desired_name}' changed while registration was authenticated."
                     )
                 if not update_existing:
                     return agent, False
-                agent.program = program
-                agent.model = model
-                agent.task_description = task_description
-                agent.last_active_ts = _naive_utc()
-                session.add(agent)
-                await session.commit()
-                await session.refresh(agent)
+                existing_update_pending = True
                 break
+
+            if not validate_client_platform_host_agent_id(desired_name):
+                raise ToolExecutionError(
+                    "INVALID_DURABLE_AGENT_NAME",
+                    (
+                        f"New durable Agent '{desired_name}' must match "
+                        "client-os-host-slot, for example 'codex-wsl-home-1'. "
+                        "Existing legacy identities remain authenticatable."
+                    ),
+                    recoverable=True,
+                    data={"provided_name": desired_name},
+                )
 
             candidate = Agent(
                 project_id=project.id,
@@ -3568,16 +4227,20 @@ async def _get_or_create_agent(
                 program=program,
                 model=model,
                 task_description=task_description,
+                attachments_policy=attachments_policy or "auto",
                 registration_token=registration_token_on_create,
+                provisioning_state="provisioning",
             )
-            if expected_existing_agent_id is not None:
+            if (
+                expected_existing_agent_id is not None
+                or expected_existing_agent_generation is not None
+            ):
                 raise NoResultFound(
                     f"Authenticated agent id '{expected_existing_agent_id}' no longer exists."
                 )
             session.add(candidate)
             try:
                 await session.commit()
-                await session.refresh(candidate)
                 agent = candidate
                 newly_created = True
                 break
@@ -3597,47 +4260,103 @@ async def _get_or_create_agent(
                     agent = result.scalars().first()
                     if agent is None:
                         raise
-                    if expected_existing_agent_id is not None and agent.id != expected_existing_agent_id:
+                    if (
+                        expected_existing_agent_id is not None
+                        and agent.id != expected_existing_agent_id
+                    ) or (
+                        expected_existing_agent_generation is not None
+                        and agent.agent_generation
+                        != expected_existing_agent_generation
+                    ):
                         raise RuntimeError(
-                            f"Agent identity '{desired_name}' changed while registration was authenticated."
+                            f"Agent lifetime '{desired_name}' changed while registration was authenticated."
                         ) from None
                     if not update_existing:
                         return agent, False
-                    agent.program = program
-                    agent.model = model
-                    agent.task_description = task_description
-                    agent.last_active_ts = _naive_utc()
-                    session.add(agent)
-                    await session.commit()
-                    await session.refresh(agent)
+                    existing_update_pending = True
                     break
 
-                # Auto-generated name collision under concurrency: pick a new name and retry.
-                desired_name = await _generate_unique_agent_name(project, settings, None)
-                continue
+                raise
         else:
             raise RuntimeError("Failed to create a unique agent after multiple retries.")
-    # Post-creation: associate explicit-name agents with window identity and
-    # enrich the archive profile.  We consolidate into a single block to avoid
-    # redundant DB lookups (window_identity may already be set from the
-    # priority-chain resolution above).
-    if window_uuid and _validate_window_uuid(window_uuid) and window_identity is None and explicit_name_used:
-        # Explicit name was used with a window UUID — look up / create association
-        window_identity = await _get_window_identity(project, window_uuid)
-        if window_identity is None:
-            window_identity = await _create_window_identity(
-                project, window_uuid, agent.name, ttl_days,
-            )
-        else:
-            await _touch_window_identity(window_identity, ttl_days)
-
-    agent_dict = _agent_to_dict(agent)
-    if window_identity is not None:
-        agent_dict["window_id"] = window_identity.window_uuid
-        agent_dict["window_display_name"] = window_identity.display_name
     try:
+        # Associate explicit-name agents with their optional window identity
+        # before profile publication and activation.  This belongs inside the
+        # provisioning failure boundary: a failed window lookup must not leave
+        # an undiscoverable row holding the durable name and its one-time token.
+        if (
+            window_uuid
+            and _validate_window_uuid(window_uuid)
+            and window_identity is None
+            and explicit_name_used
+        ):
+            window_identity = await _get_window_identity(project, window_uuid)
+            if window_identity is None:
+                window_identity = await _create_window_identity(
+                    project,
+                    window_uuid,
+                    agent.name,
+                    ttl_days,
+                )
+            else:
+                await _touch_window_identity(window_identity, ttl_days)
+
         async with _archive_write_lock(archive):
-            await write_agent_profile(archive, agent_dict)
+            if existing_update_pending:
+                # Keep an authenticated metadata update and its Git profile in
+                # one failure boundary.  The immediate transaction is not
+                # committed until profile publication succeeds, so a failed
+                # publication leaves both stores on the previous version.
+                async with get_immediate_session() as session:
+                    _db_project, db_agent, _db_execution = (
+                        await _revalidate_agent_lifetime_in_session(
+                            session,
+                            project=project,
+                            agent=agent,
+                            action="authenticated Agent profile update",
+                        )
+                    )
+                    previous_agent_dict = _agent_to_dict(db_agent)
+                    db_agent.program = program
+                    db_agent.model = model
+                    db_agent.task_description = task_description
+                    if attachments_policy is not None:
+                        db_agent.attachments_policy = attachments_policy
+                    db_agent.last_active_ts = _naive_utc()
+                    session.add(db_agent)
+                    agent_dict = _agent_to_dict(db_agent)
+                    if window_identity is not None:
+                        for profile in (previous_agent_dict, agent_dict):
+                            profile["window_id"] = window_identity.window_uuid
+                            profile["window_display_name"] = (
+                                window_identity.display_name
+                            )
+                    try:
+                        await write_agent_profile(archive, agent_dict)
+                        await session.commit()
+                    except Exception:
+                        # write_agent_profile commits independently of SQLite.
+                        # Restore the prior projection if a later DB step fails;
+                        # a pre-write failure makes this an idempotent rewrite.
+                        with suppress(Exception):
+                            await write_agent_profile(archive, previous_agent_dict)
+                        raise
+                    agent = db_agent
+            else:
+                profile_agent = await _revalidate_agent_profile_lifetime(
+                    project=project,
+                    agent=agent,
+                )
+                agent_dict = _agent_to_dict(profile_agent)
+                if window_identity is not None:
+                    agent_dict["window_id"] = window_identity.window_uuid
+                    agent_dict["window_display_name"] = window_identity.display_name
+                await write_agent_profile(archive, agent_dict)
+        if newly_created:
+            agent = await _activate_provisioned_agent_lifetime(
+                project=project,
+                agent=agent,
+            )
     except Exception:
         # Roll back the DB record if the archive write fails and we just
         # created the agent.  This keeps the two stores consistent so the
@@ -3645,11 +4364,10 @@ async def _get_or_create_agent(
         # the DB (issue #121).
         if newly_created:
             with suppress(Exception):
-                async with get_session() as rollback_session:
-                    db_agent = await rollback_session.get(Agent, agent.id)
-                    if db_agent:
-                        await rollback_session.delete(db_agent)
-                        await rollback_session.commit()
+                await _rollback_created_agent_lifetime(
+                    project=project,
+                    agent=agent,
+                )
         raise
     return agent, newly_created
 
@@ -3684,7 +4402,8 @@ async def _get_agent(project: Project, name: str) -> Agent:
                 "CONFIGURATION_ERROR",
                 f"Detected placeholder value '{name}' instead of a real agent name. "
                 f"This typically means a hook or integration script hasn't been configured yet. "
-                f"Replace placeholder values with your actual agent name (e.g., 'BlueMountain').",
+                "Replace placeholder values with your durable Agent name "
+                "(for example, 'codex-wsl-home-1').",
                 recoverable=True,
                 data={
                     "parameter": "agent_name",
@@ -3696,7 +4415,11 @@ async def _get_agent(project: Project, name: str) -> Agent:
 
     async with get_session() as session:
         result = await session.execute(
-            select(Agent).where(Agent.project_id == project.id, func.lower(Agent.name) == name.lower())
+            select(Agent).where(
+                Agent.project_id == project.id,
+                func.lower(Agent.name) == name.lower(),
+                Agent.provisioning_state == "active",
+            )
         )
         agent = result.scalars().first()
         if agent:
@@ -3736,7 +4459,8 @@ async def _get_agent(project: Project, name: str) -> Agent:
             mistake[0] if mistake else "NOT_FOUND",
             f"Agent '{name}' not found in project '{project.human_key}'. "
             f"Available agents: {agents_list}{more_text}. "
-            f"Use register_agent to create a new agent identity.{mistake_hint}",
+            "Only a durable parent client or operator may provision a missing "
+            f"mailbox with register_agent; native subagents report through their parent.{mistake_hint}",
             recoverable=True,
             data={
                 "agent_name": name,
@@ -3750,8 +4474,10 @@ async def _get_agent(project: Project, name: str) -> Agent:
         raise ToolExecutionError(
             mistake[0] if mistake else "NOT_FOUND",
             f"Agent '{name}' not found. Project '{project.human_key}' has no registered agents yet. "
-            f"Use register_agent to create an agent identity first (omit 'name' to auto-generate a valid one). "
-            f"Example: register_agent(project_key='{project.slug}', program='claude-code', model='opus-4'){mistake_hint}",
+            "A durable parent client or operator must provision an explicit "
+            "mailbox first; native subagents report through their parent. "
+            f"Example: register_agent(project_key='{project.slug}', program='claude-code', "
+            f"model='opus-4', name='claude-linux-ci-1'){mistake_hint}",
             recoverable=True,
             data={"agent_name": name, "project": project.slug, "available_agents": [], "mistake_type": mistake[0] if mistake else None},
         )
@@ -3767,47 +4493,75 @@ async def _find_agent_optional(project: Project, name: str | None) -> Agent | No
             select(Agent).where(
                 cast(Any, Agent.project_id == project.id),
                 cast(Any, func.lower(Agent.name) == name.lower()),
+                cast(Any, Agent.provisioning_state == "active"),
             )
         )
         return result.scalars().first()
+
+
+def _target_registration_required_error(
+    project: Project,
+    target_name: str,
+) -> ToolExecutionError:
+    """Explain the ownership boundary for a missing contact recipient."""
+    return ToolExecutionError(
+        "TARGET_NOT_REGISTERED",
+        f"Target Agent '{target_name}' is not registered in project "
+        f"'{project.human_key}'. The target must self-register, or an operator "
+        "must explicitly provision its durable mailbox, before another Agent "
+        "can request contact.",
+        recoverable=True,
+        data={
+            "agent_name": target_name,
+            "project": project.slug,
+            "required_action": "target_self_register_or_operator_provision",
+        },
+    )
 
 
 async def _ensure_agent_registration_token(
     agent: Agent,
     *,
     rotate: bool = False,
+    project: Project | None = None,
 ) -> tuple[Agent, str]:
     """Atomically ensure an agent has one stable registration token.
 
     Concurrent session starts may all observe an identity whose token has not
-    been initialized yet.  The conditional ``UPDATE`` is the compare-and-set:
-    only the first transaction may replace NULL/empty, and every contender
-    then reloads and returns the database winner.  This uses ordinary SQL that
-    has the same row-lock/recheck semantics on SQLite and PostgreSQL.
+    been initialized yet.  An IMMEDIATE transaction serializes initialization
+    and revalidates the immutable Agent generation before reading or returning
+    any credential.  A deleted-and-recreated row can therefore never disclose
+    its token to a caller authenticated for the predecessor lifetime.
     """
     if agent.id is None:
         raise ValueError("Agent must have an id before ensuring a registration token.")
 
     candidate = secrets.token_urlsafe(32)
-    async with get_session() as session:
-        statement = update(Agent).where(cast(Any, Agent.id == agent.id))
-        if not rotate:
-            statement = statement.where(
-                or_(
-                    cast(Any, Agent.registration_token).is_(None),
-                    cast(Any, Agent.registration_token == ""),
-                )
+    async with get_immediate_session() as session:
+        db_agent = await session.get(Agent, agent.id)
+        if (
+            db_agent is None
+            or db_agent.project_id != agent.project_id
+            or db_agent.name != agent.name
+            or db_agent.agent_generation != agent.agent_generation
+        ):
+            raise ToolExecutionError(
+                "AGENT_IDENTITY_STALE",
+                "The exact Agent lifetime no longer exists; refusing registration-token access.",
+                recoverable=True,
+                data={"agent_name": agent.name},
             )
-        await session.execute(statement.values(registration_token=candidate))
+        if project is not None:
+            await _revalidate_project_lifetime_in_session(
+                session,
+                project=project,
+                action="registration-token access",
+            )
+        if rotate or not db_agent.registration_token:
+            db_agent.registration_token = candidate
+            session.add(db_agent)
         await session.commit()
-
-        db_agent = (
-            await session.execute(
-                select(Agent).where(cast(Any, Agent.id == agent.id))
-            )
-        ).scalar_one_or_none()
-        if db_agent is None:
-            raise NoResultFound(f"Agent id '{agent.id}' no longer exists.")
+        await session.refresh(db_agent)
         token = db_agent.registration_token
         if not token:
             raise RuntimeError(f"Agent id '{agent.id}' still has no registration token.")
@@ -3866,7 +4620,11 @@ async def _get_agents_batch(project: Project, names: Sequence[str]) -> dict[str,
 
     async with get_session() as session:
         result = await session.execute(
-            select(Agent).where(Agent.project_id == project.id, func.lower(Agent.name).in_(lowered_names))
+            select(Agent).where(
+                Agent.project_id == project.id,
+                func.lower(Agent.name).in_(lowered_names),
+                Agent.provisioning_state == "active",
+            )
         )
         agents = result.scalars().all()
 
@@ -3924,7 +4682,11 @@ async def _get_agents_batch_lenient(project: Project, names: Sequence[str]) -> d
 
     async with get_session() as session:
         result = await session.execute(
-            select(Agent).where(Agent.project_id == project.id, func.lower(Agent.name).in_(lowered_names))
+            select(Agent).where(
+                Agent.project_id == project.id,
+                func.lower(Agent.name).in_(lowered_names),
+                Agent.provisioning_state == "active",
+            )
         )
         agents = result.scalars().all()
 
@@ -3944,6 +4706,7 @@ async def _get_agents_batch_lenient(project: Project, names: Sequence[str]) -> d
 async def _create_file_reservation(
     project: Project,
     agent: Agent,
+    execution: AgentExecution,
     path: str,
     exclusive: bool,
     reason: str,
@@ -3957,6 +4720,7 @@ async def _create_file_reservation(
         file_reservation = FileReservation(
             project_id=project.id,
             agent_id=agent.id,
+            execution_id=execution.id,
             path_pattern=path,
             exclusive=exclusive,
             reason=reason,
@@ -3965,6 +4729,7 @@ async def _create_file_reservation(
         session.add(file_reservation)
         await session.commit()
         await session.refresh(file_reservation)
+    await _reconcile_pending_file_reservation_artifacts(project)
     return file_reservation
 
 
@@ -3980,6 +4745,8 @@ def _file_reservation_payload(
     branch: Optional[str] = None,
     worktree: Optional[str] = None,
     reason_override: Optional[str] = None,
+    execution_status: Optional[str] = None,
+    ancestor_execution_ids: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Build a normalized payload for Git archive file_reservation records.
 
@@ -4002,11 +4769,22 @@ def _file_reservation_payload(
         # still link the row back to the deleted Agent row.
         "agent": agent.name if agent is not None else None,
         "agent_id": reservation.agent_id,
+        "execution_id": reservation.execution_id,
+        "ancestor_execution_ids": list(ancestor_execution_ids),
+        "execution_status": execution_status,
+        "origin": reservation.origin,
+        "orphaned": agent is None
+        or (
+            reservation.execution_id is not None
+            and execution_status != "active"
+        ),
+        "legacy_unscoped": reservation.execution_id is None,
         "path_pattern": reservation.path_pattern,
         "exclusive": reservation.exclusive,
         "reason": reason_override if reason_override is not None else reservation.reason,
         "created_ts": _iso(reservation.created_ts),
         "expires_ts": _iso(expires_dt) if expires_dt else _iso(reservation.expires_ts),
+        "archive_revision": reservation.archive_revision,
     }
     if released_dt is not None:
         payload["released_ts"] = _iso(released_dt)
@@ -4026,6 +4804,8 @@ async def _write_file_reservation_records(
     archive: ProjectArchive | None = None,
     archive_locked: bool = False,
     reason_override: Optional[str] = None,
+    branch_override: Optional[str] = None,
+    worktree_override: Optional[str] = None,
 ) -> None:
     if not records:
         return
@@ -4034,16 +4814,59 @@ async def _write_file_reservation_records(
     settings = get_settings()
     target_archive = archive or await ensure_archive(settings, project.slug)
 
-    async def _write_all() -> None:
-        payloads = [
-            _file_reservation_payload(
-                project,
-                reservation,
-                agent,
-                reason_override=reason_override,
+    execution_by_id: dict[str, AgentExecution] = {}
+    referenced_execution_ids = [
+        reservation.execution_id
+        for reservation, _agent in records
+        if reservation.execution_id is not None
+    ]
+    if referenced_execution_ids:
+        if project.id is None:
+            raise ValueError("Project must have an id before writing reservation records.")
+        async with get_session() as session:
+            executions = await _load_execution_lineage_rows(
+                session,
+                referenced_execution_ids,
+                project_id=project.id,
             )
-            for reservation, agent in records
-        ]
+        execution_by_id = {execution.id: execution for execution in executions}
+
+    async def _write_all() -> None:
+        payloads: list[dict[str, Any]] = []
+        for reservation, agent in records:
+            execution = (
+                execution_by_id.get(reservation.execution_id)
+                if reservation.execution_id is not None
+                else None
+            )
+            payloads.append(
+                _file_reservation_payload(
+                    project,
+                    reservation,
+                    agent,
+                    branch=(
+                        branch_override
+                        or (execution.branch if execution is not None else None)
+                    ),
+                    worktree=(
+                        worktree_override
+                        or (
+                            execution.worktree_path
+                            if execution is not None
+                            else None
+                        )
+                    ),
+                    reason_override=reason_override,
+                    execution_status=(execution.status if execution is not None else None),
+                    ancestor_execution_ids=(
+                        _execution_ancestor_ids(
+                            list(execution_by_id.values()), execution
+                        )
+                        if execution is not None
+                        else ()
+                    ),
+                )
+            )
         await write_file_reservation_records(target_archive, payloads)
 
     if archive_locked:
@@ -4052,6 +4875,112 @@ async def _write_file_reservation_records(
 
     async with _archive_write_lock(target_archive):
         await _write_all()
+
+
+async def _ack_file_reservation_archive_revisions(
+    revisions: Sequence[tuple[int, int]],
+) -> int:
+    """Acknowledge only reservation revisions that still match the written snapshot."""
+    if not revisions:
+        return 0
+    acknowledged = 0
+    async with get_immediate_session() as session:
+        for reservation_id, archive_revision in revisions:
+            result = await session.execute(
+                update(FileReservation)
+                .where(
+                    cast(Any, FileReservation.id) == reservation_id,
+                    cast(Any, FileReservation.archive_revision)
+                    == archive_revision,
+                    cast(Any, FileReservation.archive_synced_revision)
+                    < archive_revision,
+                )
+                .values(archive_synced_revision=archive_revision)
+            )
+            acknowledged += int(getattr(result, "rowcount", 0) or 0)
+        await session.commit()
+    return acknowledged
+
+
+async def _reconcile_pending_file_reservation_artifacts(
+    project: Project,
+    *,
+    archive: ProjectArchive | None = None,
+    archive_locked: bool = False,
+) -> int:
+    """Publish and exactly acknowledge all pending reservation artifact revisions.
+
+    The archive lock serializes writers, while the conditional DB acknowledgement
+    prevents a concurrent mutation from being falsely marked as published. If a
+    mutation wins between the snapshot and acknowledgement, the loop reloads and
+    writes its newer revision before returning.
+    """
+    if project.id is None:
+        raise ValueError("Project must have an id before reconciling file reservations.")
+    if archive_locked and archive is None:
+        raise ValueError("archive_locked=True requires a provided archive")
+    target_archive = archive or await ensure_archive(get_settings(), project.slug)
+
+    async def _reconcile_locked() -> int:
+        acknowledged_total = 0
+        revision_races = 0
+        while revision_races < 8:
+            async with get_session() as session:
+                await _revalidate_project_lifetime_in_session(
+                    session,
+                    project=project,
+                    action="file-reservation archive reconciliation",
+                )
+                rows = (
+                    await session.execute(
+                        select(FileReservation, Agent)
+                        .outerjoin(
+                            Agent,
+                            cast(Any, FileReservation.agent_id) == Agent.id,
+                        )
+                        .where(
+                            cast(Any, FileReservation.project_id) == project.id,
+                            cast(Any, FileReservation.archive_synced_revision)
+                            < cast(Any, FileReservation.archive_revision),
+                        )
+                        .order_by(asc(cast(Any, FileReservation.id)))
+                        .limit(_FILE_RESERVATION_ARCHIVE_BATCH_SIZE)
+                    )
+                ).all()
+            records = [
+                cast(tuple[FileReservation, Optional[Agent]], row) for row in rows
+            ]
+            if not records:
+                return acknowledged_total
+            revisions = [
+                (reservation.id, reservation.archive_revision)
+                for reservation, _agent in records
+                if reservation.id is not None
+            ]
+            await _write_file_reservation_records(
+                project,
+                records,
+                archive=target_archive,
+                archive_locked=True,
+            )
+            acknowledged = await _ack_file_reservation_archive_revisions(
+                revisions
+            )
+            acknowledged_total += acknowledged
+            if acknowledged == len(revisions):
+                revision_races = 0
+                continue
+            revision_races += 1
+
+        raise RuntimeError(
+            "File reservation artifacts changed continuously during reconciliation; "
+            "pending DB revisions were preserved for retry."
+        )
+
+    if archive_locked:
+        return await _reconcile_locked()
+    async with _archive_write_lock(target_archive):
+        return await _reconcile_locked()
 
 
 async def _collect_file_reservation_statuses(
@@ -4070,12 +4999,16 @@ async def _collect_file_reservation_statuses(
 
     async with get_session() as session:
         stmt = (
-            select(FileReservation, Agent)
+            select(FileReservation, Agent, AgentExecution)
             # LEFT JOIN so orphaned reservations (agent row deleted or agent_id
             # is NULL) are still surfaced; the staleness sweeper then has a
             # chance to auto-release them instead of letting them pin the
             # path forever. (#161)
             .outerjoin(Agent, cast(Any, FileReservation.agent_id) == Agent.id)
+            .outerjoin(
+                AgentExecution,
+                cast(Any, FileReservation.execution_id) == AgentExecution.id,
+            )
             .where(FileReservation.project_id == project.id)
             .order_by(asc(FileReservation.created_ts))
         )
@@ -4085,7 +5018,20 @@ async def _collect_file_reservation_statuses(
         rows = result.all()
         if not rows:
             return []
-        agent_ids = [agent.id for _, agent in rows if agent is not None and agent.id is not None]
+        project_executions = await _load_execution_lineage_rows(
+            session,
+            [
+                execution.id
+                for _reservation, _agent, execution in rows
+                if execution is not None
+            ],
+            project_id=project.id,
+        )
+        agent_ids = [
+            agent.id
+            for _, agent, _execution in rows
+            if agent is not None and agent.id is not None
+        ]
         send_map: dict[int, Optional[datetime]] = {}
         ack_map: dict[int, Optional[datetime]] = {}
         read_map: dict[int, Optional[datetime]] = {}
@@ -4127,7 +5073,7 @@ async def _collect_file_reservation_statuses(
 
     statuses: list[FileReservationStatus] = []
     try:
-        for reservation, agent in rows:
+        for reservation, agent, execution in rows:
             # Orphaned reservation: agent row is gone (or never existed).
             # Treat as perpetually inactive with no mail signal so the sweeper
             # auto-releases it; tag the reasons so callers can distinguish
@@ -4144,6 +5090,25 @@ async def _collect_file_reservation_statuses(
                 last_mail = _max_datetime(
                     send_map.get(agent_id), ack_map.get(agent_id), read_map.get(agent_id)
                 )
+            execution_scoped = reservation.execution_id is not None
+            execution_missing = execution_scoped and execution is None
+            execution_status = execution.status if execution is not None else None
+            execution_parent_id = (
+                execution.parent_execution_id if execution is not None else None
+            )
+            execution_ancestor_ids = (
+                _execution_ancestor_ids(
+                    project_executions,
+                    execution,
+                )
+                if execution is not None
+                else []
+            )
+            execution_last_active = (
+                _ensure_utc(execution.last_active_ts)
+                if execution is not None
+                else None
+            )
 
             matched = False
             fs_activity: Optional[datetime] = None
@@ -4166,16 +5131,47 @@ async def _collect_file_reservation_statuses(
             agent_inactive = (
                 agent_last_active is None or (moment - agent_last_active).total_seconds() > inactivity_seconds
             )
+            execution_inactive = (
+                execution_last_active is None
+                or (moment - execution_last_active).total_seconds()
+                > inactivity_seconds
+            )
             recent_mail = last_mail is not None and (moment - last_mail).total_seconds() <= activity_grace
             recent_fs = fs_activity is not None and (moment - fs_activity).total_seconds() <= activity_grace
             recent_git = git_activity is not None and (moment - git_activity).total_seconds() <= activity_grace
 
-            stale = bool(
-                reservation.released_ts is None
-                and (agent_orphaned or (agent_inactive and not (recent_mail or recent_fs or recent_git)))
-            )
+            if execution_scoped:
+                stale = bool(
+                    reservation.released_ts is None
+                    and (
+                        execution_missing
+                        or execution_status != "active"
+                        or (execution_inactive and not (recent_fs or recent_git))
+                    )
+                )
+            else:
+                stale = bool(
+                    reservation.released_ts is None
+                    and (
+                        agent_orphaned
+                        or (
+                            agent_inactive
+                            and not (recent_mail or recent_fs or recent_git)
+                        )
+                    )
+                )
             reasons: list[str] = []
-            if agent_orphaned:
+            if execution_scoped:
+                if execution_missing:
+                    reasons.append("execution_unresolved")
+                elif execution_status != "active":
+                    reasons.append(f"execution_{execution_status}")
+                elif execution_inactive:
+                    reasons.append(f"execution_inactive>{inactivity_seconds}s")
+                else:
+                    reasons.append("execution_recently_active")
+                reasons.append("mail_activity_not_execution_signal")
+            elif agent_orphaned:
                 # Distinguish never-had-owner from owner-was-deleted; both are
                 # terminal for the reservation but each tells a different
                 # operational story (config bug vs cleanup hygiene).
@@ -4187,7 +5183,9 @@ async def _collect_file_reservation_statuses(
                 reasons.append(f"agent_inactive>{inactivity_seconds}s")
             else:
                 reasons.append("agent_recently_active")
-            if agent_orphaned:
+            if execution_scoped:
+                pass
+            elif agent_orphaned:
                 reasons.append("no_mail_activity_possible")
             elif recent_mail:
                 reasons.append("mail_activity_recent")
@@ -4212,6 +5210,14 @@ async def _collect_file_reservation_statuses(
                     stale=stale,
                     stale_reasons=reasons,
                     last_agent_activity=agent_last_active,
+                    execution_id=reservation.execution_id,
+                    execution_status=execution_status,
+                    execution_parent_id=execution_parent_id,
+                    ancestor_execution_ids=execution_ancestor_ids,
+                    orphaned=agent_orphaned
+                    or (execution_scoped and execution_status != "active"),
+                    legacy_unscoped=not execution_scoped,
+                    last_execution_activity=execution_last_active,
                     last_mail_activity=last_mail,
                     last_fs_activity=fs_activity,
                     last_git_activity=git_activity,
@@ -4250,6 +5256,8 @@ async def sweep_stale_agents(
     - Optionally excludes one agent (used by the on-demand tool so callers
       cannot retire their own authenticated identity).
     - Optionally skips agents with unexpired file reservations.
+    - Always skips durable Agents that own an active AgentExecution. Execution
+      heartbeat state is authoritative for process liveness.
 
     Returns one dict per retired agent, with project/agent identifiers
     plus the `last_active_ts` that triggered retirement, so the caller
@@ -4267,9 +5275,19 @@ async def sweep_stale_agents(
     # but before the agent is retired, violating the caller's safety gate.
     async with get_immediate_session() as session:
         stmt = select(Agent, Project).join(Project, cast(Any, Agent.project_id) == Project.id).where(
+            cast(Any, Agent.provisioning_state == "active"),
             cast(Any, Agent.retired_at).is_(None),
             cast(Any, Agent.last_active_ts) < cutoff_naive,
         )
+        active_execution = (
+            select(AgentExecution.id)
+            .where(
+                cast(Any, AgentExecution.agent_id) == Agent.id,
+                cast(Any, AgentExecution.status) == "active",
+            )
+            .correlate(Agent)
+        )
+        stmt = stmt.where(~exists(active_execution))
         if project_id is not None:
             stmt = stmt.where(cast(Any, Agent.project_id) == project_id)
         if exclude_agent_id is not None:
@@ -4353,7 +5371,13 @@ async def _expire_stale_file_reservations(
             )
             await session.commit()
     statuses = await _collect_file_reservation_statuses(project, include_released=False, now=now)
-    stale_statuses = [status for status in statuses if status.stale and status.reservation.id is not None]
+    stale_statuses = [
+        status
+        for status in statuses
+        if status.stale
+        and status.reservation.origin == "auto"
+        and status.reservation.id is not None
+    ]
     stale_ids = [cast(int, status.reservation.id) for status in stale_statuses]
     if stale_ids:
         async with get_immediate_session() as session:
@@ -4371,41 +5395,39 @@ async def _expire_stale_file_reservations(
         for status in stale_statuses:
             status.reservation.released_ts = naive_now
 
-    for reservation, _agent in expired_pairs:
-        reservation.released_ts = naive_now
-
-    released_pairs: list[tuple[FileReservation, Optional[Agent]]] = []
-    seen_ids: set[int] = set()
-    for reservation, agent in expired_pairs:
-        if reservation.id is None:
-            continue
-        if reservation.id in seen_ids:
-            continue
-        seen_ids.add(reservation.id)
-        released_pairs.append((reservation, agent))
-    for status in stale_statuses:
-        if status.reservation.id is None:
-            continue
-        if status.reservation.id in seen_ids:
-            continue
-        seen_ids.add(status.reservation.id)
-        released_pairs.append((status.reservation, status.agent))
-
-    if released_pairs:
-        await _write_file_reservation_records(
-            project,
-            released_pairs,
-            archive=archive,
-            archive_locked=archive_locked,
-        )
+    # Reconcile even when this sweep did not release a new row. A previous
+    # post-commit archive failure remains visible as a pending DB revision and
+    # the next ordinary sweep must repair it rather than wait for the old TTL.
+    await _reconcile_pending_file_reservation_artifacts(
+        project,
+        archive=archive,
+        archive_locked=archive_locked,
+    )
 
     return stale_statuses
 
 
-def _file_reservations_conflict(existing: FileReservation, candidate_path: str, candidate_exclusive: bool, candidate_agent: Agent) -> bool:
+def _file_reservations_conflict(
+    existing: FileReservation,
+    candidate_path: str,
+    candidate_exclusive: bool,
+    candidate_execution_id: str | None,
+    candidate_agent_id: int,
+    compatible_execution_ids: set[str] | None = None,
+) -> bool:
     if existing.released_ts is not None:
         return False
-    if existing.agent_id == candidate_agent.id:
+    compatible_ids = compatible_execution_ids or set()
+    if candidate_execution_id is not None and existing.execution_id in {
+        candidate_execution_id,
+        *compatible_ids,
+    }:
+        return False
+    if (
+        candidate_execution_id is None
+        and existing.execution_id is None
+        and existing.agent_id == candidate_agent_id
+    ):
         return False
     if not existing.exclusive and not candidate_exclusive:
         return False
@@ -4496,8 +5518,10 @@ def _looks_like_archive_path(pattern: str) -> bool:
 
 def _build_reservation_union_spec(
     existing_reservations: list[tuple["FileReservation", str]],
-    exclude_agent_id: int | None,
+    exclude_execution_id: str | None,
+    exclude_legacy_agent_id: int,
     candidate_exclusive: bool,
+    compatible_execution_ids: set[str] | None = None,
 ) -> "PathSpec | None":
     """Build a union PathSpec matching ANY potentially conflicting reservation pattern.
 
@@ -4508,8 +5532,8 @@ def _build_reservation_union_spec(
     ----------
     existing_reservations : list[tuple[FileReservation, str]]
         List of (reservation, holder_name) tuples to check against.
-    exclude_agent_id : int | None
-        Agent ID to exclude (the requesting agent's own reservations), or None.
+    exclude_execution_id : str | None
+        Execution ID to exclude, or None for an observed legacy caller.
     candidate_exclusive : bool
         Whether the candidate reservation is exclusive.
 
@@ -4523,19 +5547,30 @@ def _build_reservation_union_spec(
     -----
     A reservation is potentially conflicting if:
     - It is not released (released_ts is None)
-    - It belongs to a different agent (agent_id != exclude_agent_id)
+    - It belongs to a different execution
     - Either the existing or candidate reservation is exclusive
     """
     if PathSpec is None:
         return None
 
     patterns: list[str] = []
+    compatible_ids = compatible_execution_ids or set()
     for record, _ in existing_reservations:
         # Skip released reservations
         if record.released_ts is not None:
             continue
-        # Skip own reservations
-        if record.agent_id == exclude_agent_id:
+        # Skip only this execution's own reservations. Sibling executions of
+        # the same durable Agent must still observe one another's conflicts.
+        if (
+            exclude_execution_id is not None
+            and record.execution_id in {exclude_execution_id, *compatible_ids}
+        ):
+            continue
+        if (
+            exclude_execution_id is None
+            and record.execution_id is None
+            and record.agent_id == exclude_legacy_agent_id
+        ):
             continue
         # Skip non-exclusive if candidate is also non-exclusive
         if not record.exclusive and not candidate_exclusive:
@@ -5052,7 +6087,11 @@ async def _get_agent_by_id(project: Project, agent_id: int) -> Agent:
     await ensure_schema()
     async with get_session() as session:
         result = await session.execute(
-            select(Agent).where(Agent.project_id == project.id, Agent.id == agent_id)
+            select(Agent).where(
+                Agent.project_id == project.id,
+                Agent.id == agent_id,
+                Agent.provisioning_state == "active",
+            )
         )
         agent = result.scalars().first()
         if not agent:
@@ -5063,7 +6102,12 @@ async def _get_agent_by_id(project: Project, agent_id: int) -> Agent:
 async def _get_agent_any_project_by_id(agent_id: int) -> Agent:
     await ensure_schema()
     async with get_session() as session:
-        result = await session.execute(select(Agent).where(Agent.id == agent_id))
+        result = await session.execute(
+            select(Agent).where(
+                Agent.id == agent_id,
+                Agent.provisioning_state == "active",
+            )
+        )
         agent = result.scalars().first()
         if not agent:
             raise NoResultFound(f"Agent id '{agent_id}' not found.")
@@ -5119,325 +6163,681 @@ async def _update_recipient_timestamp(
         return existing[0]
 
 
-async def _hard_delete_agent_database_rows(
-    session: Any,
+def _execution_children_by_parent(
+    executions: Sequence[AgentExecution],
+) -> defaultdict[str, list[AgentExecution]]:
+    """Index an execution forest once for bounded descendant walks."""
+    children: defaultdict[str, list[AgentExecution]] = defaultdict(list)
+    for execution in executions:
+        if execution.parent_execution_id:
+            children[execution.parent_execution_id].append(execution)
+    return children
+
+
+def _execution_descendants_from_children(
+    children: dict[str, list[AgentExecution]],
+    root_id: str,
     *,
-    project_id: int,
-    agent_id: int,
-    agent_name: str,
-) -> dict[str, int]:
-    """Delete one agent's mutable database graph in explicit FK-safe phases."""
-    sent_rows = await session.execute(
-        select(Message.id).where(cast(Any, Message.sender_id) == agent_id)
-    )
-    sent_message_ids = [int(row[0]) for row in sent_rows.all()]
+    active_only: bool,
+) -> list[AgentExecution]:
+    """Return descendants deepest-first without rebuilding the child map."""
+    ordered: list[AgentExecution] = []
+    visited: set[str] = {root_id}
 
-    pending_delivery = (
-        await session.execute(
-            select(MessageDelivery.id)
-            .where(
-                cast(Any, MessageDelivery.state) == "pending",
-                or_(
-                    cast(Any, MessageDelivery.sender_id) == agent_id,
-                    and_(
-                        cast(Any, MessageDelivery.actor_kind) == "agent",
-                        cast(Any, MessageDelivery.actor_id) == agent_id,
-                    ),
-                    exists(
-                        select(MessageDeliveryRecipient.delivery_id).where(
-                            cast(Any, MessageDeliveryRecipient.delivery_id)
-                            == cast(Any, MessageDelivery.id),
-                            cast(Any, MessageDeliveryRecipient.agent_id)
-                            == agent_id,
-                        )
-                    ),
-                ),
-            )
-            .limit(1)
-        )
-    ).first()
-    if pending_delivery is not None:
-        raise ValueError("Agent has a pending message delivery and cannot be hard-deleted")
+    def visit(parent_id: str) -> None:
+        for child in children.get(parent_id, []):
+            if child.id in visited:
+                continue
+            visited.add(child.id)
+            visit(child.id)
+            if not active_only or child.status == "active":
+                ordered.append(child)
 
-    recipient_count = int(
-        (
-            await session.execute(
-                select(func.count())
-                .select_from(MessageRecipient)
-                .where(cast(Any, MessageRecipient.agent_id) == agent_id)
-            )
-        ).scalar_one()
-    )
-    sent_recipient_count = 0
-    if sent_message_ids:
-        sent_recipient_count = int(
-            (
-                await session.execute(
-                    select(func.count())
-                    .select_from(MessageRecipient)
-                    .where(
-                        cast(Any, MessageRecipient.message_id).in_(sent_message_ids),
-                        cast(Any, MessageRecipient.agent_id) != agent_id,
-                    )
-                )
-            ).scalar_one()
-        )
-        # A retained reply remains in its thread, but its direct edge cannot
-        # point at a message lifetime that is about to be removed.
-        await session.execute(
-            update(Message)
-            .where(
-                cast(Any, Message.reply_to).in_(sent_message_ids),
-                cast(Any, Message.id).not_in(sent_message_ids),
-            )
-            .values(reply_to=None)
-        )
-
-    recipient_predicates: list[Any] = [
-        cast(Any, MessageRecipient.agent_id) == agent_id
-    ]
-    if sent_message_ids:
-        recipient_predicates.append(
-            cast(Any, MessageRecipient.message_id).in_(sent_message_ids)
-        )
-    await session.execute(
-        delete(MessageRecipient).where(or_(*recipient_predicates))
-    )
-    await session.flush()
-
-    if sent_message_ids:
-        await session.execute(
-            delete(Message).where(cast(Any, Message.id).in_(sent_message_ids))
-        )
-        await session.flush()
-
-    reservation_count = int(
-        (
-            await session.execute(
-                select(func.count())
-                .select_from(FileReservation)
-                .where(cast(Any, FileReservation.agent_id) == agent_id)
-            )
-        ).scalar_one()
-    )
-    link_count = int(
-        (
-            await session.execute(
-                select(func.count())
-                .select_from(AgentLink)
-                .where(
-                    or_(
-                        cast(Any, AgentLink.a_agent_id) == agent_id,
-                        cast(Any, AgentLink.b_agent_id) == agent_id,
-                    )
-                )
-            )
-        ).scalar_one()
-    )
-    window_count = int(
-        (
-            await session.execute(
-                select(func.count())
-                .select_from(WindowIdentity)
-                .where(
-                    cast(Any, WindowIdentity.project_id) == project_id,
-                    cast(Any, WindowIdentity.display_name) == agent_name,
-                )
-            )
-        ).scalar_one()
-    )
-    await session.execute(
-        delete(FileReservation).where(
-            cast(Any, FileReservation.agent_id) == agent_id
-        )
-    )
-    await session.execute(
-        delete(AgentLink).where(
-            or_(
-                cast(Any, AgentLink.a_agent_id) == agent_id,
-                cast(Any, AgentLink.b_agent_id) == agent_id,
-            )
-        )
-    )
-    await session.execute(
-        delete(WindowIdentity).where(
-            cast(Any, WindowIdentity.project_id) == project_id,
-            cast(Any, WindowIdentity.display_name) == agent_name,
-        )
-    )
-    await session.flush()
-
-    deleted_agent = await session.execute(
-        delete(Agent).where(cast(Any, Agent.id) == agent_id)
-    )
-    await session.flush()
-    return {
-        "message_recipients": recipient_count,
-        "sent_message_recipients": sent_recipient_count,
-        "messages_sent": len(sent_message_ids),
-        "file_reservations": reservation_count,
-        "agent_links": link_count,
-        "window_identities": window_count,
-        "agent": int(deleted_agent.rowcount or 0),
-    }
+    visit(root_id)
+    return ordered
 
 
-async def _hard_delete_project_database_rows(
-    session: Any,
+def _execution_descendants_all_child_first(
+    executions: Sequence[AgentExecution],
+    root_id: str,
+) -> list[AgentExecution]:
+    """Return every descendant deepest-first, tolerating corrupt cycles."""
+    return _execution_descendants_from_children(
+        _execution_children_by_parent(executions),
+        root_id,
+        active_only=False,
+    )
+
+
+def _execution_descendants_child_first(
+    executions: Sequence[AgentExecution],
+    root_id: str,
+) -> list[AgentExecution]:
+    """Return active descendants deepest-first, tolerating corrupt cycles."""
+    return _execution_descendants_from_children(
+        _execution_children_by_parent(executions),
+        root_id,
+        active_only=True,
+    )
+
+
+def _execution_subtree_latest_activity(
+    execution_id: str,
     *,
-    project_id: int,
-) -> dict[str, int]:
-    """Delete one project's mutable database graph in explicit FK-safe phases."""
-    delivery_history = (
-        await session.execute(
-            select(MessageDelivery.id)
-            .where(
-                or_(
-                    cast(Any, MessageDelivery.project_id) == project_id,
-                    cast(Any, MessageDelivery.sender_project_id_snapshot)
-                    == project_id,
-                    and_(
-                        cast(Any, MessageDelivery.actor_kind) == "agent",
-                        cast(Any, MessageDelivery.actor_project_id_snapshot)
-                        == project_id,
-                    ),
-                )
-            )
-            .limit(1)
-        )
-    ).first()
-    if delivery_history is not None:
-        raise ValueError(
-            "Project has immutable message delivery history and cannot be hard-deleted"
-        )
-
-    agent_rows = await session.execute(
-        select(Agent.id).where(cast(Any, Agent.project_id) == project_id)
-    )
-    agent_ids = [int(row[0]) for row in agent_rows.all()]
-    message_filter = cast(Any, Message.project_id) == project_id
-    if agent_ids:
-        message_filter = or_(
-            message_filter,
-            cast(Any, Message.sender_id).in_(agent_ids),
-        )
-    message_rows = await session.execute(select(Message.id).where(message_filter))
-    message_ids = [int(row[0]) for row in message_rows.all()]
-
-    recipient_predicates: list[Any] = []
-    if message_ids:
-        recipient_predicates.append(
-            cast(Any, MessageRecipient.message_id).in_(message_ids)
-        )
-        await session.execute(
-            update(Message)
-            .where(
-                cast(Any, Message.reply_to).in_(message_ids),
-                cast(Any, Message.id).not_in(message_ids),
-            )
-            .values(reply_to=None)
-        )
-    if agent_ids:
-        recipient_predicates.append(
-            cast(Any, MessageRecipient.agent_id).in_(agent_ids)
-        )
-    recipient_count = 0
-    if recipient_predicates:
-        recipient_count = int(
-            (
-                await session.execute(
-                    select(func.count())
-                    .select_from(MessageRecipient)
-                    .where(or_(*recipient_predicates))
-                )
-            ).scalar_one()
-        )
-        await session.execute(
-            delete(MessageRecipient).where(or_(*recipient_predicates))
-        )
-    await session.flush()
-
-    if message_ids:
-        await session.execute(
-            delete(Message).where(cast(Any, Message.id).in_(message_ids))
-        )
-        await session.flush()
-
-    reservation_filter = cast(Any, FileReservation.project_id) == project_id
-    link_filter = or_(
-        cast(Any, AgentLink.a_project_id) == project_id,
-        cast(Any, AgentLink.b_project_id) == project_id,
-    )
-    if agent_ids:
-        reservation_filter = or_(
-            reservation_filter,
-            cast(Any, FileReservation.agent_id).in_(agent_ids),
-        )
-        link_filter = or_(
-            link_filter,
-            cast(Any, AgentLink.a_agent_id).in_(agent_ids),
-            cast(Any, AgentLink.b_agent_id).in_(agent_ids),
-        )
-
-    dependent_specs = (
-        ("file_reservations", FileReservation, reservation_filter),
-        ("agent_links", AgentLink, link_filter),
-        (
-            "window_identities",
-            WindowIdentity,
-            cast(Any, WindowIdentity.project_id) == project_id,
-        ),
-        (
-            "message_summaries",
-            MessageSummary,
-            cast(Any, MessageSummary.project_id) == project_id,
-        ),
-        (
-            "sibling_suggestions",
-            ProjectSiblingSuggestion,
-            or_(
-                cast(Any, ProjectSiblingSuggestion.project_a_id) == project_id,
-                cast(Any, ProjectSiblingSuggestion.project_b_id) == project_id,
+    by_id: dict[str, AgentExecution],
+    children: dict[str, list[AgentExecution]],
+    memo: dict[str, datetime],
+    visiting: set[str],
+    cycle_sentinel: datetime,
+) -> datetime:
+    """Return the latest heartbeat in one active subtree, memoized per forest."""
+    cached = memo.get(execution_id)
+    if cached is not None:
+        return cached
+    execution = by_id[execution_id]
+    if execution_id in visiting:
+        # Corrupt cycles are fail-safe: keep the lifetime active instead of
+        # looping or terminalizing an ambiguous tree.
+        return cycle_sentinel
+    visiting.add(execution_id)
+    latest = _naive_utc(execution.last_active_ts)
+    for child in children.get(execution_id, []):
+        if child.status != "active":
+            continue
+        latest = max(
+            latest,
+            _execution_subtree_latest_activity(
+                child.id,
+                by_id=by_id,
+                children=children,
+                memo=memo,
+                visiting=visiting,
+                cycle_sentinel=cycle_sentinel,
             ),
-        ),
-        (
-            "product_links",
-            ProductProjectLink,
-            cast(Any, ProductProjectLink.project_id) == project_id,
-        ),
-        (
-            "ui_project_assignments",
-            UiProjectAssignment,
-            cast(Any, UiProjectAssignment.project_id) == project_id,
-        ),
+        )
+    visiting.remove(execution_id)
+    memo[execution_id] = latest
+    return latest
+
+
+def _execution_ancestor_ids(
+    executions: Sequence[AgentExecution],
+    execution: AgentExecution,
+) -> list[str]:
+    """Return root-to-parent execution ids while tolerating corrupt cycles."""
+    by_id = {item.id: item for item in executions}
+    reversed_ids: list[str] = []
+    seen: set[str] = {execution.id}
+    parent_id = execution.parent_execution_id
+    while parent_id is not None and parent_id not in seen:
+        seen.add(parent_id)
+        reversed_ids.append(parent_id)
+        parent = by_id.get(parent_id)
+        if parent is None:
+            break
+        parent_id = parent.parent_execution_id
+    reversed_ids.reverse()
+    return reversed_ids
+
+
+async def _load_execution_lineage_rows(
+    session: Any,
+    execution_ids: Sequence[str],
+    *,
+    project_id: int,
+) -> list[AgentExecution]:
+    """Load only requested executions and their recursive parent chains."""
+    normalized_ids = sorted(set(execution_ids))
+    if not normalized_ids:
+        return []
+    lineage = (
+        select(
+            AgentExecution.id,
+            AgentExecution.parent_execution_id,
+        )
+        .where(
+            cast(Any, AgentExecution.project_id) == project_id,
+            cast(Any, AgentExecution.id).in_(normalized_ids),
+        )
+        .cte("execution_lineage", recursive=True)
     )
-    counts: dict[str, int] = {
-        "agents": len(agent_ids),
-        "messages": len(message_ids),
-        "message_recipients": recipient_count,
-    }
-    for key, model, predicate in dependent_specs:
-        counts[key] = int(
+    parent = aliased(AgentExecution)
+    lineage = lineage.union(
+        select(parent.id, parent.parent_execution_id)
+        .join(
+            lineage,
+            cast(Any, parent.id) == lineage.c.parent_execution_id,
+        )
+        .where(cast(Any, parent.project_id) == project_id)
+    )
+    return list(
+        (
+            await session.execute(
+                select(AgentExecution).where(
+                    cast(Any, AgentExecution.id).in_(select(lineage.c.id))
+                )
+            )
+        ).scalars().all()
+    )
+
+
+async def _load_execution_descendant_rows(
+    session: Any,
+    root_ids: Sequence[str],
+    *,
+    project_id: int,
+    active_only: bool,
+) -> list[AgentExecution]:
+    """Load a bounded root set and its recursive descendants in one query."""
+    normalized_ids = sorted(set(root_ids))
+    if not normalized_ids:
+        return []
+    descendants = (
+        select(
+            AgentExecution.id,
+            AgentExecution.parent_execution_id,
+        )
+        .where(
+            cast(Any, AgentExecution.project_id) == project_id,
+            cast(Any, AgentExecution.id).in_(normalized_ids),
+        )
+        .cte("execution_descendants", recursive=True)
+    )
+    child = aliased(AgentExecution)
+    recursive_term = (
+        select(child.id, child.parent_execution_id)
+        .join(
+            descendants,
+            cast(Any, child.parent_execution_id) == descendants.c.id,
+        )
+        .where(cast(Any, child.project_id) == project_id)
+    )
+    if active_only:
+        recursive_term = recursive_term.where(
+            cast(Any, child.status) == "active"
+        )
+    descendants = descendants.union(recursive_term)
+    stmt = select(AgentExecution).where(
+        cast(Any, AgentExecution.id).in_(select(descendants.c.id))
+    )
+    if active_only:
+        stmt = stmt.where(cast(Any, AgentExecution.status) == "active")
+    return list((await session.execute(stmt)).scalars().all())
+
+
+async def _load_execution_ancestor_ids(execution: AgentExecution) -> list[str]:
+    """Load lineage for one execution without exposing capability material."""
+    async with get_session() as session:
+        rows = await _load_execution_lineage_rows(
+            session,
+            [execution.id],
+            project_id=execution.project_id,
+        )
+    return _execution_ancestor_ids(rows, execution)
+
+
+async def _register_execution_build_slot_artifact_path(
+    project: Project,
+    execution: AgentExecution,
+    *,
+    slot_name: str,
+    slot_path_component: str,
+) -> None:
+    """Register an exact lease path before its JSON artifact can be written."""
+    if project.id is None:
+        raise ValueError("Project must have an id before registering a build slot.")
+    async with get_immediate_session() as session:
+        current_execution = await session.get(AgentExecution, execution.id)
+        if (
+            current_execution is None
+            or current_execution.project_id != project.id
+            or current_execution.status != "active"
+        ):
+            raise ToolExecutionError(
+                "EXECUTION_NOT_ACTIVE",
+                "Cannot publish a build-slot artifact for a terminal execution.",
+                recoverable=False,
+                data={"execution_id": execution.id},
+            )
+        key = (execution.id, slot_path_component)
+        existing = await session.get(BuildSlotArtifactPath, key)
+        if existing is None:
+            session.add(
+                BuildSlotArtifactPath(
+                    execution_id=execution.id,
+                    project_id=project.id,
+                    slot_name=slot_name,
+                    slot_path_component=slot_path_component,
+                )
+            )
+        elif (
+            existing.project_id != project.id
+            or existing.slot_name != slot_name
+        ):
+            raise ToolExecutionError(
+                "BUILD_SLOT_ARTIFACT_PATH_MISMATCH",
+                "The immutable build-slot artifact path has different metadata.",
+                recoverable=False,
+                data={
+                    "execution_id": execution.id,
+                    "slot": slot_name,
+                },
+            )
+        await session.commit()
+
+
+async def _release_build_slot_artifacts_for_executions(
+    project: Project,
+    execution_ids: set[str],
+    released_at: datetime,
+    *,
+    archive: ProjectArchive | None = None,
+    archive_locked: bool = False,
+) -> int:
+    """Soft-release build-slot leases owned by terminal execution scopes."""
+    if not execution_ids:
+        return 0
+    resolved_archive = archive or await ensure_archive(get_settings(), project.slug)
+    build_slots_root = resolved_archive.root / "build_slots"
+    if project.id is None:
+        raise ValueError("Project must have an id before reconciling build slots.")
+    async with get_session() as session:
+        artifact_paths = list(
             (
                 await session.execute(
-                    select(func.count()).select_from(model).where(predicate)
+                    select(BuildSlotArtifactPath).where(
+                        cast(Any, BuildSlotArtifactPath.project_id)
+                        == project.id,
+                        cast(Any, BuildSlotArtifactPath.execution_id).in_(
+                            execution_ids
+                        ),
+                    )
                 )
-            ).scalar_one()
+            ).scalars().all()
         )
-        await session.execute(delete(model).where(predicate))
-    await session.flush()
 
-    if agent_ids:
-        await session.execute(
-            delete(Agent).where(cast(Any, Agent.id).in_(agent_ids))
+    def update_files() -> int:
+        if not artifact_paths or not build_slots_root.is_dir():
+            return 0
+        released = 0
+        failures: list[str] = []
+        released_iso = _iso(released_at)
+        for artifact_path in artifact_paths:
+            holder_file = (
+                f"{safe_build_path_component(artifact_path.execution_id)}.json"
+            )
+            lease_path = (
+                build_slots_root
+                / artifact_path.slot_path_component
+                / holder_file
+            )
+            if not lease_path.is_file():
+                continue
+            try:
+                data = json.loads(lease_path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError("build-slot lease is not a JSON object")
+                if data.get("execution_id") != artifact_path.execution_id:
+                    raise ValueError(
+                        "build-slot filename does not match execution_id"
+                    )
+                if data.get("slot") != artifact_path.slot_name:
+                    raise ValueError("build-slot path does not match slot name")
+                if data.get("released_ts"):
+                    continue
+                data["released_ts"] = released_iso
+                data["expires_ts"] = released_iso
+                _write_json_atomic_sync(lease_path, data)
+                released += 1
+            except (OSError, ValueError, TypeError) as exc:
+                failures.append(f"{lease_path}: {exc}")
+                logger.exception(
+                    "build_slot.execution_release_failed",
+                    extra={"lease_path": str(lease_path)},
+                )
+        if failures:
+            raise RuntimeError(
+                "Failed to reconcile build-slot artifact(s): "
+                + "; ".join(failures[:5])
+            )
+        return released
+
+    if archive_locked:
+        return await asyncio.to_thread(update_files)
+    async with _archive_write_lock(resolved_archive):
+        return await asyncio.to_thread(update_files)
+
+
+async def _ack_execution_build_slot_reconciliation(
+    execution_ids: set[str],
+    reconciled_at: datetime,
+) -> int:
+    """Acknowledge successful terminal build-slot projection in the DB outbox."""
+    if not execution_ids:
+        return 0
+    async with get_immediate_session() as session:
+        result = await session.execute(
+            update(BuildSlotArtifactProjection)
+            .where(
+                cast(
+                    Any,
+                    BuildSlotArtifactProjection.execution_id,
+                ).in_(execution_ids),
+                cast(
+                    Any,
+                    BuildSlotArtifactProjection.reconciled_ts,
+                ).is_(None),
+            )
+            .values(reconciled_ts=reconciled_at)
         )
-        await session.flush()
-    deleted_project = await session.execute(
-        delete(Project).where(cast(Any, Project.id) == project_id)
+        await session.commit()
+    return int(getattr(result, "rowcount", 0) or 0)
+
+
+async def _reconcile_terminal_execution_build_slots(
+    *,
+    project_id: int | None,
+    released_at: datetime,
+) -> tuple[int, list[str]]:
+    """Project one bounded batch of the terminal-execution DB outbox."""
+    async with get_session() as session:
+        stmt = select(
+            BuildSlotArtifactProjection.project_id,
+            BuildSlotArtifactProjection.execution_id,
+        ).where(
+            cast(
+                Any,
+                BuildSlotArtifactProjection.reconciled_ts,
+            ).is_(None),
+        )
+        if project_id is not None:
+            stmt = stmt.where(
+                cast(Any, BuildSlotArtifactProjection.project_id) == project_id
+            )
+        stmt = stmt.order_by(
+            asc(cast(Any, BuildSlotArtifactProjection.project_id)),
+            asc(cast(Any, BuildSlotArtifactProjection.execution_id)),
+        ).limit(_BUILD_SLOT_RECONCILIATION_BATCH_SIZE)
+        terminal_rows = list((await session.execute(stmt)).all())
+        terminal_by_project: defaultdict[int, set[str]] = defaultdict(set)
+        for terminal_project_id, execution_id in terminal_rows:
+            terminal_by_project[int(terminal_project_id)].add(str(execution_id))
+        projects = {
+            int(project.id): project
+            for project in (
+                await session.execute(
+                    select(Project).where(
+                        cast(Any, Project.id).in_(terminal_by_project)
+                    )
+                )
+            ).scalars().all()
+            if project.id is not None
+        }
+
+    released = 0
+    warnings: list[str] = []
+    for terminal_project_id, execution_ids in terminal_by_project.items():
+        project = projects.get(terminal_project_id)
+        if project is None:
+            continue
+        try:
+            released += await _release_build_slot_artifacts_for_executions(
+                project,
+                execution_ids,
+                released_at,
+            )
+            await _ack_execution_build_slot_reconciliation(
+                execution_ids,
+                released_at,
+            )
+        except Exception as exc:
+            warnings.append(f"project {terminal_project_id} build slots: {exc}")
+            logger.exception(
+                "execution_reaper.build_slot_reconcile_failed",
+                extra={"project_id": terminal_project_id},
+            )
+    return released, warnings
+
+
+async def expire_stale_agent_executions(
+    threshold_seconds: int,
+    *,
+    project_id: int | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Expire stale execution trees and release only their reservations."""
+    if threshold_seconds < 1:
+        raise ValueError("threshold_seconds must be positive.")
+    effective_now = _naive_utc(now or datetime.now(timezone.utc))
+    cutoff = effective_now - timedelta(seconds=threshold_seconds)
+    expired_ids: list[str] = []
+    expired_by_project: defaultdict[int, set[str]] = defaultdict(set)
+    released_count = 0
+    await ensure_schema()
+    async with get_immediate_session() as session:
+        closed: set[str] = set()
+        cursor: tuple[datetime, int, str] | None = None
+        while True:
+            stmt = select(AgentExecution).where(
+                cast(Any, AgentExecution.status) == "active",
+                cast(Any, AgentExecution.last_active_ts) <= cutoff,
+            )
+            if project_id is not None:
+                stmt = stmt.where(
+                    cast(Any, AgentExecution.project_id) == project_id
+                )
+            if cursor is not None:
+                cursor_ts, cursor_project_id, cursor_id = cursor
+                stmt = stmt.where(
+                    or_(
+                        cast(Any, AgentExecution.last_active_ts) > cursor_ts,
+                        and_(
+                            cast(Any, AgentExecution.last_active_ts)
+                            == cursor_ts,
+                            cast(Any, AgentExecution.project_id)
+                            > cursor_project_id,
+                        ),
+                        and_(
+                            cast(Any, AgentExecution.last_active_ts)
+                            == cursor_ts,
+                            cast(Any, AgentExecution.project_id)
+                            == cursor_project_id,
+                            cast(Any, AgentExecution.id) > cursor_id,
+                        ),
+                    )
+                )
+            stmt = stmt.order_by(
+                asc(cast(Any, AgentExecution.last_active_ts)),
+                asc(cast(Any, AgentExecution.project_id)),
+                asc(cast(Any, AgentExecution.id)),
+            ).limit(_EXECUTION_REAPER_BATCH_SIZE)
+            candidates = list((await session.execute(stmt)).scalars().all())
+            if not candidates:
+                break
+            last_candidate = candidates[-1]
+            cursor = (
+                _naive_utc(last_candidate.last_active_ts),
+                last_candidate.project_id,
+                last_candidate.id,
+            )
+            candidates_by_project: defaultdict[int, list[AgentExecution]] = (
+                defaultdict(list)
+            )
+            for candidate in candidates:
+                candidates_by_project[candidate.project_id].append(candidate)
+
+            for candidate_project_id, project_candidates in (
+                candidates_by_project.items()
+            ):
+                rows = await _load_execution_descendant_rows(
+                    session,
+                    [candidate.id for candidate in project_candidates],
+                    project_id=candidate_project_id,
+                    active_only=True,
+                )
+                by_id = {execution.id: execution for execution in rows}
+                children = _execution_children_by_parent(rows)
+                latest_activity: dict[str, datetime] = {}
+                visiting: set[str] = set()
+
+                for root in project_candidates:
+                    if (
+                        root.id in closed
+                        or root.status != "active"
+                        or _execution_subtree_latest_activity(
+                            root.id,
+                            by_id=by_id,
+                            children=children,
+                            memo=latest_activity,
+                            visiting=visiting,
+                            cycle_sentinel=effective_now,
+                        )
+                        > cutoff
+                    ):
+                        continue
+                    tree = [
+                        *_execution_descendants_from_children(
+                            children,
+                            root.id,
+                            active_only=True,
+                        ),
+                        root,
+                    ]
+                    tree_ids = [
+                        execution.id
+                        for execution in tree
+                        if execution.id not in closed
+                        and execution.status == "active"
+                    ]
+                    if tree_ids:
+                        released = await session.execute(
+                            update(FileReservation)
+                            .where(
+                                cast(Any, FileReservation.execution_id).in_(
+                                    tree_ids
+                                ),
+                                cast(Any, FileReservation.origin) == "auto",
+                                cast(Any, FileReservation.released_ts).is_(None),
+                            )
+                            .values(released_ts=effective_now)
+                        )
+                        released_count += int(
+                            getattr(released, "rowcount", 0) or 0
+                        )
+                        await session.flush()
+                    for execution in tree:
+                        if (
+                            execution.id in closed
+                            or execution.status != "active"
+                        ):
+                            continue
+                        execution.status = "expired"
+                        execution.last_active_ts = effective_now
+                        execution.ended_ts = effective_now
+                        session.add(execution)
+                        # The storage trigger enforces child-first
+                        # terminalization.
+                        await session.flush()
+                        closed.add(execution.id)
+                        expired_ids.append(execution.id)
+                        expired_by_project[execution.project_id].add(
+                            execution.id
+                        )
+        await session.commit()
+    released_build_slots = 0
+    archive_warnings: list[str] = []
+    # A sweep is also the durable retry boundary for any earlier reservation
+    # publication failure, even when there is no newly stale execution now.
+    async with get_session() as session:
+        pending_projects_stmt = select(FileReservation.project_id).where(
+            cast(Any, FileReservation.archive_synced_revision)
+            < cast(Any, FileReservation.archive_revision)
+        )
+        if project_id is not None:
+            pending_projects_stmt = pending_projects_stmt.where(
+                cast(Any, FileReservation.project_id) == project_id
+            )
+        pending_project_ids = {
+            int(value)
+            for value in (
+                await session.execute(
+                    pending_projects_stmt.distinct()
+                    .order_by(asc(cast(Any, FileReservation.project_id)))
+                    .limit(_FILE_RESERVATION_ARCHIVE_BATCH_SIZE)
+                )
+            ).scalars().all()
+        }
+    projects_to_reconcile = pending_project_ids | set(expired_by_project)
+    for expired_project_id in sorted(projects_to_reconcile):
+        async with get_session() as session:
+            project = await session.get(Project, expired_project_id)
+        if project is None:
+            continue
+        try:
+            await _reconcile_pending_file_reservation_artifacts(project)
+        except Exception as exc:
+            archive_warnings.append(
+                f"project {expired_project_id} reservations: {exc}"
+            )
+            logger.exception(
+                "execution_reaper.reservation_archive_failed",
+                extra={"project_id": expired_project_id},
+            )
+    # Terminal execution projections are the durable build-slot outbox. Each
+    # pass addresses one fixed batch through immutable DB path registrations
+    # and marks only a successfully reconciled lifetime, so history size
+    # cannot inflate a query or force an archive-wide JSON scan.
+    reconciled_build_slots, build_slot_warnings = (
+        await _reconcile_terminal_execution_build_slots(
+            project_id=project_id,
+            released_at=effective_now,
+        )
     )
-    await session.flush()
-    counts["project"] = int(deleted_project.rowcount or 0)
-    return counts
+    released_build_slots += reconciled_build_slots
+    archive_warnings.extend(build_slot_warnings)
+    return {
+        "expired": len(expired_ids),
+        "execution_ids": expired_ids,
+        "released_reservations": released_count,
+        "released_build_slots": released_build_slots,
+        "expired_at": _iso(effective_now),
+        "archive_warnings": archive_warnings,
+    }
+
+
+async def _agent_execution_reaper_worker(settings: Settings) -> None:
+    """Continuously expire crashed execution trees for every transport.
+
+    The worker belongs to the FastMCP lifespan rather than the HTTP wrapper so
+    stdio, in-memory, and HTTP deployments all receive the same crash cleanup.
+    It is deliberately independent from observe/enforce rollout mode: rollout
+    changes whether an unscoped claim may be created, not whether a known
+    execution lifetime is eventually closed.
+    """
+    interval_seconds = max(1, settings.agent_execution_reaper_interval_seconds)
+    threshold_seconds = max(1, settings.agent_execution_reaper_threshold_seconds)
+    while True:
+        try:
+            report = await expire_stale_agent_executions(threshold_seconds)
+            if report["expired"] or report["archive_warnings"]:
+                logger.info(
+                    "agent_execution.reaper",
+                    extra={
+                        "expired": report["expired"],
+                        "released_reservations": report["released_reservations"],
+                        "released_build_slots": report["released_build_slots"],
+                        "archive_warnings": report["archive_warnings"],
+                        "threshold_seconds": threshold_seconds,
+                    },
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "agent_execution.reaper_failed",
+                extra={"threshold_seconds": threshold_seconds},
+            )
+        await asyncio.sleep(interval_seconds)
 
 
 def build_mcp_server() -> FastMCP:
@@ -5471,8 +6871,15 @@ def build_mcp_server() -> FastMCP:
     session_binding_ttl_seconds: float = max(
         60.0, float(getattr(settings, "session_binding_ttl_seconds", 24 * 3600))
     )
-    session_agent_bindings: dict[str, set[tuple[int, int]]] = {}
-    session_current_agents: dict[str, dict[int, int]] = {}
+    # Numeric SQLite ids are recyclable after hard deletion.  Every in-memory
+    # binding therefore carries the immutable project/Agent row generations;
+    # an old authenticated session must never become authenticated as a newly
+    # inserted row that happens to reuse the same integer id.
+    session_agent_bindings: dict[str, set[tuple[int, str, int, str]]] = {}
+    session_current_agents: dict[str, dict[int, tuple[str, int, str]]] = {}
+    session_current_executions: dict[
+        str, dict[int, tuple[str, str, str]]
+    ] = {}
     session_binding_last_access: dict[str, float] = {}
 
     async def _ctx_info_safe(ctx: Context, message: str) -> None:
@@ -5482,10 +6889,18 @@ def build_mcp_server() -> FastMCP:
             # Context may not be available outside of a request; ignore logging
             return
 
-    def _project_agent_key(project: Project, agent: Agent) -> tuple[int, int]:
+    def _project_agent_key(
+        project: Project,
+        agent: Agent,
+    ) -> tuple[int, str, int, str]:
         if project.id is None or agent.id is None:
             raise ValueError("Project and agent must have ids before binding MCP sessions.")
-        return project.id, agent.id
+        return (
+            project.id,
+            project.project_generation,
+            agent.id,
+            agent.agent_generation,
+        )
 
     def _session_binding_key(ctx: Context) -> str:
         # `ctx.session_id` is a stable identifier across requests for both
@@ -5543,13 +6958,16 @@ def build_mcp_server() -> FastMCP:
             session_binding_last_access.pop(key, None)
             session_agent_bindings.pop(key, None)
             session_current_agents.pop(key, None)
+            session_current_executions.pop(key, None)
 
     def _touch_session_binding(key: str) -> None:
         now = time.monotonic()
         _prune_expired_session_bindings(now)
         session_binding_last_access[key] = now
 
-    def _session_bindings_for(ctx: Context) -> set[tuple[int, int]]:
+    def _session_bindings_for(
+        ctx: Context,
+    ) -> set[tuple[int, str, int, str]]:
         key = _session_binding_key(ctx)
         _touch_session_binding(key)
         bindings = session_agent_bindings.get(key)
@@ -5558,7 +6976,9 @@ def build_mcp_server() -> FastMCP:
             session_agent_bindings[key] = bindings
         return bindings
 
-    def _session_current_agents_for(ctx: Context) -> dict[int, int]:
+    def _session_current_agents_for(
+        ctx: Context,
+    ) -> dict[int, tuple[str, int, str]]:
         key = _session_binding_key(ctx)
         _touch_session_binding(key)
         current_agents = session_current_agents.get(key)
@@ -5567,17 +6987,145 @@ def build_mcp_server() -> FastMCP:
             session_current_agents[key] = current_agents
         return current_agents
 
+    def _session_current_executions_for(
+        ctx: Context,
+    ) -> dict[int, tuple[str, str, str]]:
+        key = _session_binding_key(ctx)
+        _touch_session_binding(key)
+        current_executions = session_current_executions.get(key)
+        if current_executions is None:
+            current_executions = {}
+            session_current_executions[key] = current_executions
+        return current_executions
+
     def _bind_session_agent(ctx: Context, project: Project, agent: Agent) -> None:
-        project_id, agent_id = _project_agent_key(project, agent)
+        project_id, project_generation, agent_id, agent_generation = (
+            _project_agent_key(project, agent)
+        )
         bindings = _session_bindings_for(ctx)
         current_agents = _session_current_agents_for(ctx)
-        bindings.add((project_id, agent_id))
-        current_agents[project_id] = agent_id
+        bindings.add(
+            (project_id, project_generation, agent_id, agent_generation)
+        )
+        current_agents[project_id] = (
+            project_generation,
+            agent_id,
+            agent_generation,
+        )
+
+    def _bind_session_execution(
+        ctx: Context,
+        project: Project,
+        agent: Agent,
+        execution: AgentExecution,
+    ) -> None:
+        project_id, project_generation, agent_id, agent_generation = (
+            _project_agent_key(project, agent)
+        )
+        if execution.project_id != project_id or execution.agent_id != agent_id:
+            raise ValueError("Agent execution does not belong to the authenticated project and agent.")
+        _bind_session_agent(ctx, project, agent)
+        # One MCP session may host a root execution and explicit subagent
+        # lifetimes. Only the root is eligible for implicit resolution; a
+        # child must always pass execution_id and must not steal the root slot.
+        if execution.kind == "session":
+            _session_current_executions_for(ctx)[project_id] = (
+                project_generation,
+                agent_generation,
+                execution.id,
+            )
+
+    def _session_execution_id(
+        ctx: Context,
+        project: Project,
+        agent: Agent,
+    ) -> str | None:
+        if project.id is None:
+            return None
+        current = _session_current_executions_for(ctx)
+        binding = current.get(project.id)
+        if binding is None:
+            return None
+        project_generation, agent_generation, execution_id = binding
+        if (
+            project_generation != project.project_generation
+            or agent_generation != agent.agent_generation
+        ):
+            current.pop(project.id, None)
+            return None
+        return execution_id
+
+    def _clear_session_execution(
+        ctx: Context,
+        project: Project,
+        execution_id: str,
+    ) -> None:
+        if project.id is None:
+            return
+        current = _session_current_executions_for(ctx)
+        binding = current.get(project.id)
+        if binding is not None and binding[2] == execution_id:
+            current.pop(project.id, None)
+
+    def _clear_execution_bindings(execution_ids: set[str]) -> None:
+        if not execution_ids:
+            return
+        for current in session_current_executions.values():
+            for project_id, binding in list(current.items()):
+                execution_id = binding[2]
+                if execution_id in execution_ids:
+                    current.pop(project_id, None)
+
+    def _invalidate_deleted_session_bindings(
+        project: Project,
+        agent: Agent | None = None,
+    ) -> None:
+        """Drop only bindings for the exact deleted row generation."""
+        if project.id is None:
+            return
+        deleted_agent_key: tuple[int, str] | None = None
+        if agent is not None:
+            if agent.id is None:
+                return
+            deleted_agent_key = (agent.id, agent.agent_generation)
+
+        for session_key, bindings in session_agent_bindings.items():
+            removed_bindings = {
+                binding
+                for binding in bindings
+                if binding[0] == project.id
+                and binding[1] == project.project_generation
+                and (
+                    deleted_agent_key is None
+                    or (binding[2], binding[3]) == deleted_agent_key
+                )
+            }
+            bindings.difference_update(removed_bindings)
+            current_agents = session_current_agents.get(session_key)
+            if current_agents is None:
+                continue
+            current_agent = current_agents.get(project.id)
+            if current_agent is None:
+                continue
+            current_project_generation, current_agent_id, current_agent_generation = (
+                current_agent
+            )
+            if current_project_generation != project.project_generation:
+                continue
+            if deleted_agent_key is not None and (
+                current_agent_id,
+                current_agent_generation,
+            ) != deleted_agent_key:
+                continue
+            current_agents.pop(project.id, None)
+            current_executions = session_current_executions.get(session_key)
+            if current_executions is not None:
+                current_executions.pop(project.id, None)
 
     def _session_is_bound_to_agent(ctx: Context, project: Project, agent: Agent) -> bool:
         if project.id is None or agent.id is None:
             return False
-        return (project.id, agent.id) in _session_bindings_for(ctx)
+        return _project_agent_key(project, agent) in _session_bindings_for(ctx)
 
     async def _resolve_session_agent_for_project(
         ctx: Context,
@@ -5585,19 +7133,157 @@ def build_mcp_server() -> FastMCP:
     ) -> Agent | None:
         if project.id is None:
             return None
-        current_agent_id = _session_current_agents_for(ctx).get(project.id)
-        if current_agent_id is not None:
-            with suppress(NoResultFound):
-                return await _get_agent_by_id(project, current_agent_id)
+        current_agents = _session_current_agents_for(ctx)
+        current_agent = current_agents.get(project.id)
+        if current_agent is not None:
+            project_generation, agent_id, agent_generation = current_agent
+            if project_generation == project.project_generation:
+                try:
+                    resolved = await _get_agent_by_id(project, agent_id)
+                except NoResultFound:
+                    resolved = None
+                if (
+                    resolved is not None
+                    and resolved.agent_generation == agent_generation
+                ):
+                    return resolved
+            current_agents.pop(project.id, None)
+            _session_current_executions_for(ctx).pop(project.id, None)
 
-        bound_agent_ids = [
-            agent_id
-            for bound_project_id, agent_id in _session_bindings_for(ctx)
-            if bound_project_id == project.id
-        ]
-        if len(bound_agent_ids) == 1:
-            return await _get_agent_by_id(project, bound_agent_ids[0])
+        bindings = _session_bindings_for(ctx)
+        resolved_agents: list[Agent] = []
+        for binding in list(bindings):
+            bound_project_id, project_generation, agent_id, agent_generation = binding
+            if bound_project_id != project.id:
+                continue
+            if project_generation != project.project_generation:
+                bindings.discard(binding)
+                continue
+            try:
+                resolved = await _get_agent_by_id(project, agent_id)
+            except NoResultFound:
+                bindings.discard(binding)
+                continue
+            if resolved.agent_generation != agent_generation:
+                bindings.discard(binding)
+                continue
+            resolved_agents.append(resolved)
+        if len(resolved_agents) == 1:
+            return resolved_agents[0]
         return None
+
+    async def _resolve_agent_execution(
+        ctx: Context,
+        project: Project,
+        agent: Agent,
+        execution_id: str | None,
+        execution_token: str | None,
+        *,
+        action: str,
+        required: bool = True,
+        require_active: bool = True,
+        allow_authenticated_owner_recovery: bool = False,
+        require_active_capability: bool = False,
+        touch_activity: bool = True,
+    ) -> AgentExecution | None:
+        """Resolve an explicit or session-bound execution and enforce ownership."""
+        if project.id is None or agent.id is None:
+            raise ValueError("Project and agent must have ids before resolving an execution.")
+        resolved_id = execution_id.strip() if execution_id else None
+        explicit_resolution = resolved_id is not None
+        if resolved_id is None:
+            resolved_id = _session_execution_id(ctx, project, agent)
+        if resolved_id is None:
+            if not required:
+                return None
+            raise ToolExecutionError(
+                "EXECUTION_REQUIRED",
+                (
+                    f"{action} requires execution_id or an active AgentExecution bound "
+                    "to this MCP session. Call start_agent_execution first."
+                ),
+                recoverable=True,
+                data={
+                    "project_key": project.human_key,
+                    "agent_name": agent.name,
+                    "action": action,
+                },
+            )
+        async with get_session() as session:
+            execution = await session.get(AgentExecution, resolved_id)
+        if execution is None:
+            raise ToolExecutionError(
+                "EXECUTION_NOT_FOUND",
+                f"Agent execution '{resolved_id}' was not found.",
+                recoverable=True,
+                data={"execution_id": resolved_id, "action": action},
+            )
+        if execution.project_id != project.id or execution.agent_id != agent.id:
+            raise ToolExecutionError(
+                "EXECUTION_OWNERSHIP_MISMATCH",
+                (
+                    f"Agent execution '{resolved_id}' does not belong to agent "
+                    f"'{agent.name}' in project '{project.human_key}'."
+                ),
+                recoverable=False,
+                data={"execution_id": resolved_id, "action": action},
+            )
+        is_exact_session_binding = (
+            _session_execution_id(ctx, project, agent) == execution.id
+        )
+        token_matches = bool(
+            execution_token
+            and hmac.compare_digest(
+                hashlib.sha256(execution_token.encode("utf-8")).hexdigest(),
+                execution.execution_token_hash,
+            )
+        )
+        owner_recovery_allowed = (
+            allow_authenticated_owner_recovery and execution.status != "active"
+        )
+        if (
+            execution.status == "active"
+            and require_active_capability
+            and not token_matches
+        ) or (
+            explicit_resolution
+            and not is_exact_session_binding
+            and not owner_recovery_allowed
+            and not token_matches
+        ):
+            raise ToolExecutionError(
+                "EXECUTION_CAPABILITY_MISMATCH",
+                f"Invalid execution_token for execution '{execution.id}'.",
+                recoverable=False,
+                data={"execution_id": execution.id, "action": action},
+            )
+        if require_active and execution.status != "active":
+            _clear_session_execution(ctx, project, execution.id)
+            raise ToolExecutionError(
+                "EXECUTION_NOT_ACTIVE",
+                f"Agent execution '{resolved_id}' is '{execution.status}', not active.",
+                recoverable=True,
+                data={
+                    "execution_id": resolved_id,
+                    "status": execution.status,
+                    "action": action,
+                },
+            )
+        if execution.status == "active" and touch_activity:
+            touched_at = _naive_utc()
+            async with get_session() as session:
+                await session.execute(
+                    update(AgentExecution)
+                    .where(
+                        cast(Any, AgentExecution.id) == execution.id,
+                        cast(Any, AgentExecution.status) == "active",
+                    )
+                    .values(last_active_ts=touched_at)
+                )
+                await session.commit()
+            execution.last_active_ts = touched_at
+            _bind_session_execution(ctx, project, agent, execution)
+        return execution
 
     # Authenticating IS activity, and until now it did not count as any.
     #
@@ -5642,9 +7328,14 @@ def build_mcp_server() -> FastMCP:
                 previous = _naive_utc(previous)
                 if (now - previous).total_seconds() < _ACTIVITY_TOUCH_SECONDS:
                     return
-            async with get_session() as session:
+            async with get_immediate_session() as session:
                 db_agent = await session.get(Agent, agent.id)
-                if db_agent is not None:
+                if (
+                    db_agent is not None
+                    and db_agent.project_id == agent.project_id
+                    and db_agent.name == agent.name
+                    and db_agent.agent_generation == agent.agent_generation
+                ):
                     db_agent.last_active_ts = now
                     session.add(db_agent)
                     await session.commit()
@@ -5682,15 +7373,6 @@ def build_mcp_server() -> FastMCP:
             # unsticks cleanup of pre-token agents without direct SQL surgery.
             # All other actions continue to require the target's own token.
             #
-            # Scoped to the reversible pair, deliberately. hard_delete_agent
-            # used to be here, which let any participant permanently destroy
-            # another identity — and a tokenless agent is not always a stale
-            # ghost. The human operator's own identity is created without a
-            # token and there is no path to issue one afterwards: minting
-            # requires authentication, authentication requires the token. So
-            # the one identity that cannot defend itself was the one anybody
-            # could delete, with no way to recreate its mailbox or its history.
-            #
             # unretire_agent was NOT here, which made the "reversible" half
             # one-way in exactly the same case: retiring a tokenless agent
             # locked it out, since putting it back demanded the token it does
@@ -5710,23 +7392,12 @@ def build_mcp_server() -> FastMCP:
                     f"Agent '{agent.name}' does not have a registration token, so {action} cannot be authenticated. "
                     "Re-register or mint a token locally before retrying, or run this call from an MCP session "
                     "already authenticated as another agent in the same project (adjacent-agent auth is permitted "
-                    "for retire_agent and unretire_agent on tokenless legacy agents, and deliberately not for "
-                    "hard_delete_agent, which cannot be undone)."
+                    "only for retire_agent and unretire_agent on tokenless legacy agents)."
                 ),
                 recoverable=True,
                 data={"agent_name": agent.name, "project_key": project.human_key, "action": action},
             )
         if not provided_token:
-            # Fallback: auto-rebind via window identity when session reconnects.
-            # If MCP_AGENT_MAIL_WINDOW_ID is set and maps to this agent in this
-            # project, treat it as proof of identity and bind the session.
-            _wi_settings = get_settings()
-            _wi_uuid = getattr(_wi_settings, "window_identity_uuid", "") or ""
-            if _wi_uuid and _validate_window_uuid(_wi_uuid):
-                _wi = await _get_window_identity(project, _wi_uuid)
-                if _wi and _wi.display_name == agent.name:
-                    _bind_session_agent(ctx, project, agent)
-                    return agent
             raise ToolExecutionError(
                 "AUTHENTICATION_REQUIRED",
                 (
@@ -5758,13 +7429,61 @@ def build_mcp_server() -> FastMCP:
         registration_token: str | None,
         *,
         action: str,
-    ) -> Agent:
+        allow_create: bool,
+        attachments_policy: str | None = None,
+    ) -> tuple[Agent, bool]:
         """Create an identity or authenticate before updating an existing one.
 
         The registration token is part of the unique-row INSERT.  Therefore a
         concurrent loser can identify the database winner but can neither
         receive its token nor update its profile without authenticating first.
         """
+        if not allow_create:
+            existing = await _find_agent_optional(project, name or "")
+            if existing is None:
+                raise ToolExecutionError(
+                    "BOOTSTRAP_TOKEN_HANDOFF_REQUIRED",
+                    (
+                        f"Agent '{name}' does not exist. Provision it first with register_agent "
+                        "or create_agent_identity, persist the one-time credential outside the "
+                        "MCP transcript, then retry this session macro."
+                    ),
+                    recoverable=True,
+                    data={
+                        "agent_name": name,
+                        "project_key": project.human_key,
+                        "required_action": "provision_agent",
+                    },
+                )
+            authenticated = await _authenticate_agent(
+                ctx,
+                project,
+                existing.name,
+                registration_token,
+                token_param="registration_token",
+                action=action,
+            )
+            if authenticated.id is None:
+                raise NoResultFound(f"Agent '{authenticated.name}' no longer exists.")
+            updated, recreated = await _get_or_create_agent(
+                project,
+                authenticated.name,
+                program,
+                model,
+                task_description,
+                settings,
+                attachments_policy=attachments_policy,
+                update_existing=True,
+                expected_existing_agent_id=authenticated.id,
+                expected_existing_agent_generation=authenticated.agent_generation,
+                expected_project_generation=project.project_generation,
+            )
+            if recreated:
+                raise RuntimeError(
+                    f"Agent identity '{authenticated.name}' was recreated during authenticated registration."
+                )
+            return updated, False
+
         candidate_token = secrets.token_urlsafe(32)
         agent, newly_created = await _get_or_create_agent(
             project,
@@ -5774,10 +7493,11 @@ def build_mcp_server() -> FastMCP:
             task_description,
             settings,
             registration_token_on_create=candidate_token,
+            attachments_policy=attachments_policy,
             update_existing=False,
         )
         if newly_created:
-            return agent
+            return agent, True
 
         authenticated = await _authenticate_agent(
             ctx,
@@ -5796,14 +7516,17 @@ def build_mcp_server() -> FastMCP:
             model,
             task_description,
             settings,
+            attachments_policy=attachments_policy,
             update_existing=True,
             expected_existing_agent_id=authenticated.id,
+            expected_existing_agent_generation=authenticated.agent_generation,
+            expected_project_generation=project.project_generation,
         )
         if recreated:
             raise RuntimeError(
                 f"Agent identity '{authenticated.name}' was recreated during authenticated registration."
             )
-        return updated
+        return updated, False
 
     async def _resolve_authenticated_agent(
         ctx: Context,
@@ -5832,7 +7555,7 @@ def build_mcp_server() -> FastMCP:
             "AUTHENTICATION_REQUIRED",
             (
                 f"{action} requires an authenticated agent for project '{project.human_key}'. "
-                "Provide agent_name plus registration_token (or agent_token for resources), or authenticate in this session first."
+                "Provide agent_name plus registration_token, or authenticate in this session first."
             ),
             recoverable=True,
             data={"project_key": project.human_key, "token_param": token_param},
@@ -5857,6 +7580,7 @@ def build_mcp_server() -> FastMCP:
                 select(Agent).where(
                     cast(Any, Agent.project_id) == project.id,
                     cast(Any, Agent.registration_token).isnot(None),
+                    cast(Any, Agent.provisioning_state == "active"),
                 )
             )
             token_agents = agents_result.scalars().all()
@@ -6298,7 +8022,8 @@ def build_mcp_server() -> FastMCP:
         What it checks vs what it does not
         ----------------------------------
         - Reports current environment and HTTP binding details.
-        - Returns the configured database URL (not a live connection test).
+        - Deliberately omits the configured database URL because connection URLs
+          may contain credentials or sensitive filesystem locations.
         - Does not perform deep dependency health checks or connection attempts.
 
         Returns
@@ -6309,7 +8034,7 @@ def build_mcp_server() -> FastMCP:
               "environment": str,
               "http_host": str,
               "http_port": int,
-              "database_url": str
+              "http_path": str
             }
 
         Examples
@@ -6326,10 +8051,7 @@ def build_mcp_server() -> FastMCP:
         await ctx.info("Running health check.")
         return {
             "status": "ok",
-            "environment": settings.environment,
-            "http_host": settings.http.host,
-            "http_port": settings.http.port,
-            "database_url": settings.database.url,
+            **_public_runtime_descriptor(settings),
         }
 
     @mcp.tool(name="ensure_project")
@@ -6345,37 +8067,40 @@ def build_mcp_server() -> FastMCP:
 
         When to use
         -----------
-        - First call in a workflow targeting a new repo/path identifier.
+        - First call in a workflow targeting a new repository identity.
         - As a guard before registering agents or sending messages.
 
         How it works
         ------------
-        - Validates that `human_key` is an absolute path-like project key (typically the
-          agent's working directory). It need not exist on the local filesystem: it is an
-          opaque project KEY, and collaborating agents may not share a filesystem.
-        - Computes a stable slug from `human_key` (lowercased, safe characters) so
-          multiple agents can refer to the same project consistently.
+        - Validates that `human_key` is an absolute path-like project key. For a
+          shared Git repository, normalize its origin to a synthetic key such as
+          ``/owner/repository`` and use that same key on every host. A local
+          checkout path is also accepted so the identity resolver can inspect
+          its marker/discovery/remote metadata.
+        - Resolves the durable `project_uid` before any DB lookup. Committed
+          markers, discovery YAML, and normalized Git remotes therefore join
+          linked worktrees and clones even when their local paths differ.
         - Ensures DB row exists and that the on-disk archive is initialized
           (e.g., `messages/`, `agents/`, `file_reservations/` directories).
 
         CRITICAL: Project Identity Rules
         ---------------------------------
-        - The `human_key` MUST be an absolute path-like project key (typically the
-          agent's working directory path)
-        - Two agents working in the SAME directory path are working on the SAME project
-        - Example: Both agents in /data/projects/smartedgar_mcp → SAME project
-        - Sibling projects are DIFFERENT directories (e.g., /data/projects/smartedgar_mcp
-          vs /data/projects/smartedgar_mcp_frontend)
+        - The `human_key` MUST be an absolute path-like project key. Prefer the
+          normalized remote key (for example ``/owner/repository``) across hosts;
+          never make a checkout-specific path the shared identity by convention.
+        - A durable marker/discovery/remote identity is authoritative across
+          worktrees and hosts. Without one, normalized directory identity is used.
 
         Parameters
         ----------
         human_key : str
-            An absolute path-like project key (e.g., "/data/projects/backend"), typically the
-            agent's working directory. This MUST be an absolute path, not a relative path or
-            arbitrary slug, but it does NOT need to exist on the local filesystem - it is an
-            opaque project KEY (collaborating agents may not share a filesystem).
-            This is the canonical identifier for the project - all agents using the same key
-            share the same project identity.
+            An absolute path-like project key (for example ``/owner/backend``),
+            normally derived from the normalized Git origin. This MUST be an
+            absolute path, not a relative path or arbitrary slug, but it does not
+            need to exist on the local filesystem. Passing a checkout path is
+            useful only when the server must resolve its Git identity metadata.
+            The first resolved path is retained as the project's canonical human
+            alias; subsequent equivalent worktrees return that same DB row.
         identity_mode : str, optional
             Per-call override of the server's PROJECT_IDENTITY_MODE setting; one of
             "dir", "git-remote", "git-common-dir", "git-toplevel". Only takes effect when
@@ -6384,7 +8109,7 @@ def build_mcp_server() -> FastMCP:
         Returns
         -------
         dict
-            Minimal project descriptor: { id, slug, human_key, created_at }.
+            Minimal project descriptor: { id, project_uid, slug, human_key, created_at }.
 
         Examples
         --------
@@ -6394,15 +8119,16 @@ def build_mcp_server() -> FastMCP:
           "jsonrpc": "2.0",
           "id": "2",
           "method": "tools/call",
-          "params": {"name": "ensure_project", "arguments": {"human_key": "/data/projects/backend"}}
+          "params": {"name": "ensure_project", "arguments": {"human_key": "/owner/backend"}}
         }
         ```
 
         Common mistakes
         ---------------
         - Passing a relative path (e.g., "./backend") instead of an absolute path
-        - Using arbitrary slugs instead of the actual working directory path
-        - Creating separate projects for the same directory with different slugs
+        - Using a checkout-specific path on one host and a normalized remote key
+          on another without a shared marker/project UID
+        - Creating separate project keys for the same Git origin
 
         Idempotency
         -----------
@@ -6414,17 +8140,21 @@ def build_mcp_server() -> FastMCP:
         if not _is_absolute_project_key(human_key):
             raise ValueError(
                 f"human_key must be an absolute path-like project key, got: '{human_key}'. "
-                "Use the agent's working directory path (e.g., '/data/projects/backend' on Unix "
-                "or 'C:\\projects\\backend' on Windows)."
+                "Use the normalized Git-origin key (for example '/owner/backend') "
+                "or an absolute checkout path when resolving local Git metadata."
             )
 
         await _ctx_info_safe(ctx, f"Ensuring project for key '{human_key}'.")
-        project = await _ensure_project(human_key)
+        project = await _ensure_project(human_key, identity_mode=identity_mode)
         await ensure_archive(settings, project.slug)
         payload = _project_to_dict(project)
         # Worktree identity metadata is opt-in to keep default calls lightweight and stable.
         if settings.worktrees_enabled:
-            identity_payload = _resolve_project_identity(human_key, identity_mode=identity_mode)
+            identity_payload = await asyncio.to_thread(
+                _resolve_project_identity,
+                human_key,
+                identity_mode,
+            )
             payload["identity"] = identity_payload
             for key in (
                 "identity_mode_used",
@@ -6447,7 +8177,7 @@ def build_mcp_server() -> FastMCP:
         project_key: str,
         program: str,
         model: str,
-        name: Optional[str] = None,
+        name: str,
         task_description: str = "",
         attachments_policy: str = "auto",
         registration_token: Optional[str] = None,
@@ -6463,23 +8193,17 @@ def build_mcp_server() -> FastMCP:
 
         Semantics
         ---------
-        - If `name` is omitted, a random adjective+noun name is auto-generated.
-        - Reusing the same `name` updates the profile (program/model/task) and
-          refreshes `last_active_ts`.
+        - `name` is required and identifies a durable mailbox/persona.
+        - Creation is authorized by the MCP transport's bearer/JWT/RBAC policy;
+          a structurally valid name is an identifier, never an authenticator.
+        - Reusing the same explicit `name` updates the profile (program/model/task) and
+          refreshes `last_active_ts` only after registration-token/session authentication.
         - A `profile.json` file is written under `agents/<Name>/` in the project archive.
 
         Agent Identity
         ---------------
-        Two naming modes are supported:
-        1. **Explicit identity** — pass a stable ID like ``alpha-one``, ``cc-0``,
-           or ``worker_42``.  Must match ``[A-Za-z0-9][A-Za-z0-9._-]{0,127}``.
-           Useful for swarm workflows where agents are relaunched onto the same
-           identity.
-        2. **Auto-generated** — omit ``name`` to get a random adjective+noun
-           identity like ``GreenLake`` or ``BlueDog`` (RECOMMENDED for ad-hoc use).
-
-        Invalid examples: "BackendHarmonizer", "DatabaseMigrator" (descriptive
-        role names are rejected in strict mode).
+        Pass a stable ID such as ``codex-wsl-home-1``. Execution lifetimes and
+        subagents belong in ``start_agent_execution``, not separate Agent rows.
 
         Parameters
         ----------
@@ -6489,14 +8213,12 @@ def build_mcp_server() -> FastMCP:
             The agent program (e.g., "codex-cli", "claude-code").
         model : str
             The underlying model (e.g., "gpt5-codex", "opus-4.1").
-        name : Optional[str]
-            A valid explicit identity (e.g., "alpha-one", "cc-0") or adjective+noun
-            combination (e.g., "BlueLake").
-            If omitted, a random valid name is auto-generated (RECOMMENDED).
+        name : str
+            Required stable ``client-os-host-slot`` identity, for example
+            ``codex-wsl-home-1`` or ``claude-linux-ci-1``.
             Names are unique per project; passing the same name updates the profile.
         task_description : str
             Short description of current focus (shows up in directory listings).
-
         Returns
         -------
         dict
@@ -6504,27 +8226,28 @@ def build_mcp_server() -> FastMCP:
 
         Examples
         --------
-        Register with auto-generated name (RECOMMENDED):
-        ```json
-        {"jsonrpc":"2.0","id":"3","method":"tools/call","params":{"name":"register_agent","arguments":{
-          "project_key":"/data/projects/backend","program":"codex-cli","model":"gpt5-codex","task_description":"Auth refactor"
-        }}}
-        ```
-
-        Register with explicit valid name:
+        Register a durable identity:
         ```json
         {"jsonrpc":"2.0","id":"4","method":"tools/call","params":{"name":"register_agent","arguments":{
-          "project_key":"/data/projects/backend","program":"claude-code","model":"opus-4.1","name":"BlueLake","task_description":"Navbar redesign"
+          "project_key":"/data/projects/backend","program":"claude-code","model":"opus-4.1","name":"claude-linux-ci-1","task_description":"Navbar redesign"
         }}}
         ```
 
         Pitfalls
         --------
-        - Names MUST match the adjective+noun format or an error will be raised
-        - Names are case-insensitive unique. If you see "already in use", pick another or omit `name`.
+        - New names MUST match ``client-os-host-slot``; no fallback name is generated.
+        - Names are case-insensitive unique. Resume the same durable identity with
+          its registration token instead of creating a replacement Agent.
         - Use the same `project_key` consistently across cooperating agents.
         """
         _validate_program_model(program, model)
+        if name is None or not name.strip():
+            raise ToolExecutionError(
+                "NAME_REQUIRED",
+                "register_agent requires an explicit durable name.",
+                recoverable=True,
+                data={"field": "name"},
+            )
         project = await _get_project_by_identifier(project_key)
         if settings.tools_log_enabled:
             try:
@@ -6534,14 +8257,14 @@ def build_mcp_server() -> FastMCP:
                 Console = _rc.Console
                 Panel = _rp.Panel
                 c = Console()
-                c.print(Panel(f"project=[bold]{project.human_key}[/]\nname=[bold]{name or '(generated)'}[/]\nprogram={program}\nmodel={model}", title="tool: register_agent", border_style="green"))
+                c.print(Panel(f"project=[bold]{project.human_key}[/]\nname=[bold]{name or '(required)'}[/]\nprogram={program}\nmodel={model}", title="tool: register_agent", border_style="green"))
             except Exception:
                 pass
         # sanitize attachments policy
         ap = (attachments_policy or "auto").lower()
         if ap not in {"auto", "inline", "file"}:
             ap = "auto"
-        agent = await _register_or_authenticate_agent(
+        agent, newly_created = await _register_or_authenticate_agent(
             ctx,
             project,
             name,
@@ -6550,73 +8273,821 @@ def build_mcp_server() -> FastMCP:
             task_description,
             registration_token,
             action="register_agent for an existing identity",
+            allow_create=True,
+            attachments_policy=ap,
         )
-        # Persist attachment policy if changed
-        if getattr(agent, "attachments_policy", None) != ap:
-            async with get_session() as session:
-                db_agent = await session.get(Agent, agent.id)
-                if db_agent:
-                    db_agent.attachments_policy = ap
-                    session.add(db_agent)
-                    await session.commit()
-                    await session.refresh(db_agent)
-                    agent = db_agent
-        agent, token = await _ensure_agent_registration_token(agent)
-        _bind_session_agent(ctx, project, agent)
-        await ctx.info(f"Registered agent '{agent.name}' for project '{project.human_key}'.")
+        if newly_created:
+            # Provisioning inserted the one-time credential before publishing
+            # the exact DB-backed profile and activating the Agent.  Do not add
+            # another fallible DB step after activation but before handoff: an
+            # error there would strand a valid credential the caller never saw.
+            token = (agent.registration_token or "").strip()
+            if not token:
+                raise RuntimeError(
+                    f"Provisioned Agent id '{agent.id}' has no registration token."
+                )
+        if newly_created:
+            with suppress(Exception):
+                _bind_session_agent(ctx, project, agent)
+        else:
+            _bind_session_agent(ctx, project, agent)
+        await _ctx_info_safe(
+            ctx,
+            f"Registered agent '{agent.name}' for project '{project.human_key}'.",
+        )
         result = _agent_to_dict(agent)
-        result["registration_token"] = token
+        if newly_created:
+            result["registration_token"] = token
+        else:
+            result["registration_token_issued"] = False
         # Enrich with window identity info if MCP_AGENT_MAIL_WINDOW_ID is set.
         # NOTE: _get_or_create_agent already resolved this for the archive profile,
         # but propagating it via return type would churn 8+ callers for a cold-path query.
         window_uuid = getattr(settings, "window_identity_uuid", "") or ""
         if window_uuid and _validate_window_uuid(window_uuid):
-            wi = await _get_window_identity(project, window_uuid)
-            if wi:
+            try:
+                wi = await _get_window_identity(project, window_uuid)
+            except Exception:
+                # Window metadata is optional response enrichment.  The exact
+                # association was already included in provisioning/profile
+                # publication; a read failure must not burn token handoff.
+                wi = None
+            if wi is not None:
                 result["window_id"] = wi.window_uuid
                 result["window_display_name"] = wi.display_name
         return result
 
-    @mcp.tool(
-        name="deregister_agent",
-        description="Remove an agent from a project. Marks the agent as inactive and removes it from the active roster. "
-        "Messages from/to the agent are preserved for audit but the agent can no longer send or receive new messages.",
+    @mcp.tool(name="start_agent_execution")
+    @_instrument_tool(
+        "start_agent_execution",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity", "repository"},
+        project_arg="project_key",
+        agent_arg="agent_name",
     )
-    @_instrument_tool("deregister_agent", cluster=CLUSTER_IDENTITY, capabilities={"identity"}, agent_arg="agent_name", project_arg="project_key")
-    async def deregister_agent(
+    async def start_agent_execution(
         ctx: Context,
         project_key: str,
         agent_name: str,
+        external_id: str,
+        client_name: str,
+        execution_token: str,
+        lifecycle_protocol_version: Optional[int] = None,
+        kind: str = "session",
+        parent_execution_id: Optional[str] = None,
+        parent_execution_token: Optional[str] = None,
+        turn_id: Optional[str] = None,
+        agent_type: Optional[str] = None,
+        model: Optional[str] = None,
+        permission_mode: Optional[str] = None,
+        task_description: str = "",
+        cwd: Optional[str] = None,
+        repo_root: Optional[str] = None,
+        git_common_dir: Optional[str] = None,
+        worktree_path: Optional[str] = None,
+        branch: Optional[str] = None,
+        head_sha: Optional[str] = None,
         registration_token: Optional[str] = None,
+        format: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Remove an agent from the active roster."""
+        """Start and bind one session/subagent lifetime to a durable Agent."""
         project = await _get_project_by_identifier(project_key)
-        if not project:
-            raise ValueError(f"Project '{project_key}' not found")
-
         agent = await _authenticate_agent(
             ctx,
             project,
             agent_name,
             registration_token,
             token_param="registration_token",
-            action="deregister_agent",
+            action="start_agent_execution",
         )
+        if project.id is None or agent.id is None:
+            raise ValueError("Project and agent must have ids before starting an execution.")
 
-        async with get_session() as session:
+        normalized_external_id = cast(
+            str,
+            _bounded_execution_text(
+                "external_id", external_id, 255, required=True
+            ),
+        )
+        normalized_client_name = cast(
+            str,
+            _bounded_execution_text(
+                "client_name", client_name, 128, required=True
+            ),
+        )
+        normalized_kind = kind.strip().lower()
+        if _EXECUTION_TOKEN_PATTERN.fullmatch(execution_token) is None:
+            raise ToolExecutionError(
+                "INVALID_EXECUTION_TOKEN",
+                "execution_token must be exactly 64 lowercase hexadecimal characters.",
+                recoverable=False,
+            )
+        requested_protocol_version, protocol_warning = _validate_execution_protocol(
+            lifecycle_protocol_version,
+            settings=get_settings(),
+        )
+        execution_token_hash = hashlib.sha256(
+            execution_token.encode("utf-8")
+        ).hexdigest()
+        if normalized_kind not in {"session", "subagent"}:
+            raise ToolExecutionError(
+                "INVALID_EXECUTION_KIND",
+                "kind must be 'session' or 'subagent'.",
+                data={"kind": kind},
+            )
+
+        normalized_parent_id = _bounded_execution_text(
+            "parent_execution_id", parent_execution_id, 36
+        )
+        normalized_turn_id = _bounded_execution_text("turn_id", turn_id, 255)
+        normalized_agent_type = _bounded_execution_text(
+            "agent_type", agent_type, 128
+        )
+        normalized_model = _bounded_execution_text("model", model, 128)
+        normalized_permission_mode = _bounded_execution_text(
+            "permission_mode", permission_mode, 64
+        )
+        normalized_task = _bounded_execution_text(
+            "task_description", task_description, 2048
+        ) or ""
+        normalized_cwd = _bounded_execution_text("cwd", cwd, 2048)
+        normalized_repo_root = _bounded_execution_text(
+            "repo_root", repo_root, 2048
+        )
+        normalized_git_common_dir = _bounded_execution_text(
+            "git_common_dir", git_common_dir, 2048
+        )
+        normalized_worktree_path = _bounded_execution_text(
+            "worktree_path", worktree_path, 2048
+        )
+        normalized_branch = _bounded_execution_text("branch", branch, 512)
+        normalized_head = _bounded_execution_text("head_sha", head_sha, 40)
+        if normalized_kind == "session" and normalized_parent_id is not None:
+            raise ToolExecutionError(
+                "INVALID_PARENT_EXECUTION",
+                "A session execution cannot have a parent_execution_id.",
+                data={"parent_execution_id": normalized_parent_id},
+            )
+        if normalized_kind == "subagent" and normalized_parent_id is None:
+            raise ToolExecutionError(
+                "PARENT_EXECUTION_REQUIRED",
+                "A subagent execution requires an active parent_execution_id.",
+                data={"kind": normalized_kind},
+            )
+        if normalized_head is not None:
+            normalized_head = normalized_head.lower()
+            if not re.fullmatch(r"[0-9a-f]{40}", normalized_head):
+                raise ToolExecutionError(
+                    "INVALID_HEAD_SHA",
+                    "head_sha must be exactly 40 hexadecimal characters.",
+                    data={"head_sha": head_sha},
+                )
+
+        now = _naive_utc()
+        reused = False
+        async with get_immediate_session() as session:
+            db_project = await session.get(Project, project.id)
             db_agent = await session.get(Agent, agent.id)
-            if db_agent:
-                db_agent.contact_policy = "block_all"
-                db_agent.task_description = f"[DEREGISTERED at {datetime.now(timezone.utc).isoformat()}] {db_agent.task_description}"
-                session.add(db_agent)
-                await session.commit()
+            if (
+                db_project is None
+                or db_project.project_generation != project.project_generation
+                or db_agent is None
+                or db_agent.project_id != project.id
+                or db_agent.agent_generation != agent.agent_generation
+                or db_agent.provisioning_state != "active"
+            ):
+                raise ToolExecutionError(
+                    "AGENT_IDENTITY_STALE",
+                    "The authenticated project or Agent lifetime no longer exists.",
+                    recoverable=True,
+                    data={"project_key": project.human_key, "agent_name": agent.name},
+                )
+            if db_agent.retired_at is not None:
+                raise ToolExecutionError(
+                    "AGENT_RETIRED",
+                    f"Agent '{agent.name}' is retired and cannot start an execution.",
+                    recoverable=False,
+                    data={"project_key": project.human_key, "agent_name": agent.name},
+                )
+            parent: AgentExecution | None = None
+            if normalized_parent_id is not None:
+                parent = await session.get(AgentExecution, normalized_parent_id)
+                if (
+                    parent is None
+                    or parent.project_id != project.id
+                    or parent.agent_id != agent.id
+                ):
+                    raise ToolExecutionError(
+                        "INVALID_PARENT_EXECUTION",
+                        "Parent execution must belong to the same project and Agent.",
+                        data={"parent_execution_id": normalized_parent_id},
+                    )
+                if parent.status != "active":
+                    raise ToolExecutionError(
+                        "PARENT_EXECUTION_NOT_ACTIVE",
+                        f"Parent execution '{parent.id}' is '{parent.status}', not active.",
+                        data={"parent_execution_id": parent.id, "status": parent.status},
+                    )
+                parent_is_bound = (
+                    _session_execution_id(ctx, project, agent) == parent.id
+                )
+                if not parent_is_bound and (
+                    not parent_execution_token
+                    or not hmac.compare_digest(
+                        hashlib.sha256(
+                            parent_execution_token.encode("utf-8")
+                        ).hexdigest(),
+                        parent.execution_token_hash,
+                    )
+                ):
+                    raise ToolExecutionError(
+                        "EXECUTION_CAPABILITY_MISMATCH",
+                        f"Invalid parent_execution_token for execution '{parent.id}'.",
+                        recoverable=False,
+                        data={"parent_execution_id": parent.id},
+                    )
 
-        await ctx.info(f"Deregistered agent '{agent_name}' from project '{project.human_key}'.")
-        return {
-            "status": "deregistered",
-            "agent_name": agent_name,
-            "project_key": project_key,
+            existing_stmt = select(AgentExecution).where(
+                cast(Any, AgentExecution.client_name) == normalized_client_name,
+                cast(Any, AgentExecution.external_id) == normalized_external_id,
+                cast(Any, AgentExecution.kind) == normalized_kind,
+            )
+            if normalized_kind == "session":
+                existing_stmt = existing_stmt.where(
+                    cast(Any, AgentExecution.agent_id) == agent.id,
+                    cast(Any, AgentExecution.parent_execution_id).is_(None),
+                )
+            else:
+                existing_stmt = existing_stmt.where(
+                    cast(Any, AgentExecution.parent_execution_id)
+                    == normalized_parent_id
+                )
+            existing_result = await session.execute(existing_stmt)
+            execution = existing_result.scalars().first()
+            if execution is not None:
+                if not hmac.compare_digest(
+                    execution_token_hash, execution.execution_token_hash
+                ):
+                    raise ToolExecutionError(
+                        "EXECUTION_CAPABILITY_MISMATCH",
+                        "Idempotent start requires the original execution_token.",
+                        recoverable=False,
+                        data={"execution_id": execution.id},
+                    )
+                if execution.status != "active":
+                    raise ToolExecutionError(
+                        "EXECUTION_ALREADY_ENDED",
+                        (
+                            f"Execution external_id '{normalized_external_id}' already ended "
+                            f"as '{execution.status}' and cannot be reactivated."
+                        ),
+                        recoverable=False,
+                        data=_agent_execution_to_dict(execution),
+                    )
+                immutable_existing = (
+                    execution.project_id,
+                    execution.agent_id,
+                    execution.kind,
+                    execution.parent_execution_id,
+                    execution.client_name,
+                    execution.turn_id if execution.kind == "subagent" else None,
+                    execution.agent_type if execution.kind == "subagent" else None,
+                )
+                immutable_requested = (
+                    project.id,
+                    agent.id,
+                    normalized_kind,
+                    normalized_parent_id,
+                    normalized_client_name,
+                    normalized_turn_id if normalized_kind == "subagent" else None,
+                    normalized_agent_type if normalized_kind == "subagent" else None,
+                )
+                if immutable_existing != immutable_requested:
+                    raise ToolExecutionError(
+                        "EXECUTION_CONFLICT",
+                        "An active execution with this external_id has different immutable identity metadata.",
+                        recoverable=False,
+                        data={"execution_id": execution.id, "external_id": normalized_external_id},
+                    )
+                reused = True
+                execution.task_description = normalized_task
+                execution.lifecycle_protocol_version = max(
+                    execution.lifecycle_protocol_version,
+                    requested_protocol_version,
+                )
+                execution.model = normalized_model
+                execution.permission_mode = normalized_permission_mode
+                execution.cwd = normalized_cwd
+                execution.repo_root = normalized_repo_root
+                execution.git_common_dir = normalized_git_common_dir
+                execution.worktree_path = normalized_worktree_path
+                execution.branch = normalized_branch
+                execution.head_sha = normalized_head
+                execution.last_active_ts = now
+            else:
+                token_owner = (
+                    await session.execute(
+                        select(AgentExecution.id).where(
+                            cast(Any, AgentExecution.execution_token_hash)
+                            == execution_token_hash
+                        )
+                    )
+                ).scalar_one_or_none()
+                if token_owner is not None:
+                    raise ToolExecutionError(
+                        "EXECUTION_CAPABILITY_REUSED",
+                        "execution_token is already assigned to a different execution lifetime.",
+                        recoverable=False,
+                    )
+                execution = AgentExecution(
+                    id=str(uuid.uuid4()),
+                    project_id=project.id,
+                    agent_id=agent.id,
+                    parent_execution_id=normalized_parent_id,
+                    external_id=normalized_external_id,
+                    client_name=normalized_client_name,
+                    execution_token_hash=execution_token_hash,
+                    lifecycle_protocol_version=requested_protocol_version,
+                    kind=normalized_kind,
+                    status="active",
+                    turn_id=normalized_turn_id,
+                    agent_type=normalized_agent_type,
+                    model=normalized_model,
+                    permission_mode=normalized_permission_mode,
+                    task_description=normalized_task,
+                    cwd=normalized_cwd,
+                    repo_root=normalized_repo_root,
+                    git_common_dir=normalized_git_common_dir,
+                    worktree_path=normalized_worktree_path,
+                    branch=normalized_branch,
+                    head_sha=normalized_head,
+                    started_ts=now,
+                    last_active_ts=now,
+                )
+            session.add(execution)
+            await session.commit()
+            await session.refresh(execution)
+
+        _bind_session_execution(ctx, project, agent, execution)
+        ancestor_ids = await _load_execution_ancestor_ids(execution)
+        response = {
+            **_agent_execution_to_dict(
+                execution,
+                ancestor_execution_ids=ancestor_ids,
+            ),
+            "reused": reused,
         }
+        if protocol_warning is not None:
+            response["warnings"] = [protocol_warning]
+        return response
+
+    @mcp.tool(name="heartbeat_agent_execution")
+    @_instrument_tool(
+        "heartbeat_agent_execution",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity", "repository"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def heartbeat_agent_execution(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        execution_id: Optional[str] = None,
+        execution_token: Optional[str] = None,
+        lifecycle_protocol_version: Optional[int] = None,
+        task_description: Optional[str] = None,
+        model: Optional[str] = None,
+        permission_mode: Optional[str] = None,
+        cwd: Optional[str] = None,
+        repo_root: Optional[str] = None,
+        git_common_dir: Optional[str] = None,
+        worktree_path: Optional[str] = None,
+        branch: Optional[str] = None,
+        head_sha: Optional[str] = None,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Heartbeat an active execution and optionally refresh observed metadata."""
+        project = await _get_project_by_identifier(project_key)
+        agent = await _authenticate_agent(
+            ctx,
+            project,
+            agent_name,
+            registration_token,
+            token_param="registration_token",
+            action="heartbeat_agent_execution",
+        )
+        requested_protocol_version, protocol_warning = _validate_execution_protocol(
+            lifecycle_protocol_version,
+            settings=get_settings(),
+        )
+        execution = await _resolve_agent_execution(
+            ctx,
+            project,
+            agent,
+            execution_id,
+            execution_token,
+            action="heartbeat_agent_execution",
+            touch_activity=False,
+        )
+        assert execution is not None
+        normalized_head = _bounded_execution_text("head_sha", head_sha, 40)
+        if normalized_head is not None:
+            normalized_head = normalized_head.lower()
+        if normalized_head is not None and not re.fullmatch(r"[0-9a-f]{40}", normalized_head):
+            raise ToolExecutionError(
+                "INVALID_HEAD_SHA",
+                "head_sha must be exactly 40 hexadecimal characters.",
+                data={"head_sha": head_sha},
+            )
+        updates: dict[str, str | None] = {}
+        if task_description is not None:
+            updates["task_description"] = (
+                _bounded_execution_text(
+                    "task_description", task_description, 2048
+                )
+                or ""
+            )
+        for field_name, value, max_length in (
+            ("model", model, 128),
+            ("permission_mode", permission_mode, 64),
+            ("cwd", cwd, 2048),
+            ("repo_root", repo_root, 2048),
+            ("git_common_dir", git_common_dir, 2048),
+            ("worktree_path", worktree_path, 2048),
+            ("branch", branch, 512),
+        ):
+            if value is not None:
+                updates[field_name] = _bounded_execution_text(
+                    field_name, value, max_length
+                )
+        if head_sha is not None:
+            updates["head_sha"] = normalized_head
+        async with get_immediate_session() as session:
+            db_execution = await session.get(AgentExecution, execution.id)
+            if db_execution is None:
+                raise ToolExecutionError("EXECUTION_NOT_FOUND", "Execution no longer exists.")
+            if db_execution.status != "active":
+                raise ToolExecutionError(
+                    "EXECUTION_NOT_ACTIVE",
+                    f"Agent execution '{db_execution.id}' is '{db_execution.status}', not active.",
+                    data={"execution_id": db_execution.id, "status": db_execution.status},
+                )
+            for field_name, value in updates.items():
+                setattr(db_execution, field_name, value)
+            db_execution.last_active_ts = _naive_utc()
+            db_execution.lifecycle_protocol_version = max(
+                db_execution.lifecycle_protocol_version,
+                requested_protocol_version,
+            )
+            session.add(db_execution)
+            await session.commit()
+            await session.refresh(db_execution)
+        _bind_session_execution(ctx, project, agent, db_execution)
+        response = _agent_execution_to_dict(
+            db_execution,
+            ancestor_execution_ids=await _load_execution_ancestor_ids(db_execution),
+        )
+        if protocol_warning is not None:
+            response["warnings"] = [protocol_warning]
+        return response
+
+    @mcp.tool(name="end_agent_execution")
+    @_instrument_tool(
+        "end_agent_execution",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity", "file_reservations"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def end_agent_execution(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        status: str = "completed",
+        execution_id: Optional[str] = None,
+        execution_token: Optional[str] = None,
+        lifecycle_protocol_version: Optional[int] = None,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """End an execution tree and atomically release only its claims."""
+        terminal_status = status.strip().lower()
+        requested_protocol_version, protocol_warning = _validate_execution_protocol(
+            lifecycle_protocol_version,
+            settings=get_settings(),
+        )
+        if terminal_status not in {"completed", "failed", "cancelled"}:
+            raise ToolExecutionError(
+                "INVALID_EXECUTION_STATUS",
+                "status must be completed, failed, or cancelled.",
+                data={"status": status},
+            )
+        project = await _get_project_by_identifier(project_key)
+        agent = await _authenticate_agent(
+            ctx,
+            project,
+            agent_name,
+            registration_token,
+            token_param="registration_token",
+            action="end_agent_execution",
+        )
+        execution = await _resolve_agent_execution(
+            ctx,
+            project,
+            agent,
+            execution_id,
+            execution_token,
+            action="end_agent_execution",
+            require_active=False,
+            allow_authenticated_owner_recovery=True,
+            require_active_capability=True,
+            touch_activity=False,
+        )
+        assert execution is not None
+
+        async def _reconcile_terminal_retry(
+            terminal_execution: AgentExecution,
+        ) -> dict[str, Any]:
+            """Repair post-commit archive artifacts on an idempotent end retry."""
+            async with get_session() as session:
+                execution_rows = await _load_execution_descendant_rows(
+                    session,
+                    [terminal_execution.id],
+                    project_id=cast(int, project.id),
+                    active_only=False,
+                )
+                lineage_rows = await _load_execution_lineage_rows(
+                    session,
+                    [terminal_execution.id],
+                    project_id=cast(int, project.id),
+                )
+                terminal_descendants = [
+                    descendant
+                    for descendant in _execution_descendants_all_child_first(
+                        execution_rows,
+                        terminal_execution.id,
+                    )
+                    if descendant.status != "active"
+                ]
+                descendant_ids = [
+                    descendant.id for descendant in terminal_descendants
+                ]
+                terminal_ids = {terminal_execution.id, *descendant_ids}
+
+            _clear_execution_bindings(terminal_ids)
+            archive_warnings: list[str] = []
+            reconciled_reservation_artifacts = 0
+            try:
+                reconciled_reservation_artifacts = (
+                    await _reconcile_pending_file_reservation_artifacts(project)
+                )
+            except Exception as exc:
+                archive_warnings.append(f"reservations: {exc}")
+                logger.exception(
+                    "execution_end.retry_reservation_archive_failed",
+                    extra={"execution_id": terminal_execution.id},
+                )
+
+            released_at = (
+                _ensure_utc(terminal_execution.ended_ts)
+                or datetime.now(timezone.utc)
+            )
+            released_build_slots = 0
+            try:
+                released_build_slots = (
+                    await _release_build_slot_artifacts_for_executions(
+                        project,
+                        terminal_ids,
+                        released_at,
+                    )
+                )
+                await _ack_execution_build_slot_reconciliation(
+                    terminal_ids,
+                    released_at,
+                )
+            except Exception as exc:
+                archive_warnings.append(f"build slots: {exc}")
+                logger.exception(
+                    "execution_end.retry_build_slot_archive_failed",
+                    extra={"execution_id": terminal_execution.id},
+                )
+
+            ancestor_ids = _execution_ancestor_ids(
+                lineage_rows,
+                terminal_execution,
+            )
+            retry_payload: dict[str, Any] = {
+                "execution": _agent_execution_to_dict(
+                    terminal_execution,
+                    ancestor_execution_ids=ancestor_ids,
+                ),
+                "already_ended": True,
+                "descendants_ended": 0,
+                "descendant_execution_ids": descendant_ids,
+                "released_reservations": 0,
+                "reconciled_reservation_artifacts": (
+                    reconciled_reservation_artifacts
+                ),
+                "released_build_slots": released_build_slots,
+            }
+            if archive_warnings:
+                retry_payload["archive_warning"] = "; ".join(archive_warnings)
+            if protocol_warning is not None:
+                retry_payload["warnings"] = [protocol_warning]
+            return retry_payload
+
+        if execution.status != "active":
+            if execution.status != terminal_status:
+                raise ToolExecutionError(
+                    "EXECUTION_TERMINAL_CONFLICT",
+                    (
+                        f"Execution '{execution.id}' already ended as '{execution.status}', "
+                        f"not '{terminal_status}'."
+                    ),
+                    recoverable=False,
+                    data=_agent_execution_to_dict(execution),
+                )
+            return await _reconcile_terminal_retry(execution)
+
+        now = _naive_utc()
+        released_reservations: list[FileReservation] = []
+        descendant_ids: list[str] = []
+        already_ended_after_lock = False
+        async with get_immediate_session() as session:
+            db_execution = await session.get(AgentExecution, execution.id)
+            if db_execution is None:
+                raise ToolExecutionError("EXECUTION_NOT_FOUND", "Execution no longer exists.")
+            if db_execution.status != "active":
+                if db_execution.status != terminal_status:
+                    raise ToolExecutionError(
+                        "EXECUTION_TERMINAL_CONFLICT",
+                        f"Execution '{db_execution.id}' already ended as '{db_execution.status}'.",
+                        recoverable=False,
+                    )
+                execution = db_execution
+                already_ended_after_lock = True
+            else:
+                db_execution.lifecycle_protocol_version = max(
+                    db_execution.lifecycle_protocol_version,
+                    requested_protocol_version,
+                )
+                execution_rows = await _load_execution_descendant_rows(
+                    session,
+                    [db_execution.id],
+                    project_id=cast(int, project.id),
+                    active_only=True,
+                )
+                descendants = _execution_descendants_child_first(
+                    execution_rows, db_execution.id
+                )
+                descendant_ids = [item.id for item in descendants]
+                ending_ids = [*descendant_ids, db_execution.id]
+                reservation_result = await session.execute(
+                    select(FileReservation).where(
+                        cast(Any, FileReservation.execution_id).in_(ending_ids),
+                        cast(Any, FileReservation.origin) == "auto",
+                        cast(Any, FileReservation.released_ts).is_(None),
+                    )
+                )
+                released_reservations = list(reservation_result.scalars().all())
+                for reservation in released_reservations:
+                    reservation.released_ts = now
+                    session.add(reservation)
+                # Storage refuses to terminalize an execution while any of its
+                # active claims remain. Flush claims before the first child.
+                await session.flush()
+                for descendant in descendants:
+                    descendant.status = "cancelled"
+                    descendant.last_active_ts = now
+                    descendant.ended_ts = now
+                    session.add(descendant)
+                    # The parent trigger requires strict child-first order; do
+                    # not leave ORM statement ordering to chance.
+                    await session.flush()
+                db_execution.status = terminal_status
+                db_execution.last_active_ts = now
+                db_execution.ended_ts = now
+                session.add(db_execution)
+                await session.flush()
+                await session.commit()
+                await session.refresh(db_execution)
+                execution = db_execution
+
+        if already_ended_after_lock:
+            return await _reconcile_terminal_retry(execution)
+
+        ending_id_set = {execution.id, *descendant_ids}
+        _clear_execution_bindings(ending_id_set)
+        archive_warning: str | None = None
+        try:
+            await _reconcile_pending_file_reservation_artifacts(project)
+        except Exception as exc:
+            archive_warning = str(exc)
+            logger.exception(
+                "execution_end.reservation_archive_failed",
+                extra={"execution_id": execution.id},
+            )
+        released_build_slots = 0
+        try:
+            released_build_slots = await _release_build_slot_artifacts_for_executions(
+                project,
+                ending_id_set,
+                now,
+            )
+            await _ack_execution_build_slot_reconciliation(
+                ending_id_set,
+                now,
+            )
+        except Exception as exc:
+            build_slot_warning = str(exc)
+            archive_warning = (
+                f"{archive_warning}; build slots: {build_slot_warning}"
+                if archive_warning
+                else f"build slots: {build_slot_warning}"
+            )
+            logger.exception(
+                "execution_end.build_slot_archive_failed",
+                extra={"execution_id": execution.id},
+            )
+        ancestor_ids = await _load_execution_ancestor_ids(execution)
+        payload: dict[str, Any] = {
+            "execution": _agent_execution_to_dict(
+                execution,
+                ancestor_execution_ids=ancestor_ids,
+            ),
+            "already_ended": False,
+            "descendants_ended": len(descendant_ids),
+            "descendant_execution_ids": descendant_ids,
+            "released_reservations": len(released_reservations),
+            "released_build_slots": released_build_slots,
+        }
+        if archive_warning is not None:
+            payload["archive_warning"] = archive_warning
+        if protocol_warning is not None:
+            payload["warnings"] = [protocol_warning]
+        return payload
+
+    @mcp.tool(name="list_agent_executions")
+    @_instrument_tool(
+        "list_agent_executions",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def list_agent_executions(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        status: Optional[str] = None,
+        kind: Optional[str] = None,
+        limit: int = 100,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> ToonableList:
+        """List execution audit rows for one authenticated durable Agent."""
+        project = await _get_project_by_identifier(project_key)
+        agent = await _authenticate_agent(
+            ctx,
+            project,
+            agent_name,
+            registration_token,
+            token_param="registration_token",
+            action="list_agent_executions",
+        )
+        stmt = select(AgentExecution).where(
+            cast(Any, AgentExecution.project_id) == project.id,
+            cast(Any, AgentExecution.agent_id) == agent.id,
+        )
+        if status is not None:
+            normalized_status = status.strip().lower()
+            if normalized_status not in {"active", "completed", "failed", "cancelled", "expired"}:
+                raise ToolExecutionError("INVALID_EXECUTION_STATUS", "Invalid execution status filter.")
+            stmt = stmt.where(cast(Any, AgentExecution.status) == normalized_status)
+        if kind is not None:
+            normalized_kind = kind.strip().lower()
+            if normalized_kind not in {"session", "subagent"}:
+                raise ToolExecutionError("INVALID_EXECUTION_KIND", "Invalid execution kind filter.")
+            stmt = stmt.where(cast(Any, AgentExecution.kind) == normalized_kind)
+        stmt = stmt.order_by(desc(cast(Any, AgentExecution.started_ts))).limit(
+            max(1, min(500, int(limit)))
+        )
+        async with get_session() as session:
+            rows = list((await session.execute(stmt)).scalars().all())
+            lineage_rows = await _load_execution_lineage_rows(
+                session,
+                [item.id for item in rows],
+                project_id=cast(int, project.id),
+            )
+        return [
+            _agent_execution_to_dict(
+                item,
+                ancestor_execution_ids=_execution_ancestor_ids(lineage_rows, item),
+            )
+            for item in rows
+        ]
 
     @mcp.tool(
         name="retire_agent",
@@ -6644,12 +9115,18 @@ def build_mcp_server() -> FastMCP:
             action="retire_agent",
         )
 
-        async with get_session() as session:
-            db_agent = await session.get(Agent, agent.id)
-            if db_agent:
-                db_agent.retired_at = datetime.now(timezone.utc).replace(tzinfo=None)
-                session.add(db_agent)
-                await session.commit()
+        async with get_immediate_session() as session:
+            _db_project, db_agent, _db_execution = (
+                await _revalidate_agent_lifetime_in_session(
+                    session,
+                    project=project,
+                    agent=agent,
+                    action="retire_agent",
+                )
+            )
+            db_agent.retired_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            session.add(db_agent)
+            await session.commit()
 
         await ctx.info(f"Retired agent '{agent_name}' from project '{project.human_key}'. Message history preserved.")
         return {
@@ -6738,12 +9215,18 @@ def build_mcp_server() -> FastMCP:
             action="unretire_agent",
         )
 
-        async with get_session() as session:
-            db_agent = await session.get(Agent, agent.id)
-            if db_agent:
-                db_agent.retired_at = None
-                session.add(db_agent)
-                await session.commit()
+        async with get_immediate_session() as session:
+            _db_project, db_agent, _db_execution = (
+                await _revalidate_agent_lifetime_in_session(
+                    session,
+                    project=project,
+                    agent=agent,
+                    action="unretire_agent",
+                )
+            )
+            db_agent.retired_at = None
+            session.add(db_agent)
+            await session.commit()
 
         await ctx.info(f"Restored agent '{agent_name}' in project '{project.human_key}' to active status.")
         return {
@@ -6775,12 +9258,15 @@ def build_mcp_server() -> FastMCP:
             action="archive_project",
         )
 
-        async with get_session() as session:
-            db_project = await session.get(Project, project.id)
-            if db_project:
-                db_project.archived_at = datetime.now(timezone.utc).replace(tzinfo=None)
-                session.add(db_project)
-                await session.commit()
+        async with get_immediate_session() as session:
+            db_project = await _revalidate_project_lifetime_in_session(
+                session,
+                project=project,
+                action="archive_project",
+            )
+            db_project.archived_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            session.add(db_project)
+            await session.commit()
 
         await ctx.info(f"Archived project '{project.human_key}'. All messages preserved.")
         return {
@@ -6811,228 +9297,21 @@ def build_mcp_server() -> FastMCP:
             action="unarchive_project",
         )
 
-        async with get_session() as session:
-            db_project = await session.get(Project, project.id)
-            if db_project:
-                db_project.archived_at = None
-                session.add(db_project)
-                await session.commit()
+        async with get_immediate_session() as session:
+            db_project = await _revalidate_project_lifetime_in_session(
+                session,
+                project=project,
+                action="unarchive_project",
+            )
+            db_project.archived_at = None
+            session.add(db_project)
+            await session.commit()
 
         await ctx.info(f"Restored project '{project.human_key}' to active status.")
         return {
             "status": "active",
             "project_key": project_key,
             "slug": project.slug,
-        }
-
-    # ------------------------------------------------------------------
-    # Hard-delete tools (irreversible physical data removal)
-    # ------------------------------------------------------------------
-
-    @mcp.tool(
-        name="hard_delete_agent",
-        description=(
-            "IRREVERSIBLY delete an agent and ALL associated data: messages sent by the agent, "
-            "message recipient records, file reservations, agent links, window identities, "
-            "and on-disk archive files (inbox, outbox, attachments). "
-            "This is NOT soft-delete — data is permanently destroyed and cannot be recovered. "
-            "Requires the confirmation parameter to be exactly 'I UNDERSTAND'."
-        ),
-    )
-    @_instrument_tool("hard_delete_agent", cluster=CLUSTER_IDENTITY, capabilities={"identity"}, agent_arg="agent_name", project_arg="project_key")
-    async def hard_delete_agent(
-        ctx: Context,
-        project_key: str,
-        agent_name: str,
-        confirmation: str,
-        registration_token: Optional[str] = None,
-    ) -> dict[str, Any]:
-        """Permanently delete an agent and all associated data. Requires confirmation='I UNDERSTAND'."""
-        if confirmation != "I UNDERSTAND":
-            raise ValueError(
-                "Hard delete requires the confirmation parameter to be exactly 'I UNDERSTAND' (case-sensitive). "
-                "This operation is IRREVERSIBLE — all messages, files, and database records for this agent "
-                "will be permanently destroyed."
-            )
-
-        project = await _get_project_by_identifier(project_key)
-        if not project:
-            raise ValueError(f"Project '{project_key}' not found")
-
-        agent = await _authenticate_agent(
-            ctx,
-            project,
-            agent_name,
-            registration_token,
-            token_param="registration_token",
-            action="hard_delete_agent",
-        )
-
-        agent_id = agent.id
-        if agent_id is None:
-            raise ValueError("Agent must have an id before hard delete")
-        project_id = project.id
-        # Phase 1: Database cleanup in a single transaction
-        async with get_immediate_session() as session:
-            deleted_counts = await _hard_delete_agent_database_rows(
-                session,
-                project_id=cast(int, project_id),
-                agent_id=agent_id,
-                agent_name=agent_name,
-            )
-            await session.commit()
-
-        # Phase 2: Filesystem cleanup (non-transactional, best-effort)
-        files_removed = 0
-        dirs_removed = 0
-        fs_errors: list[str] = []
-        reservation_files_removed = 0
-        try:
-            settings = get_settings()
-            archive = await ensure_archive(settings, project.slug)
-            agent_dir = archive.root / "agents" / agent_name
-            async with _archive_write_lock(archive):
-                reservation_paths = await get_agent_reservation_archive_paths(
-                    archive,
-                    agent_id,
-                    agent_name,
-                )
-                files_removed, dirs_removed = await asyncio.to_thread(
-                    _delete_tree_with_counts,
-                    agent_dir,
-                )
-                for reservation_path in reservation_paths:
-                    await asyncio.to_thread(reservation_path.unlink)
-                    files_removed += 1
-                    reservation_files_removed += 1
-                await commit_archive_path_deletions(
-                    archive,
-                    [agent_dir, *reservation_paths],
-                    f"hard_delete: agent {agent_name}",
-                )
-        except Exception as exc:
-            fs_errors.append(f"Failed to remove and commit agent archive artifacts: {exc}")
-
-        deleted_counts["archive_files_removed"] = files_removed
-        deleted_counts["archive_dirs_removed"] = dirs_removed
-        deleted_counts["archive_reservation_files_removed"] = reservation_files_removed
-
-        summary_parts = [
-            f"Hard-deleted agent '{agent_name}' from project '{project.human_key}'.",
-            f"Database: {deleted_counts.get('messages_sent', 0)} messages, "
-            f"{deleted_counts.get('message_recipients', 0) + deleted_counts.get('sent_message_recipients', 0)} recipient records, "
-            f"{deleted_counts.get('file_reservations', 0)} file reservations, "
-            f"{deleted_counts.get('agent_links', 0)} agent links, "
-            f"{deleted_counts.get('window_identities', 0)} window identities removed.",
-            f"Filesystem: {files_removed} files and {dirs_removed} directories removed.",
-        ]
-        if fs_errors:
-            summary_parts.append(f"Filesystem warnings: {'; '.join(fs_errors)}")
-
-        await ctx.info(" ".join(summary_parts))
-        return {
-            "status": "hard_deleted",
-            "agent_name": agent_name,
-            "project_key": project_key,
-            "deleted_counts": deleted_counts,
-            "filesystem_errors": fs_errors,
-        }
-
-    @mcp.tool(
-        name="hard_delete_project",
-        description=(
-            "IRREVERSIBLY delete a project and ALL associated data: every agent, message, "
-            "message recipient, file reservation, agent link, window identity, message summary, "
-            "sibling suggestion, product link, and the entire on-disk project archive directory. "
-            "This is NOT soft-delete — data is permanently destroyed and cannot be recovered. "
-            "Requires the confirmation parameter to be exactly 'I UNDERSTAND'."
-        ),
-    )
-    @_instrument_tool("hard_delete_project", cluster=CLUSTER_SETUP, capabilities={"infrastructure"}, project_arg="project_key")
-    async def hard_delete_project(
-        ctx: Context,
-        project_key: str,
-        confirmation: str,
-        registration_token: Optional[str] = None,
-    ) -> dict[str, Any]:
-        """Permanently delete a project and all associated data. Requires confirmation='I UNDERSTAND'."""
-        if confirmation != "I UNDERSTAND":
-            raise ValueError(
-                "Hard delete requires the confirmation parameter to be exactly 'I UNDERSTAND' (case-sensitive). "
-                "This operation is IRREVERSIBLE — ALL agents, messages, files, and database records for this "
-                "project will be permanently destroyed."
-            )
-
-        project = await _get_project_by_identifier(project_key)
-        if not project:
-            raise ValueError(f"Project '{project_key}' not found")
-
-        project_id = project.id
-        project_slug = project.slug
-        project_human_key = project.human_key
-
-        await _authenticate_project_admin(
-            ctx,
-            project,
-            registration_token,
-            action="hard_delete_project",
-        )
-
-        # Phase 1: Database cleanup in a single transaction
-        async with get_immediate_session() as session:
-            deleted_counts = await _hard_delete_project_database_rows(
-                session,
-                project_id=cast(int, project_id),
-            )
-            await session.commit()
-
-        # Phase 2: Filesystem cleanup (non-transactional, best-effort)
-        files_removed = 0
-        dirs_removed = 0
-        fs_errors: list[str] = []
-        try:
-            settings = get_settings()
-            archive = await ensure_archive(settings, project_slug)
-            async with _archive_write_lock(archive):
-                files_removed, dirs_removed = await asyncio.to_thread(
-                    delete_archive_tree_contents,
-                    archive.root,
-                )
-                await commit_archive_subtree_deletion(
-                    archive,
-                    archive.root,
-                    f"hard_delete: project {project_slug}",
-                )
-            await asyncio.to_thread(archive.root.rmdir)
-        except Exception as exc:
-            fs_errors.append(f"Failed to remove and commit project archive directory: {exc}")
-
-        deleted_counts["archive_files_removed"] = files_removed
-        deleted_counts["archive_dirs_removed"] = dirs_removed
-
-        summary_parts = [
-            f"Hard-deleted project '{project_human_key}' (slug: {project_slug}).",
-            f"Database: {deleted_counts.get('agents', 0)} agents, "
-            f"{deleted_counts.get('messages', 0)} messages, "
-            f"{deleted_counts.get('message_recipients', 0)} recipient records, "
-            f"{deleted_counts.get('file_reservations', 0)} file reservations, "
-            f"{deleted_counts.get('agent_links', 0)} agent links, "
-            f"{deleted_counts.get('window_identities', 0)} window identities, "
-            f"{deleted_counts.get('message_summaries', 0)} message summaries, "
-            f"{deleted_counts.get('sibling_suggestions', 0)} sibling suggestions, "
-            f"{deleted_counts.get('product_links', 0)} product links removed.",
-            f"Filesystem: {files_removed} files and {dirs_removed} directories removed.",
-        ]
-        if fs_errors:
-            summary_parts.append(f"Filesystem warnings: {'; '.join(fs_errors)}")
-
-        await ctx.info(" ".join(summary_parts))
-        return {
-            "status": "hard_deleted",
-            "project_key": project_key,
-            "slug": project_slug,
-            "deleted_counts": deleted_counts,
-            "filesystem_errors": fs_errors,
         }
 
     @mcp.tool(name="whois")
@@ -7108,46 +9387,27 @@ def build_mcp_server() -> FastMCP:
         project_key: str,
         program: str,
         model: str,
-        name_hint: Optional[str] = None,
+        name_hint: str,
         task_description: str = "",
         attachments_policy: str = "auto",
         format: Optional[str] = None,
-        return_registration_token: bool = True,
     ) -> dict[str, Any]:
         """
         Create a new, unique agent identity and persist its profile to Git.
 
         How this differs from `register_agent`
         --------------------------------------
-        - Always creates a new identity with a fresh unique name (never updates an existing one).
-        - `name_hint`, if provided, MUST be a valid adjective+noun combination and must be available,
-          otherwise an error is raised. Without a hint, a random adjective+noun name is generated.
+        - Always creates a new durable identity (never updates an existing one).
+        - `name_hint` is required, must be a stable explicit identity, and must be available.
 
         CRITICAL: Agent Naming Rules
         -----------------------------
-        - Agent names MUST be randomly generated adjective+noun combinations
-        - Examples: "GreenCastle", "BlueLake", "RedStone", "PurpleBear"
-        - Names should be unique, easy to remember, and NOT descriptive
-        - INVALID examples: "BackendHarmonizer", "DatabaseMigrator", "UIRefactorer"
-        - Best practice: Omit `name_hint` to auto-generate a valid name (RECOMMENDED)
+        - Durable Agent names are explicit stable addresses such as ``codex-wsl-home-1``.
+        - Use ``start_agent_execution`` for sessions and temporary workers.
 
         When to use
         -----------
-        - Spawning a brand new worker agent that should not overwrite an existing profile.
-        - Temporary task-specific identities (e.g., short-lived refactor assistants).
-
-        Parameters
-        ----------
-        return_registration_token : bool, default True
-            When True (default, current behaviour), the response includes the
-            freshly-minted `registration_token`. When False, the token is omitted
-            from the tool result so transcript-visible MCP sessions can satisfy
-            a "do not echo secrets into scrollback" contract; the agent is still
-            bound to the current MCP session via `_bind_session_agent`, so
-            follow-up calls in the same session can authenticate without
-            ever surfacing the token. The token still exists on the server
-            and can be retrieved or rotated through the normal admin paths.
-            See issue #154.
+        - Provisioning a new durable mailbox/persona that must not overwrite an existing profile.
 
         Returns
         -------
@@ -7157,71 +9417,79 @@ def build_mcp_server() -> FastMCP:
 
         Examples
         --------
-        Auto-generate name (RECOMMENDED):
-        ```json
-        {"jsonrpc":"2.0","id":"c2","method":"tools/call","params":{"name":"create_agent_identity","arguments":{
-          "project_key":"/data/projects/backend","program":"claude-code","model":"opus-4.1"
-        }}}
-        ```
-
         With valid name hint:
         ```json
         {"jsonrpc":"2.0","id":"c1","method":"tools/call","params":{"name":"create_agent_identity","arguments":{
-          "project_key":"/data/projects/backend","program":"codex-cli","model":"gpt5-codex","name_hint":"GreenCastle",
+          "project_key":"/data/projects/backend","program":"codex-cli","model":"gpt5-codex","name_hint":"codex-linux-ci-1",
           "task_description":"DB migration spike"
         }}}
         ```
 
-        Transcript-safe creation (issue #154) — omit the token from the
-        visible tool result and rely on session binding for follow-ups:
+        This provisioning tool returns the newly minted token exactly once.
+        Persist it in the client's private credential store before ending the
+        session; ordinary register/resume calls never echo an existing token:
         ```json
         {"jsonrpc":"2.0","id":"c3","method":"tools/call","params":{"name":"create_agent_identity","arguments":{
           "project_key":"/data/projects/backend","program":"codex-cli","model":"gpt5",
-          "return_registration_token":false
+          "name_hint":"codex-linux-review-1"
         }}}
         ```
         """
         _validate_program_model(program, model)
+        if not name_hint.strip():
+            raise ToolExecutionError(
+                "NAME_REQUIRED",
+                "create_agent_identity requires an explicit durable name_hint.",
+                recoverable=True,
+                data={"field": "name_hint"},
+            )
         project = await _get_project_by_identifier(project_key)
-        unique_name = await _generate_unique_agent_name(project, settings, name_hint)
+        unique_name = await _generate_unique_agent_name(
+            project, settings, name_hint.strip()
+        )
+        # Resolve the archive once and reuse it for the profile publication.
+        archive = await ensure_archive(settings, project.slug)
         ap = (attachments_policy or "auto").lower()
         if ap not in {"auto", "inline", "file"}:
             ap = "auto"
-        agent = await _create_agent_record(project, unique_name, program, model, task_description)
-        # Update attachments policy and ensure a registration token exists
-        async with get_session() as session:
-            db_agent = await session.get(Agent, agent.id)
-            if db_agent:
-                db_agent.attachments_policy = ap
-                session.add(db_agent)
-                await session.commit()
-                await session.refresh(db_agent)
-                agent = db_agent
-        agent, token = await _ensure_agent_registration_token(agent)
-        archive = await ensure_archive(settings, project.slug)
+        token = secrets.token_urlsafe(32)
+        agent = await _create_agent_record(
+            project,
+            unique_name,
+            program,
+            model,
+            task_description,
+            token,
+            ap,
+        )
         try:
             async with _archive_write_lock(archive):
-                await write_agent_profile(archive, _agent_to_dict(agent))
+                profile_agent = await _revalidate_agent_profile_lifetime(
+                    project=project,
+                    agent=agent,
+                )
+                await write_agent_profile(archive, _agent_to_dict(profile_agent))
+            agent = await _activate_provisioned_agent_lifetime(
+                project=project,
+                agent=agent,
+            )
         except Exception:
             # Roll back the DB record so the caller doesn't get an error
             # while the agent already exists in the database (issue #121).
             with suppress(Exception):
-                async with get_session() as rollback_session:
-                    db_agent = await rollback_session.get(Agent, agent.id)
-                    if db_agent:
-                        await rollback_session.delete(db_agent)
-                        await rollback_session.commit()
+                await _rollback_created_agent_lifetime(
+                    project=project,
+                    agent=agent,
+                )
             raise
-        _bind_session_agent(ctx, project, agent)
-        await ctx.info(f"Created new agent identity '{agent.name}' for project '{project.human_key}'.")
+        with suppress(Exception):
+            _bind_session_agent(ctx, project, agent)
+        await _ctx_info_safe(
+            ctx,
+            f"Created new agent identity '{agent.name}' for project '{project.human_key}'.",
+        )
         result = _agent_to_dict(agent)
-        if return_registration_token:
-            result["registration_token"] = token
-        else:
-            # Caller opted out of token echo (issue #154). The token still
-            # exists server-side; the agent is bound to this MCP session so
-            # follow-up calls can authenticate without ever surfacing it.
-            result["registration_token_returned"] = False
+        result["registration_token"] = token
         return result
 
     @mcp.tool(name="list_window_identities")
@@ -7530,7 +9798,8 @@ def build_mcp_server() -> FastMCP:
         Edge cases
         ----------
         - If no recipients are given, the call fails.
-        - Unknown recipient names fail fast; register them first.
+        - Unknown recipient names fail fast. The recipient must self-register, or an
+          operator must explicitly provision its durable mailbox, before delivery.
         - Pending/deferred deliveries have `message: null`; use `get_message_delivery`.
 
         Do / Don't
@@ -7551,7 +9820,7 @@ def build_mcp_server() -> FastMCP:
         1) Simple message:
         ```json
         {"jsonrpc":"2.0","id":"5","method":"tools/call","params":{"name":"send_message","arguments":{
-          "project_key":"/abs/path/backend","sender_name":"GreenCastle","to":["BlueLake"],
+          "project_key":"/owner/backend","sender_name":"codex-wsl-home-1","to":["claude-linux-ci-1"],
           "subject":"Plan for /api/users","body_md":"See below.",
           "idempotency_key":"plan-users-2026-08-12-01"
         }}}
@@ -7618,6 +9887,7 @@ def build_mcp_server() -> FastMCP:
                 _bcast_result = await _bcast_session.execute(
                     select(Agent.name, Agent.contact_policy, Agent.retired_at).where(
                         cast(Any, Agent.project_id == project.id),
+                        cast(Any, Agent.provisioning_state == "active"),
                         cast(Any, Agent.last_active_ts > _bcast_cutoff),
                     )
                 )
@@ -7638,7 +9908,8 @@ def build_mcp_server() -> FastMCP:
         if not isinstance(to, list):
             raise ToolExecutionError(
                 "INVALID_ARGUMENT",
-                f"'to' must be a list of agent names (e.g., ['BlueLake']) or a single agent name string. "
+                "'to' must be a list of durable Agent names (for example, "
+                "['claude-linux-ci-1']) or a single Agent name string. "
                 f"Received: {type(to).__name__}",
                 recoverable=True,
                 data={"argument": "to", "received_type": type(to).__name__},
@@ -7653,13 +9924,21 @@ def build_mcp_server() -> FastMCP:
                     recoverable=True,
                     data={"argument": "to", "invalid_item": repr(recipient)},
                 )
-            mistake = _detect_agent_name_mistake(recipient)
+            mistake = _detect_agent_name_mistake(
+                _recipient_agent_fragment(recipient)
+            )
             if mistake:
                 raise ToolExecutionError(
                     mistake[0],
                     f"Invalid recipient '{recipient}': {mistake[1]}",
                     recoverable=True,
-                    data={"recipient": recipient, "hint": "Use agent names like 'BlueLake', not program/model names"},
+                    data={
+                        "recipient": recipient,
+                        "hint": (
+                            "Use a durable client-os-host-slot Agent name, "
+                            "not a program or model name."
+                        ),
+                    },
                 )
 
         # Normalize cc/bcc inputs and validate types for friendlier UX
@@ -7728,7 +10007,7 @@ def build_mcp_server() -> FastMCP:
             await ctx.info(
                 f"[note] You ({sender_name}) are sending a message to yourself. "
                 f"This is allowed but usually not intended. To communicate with other agents, "
-                f"use their agent names (e.g., 'BlueLake'). To discover agents, "
+                "use their durable Agent names (for example, 'claude-linux-ci-1'). To discover agents, "
                 f"use resource://agents/{project_key}."
             )
 
@@ -8141,7 +10420,12 @@ def build_mcp_server() -> FastMCP:
 
         async with get_session() as sx:
             # Preload local agent names (normalized -> canonical stored name)
-            existing = await sx.execute(select(Agent.name).where(Agent.project_id == project.id))
+            existing = await sx.execute(
+                select(Agent.name).where(
+                    Agent.project_id == project.id,
+                    Agent.provisioning_state == "active",
+                )
+            )
             local_lookup: dict[str, str] = {}
             for row in existing.fetchall():
                 canonical_name = (row[0] or "").strip()
@@ -8204,7 +10488,11 @@ def build_mcp_server() -> FastMCP:
                     keys.add(trimmed.lower())
                 if sanitized:
                     keys.add(sanitized.lower())
-                canonical = sanitized or (trimmed if trimmed else None)
+                # Preserve the exact durable identity for DB lookup.  The
+                # sanitized spelling is only an alias candidate; notably,
+                # sanitize_agent_name() removes hyphens from canonical
+                # client-os-host-slot names.
+                canonical = trimmed if trimmed else None
                 return trimmed or value, keys, canonical
 
             unknown_local: dict[str, set[str]] = defaultdict(set)
@@ -8388,31 +10676,6 @@ def build_mcp_server() -> FastMCP:
                 ) from err
 
             if unknown_local or unknown_external:
-                # Auto-register missing local recipients if enabled
-                if getattr(settings_local, "messaging_auto_register_recipients", True):
-                    # Best effort: try to register any unknown local recipients with sane defaults
-                    newly_registered: set[str] = set()
-                    for missing in list(unknown_local):
-                        try:
-                            _ = await _get_or_create_agent(
-                                project,
-                                missing,
-                                sender.program,
-                                sender.model,
-                                sender.task_description,
-                                settings,
-                            )
-                            newly_registered.add(missing)
-                        except Exception:
-                            logger.exception("Failed to auto-register recipient %r in project %r", missing, project.human_key)
-                    # Re-run routing for any that were registered
-                    if newly_registered:
-                        from contextlib import suppress
-                        with suppress(_ContactBlocked):
-                            for name in sorted(newly_registered):
-                                for route_kind in sorted(unknown_local.get(name, {"to"})):
-                                    await _route([name], route_kind)
-                                unknown_local.pop(name, None)
                 # Attempt cross-project handshakes for unknown external recipients if allowed
                 approved_external_routes: list[tuple[str, str]] = []
                 attempted_external: list[str] = []
@@ -8450,7 +10713,6 @@ def build_mcp_server() -> FastMCP:
                                                 "reason": "in-session auto-approval by send_message",
                                                 "auto_accept": True,
                                                 "ttl_seconds": int(settings_local.contact_auto_ttl_seconds),
-                                                "register_if_missing": True,
                                                 "format": "json",
                                             }
                                         )
@@ -8470,10 +10732,6 @@ def build_mcp_server() -> FastMCP:
                                                 "to_project": target_proj.human_key or target_proj.slug,
                                                 "reason": "auto contact request created by send_message",
                                                 "ttl_seconds": int(settings_local.contact_pending_ttl_seconds),
-                                                "register_if_missing": True,
-                                                "program": sender.program,
-                                                "model": sender.model,
-                                                "task_description": sender.task_description,
                                                 "format": "json",
                                             }
                                         )
@@ -8556,7 +10814,29 @@ def build_mcp_server() -> FastMCP:
                 if still_unknown and requested_external:
                     data_payload["auto_contact_requested_external"] = requested_external
                 if still_unknown:
-                    hint = f"Use resource://agents/{project.slug} to list registered agents or register new identities."
+                    hint_parts = [
+                        f"Use resource://agents/{project.slug} to list registered agents."
+                    ]
+                    required_actions: list[str] = []
+                    if unknown_local:
+                        hint_parts.append(
+                            "A missing local recipient must self-register, or an "
+                            "operator must explicitly provision its durable mailbox, "
+                            "before delivery."
+                        )
+                        required_actions.append(
+                            "target_self_register_or_operator_provision"
+                        )
+                    if unknown_external:
+                        hint_parts.append(
+                            "Verify each external target is already registered in its "
+                            "own project, then request contact; request_contact never "
+                            "provisions the target mailbox."
+                        )
+                        required_actions.append(
+                            "verify_target_registration_then_request_contact"
+                        )
+                    hint = " ".join(hint_parts)
                     if requested_external:
                         parts.append(
                             "pending external contact requests were created for "
@@ -8565,44 +10845,7 @@ def build_mcp_server() -> FastMCP:
                     parts.append(hint)
                     message = "Unable to send message — " + "; ".join(parts)
                     data_payload["hint"] = hint
-                    # Provide concrete fix suggestions
-                    try:
-                        suggestions: list[dict[str, Any]] = []
-                        for name in data_payload.get("unknown_local", [])[:5]:
-                            suggestions.append(
-                                {
-                                    "tool": "register_agent",
-                                    "arguments": {
-                                        "project_key": project.human_key,
-                                        "name": name,
-                                        "program": sender.program,
-                                        "model": sender.model,
-                                        "task_description": sender.task_description,
-                                    },
-                                }
-                            )
-                        for label, names in (data_payload.get("unknown_external", {}) or {}).items():
-                            for nm in names[:5]:
-                                suggestions.append(
-                                    {
-                                        "tool": "request_contact",
-                                        "arguments": {
-                                            "project_key": project.human_key,
-                                            "from_agent": sender.name,
-                                            "to_agent": nm,
-                                            "to_project": label,
-                                            "ttl_seconds": int(settings_local.contact_pending_ttl_seconds),
-                                            "register_if_missing": True,
-                                            "program": sender.program,
-                                            "model": sender.model,
-                                            "task_description": sender.task_description,
-                                        },
-                                    }
-                                )
-                        if suggestions:
-                            data_payload["suggested_tool_calls"] = suggestions
-                    except Exception:
-                        logger.exception("Failed to build suggestion tool calls for recipient errors")
+                    data_payload["required_actions"] = required_actions
                     await ctx.error(f"RECIPIENT_NOT_FOUND: {message}")
                     raise ToolExecutionError(
                         "RECIPIENT_NOT_FOUND",
@@ -8948,7 +11191,7 @@ def build_mcp_server() -> FastMCP:
 
         ```json
         {"jsonrpc":"2.0","id":"6","method":"tools/call","params":{"name":"reply_message","arguments":{
-          "project_key":"/abs/path/backend","message_id":1234,"sender_name":"BlueLake",
+          "project_key":"/owner/backend","message_id":1234,"sender_name":"codex-wsl-home-1",
           "body_md":"Questions about the migration plan...",
           "idempotency_key":"reply-1234-01","sender_token":"<registration_token>"
         }}}
@@ -8957,8 +11200,8 @@ def build_mcp_server() -> FastMCP:
         Reply with explicit recipients and CC:
         ```json
         {"jsonrpc":"2.0","id":"6c","method":"tools/call","params":{"name":"reply_message","arguments":{
-          "project_key":"/abs/path/backend","message_id":1234,"sender_name":"BlueLake",
-          "body_md":"Looping ops.","to":["GreenCastle"],"cc":["RedCat"],"subject_prefix":"RE:",
+          "project_key":"/owner/backend","message_id":1234,"sender_name":"codex-wsl-home-1",
+          "body_md":"Looping ops.","to":["claude-linux-ci-1"],"cc":["gemini-linux-qa-1"],"subject_prefix":"RE:",
           "idempotency_key":"reply-1234-02","sender_token":"<registration_token>"
         }}}
         ```
@@ -9039,7 +11282,12 @@ def build_mcp_server() -> FastMCP:
         thread_external_participants = await _get_thread_external_participants(project, sender, thread_key)
 
         async with get_session() as sx:
-            existing = await sx.execute(select(Agent.name).where(Agent.project_id == project.id))
+            existing = await sx.execute(
+                select(Agent.name).where(
+                    Agent.project_id == project.id,
+                    Agent.provisioning_state == "active",
+                )
+            )
             local_lookup: dict[str, str] = {}
             for row in existing.fetchall():
                 canonical_name = (row[0] or "").strip()
@@ -9069,7 +11317,11 @@ def build_mcp_server() -> FastMCP:
                     keys.add(trimmed.lower())
                 if sanitized:
                     keys.add(sanitized.lower())
-                canonical = sanitized or (trimmed if trimmed else None)
+                # Preserve the exact durable identity for DB lookup.  The
+                # sanitized spelling is only an alias candidate; notably,
+                # sanitize_agent_name() removes hyphens from canonical
+                # client-os-host-slot names.
+                canonical = trimmed if trimmed else None
                 return trimmed or value, keys, canonical
 
             async def _route(name_list: list[str], kind: str) -> None:
@@ -9476,11 +11728,6 @@ def build_mcp_server() -> FastMCP:
         reason: str = "",
         ttl_seconds: int = 7 * 24 * 3600,
         registration_token: Optional[str] = None,
-        # Optional quality-of-life flags; ignored by clients that don't pass them
-        register_if_missing: bool = True,
-        program: Optional[str] = None,
-        model: Optional[str] = None,
-        task_description: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """Request contact approval to message another agent.
@@ -9499,7 +11746,9 @@ def build_mcp_server() -> FastMCP:
         from_agent : str
             Your agent name (must be registered in the project).
         to_agent : str
-            Target agent name (use resource://agents/{project_key} to discover names).
+            Registered target Agent name (use resource://agents/{project_key} to
+            discover names). A requester never creates the target's mailbox: the
+            target must self-register, or an operator must explicitly provision it.
         to_project : Optional[str]
             Target project if different from your project (cross-project coordination).
         reason : str
@@ -9508,7 +11757,6 @@ def build_mcp_server() -> FastMCP:
             Time to live for the contact approval request (default: 7 days).
         """
         project = await _get_project_by_identifier(project_key)
-        settings = get_settings()
         a = await _authenticate_agent(
             ctx,
             project,
@@ -9534,22 +11782,15 @@ def build_mcp_server() -> FastMCP:
         try:
             b = await _get_agent(target_project, target_name)
         except (NoResultFound, ToolExecutionError) as exc:
-            # Check if this is a NOT_FOUND error we can handle with register_if_missing
             is_not_found = isinstance(exc, NoResultFound) or (
                 isinstance(exc, ToolExecutionError) and exc.error_type == "NOT_FOUND"
             )
-            if is_not_found and register_if_missing and validate_agent_name_format(target_name):
-                # Create the missing target identity using provided metadata (best effort)
-                b, _ = await _get_or_create_agent(
+            if is_not_found:
+                raise _target_registration_required_error(
                     target_project,
                     target_name,
-                    program or "unknown",
-                    model or "unknown",
-                    task_description or "",
-                    settings,
-                )
-            else:
-                raise
+                ) from exc
+            raise
         _raise_if_self_contact(
             project,
             a,
@@ -10186,7 +12427,7 @@ def build_mcp_server() -> FastMCP:
         -------
         ```json
         {"jsonrpc":"2.0","id":"7","method":"tools/call","params":{"name":"fetch_inbox","arguments":{
-          "project_key":"/abs/path/backend","agent_name":"BlueLake","since_ts":"2025-10-23T00:00:00+00:00"
+          "project_key":"/owner/backend","agent_name":"codex-wsl-home-1","since_ts":"2025-10-23T00:00:00+00:00"
         }}}
         ```
         """
@@ -10426,7 +12667,7 @@ def build_mcp_server() -> FastMCP:
         -------
         ```json
         {"jsonrpc":"2.0","id":"8","method":"tools/call","params":{"name":"mark_message_read","arguments":{
-          "project_key":"/abs/path/backend","agent_name":"BlueLake","message_id":1234
+          "project_key":"/owner/backend","agent_name":"codex-wsl-home-1","message_id":1234
         }}}
         ```
         """
@@ -10507,7 +12748,7 @@ def build_mcp_server() -> FastMCP:
         -------
         ```json
         {"jsonrpc":"2.0","id":"9","method":"tools/call","params":{"name":"acknowledge_message","arguments":{
-          "project_key":"/abs/path/backend","agent_name":"BlueLake","message_id":1234
+          "project_key":"/owner/backend","agent_name":"codex-wsl-home-1","message_id":1234
         }}}
         ```
         """
@@ -10567,8 +12808,11 @@ def build_mcp_server() -> FastMCP:
         human_key: str,
         program: str,
         model: str,
+        agent_name: str,
+        external_id: str,
+        client_name: str,
+        execution_token: str,
         task_description: str = "",
-        agent_name: Optional[str] = None,
         registration_token: Optional[str] = None,
         file_reservation_paths: Optional[list[str]] = None,
         file_reservation_reason: str = "macro-session",
@@ -10581,9 +12825,16 @@ def build_mcp_server() -> FastMCP:
         optionally file_reservation paths, and fetch the latest inbox snapshot.
         """
         _validate_program_model(program, model)
+        if not agent_name.strip():
+            raise ToolExecutionError(
+                "NAME_REQUIRED",
+                "macro_start_session requires an explicit durable agent_name.",
+                recoverable=True,
+                data={"field": "agent_name"},
+            )
         get_settings()
         project = await _ensure_project(human_key)
-        agent = await _register_or_authenticate_agent(
+        agent, _newly_created = await _register_or_authenticate_agent(
             ctx,
             project,
             agent_name,
@@ -10592,16 +12843,41 @@ def build_mcp_server() -> FastMCP:
             task_description,
             registration_token,
             action="macro_start_session for an existing identity",
+            allow_create=False,
         )
-        agent, token = await _ensure_agent_registration_token(agent)
+        agent, _ = await _ensure_agent_registration_token(
+            agent,
+            project=project,
+        )
         _bind_session_agent(ctx, project, agent)
+
+        from fastmcp.tools.tool import FunctionTool
+
+        mcp_with_tools = cast(_FastMCPToolGetter, mcp)
+        start_tool = cast(
+            FunctionTool, await mcp_with_tools.get_tool("start_agent_execution")
+        )
+        start_result = await start_tool.run(
+            {
+                "ctx": ctx,
+                "project_key": project.human_key,
+                "agent_name": agent.name,
+                "external_id": external_id,
+                "client_name": client_name,
+                "execution_token": execution_token,
+                "lifecycle_protocol_version": _EXECUTION_LIFECYCLE_PROTOCOL_VERSION,
+                "kind": "session",
+                "task_description": task_description,
+                "format": "json",
+            }
+        )
+        execution_result = cast(
+            dict[str, Any], start_result.structured_content or {}
+        )
 
         file_reservations_result: Optional[dict[str, Any]] = None
         if file_reservation_paths is not None:
             # Use MCP tool registry to avoid param shadowing (file_reservation_paths param shadows file_reservation_paths function)
-            from fastmcp.tools.tool import FunctionTool
-
-            mcp_with_tools = cast(_FastMCPToolGetter, mcp)
             _file_reservation_tool = cast(FunctionTool, await mcp_with_tools.get_tool("file_reservation_paths"))
             _file_reservation_run = await _file_reservation_tool.run(
                 {
@@ -10612,6 +12888,7 @@ def build_mcp_server() -> FastMCP:
                     "ttl_seconds": file_reservation_ttl_seconds,
                     "exclusive": True,
                     "reason": file_reservation_reason,
+                    "lifecycle_protocol_version": _EXECUTION_LIFECYCLE_PROTOCOL_VERSION,
                     "format": "json",
                 }
             )
@@ -10632,7 +12909,7 @@ def build_mcp_server() -> FastMCP:
         return {
             "project": _project_to_dict(project),
             "agent": _agent_to_dict(agent),
-            "registration_token": token,
+            "execution": execution_result,
             "file_reservations": file_reservations_result or {"granted": [], "conflicts": []},
             "inbox": inbox_items,
         }
@@ -10651,10 +12928,12 @@ def build_mcp_server() -> FastMCP:
         thread_id: str,
         program: str,
         model: str,
-        agent_name: Optional[str] = None,
+        agent_name: str,
+        external_id: str,
+        client_name: str,
+        execution_token: str,
         registration_token: Optional[str] = None,
         task_description: str = "",
-        register_if_missing: bool = True,
         include_examples: bool = True,
         inbox_limit: int = 10,
         include_inbox_bodies: bool = False,
@@ -10663,36 +12942,59 @@ def build_mcp_server() -> FastMCP:
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """
-        Macro helper that aligns an agent with an existing thread by ensuring registration,
+        Macro helper that aligns an already provisioned agent with an existing thread,
         summarising the thread, and fetching recent inbox context.
         """
+        if not agent_name.strip():
+            raise ToolExecutionError(
+                "NAME_REQUIRED",
+                "macro_prepare_thread requires an explicit durable agent_name.",
+                recoverable=True,
+                data={"field": "agent_name"},
+            )
         get_settings()
         project = await _get_project_by_identifier(project_key)
-        if register_if_missing:
-            _validate_program_model(program, model)
-            agent = await _register_or_authenticate_agent(
-                ctx,
-                project,
-                agent_name,
-                program,
-                model,
-                task_description,
-                registration_token,
-                action="macro_prepare_thread for an existing identity",
-            )
-        else:
-            if not agent_name:
-                raise ValueError("agent_name is required when register_if_missing is False.")
-            agent = await _authenticate_agent(
-                ctx,
-                project,
-                agent_name,
-                registration_token,
-                token_param="registration_token",
-                action="macro_prepare_thread",
-            )
-        agent, token = await _ensure_agent_registration_token(agent)
+        _validate_program_model(program, model)
+        agent, _newly_created = await _register_or_authenticate_agent(
+            ctx,
+            project,
+            agent_name,
+            program,
+            model,
+            task_description,
+            registration_token,
+            action="macro_prepare_thread for an existing identity",
+            allow_create=False,
+        )
+        agent, _token = await _ensure_agent_registration_token(
+            agent,
+            project=project,
+        )
         _bind_session_agent(ctx, project, agent)
+
+        from fastmcp.tools.tool import FunctionTool
+
+        mcp_with_tools = cast(_FastMCPToolGetter, mcp)
+        start_tool = cast(
+            FunctionTool, await mcp_with_tools.get_tool("start_agent_execution")
+        )
+        start_result = await start_tool.run(
+            {
+                "ctx": ctx,
+                "project_key": project.human_key,
+                "agent_name": agent.name,
+                "external_id": external_id,
+                "client_name": client_name,
+                "execution_token": execution_token,
+                "lifecycle_protocol_version": _EXECUTION_LIFECYCLE_PROTOCOL_VERSION,
+                "kind": "session",
+                "task_description": task_description,
+                "format": "json",
+            }
+        )
+        execution_result = cast(
+            dict[str, Any], start_result.structured_content or {}
+        )
 
         inbox_items = await _list_inbox(
             project,
@@ -10717,7 +13019,7 @@ def build_mcp_server() -> FastMCP:
         return {
             "project": _project_to_dict(project),
             "agent": _agent_to_dict(agent),
-            "registration_token": token,
+            "execution": execution_result,
             "thread": {"thread_id": thread_id, "summary": summary, "examples": examples, "total_messages": total_messages},
             "inbox": inbox_items,
         }
@@ -10739,6 +13041,8 @@ def build_mcp_server() -> FastMCP:
         exclusive: bool = True,
         reason: str = "macro-file_reservation",
         auto_release: bool = False,
+        execution_id: Optional[str] = None,
+        execution_token: Optional[str] = None,
         registration_token: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
@@ -10757,6 +13061,9 @@ def build_mcp_server() -> FastMCP:
                 "ttl_seconds": ttl_seconds,
                 "exclusive": exclusive,
                 "reason": reason,
+                "execution_id": execution_id,
+                "execution_token": execution_token,
+                "lifecycle_protocol_version": _EXECUTION_LIFECYCLE_PROTOCOL_VERSION,
                 "registration_token": registration_token,
                 "format": "json",
             }
@@ -10782,6 +13089,9 @@ def build_mcp_server() -> FastMCP:
                         "project_key": project_key,
                         "agent_name": agent_name,
                         "file_reservation_ids": newly_granted_ids,
+                        "execution_id": execution_id,
+                        "execution_token": execution_token,
+                        "lifecycle_protocol_version": _EXECUTION_LIFECYCLE_PROTOCOL_VERSION,
                         "registration_token": registration_token,
                         "format": "json",
                     }
@@ -10825,14 +13135,15 @@ def build_mcp_server() -> FastMCP:
         # Aliases for compatibility
         agent_name: Optional[str] = None,
         to_agent: Optional[str] = None,
-        register_if_missing: bool = True,
-        program: Optional[str] = None,
-        model: Optional[str] = None,
-        task_description: Optional[str] = None,
         thread_id: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Request contact permissions and optionally auto-approve plus send a welcome message."""
+        """Request contact with an already registered target.
+
+        The macro never creates the target's durable mailbox. The target must
+        self-register, or an operator must explicitly provision it, before the
+        handshake begins.
+        """
 
         # Resolve aliases
         real_requester = (requester or agent_name or "").strip()
@@ -10878,14 +13189,24 @@ def build_mcp_server() -> FastMCP:
                 # If requester missing and exactly one agent exists in project, assume that one
                 if not real_requester and project.id is not None:
                     async with get_session() as s:
-                        rows = await s.execute(select(Agent.name).where(cast(Any, Agent.project_id) == project.id))
+                        rows = await s.execute(
+                            select(Agent.name).where(
+                                cast(Any, Agent.project_id) == project.id,
+                                cast(Any, Agent.provisioning_state == "active"),
+                            )
+                        )
                         names = [str(row[0]).strip() for row in rows.fetchall() if (row and row[0])]
                     if len(names) == 1:
                         real_requester = names[0]
                 # If target missing and exactly two agents exist, infer the other
                 if not real_target and project.id is not None:
                     async with get_session() as s2:
-                        rows2 = await s2.execute(select(Agent.name).where(cast(Any, Agent.project_id) == project.id))
+                        rows2 = await s2.execute(
+                            select(Agent.name).where(
+                                cast(Any, Agent.project_id) == project.id,
+                                cast(Any, Agent.provisioning_state == "active"),
+                            )
+                        )
                         names2 = [str(row[0]).strip() for row in rows2.fetchall() if (row and row[0])]
                     if real_requester and len(names2) == 2 and real_requester in names2:
                         real_target = next((n for n in names2 if n != real_requester), real_target)
@@ -10946,18 +13267,12 @@ def build_mcp_server() -> FastMCP:
                 is_not_found = isinstance(exc, NoResultFound) or (
                     isinstance(exc, ToolExecutionError) and exc.error_type == "NOT_FOUND"
                 )
-                if is_not_found and register_if_missing and validate_agent_name_format(real_target):
-                    settings = get_settings()
-                    b, _ = await _get_or_create_agent(
+                if is_not_found:
+                    raise _target_registration_required_error(
                         project,
                         real_target,
-                        program or "unknown",
-                        model or "unknown",
-                        task_description or "",
-                        settings,
-                    )
-                else:
-                    raise
+                    ) from exc
+                raise
             _raise_if_self_contact(
                 project,
                 a,
@@ -11069,19 +13384,12 @@ def build_mcp_server() -> FastMCP:
             "to_agent": real_target,
             "reason": reason,
             "ttl_seconds": ttl_seconds,
-            "register_if_missing": register_if_missing,
             "format": "json",
         }
         if requester_registration_token:
             request_payload["registration_token"] = requester_registration_token
         if target_project_key:
             request_payload["to_project"] = target_project_key
-        if program:
-            request_payload["program"] = program
-        if model:
-            request_payload["model"] = model
-        if task_description:
-            request_payload["task_description"] = task_description
         request_tool_result = await request_tool.run(request_payload)
         request_result = cast(dict[str, Any], request_tool_result.structured_content or {})
         request_status = str(request_result.get("status") or "").lower()
@@ -11974,6 +14282,10 @@ def build_mcp_server() -> FastMCP:
         ttl_seconds: int = 3600,
         exclusive: bool = True,
         reason: str = "",
+        origin: Optional[str] = None,
+        execution_id: Optional[str] = None,
+        execution_token: Optional[str] = None,
+        lifecycle_protocol_version: Optional[int] = None,
         registration_token: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
@@ -12023,7 +14335,7 @@ def build_mcp_server() -> FastMCP:
         -------
         ```json
         {"jsonrpc":"2.0","id":"12","method":"tools/call","params":{"name":"file_reservation_paths","arguments":{
-          "project_key":"/abs/path/backend","agent_name":"GreenCastle","paths":["app/api/*.py"],
+          "project_key":"/owner/backend","agent_name":"codex-wsl-home-1","paths":["app/api/*.py"],
           "ttl_seconds":7200,"exclusive":true,"reason":"migrations"
         }}}
         ```
@@ -12068,8 +14380,36 @@ def build_mcp_server() -> FastMCP:
             token_param="registration_token",
             action="file_reservation_paths",
         )
+        legacy_observe = _legacy_execution_rollout_allowed(settings)
+        execution = await _resolve_agent_execution(
+            ctx,
+            project,
+            agent,
+            execution_id,
+            execution_token,
+            action="file_reservation_paths",
+            required=not legacy_observe,
+            touch_activity=False,
+        )
+        _requested_protocol_version, protocol_warning = _validate_execution_protocol(
+            lifecycle_protocol_version,
+            settings=settings,
+        )
+        normalized_origin = (origin or "auto").strip().lower()
+        if normalized_origin not in {"auto", "explicit"}:
+            raise ToolExecutionError(
+                "INVALID_RESERVATION_ORIGIN",
+                "origin must be 'auto' or 'explicit'.",
+                data={"origin": origin},
+            )
         if project.id is None:
             raise ValueError("Project must have an id before reserving file paths.")
+        ancestor_execution_ids = (
+            await _load_execution_ancestor_ids(execution)
+            if execution is not None
+            else []
+        )
+        compatible_execution_ids = set(ancestor_execution_ids)
         stale_auto_releases = await _expire_stale_file_reservations(project.id)
         if stale_auto_releases:
             summary = ", ".join(
@@ -12112,6 +14452,17 @@ def build_mcp_server() -> FastMCP:
             # write cycle runs inside a single IMMEDIATE transaction so that
             # concurrent callers are serialised at the SQLite lock level.
             async with get_immediate_session() as session:
+                await _revalidate_agent_lifetime_in_session(
+                    session,
+                    project=project,
+                    agent=agent,
+                    execution=execution,
+                    require_active_execution=execution is not None,
+                    touch_execution_ts=(
+                        _naive_utc() if execution is not None else None
+                    ),
+                    action="file_reservation_paths",
+                )
                 existing_rows = await session.execute(
                     select(FileReservation, Agent.name)
                     .join(Agent, cast(Any, FileReservation.agent_id) == Agent.id)
@@ -12123,15 +14474,14 @@ def build_mcp_server() -> FastMCP:
                 )
                 existing_reservations = [(row[0], row[1]) for row in existing_rows.all()]
 
-                payloads: list[dict[str, Any]] = []
-                # #180: track reservations newly *created* by this call (not the
-                # ones that merely had their expiry extended). If the Git
-                # archive write below fails after the DB commit, we delete these
-                # so we never leave a committed reservation row with no archive
-                # artifact — mirroring the message-creation compensation.
-                created_reservations: list[FileReservation] = []
                 # Build union PathSpec for fast conflict pre-filtering (O(n+m) instead of O(n*m))
-                union_spec = _build_reservation_union_spec(existing_reservations, agent.id, exclusive)
+                union_spec = _build_reservation_union_spec(
+                    existing_reservations,
+                    execution.id if execution is not None else None,
+                    cast(int, agent.id),
+                    exclusive,
+                    compatible_execution_ids,
+                )
 
                 # Pre-compute which paths might conflict using the union spec
                 potentially_conflicting_paths: set[str] = set()
@@ -12159,7 +14509,18 @@ def build_mcp_server() -> FastMCP:
                         (
                             file_reservation_record
                             for file_reservation_record, _holder_name in existing_reservations
-                            if file_reservation_record.agent_id == agent.id
+                            if (
+                                (
+                                    execution is not None
+                                    and file_reservation_record.execution_id
+                                    == execution.id
+                                )
+                                or (
+                                    execution is None
+                                    and file_reservation_record.execution_id is None
+                                    and file_reservation_record.agent_id == agent.id
+                                )
+                            )
                             and file_reservation_record.path_pattern == path
                         ),
                         None,
@@ -12169,10 +14530,19 @@ def build_mcp_server() -> FastMCP:
                     if path in potentially_conflicting_paths:
                         # Slow path: detailed attribution for potentially conflicting paths only
                         for file_reservation_record, holder_name in existing_reservations:
-                            if _file_reservations_conflict(file_reservation_record, path, exclusive, agent):
+                            if _file_reservations_conflict(
+                                file_reservation_record,
+                                path,
+                                exclusive,
+                                execution.id if execution is not None else None,
+                                cast(int, agent.id),
+                                compatible_execution_ids,
+                            ):
                                 conflicting_holders.append(
                                     {
                                         "agent": holder_name,
+                                        "execution_id": file_reservation_record.execution_id,
+                                        "origin": file_reservation_record.origin,
                                         "path_pattern": file_reservation_record.path_pattern,
                                         "exclusive": file_reservation_record.exclusive,
                                         "expires_ts": _iso(file_reservation_record.expires_ts),
@@ -12192,6 +14562,8 @@ def build_mcp_server() -> FastMCP:
                         if getattr(current_exp, "tzinfo", None) is not None:
                             current_exp = _naive_utc(current_exp)
                         existing_self_reservation.exclusive = exclusive
+                        if normalized_origin == "explicit":
+                            existing_self_reservation.origin = "explicit"
                         if reason or not existing_self_reservation.reason:
                             existing_self_reservation.reason = reason
                         existing_self_reservation.expires_ts = max(requested_exp, current_exp)
@@ -12203,6 +14575,8 @@ def build_mcp_server() -> FastMCP:
                         file_reservation = FileReservation(
                             project_id=project.id,
                             agent_id=agent.id,
+                            execution_id=execution.id if execution is not None else None,
+                            origin=normalized_origin,
                             path_pattern=path,
                             exclusive=exclusive,
                             reason=reason,
@@ -12210,18 +14584,14 @@ def build_mcp_server() -> FastMCP:
                         )
                         session.add(file_reservation)
                         await session.flush()  # Assigns id without committing
-                        created_reservations.append(file_reservation)
-                    file_reservation_payload = _file_reservation_payload(
-                        project,
-                        file_reservation,
-                        agent,
-                        branch=ctx_branch,
-                        worktree=ctx_worktree,
-                    )
-                    payloads.append(file_reservation_payload)
                     granted.append(
                         {
                             "id": file_reservation.id,
+                            "execution_id": file_reservation.execution_id,
+                            "ancestor_execution_ids": ancestor_execution_ids,
+                            "origin": file_reservation.origin,
+                            "legacy_unscoped": execution is None,
+                            "orphaned": False,
                             "path_pattern": file_reservation.path_pattern,
                             "exclusive": file_reservation.exclusive,
                             "reason": file_reservation.reason,
@@ -12232,28 +14602,58 @@ def build_mcp_server() -> FastMCP:
                     existing_reservations.append((file_reservation, agent.name))
                 # Commit all reservations atomically within the IMMEDIATE tx
                 await session.commit()
-            if payloads:
-                try:
-                    await write_file_reservation_records(archive, payloads)
-                except Exception:
-                    # #180: the reservation rows are already committed. If the
-                    # Git archive write fails, delete the rows this call newly
-                    # created so we don't leave committed reservations with no
-                    # archive artifact (reused/extended reservations are left
-                    # as-is — they legitimately existed before this call).
-                    # Best-effort cleanup; the original archive error always
-                    # re-raises.
-                    created_ids = [r.id for r in created_reservations if r.id is not None]
-                    if created_ids:
-                        with suppress(Exception):
-                            async with get_immediate_session() as rollback_session:
-                                await rollback_session.execute(
-                                    delete(FileReservation).where(
-                                        cast(Any, FileReservation.id).in_(created_ids)
-                                    )
+            if granted:
+                reservation_ids = [
+                    int(item["id"])
+                    for item in granted
+                    if item.get("id") is not None
+                ]
+                async with get_session() as version_session:
+                    current_rows = (
+                        await version_session.execute(
+                            select(FileReservation, Agent)
+                            .outerjoin(
+                                Agent,
+                                cast(Any, FileReservation.agent_id) == Agent.id,
+                            )
+                            .where(
+                                cast(Any, FileReservation.id).in_(
+                                    reservation_ids
                                 )
-                                await rollback_session.commit()
-                    raise
+                            )
+                            .order_by(asc(cast(Any, FileReservation.id)))
+                        )
+                    ).all()
+                records = [
+                    cast(tuple[FileReservation, Optional[Agent]], row)
+                    for row in current_rows
+                ]
+                revisions = [
+                    (reservation.id, reservation.archive_revision)
+                    for reservation, _agent in records
+                    if reservation.id is not None
+                ]
+                # DB is authoritative. A failed or partial archive publication
+                # leaves these exact revisions pending for the next ordinary
+                # operation/reaper instead of deleting ownership state while a
+                # guard artifact may already have reached disk or Git.
+                await _write_file_reservation_records(
+                    project,
+                    records,
+                    archive=archive,
+                    archive_locked=True,
+                    branch_override=ctx_branch,
+                    worktree_override=ctx_worktree,
+                )
+                acknowledged = await _ack_file_reservation_archive_revisions(
+                    revisions
+                )
+                if acknowledged != len(revisions):
+                    await _reconcile_pending_file_reservation_artifacts(
+                        project,
+                        archive=archive,
+                        archive_locked=True,
+                    )
         await ctx.info(f"Issued {len(granted)} file_reservations for '{agent.name}'. Conflicts: {len(conflicts)}")
         # Surface per-call enforcement mode so wrappers (e.g. ntm's `lock`
         # subcommand) can warn the operator that code-repo paths are
@@ -12264,6 +14664,14 @@ def build_mcp_server() -> FastMCP:
         # response, downstream tools have no programmatic way to detect
         # the advisory-only mode short of parsing the docstring. (#162)
         warnings_list: list[str] = []
+        if execution is None:
+            warnings_list.append(
+                "execution_required_after_rollout: reservation was accepted as a legacy "
+                "unscoped claim because AGENT_EXECUTION_ENFORCEMENT_MODE=observe; "
+                "start_agent_execution and pass execution_id before enforce mode is enabled."
+            )
+        if protocol_warning is not None:
+            warnings_list.append(protocol_warning)
         advisory_only_paths = [p for p in paths if not _looks_like_archive_path(p)]
         if advisory_only_paths:
             warnings_list.append(
@@ -12273,7 +14681,14 @@ def build_mcp_server() -> FastMCP:
                 "Install the pre-commit guard via `install_precommit_guard` for "
                 "the authoritative reservation gate."
             )
-        return {"granted": granted, "conflicts": conflicts, "warnings": warnings_list}
+        return {
+            "granted": granted,
+            "conflicts": conflicts,
+            "warnings": warnings_list,
+            "execution_id": execution.id if execution is not None else None,
+            "ancestor_execution_ids": ancestor_execution_ids,
+            "legacy_unscoped": execution is None,
+        }
 
     @mcp.tool(name="release_file_reservations")
     @_instrument_tool("release_file_reservations", cluster=CLUSTER_FILE_RESERVATIONS, capabilities={"file_reservations"}, project_arg="project_key", agent_arg="agent_name")
@@ -12283,6 +14698,9 @@ def build_mcp_server() -> FastMCP:
         agent_name: str,
         paths: Optional[list[str]] = None,
         file_reservation_ids: Optional[list[int]] = None,
+        execution_id: Optional[str] = None,
+        execution_token: Optional[str] = None,
+        lifecycle_protocol_version: Optional[int] = None,
         registration_token: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
@@ -12309,14 +14727,14 @@ def build_mcp_server() -> FastMCP:
         Release all active reservations for agent:
         ```json
         {"jsonrpc":"2.0","id":"13","method":"tools/call","params":{"name":"release_file_reservations","arguments":{
-          "project_key":"/abs/path/backend","agent_name":"GreenCastle"
+          "project_key":"/owner/backend","agent_name":"codex-wsl-home-1"
         }}}
         ```
 
         Release by ids:
         ```json
         {"jsonrpc":"2.0","id":"14","method":"tools/call","params":{"name":"release_file_reservations","arguments":{
-          "project_key":"/abs/path/backend","agent_name":"GreenCastle","file_reservation_ids":[101,102]
+          "project_key":"/owner/backend","agent_name":"codex-wsl-home-1","file_reservation_ids":[101,102]
         }}}
         ```
         """
@@ -12350,6 +14768,7 @@ def build_mcp_server() -> FastMCP:
                 pass
         try:
             project = await _get_project_by_identifier(project_key)
+            legacy_observe = _legacy_execution_rollout_allowed(get_settings())
             agent = await _authenticate_agent(
                 ctx,
                 project,
@@ -12357,6 +14776,21 @@ def build_mcp_server() -> FastMCP:
                 registration_token,
                 token_param="registration_token",
                 action="release_file_reservations",
+            )
+            execution = await _resolve_agent_execution(
+                ctx,
+                project,
+                agent,
+                execution_id,
+                execution_token,
+                action="release_file_reservations",
+                required=not legacy_observe,
+                require_active=False,
+                touch_activity=False,
+            )
+            _requested_protocol_version, protocol_warning = _validate_execution_protocol(
+                lifecycle_protocol_version,
+                settings=get_settings(),
             )
             if project.id is None or agent.id is None:
                 raise ValueError("Project and agent must have ids before releasing file_reservations.")
@@ -12367,11 +14801,27 @@ def build_mcp_server() -> FastMCP:
             # Use BEGIN IMMEDIATE so the release is immediately visible to
             # subsequent reserve calls on other connections (#130).
             async with get_immediate_session() as session:
+                await _revalidate_agent_lifetime_in_session(
+                    session,
+                    project=project,
+                    agent=agent,
+                    execution=execution,
+                    require_active_execution=False,
+                    touch_execution_ts=(
+                        naive_now if execution is not None else None
+                    ),
+                    action="release_file_reservations",
+                )
                 select_stmt = (
                     select(FileReservation)
                     .where(
                         cast(Any, FileReservation.project_id) == project.id,
                         cast(Any, FileReservation.agent_id) == agent.id,
+                        (
+                            cast(Any, FileReservation.execution_id) == execution.id
+                            if execution is not None
+                            else cast(Any, FileReservation.execution_id).is_(None)
+                        ),
                         cast(Any, FileReservation.released_ts).is_(None),
                         or_(
                             cast(Any, FileReservation.expires_ts).is_(None),
@@ -12393,22 +14843,38 @@ def build_mcp_server() -> FastMCP:
                             .where(
                                 cast(Any, FileReservation.project_id) == project.id,
                                 cast(Any, FileReservation.agent_id) == agent.id,
+                                (
+                                    cast(Any, FileReservation.execution_id)
+                                    == execution.id
+                                    if execution is not None
+                                    else cast(Any, FileReservation.execution_id).is_(None)
+                                ),
                                 cast(Any, FileReservation.released_ts).is_(None),
                                 cast(Any, FileReservation.id).in_(ids),
                             )
                             .values(released_ts=naive_now)  # Use naive UTC for SQLite compatibility
                         )
-                        await session.commit()
+                await session.commit()
             affected = len(reservations)
             for reservation in reservations:
                 reservation.released_ts = naive_now
-            if reservations:
-                await _write_file_reservation_records(
-                    project,
-                    [(reservation, agent) for reservation in reservations],
-                )
+            await _reconcile_pending_file_reservation_artifacts(project)
             await ctx.info(f"Released {affected} file_reservations for '{agent.name}'.")
-            return {"released": affected, "released_at": _iso(now)}
+            response: dict[str, Any] = {
+                "released": affected,
+                "released_at": _iso(now),
+                "execution_id": execution.id if execution is not None else None,
+            }
+            response_warnings: list[str] = []
+            if execution is None:
+                response_warnings.append(
+                    "execution_required_after_rollout: only legacy unscoped reservations were released."
+                )
+            if protocol_warning is not None:
+                response_warnings.append(protocol_warning)
+            if response_warnings:
+                response["warnings"] = response_warnings
+            return response
         except Exception as exc:
             if get_settings().tools_log_enabled:
                 try:
@@ -12440,13 +14906,7 @@ def build_mcp_server() -> FastMCP:
         registration_token: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
-        """
-        Force-release a stale file reservation held by another agent after inactivity heuristics.
-
-        The tool validates that the reservation appears abandoned (agent inactive beyond threshold and
-        no recent mail/filesystem/git activity). When released, an optional notification is sent to the
-        previous holder summarizing the heuristics.
-        """
+        """Recover one stale claim owned by this authenticated durable Agent."""
         project = await _get_project_by_identifier(project_key)
         actor = await _authenticate_agent(
             ctx,
@@ -12460,6 +14920,7 @@ def build_mcp_server() -> FastMCP:
             raise ValueError("Project must have an id before releasing file_reservations.")
 
         await ensure_schema()
+        await _reconcile_pending_file_reservation_artifacts(project)
         async with get_session() as session:
             result = await session.execute(
                 select(FileReservation, Agent)
@@ -12479,6 +14940,17 @@ def build_mcp_server() -> FastMCP:
             )
 
         reservation, holder = row
+        if actor.id != holder.id:
+            raise ToolExecutionError(
+                "RESERVATION_OWNERSHIP_MISMATCH",
+                "An Agent may force-release only its own stale reservation.",
+                recoverable=False,
+                data={
+                    "file_reservation_id": file_reservation_id,
+                    "owner_agent_id": holder.id,
+                    "actor_agent_id": actor.id,
+                },
+            )
         if reservation.released_ts is not None:
             return {
                 "released": 0,
@@ -12491,6 +14963,12 @@ def build_mcp_server() -> FastMCP:
         if reservation.expires_ts is not None and reservation.expires_ts <= naive_now:
             # Normalize TTL-expired reservations to released before applying stale-activity heuristics.
             async with get_immediate_session() as session:
+                await _revalidate_agent_lifetime_in_session(
+                    session,
+                    project=project,
+                    agent=actor,
+                    action="force_release_file_reservation",
+                )
                 await session.execute(
                     update(FileReservation)
                     .where(
@@ -12504,10 +14982,7 @@ def build_mcp_server() -> FastMCP:
                 await session.commit()
 
             reservation.released_ts = naive_now
-            await _write_file_reservation_records(
-                project,
-                [(reservation, holder)],
-            )
+            await _reconcile_pending_file_reservation_artifacts(project)
             return {
                 "released": 0,
                 "released_at": _iso(naive_now),
@@ -12532,12 +15007,25 @@ def build_mcp_server() -> FastMCP:
                 recoverable=True,
                 data={
                     "file_reservation_id": file_reservation_id,
+                    "execution_id": target_status.execution_id,
+                    "execution_status": target_status.execution_status,
+                    "last_execution_activity_ts": _iso(
+                        target_status.last_execution_activity
+                    )
+                    if target_status.last_execution_activity
+                    else None,
                     "stale_reasons": target_status.stale_reasons,
                 },
             )
 
         # Use BEGIN IMMEDIATE so the forced release is immediately visible (#130).
         async with get_immediate_session() as session:
+            await _revalidate_agent_lifetime_in_session(
+                session,
+                project=project,
+                agent=actor,
+                action="force_release_file_reservation",
+            )
             await session.execute(
                 update(FileReservation)
                 .where(
@@ -12549,10 +15037,7 @@ def build_mcp_server() -> FastMCP:
             await session.commit()
 
         reservation.released_ts = naive_now
-        await _write_file_reservation_records(
-            project,
-            [(reservation, holder)],
-        )
+        await _reconcile_pending_file_reservation_artifacts(project)
         settings = get_settings()
         grace_seconds = int(settings.file_reservation_activity_grace_seconds)
         inactivity_seconds = int(settings.file_reservation_inactivity_seconds)
@@ -12560,6 +15045,12 @@ def build_mcp_server() -> FastMCP:
         summary = {
             "id": reservation.id,
             "agent": holder.name,
+            "execution_id": target_status.execution_id,
+            "execution_status": target_status.execution_status,
+            "ancestor_execution_ids": target_status.ancestor_execution_ids,
+            "origin": reservation.origin,
+            "orphaned": target_status.orphaned,
+            "legacy_unscoped": target_status.legacy_unscoped,
             "path_pattern": reservation.path_pattern,
             "exclusive": reservation.exclusive,
             "reason": reservation.reason,
@@ -12568,6 +15059,7 @@ def build_mcp_server() -> FastMCP:
             "released_ts": _iso(reservation.released_ts),
             "stale_reasons": target_status.stale_reasons,
             "last_agent_activity_ts": _iso(target_status.last_agent_activity) if target_status.last_agent_activity else None,
+            "last_execution_activity_ts": _iso(target_status.last_execution_activity) if target_status.last_execution_activity else None,
             "last_mail_activity_ts": _iso(target_status.last_mail_activity) if target_status.last_mail_activity else None,
             "last_filesystem_activity_ts": _iso(target_status.last_fs_activity) if target_status.last_fs_activity else None,
             "last_git_activity_ts": _iso(target_status.last_git_activity) if target_status.last_git_activity else None,
@@ -12664,6 +15156,9 @@ def build_mcp_server() -> FastMCP:
         extend_seconds: int = 1800,
         paths: Optional[list[str]] = None,
         file_reservation_ids: Optional[list[int]] = None,
+        execution_id: Optional[str] = None,
+        execution_token: Optional[str] = None,
+        lifecycle_protocol_version: Optional[int] = None,
         registration_token: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
@@ -12718,6 +15213,7 @@ def build_mcp_server() -> FastMCP:
             except Exception:
                 pass
         project = await _get_project_by_identifier(project_key)
+        legacy_observe = _legacy_execution_rollout_allowed(get_settings())
         agent = await _authenticate_agent(
             ctx,
             project,
@@ -12725,6 +15221,20 @@ def build_mcp_server() -> FastMCP:
             registration_token,
             token_param="registration_token",
             action="renew_file_reservations",
+        )
+        execution = await _resolve_agent_execution(
+            ctx,
+            project,
+            agent,
+            execution_id,
+            execution_token,
+            action="renew_file_reservations",
+            required=not legacy_observe,
+            touch_activity=False,
+        )
+        _requested_protocol_version, protocol_warning = _validate_execution_protocol(
+            lifecycle_protocol_version,
+            settings=get_settings(),
         )
         if project.id is None or agent.id is None:
             raise ValueError("Project and agent must have ids before renewing file_reservations.")
@@ -12743,11 +15253,27 @@ def build_mcp_server() -> FastMCP:
         # Use a single IMMEDIATE session for the read + write so the
         # renewal is atomic and immediately visible to other connections.
         async with get_immediate_session() as session:
+            await _revalidate_agent_lifetime_in_session(
+                session,
+                project=project,
+                agent=agent,
+                execution=execution,
+                require_active_execution=execution is not None,
+                touch_execution_ts=(
+                    _naive_utc(now) if execution is not None else None
+                ),
+                action="renew_file_reservations",
+            )
             stmt = (
                 select(FileReservation)
                 .where(
                     cast(Any, FileReservation.project_id) == project.id,
                     cast(Any, FileReservation.agent_id) == agent.id,
+                    (
+                        cast(Any, FileReservation.execution_id) == execution.id
+                        if execution is not None
+                        else cast(Any, FileReservation.execution_id).is_(None)
+                    ),
                     cast(Any, FileReservation.released_ts).is_(None),
                     cast(Any, FileReservation.expires_ts) > _naive_utc(now),
                 )
@@ -12761,8 +15287,23 @@ def build_mcp_server() -> FastMCP:
             file_reservations: list[FileReservation] = list(result.scalars().all())
 
             if not file_reservations:
+                await session.commit()
                 await ctx.info(f"No active file_reservations to renew for '{agent.name}'.")
-                return {"renewed": 0, "file_reservations": []}
+                empty_response: dict[str, Any] = {
+                    "renewed": 0,
+                    "execution_id": execution.id if execution is not None else None,
+                    "file_reservations": [],
+                }
+                empty_warnings: list[str] = []
+                if execution is None:
+                    empty_warnings.append(
+                        "execution_required_after_rollout: only legacy unscoped reservations were renewed."
+                    )
+                if protocol_warning is not None:
+                    empty_warnings.append(protocol_warning)
+                if empty_warnings:
+                    empty_response["warnings"] = empty_warnings
+                return empty_response
 
             updated: list[dict[str, Any]] = []
             for file_reservation in file_reservations:
@@ -12777,6 +15318,7 @@ def build_mcp_server() -> FastMCP:
                 updated.append(
                     {
                         "id": file_reservation.id,
+                        "execution_id": file_reservation.execution_id,
                         "path_pattern": file_reservation.path_pattern,
                         "old_expires_ts": _iso(old_exp),
                         "new_expires_ts": _iso(file_reservation.expires_ts),
@@ -12784,27 +15326,32 @@ def build_mcp_server() -> FastMCP:
                 )
             await session.commit()
 
-        # Update Git artifacts for the renewed file_reservations
-        await _write_file_reservation_records(
-            project,
-            [(reservation, agent) for reservation in file_reservations],
-        )
+        # Publish the exact committed revisions. A failed write leaves each
+        # renewal pending in DB for the next ordinary sweep or operation.
+        await _reconcile_pending_file_reservation_artifacts(project)
         await ctx.info(f"Renewed {len(updated)} file_reservation(s) for '{agent.name}'.")
-        return {"renewed": len(updated), "file_reservations": updated}
+        response: dict[str, Any] = {
+            "renewed": len(updated),
+            "execution_id": execution.id if execution is not None else None,
+            "file_reservations": updated,
+        }
+        response_warnings: list[str] = []
+        if execution is None:
+            response_warnings.append(
+                "execution_required_after_rollout: only legacy unscoped reservations were renewed."
+            )
+        if protocol_warning is not None:
+            response_warnings.append(protocol_warning)
+        if response_warnings:
+            response["warnings"] = response_warnings
+        return response
 
     # --- Build slots (coarse concurrency control) --------------------------------------------
     # Only registered when WORKTREES_ENABLED=1 to reduce token overhead for single-worktree setups
 
     if settings.worktrees_enabled:
-        def _safe_component(value: str) -> str:
-            # Keep it simple and dependency-free: replace common problematic filesystem chars
-            safe = value.strip()
-            for ch in ("/", "\\", ":", "*", "?", "\"", "<", ">", "|", " "):
-                safe = safe.replace(ch, "_")
-            return safe or "unknown"
-
         def _slot_dir(archive: ProjectArchive, slot: str) -> Path:
-            safe = _safe_component(slot)
+            safe = safe_build_path_component(slot)
             return archive.root / "build_slots" / safe
 
         def _compute_branch(path: str) -> Optional[str]:
@@ -12839,7 +15386,15 @@ def build_mcp_server() -> FastMCP:
                     if isinstance(data, dict) and _is_active_build_slot_lease(cast(dict[str, Any], data), now):
                         results.append(cast(dict[str, Any], data))
                 except Exception:
-                    continue
+                    results.append(
+                        {
+                            "slot": slot_path.name,
+                            "agent": "<unreadable lease>",
+                            "exclusive": True,
+                            "malformed": True,
+                            "lease_file": f.name,
+                        }
+                    )
             return results
 
         def _read_build_slot_lease(lease_path: Path) -> dict[str, Any]:
@@ -12859,6 +15414,96 @@ def build_mcp_server() -> FastMCP:
                 return None
             return cast(dict[str, Any], data)
 
+        def _build_slot_holder_id(
+            agent: Agent,
+            branch: str | None,
+            execution: AgentExecution | None,
+        ) -> str:
+            """Return the execution key or the documented observe-mode legacy key."""
+            if execution is not None:
+                return safe_build_path_component(execution.id)
+            return safe_build_path_component(
+                f"{agent.name}__{branch or 'unknown'}__{agent.agent_generation}"
+            )
+
+        def _build_slot_lease_matches_lifetime(
+            data: dict[str, Any],
+            *,
+            project: Project,
+            agent: Agent,
+            execution: AgentExecution | None,
+            branch: str | None,
+        ) -> bool:
+            """Return whether a lease belongs to this exact immutable lifetime."""
+            if (
+                data.get("agent_id") != agent.id
+                or data.get("agent_generation") != agent.agent_generation
+                or data.get("project_generation") != project.project_generation
+            ):
+                return False
+            if execution is not None:
+                return data.get("execution_id") == execution.id
+            return (
+                data.get("execution_id") is None
+                and data.get("agent") == agent.name
+                and data.get("branch") == branch
+            )
+
+        def _build_slot_rollout_response(
+            payload: dict[str, Any],
+            *,
+            action: str,
+            execution: AgentExecution | None,
+            lifecycle_protocol_version: int,
+            protocol_warning: str | None,
+        ) -> dict[str, Any]:
+            """Attach explicit rollout ownership/protocol diagnostics."""
+            payload["execution_id"] = execution.id if execution is not None else None
+            payload["legacy_unscoped"] = execution is None
+            payload["lifecycle_protocol_version"] = lifecycle_protocol_version
+            warnings: list[str] = []
+            if execution is None:
+                warnings.append(
+                    "execution_required_after_rollout: "
+                    f"{action} accepted a legacy unscoped build-slot lease in observe mode."
+                )
+            if protocol_warning is not None:
+                warnings.append(protocol_warning)
+            if warnings:
+                payload["warnings"] = warnings
+            return payload
+
+        async def _revalidate_build_slot_lifetime(
+            execution: AgentExecution | None,
+            project: Project,
+            agent: Agent,
+            *,
+            action: str,
+            require_active_execution: bool,
+        ) -> None:
+            """Recheck exact ownership/liveness while the archive lock is held.
+
+            Ending an execution commits its terminal database state before it
+            waits for the archive lock to release slot artifacts.  Acquiring
+            the archive lock first and then taking an IMMEDIATE transaction
+            gives both interleavings a safe outcome: either this check observes
+            the terminal row and refuses the write, or the end operation runs
+            second and releases the newly written lease before returning.
+            """
+            async with get_immediate_session() as session:
+                await _revalidate_agent_lifetime_in_session(
+                    session,
+                    project=project,
+                    agent=agent,
+                    execution=execution,
+                    require_active_execution=require_active_execution,
+                    touch_execution_ts=(
+                        _naive_utc() if execution is not None else None
+                    ),
+                    action=action,
+                )
+                await session.commit()
+
         @mcp.tool(name="acquire_build_slot")
         @_instrument_tool("acquire_build_slot", cluster=CLUSTER_BUILD_SLOTS, capabilities={"build"}, project_arg="project_key", agent_arg="agent_name")
         async def acquire_build_slot(
@@ -12869,6 +15514,9 @@ def build_mcp_server() -> FastMCP:
             branch: Optional[str] = None,
             ttl_seconds: int = 3600,
             exclusive: bool = True,
+            execution_id: Optional[str] = None,
+            execution_token: Optional[str] = None,
+            lifecycle_protocol_version: Optional[int] = None,
             registration_token: Optional[str] = None,
             format: Optional[str] = None,
         ) -> dict[str, Any]:
@@ -12884,14 +15532,38 @@ def build_mcp_server() -> FastMCP:
                 token_param="registration_token",
                 action="acquire_build_slot",
             )
+            legacy_observe = _legacy_execution_rollout_allowed(settings)
+            execution = await _resolve_agent_execution(
+                ctx,
+                project,
+                agent,
+                execution_id,
+                execution_token,
+                action="acquire_build_slot",
+                required=not legacy_observe,
+                touch_activity=False,
+            )
+            requested_protocol_version, protocol_warning = (
+                _validate_execution_protocol(
+                    lifecycle_protocol_version,
+                    settings=settings,
+                )
+            )
             archive = await ensure_archive(settings, project.slug)
             now = datetime.now(timezone.utc)
             holder_branch = (branch or "").strip() or await asyncio.to_thread(_compute_branch, project.human_key)
             conflicts: list[dict[str, Any]] = []
-            holder_id = _safe_component(f"{agent.name}__{holder_branch or 'unknown'}")
+            holder_id = _build_slot_holder_id(agent, holder_branch, execution)
             async with _archive_write_lock(archive):
                 # Serialize slot lease reads and writes so concurrent holders observe
                 # the latest lease state and never parse partially written JSON.
+                await _revalidate_build_slot_lifetime(
+                    execution,
+                    project,
+                    agent,
+                    action="acquire_build_slot",
+                    require_active_execution=execution is not None,
+                )
                 slot_path = _slot_dir(archive, slot)
                 await asyncio.to_thread(slot_path.mkdir, parents=True, exist_ok=True)
                 active = await asyncio.to_thread(_read_active_slots, slot_path, now)
@@ -12899,11 +15571,30 @@ def build_mcp_server() -> FastMCP:
                 current = await asyncio.to_thread(_read_existing_build_slot_lease, lease_path)
 
                 for entry in active:
-                    if entry.get("agent") == agent.name and entry.get("branch") == holder_branch:
+                    same_holder = _build_slot_lease_matches_lifetime(
+                        entry,
+                        project=project,
+                        agent=agent,
+                        execution=execution,
+                        branch=holder_branch,
+                    )
+                    if same_holder:
                         continue
                     if exclusive or entry.get("exclusive", True):
                         conflicts.append(entry)
-                active_current = current if current is not None and _is_active_build_slot_lease(current, now) else None
+                active_current = (
+                    current
+                    if current is not None
+                    and _is_active_build_slot_lease(current, now)
+                    and _build_slot_lease_matches_lifetime(
+                        current,
+                        project=project,
+                        agent=agent,
+                        execution=execution,
+                        branch=holder_branch,
+                    )
+                    else None
+                )
                 requested_exp = now + timedelta(seconds=max(ttl_seconds, 60))
                 current_exp = None
                 if active_current is not None:
@@ -12911,16 +15602,39 @@ def build_mcp_server() -> FastMCP:
                 payload = {
                     "slot": slot,
                     "agent": agent.name,
+                    "agent_id": agent.id,
+                    "agent_generation": agent.agent_generation,
+                    "project_generation": project.project_generation,
+                    "authority": "server",
+                    "execution_id": execution.id if execution is not None else None,
+                    "legacy_unscoped": execution is None,
+                    "lifecycle_protocol_version": requested_protocol_version,
                     "branch": holder_branch,
                     "exclusive": exclusive,
                     "acquired_ts": cast(str, active_current.get("acquired_ts")) if active_current is not None and isinstance(active_current.get("acquired_ts"), str) else _iso(now),
                     "expires_ts": _iso(max(requested_exp, current_exp) if current_exp is not None else requested_exp),
                 }
-                with contextlib.suppress(Exception):
-                    await asyncio.to_thread(lease_path.write_text, json.dumps(payload, indent=2), "utf-8")
+                if execution is not None:
+                    await _register_execution_build_slot_artifact_path(
+                        project,
+                        execution,
+                        slot_name=slot,
+                        slot_path_component=safe_build_path_component(slot),
+                    )
+                await asyncio.to_thread(
+                    _write_json_atomic_sync,
+                    lease_path,
+                    payload,
+                )
             if conflicts:
                 await ctx.info(f"Build slot conflicts for '{slot}': {len(conflicts)}")
-            return {"granted": payload, "conflicts": conflicts}
+            return _build_slot_rollout_response(
+                {"granted": payload, "conflicts": conflicts},
+                action="acquire_build_slot",
+                execution=execution,
+                lifecycle_protocol_version=requested_protocol_version,
+                protocol_warning=protocol_warning,
+            )
 
         @mcp.tool(name="renew_build_slot")
         @_instrument_tool("renew_build_slot", cluster=CLUSTER_BUILD_SLOTS, capabilities={"build"}, project_arg="project_key", agent_arg="agent_name")
@@ -12931,6 +15645,9 @@ def build_mcp_server() -> FastMCP:
             slot: str,
             branch: Optional[str] = None,
             extend_seconds: int = 1800,
+            execution_id: Optional[str] = None,
+            execution_token: Optional[str] = None,
+            lifecycle_protocol_version: Optional[int] = None,
             registration_token: Optional[str] = None,
             format: Optional[str] = None,
         ) -> dict[str, Any]:
@@ -12946,23 +15663,91 @@ def build_mcp_server() -> FastMCP:
                 token_param="registration_token",
                 action="renew_build_slot",
             )
+            legacy_observe = _legacy_execution_rollout_allowed(settings)
+            execution = await _resolve_agent_execution(
+                ctx,
+                project,
+                agent,
+                execution_id,
+                execution_token,
+                action="renew_build_slot",
+                required=not legacy_observe,
+                touch_activity=False,
+            )
+            requested_protocol_version, protocol_warning = (
+                _validate_execution_protocol(
+                    lifecycle_protocol_version,
+                    settings=settings,
+                )
+            )
             archive = await ensure_archive(settings, project.slug)
             now = datetime.now(timezone.utc)
-            holder_branch = (branch or "").strip() or await asyncio.to_thread(_compute_branch, project.human_key)
-            holder_id = _safe_component(f"{agent.name}__{holder_branch or 'unknown'}")
+            holder_branch = (branch or "").strip() or await asyncio.to_thread(
+                _compute_branch, project.human_key
+            )
+            holder_id = _build_slot_holder_id(agent, holder_branch, execution)
             async with _archive_write_lock(archive):
+                await _revalidate_build_slot_lifetime(
+                    execution,
+                    project,
+                    agent,
+                    action="renew_build_slot",
+                    require_active_execution=execution is not None,
+                )
                 slot_path = _slot_dir(archive, slot)
                 lease_path = slot_path / f"{holder_id}.json"
                 current = await asyncio.to_thread(_read_existing_build_slot_lease, lease_path)
                 if current is None or not _is_active_build_slot_lease(current, now):
-                    return {"renewed": False, "expires_ts": None}
+                    return _build_slot_rollout_response(
+                        {"renewed": False, "expires_ts": None},
+                        action="renew_build_slot",
+                        execution=execution,
+                        lifecycle_protocol_version=requested_protocol_version,
+                        protocol_warning=protocol_warning,
+                    )
+                if not _build_slot_lease_matches_lifetime(
+                    current,
+                    project=project,
+                    agent=agent,
+                    execution=execution,
+                    branch=holder_branch,
+                ):
+                    raise ToolExecutionError(
+                        "BUILD_SLOT_OWNERSHIP_MISMATCH",
+                        "The build-slot lease belongs to a different Agent lifetime.",
+                        recoverable=False,
+                        data={"slot": slot, "action": "renew_build_slot"},
+                    )
                 current_exp = _ensure_utc(_parse_iso(cast(Optional[str], current.get("expires_ts"))))
                 base = max(now, current_exp) if current_exp is not None else now
                 new_exp = _iso(base + timedelta(seconds=max(extend_seconds, 60)))
-                current.update({"slot": slot, "agent": agent.name, "branch": holder_branch, "expires_ts": new_exp})
-                with contextlib.suppress(Exception):
-                    await asyncio.to_thread(lease_path.write_text, json.dumps(current, indent=2), "utf-8")
-            return {"renewed": True, "expires_ts": new_exp}
+                current.update(
+                    {
+                        "slot": slot,
+                        "agent": agent.name,
+                        "agent_id": agent.id,
+                        "agent_generation": agent.agent_generation,
+                        "project_generation": project.project_generation,
+                        "authority": "server",
+                        "execution_id": execution.id if execution is not None else None,
+                        "legacy_unscoped": execution is None,
+                        "lifecycle_protocol_version": requested_protocol_version,
+                        "branch": holder_branch,
+                        "expires_ts": new_exp,
+                    }
+                )
+                await asyncio.to_thread(
+                    _write_json_atomic_sync,
+                    lease_path,
+                    current,
+                )
+            return _build_slot_rollout_response(
+                {"renewed": True, "expires_ts": new_exp},
+                action="renew_build_slot",
+                execution=execution,
+                lifecycle_protocol_version=requested_protocol_version,
+                protocol_warning=protocol_warning,
+            )
 
         @mcp.tool(name="release_build_slot")
         @_instrument_tool("release_build_slot", cluster=CLUSTER_BUILD_SLOTS, capabilities={"build"}, project_arg="project_key", agent_arg="agent_name")
@@ -12972,6 +15757,9 @@ def build_mcp_server() -> FastMCP:
             agent_name: str,
             slot: str,
             branch: Optional[str] = None,
+            execution_id: Optional[str] = None,
+            execution_token: Optional[str] = None,
+            lifecycle_protocol_version: Optional[int] = None,
             registration_token: Optional[str] = None,
             format: Optional[str] = None,
         ) -> dict[str, Any]:
@@ -12987,24 +15775,77 @@ def build_mcp_server() -> FastMCP:
                 token_param="registration_token",
                 action="release_build_slot",
             )
+            legacy_observe = _legacy_execution_rollout_allowed(settings)
+            execution = await _resolve_agent_execution(
+                ctx,
+                project,
+                agent,
+                execution_id,
+                execution_token,
+                action="release_build_slot",
+                required=not legacy_observe,
+                touch_activity=False,
+            )
+            requested_protocol_version, protocol_warning = (
+                _validate_execution_protocol(
+                    lifecycle_protocol_version,
+                    settings=settings,
+                )
+            )
             archive = await ensure_archive(settings, project.slug)
             now = datetime.now(timezone.utc)
-            holder_branch = (branch or "").strip() or await asyncio.to_thread(_compute_branch, project.human_key)
-            holder_id = _safe_component(f"{agent.name}__{holder_branch or 'unknown'}")
-            released = False
+            holder_branch = None
+            if execution is None:
+                holder_branch = (branch or "").strip() or await asyncio.to_thread(
+                    _compute_branch,
+                    project.human_key,
+                )
+            holder_id = _build_slot_holder_id(agent, holder_branch, execution)
             async with _archive_write_lock(archive):
+                await _revalidate_build_slot_lifetime(
+                    execution,
+                    project,
+                    agent,
+                    action="release_build_slot",
+                    require_active_execution=False,
+                )
                 slot_path = _slot_dir(archive, slot)
                 lease_path = slot_path / f"{holder_id}.json"
                 data = await asyncio.to_thread(_read_existing_build_slot_lease, lease_path)
                 if data is None or not _is_active_build_slot_lease(data, now):
-                    return {"released": False, "released_at": _iso(now)}
-                try:
-                    data.update({"released_ts": _iso(now), "expires_ts": _iso(now)})
-                    await asyncio.to_thread(lease_path.write_text, json.dumps(data, indent=2), "utf-8")
-                    released = True
-                except Exception:
-                    released = False
-            return {"released": released, "released_at": _iso(now)}
+                    return _build_slot_rollout_response(
+                        {"released": False, "released_at": _iso(now)},
+                        action="release_build_slot",
+                        execution=execution,
+                        lifecycle_protocol_version=requested_protocol_version,
+                        protocol_warning=protocol_warning,
+                    )
+                if not _build_slot_lease_matches_lifetime(
+                    data,
+                    project=project,
+                    agent=agent,
+                    execution=execution,
+                    branch=holder_branch,
+                ):
+                    raise ToolExecutionError(
+                        "BUILD_SLOT_OWNERSHIP_MISMATCH",
+                        "The build-slot lease belongs to a different Agent lifetime.",
+                        recoverable=False,
+                        data={"slot": slot, "action": "release_build_slot"},
+                    )
+                data.update({"released_ts": _iso(now), "expires_ts": _iso(now)})
+                await asyncio.to_thread(
+                    _write_json_atomic_sync,
+                    lease_path,
+                    data,
+                )
+            return _build_slot_rollout_response(
+                {"released": True, "released_at": _iso(now)},
+                action="release_build_slot",
+                execution=execution,
+                lifecycle_protocol_version=requested_protocol_version,
+                protocol_warning=protocol_warning,
+            )
 
     def _read_environment_resource(format: Optional[str] = None) -> dict[str, Any]:
         """
@@ -13024,7 +15865,6 @@ def build_mcp_server() -> FastMCP:
         dict
             {
               "environment": str,
-              "database_url": str,
               "http": { "host": str, "port": int, "path": str }
             }
 
@@ -13034,13 +15874,13 @@ def build_mcp_server() -> FastMCP:
         {"jsonrpc":"2.0","id":"r1","method":"resources/read","params":{"uri":"resource://config/environment"}}
         ```
         """
+        public_runtime = _public_runtime_descriptor(settings)
         payload = {
-            "environment": settings.environment,
-            "database_url": settings.database.url,
+            "environment": public_runtime["environment"],
             "http": {
-                "host": settings.http.host,
-                "port": settings.http.port,
-                "path": settings.http.path,
+                "host": public_runtime["http_host"],
+                "port": public_runtime["http_port"],
+                "path": public_runtime["http_path"],
             },
         }
         return _apply_resource_output_format(
@@ -13651,7 +16491,25 @@ def build_mcp_server() -> FastMCP:
                         "related": ["register_agent", "file_reservation_paths"],
                         "expected_frequency": "Whenever a new repo/path is encountered.",
                         "required_capabilities": ["infrastructure", "storage"],
-                        "usage_examples": [{"hint": "First action", "sample": "ensure_project(human_key='/abs/path/backend')"}],
+                        "usage_examples": [{"hint": "First action", "sample": "ensure_project(human_key='/owner/backend')"}],
+                    },
+                    {
+                        "name": "archive_project",
+                        "summary": "Reversibly hide a project from active listings while preserving all history.",
+                        "use_when": "A project is dormant and should leave the active workspace roster.",
+                        "related": ["unarchive_project", "ensure_project"],
+                        "expected_frequency": "Rare project lifecycle maintenance.",
+                        "required_capabilities": ["infrastructure"],
+                        "usage_examples": [{"hint": "Archive", "sample": "archive_project(project_key='/owner/backend', registration_token='<project agent token>')"}],
+                    },
+                    {
+                        "name": "unarchive_project",
+                        "summary": "Restore an archived project to active listings.",
+                        "use_when": "Coordination resumes for a previously archived project.",
+                        "related": ["archive_project"],
+                        "expected_frequency": "Rare project lifecycle maintenance.",
+                        "required_capabilities": ["infrastructure"],
+                        "usage_examples": [{"hint": "Restore", "sample": "unarchive_project(project_key='/owner/backend', registration_token='<project agent token>')"}],
                     },
                     {
                         "name": "install_precommit_guard",
@@ -13675,7 +16533,7 @@ def build_mcp_server() -> FastMCP:
             },
             {
                 "name": "Identity & Directory",
-                "purpose": "Register agents, mint unique identities, and inspect directory metadata.",
+                "purpose": "Provision durable mailboxes, resume their metadata, and inspect directory state.",
                 "tools": [
                     {
                         "name": "register_agent",
@@ -13684,16 +16542,34 @@ def build_mcp_server() -> FastMCP:
                         "related": ["create_agent_identity", "whois"],
                         "expected_frequency": "At the start of each automated work session.",
                         "required_capabilities": ["identity"],
-                        "usage_examples": [{"hint": "Resume persona", "sample": "register_agent(project_key='/abs/path/backend', program='codex', model='gpt5')"}],
+                        "usage_examples": [{"hint": "Resume durable identity", "sample": "register_agent(project_key='/owner/backend', program='codex', model='gpt5', name='codex-wsl-home-1', registration_token='<private token>')"}],
                     },
                     {
                         "name": "create_agent_identity",
-                        "summary": "Always create a new unique agent name (optionally using a sanitized hint).",
-                        "use_when": "Spawning a brand-new helper that should not overwrite existing profiles.",
+                        "summary": "Provision a new durable Agent from a required stable identity.",
+                        "use_when": "Provisioning a new durable mailbox/persona that must not overwrite an existing profile.",
                         "related": ["register_agent"],
-                        "expected_frequency": "When minting fresh, short-lived identities.",
+                        "expected_frequency": "Infrequent durable identity provisioning.",
                         "required_capabilities": ["identity"],
-                        "usage_examples": [{"hint": "New helper", "sample": "create_agent_identity(project_key='backend', name_hint='GreenCastle', program='codex', model='gpt5')"}],
+                        "usage_examples": [{"hint": "Provision durable identity", "sample": "create_agent_identity(project_key='/owner/backend', name_hint='codex-linux-ci-1', program='codex', model='gpt5')"}],
+                    },
+                    {
+                        "name": "retire_agent",
+                        "summary": "Reversibly remove a durable mailbox from active routing while preserving its history.",
+                        "use_when": "A durable mailbox is no longer in use and should leave the active roster.",
+                        "related": ["unretire_agent", "sweep_stale_agents"],
+                        "expected_frequency": "Rare lifecycle maintenance.",
+                        "required_capabilities": ["identity"],
+                        "usage_examples": [{"hint": "Retire", "sample": "retire_agent(project_key='/owner/backend', agent_name='codex-linux-ci-1', registration_token='<private token>')"}],
+                    },
+                    {
+                        "name": "unretire_agent",
+                        "summary": "Restore a previously retired durable mailbox to active routing.",
+                        "use_when": "A known mailbox resumes service after reversible retirement.",
+                        "related": ["retire_agent"],
+                        "expected_frequency": "Rare lifecycle maintenance.",
+                        "required_capabilities": ["identity"],
+                        "usage_examples": [{"hint": "Restore", "sample": "unretire_agent(project_key='/owner/backend', agent_name='codex-linux-ci-1', registration_token='<private token>')"}],
                     },
                     {
                         "name": "whois",
@@ -13702,7 +16578,7 @@ def build_mcp_server() -> FastMCP:
                         "related": ["register_agent"],
                         "expected_frequency": "Ad hoc when context about an agent is required.",
                         "required_capabilities": ["identity", "audit"],
-                        "usage_examples": [{"hint": "Directory lookup", "sample": "whois(project_key='backend', agent_name='BlueLake')"}],
+                        "usage_examples": [{"hint": "Directory lookup", "sample": "whois(project_key='/owner/backend', agent_name='codex-wsl-home-1', registration_token='<private token>')"}],
                     },
                     {
                         "name": "set_contact_policy",
@@ -13711,7 +16587,7 @@ def build_mcp_server() -> FastMCP:
                         "related": ["request_contact", "respond_contact"],
                         "expected_frequency": "Occasional configuration change.",
                         "required_capabilities": ["contact"],
-                        "usage_examples": [{"hint": "Restrict inbox", "sample": "set_contact_policy(project_key='backend', agent_name='BlueLake', policy='contacts_only')"}],
+                        "usage_examples": [{"hint": "Restrict inbox", "sample": "set_contact_policy(project_key='/owner/backend', agent_name='codex-wsl-home-1', policy='contacts_only', registration_token='<private token>')"}],
                     },
                 ],
             },
@@ -13726,7 +16602,7 @@ def build_mcp_server() -> FastMCP:
                         "related": ["reply_message", "request_contact"],
                         "expected_frequency": "Frequent—core write operation.",
                         "required_capabilities": ["messaging"],
-                        "usage_examples": [{"hint": "New plan", "sample": "send_message(project_key='backend', sender_name='GreenCastle', to=['BlueLake'], subject='Plan', body_md='...', idempotency_key='plan-01')"}],
+                        "usage_examples": [{"hint": "New plan", "sample": "send_message(project_key='backend', sender_name='codex-wsl-home-1', to=['claude-linux-ci-1'], subject='Plan', body_md='...', idempotency_key='plan-01')"}],
                     },
                     {
                         "name": "reply_message",
@@ -13735,7 +16611,7 @@ def build_mcp_server() -> FastMCP:
                         "related": ["send_message"],
                         "expected_frequency": "Frequent when collaborating inside a thread.",
                         "required_capabilities": ["messaging"],
-                        "usage_examples": [{"hint": "Thread reply", "sample": "reply_message(project_key='backend', message_id=42, sender_name='BlueLake', body_md='Got it!', idempotency_key='reply-42-01', sender_token='<sender token>')"}],
+                        "usage_examples": [{"hint": "Thread reply", "sample": "reply_message(project_key='backend', message_id=42, sender_name='codex-wsl-home-1', body_md='Got it!', idempotency_key='reply-42-01', sender_token='<sender token>')"}],
                     },
                     {
                         "name": "get_message_delivery",
@@ -13744,7 +16620,7 @@ def build_mcp_server() -> FastMCP:
                         "related": ["send_message", "reply_message"],
                         "expected_frequency": "After a pending/deferred response or network disconnect.",
                         "required_capabilities": ["messaging", "read"],
-                        "usage_examples": [{"hint": "Recover", "sample": "get_message_delivery(project_key='backend', agent_name='GreenCastle', delivery_id='<uuid>', retry_pending=True)"}],
+                        "usage_examples": [{"hint": "Recover", "sample": "get_message_delivery(project_key='backend', agent_name='codex-wsl-home-1', delivery_id='<uuid>', retry_pending=True)"}],
                     },
                     {
                         "name": "fetch_inbox",
@@ -13753,7 +16629,7 @@ def build_mcp_server() -> FastMCP:
                         "related": ["mark_message_read", "acknowledge_message"],
                         "expected_frequency": "Frequent polling in agent loops.",
                         "required_capabilities": ["messaging", "read"],
-                        "usage_examples": [{"hint": "Poll", "sample": "fetch_inbox(project_key='backend', agent_name='BlueLake', since_ts='2025-10-24T00:00:00Z')"}],
+                        "usage_examples": [{"hint": "Poll", "sample": "fetch_inbox(project_key='backend', agent_name='codex-wsl-home-1', since_ts='2025-10-24T00:00:00Z')"}],
                     },
                     {
                         "name": "mark_message_read",
@@ -13762,7 +16638,7 @@ def build_mcp_server() -> FastMCP:
                         "related": ["acknowledge_message"],
                         "expected_frequency": "Whenever FYI mail is processed.",
                         "required_capabilities": ["messaging", "read"],
-                        "usage_examples": [{"hint": "Read receipt", "sample": "mark_message_read(project_key='backend', agent_name='BlueLake', message_id=42)"}],
+                        "usage_examples": [{"hint": "Read receipt", "sample": "mark_message_read(project_key='backend', agent_name='codex-wsl-home-1', message_id=42)"}],
                     },
                     {
                         "name": "acknowledge_message",
@@ -13771,7 +16647,7 @@ def build_mcp_server() -> FastMCP:
                         "related": ["mark_message_read"],
                         "expected_frequency": "Each time a message requests acknowledgement.",
                         "required_capabilities": ["messaging", "ack"],
-                        "usage_examples": [{"hint": "Ack", "sample": "acknowledge_message(project_key='backend', agent_name='BlueLake', message_id=42)"}],
+                        "usage_examples": [{"hint": "Ack", "sample": "acknowledge_message(project_key='backend', agent_name='codex-wsl-home-1', message_id=42)"}],
                     },
                 ],
             },
@@ -13781,12 +16657,12 @@ def build_mcp_server() -> FastMCP:
                 "tools": [
                     {
                         "name": "request_contact",
-                        "summary": "Create or refresh a pending AgentLink and notify the target with ack_required intro.",
-                        "use_when": "Requesting permission before messaging another agent.",
+                        "summary": "Create or refresh a pending AgentLink to an already registered target and notify it with an ack_required intro.",
+                        "use_when": "Requesting permission before messaging another registered Agent; it never provisions the target mailbox.",
                         "related": ["respond_contact", "set_contact_policy"],
                         "expected_frequency": "Occasional—when new communication lines are needed.",
                         "required_capabilities": ["contact"],
-                        "usage_examples": [{"hint": "Ask permission", "sample": "request_contact(project_key='backend', from_agent='GreenCastle', to_agent='BlueLake', registration_token='<requester token>')"}],
+                        "usage_examples": [{"hint": "Ask permission", "sample": "request_contact(project_key='backend', from_agent='codex-wsl-home-1', to_agent='claude-linux-ci-1', registration_token='<requester token>')"}],
                     },
                     {
                         "name": "respond_contact",
@@ -13795,7 +16671,7 @@ def build_mcp_server() -> FastMCP:
                         "related": ["request_contact"],
                         "expected_frequency": "As often as requests arrive.",
                         "required_capabilities": ["contact"],
-                        "usage_examples": [{"hint": "Approve", "sample": "respond_contact(project_key='backend', to_agent='BlueLake', from_agent='GreenCastle', accept=True, registration_token='<target token>')"}],
+                        "usage_examples": [{"hint": "Approve", "sample": "respond_contact(project_key='backend', to_agent='claude-linux-ci-1', from_agent='codex-wsl-home-1', accept=True, registration_token='<target token>')"}],
                     },
                     {
                         "name": "list_contacts",
@@ -13804,7 +16680,7 @@ def build_mcp_server() -> FastMCP:
                         "related": ["request_contact", "respond_contact"],
                         "expected_frequency": "Periodic audits or dashboards.",
                         "required_capabilities": ["contact", "audit"],
-                        "usage_examples": [{"hint": "Audit", "sample": "list_contacts(project_key='backend', agent_name='BlueLake')"}],
+                        "usage_examples": [{"hint": "Audit", "sample": "list_contacts(project_key='backend', agent_name='codex-wsl-home-1')"}],
                     },
                 ],
             },
@@ -13819,7 +16695,7 @@ def build_mcp_server() -> FastMCP:
                         "related": ["fetch_inbox", "summarize_thread"],
                         "expected_frequency": "Regular during investigation phases.",
                         "required_capabilities": ["search"],
-                        "usage_examples": [{"hint": "FTS", "sample": "search_messages(project_key='backend', query='\"build plan\" AND users', limit=20, agent_name='GreenCastle', registration_token='<agent token>')"}],
+                        "usage_examples": [{"hint": "FTS", "sample": "search_messages(project_key='backend', query='\"build plan\" AND users', limit=20, agent_name='codex-wsl-home-1', registration_token='<agent token>')"}],
                     },
                     {
                         "name": "summarize_thread",
@@ -13829,8 +16705,8 @@ def build_mcp_server() -> FastMCP:
                         "expected_frequency": "When threads exceed quick skim length or at cadence checkpoints.",
                         "required_capabilities": ["search", "summarization"],
                         "usage_examples": [
-                            {"hint": "Single thread", "sample": "summarize_thread(project_key='backend', thread_id='TKT-123', include_examples=True, agent_name='GreenCastle', registration_token='<agent token>')"},
-                            {"hint": "Multi-thread digest", "sample": "summarize_thread(project_key='backend', thread_id='TKT-123,UX-42,BUG-99', agent_name='GreenCastle', registration_token='<agent token>')"},
+                            {"hint": "Single thread", "sample": "summarize_thread(project_key='backend', thread_id='TKT-123', include_examples=True, agent_name='codex-wsl-home-1', registration_token='<agent token>')"},
+                            {"hint": "Multi-thread digest", "sample": "summarize_thread(project_key='backend', thread_id='TKT-123,UX-42,BUG-99', agent_name='codex-wsl-home-1', registration_token='<agent token>')"},
                         ],
                     },
                 ],
@@ -13846,7 +16722,7 @@ def build_mcp_server() -> FastMCP:
                         "related": ["release_file_reservations", "renew_file_reservations"],
                         "expected_frequency": "Whenever starting work on contested surfaces.",
                         "required_capabilities": ["file_reservations", "repository"],
-                        "usage_examples": [{"hint": "Lock file", "sample": "file_reservation_paths(project_key='backend', agent_name='BlueLake', paths=['src/app.py'], ttl_seconds=7200)"}],
+                        "usage_examples": [{"hint": "Lock file", "sample": "file_reservation_paths(project_key='backend', agent_name='codex-wsl-home-1', paths=['src/app.py'], ttl_seconds=7200, execution_id='<uuid>', execution_token='<capability>', lifecycle_protocol_version=1)"}],
                     },
                     {
                         "name": "release_file_reservations",
@@ -13855,7 +16731,7 @@ def build_mcp_server() -> FastMCP:
                         "related": ["file_reservation_paths", "renew_file_reservations"],
                         "expected_frequency": "Each time work on a surface completes.",
                         "required_capabilities": ["file_reservations"],
-                        "usage_examples": [{"hint": "Unlock", "sample": "release_file_reservations(project_key='backend', agent_name='BlueLake', paths=['src/app.py'])"}],
+                        "usage_examples": [{"hint": "Unlock", "sample": "release_file_reservations(project_key='backend', agent_name='codex-wsl-home-1', paths=['src/app.py'], execution_id='<uuid>', execution_token='<capability>', lifecycle_protocol_version=1)"}],
                     },
                     {
                         "name": "renew_file_reservations",
@@ -13864,7 +16740,7 @@ def build_mcp_server() -> FastMCP:
                         "related": ["file_reservation_paths", "release_file_reservations"],
                         "expected_frequency": "Periodically during multi-hour work items.",
                         "required_capabilities": ["file_reservations"],
-                        "usage_examples": [{"hint": "Extend", "sample": "renew_file_reservations(project_key='backend', agent_name='BlueLake', extend_seconds=1800)"}],
+                        "usage_examples": [{"hint": "Extend", "sample": "renew_file_reservations(project_key='backend', agent_name='codex-wsl-home-1', extend_seconds=1800, execution_id='<uuid>', execution_token='<capability>', lifecycle_protocol_version=1)"}],
                     },
                 ],
             },
@@ -13879,7 +16755,7 @@ def build_mcp_server() -> FastMCP:
                         "related": ["ensure_project", "register_agent", "file_reservation_paths", "fetch_inbox"],
                         "expected_frequency": "At the beginning of each autonomous session.",
                         "required_capabilities": ["workflow", "messaging", "file_reservations", "identity"],
-                        "usage_examples": [{"hint": "Bootstrap", "sample": "macro_start_session(human_key='/abs/path/backend', program='codex', model='gpt5', file_reservation_paths=['src/api/*.py'])"}],
+                        "usage_examples": [{"hint": "Bootstrap", "sample": "macro_start_session(human_key='/abs/path/backend', program='codex', model='gpt5', agent_name='codex-wsl-home-1', external_id='<native-session-id>', client_name='codex', execution_token='<64-hex-token>', file_reservation_paths=['src/api/*.py'])"}],
                     },
                     {
                         "name": "macro_prepare_thread",
@@ -13888,7 +16764,7 @@ def build_mcp_server() -> FastMCP:
                         "related": ["register_agent", "summarize_thread", "fetch_inbox"],
                         "expected_frequency": "Whenever onboarding a new contributor to an active thread.",
                         "required_capabilities": ["workflow", "messaging", "summarization"],
-                        "usage_examples": [{"hint": "Join thread", "sample": "macro_prepare_thread(project_key='backend', thread_id='TKT-123', program='codex', model='gpt5', agent_name='GreenCastle')"}],
+                        "usage_examples": [{"hint": "Join thread", "sample": "macro_prepare_thread(project_key='backend', thread_id='TKT-123', program='codex', model='gpt5', agent_name='codex-wsl-home-1', external_id='<native-session-id>', client_name='codex', execution_token='<64-hex-token>')"}],
                     },
                     {
                         "name": "macro_file_reservation_cycle",
@@ -13897,16 +16773,16 @@ def build_mcp_server() -> FastMCP:
                         "related": ["file_reservation_paths", "release_file_reservations", "renew_file_reservations"],
                         "expected_frequency": "Per guarded work block.",
                         "required_capabilities": ["workflow", "file_reservations", "repository"],
-                        "usage_examples": [{"hint": "FileReservation & release", "sample": "macro_file_reservation_cycle(project_key='backend', agent_name='BlueLake', paths=['src/app.py'], auto_release=true)"}],
+                        "usage_examples": [{"hint": "FileReservation & release", "sample": "macro_file_reservation_cycle(project_key='backend', agent_name='codex-wsl-home-1', paths=['src/app.py'], auto_release=true, execution_id='<uuid>', execution_token='<capability>')"}],
                     },
                     {
                         "name": "macro_contact_handshake",
-                        "summary": "Request contact approval, optionally auto-accept, and send a welcome message.",
-                        "use_when": "Spinning up collaboration between two agents who lack permissions.",
+                        "summary": "Request contact approval between registered Agents, optionally auto-accept, and send a welcome message.",
+                        "use_when": "Connecting two existing durable mailboxes that lack permissions; it never provisions either identity.",
                         "related": ["request_contact", "respond_contact", "send_message"],
                         "expected_frequency": "When onboarding new agent pairs.",
                         "required_capabilities": ["workflow", "contact", "messaging"],
-                        "usage_examples": [{"hint": "Automated handshake", "sample": "macro_contact_handshake(project_key='backend', requester='GreenCastle', target='BlueLake', auto_accept=true, requester_registration_token='<requester token>', target_registration_token='<target token>', welcome_subject='Hello', welcome_body='Excited to collaborate!')"}],
+                        "usage_examples": [{"hint": "Automated handshake", "sample": "macro_contact_handshake(project_key='backend', requester='codex-wsl-home-1', target='claude-linux-ci-1', auto_accept=true, requester_registration_token='<requester token>', target_registration_token='<target token>', welcome_subject='Hello', welcome_body='Excited to collaborate!')"}],
                     },
                 ],
             },
@@ -14013,6 +16889,9 @@ def build_mcp_server() -> FastMCP:
                 "macro_contact_handshake": {
                     "required": ["project_key", "requester|agent_name", "target|to_agent"],
                     "optional": ["reason", "ttl_seconds", "auto_accept", "welcome_subject", "welcome_body"],
+                    "constraints": [
+                        "target must already be registered; the macro never creates a durable Agent"
+                    ],
                     "aliases": {
                         "requester": ["agent_name"],
                         "target": ["to_agent"],
@@ -14242,7 +17121,12 @@ def build_mcp_server() -> FastMCP:
         project = await _get_project_by_identifier(slug_value)
         await ensure_schema()
         async with get_session() as session:
-            result = await session.execute(select(Agent).where(cast(Any, Agent.project_id == project.id)))
+            result = await session.execute(
+                select(Agent).where(
+                    cast(Any, Agent.project_id == project.id),
+                    cast(Any, Agent.provisioning_state == "active"),
+                )
+            )
             agents = result.scalars().all()
         payload = {
             **_project_to_dict(project),
@@ -14312,7 +17196,12 @@ def build_mcp_server() -> FastMCP:
         async with get_session() as session:
             # Get all agents in the project
             result = await session.execute(
-                select(Agent).where(cast(Any, Agent.project_id == project.id)).order_by(desc(cast(Any, Agent.last_active_ts)))
+                select(Agent)
+                .where(
+                    cast(Any, Agent.project_id == project.id),
+                    cast(Any, Agent.provisioning_state == "active"),
+                )
+                .order_by(desc(cast(Any, Agent.last_active_ts)))
             )
             agents = result.scalars().all()
 
@@ -14420,6 +17309,13 @@ def build_mcp_server() -> FastMCP:
                     # back to `agent_id` for debugging. (#161)
                     "agent": status.agent.name if status.agent is not None else None,
                     "agent_id": reservation.agent_id,
+                    "execution_id": status.execution_id,
+                    "execution_status": status.execution_status,
+                    "execution_parent_id": status.execution_parent_id,
+                    "ancestor_execution_ids": status.ancestor_execution_ids,
+                    "origin": reservation.origin,
+                    "orphaned": status.orphaned,
+                    "legacy_unscoped": status.legacy_unscoped,
                     "path_pattern": reservation.path_pattern,
                     "exclusive": reservation.exclusive,
                     "reason": reservation.reason,
@@ -14429,6 +17325,7 @@ def build_mcp_server() -> FastMCP:
                     "stale": status.stale,
                     "stale_reasons": status.stale_reasons,
                     "last_agent_activity_ts": _iso(status.last_agent_activity) if status.last_agent_activity else None,
+                    "last_execution_activity_ts": _iso(status.last_execution_activity) if status.last_execution_activity else None,
                     "last_mail_activity_ts": _iso(status.last_mail_activity) if status.last_mail_activity else None,
                     "last_filesystem_activity_ts": _iso(status.last_fs_activity) if status.last_fs_activity else None,
                     "last_git_activity_ts": _iso(status.last_git_activity) if status.last_git_activity else None,
@@ -14441,13 +17338,67 @@ def build_mcp_server() -> FastMCP:
             format_value=format_value,
         )
 
-    @mcp.resource("resource://message/{message_id}{?project,agent,agent_token,format}", mime_type="application/json")
+    async def _resolve_private_resource_agent(
+        ctx: Context,
+        project: Project,
+        *,
+        requested_agent: str | None,
+        action: str,
+        stateless_tool: str,
+    ) -> Agent:
+        """Authorize a private resource from an existing MCP session binding.
+
+        Registration capabilities are deliberately excluded from resource URIs:
+        URIs are routinely copied into logs, history, telemetry, and prompts. A
+        stateless caller must use the equivalent tool, whose token is carried in
+        structured tool arguments instead. ``requested_agent`` is only an
+        assertion/selector among identities already bound to this exact session;
+        it can never establish a new binding.
+        """
+        if requested_agent is not None:
+            viewer = await _get_agent(project, requested_agent)
+            if not _session_is_bound_to_agent(ctx, project, viewer):
+                raise ToolExecutionError(
+                    "AUTHENTICATION_REQUIRED",
+                    (
+                        f"{action} requires agent '{viewer.name}' to be already authenticated in this MCP session. "
+                        f"Registration tokens are not accepted in resource URIs; stateless callers must use "
+                        f"the {stateless_tool} tool."
+                    ),
+                    recoverable=True,
+                    data={
+                        "project_key": project.human_key,
+                        "agent_name": viewer.name,
+                        "action": action,
+                        "stateless_tool": stateless_tool,
+                    },
+                )
+        else:
+            viewer = await _resolve_session_agent_for_project(ctx, project)
+            if viewer is None:
+                raise ToolExecutionError(
+                    "AUTHENTICATION_REQUIRED",
+                    (
+                        f"{action} requires an Agent already authenticated in this MCP session. "
+                        f"Registration tokens are not accepted in resource URIs; stateless callers must use "
+                        f"the {stateless_tool} tool."
+                    ),
+                    recoverable=True,
+                    data={
+                        "project_key": project.human_key,
+                        "action": action,
+                        "stateless_tool": stateless_tool,
+                    },
+                )
+        await _touch_agent_activity(viewer)
+        return viewer
+
+    @mcp.resource("resource://message/{message_id}{?project,agent,format}", mime_type="application/json")
     async def message_resource(
         ctx: Context,
         message_id: str,
         project: Optional[str] = None,
         agent: Optional[str] = None,
-        agent_token: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """
@@ -14476,11 +17427,14 @@ def build_mcp_server() -> FastMCP:
 
         Example
         -------
-        If the caller has not already authenticated as the viewer in this MCP session,
-        include `agent` and `agent_token`.
+        The caller must already be authenticated as the viewer in this MCP
+        session. The optional `agent` query parameter selects/asserts one of
+        this session's existing bindings. Stateless callers must use the
+        `search_messages` tool; registration tokens are never accepted in a
+        resource URI.
 
         ```json
-        {"jsonrpc":"2.0","id":"r5","method":"resources/read","params":{"uri":"resource://message/1234?project=/abs/path/backend&agent=BlueLake&agent_token=<registration_token>"}}
+        {"jsonrpc":"2.0","id":"r5","method":"resources/read","params":{"uri":"resource://message/1234?project=/owner/backend&agent=codex-wsl-home-1"}}
         ```
         """
         # Support toolkits that pass query in the template segment
@@ -14495,21 +17449,18 @@ def build_mcp_server() -> FastMCP:
                     project = parsed["project"][0]
                 if agent is None and parsed.get("agent"):
                     agent = parsed["agent"][0]
-                if agent_token is None and parsed.get("agent_token"):
-                    agent_token = parsed["agent_token"][0]
                 format_value = format_value or _extract_format_param(parsed)
             except Exception:
                 pass
         project_obj = await _get_project_by_identifier(
             _require_project_resource_param(project, resource_name="message resource")
         )
-        viewer = await _resolve_authenticated_agent(
+        viewer = await _resolve_private_resource_agent(
             ctx,
             project_obj,
-            agent_name=agent,
-            provided_token=agent_token,
-            token_param="agent_token",
+            requested_agent=agent,
             action="resource://message/{message_id}",
+            stateless_tool="search_messages",
         )
         message = await _get_visible_message(project_obj, viewer, int(message_id))
         sender = await _get_agent_any_project_by_id(message.sender_id)
@@ -14530,13 +17481,12 @@ def build_mcp_server() -> FastMCP:
             format_value=format_value,
         )
 
-    @mcp.resource("resource://thread/{thread_id}{?project,agent,agent_token,include_bodies,format}", mime_type="application/json")
+    @mcp.resource("resource://thread/{thread_id}{?project,agent,include_bodies,format}", mime_type="application/json")
     async def thread_resource(
         ctx: Context,
         thread_id: str,
         project: Optional[str] = None,
         agent: Optional[str] = None,
-        agent_token: Optional[str] = None,
         include_bodies: bool = False,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
@@ -14564,16 +17514,19 @@ def build_mcp_server() -> FastMCP:
 
         Example
         -------
-        If the caller has not already authenticated as the viewer in this MCP session,
-        include both `agent` and `agent_token`.
+        The caller must already be authenticated as the viewer in this MCP
+        session. The optional `agent` query parameter selects/asserts one of
+        this session's existing bindings. Stateless callers must use the
+        `summarize_thread` tool; registration tokens are never accepted in a
+        resource URI.
 
         ```json
-        {"jsonrpc":"2.0","id":"r6","method":"resources/read","params":{"uri":"resource://thread/TKT-123?project=/abs/path/backend&agent=BlueLake&agent_token=<registration_token>&include_bodies=true"}}
+        {"jsonrpc":"2.0","id":"r6","method":"resources/read","params":{"uri":"resource://thread/TKT-123?project=/owner/backend&agent=codex-wsl-home-1&include_bodies=true"}}
         ```
 
         Numeric seed example (message id as thread seed):
         ```json
-        {"jsonrpc":"2.0","id":"r6b","method":"resources/read","params":{"uri":"resource://thread/1234?project=/abs/path/backend&agent=BlueLake&agent_token=<registration_token>"}}
+        {"jsonrpc":"2.0","id":"r6b","method":"resources/read","params":{"uri":"resource://thread/1234?project=/owner/backend&agent=codex-wsl-home-1"}}
         ```
         """
         # Robust query parsing: some FastMCP versions do not inject query args.
@@ -14590,8 +17543,6 @@ def build_mcp_server() -> FastMCP:
                     project = parsed["project"][0]
                 if agent is None and parsed.get("agent"):
                     agent = parsed["agent"][0]
-                if agent_token is None and parsed.get("agent_token"):
-                    agent_token = parsed["agent_token"][0]
                 if parsed.get("include_bodies"):
                     val = parsed["include_bodies"][0].strip().lower()
                     include_bodies = val in ("1", "true", "t", "yes", "y")
@@ -14602,13 +17553,12 @@ def build_mcp_server() -> FastMCP:
         project_obj = await _get_project_by_identifier(
             _require_project_resource_param(project, resource_name="thread resource")
         )
-        viewer = await _resolve_authenticated_agent(
+        viewer = await _resolve_private_resource_agent(
             ctx,
             project_obj,
-            agent_name=agent,
-            provided_token=agent_token,
-            token_param="agent_token",
+            requested_agent=agent,
             action="resource://thread/{thread_id}",
+            stateless_tool="summarize_thread",
         )
 
         if project_obj.id is None:
@@ -14664,7 +17614,7 @@ def build_mcp_server() -> FastMCP:
         )
 
     @mcp.resource(
-        "resource://inbox/{agent}{?project,since_ts,urgent_only,include_bodies,limit,agent_token,format}",
+        "resource://inbox/{agent}{?project,since_ts,urgent_only,include_bodies,limit,format}",
         mime_type="application/json",
     )
     async def inbox_resource(
@@ -14675,7 +17625,6 @@ def build_mcp_server() -> FastMCP:
         urgent_only: bool = False,
         include_bodies: bool = False,
         limit: int = 20,
-        agent_token: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """
@@ -14703,15 +17652,16 @@ def build_mcp_server() -> FastMCP:
 
         Example
         -------
-        If the caller has not already authenticated as this agent in the current MCP session,
-        include `agent_token=<registration_token>`.
+        The caller must already be authenticated as this agent in the current
+        MCP session. Stateless callers must use the `fetch_inbox` tool;
+        registration tokens are never accepted in a resource URI.
 
         ```json
-        {"jsonrpc":"2.0","id":"r7","method":"resources/read","params":{"uri":"resource://inbox/BlueLake?project=/abs/path/backend&limit=10&urgent_only=true&agent_token=<registration_token>"}}
+        {"jsonrpc":"2.0","id":"r7","method":"resources/read","params":{"uri":"resource://inbox/codex-wsl-home-1?project=/owner/backend&limit=10&urgent_only=true"}}
         ```
         Incremental fetch example (using since_ts):
         ```json
-        {"jsonrpc":"2.0","id":"r7b","method":"resources/read","params":{"uri":"resource://inbox/BlueLake?project=/abs/path/backend&since_ts=2025-10-23T15:00:00Z&agent_token=<registration_token>"}}
+        {"jsonrpc":"2.0","id":"r7b","method":"resources/read","params":{"uri":"resource://inbox/codex-wsl-home-1?project=/owner/backend&since_ts=2025-10-23T15:00:00Z"}}
         ```
         """
         # Robust query parsing: some FastMCP versions do not inject query args.
@@ -14728,8 +17678,6 @@ def build_mcp_server() -> FastMCP:
                     project = parsed["project"][0]
                 if since_ts is None and "since_ts" in parsed and parsed["since_ts"]:
                     since_ts = parsed["since_ts"][0]
-                if agent_token is None and parsed.get("agent_token"):
-                    agent_token = parsed["agent_token"][0]
                 if parsed.get("urgent_only"):
                     val = parsed["urgent_only"][0].strip().lower()
                     urgent_only = val in ("1", "true", "t", "yes", "y")
@@ -14749,13 +17697,12 @@ def build_mcp_server() -> FastMCP:
         project_obj = await _get_project_by_identifier(
             _require_project_resource_param(project, resource_name="inbox resource")
         )
-        agent_obj = await _authenticate_agent(
+        agent_obj = await _resolve_private_resource_agent(
             ctx,
             project_obj,
-            agent,
-            agent_token,
-            token_param="agent_token",
+            requested_agent=agent,
             action="resource://inbox/{agent}",
+            stateless_tool="fetch_inbox",
         )
         messages = await _list_inbox(project_obj, agent_obj, limit, urgent_only, include_bodies, since_ts)
         # Enrich with commit info for canonical markdown files (best-effort)
@@ -14782,13 +17729,12 @@ def build_mcp_server() -> FastMCP:
             format_value=format_value,
         )
 
-    @mcp.resource("resource://views/urgent-unread/{agent}{?project,limit,agent_token,format}", mime_type="application/json")
+    @mcp.resource("resource://views/urgent-unread/{agent}{?project,limit,format}", mime_type="application/json")
     async def urgent_unread_view(
         ctx: Context,
         agent: str,
         project: Optional[str] = None,
         limit: int = 20,
-        agent_token: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """
@@ -14813,8 +17759,6 @@ def build_mcp_server() -> FastMCP:
                 parsed = parse_qs(qs, keep_blank_values=False)
                 if project is None and parsed.get("project"):
                     project = parsed["project"][0]
-                if agent_token is None and parsed.get("agent_token"):
-                    agent_token = parsed["agent_token"][0]
                 limit = _parse_resource_limit(parsed, default=limit)
                 format_value = format_value or _extract_format_param(parsed)
             except Exception:
@@ -14823,13 +17767,12 @@ def build_mcp_server() -> FastMCP:
         project_obj = await _get_project_by_identifier(
             _require_project_resource_param(project, resource_name="urgent view")
         )
-        agent_obj = await _authenticate_agent(
+        agent_obj = await _resolve_private_resource_agent(
             ctx,
             project_obj,
-            agent,
-            agent_token,
-            token_param="agent_token",
+            requested_agent=agent,
             action="resource://views/urgent-unread/{agent}",
+            stateless_tool="fetch_inbox",
         )
         # Single SQL query: urgent + unread filter at the DB layer. Fixes a
         # prior N+1 (one read-state probe per row) and a limit-before-filter
@@ -14853,13 +17796,12 @@ def build_mcp_server() -> FastMCP:
             format_value=format_value,
         )
 
-    @mcp.resource("resource://views/ack-required/{agent}{?project,limit,agent_token,format}", mime_type="application/json")
+    @mcp.resource("resource://views/ack-required/{agent}{?project,limit,format}", mime_type="application/json")
     async def ack_required_view(
         ctx: Context,
         agent: str,
         project: Optional[str] = None,
         limit: int = 20,
-        agent_token: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """
@@ -14884,8 +17826,6 @@ def build_mcp_server() -> FastMCP:
                 parsed = parse_qs(qs, keep_blank_values=False)
                 if project is None and parsed.get("project"):
                     project = parsed["project"][0]
-                if agent_token is None and parsed.get("agent_token"):
-                    agent_token = parsed["agent_token"][0]
                 limit = _parse_resource_limit(parsed, default=limit)
                 format_value = format_value or _extract_format_param(parsed)
             except Exception:
@@ -14894,13 +17834,12 @@ def build_mcp_server() -> FastMCP:
         project_obj = await _get_project_by_identifier(
             _require_project_resource_param(project, resource_name="ack view")
         )
-        agent_obj = await _authenticate_agent(
+        agent_obj = await _resolve_private_resource_agent(
             ctx,
             project_obj,
-            agent,
-            agent_token,
-            token_param="agent_token",
+            requested_agent=agent,
             action="resource://views/ack-required/{agent}",
+            stateless_tool="fetch_inbox",
         )
         if project_obj.id is None or agent_obj.id is None:
             raise ValueError("Project/agent IDs must exist")
@@ -14931,14 +17870,13 @@ def build_mcp_server() -> FastMCP:
             format_value=format_value,
         )
 
-    @mcp.resource("resource://views/acks-stale/{agent}{?project,ttl_seconds,limit,agent_token,format}", mime_type="application/json")
+    @mcp.resource("resource://views/acks-stale/{agent}{?project,ttl_seconds,limit,format}", mime_type="application/json")
     async def acks_stale_view(
         ctx: Context,
         agent: str,
         project: Optional[str] = None,
         ttl_seconds: Optional[int] = None,
         limit: int = 20,
-        agent_token: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """
@@ -14965,8 +17903,6 @@ def build_mcp_server() -> FastMCP:
                 parsed = parse_qs(qs, keep_blank_values=False)
                 if project is None and parsed.get("project"):
                     project = parsed["project"][0]
-                if agent_token is None and parsed.get("agent_token"):
-                    agent_token = parsed["agent_token"][0]
                 if parsed.get("ttl_seconds"):
                     with suppress(Exception):
                         ttl_seconds = int(parsed["ttl_seconds"][0])
@@ -14978,13 +17914,12 @@ def build_mcp_server() -> FastMCP:
         project_obj = await _get_project_by_identifier(
             _require_project_resource_param(project, resource_name="stale acks view")
         )
-        agent_obj = await _authenticate_agent(
+        agent_obj = await _resolve_private_resource_agent(
             ctx,
             project_obj,
-            agent,
-            agent_token,
-            token_param="agent_token",
+            requested_agent=agent,
             action="resource://views/acks-stale/{agent}",
+            stateless_tool="fetch_inbox",
         )
         if project_obj.id is None or agent_obj.id is None:
             raise ValueError("Project/agent IDs must exist")
@@ -15033,14 +17968,13 @@ def build_mcp_server() -> FastMCP:
             format_value=format_value,
         )
 
-    @mcp.resource("resource://views/ack-overdue/{agent}{?project,ttl_minutes,limit,agent_token,format}", mime_type="application/json")
+    @mcp.resource("resource://views/ack-overdue/{agent}{?project,ttl_minutes,limit,format}", mime_type="application/json")
     async def ack_overdue_view(
         ctx: Context,
         agent: str,
         project: Optional[str] = None,
         ttl_minutes: int = 60,
         limit: int = 50,
-        agent_token: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """List messages requiring acknowledgement older than ttl_minutes without ack."""
@@ -15054,8 +17988,6 @@ def build_mcp_server() -> FastMCP:
                 parsed = parse_qs(qs, keep_blank_values=False)
                 if project is None and parsed.get("project"):
                     project = parsed["project"][0]
-                if agent_token is None and parsed.get("agent_token"):
-                    agent_token = parsed["agent_token"][0]
                 if parsed.get("ttl_minutes"):
                     with suppress(Exception):
                         ttl_minutes = int(parsed["ttl_minutes"][0])
@@ -15067,13 +17999,12 @@ def build_mcp_server() -> FastMCP:
         project_obj = await _get_project_by_identifier(
             _require_project_resource_param(project, resource_name="ack-overdue view")
         )
-        agent_obj = await _authenticate_agent(
+        agent_obj = await _resolve_private_resource_agent(
             ctx,
             project_obj,
-            agent,
-            agent_token,
-            token_param="agent_token",
+            requested_agent=agent,
             action="resource://views/ack-overdue/{agent}",
+            stateless_tool="fetch_inbox",
         )
         if project_obj.id is None or agent_obj.id is None:
             raise ValueError("Project/agent IDs must exist")
@@ -15111,13 +18042,12 @@ def build_mcp_server() -> FastMCP:
             format_value=format_value,
         )
 
-    @mcp.resource("resource://mailbox/{agent}{?project,limit,agent_token,format}", mime_type="application/json")
+    @mcp.resource("resource://mailbox/{agent}{?project,limit,format}", mime_type="application/json")
     async def mailbox_resource(
         ctx: Context,
         agent: str,
         project: Optional[str] = None,
         limit: int = 20,
-        agent_token: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """
@@ -15138,8 +18068,6 @@ def build_mcp_server() -> FastMCP:
                 parsed = parse_qs(qs, keep_blank_values=False)
                 if project is None and parsed.get("project"):
                     project = parsed["project"][0]
-                if agent_token is None and parsed.get("agent_token"):
-                    agent_token = parsed["agent_token"][0]
                 limit = _parse_resource_limit(parsed, default=limit)
                 format_value = format_value or _extract_format_param(parsed)
             except Exception:
@@ -15148,13 +18076,12 @@ def build_mcp_server() -> FastMCP:
         project_obj = await _get_project_by_identifier(
             _require_project_resource_param(project, resource_name="mailbox resource")
         )
-        agent_obj = await _authenticate_agent(
+        agent_obj = await _resolve_private_resource_agent(
             ctx,
             project_obj,
-            agent,
-            agent_token,
-            token_param="agent_token",
+            requested_agent=agent,
             action="resource://mailbox/{agent}",
+            stateless_tool="fetch_inbox",
         )
         items = await _list_inbox(project_obj, agent_obj, limit, urgent_only=False, include_bodies=False, since_ts=None)
 
@@ -15178,7 +18105,7 @@ def build_mcp_server() -> FastMCP:
         )
 
     @mcp.resource(
-        "resource://mailbox-with-commits/{agent}{?project,limit,agent_token,format}",
+        "resource://mailbox-with-commits/{agent}{?project,limit,format}",
         mime_type="application/json",
     )
     async def mailbox_with_commits_resource(
@@ -15186,7 +18113,6 @@ def build_mcp_server() -> FastMCP:
         agent: str,
         project: Optional[str] = None,
         limit: int = 20,
-        agent_token: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """List recent messages in an agent's mailbox with commit metadata including diff summaries."""
@@ -15200,8 +18126,6 @@ def build_mcp_server() -> FastMCP:
                 parsed = parse_qs(qs, keep_blank_values=False)
                 if project is None and parsed.get("project"):
                     project = parsed["project"][0]
-                if agent_token is None and parsed.get("agent_token"):
-                    agent_token = parsed["agent_token"][0]
                 limit = _parse_resource_limit(parsed, default=limit)
                 format_value = format_value or _extract_format_param(parsed)
             except Exception:
@@ -15209,13 +18133,12 @@ def build_mcp_server() -> FastMCP:
         project_obj = await _get_project_by_identifier(
             _require_project_resource_param(project, resource_name="mailbox-with-commits resource")
         )
-        agent_obj = await _authenticate_agent(
+        agent_obj = await _resolve_private_resource_agent(
             ctx,
             project_obj,
-            agent,
-            agent_token,
-            token_param="agent_token",
+            requested_agent=agent,
             action="resource://mailbox-with-commits/{agent}",
+            stateless_tool="fetch_inbox",
         )
         items = await _list_inbox(project_obj, agent_obj, limit, urgent_only=False, include_bodies=False, since_ts=None)
 
@@ -15237,7 +18160,7 @@ def build_mcp_server() -> FastMCP:
             format_value=format_value,
         )
 
-    @mcp.resource("resource://outbox/{agent}{?project,limit,include_bodies,since_ts,agent_token,format}", mime_type="application/json")
+    @mcp.resource("resource://outbox/{agent}{?project,limit,include_bodies,since_ts,format}", mime_type="application/json")
     async def outbox_resource(
         ctx: Context,
         agent: str,
@@ -15245,7 +18168,6 @@ def build_mcp_server() -> FastMCP:
         limit: int = 20,
         include_bodies: bool = False,
         since_ts: Optional[str] = None,
-        agent_token: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """List messages sent by the agent, enriched with commit metadata for canonical files."""
@@ -15267,8 +18189,6 @@ def build_mcp_server() -> FastMCP:
                     include_bodies = parsed["include_bodies"][0].lower() in {"1","true","t","yes","y"}
                 if parsed.get("since_ts"):
                     since_ts = parsed["since_ts"][0]
-                if agent_token is None and parsed.get("agent_token"):
-                    agent_token = parsed["agent_token"][0]
                 format_value = format_value or _extract_format_param(parsed)
             except Exception:
                 pass
@@ -15276,13 +18196,12 @@ def build_mcp_server() -> FastMCP:
         project_obj = await _get_project_by_identifier(
             _require_project_resource_param(project, resource_name="outbox resource")
         )
-        agent_obj = await _authenticate_agent(
+        agent_obj = await _resolve_private_resource_agent(
             ctx,
             project_obj,
-            agent,
-            agent_token,
-            token_param="agent_token",
+            requested_agent=agent,
             action="resource://outbox/{agent}",
+            stateless_tool="search_messages",
         )
         items = await _list_outbox(project_obj, agent_obj, limit, include_bodies, since_ts)
         enriched: list[dict[str, Any]] = []

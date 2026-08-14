@@ -20,6 +20,7 @@ from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
 
 KEY = "/test/sound"
+AGENT_NAME = "codex-linux-sound-1"
 
 
 def _data(result):
@@ -33,7 +34,7 @@ def server(isolated_env, monkeypatch):
     return build_mcp_server()
 
 
-async def _register(client, name="worker-1"):
+async def _register(client, name: str = AGENT_NAME):
     await client.call_tool("ensure_project", {"human_key": KEY})
     me = _data(
         await client.call_tool(
@@ -52,7 +53,7 @@ async def test_an_agent_can_choose_and_clear_its_tone(server):
         out = _data(
             await client.call_tool(
                 "set_agent_notify_sound",
-                {"project_key": KEY, "agent_name": "worker-1",
+                {"project_key": KEY, "agent_name": AGENT_NAME,
                  "notify_sound": "high", "registration_token": token},
             )
         )
@@ -63,7 +64,7 @@ async def test_an_agent_can_choose_and_clear_its_tone(server):
         cleared = _data(
             await client.call_tool(
                 "set_agent_notify_sound",
-                {"project_key": KEY, "agent_name": "worker-1",
+                {"project_key": KEY, "agent_name": AGENT_NAME,
                  "notify_sound": "", "registration_token": token},
             )
         )
@@ -83,7 +84,7 @@ async def test_an_unknown_tone_is_refused_out_loud(server):
         with pytest.raises(Exception) as excinfo:
             await client.call_tool(
                 "set_agent_notify_sound",
-                {"project_key": KEY, "agent_name": "worker-1",
+                {"project_key": KEY, "agent_name": AGENT_NAME,
                  "notify_sound": "airhorn", "registration_token": token},
             )
         assert "airhorn" in str(excinfo.value)
@@ -104,7 +105,7 @@ async def test_a_url_is_refused_like_any_other_unknown_value(server):
         with pytest.raises(Exception) as excinfo:
             await client.call_tool(
                 "set_agent_notify_sound",
-                {"project_key": KEY, "agent_name": "worker-1",
+                {"project_key": KEY, "agent_name": AGENT_NAME,
                  "notify_sound": "https://example.invalid/ping.mp3",
                  "registration_token": token},
             )
@@ -123,16 +124,16 @@ async def test_the_tone_is_not_a_credential_and_not_an_identity(server):
         token = await _register(client)
         await client.call_tool(
             "set_agent_notify_sound",
-            {"project_key": KEY, "agent_name": "worker-1",
+            {"project_key": KEY, "agent_name": AGENT_NAME,
              "notify_sound": "soft", "registration_token": token},
         )
         who = _data(
             await client.call_tool(
                 "whois",
-                {"project_key": KEY, "agent_name": "worker-1",
+                {"project_key": KEY, "agent_name": AGENT_NAME,
                  "registration_token": token, "include_recent_commits": False},
             )
         )
         payload = who.get("agent", who)
         assert payload.get("notify_sound") == "soft"
-        assert payload.get("name") == "worker-1", "the address must be untouched"
+        assert payload.get("name") == AGENT_NAME, "the address must be untouched"

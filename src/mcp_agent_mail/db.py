@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any, Final, TypeVar, cast
 
 import anyio
-from sqlalchemy import MetaData
+from sqlalchemy import CheckConstraint, MetaData
 from sqlalchemy.exc import OperationalError, TimeoutError as SATimeoutError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.schema import CreateIndex, CreateTable
@@ -42,7 +42,15 @@ from sqlalchemy.sql.schema import Table
 from sqlmodel import SQLModel
 
 from .config import DatabaseSettings, Settings, clear_settings_cache, get_settings
-from .models import MAIL_UI_LOCALE_VALUES, UiUser
+from .models import (
+    MAIL_UI_LOCALE_VALUES,
+    Agent,
+    AgentExecution,
+    MessageDelivery,
+    MessageDeliveryRecipient,
+    Project,
+    UiUser,
+)
 
 T = TypeVar("T")
 _logger = logging.getLogger(__name__)
@@ -765,6 +773,431 @@ def get_db_health_status() -> dict[str, Any]:
     return status
 
 
+_RELEASED_MESSAGE_DELIVERY_COLUMNS: Final[frozenset[str]] = frozenset(
+    {
+        "id",
+        "state",
+        "project_id",
+        "project_slug_snapshot",
+        "project_generation_snapshot",
+        "sender_id",
+        "sender_name_snapshot",
+        "sender_generation_snapshot",
+        "actor_kind",
+        "actor_agent_id",
+        "actor_ui_user_id",
+        "actor_name_snapshot",
+        "actor_generation_snapshot",
+        "actor_session_epoch_snapshot",
+        "idempotency_scope",
+        "idempotency_key",
+        "request_sha256",
+        "thread_id",
+        "reply_to_message_id",
+        "topic",
+        "subject",
+        "body_md",
+        "importance",
+        "ack_required",
+        "attachments",
+        "archive_document",
+        "archive_document_sha256",
+        "created_ts",
+        "lease_token",
+        "lease_fence",
+        "lease_expires_ts",
+        "attempt_count",
+        "next_attempt_ts",
+        "last_attempt_ts",
+        "last_error",
+        "archive_commit_sha",
+        "archive_receipt_path",
+        "receipt_sha256",
+        "published_message_id",
+        "published_ts",
+        "quarantined_ts",
+        "quarantine_reason",
+    }
+)
+_RELEASED_MESSAGE_DELIVERY_RECIPIENT_COLUMNS: Final[frozenset[str]] = frozenset(
+    {
+        "delivery_id",
+        "position",
+        "kind",
+        "agent_id",
+        "agent_name_snapshot",
+        "agent_generation_snapshot",
+    }
+)
+
+
+def _sqlite_existing_table_columns(
+    connection: Any,
+    table_name: str,
+) -> frozenset[str] | None:
+    table_row = connection.exec_driver_sql(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    if table_row is None:
+        return None
+    return frozenset(
+        str(row[1])
+        for row in connection.exec_driver_sql(
+            f'PRAGMA table_info("{table_name}")'
+        ).fetchall()
+    )
+
+
+def _message_delivery_schema_needs_rebuild(connection: Any) -> bool:
+    """Recognize only the released delivery schema or the current schema.
+
+    An unknown intermediate shape is not safe to guess at: delivery rows are
+    immutable audit data, so startup must stop without changing the database
+    instead of silently dropping an unrecognized column.
+    """
+    delivery_columns = _sqlite_existing_table_columns(
+        connection,
+        "message_deliveries",
+    )
+    recipient_columns = _sqlite_existing_table_columns(
+        connection,
+        "message_delivery_recipients",
+    )
+    if delivery_columns is None or recipient_columns is None:
+        return False
+
+    delivery_table = cast(Table, getattr(MessageDelivery, "__table__"))  # noqa: B009
+    recipient_table = cast(
+        Table,
+        getattr(MessageDeliveryRecipient, "__table__"),  # noqa: B009
+    )
+    canonical_delivery_columns = frozenset(
+        column.name for column in delivery_table.columns
+    )
+    canonical_recipient_columns = frozenset(
+        column.name for column in recipient_table.columns
+    )
+    if (
+        delivery_columns == canonical_delivery_columns
+        and recipient_columns == canonical_recipient_columns
+    ):
+        return False
+    if (
+        delivery_columns == _RELEASED_MESSAGE_DELIVERY_COLUMNS
+        and recipient_columns == _RELEASED_MESSAGE_DELIVERY_RECIPIENT_COLUMNS
+    ):
+        return True
+
+    delivery_missing = sorted(canonical_delivery_columns - delivery_columns)
+    delivery_unexpected = sorted(delivery_columns - canonical_delivery_columns)
+    recipient_missing = sorted(canonical_recipient_columns - recipient_columns)
+    recipient_unexpected = sorted(recipient_columns - canonical_recipient_columns)
+    raise RuntimeError(
+        "MessageDelivery schema migration found an unrecognized table shape; "
+        f"delivery missing={delivery_missing}, unexpected={delivery_unexpected}; "
+        f"recipients missing={recipient_missing}, unexpected={recipient_unexpected}"
+    )
+
+
+_RELEASED_MESSAGE_DELIVERY_PROJECTION_SQL: Final[str] = """
+    SELECT
+        legacy.id,
+        legacy.state,
+        CASE
+            WHEN legacy.reply_to_message_id IS NOT NULL THEN 'reply'
+            ELSE 'message'
+        END,
+        legacy.project_id,
+        legacy.project_slug_snapshot,
+        legacy.project_generation_snapshot,
+        sender_project.id,
+        CASE
+            WHEN sender_project.id = legacy.project_id
+                THEN legacy.project_slug_snapshot
+            ELSE sender_project.slug
+        END,
+        CASE
+            WHEN sender_project.id = legacy.project_id
+                THEN legacy.project_generation_snapshot
+            ELSE sender_project.project_generation
+        END,
+        legacy.sender_id,
+        legacy.sender_name_snapshot,
+        legacy.sender_generation_snapshot,
+        legacy.actor_kind,
+        CASE legacy.actor_kind
+            WHEN 'agent' THEN legacy.actor_agent_id
+            WHEN 'ui_user' THEN legacy.actor_ui_user_id
+            ELSE 0
+        END,
+        legacy.actor_name_snapshot,
+        sender_project.id,
+        CASE
+            WHEN sender_project.id = legacy.project_id
+                THEN legacy.project_slug_snapshot
+            ELSE sender_project.slug
+        END,
+        CASE
+            WHEN sender_project.id = legacy.project_id
+                THEN legacy.project_generation_snapshot
+            ELSE sender_project.project_generation
+        END,
+        legacy.actor_generation_snapshot,
+        legacy.actor_session_epoch_snapshot,
+        legacy.idempotency_key,
+        legacy.request_sha256,
+        legacy.thread_id,
+        legacy.reply_to_message_id,
+        legacy.topic,
+        legacy.subject,
+        legacy.body_md,
+        legacy.importance,
+        legacy.ack_required,
+        legacy.attachments,
+        legacy.archive_document,
+        legacy.archive_document_sha256,
+        legacy.created_ts,
+        legacy.lease_token,
+        legacy.lease_fence,
+        legacy.lease_expires_ts,
+        legacy.attempt_count,
+        0,
+        legacy.next_attempt_ts,
+        legacy.last_attempt_ts,
+        legacy.last_error,
+        legacy.archive_receipt_path,
+        legacy.receipt_sha256,
+        legacy.archive_commit_sha,
+        legacy.published_message_id,
+        legacy.published_ts,
+        legacy.quarantined_ts,
+        legacy.quarantine_reason
+    FROM message_deliveries_schema_v1 AS legacy
+    JOIN agents AS sender ON sender.id = legacy.sender_id
+    JOIN projects AS sender_project ON sender_project.id = sender.project_id
+"""
+
+_CANONICAL_MESSAGE_DELIVERY_COLUMN_NAMES: Final[tuple[str, ...]] = (
+    "id",
+    "state",
+    "delivery_kind",
+    "project_id",
+    "project_slug_snapshot",
+    "project_generation_snapshot",
+    "sender_project_id_snapshot",
+    "sender_project_slug_snapshot",
+    "sender_project_generation_snapshot",
+    "sender_id",
+    "sender_name_snapshot",
+    "sender_generation_snapshot",
+    "actor_kind",
+    "actor_id",
+    "actor_name_snapshot",
+    "actor_project_id_snapshot",
+    "actor_project_slug_snapshot",
+    "actor_project_generation_snapshot",
+    "actor_generation_snapshot",
+    "actor_epoch_snapshot",
+    "idempotency_key",
+    "request_sha256",
+    "thread_id",
+    "reply_to_message_id",
+    "topic",
+    "subject",
+    "body_md",
+    "importance",
+    "ack_required",
+    "attachments",
+    "archive_document",
+    "document_sha256",
+    "created_ts",
+    "lease_token",
+    "lease_fence",
+    "lease_expires_ts",
+    "attempt_count",
+    "backoff_seconds",
+    "next_attempt_ts",
+    "last_attempt_ts",
+    "last_error",
+    "archive_relative_path",
+    "archive_blob_sha",
+    "archive_commit_sha",
+    "message_id",
+    "published_ts",
+    "quarantined_ts",
+    "quarantine_reason",
+)
+
+_CANONICAL_MESSAGE_DELIVERY_RECIPIENT_COLUMN_NAMES: Final[tuple[str, ...]] = (
+    "delivery_id",
+    "ordinal",
+    "kind",
+    "agent_id",
+    "agent_name_snapshot",
+    "agent_generation_snapshot",
+    "project_id_snapshot",
+)
+
+
+def _quoted_column_list(column_names: tuple[str, ...]) -> str:
+    return ", ".join(f'"{name}"' for name in column_names)
+
+
+def _rebuild_message_delivery_schema(connection: Any) -> None:
+    """Rebuild both released delivery tables as the canonical immutable ledger."""
+    if not _message_delivery_schema_needs_rebuild(connection):
+        return
+
+    delivery_table = cast(Table, getattr(MessageDelivery, "__table__"))  # noqa: B009
+    recipient_table = cast(
+        Table,
+        getattr(MessageDeliveryRecipient, "__table__"),  # noqa: B009
+    )
+    delivery_columns = _quoted_column_list(
+        _CANONICAL_MESSAGE_DELIVERY_COLUMN_NAMES
+    )
+    recipient_columns = _quoted_column_list(
+        _CANONICAL_MESSAGE_DELIVERY_RECIPIENT_COLUMN_NAMES
+    )
+
+    connection.exec_driver_sql(
+        "ALTER TABLE message_delivery_recipients "
+        "RENAME TO message_delivery_recipients_schema_v1"
+    )
+    connection.exec_driver_sql(
+        "ALTER TABLE message_deliveries RENAME TO message_deliveries_schema_v1"
+    )
+    connection.execute(CreateTable(delivery_table))
+    connection.execute(CreateTable(recipient_table))
+
+    connection.exec_driver_sql(
+        f"INSERT INTO message_deliveries ({delivery_columns}) "
+        f"{_RELEASED_MESSAGE_DELIVERY_PROJECTION_SQL}"
+    )
+    recipient_projection_sql = """
+        SELECT
+            legacy.delivery_id,
+            legacy.position,
+            legacy.kind,
+            legacy.agent_id,
+            legacy.agent_name_snapshot,
+            legacy.agent_generation_snapshot,
+            delivery.project_id
+        FROM message_delivery_recipients_schema_v1 AS legacy
+        JOIN message_deliveries_schema_v1 AS delivery
+          ON delivery.id = legacy.delivery_id
+    """
+    connection.exec_driver_sql(
+        f"INSERT INTO message_delivery_recipients ({recipient_columns}) "
+        f"{recipient_projection_sql}"
+    )
+
+    source_delivery_count = int(
+        connection.exec_driver_sql(
+            "SELECT COUNT(*) FROM message_deliveries_schema_v1"
+        ).scalar_one()
+    )
+    target_delivery_count = int(
+        connection.exec_driver_sql(
+            "SELECT COUNT(*) FROM message_deliveries"
+        ).scalar_one()
+    )
+    source_recipient_count = int(
+        connection.exec_driver_sql(
+            "SELECT COUNT(*) FROM message_delivery_recipients_schema_v1"
+        ).scalar_one()
+    )
+    target_recipient_count = int(
+        connection.exec_driver_sql(
+            "SELECT COUNT(*) FROM message_delivery_recipients"
+        ).scalar_one()
+    )
+    delivery_difference = connection.exec_driver_sql(
+        f"SELECT 1 FROM ({_RELEASED_MESSAGE_DELIVERY_PROJECTION_SQL} "
+        f"EXCEPT SELECT {delivery_columns} FROM message_deliveries) LIMIT 1"
+    ).fetchone()
+    reverse_delivery_difference = connection.exec_driver_sql(
+        f"SELECT 1 FROM (SELECT {delivery_columns} FROM message_deliveries "
+        f"EXCEPT {_RELEASED_MESSAGE_DELIVERY_PROJECTION_SQL}) LIMIT 1"
+    ).fetchone()
+    recipient_difference = connection.exec_driver_sql(
+        f"SELECT 1 FROM ({recipient_projection_sql} "
+        f"EXCEPT SELECT {recipient_columns} "
+        "FROM message_delivery_recipients) LIMIT 1"
+    ).fetchone()
+    reverse_recipient_difference = connection.exec_driver_sql(
+        f"SELECT 1 FROM (SELECT {recipient_columns} "
+        "FROM message_delivery_recipients "
+        f"EXCEPT {recipient_projection_sql}) LIMIT 1"
+    ).fetchone()
+    if (
+        source_delivery_count != target_delivery_count
+        or source_recipient_count != target_recipient_count
+        or delivery_difference is not None
+        or reverse_delivery_difference is not None
+        or recipient_difference is not None
+        or reverse_recipient_difference is not None
+    ):
+        raise RuntimeError(
+            "MessageDelivery schema migration did not preserve every immutable row"
+        )
+
+    connection.exec_driver_sql("DROP TABLE message_delivery_recipients_schema_v1")
+    connection.exec_driver_sql("DROP TABLE message_deliveries_schema_v1")
+    for table in (delivery_table, recipient_table):
+        for index in sorted(table.indexes, key=lambda item: item.name or ""):
+            connection.execute(CreateIndex(index))
+
+    canonical_delivery_columns = _sqlite_existing_table_columns(
+        connection,
+        "message_deliveries",
+    )
+    canonical_recipient_columns = _sqlite_existing_table_columns(
+        connection,
+        "message_delivery_recipients",
+    )
+    if canonical_delivery_columns != frozenset(
+        _CANONICAL_MESSAGE_DELIVERY_COLUMN_NAMES
+    ) or canonical_recipient_columns != frozenset(
+        _CANONICAL_MESSAGE_DELIVERY_RECIPIENT_COLUMN_NAMES
+    ):
+        raise RuntimeError(
+            "MessageDelivery schema migration did not install the canonical columns"
+        )
+
+    violations = connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise RuntimeError(
+            "MessageDelivery schema migration failed foreign-key validation"
+        )
+
+
+async def _migrate_message_delivery_schema(engine: AsyncEngine) -> None:
+    """Atomically upgrade the released SQLite delivery ledger in place."""
+    async with engine.connect() as connection:
+        if connection.dialect.name != "sqlite":
+            return
+        await connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        await connection.commit()
+        try:
+            await connection.exec_driver_sql("BEGIN IMMEDIATE")
+            await connection.run_sync(_rebuild_message_delivery_schema)
+            await connection.commit()
+        except BaseException:
+            with suppress(BaseException):
+                await connection.rollback()
+            raise
+        finally:
+            await connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+            foreign_keys_enabled = int(
+                (await connection.exec_driver_sql("PRAGMA foreign_keys")).scalar_one()
+            )
+            if foreign_keys_enabled != 1:
+                raise RuntimeError("SQLite foreign-key enforcement was not restored")
+            await connection.commit()
+
+
 def _ui_users_locale_schema_needs_rebuild(connection: Any) -> bool:
     """Return whether an existing UI-account table still has the two-locale schema."""
     row = connection.exec_driver_sql(
@@ -928,8 +1361,21 @@ async def ensure_schema(settings: Settings | None = None) -> None:
             # Pure SQLModel: create tables from metadata
             # (WAL mode is set automatically via event listener in _build_engine)
             await conn.run_sync(SQLModel.metadata.create_all)
-            # Setup FTS and custom indexes
-            await conn.run_sync(_setup_fts)
+        # The released delivery ledger predates the canonical actor/project
+        # snapshots. Its idempotency index references columns that no longer
+        # exist, so rebuild both immutable tables before any index/trigger DDL.
+        await _migrate_message_delivery_schema(engine)
+        async with engine.begin() as conn:
+            # Additive migrations and backfills must run before SQLite can
+            # rebuild an intermediate AgentExecution table with physical
+            # NOT NULL/CHECK/FK guarantees.
+            await conn.run_sync(
+                lambda sync_conn: _setup_fts(
+                    sync_conn,
+                    validate_execution_schema=False,
+                )
+            )
+        await _migrate_agent_executions_schema(engine)
         # SQLite cannot widen a table-level CHECK in place. Rebuild the one
         # account table atomically after additive legacy migrations have made
         # every current column available, then recreate its dropped triggers.
@@ -998,7 +1444,827 @@ def _is_sqlite_connection(connection: Any) -> bool:
         return False
 
 
-def _setup_fts(connection: Any) -> None:
+_AGENT_EXECUTION_INDEX_SQL: Final[dict[str, str]] = {
+    "idx_agent_executions_active": (
+        "CREATE INDEX IF NOT EXISTS idx_agent_executions_active "
+        "ON agent_executions (project_id, agent_id, last_active_ts) "
+        "WHERE status = 'active'"
+    ),
+    "idx_agent_executions_active_stale": (
+        "CREATE INDEX IF NOT EXISTS idx_agent_executions_active_stale "
+        "ON agent_executions (last_active_ts, project_id, id) "
+        "WHERE status = 'active'"
+    ),
+    "idx_agent_executions_project_active_stale": (
+        "CREATE INDEX IF NOT EXISTS idx_agent_executions_project_active_stale "
+        "ON agent_executions (project_id, last_active_ts, id) "
+        "WHERE status = 'active'"
+    ),
+    "idx_build_slot_artifact_projections_pending": (
+        "CREATE INDEX IF NOT EXISTS "
+        "idx_build_slot_artifact_projections_pending "
+        "ON build_slot_artifact_projections (project_id, execution_id) "
+        "WHERE reconciled_ts IS NULL"
+    ),
+    "idx_build_slot_artifact_paths_project_execution": (
+        "CREATE INDEX IF NOT EXISTS "
+        "idx_build_slot_artifact_paths_project_execution "
+        "ON build_slot_artifact_paths "
+        "(project_id, execution_id, slot_path_component)"
+    ),
+    "uq_agent_executions_session_external": (
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_executions_session_external "
+        "ON agent_executions (agent_id, client_name, external_id) "
+        "WHERE kind = 'session'"
+    ),
+    "uq_agent_executions_subagent_external": (
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_executions_subagent_external "
+        "ON agent_executions (parent_execution_id, client_name, external_id) "
+        "WHERE kind = 'subagent'"
+    ),
+    "idx_file_reservations_execution": (
+        "CREATE INDEX IF NOT EXISTS idx_file_reservations_execution "
+        "ON file_reservations (execution_id)"
+    ),
+    "idx_file_reservations_archive_pending": (
+        "CREATE INDEX IF NOT EXISTS idx_file_reservations_archive_pending "
+        "ON file_reservations (project_id, id) "
+        "WHERE archive_synced_revision < archive_revision"
+    ),
+    "uq_agent_executions_token_hash": (
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_executions_token_hash "
+        "ON agent_executions (execution_token_hash)"
+    ),
+}
+
+
+_AGENT_EXECUTION_TRIGGER_SQL: Final[dict[str, str]] = {
+    "file_reservations_origin_guard_bi": """
+        CREATE TRIGGER IF NOT EXISTS file_reservations_origin_guard_bi
+        BEFORE INSERT ON file_reservations
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid reservation origin')
+            WHERE new.origin IS NULL
+               OR new.origin NOT IN ('auto', 'explicit');
+        END
+    """,
+    "file_reservations_origin_guard_bu": """
+        CREATE TRIGGER IF NOT EXISTS file_reservations_origin_guard_bu
+        BEFORE UPDATE OF origin ON file_reservations
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid reservation origin')
+            WHERE new.origin IS NULL
+               OR new.origin NOT IN ('auto', 'explicit');
+            SELECT RAISE(ABORT, 'reservation origin cannot downgrade to auto')
+            WHERE old.origin = 'explicit' AND new.origin = 'auto';
+        END
+    """,
+    "file_reservations_archive_version_guard_bi": """
+        CREATE TRIGGER IF NOT EXISTS file_reservations_archive_version_guard_bi
+        BEFORE INSERT ON file_reservations
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid reservation archive version')
+            WHERE new.archive_revision IS NULL
+               OR new.archive_revision < 1
+               OR new.archive_synced_revision IS NULL
+               OR new.archive_synced_revision < 0
+               OR new.archive_synced_revision > new.archive_revision;
+        END
+    """,
+    "file_reservations_archive_version_guard_bu": """
+        CREATE TRIGGER IF NOT EXISTS file_reservations_archive_version_guard_bu
+        BEFORE UPDATE ON file_reservations
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid reservation archive version')
+            WHERE new.archive_revision IS NULL
+               OR new.archive_revision < old.archive_revision
+               OR new.archive_revision > old.archive_revision + 1
+               OR new.archive_synced_revision IS NULL
+               OR new.archive_synced_revision < old.archive_synced_revision
+               OR new.archive_synced_revision < 0
+               OR new.archive_synced_revision > new.archive_revision;
+            SELECT RAISE(ABORT, 'reservation archive version is storage-managed')
+            WHERE (
+                    old.project_id IS NOT new.project_id
+                    OR old.agent_id IS NOT new.agent_id
+                    OR old.execution_id IS NOT new.execution_id
+                    OR old.origin IS NOT new.origin
+                    OR old.path_pattern IS NOT new.path_pattern
+                    OR old.exclusive IS NOT new.exclusive
+                    OR old.reason IS NOT new.reason
+                    OR old.created_ts IS NOT new.created_ts
+                    OR old.expires_ts IS NOT new.expires_ts
+                    OR old.released_ts IS NOT new.released_ts
+                  )
+              AND (
+                    new.archive_revision IS NOT old.archive_revision
+                    OR new.archive_synced_revision IS NOT old.archive_synced_revision
+                  );
+            SELECT RAISE(ABORT, 'reservation archive version is storage-managed')
+            WHERE old.project_id IS new.project_id
+              AND old.agent_id IS new.agent_id
+              AND old.execution_id IS new.execution_id
+              AND old.origin IS new.origin
+              AND old.path_pattern IS new.path_pattern
+              AND old.exclusive IS new.exclusive
+              AND old.reason IS new.reason
+              AND old.created_ts IS new.created_ts
+              AND old.expires_ts IS new.expires_ts
+              AND old.released_ts IS new.released_ts
+              AND new.archive_revision = old.archive_revision + 1
+              AND new.archive_synced_revision IS NOT old.archive_synced_revision;
+        END
+    """,
+    "file_reservations_archive_revision_au": """
+        CREATE TRIGGER IF NOT EXISTS file_reservations_archive_revision_au
+        AFTER UPDATE OF project_id, agent_id, execution_id, origin, path_pattern,
+            exclusive, reason, created_ts, expires_ts, released_ts
+        ON file_reservations
+        WHEN old.project_id IS NOT new.project_id
+          OR old.agent_id IS NOT new.agent_id
+          OR old.execution_id IS NOT new.execution_id
+          OR old.origin IS NOT new.origin
+          OR old.path_pattern IS NOT new.path_pattern
+          OR old.exclusive IS NOT new.exclusive
+          OR old.reason IS NOT new.reason
+          OR old.created_ts IS NOT new.created_ts
+          OR old.expires_ts IS NOT new.expires_ts
+          OR old.released_ts IS NOT new.released_ts
+        BEGIN
+            UPDATE file_reservations
+            SET archive_revision = old.archive_revision + 1
+            WHERE id = new.id;
+        END
+    """,
+    "agent_executions_project_agent_guard_bi": """
+        CREATE TRIGGER IF NOT EXISTS agent_executions_project_agent_guard_bi
+        BEFORE INSERT ON agent_executions
+        BEGIN
+            SELECT RAISE(ABORT, 'agent execution owner is missing, mismatched, or retired')
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM agents
+                WHERE id IS new.agent_id
+                  AND project_id IS new.project_id
+                  AND retired_at IS NULL
+            );
+        END
+    """,
+    "agent_executions_capability_guard_bi": """
+        CREATE TRIGGER IF NOT EXISTS agent_executions_capability_guard_bi
+        BEFORE INSERT ON agent_executions
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid agent execution capability')
+            WHERE new.execution_token_hash IS NULL
+               OR length(new.execution_token_hash) != 64
+               OR lower(new.execution_token_hash) IS NOT new.execution_token_hash
+               OR new.execution_token_hash GLOB '*[^0-9a-f]*'
+               OR new.lifecycle_protocol_version IS NULL
+               OR new.lifecycle_protocol_version < 0;
+        END
+    """,
+    "agent_executions_capability_guard_bu": """
+        CREATE TRIGGER IF NOT EXISTS agent_executions_capability_guard_bu
+        BEFORE UPDATE OF execution_token_hash, lifecycle_protocol_version
+        ON agent_executions
+        BEGIN
+            SELECT RAISE(ABORT, 'agent execution capability is immutable')
+            WHERE new.execution_token_hash IS NOT old.execution_token_hash;
+            SELECT RAISE(ABORT, 'invalid agent execution capability')
+            WHERE new.execution_token_hash IS NULL
+               OR length(new.execution_token_hash) != 64
+               OR lower(new.execution_token_hash) IS NOT new.execution_token_hash
+               OR new.execution_token_hash GLOB '*[^0-9a-f]*'
+               OR new.lifecycle_protocol_version IS NULL
+               OR new.lifecycle_protocol_version < old.lifecycle_protocol_version;
+        END
+    """,
+    "agent_executions_project_agent_guard_bu": """
+        CREATE TRIGGER IF NOT EXISTS agent_executions_project_agent_guard_bu
+        BEFORE UPDATE OF project_id, agent_id ON agent_executions
+        BEGIN
+            SELECT RAISE(ABORT, 'agent execution owner is immutable')
+            WHERE new.project_id IS NOT old.project_id
+               OR new.agent_id IS NOT old.agent_id;
+            SELECT RAISE(ABORT, 'agent execution owner is missing, mismatched, or retired')
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM agents
+                WHERE id IS new.agent_id
+                  AND project_id IS new.project_id
+            );
+            SELECT RAISE(ABORT, 'agent execution reservation binding mismatch')
+            WHERE EXISTS (
+                SELECT 1
+                FROM file_reservations
+                WHERE execution_id IS old.id
+                  AND (project_id IS NOT new.project_id OR agent_id IS NOT new.agent_id)
+            );
+            SELECT RAISE(ABORT, 'agent execution child binding mismatch')
+            WHERE EXISTS (
+                SELECT 1
+                FROM agent_executions
+                WHERE parent_execution_id IS old.id
+                  AND (project_id IS NOT new.project_id OR agent_id IS NOT new.agent_id)
+            );
+        END
+    """,
+    "agents_execution_project_guard_bu": """
+        CREATE TRIGGER IF NOT EXISTS agents_execution_project_guard_bu
+        BEFORE UPDATE OF id, project_id ON agents
+        BEGIN
+            SELECT RAISE(ABORT, 'agent has project-bound executions')
+            WHERE EXISTS (
+                SELECT 1
+                FROM agent_executions
+                WHERE agent_id IS old.id
+                  AND (agent_id IS NOT new.id OR project_id IS NOT new.project_id)
+            );
+        END
+    """,
+    "agent_executions_parent_guard_bi": """
+        CREATE TRIGGER IF NOT EXISTS agent_executions_parent_guard_bi
+        BEFORE INSERT ON agent_executions
+        WHEN new.parent_execution_id IS NOT NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'agent execution parent mismatch or inactive')
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM agent_executions
+                WHERE id IS new.parent_execution_id
+                  AND project_id IS new.project_id
+                  AND agent_id IS new.agent_id
+                  AND status = 'active'
+            );
+        END
+    """,
+    "agent_executions_parent_guard_bu": """
+        CREATE TRIGGER IF NOT EXISTS agent_executions_parent_guard_bu
+        BEFORE UPDATE OF parent_execution_id, kind, project_id, agent_id
+        ON agent_executions
+        WHEN new.parent_execution_id IS NOT NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'agent execution parent mismatch or inactive')
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM agent_executions
+                WHERE id IS new.parent_execution_id
+                  AND project_id IS new.project_id
+                  AND agent_id IS new.agent_id
+                  AND status = 'active'
+            );
+        END
+    """,
+    "agent_executions_terminal_guard_bu": """
+        CREATE TRIGGER IF NOT EXISTS agent_executions_terminal_guard_bu
+        BEFORE UPDATE ON agent_executions
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal agent execution is immutable')
+            WHERE old.status != 'active';
+            SELECT RAISE(ABORT, 'agent execution has active children')
+            WHERE new.status IS NOT 'active'
+              AND EXISTS (
+                  SELECT 1
+                  FROM agent_executions
+                  WHERE parent_execution_id IS old.id AND status = 'active'
+              );
+            SELECT RAISE(ABORT, 'agent execution has active reservations')
+            WHERE new.status IS NOT 'active'
+              AND EXISTS (
+                  SELECT 1
+                  FROM file_reservations
+                  WHERE execution_id IS old.id
+                    AND origin = 'auto'
+                    AND released_ts IS NULL
+                    AND expires_ts > CURRENT_TIMESTAMP
+              );
+        END
+    """,
+    "agent_executions_build_slot_projection_ai": """
+        CREATE TRIGGER IF NOT EXISTS agent_executions_build_slot_projection_ai
+        AFTER INSERT ON agent_executions
+        WHEN new.status != 'active'
+        BEGIN
+            INSERT OR IGNORE INTO build_slot_artifact_projections
+                (execution_id, project_id, created_ts, reconciled_ts)
+            VALUES (
+                new.id,
+                new.project_id,
+                COALESCE(new.ended_ts, new.last_active_ts),
+                NULL
+            );
+        END
+    """,
+    "agent_executions_build_slot_projection_au": """
+        CREATE TRIGGER IF NOT EXISTS agent_executions_build_slot_projection_au
+        AFTER UPDATE OF status ON agent_executions
+        WHEN old.status = 'active' AND new.status != 'active'
+        BEGIN
+            INSERT OR IGNORE INTO build_slot_artifact_projections
+                (execution_id, project_id, created_ts, reconciled_ts)
+            VALUES (
+                new.id,
+                new.project_id,
+                COALESCE(new.ended_ts, new.last_active_ts),
+                NULL
+            );
+        END
+    """,
+    "build_slot_artifact_paths_active_execution_guard_bi": """
+        CREATE TRIGGER IF NOT EXISTS
+        build_slot_artifact_paths_active_execution_guard_bi
+        BEFORE INSERT ON build_slot_artifact_paths
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'build-slot artifact path execution mismatch or inactive'
+            )
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM agent_executions
+                WHERE id IS new.execution_id
+                  AND project_id IS new.project_id
+                  AND status = 'active'
+            );
+        END
+    """,
+    "build_slot_artifact_paths_immutable_bu": """
+        CREATE TRIGGER IF NOT EXISTS build_slot_artifact_paths_immutable_bu
+        BEFORE UPDATE ON build_slot_artifact_paths
+        BEGIN
+            SELECT RAISE(ABORT, 'build-slot artifact path is immutable');
+        END
+    """,
+    "build_slot_artifact_paths_immutable_bd": """
+        CREATE TRIGGER IF NOT EXISTS build_slot_artifact_paths_immutable_bd
+        BEFORE DELETE ON build_slot_artifact_paths
+        BEGIN
+            SELECT RAISE(ABORT, 'build-slot artifact path is immutable');
+        END
+    """,
+    "file_reservations_execution_guard_bi": """
+        CREATE TRIGGER IF NOT EXISTS file_reservations_execution_guard_bi
+        BEFORE INSERT ON file_reservations
+        WHEN new.execution_id IS NOT NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'reservation execution binding mismatch')
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM agent_executions
+                WHERE id IS new.execution_id
+                  AND project_id IS new.project_id
+                  AND agent_id IS new.agent_id
+                  AND status = 'active'
+            );
+        END
+    """,
+    "file_reservations_execution_guard_bu": """
+        CREATE TRIGGER IF NOT EXISTS file_reservations_execution_guard_bu
+        BEFORE UPDATE ON file_reservations
+        BEGIN
+            SELECT RAISE(ABORT, 'reservation execution binding is immutable')
+            WHERE new.execution_id IS NOT old.execution_id;
+            SELECT RAISE(ABORT, 'reservation execution owner is immutable')
+            WHERE old.execution_id IS NOT NULL
+              AND (
+                    new.project_id IS NOT old.project_id
+                    OR new.agent_id IS NOT old.agent_id
+              );
+            SELECT RAISE(ABORT, 'reservation execution binding mismatch')
+            WHERE new.execution_id IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1
+                FROM agent_executions
+                WHERE id IS new.execution_id
+                  AND project_id IS new.project_id
+                  AND agent_id IS new.agent_id
+                  AND status = 'active'
+            )
+            AND NOT (
+                old.project_id IS new.project_id
+                AND old.agent_id IS new.agent_id
+                AND old.execution_id IS new.execution_id
+                AND old.origin IS new.origin
+                AND old.path_pattern IS new.path_pattern
+                AND old.exclusive IS new.exclusive
+                AND old.reason IS new.reason
+                AND old.created_ts IS new.created_ts
+                AND old.expires_ts IS new.expires_ts
+                AND old.released_ts IS new.released_ts
+            )
+            AND NOT (
+                old.project_id IS new.project_id
+                AND old.agent_id IS new.agent_id
+                AND old.execution_id IS new.execution_id
+                AND old.origin IS new.origin
+                AND old.path_pattern IS new.path_pattern
+                AND old.exclusive IS new.exclusive
+                AND old.reason IS new.reason
+                AND old.created_ts IS new.created_ts
+                AND new.expires_ts <= old.expires_ts
+                AND old.released_ts IS NULL
+                AND new.released_ts IS NOT NULL
+            );
+        END
+    """,
+}
+
+
+_MESSAGE_DELIVERIES_PROJECT_GUARD_BD_SQL: Final[str] = """
+    CREATE TRIGGER IF NOT EXISTS message_deliveries_project_guard_bd
+    BEFORE DELETE ON projects
+    BEGIN
+        SELECT RAISE(ABORT, 'project has pending message delivery')
+        WHERE EXISTS (
+            SELECT 1
+            FROM message_deliveries
+            WHERE state = 'pending'
+              AND (
+                    project_id IS old.id
+                    OR sender_project_id_snapshot IS old.id
+                    OR (
+                        actor_kind = 'agent'
+                        AND actor_project_id_snapshot IS old.id
+                    )
+                )
+        );
+    END
+"""
+
+
+def _sqlite_table_columns(connection: Any, table_name: str) -> set[str]:
+    """Return exact SQLite column names for one trusted internal table."""
+    rows = connection.exec_driver_sql(f"PRAGMA table_info({table_name})").fetchall()
+    return {str(row[1]) for row in rows}
+
+
+def _ensure_sqlite_column(
+    connection: Any,
+    *,
+    table_name: str,
+    column_name: str,
+    alter_sql: str,
+) -> None:
+    """Apply a required additive migration without swallowing DDL failures."""
+    if column_name not in _sqlite_table_columns(connection, table_name):
+        connection.exec_driver_sql(alter_sql)
+    if column_name not in _sqlite_table_columns(connection, table_name):
+        raise RuntimeError(
+            f"Required schema column {table_name}.{column_name} is unavailable"
+        )
+
+
+def _normalize_schema_sql(sql: str) -> str:
+    """Normalize harmless SQLite DDL formatting without erasing semantics."""
+    normalized = re.sub(r"\bIF\s+NOT\s+EXISTS\b", "", sql, flags=re.IGNORECASE)
+    normalized = normalized.replace('"', "").replace("`", "")
+    return re.sub(r"\s+", " ", normalized).strip().removesuffix(";").casefold()
+
+
+def _agent_execution_table_mismatches(connection: Any) -> list[str]:
+    """Return physical AgentExecution table drift from the SQLModel contract."""
+    table = cast(Table, getattr(AgentExecution, "__table__"))  # noqa: B009
+    actual_rows = connection.exec_driver_sql(
+        "PRAGMA table_info(agent_executions)"
+    ).fetchall()
+    actual_columns = {
+        str(row[1]): (
+            str(row[2]).upper(),
+            int(row[3]),
+            None if row[4] is None else str(row[4]),
+            int(row[5]),
+        )
+        for row in actual_rows
+    }
+    expected_columns = {
+        column.name: (
+            str(column.type.compile(dialect=connection.dialect)).upper(),
+            int(not column.nullable),
+            None,
+            int(column.primary_key),
+        )
+        for column in table.columns
+    }
+    mismatches: list[str] = []
+    if actual_columns != expected_columns:
+        mismatches.append("columns")
+
+    table_sql_row = connection.exec_driver_sql(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'agent_executions'"
+    ).fetchone()
+    if table_sql_row is None or table_sql_row[0] is None:
+        return [*mismatches, "table"]
+    actual_table_sql = _normalize_schema_sql(str(table_sql_row[0]))
+    for constraint in table.constraints:
+        if not isinstance(constraint, CheckConstraint):
+            continue
+        constraint_sql = str(
+            constraint.sqltext.compile(dialect=connection.dialect)
+        )
+        expected_clause = _normalize_schema_sql(
+            f"CONSTRAINT {constraint.name} CHECK ({constraint_sql})"
+        )
+        if expected_clause not in actual_table_sql:
+            mismatches.append(f"constraint:{constraint.name}")
+    if "unique (execution_token_hash)" not in actual_table_sql:
+        mismatches.append("unique:execution_token_hash")
+
+    actual_foreign_keys = {
+        tuple(str(value).casefold() for value in row[2:8])
+        for row in connection.exec_driver_sql(
+            "PRAGMA foreign_key_list(agent_executions)"
+        ).fetchall()
+    }
+    expected_foreign_keys = {
+        ("projects", "project_id", "id", "no action", "no action", "none"),
+        ("agents", "agent_id", "id", "no action", "no action", "none"),
+        (
+            "agent_executions",
+            "parent_execution_id",
+            "id",
+            "no action",
+            "no action",
+            "none",
+        ),
+    }
+    if actual_foreign_keys != expected_foreign_keys:
+        mismatches.append("foreign_keys")
+    return mismatches
+
+
+def _rebuild_agent_executions_schema(connection: Any) -> None:
+    """Atomically rebuild the execution table to its canonical physical shape."""
+    mismatches = _agent_execution_table_mismatches(connection)
+    if not mismatches:
+        return
+
+    table = cast(Table, getattr(AgentExecution, "__table__"))  # noqa: B009
+    canonical_index_names = {
+        index.name for index in table.indexes if index.name is not None
+    } | set(_AGENT_EXECUTION_INDEX_SQL)
+    canonical_trigger_names = set(_AGENT_EXECUTION_TRIGGER_SQL)
+    dependent_schema_objects = connection.exec_driver_sql(
+        """
+        SELECT type, name, sql
+        FROM sqlite_master
+        WHERE tbl_name = 'agent_executions'
+          AND type IN ('index', 'trigger')
+          AND sql IS NOT NULL
+        ORDER BY type, name
+        """
+    ).fetchall()
+    custom_schema_sql = [
+        str(sql)
+        for object_type, name, sql in dependent_schema_objects
+        if (
+            (object_type == "index" and name not in canonical_index_names)
+            or (object_type == "trigger" and name not in canonical_trigger_names)
+        )
+    ]
+    referencing_triggers = connection.exec_driver_sql(
+        """
+        SELECT name, sql
+        FROM sqlite_master
+        WHERE type = 'trigger'
+          AND tbl_name != 'agent_executions'
+          AND sql IS NOT NULL
+          AND instr(lower(sql), 'agent_executions') > 0
+        ORDER BY name
+        """
+    ).fetchall()
+    for trigger_name, _trigger_sql in referencing_triggers:
+        quoted_name = connection.dialect.identifier_preparer.quote(str(trigger_name))
+        connection.exec_driver_sql(f"DROP TRIGGER {quoted_name}")
+
+    temporary_metadata = MetaData()
+    cast(Table, getattr(Project, "__table__")).to_metadata(temporary_metadata)  # noqa: B009
+    cast(Table, getattr(Agent, "__table__")).to_metadata(temporary_metadata)  # noqa: B009
+    temporary_table = table.to_metadata(
+        temporary_metadata,
+        name="agent_executions_schema_v2",
+    )
+    connection.execute(CreateTable(temporary_table))
+
+    column_names = [column.name for column in table.columns]
+    quoted_columns = ", ".join(f'"{name}"' for name in column_names)
+    connection.exec_driver_sql(
+        f'INSERT INTO "agent_executions_schema_v2" ({quoted_columns}) '
+        f'SELECT {quoted_columns} FROM "agent_executions"'
+    )
+    source_count = int(
+        connection.exec_driver_sql("SELECT COUNT(*) FROM agent_executions").scalar_one()
+    )
+    target_count = int(
+        connection.exec_driver_sql(
+            "SELECT COUNT(*) FROM agent_executions_schema_v2"
+        ).scalar_one()
+    )
+    forward_difference = connection.exec_driver_sql(
+        f"SELECT 1 FROM (SELECT {quoted_columns} FROM agent_executions "
+        f"EXCEPT SELECT {quoted_columns} FROM agent_executions_schema_v2) LIMIT 1"
+    ).fetchone()
+    reverse_difference = connection.exec_driver_sql(
+        f"SELECT 1 FROM (SELECT {quoted_columns} FROM agent_executions_schema_v2 "
+        f"EXCEPT SELECT {quoted_columns} FROM agent_executions) LIMIT 1"
+    ).fetchone()
+    if (
+        source_count != target_count
+        or forward_difference is not None
+        or reverse_difference is not None
+    ):
+        raise RuntimeError(
+            "AgentExecution schema migration did not preserve every execution row"
+        )
+
+    connection.exec_driver_sql("DROP TABLE agent_executions")
+    connection.exec_driver_sql(
+        "ALTER TABLE agent_executions_schema_v2 RENAME TO agent_executions"
+    )
+    for index in sorted(table.indexes, key=lambda item: item.name or ""):
+        connection.execute(CreateIndex(index))
+    for schema_sql in custom_schema_sql:
+        connection.exec_driver_sql(schema_sql)
+    for _trigger_name, trigger_sql in referencing_triggers:
+        connection.exec_driver_sql(str(trigger_sql))
+
+    remaining_mismatches = _agent_execution_table_mismatches(connection)
+    if remaining_mismatches:
+        raise RuntimeError(
+            "AgentExecution schema migration left physical drift: "
+            f"{remaining_mismatches}"
+        )
+
+
+async def _migrate_agent_executions_schema(engine: AsyncEngine) -> None:
+    """Rebuild an intermediate nullable execution schema with FK safety."""
+    async with engine.connect() as connection:
+        mismatches = await connection.run_sync(_agent_execution_table_mismatches)
+        await connection.commit()
+        if not mismatches:
+            return
+
+        await connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        await connection.commit()
+        try:
+            await connection.exec_driver_sql("BEGIN IMMEDIATE")
+            await connection.run_sync(_rebuild_agent_executions_schema)
+            await connection.commit()
+        except BaseException:
+            with suppress(BaseException):
+                await connection.rollback()
+            raise
+        finally:
+            await connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+            foreign_keys_enabled = int(
+                (await connection.exec_driver_sql("PRAGMA foreign_keys")).scalar_one()
+            )
+            if foreign_keys_enabled != 1:
+                raise RuntimeError("SQLite foreign-key enforcement was not restored")
+            violations = (
+                await connection.exec_driver_sql("PRAGMA foreign_key_check")
+            ).fetchall()
+            if violations:
+                raise RuntimeError(
+                    "AgentExecution schema migration failed foreign-key validation"
+                )
+            await connection.commit()
+
+
+def _validate_agent_execution_schema(connection: Any) -> None:
+    """Fail closed on semantic drift in execution capability DDL."""
+    table_mismatches = _agent_execution_table_mismatches(connection)
+    if table_mismatches:
+        raise RuntimeError(
+            "AgentExecution schema validation failed; table drift: "
+            f"{table_mismatches}"
+        )
+
+    reservation_columns = {
+        str(row[1]): (str(row[2]).upper(), int(row[3]))
+        for row in connection.exec_driver_sql(
+            "PRAGMA table_info(file_reservations)"
+        ).fetchall()
+    }
+    required_reservation_columns = {
+        "execution_id": ("VARCHAR(36)", 0),
+        "origin": ("VARCHAR(16)", 1),
+        "archive_revision": ("INTEGER", 1),
+        "archive_synced_revision": ("INTEGER", 1),
+    }
+    if any(
+        reservation_columns.get(name) != definition
+        for name, definition in required_reservation_columns.items()
+    ):
+        raise RuntimeError(
+            "AgentExecution schema validation failed; reservation column drift"
+        )
+    reservation_foreign_keys = {
+        tuple(str(value).casefold() for value in row[2:8])
+        for row in connection.exec_driver_sql(
+            "PRAGMA foreign_key_list(file_reservations)"
+        ).fetchall()
+    }
+    if (
+        "agent_executions",
+        "execution_id",
+        "id",
+        "no action",
+        "no action",
+        "none",
+    ) not in reservation_foreign_keys:
+        raise RuntimeError(
+            "AgentExecution schema validation failed; reservation FK drift"
+        )
+
+    invalid_capabilities = int(
+        connection.exec_driver_sql(
+            "SELECT COUNT(*) FROM agent_executions "
+            "WHERE execution_token_hash IS NULL "
+            "OR length(execution_token_hash) != 64 "
+            "OR lower(execution_token_hash) != execution_token_hash "
+            "OR execution_token_hash GLOB '*[^0-9a-f]*' "
+            "OR lifecycle_protocol_version IS NULL "
+            "OR lifecycle_protocol_version < 0"
+        ).scalar_one()
+    )
+    if invalid_capabilities:
+        raise RuntimeError(
+            "AgentExecution schema validation found invalid capability rows"
+        )
+
+    invalid_reservation_origins = int(
+        connection.exec_driver_sql(
+            "SELECT COUNT(*) FROM file_reservations "
+            "WHERE origin IS NULL OR origin NOT IN ('auto', 'explicit')"
+        ).scalar_one()
+    )
+    if invalid_reservation_origins:
+        raise RuntimeError(
+            "AgentExecution schema validation found invalid reservation origins"
+        )
+
+    invalid_reservation_archive_versions = int(
+        connection.exec_driver_sql(
+            "SELECT COUNT(*) FROM file_reservations "
+            "WHERE archive_revision IS NULL OR archive_revision < 1 "
+            "OR archive_synced_revision IS NULL OR archive_synced_revision < 0 "
+            "OR archive_synced_revision > archive_revision"
+        ).scalar_one()
+    )
+    if invalid_reservation_archive_versions:
+        raise RuntimeError(
+            "AgentExecution schema validation found invalid reservation archive versions"
+        )
+
+    actual_indexes = {
+        str(row[0]): _normalize_schema_sql(str(row[1]))
+        for row in connection.exec_driver_sql(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE type = 'index' AND sql IS NOT NULL"
+        ).fetchall()
+    }
+    index_mismatches = sorted(
+        name
+        for name, expected_sql in _AGENT_EXECUTION_INDEX_SQL.items()
+        if actual_indexes.get(name) != _normalize_schema_sql(expected_sql)
+    )
+    if index_mismatches:
+        raise RuntimeError(
+            "AgentExecution schema validation failed; index definition drift: "
+            f"{index_mismatches}"
+        )
+
+    expected_triggers = {
+        **_AGENT_EXECUTION_TRIGGER_SQL,
+        "message_deliveries_project_guard_bd": (
+            _MESSAGE_DELIVERIES_PROJECT_GUARD_BD_SQL
+        ),
+    }
+    actual_triggers = {
+        str(row[0]): _normalize_schema_sql(str(row[1]))
+        for row in connection.exec_driver_sql(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE type = 'trigger' AND sql IS NOT NULL"
+        ).fetchall()
+    }
+    trigger_mismatches = sorted(
+        name
+        for name, expected_sql in expected_triggers.items()
+        if actual_triggers.get(name) != _normalize_schema_sql(expected_sql)
+    )
+    if trigger_mismatches:
+        raise RuntimeError(
+            "AgentExecution schema validation failed; trigger definition drift: "
+            f"{trigger_mismatches}"
+        )
+
+
+def _setup_fts(
+    connection: Any,
+    *,
+    validate_execution_schema: bool = True,
+) -> None:
     # FTS5 + the ``ALTER TABLE`` idioms below are SQLite-only. Skip them
     # entirely on other backends so schema init does not blow up with
     # ``CREATE VIRTUAL TABLE`` against Postgres et al. Runtime search paths
@@ -1106,6 +2372,81 @@ def _setup_fts(connection: Any) -> None:
     )
     # Schema migrations: add columns that may be missing on older databases.
     # SQLite ALTER TABLE ADD COLUMN is idempotent-safe via try/except.
+    # These columns form the execution capability/ownership boundary. Unlike
+    # older best-effort additive migrations below, failures must abort startup:
+    # enforce mode cannot safely run against a partially upgraded schema.
+    _ensure_sqlite_column(
+        connection,
+        table_name="file_reservations",
+        column_name="execution_id",
+        alter_sql=(
+            "ALTER TABLE file_reservations ADD COLUMN execution_id VARCHAR(36) "
+            "DEFAULT NULL REFERENCES agent_executions(id)"
+        ),
+    )
+    _ensure_sqlite_column(
+        connection,
+        table_name="file_reservations",
+        column_name="origin",
+        alter_sql=(
+            "ALTER TABLE file_reservations ADD COLUMN origin VARCHAR(16) "
+            "NOT NULL DEFAULT 'explicit'"
+        ),
+    )
+    _ensure_sqlite_column(
+        connection,
+        table_name="file_reservations",
+        column_name="archive_revision",
+        alter_sql=(
+            "ALTER TABLE file_reservations ADD COLUMN archive_revision INTEGER "
+            "NOT NULL DEFAULT 1"
+        ),
+    )
+    _ensure_sqlite_column(
+        connection,
+        table_name="file_reservations",
+        column_name="archive_synced_revision",
+        alter_sql=(
+            "ALTER TABLE file_reservations ADD COLUMN archive_synced_revision "
+            "INTEGER NOT NULL DEFAULT 0"
+        ),
+    )
+    _ensure_sqlite_column(
+        connection,
+        table_name="agent_executions",
+        column_name="execution_token_hash",
+        alter_sql=(
+            "ALTER TABLE agent_executions ADD COLUMN execution_token_hash "
+            "VARCHAR(64) DEFAULT NULL"
+        ),
+    )
+    _ensure_sqlite_column(
+        connection,
+        table_name="agent_executions",
+        column_name="lifecycle_protocol_version",
+        alter_sql=(
+            "ALTER TABLE agent_executions ADD COLUMN lifecycle_protocol_version "
+            "INTEGER NOT NULL DEFAULT 0"
+        ),
+    )
+    _ensure_sqlite_column(
+        connection,
+        table_name="projects",
+        column_name="project_uid",
+        alter_sql=(
+            "ALTER TABLE projects ADD COLUMN project_uid VARCHAR(255) DEFAULT NULL"
+        ),
+    )
+    _ensure_sqlite_column(
+        connection,
+        table_name="agents",
+        column_name="provisioning_state",
+        alter_sql=(
+            "ALTER TABLE agents ADD COLUMN provisioning_state VARCHAR(16) "
+            "NOT NULL DEFAULT 'active'"
+        ),
+    )
+
     for migration_sql in [
         "ALTER TABLE agents ADD COLUMN retired_at DATETIME DEFAULT NULL",
         "ALTER TABLE agents ADD COLUMN agent_generation VARCHAR(64) DEFAULT NULL",
@@ -1137,6 +2478,14 @@ def _setup_fts(connection: Any) -> None:
         with suppress(Exception):  # Column already exists — safe to ignore
             connection.exec_driver_sql(migration_sql)
 
+    # This execution surface is still unreleased; existing development rows
+    # receive irrecoverable random capabilities so no caller can accidentally
+    # authenticate them after the capability boundary is introduced.
+    connection.exec_driver_sql(
+        "UPDATE agent_executions SET execution_token_hash = lower(hex(randomblob(32))) "
+        "WHERE execution_token_hash IS NULL"
+    )
+
     # The delivery idempotency scope changed before this unshipped surface was
     # enabled: a UI actor's mailbox-project lifetime is now part of its scope.
     # Recreate the development index instead of preserving the obsolete shape.
@@ -1145,6 +2494,11 @@ def _setup_fts(connection: Any) -> None:
     # Index migrations for newly added columns.
     # CREATE INDEX IF NOT EXISTS is natively idempotent in SQLite.
     for index_sql in [
+        # Multiple NULLs deliberately preserve unclaimed legacy rows.  Every
+        # newly created or lazily claimed Project receives a durable UID, and
+        # SQLite's UNIQUE semantics reject any accidental merge.
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_projects_project_uid "
+        "ON projects (project_uid)",
         "CREATE INDEX IF NOT EXISTS ix_agents_registration_token ON agents (registration_token)",
         "CREATE INDEX IF NOT EXISTS idx_messages_project_topic ON messages (project_id, topic)",
         "CREATE INDEX IF NOT EXISTS ix_messages_reply_to ON messages (reply_to)",
@@ -1168,8 +2522,26 @@ def _setup_fts(connection: Any) -> None:
         "ON message_deliveries (reply_to_message_id, state)",
         "CREATE INDEX IF NOT EXISTS idx_message_delivery_recipients_agent "
         "ON message_delivery_recipients (agent_id, delivery_id)",
+        *_AGENT_EXECUTION_INDEX_SQL.values(),
     ]:
         connection.exec_driver_sql(index_sql)
+
+    # These definitions are dropped and recreated on every startup. Merely
+    # checking that a trigger name exists is unsafe: an older or tampered body
+    # could otherwise retain weaker NULL/equality or terminal-state semantics.
+    for trigger_name in _AGENT_EXECUTION_TRIGGER_SQL:
+        connection.exec_driver_sql(f"DROP TRIGGER IF EXISTS {trigger_name}")
+    for trigger_sql in _AGENT_EXECUTION_TRIGGER_SQL.values():
+        connection.exec_driver_sql(trigger_sql)
+
+    # Seed the outbox for terminal rows created before this projection table
+    # existed. INSERT OR IGNORE preserves any already acknowledged row.
+    connection.exec_driver_sql(
+        "INSERT OR IGNORE INTO build_slot_artifact_projections "
+        "(execution_id, project_id, created_ts, reconciled_ts) "
+        "SELECT id, project_id, COALESCE(ended_ts, last_active_ts), NULL "
+        "FROM agent_executions WHERE status != 'active'"
+    )
 
     connection.exec_driver_sql(
         """
@@ -1351,6 +2723,158 @@ def _setup_fts(connection: Any) -> None:
             "UPDATE agents SET agent_generation = ? WHERE id = ?",
             (secrets.token_hex(32), int(agent_generation_row[0])),
         )
+    connection.exec_driver_sql(
+        "UPDATE agents SET provisioning_state = 'active' "
+        "WHERE provisioning_state IS NULL OR trim(provisioning_state) = ''"
+    )
+    invalid_provisioning_state = connection.exec_driver_sql(
+        "SELECT id, provisioning_state FROM agents "
+        "WHERE provisioning_state NOT IN ('provisioning', 'active') LIMIT 1"
+    ).fetchone()
+    if invalid_provisioning_state is not None:
+        raise RuntimeError(
+            "Invalid agents.provisioning_state for Agent id "
+            f"{invalid_provisioning_state[0]}: {invalid_provisioning_state[1]!r}"
+        )
+    for trigger_name in (
+        "agents_provisioning_state_guard_bi",
+        "agents_provisioning_state_guard_bu",
+        "agent_executions_active_agent_guard_bi",
+        "file_reservations_active_agent_guard_bi",
+        "agent_links_active_agents_guard_bi",
+        "messages_active_sender_guard_bi",
+        "message_recipients_active_agent_guard_bi",
+        "message_deliveries_active_agents_guard_bi",
+        "message_delivery_recipients_active_agent_guard_bi",
+    ):
+        connection.exec_driver_sql(f"DROP TRIGGER IF EXISTS {trigger_name}")
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER agents_provisioning_state_guard_bi
+        BEFORE INSERT ON agents
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid agent provisioning_state')
+            WHERE new.provisioning_state NOT IN ('provisioning', 'active');
+            SELECT RAISE(ABORT, 'provisioning agent requires registration token')
+            WHERE new.provisioning_state = 'provisioning'
+              AND (new.registration_token IS NULL OR trim(new.registration_token) = '');
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER agents_provisioning_state_guard_bu
+        BEFORE UPDATE OF provisioning_state ON agents
+        WHEN old.provisioning_state IS NOT new.provisioning_state
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid agent provisioning_state transition')
+            WHERE old.provisioning_state != 'provisioning'
+               OR new.provisioning_state != 'active';
+            SELECT RAISE(ABORT, 'active agent requires registration token')
+            WHERE new.registration_token IS NULL OR trim(new.registration_token) = '';
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER agent_executions_active_agent_guard_bi
+        BEFORE INSERT ON agent_executions
+        BEGIN
+            SELECT RAISE(ABORT, 'agent execution requires active Agent')
+            WHERE NOT EXISTS (
+                SELECT 1 FROM agents
+                WHERE id = new.agent_id AND provisioning_state = 'active'
+            );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER file_reservations_active_agent_guard_bi
+        BEFORE INSERT ON file_reservations
+        WHEN new.agent_id IS NOT NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'file reservation requires active Agent')
+            WHERE NOT EXISTS (
+                SELECT 1 FROM agents
+                WHERE id = new.agent_id AND provisioning_state = 'active'
+            );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER agent_links_active_agents_guard_bi
+        BEFORE INSERT ON agent_links
+        BEGIN
+            SELECT RAISE(ABORT, 'agent link requires active Agents')
+            WHERE NOT EXISTS (
+                SELECT 1 FROM agents
+                WHERE id = new.a_agent_id AND provisioning_state = 'active'
+            ) OR NOT EXISTS (
+                SELECT 1 FROM agents
+                WHERE id = new.b_agent_id AND provisioning_state = 'active'
+            );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER messages_active_sender_guard_bi
+        BEFORE INSERT ON messages
+        BEGIN
+            SELECT RAISE(ABORT, 'message requires active sender Agent')
+            WHERE NOT EXISTS (
+                SELECT 1 FROM agents
+                WHERE id = new.sender_id AND provisioning_state = 'active'
+            );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER message_recipients_active_agent_guard_bi
+        BEFORE INSERT ON message_recipients
+        BEGIN
+            SELECT RAISE(ABORT, 'message recipient requires active Agent')
+            WHERE NOT EXISTS (
+                SELECT 1 FROM agents
+                WHERE id = new.agent_id AND provisioning_state = 'active'
+            );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER message_deliveries_active_agents_guard_bi
+        BEFORE INSERT ON message_deliveries
+        BEGIN
+            SELECT RAISE(ABORT, 'delivery requires active sender Agent')
+            WHERE NOT EXISTS (
+                SELECT 1 FROM agents
+                WHERE id = new.sender_id AND provisioning_state = 'active'
+            );
+            SELECT RAISE(ABORT, 'delivery requires active actor Agent')
+            WHERE new.actor_kind = 'agent' AND NOT EXISTS (
+                SELECT 1 FROM agents
+                WHERE id = new.actor_id AND provisioning_state = 'active'
+            );
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER message_delivery_recipients_active_agent_guard_bi
+        BEFORE INSERT ON message_delivery_recipients
+        BEGIN
+            SELECT RAISE(ABORT, 'delivery recipient requires active Agent')
+            WHERE NOT EXISTS (
+                SELECT 1 FROM agents
+                WHERE id = new.agent_id AND provisioning_state = 'active'
+            );
+        END
+        """
+    )
     connection.exec_driver_sql(
         """
         CREATE TRIGGER IF NOT EXISTS agents_identity_collision_guard_bi
@@ -2094,27 +3618,7 @@ def _setup_fts(connection: Any) -> None:
         END
         """
     )
-    connection.exec_driver_sql(
-        """
-        CREATE TRIGGER IF NOT EXISTS message_deliveries_project_guard_bd
-        BEFORE DELETE ON projects
-        BEGIN
-            SELECT RAISE(ABORT, 'project has immutable message delivery history')
-            WHERE EXISTS (
-                SELECT 1
-                FROM message_deliveries
-                WHERE (
-                      project_id = old.id
-                      OR sender_project_id_snapshot = old.id
-                      OR (
-                          actor_kind = 'agent'
-                          AND actor_project_id_snapshot = old.id
-                      )
-                  )
-            );
-        END
-        """
-    )
+    connection.exec_driver_sql(_MESSAGE_DELIVERIES_PROJECT_GUARD_BD_SQL)
     connection.exec_driver_sql(
         """
         CREATE TRIGGER IF NOT EXISTS message_deliveries_project_guard_bu
@@ -2376,6 +3880,8 @@ def _setup_fts(connection: Any) -> None:
         END
         """
     )
+    if validate_execution_schema:
+        _validate_agent_execution_schema(connection)
 
 
 def get_database_path(settings: Settings | None = None) -> Path | None:

@@ -2,21 +2,21 @@
 # Copy to deploy/capabilities/agent_capabilities.yaml and populate with real data.
 
 agents:
-  - name: BlueLake
-    project: /abs/path/backend
+  - name: codex-wsl-home-1
+    project: /owner/backend
     capabilities:
       - messaging
       - read
       - ack
-  - name: GreenCastle
-    project: /abs/path/backend
+  - name: claude-linux-ci-1
+    project: /owner/backend
     capabilities:
       - messaging
       - write
       - claims
       - repository
-  - name: OpsBot
-    project: /abs/path/backend
+  - name: opencode-linux-automation-1
+    project: /owner/backend
     capabilities:
       - workflow
       - contact

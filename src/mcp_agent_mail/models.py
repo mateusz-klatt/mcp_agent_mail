@@ -145,6 +145,11 @@ def _new_agent_generation() -> str:
     return secrets.token_hex(32)
 
 
+def _new_execution_id() -> str:
+    """Return a canonical UUID for one bounded agent execution."""
+    return str(uuid.uuid4())
+
+
 def _new_delivery_id() -> str:
     """Return a canonical UUID for one durable message-delivery intent."""
     return str(uuid.uuid4())
@@ -153,6 +158,7 @@ def _new_delivery_id() -> str:
 class Project(SQLModel, table=True):
     __tablename__ = "projects"
     __table_args__ = (
+        Index("uq_projects_project_uid", "project_uid", unique=True),
         CheckConstraint(
             "length(slug) BETWEEN 1 AND 255 "
             "AND lower(slug) = slug "
@@ -166,6 +172,11 @@ class Project(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     slug: str = Field(index=True, unique=True, max_length=255)
     human_key: str = Field(max_length=255, index=True)
+    # ``project_uid`` is the durable repository identity.  It is nullable only
+    # for rows created before this column existed: such rows are claimed lazily
+    # after an exact, unambiguous identity match instead of being bulk-merged
+    # during migration.
+    project_uid: Optional[str] = Field(default=None, max_length=255)
     project_generation: str = Field(
         default_factory=_new_project_generation,
         sa_column=Column(
@@ -205,7 +216,13 @@ class ProductProjectLink(SQLModel, table=True):
 
 class Agent(SQLModel, table=True):
     __tablename__ = "agents"
-    __table_args__ = (UniqueConstraint("project_id", "name", name="uq_agent_project_name"),)
+    __table_args__ = (
+        UniqueConstraint("project_id", "name", name="uq_agent_project_name"),
+        CheckConstraint(
+            "provisioning_state IN ('provisioning', 'active')",
+            name="ck_agents_provisioning_state",
+        ),
+    )
 
     id: Optional[int] = Field(default=None, primary_key=True)
     project_id: int = Field(foreign_key="projects.id", index=True)
@@ -226,6 +243,17 @@ class Agent(SQLModel, table=True):
     attachments_policy: str = Field(default="auto", max_length=16)
     contact_policy: str = Field(default="auto", max_length=16)  # open | auto | contacts_only | block_all
     registration_token: Optional[str] = Field(default=None, max_length=64, index=True)
+    # A newly inserted mailbox is not addressable until its private credential
+    # and Git profile have both been published successfully. Existing databases
+    # are backfilled to ``active`` by the additive schema migration.
+    provisioning_state: str = Field(
+        default="active",
+        sa_column=Column(
+            String(16),
+            nullable=False,
+            server_default=text("'active'"),
+        ),
+    )
     retired_at: Optional[datetime] = Field(default=None)
     # A human-chosen label, shown alongside `name` and never instead of it.
     #
@@ -246,6 +274,242 @@ class Agent(SQLModel, table=True):
     # set is what makes this field safe to render without asking anything of the
     # reader.
     notify_sound: Optional[str] = Field(default=None, max_length=32)
+
+
+class AgentExecution(SQLModel, table=True):
+    """One session or subagent run owned by a durable Agent identity."""
+
+    __tablename__ = "agent_executions"
+    __table_args__ = (
+        CheckConstraint(
+            "length(id) = 36 "
+            "AND substr(id, 9, 1) = '-' "
+            "AND substr(id, 14, 1) = '-' "
+            "AND substr(id, 19, 1) = '-' "
+            "AND substr(id, 24, 1) = '-' "
+            "AND lower(id) = id "
+            "AND length(replace(id, '-', '')) = 32 "
+            "AND replace(id, '-', '') NOT GLOB '*[^0-9a-f]*'",
+            name="ck_agent_executions_uuid",
+        ),
+        CheckConstraint(
+            "length(external_id) BETWEEN 1 AND 255 "
+            "AND length(trim(external_id)) > 0",
+            name="ck_agent_executions_external_id",
+        ),
+        CheckConstraint(
+            "length(client_name) BETWEEN 1 AND 128 "
+            "AND length(trim(client_name)) > 0",
+            name="ck_agent_executions_client_name",
+        ),
+        CheckConstraint(
+            "length(execution_token_hash) = 64 "
+            "AND lower(execution_token_hash) = execution_token_hash "
+            "AND execution_token_hash NOT GLOB '*[^0-9a-f]*'",
+            name="ck_agent_executions_token_hash",
+        ),
+        CheckConstraint(
+            "lifecycle_protocol_version >= 0",
+            name="ck_agent_executions_lifecycle_protocol_version",
+        ),
+        CheckConstraint(
+            "turn_id IS NULL OR (length(turn_id) BETWEEN 1 AND 255 "
+            "AND length(trim(turn_id)) > 0)",
+            name="ck_agent_executions_turn_id",
+        ),
+        CheckConstraint(
+            "agent_type IS NULL OR (length(agent_type) BETWEEN 1 AND 128 "
+            "AND length(trim(agent_type)) > 0)",
+            name="ck_agent_executions_agent_type",
+        ),
+        CheckConstraint(
+            "model IS NULL OR (length(model) BETWEEN 1 AND 128 "
+            "AND length(trim(model)) > 0)",
+            name="ck_agent_executions_model",
+        ),
+        CheckConstraint(
+            "permission_mode IS NULL OR (length(permission_mode) BETWEEN 1 AND 64 "
+            "AND length(trim(permission_mode)) > 0)",
+            name="ck_agent_executions_permission_mode",
+        ),
+        CheckConstraint(
+            "kind IN ('session', 'subagent')",
+            name="ck_agent_executions_kind",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'completed', 'failed', 'cancelled', 'expired')",
+            name="ck_agent_executions_status",
+        ),
+        CheckConstraint(
+            "(kind = 'session' AND parent_execution_id IS NULL) "
+            "OR (kind = 'subagent' AND parent_execution_id IS NOT NULL "
+            "    AND parent_execution_id != id)",
+            name="ck_agent_executions_kind_parent",
+        ),
+        CheckConstraint(
+            "head_sha IS NULL OR ("
+            "length(head_sha) = 40 "
+            "AND lower(head_sha) = head_sha "
+            "AND head_sha NOT GLOB '*[^0-9a-f]*'"
+            ")",
+            name="ck_agent_executions_head_sha",
+        ),
+        CheckConstraint(
+            "length(task_description) <= 2048",
+            name="ck_agent_executions_task_description",
+        ),
+        CheckConstraint(
+            "(cwd IS NULL OR (length(cwd) BETWEEN 1 AND 2048 AND length(trim(cwd)) > 0)) "
+            "AND (repo_root IS NULL OR (length(repo_root) BETWEEN 1 AND 2048 "
+            "     AND length(trim(repo_root)) > 0)) "
+            "AND (git_common_dir IS NULL OR (length(git_common_dir) BETWEEN 1 AND 2048 "
+            "     AND length(trim(git_common_dir)) > 0)) "
+            "AND (worktree_path IS NULL OR (length(worktree_path) BETWEEN 1 AND 2048 "
+            "     AND length(trim(worktree_path)) > 0)) "
+            "AND (branch IS NULL OR (length(branch) BETWEEN 1 AND 512 "
+            "     AND length(trim(branch)) > 0))",
+            name="ck_agent_executions_workspace_metadata",
+        ),
+        CheckConstraint(
+            "(status = 'active' AND ended_ts IS NULL) "
+            "OR (status != 'active' AND ended_ts IS NOT NULL)",
+            name="ck_agent_executions_status_end",
+        ),
+        CheckConstraint(
+            "last_active_ts >= started_ts "
+            "AND (ended_ts IS NULL OR ended_ts >= last_active_ts)",
+            name="ck_agent_executions_timestamps",
+        ),
+        Index(
+            "uq_agent_executions_session_external",
+            "agent_id",
+            "client_name",
+            "external_id",
+            unique=True,
+            sqlite_where=text("kind = 'session'"),
+        ),
+        Index(
+            "uq_agent_executions_subagent_external",
+            "parent_execution_id",
+            "client_name",
+            "external_id",
+            unique=True,
+            sqlite_where=text("kind = 'subagent'"),
+        ),
+        Index(
+            "idx_agent_executions_active",
+            "project_id",
+            "agent_id",
+            "last_active_ts",
+            sqlite_where=text("status = 'active'"),
+        ),
+        Index(
+            "idx_agent_executions_active_stale",
+            "last_active_ts",
+            "project_id",
+            "id",
+            sqlite_where=text("status = 'active'"),
+        ),
+        Index(
+            "idx_agent_executions_project_active_stale",
+            "project_id",
+            "last_active_ts",
+            "id",
+            sqlite_where=text("status = 'active'"),
+        ),
+    )
+
+    id: str = Field(default_factory=_new_execution_id, primary_key=True, max_length=36)
+    project_id: int = Field(foreign_key="projects.id", index=True)
+    agent_id: int = Field(foreign_key="agents.id", index=True)
+    parent_execution_id: Optional[str] = Field(
+        default=None,
+        foreign_key="agent_executions.id",
+        index=True,
+        max_length=36,
+    )
+    external_id: str = Field(max_length=255)
+    client_name: str = Field(max_length=128)
+    execution_token_hash: str = Field(
+        repr=False,
+        sa_column=Column(String(64), nullable=False, unique=True),
+    )
+    lifecycle_protocol_version: int = Field(default=0)
+    turn_id: Optional[str] = Field(default=None, max_length=255)
+    agent_type: Optional[str] = Field(default=None, max_length=128)
+    model: Optional[str] = Field(default=None, max_length=128)
+    permission_mode: Optional[str] = Field(default=None, max_length=64)
+    kind: str = Field(default="session", max_length=16)
+    status: str = Field(default="active", max_length=16)
+    task_description: str = Field(default="", max_length=2048)
+    cwd: Optional[str] = Field(default=None, max_length=2048)
+    repo_root: Optional[str] = Field(default=None, max_length=2048)
+    git_common_dir: Optional[str] = Field(default=None, max_length=2048)
+    worktree_path: Optional[str] = Field(default=None, max_length=2048)
+    branch: Optional[str] = Field(default=None, max_length=512)
+    head_sha: Optional[str] = Field(default=None, max_length=40)
+    started_ts: datetime = Field(default_factory=_utcnow_naive)
+    last_active_ts: datetime = Field(default_factory=_utcnow_naive)
+    ended_ts: Optional[datetime] = Field(default=None)
+
+
+class BuildSlotArtifactProjection(SQLModel, table=True):
+    """Durable outbox row for one terminal execution's build-slot JSON."""
+
+    __tablename__ = "build_slot_artifact_projections"
+    __table_args__ = (
+        Index(
+            "idx_build_slot_artifact_projections_pending",
+            "project_id",
+            "execution_id",
+            sqlite_where=text("reconciled_ts IS NULL"),
+        ),
+    )
+
+    execution_id: str = Field(
+        foreign_key="agent_executions.id",
+        primary_key=True,
+        max_length=36,
+    )
+    project_id: int = Field(foreign_key="projects.id")
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+    reconciled_ts: Optional[datetime] = Field(default=None)
+
+
+class BuildSlotArtifactPath(SQLModel, table=True):
+    """Exact immutable archive path registered by an execution-owned lease."""
+
+    __tablename__ = "build_slot_artifact_paths"
+    __table_args__ = (
+        CheckConstraint(
+            "length(slot_path_component) BETWEEN 1 AND 80 "
+            "AND slot_path_component NOT IN ('.', '..') "
+            "AND instr(slot_path_component, '/') = 0 "
+            "AND instr(slot_path_component, char(92)) = 0",
+            name="ck_build_slot_artifact_paths_component",
+        ),
+        CheckConstraint(
+            "length(slot_name) BETWEEN 1 AND 512 "
+            "AND length(trim(slot_name)) > 0",
+            name="ck_build_slot_artifact_paths_slot_name",
+        ),
+        Index(
+            "idx_build_slot_artifact_paths_project_execution",
+            "project_id",
+            "execution_id",
+            "slot_path_component",
+        ),
+    )
+
+    execution_id: str = Field(
+        foreign_key="agent_executions.id",
+        primary_key=True,
+        max_length=36,
+    )
+    slot_path_component: str = Field(primary_key=True, max_length=80)
+    project_id: int = Field(foreign_key="projects.id")
+    slot_name: str = Field(max_length=512)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
 
 
 class MessageRecipient(SQLModel, table=True):
@@ -569,6 +833,28 @@ class FileReservation(SQLModel, table=True):
     __table_args__ = (
         Index("idx_file_reservations_project_released_expires", "project_id", "released_ts", "expires_ts"),
         Index("idx_file_reservations_project_agent_released", "project_id", "agent_id", "released_ts"),
+        Index("idx_file_reservations_execution", "execution_id"),
+        Index(
+            "idx_file_reservations_archive_pending",
+            "project_id",
+            "id",
+            sqlite_where=text(
+                "archive_synced_revision < archive_revision"
+            ),
+        ),
+        CheckConstraint(
+            "origin IN ('auto', 'explicit')",
+            name="ck_file_reservations_origin",
+        ),
+        CheckConstraint(
+            "archive_revision >= 1",
+            name="ck_file_reservations_archive_revision",
+        ),
+        CheckConstraint(
+            "archive_synced_revision >= 0 "
+            "AND archive_synced_revision <= archive_revision",
+            name="ck_file_reservations_archive_synced_revision",
+        ),
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -579,12 +865,33 @@ class FileReservation(SQLModel, table=True):
     # auto-released by the staleness sweeper instead of pinning the path
     # forever. (#161)
     agent_id: Optional[int] = Field(default=None, foreign_key="agents.id", index=True)
+    # Legacy reservations remain nullable. New execution-aware claims bind to
+    # the exact run that owns them so sibling runs of one Agent still conflict.
+    execution_id: Optional[str] = Field(
+        default=None,
+        foreign_key="agent_executions.id",
+        max_length=36,
+    )
+    origin: str = Field(default="explicit", max_length=16)
     path_pattern: str = Field(max_length=512)
     exclusive: bool = Field(default=True)
     reason: str = Field(default="", max_length=512)
     created_ts: datetime = Field(default_factory=_utcnow_naive)
     expires_ts: datetime
     released_ts: Optional[datetime] = None
+    # DB state is authoritative. Every artifact-visible mutation advances
+    # ``archive_revision`` in SQLite; publication acknowledges only the exact
+    # revision that reached the Git archive. A crash or I/O failure therefore
+    # leaves a durable, retryable ``archive_synced_revision < archive_revision``
+    # row instead of relying on the old lease TTL to hide stale guard JSON.
+    archive_revision: int = Field(
+        default=1,
+        sa_column=Column(Integer, nullable=False, server_default="1"),
+    )
+    archive_synced_revision: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default="0"),
+    )
 
 
 class AgentLink(SQLModel, table=True):

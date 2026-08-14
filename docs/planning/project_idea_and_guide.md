@@ -1,5 +1,12 @@
 # Original prompt:
 
+> **Historical, non-normative design record.** This document preserves the
+> original project prompt and early responses. Current behavior is defined by
+> `README.md`, `AGENTS.md`, and `docs/hooks.md`: Agents are durable
+> `client-os-host-slot` mailboxes, while sessions and native subagents are
+> `AgentExecution` rows. Do not copy the temporary adjective+noun identity
+> examples below into new integrations.
+
 ```
 
 I have an idea for a python project I want you to help me design in the best way possible, doing research on the web and really thinking super hard about the best way to do things.

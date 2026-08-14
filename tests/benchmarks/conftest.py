@@ -48,6 +48,7 @@ async def _bench_context(label: str, seed: int):
                 "project_key": project_key,
                 "program": "benchmark",
                 "model": "test",
+                "name_hint": f"codex-wsl-bench-{label.replace('_', '-')}-1",
                 "task_description": f"Benchmark agent for {label}",
             },
         )

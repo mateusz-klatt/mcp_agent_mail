@@ -47,15 +47,20 @@ async def test_attachment_paths_fail_closed_without_artifacts(isolated_env, monk
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {
+                "project_key": "Backend",
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-attachments-1",
+            },
         )
         with pytest.raises(ToolError, match="bounded canonical inline representation"):
             await client.call_tool(
                 "send_message",
                 {
                     "project_key": "Backend",
-                    "sender_name": "BlueLake",
-                    "to": ["BlueLake"],
+                    "sender_name": "codex-wsl-attachments-1",
+                    "to": ["codex-wsl-attachments-1"],
                     "subject": "Orig",
                     "body_md": "see",
                     "attachment_paths": [str(img_path)],
@@ -87,15 +92,20 @@ async def test_attachment_paths_fail_closed_independent_of_inline_threshold(isol
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {
+                "project_key": "Backend",
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-attachments-1",
+            },
         )
         with pytest.raises(ToolError, match="bounded canonical inline representation"):
             await client.call_tool(
                 "send_message",
                 {
                     "project_key": "Backend",
-                    "sender_name": "BlueLake",
-                    "to": ["BlueLake"],
+                    "sender_name": "codex-wsl-attachments-1",
+                    "to": ["codex-wsl-attachments-1"],
                     "subject": "Inline",
                     "body_md": "body",
                     "attachment_paths": [str(img_path)],
@@ -112,8 +122,8 @@ async def test_attachment_paths_fail_closed_independent_of_inline_threshold(isol
                 "send_message",
                 {
                     "project_key": "Backend",
-                    "sender_name": "BlueLake",
-                    "to": ["BlueLake"],
+                    "sender_name": "codex-wsl-attachments-1",
+                    "to": ["codex-wsl-attachments-1"],
                     "subject": "File",
                     "body_md": "body",
                     "attachment_paths": [str(img_path)],

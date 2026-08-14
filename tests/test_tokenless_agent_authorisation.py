@@ -6,8 +6,8 @@ to issue one afterwards, because minting a token requires authentication and
 authentication requires the token. So a tokenless agent cannot defend itself,
 and whatever a peer is allowed to do to it, it cannot undo.
 
-That makes the boundary worth pinning: reversible operations may be authorised
-by any participant, irreversible ones by nobody but the target.
+That makes the reversible adjacent-agent authorization boundary worth pinning.
+Irreversible identity deletion is intentionally absent from the public API.
 
 Every test uses TWO sessions. A session that registered an agent is *bound* to
 it, and a bound session authenticates as that agent without consulting tokens
@@ -19,13 +19,14 @@ from __future__ import annotations
 
 import pytest
 from fastmcp import Client
-from fastmcp.exceptions import ToolError
 from sqlalchemy import text
 
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import get_session
 
 KEY = "/test/tokenless"
+TOKENLESS_AGENT = "codex-linux-tokenless-1"
+PEER_AGENT = "claude-linux-tokenless-peer-1"
 
 
 def _data(result):
@@ -43,30 +44,40 @@ async def _strip_token(agent_name: str) -> None:
 
 
 async def _seed(server) -> dict:
-    """Create a tokenless 'ghost-1' and a token-holding 'peer-1'."""
+    """Create one tokenless durable Agent and one token-holding peer."""
     async with Client(server) as setup:
         await setup.call_tool("ensure_project", {"human_key": KEY})
         await setup.call_tool(
             "register_agent",
-            {"project_key": KEY, "name": "ghost-1", "program": "probe", "model": "probe"},
+            {
+                "project_key": KEY,
+                "name": TOKENLESS_AGENT,
+                "program": "probe",
+                "model": "probe",
+            },
         )
         peer = _data(
             await setup.call_tool(
                 "register_agent",
-                {"project_key": KEY, "name": "peer-1", "program": "probe", "model": "probe"},
+                {
+                    "project_key": KEY,
+                    "name": PEER_AGENT,
+                    "program": "probe",
+                    "model": "probe",
+                },
             )
         )
-    await _strip_token("ghost-1")
+    await _strip_token(TOKENLESS_AGENT)
     return peer
 
 
 async def _bind_as_peer(client, peer) -> None:
-    """Authenticate this session as peer-1 and nothing else."""
+    """Authenticate this session as the token-holding peer and nothing else."""
     await client.call_tool(
         "whois",
         {
             "project_key": KEY,
-            "agent_name": "peer-1",
+            "agent_name": PEER_AGENT,
             "registration_token": peer["registration_token"],
         },
     )
@@ -82,7 +93,7 @@ async def test_a_peer_may_retire_a_tokenless_agent(isolated_env):
         await _bind_as_peer(bystander, peer)
         assert _data(
             await bystander.call_tool(
-                "retire_agent", {"project_key": KEY, "agent_name": "ghost-1"}
+                "retire_agent", {"project_key": KEY, "agent_name": TOKENLESS_AGENT}
             )
         )
 
@@ -99,56 +110,11 @@ async def test_a_peer_may_put_a_tokenless_agent_back(isolated_env):
     peer = await _seed(server)
     async with Client(server) as bystander:
         await _bind_as_peer(bystander, peer)
-        await bystander.call_tool("retire_agent", {"project_key": KEY, "agent_name": "ghost-1"})
-        assert _data(
-            await bystander.call_tool(
-                "unretire_agent", {"project_key": KEY, "agent_name": "ghost-1"}
-            )
+        await bystander.call_tool(
+            "retire_agent", {"project_key": KEY, "agent_name": TOKENLESS_AGENT}
         )
-
-
-@pytest.mark.asyncio
-async def test_a_peer_may_not_permanently_delete_a_tokenless_agent(isolated_env):
-    """The load-bearing one.
-
-    Deleting an identity destroys its mailbox and its history, and a tokenless
-    agent cannot be recreated with them. Allowing a bystander to do that put
-    the one identity that cannot defend itself within reach of everyone else.
-    """
-    server = build_mcp_server()
-    peer = await _seed(server)
-    async with Client(server) as bystander:
-        await _bind_as_peer(bystander, peer)
-        with pytest.raises(ToolError) as excinfo:
-            await bystander.call_tool(
-                "hard_delete_agent",
-                {"project_key": KEY, "agent_name": "ghost-1", "confirmation": "I UNDERSTAND"},
-            )
-        assert "ghost-1" in str(excinfo.value)
-
-    async with get_session() as session:
-        row = (
-            await session.execute(
-                text("SELECT name FROM agents WHERE name = :n"), {"n": "ghost-1"}
-            )
-        ).fetchone()
-    assert row is not None, "the identity a bystander may not delete was deleted"
-
-
-@pytest.mark.asyncio
-async def test_an_agent_holding_its_own_token_is_still_deletable(isolated_env):
-    """The narrowing must not reach agents that can authenticate."""
-    server = build_mcp_server()
-    peer = await _seed(server)
-    async with Client(server) as client:
         assert _data(
-            await client.call_tool(
-                "hard_delete_agent",
-                {
-                    "project_key": KEY,
-                    "agent_name": "peer-1",
-                    "confirmation": "I UNDERSTAND",
-                    "registration_token": peer["registration_token"],
-                },
+            await bystander.call_tool(
+                "unretire_agent", {"project_key": KEY, "agent_name": TOKENLESS_AGENT}
             )
         )

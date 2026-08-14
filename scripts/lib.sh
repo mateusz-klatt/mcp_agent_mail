@@ -1151,6 +1151,11 @@ integration_client() {
     codex) printf 'codex' ;;
     copilot) printf 'copilot' ;;
     gemini) printf 'gemini' ;;
+    factory) printf 'factory' ;;
+    cursor) printf 'cursor' ;;
+    cline) printf 'cline' ;;
+    windsurf) printf 'windsurf' ;;
+    opencode) printf 'opencode' ;;
     *)
       log_err "Unsupported agent client token: ${client}"
       return 1 ;;
@@ -1210,21 +1215,23 @@ requested_agent_name_override() {
   fi
 }
 
-# Build the JSON arguments fragment for register_agent, optionally including
-# an explicit name when AGENT_NAME is set.
-# Usage: _ARGS=$(build_register_agent_arguments_json "$human_key" "program" "model" "task" "$name_override")
+# Build the JSON arguments fragment for register_agent with the required durable
+# client/OS/host/slot mailbox name.
+# Usage: _ARGS=$(build_register_agent_arguments_json "$human_key" "program" "model" "task" "$agent_name")
 build_register_agent_arguments_json() {
   local human_key="$1" program="$2" model="$3" task="$4" agent_name="${5:-}"
+  if [[ -z "$agent_name" ]]; then
+    log_err "register_agent requires a durable client-os-host-slot name"
+    return 1
+  fi
   local program_esc model_esc task_esc
   program_esc=$(json_escape_string "$program") || return 1
   model_esc=$(json_escape_string "$model") || return 1
   task_esc=$(json_escape_string "$task") || return 1
   local args="\"project_key\":${human_key},\"program\":${program_esc},\"model\":${model_esc},\"task_description\":${task_esc}"
-  if [[ -n "$agent_name" ]]; then
-    local name_esc
-    name_esc=$(json_escape_string "$agent_name") || return 1
-    args="${args},\"name\":${name_esc}"
-  fi
+  local name_esc
+  name_esc=$(json_escape_string "$agent_name") || return 1
+  args="${args},\"name\":${name_esc}"
   echo "$args"
 }
 

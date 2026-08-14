@@ -10,6 +10,8 @@ from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.config import clear_settings_cache
 from tests.keys import pkey
 
+IDENTITY_AGENT = "codex-wsl-identity-1"
+
 
 @pytest.mark.asyncio
 async def test_whois_and_projects_resources(isolated_env, monkeypatch):
@@ -20,14 +22,20 @@ async def test_whois_and_projects_resources(isolated_env, monkeypatch):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake", "task_description": "dir"},
+            {
+                "project_key": "Backend",
+                "program": "codex",
+                "model": "gpt-5",
+                "name": IDENTITY_AGENT,
+                "task_description": "dir",
+            },
         )
 
         who = await client.call_tool(
             "whois",
-            {"project_key": "Backend", "agent_name": "BlueLake"},
+            {"project_key": "Backend", "agent_name": IDENTITY_AGENT},
         )
-        assert who.data.get("name") == "BlueLake"
+        assert who.data.get("name") == IDENTITY_AGENT
         assert who.data.get("program") == "codex"
 
         # Projects list
@@ -36,7 +44,7 @@ async def test_whois_and_projects_resources(isolated_env, monkeypatch):
 
         # Project detail
         blocks2 = await client.read_resource("resource://project/backend")
-        assert blocks2 and "BlueLake" in (blocks2[0].text or "")
+        assert blocks2 and IDENTITY_AGENT in (blocks2[0].text or "")
 
 
 @pytest.mark.asyncio

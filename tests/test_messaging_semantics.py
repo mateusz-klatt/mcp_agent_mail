@@ -63,14 +63,14 @@ async def test_reply_message_inherits_thread_and_subject_prefix(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "codex-wsl-semantics-2"},
         )
         m1 = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": "codex-wsl-semantics-2",
+                "to": ["codex-wsl-semantics-2"],
                 "subject": "Plan",
                 "body_md": "body",
                 "idempotency_key": "semantics-reply-parent",
@@ -84,7 +84,7 @@ async def test_reply_message_inherits_thread_and_subject_prefix(isolated_env):
             {
                 "project_key": "Backend",
                 "message_id": orig_id,
-                "sender_name": "BlueLake",
+                "sender_name": "codex-wsl-semantics-2",
                 "body_md": "ack",
                 "idempotency_key": "semantics-reply-child",
             },
@@ -107,14 +107,19 @@ async def test_reply_message_explicit_empty_to_does_not_restore_default_recipien
         await client.call_tool("ensure_project", {"human_key": pkey("reply-empty-to")})
         await client.call_tool(
             "register_agent",
-            {"project_key": pkey("reply-empty-to"), "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {
+                "project_key": pkey("reply-empty-to"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-2",
+            },
         )
         original = await client.call_tool(
             "send_message",
             {
                 "project_key": pkey("reply-empty-to"),
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": "codex-wsl-semantics-2",
+                "to": ["codex-wsl-semantics-2"],
                 "subject": "Plan",
                 "body_md": "body",
                 "idempotency_key": "semantics-empty-reply-parent",
@@ -128,7 +133,7 @@ async def test_reply_message_explicit_empty_to_does_not_restore_default_recipien
             {
                 "project_key": pkey("reply-empty-to"),
                 "message_id": original_id,
-                "sender_name": "BlueLake",
+                "sender_name": "codex-wsl-semantics-2",
                 "to": [],
                 "body_md": "no recipients on purpose",
                 "idempotency_key": "semantics-empty-reply-child",
@@ -147,18 +152,18 @@ async def test_mark_read_then_ack_updates_state(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "codex-wsl-semantics-1"},
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "RedStone"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "codex-wsl-semantics-3"},
         )
         m1 = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "GreenCastle",
-                "to": ["RedStone"],
+                "sender_name": "codex-wsl-semantics-1",
+                "to": ["codex-wsl-semantics-3"],
                 "subject": "AckPlease",
                 "body_md": "hello",
                 "ack_required": True,
@@ -170,13 +175,13 @@ async def test_mark_read_then_ack_updates_state(isolated_env):
 
         mr = await client.call_tool(
             "mark_message_read",
-            {"project_key": "Backend", "agent_name": "RedStone", "message_id": mid},
+            {"project_key": "Backend", "agent_name": "codex-wsl-semantics-3", "message_id": mid},
         )
         assert mr.data.get("read") is True and isinstance(mr.data.get("read_at"), str)
 
         ack = await client.call_tool(
             "acknowledge_message",
-            {"project_key": "Backend", "agent_name": "RedStone", "message_id": mid},
+            {"project_key": "Backend", "agent_name": "codex-wsl-semantics-3", "message_id": mid},
         )
         assert ack.data.get("acknowledged") is True
         assert isinstance(ack.data.get("acknowledged_at"), str)
@@ -190,18 +195,18 @@ async def test_acknowledge_idempotent_multiple_calls(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "codex-wsl-semantics-1"},
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "RedStone"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "codex-wsl-semantics-3"},
         )
         m1 = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "GreenCastle",
-                "to": ["RedStone"],
+                "sender_name": "codex-wsl-semantics-1",
+                "to": ["codex-wsl-semantics-3"],
                 "subject": "AckTwice",
                 "body_md": "hello",
                 "ack_required": True,
@@ -213,14 +218,14 @@ async def test_acknowledge_idempotent_multiple_calls(isolated_env):
 
         first = await client.call_tool(
             "acknowledge_message",
-            {"project_key": "Backend", "agent_name": "RedStone", "message_id": mid},
+            {"project_key": "Backend", "agent_name": "codex-wsl-semantics-3", "message_id": mid},
         )
         first_ack_at = first.data.get("acknowledged_at")
         assert first.data.get("acknowledged") is True and isinstance(first_ack_at, str)
 
         second = await client.call_tool(
             "acknowledge_message",
-            {"project_key": "Backend", "agent_name": "RedStone", "message_id": mid},
+            {"project_key": "Backend", "agent_name": "codex-wsl-semantics-3", "message_id": mid},
         )
         # Timestamps should remain the same (idempotent)
         assert second.data.get("acknowledged_at") == first_ack_at
@@ -234,7 +239,12 @@ async def test_send_message_requires_sender_token_across_sessions(isolated_env):
         await bootstrap_client.call_tool("ensure_project", {"human_key": pkey("security/spoof-send")})
         sender = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": pkey("security/spoof-send"), "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {
+                "project_key": pkey("security/spoof-send"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-1",
+            },
         )
         sender_token = sender.data["registration_token"]
 
@@ -244,8 +254,8 @@ async def test_send_message_requires_sender_token_across_sessions(isolated_env):
                 "send_message",
                 {
                     "project_key": pkey("security/spoof-send"),
-                    "sender_name": "GreenCastle",
-                    "to": ["GreenCastle"],
+                    "sender_name": "codex-wsl-semantics-1",
+                    "to": ["codex-wsl-semantics-1"],
                     "subject": "Forged",
                     "body_md": "This should fail",
                     "idempotency_key": "security-spoof-forged",
@@ -258,9 +268,9 @@ async def test_send_message_requires_sender_token_across_sessions(isolated_env):
             "send_message",
                 {
                     "project_key": pkey("security/spoof-send"),
-                    "sender_name": "GreenCastle",
+                    "sender_name": "codex-wsl-semantics-1",
                     "sender_token": sender_token,
-                    "to": ["GreenCastle"],
+                    "to": ["codex-wsl-semantics-1"],
                     "subject": "Legit",
                     "body_md": "This should succeed",
                     "idempotency_key": "security-spoof-legit",
@@ -278,11 +288,21 @@ async def test_send_message_auto_contact_requests_pending_approval_without_targe
         await bootstrap_client.call_tool("ensure_project", {"human_key": pkey("security/auto-contact-pending")})
         green = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": pkey("security/auto-contact-pending"), "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {
+                "project_key": pkey("security/auto-contact-pending"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-1",
+            },
         )
         blue = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": pkey("security/auto-contact-pending"), "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {
+                "project_key": pkey("security/auto-contact-pending"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-2",
+            },
         )
         green_token = green.data["registration_token"]
         blue_token = blue.data["registration_token"]
@@ -293,40 +313,40 @@ async def test_send_message_auto_contact_requests_pending_approval_without_targe
                 "send_message",
                 {
                     "project_key": pkey("security/auto-contact-pending"),
-                    "sender_name": "GreenCastle",
+                    "sender_name": "codex-wsl-semantics-1",
                     "sender_token": green_token,
-                    "to": ["BlueLake"],
+                    "to": ["codex-wsl-semantics-2"],
                     "subject": "Need approval",
                     "body_md": "please let me in",
                     "auto_contact_if_blocked": True,
                     "idempotency_key": "security-auto-contact-pending",
                 },
             )
-        assert "Pending contact requests were created for: BlueLake" in str(exc_info.value)
+        assert "Pending contact requests were created for: codex-wsl-semantics-2" in str(exc_info.value)
 
         contacts = await sender_client.call_tool(
             "list_contacts",
             {
                 "project_key": pkey("security/auto-contact-pending"),
-                "agent_name": "GreenCastle",
+                "agent_name": "codex-wsl-semantics-1",
                 "registration_token": green_token,
             },
         )
         contact_items = contacts.structured_content["result"]
-        assert any(item["to"] == "BlueLake" and item["status"] == "pending" for item in contact_items)
+        assert any(item["to"] == "codex-wsl-semantics-2" and item["status"] == "pending" for item in contact_items)
 
     async with Client(server) as recipient_client:
         inbox = await recipient_client.call_tool(
             "fetch_inbox",
             {
                 "project_key": pkey("security/auto-contact-pending"),
-                "agent_name": "BlueLake",
+                "agent_name": "codex-wsl-semantics-2",
                 "registration_token": blue_token,
                 "include_bodies": True,
             },
         )
         messages = inbox.structured_content["result"]
-        assert any(item["subject"] == "Contact request from GreenCastle" for item in messages)
+        assert any(item["subject"] == "Contact request from codex-wsl-semantics-1" for item in messages)
 
 
 @pytest.mark.asyncio
@@ -337,11 +357,21 @@ async def test_send_message_explicit_false_disables_local_auto_contact(isolated_
         await bootstrap_client.call_tool("ensure_project", {"human_key": pkey("security/auto-contact-disabled")})
         green = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": pkey("security/auto-contact-disabled"), "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {
+                "project_key": pkey("security/auto-contact-disabled"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-1",
+            },
         )
         blue = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": pkey("security/auto-contact-disabled"), "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {
+                "project_key": pkey("security/auto-contact-disabled"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-2",
+            },
         )
         green_token = green.data["registration_token"]
         blue_token = blue.data["registration_token"]
@@ -352,9 +382,9 @@ async def test_send_message_explicit_false_disables_local_auto_contact(isolated_
                 "send_message",
                 {
                     "project_key": pkey("security/auto-contact-disabled"),
-                    "sender_name": "GreenCastle",
+                    "sender_name": "codex-wsl-semantics-1",
                     "sender_token": green_token,
-                    "to": ["BlueLake"],
+                    "to": ["codex-wsl-semantics-2"],
                     "subject": "No auto contact",
                     "body_md": "stay blocked",
                     "auto_contact_if_blocked": False,
@@ -366,25 +396,28 @@ async def test_send_message_explicit_false_disables_local_auto_contact(isolated_
             "list_contacts",
             {
                 "project_key": pkey("security/auto-contact-disabled"),
-                "agent_name": "GreenCastle",
+                "agent_name": "codex-wsl-semantics-1",
                 "registration_token": green_token,
             },
         )
         contact_items = contacts.structured_content["result"]
-        assert not any(item["to"] == "BlueLake" and item["status"] == "pending" for item in contact_items)
+        assert not any(
+            item["to"] == "codex-wsl-semantics-2" and item["status"] == "pending"
+            for item in contact_items
+        )
 
     async with Client(server) as recipient_client:
         inbox = await recipient_client.call_tool(
             "fetch_inbox",
             {
                 "project_key": pkey("security/auto-contact-disabled"),
-                "agent_name": "BlueLake",
+                "agent_name": "codex-wsl-semantics-2",
                 "registration_token": blue_token,
                 "include_bodies": True,
             },
         )
         messages = inbox.structured_content["result"]
-        assert not any(item["subject"] == "Contact request from GreenCastle" for item in messages)
+        assert not any(item["subject"] == "Contact request from codex-wsl-semantics-1" for item in messages)
 
 
 @pytest.mark.asyncio
@@ -395,19 +428,29 @@ async def test_send_message_auto_contact_auto_approves_when_target_is_authentica
         await client.call_tool("ensure_project", {"human_key": pkey("security/auto-contact-approved")})
         await client.call_tool(
             "register_agent",
-            {"project_key": pkey("security/auto-contact-approved"), "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {
+                "project_key": pkey("security/auto-contact-approved"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-1",
+            },
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": pkey("security/auto-contact-approved"), "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {
+                "project_key": pkey("security/auto-contact-approved"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-2",
+            },
         )
 
         result = await client.call_tool(
             "send_message",
             {
                 "project_key": pkey("security/auto-contact-approved"),
-                "sender_name": "GreenCastle",
-                "to": ["BlueLake"],
+                "sender_name": "codex-wsl-semantics-1",
+                "to": ["codex-wsl-semantics-2"],
                 "subject": "Auto approved",
                 "body_md": "same session works",
                 "auto_contact_if_blocked": True,
@@ -420,11 +463,11 @@ async def test_send_message_auto_contact_auto_approves_when_target_is_authentica
             "list_contacts",
             {
                 "project_key": pkey("security/auto-contact-approved"),
-                "agent_name": "GreenCastle",
+                "agent_name": "codex-wsl-semantics-1",
             },
         )
         contact_items = contacts.structured_content["result"]
-        assert any(item["to"] == "BlueLake" and item["status"] == "approved" for item in contact_items)
+        assert any(item["to"] == "codex-wsl-semantics-2" and item["status"] == "approved" for item in contact_items)
 
 
 @pytest.mark.asyncio
@@ -436,11 +479,21 @@ async def test_send_message_auto_contact_requests_cross_project_approval_without
         await bootstrap_client.call_tool("ensure_project", {"human_key": pkey("security/auto-contact-xproj-frontend")})
         green = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": pkey("security/auto-contact-xproj-backend"), "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {
+                "project_key": pkey("security/auto-contact-xproj-backend"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-1",
+            },
         )
         blue = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": pkey("security/auto-contact-xproj-frontend"), "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {
+                "project_key": pkey("security/auto-contact-xproj-frontend"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-2",
+            },
         )
         green_token = green.data["registration_token"]
         blue_token = blue.data["registration_token"]
@@ -451,40 +504,43 @@ async def test_send_message_auto_contact_requests_cross_project_approval_without
                 "send_message",
                 {
                     "project_key": pkey("security/auto-contact-xproj-backend"),
-                    "sender_name": "GreenCastle",
+                    "sender_name": "codex-wsl-semantics-1",
                     "sender_token": green_token,
-                    "to": ["BlueLake@/security/auto-contact-xproj-frontend"],
+                    "to": ["codex-wsl-semantics-2@/security/auto-contact-xproj-frontend"],
                     "subject": "Need cross-project approval",
                     "body_md": "please link us",
                     "auto_contact_if_blocked": True,
                     "idempotency_key": "security-auto-contact-xproj-pending",
                 },
             )
-        assert "pending external contact requests were created for BlueLake@/security/auto-contact-xproj-frontend" in str(exc_info.value)
+        assert (
+            "pending external contact requests were created for "
+            "codex-wsl-semantics-2@/security/auto-contact-xproj-frontend"
+        ) in str(exc_info.value)
 
         contacts = await sender_client.call_tool(
             "list_contacts",
             {
                 "project_key": pkey("security/auto-contact-xproj-backend"),
-                "agent_name": "GreenCastle",
+                "agent_name": "codex-wsl-semantics-1",
                 "registration_token": green_token,
             },
         )
         contact_items = contacts.structured_content["result"]
-        assert any(item["to"] == "BlueLake" and item["status"] == "pending" for item in contact_items)
+        assert any(item["to"] == "codex-wsl-semantics-2" and item["status"] == "pending" for item in contact_items)
 
     async with Client(server) as recipient_client:
         inbox = await recipient_client.call_tool(
             "fetch_inbox",
             {
                 "project_key": pkey("security/auto-contact-xproj-frontend"),
-                "agent_name": "BlueLake",
+                "agent_name": "codex-wsl-semantics-2",
                 "registration_token": blue_token,
                 "include_bodies": True,
             },
         )
         messages = inbox.structured_content["result"]
-        assert any(item["subject"] == "Contact request from GreenCastle" for item in messages)
+        assert any(item["subject"] == "Contact request from codex-wsl-semantics-1" for item in messages)
 
 
 @pytest.mark.asyncio
@@ -496,11 +552,21 @@ async def test_send_message_explicit_false_disables_cross_project_auto_contact(i
         await bootstrap_client.call_tool("ensure_project", {"human_key": pkey("security/auto-contact-false-frontend")})
         green = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": pkey("security/auto-contact-false-backend"), "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {
+                "project_key": pkey("security/auto-contact-false-backend"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-1",
+            },
         )
         blue = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": pkey("security/auto-contact-false-frontend"), "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {
+                "project_key": pkey("security/auto-contact-false-frontend"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-2",
+            },
         )
         green_token = green.data["registration_token"]
         blue_token = blue.data["registration_token"]
@@ -511,9 +577,9 @@ async def test_send_message_explicit_false_disables_cross_project_auto_contact(i
                 "send_message",
                 {
                     "project_key": pkey("security/auto-contact-false-backend"),
-                    "sender_name": "GreenCastle",
+                    "sender_name": "codex-wsl-semantics-1",
                     "sender_token": green_token,
-                    "to": ["BlueLake@/security/auto-contact-false-frontend"],
+                    "to": ["codex-wsl-semantics-2@/security/auto-contact-false-frontend"],
                     "subject": "No external auto contact",
                     "body_md": "stay blocked",
                     "auto_contact_if_blocked": False,
@@ -525,25 +591,28 @@ async def test_send_message_explicit_false_disables_cross_project_auto_contact(i
             "list_contacts",
             {
                 "project_key": pkey("security/auto-contact-false-backend"),
-                "agent_name": "GreenCastle",
+                "agent_name": "codex-wsl-semantics-1",
                 "registration_token": green_token,
             },
         )
         contact_items = contacts.structured_content["result"]
-        assert not any(item["to"] == "BlueLake" and item["status"] == "pending" for item in contact_items)
+        assert not any(
+            item["to"] == "codex-wsl-semantics-2" and item["status"] == "pending"
+            for item in contact_items
+        )
 
     async with Client(server) as recipient_client:
         inbox = await recipient_client.call_tool(
             "fetch_inbox",
             {
                 "project_key": pkey("security/auto-contact-false-frontend"),
-                "agent_name": "BlueLake",
+                "agent_name": "codex-wsl-semantics-2",
                 "registration_token": blue_token,
                 "include_bodies": True,
             },
         )
         messages = inbox.structured_content["result"]
-        assert not any(item["subject"] == "Contact request from GreenCastle" for item in messages)
+        assert not any(item["subject"] == "Contact request from codex-wsl-semantics-1" for item in messages)
 
 
 @pytest.mark.asyncio
@@ -555,20 +624,30 @@ async def test_send_message_cross_project_auto_contact_preserves_recipient_kind(
         await client.call_tool("ensure_project", {"human_key": pkey("security/auto-contact-kind-frontend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": pkey("security/auto-contact-kind-backend"), "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {
+                "project_key": pkey("security/auto-contact-kind-backend"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-1",
+            },
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": pkey("security/auto-contact-kind-frontend"), "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {
+                "project_key": pkey("security/auto-contact-kind-frontend"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-2",
+            },
         )
 
         result = await client.call_tool(
             "send_message",
             {
                 "project_key": pkey("security/auto-contact-kind-backend"),
-                "sender_name": "GreenCastle",
-                "to": ["GreenCastle"],
-                "bcc": ["BlueLake@/security/auto-contact-kind-frontend"],
+                "sender_name": "codex-wsl-semantics-1",
+                "to": ["codex-wsl-semantics-1"],
+                "bcc": ["codex-wsl-semantics-2@/security/auto-contact-kind-frontend"],
                 "subject": "Cross-project BCC",
                 "body_md": "recipient kind must survive auto-approval",
                 "auto_contact_if_blocked": True,
@@ -581,7 +660,7 @@ async def test_send_message_cross_project_auto_contact_preserves_recipient_kind(
             "fetch_inbox",
             {
                 "project_key": pkey("security/auto-contact-kind-frontend"),
-                "agent_name": "BlueLake",
+                "agent_name": "codex-wsl-semantics-2",
                 "include_bodies": True,
             },
         )
@@ -599,27 +678,46 @@ async def test_reply_message_enforces_local_contact_policy_for_new_recipient(iso
         await client.call_tool("ensure_project", {"human_key": pkey("security/reply-contact-policy")})
         await client.call_tool(
             "register_agent",
-            {"project_key": pkey("security/reply-contact-policy"), "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {
+                "project_key": pkey("security/reply-contact-policy"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-1",
+            },
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": pkey("security/reply-contact-policy"), "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {
+                "project_key": pkey("security/reply-contact-policy"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-2",
+            },
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": pkey("security/reply-contact-policy"), "program": "codex", "model": "gpt-5", "name": "PurpleBear"},
+            {
+                "project_key": pkey("security/reply-contact-policy"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-4",
+            },
         )
         await client.call_tool(
             "set_contact_policy",
-            {"project_key": pkey("security/reply-contact-policy"), "agent_name": "PurpleBear", "policy": "contacts_only"},
+            {
+                "project_key": pkey("security/reply-contact-policy"),
+                "agent_name": "codex-wsl-semantics-4",
+                "policy": "contacts_only",
+            },
         )
 
         seed = await client.call_tool(
             "send_message",
             {
                 "project_key": pkey("security/reply-contact-policy"),
-                "sender_name": "BlueLake",
-                "to": ["GreenCastle"],
+                "sender_name": "codex-wsl-semantics-2",
+                "to": ["codex-wsl-semantics-1"],
                 "subject": "Seed",
                 "body_md": "start thread",
                 "idempotency_key": "reply-contact-policy-seed",
@@ -633,13 +731,13 @@ async def test_reply_message_enforces_local_contact_policy_for_new_recipient(iso
                 {
                     "project_key": pkey("security/reply-contact-policy"),
                     "message_id": seed_id,
-                    "sender_name": "GreenCastle",
-                    "to": ["PurpleBear"],
+                    "sender_name": "codex-wsl-semantics-1",
+                    "to": ["codex-wsl-semantics-4"],
                     "body_md": "looping in a new recipient",
                     "idempotency_key": "reply-contact-policy-blocked",
                 },
             )
-        assert "Contact approval required for recipients: PurpleBear" in str(exc_info.value)
+        assert "Contact approval required for recipients: codex-wsl-semantics-4" in str(exc_info.value)
 
 
 @pytest.mark.asyncio
@@ -650,40 +748,49 @@ async def test_send_message_rejects_expired_local_approved_contact(isolated_env)
         await client.call_tool("ensure_project", {"human_key": project_key})
         await client.call_tool(
             "register_agent",
-            {"project_key": project_key, "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {"project_key": project_key, "program": "codex", "model": "gpt-5", "name": "codex-wsl-semantics-1"},
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": project_key, "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": project_key, "program": "codex", "model": "gpt-5", "name": "codex-wsl-semantics-2"},
         )
         await client.call_tool(
             "set_contact_policy",
-            {"project_key": project_key, "agent_name": "BlueLake", "policy": "contacts_only"},
+            {"project_key": project_key, "agent_name": "codex-wsl-semantics-2", "policy": "contacts_only"},
         )
         await client.call_tool(
             "request_contact",
-            {"project_key": project_key, "from_agent": "GreenCastle", "to_agent": "BlueLake"},
+            {
+                "project_key": project_key,
+                "from_agent": "codex-wsl-semantics-1",
+                "to_agent": "codex-wsl-semantics-2",
+            },
         )
         await client.call_tool(
             "respond_contact",
-            {"project_key": project_key, "to_agent": "BlueLake", "from_agent": "GreenCastle", "accept": True},
+            {
+                "project_key": project_key,
+                "to_agent": "codex-wsl-semantics-2",
+                "from_agent": "codex-wsl-semantics-1",
+                "accept": True,
+            },
         )
-        await _expire_contact_link(project_key, "GreenCastle", "BlueLake")
+        await _expire_contact_link(project_key, "codex-wsl-semantics-1", "codex-wsl-semantics-2")
 
         with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
                 "send_message",
                 {
                     "project_key": project_key,
-                    "sender_name": "GreenCastle",
-                    "to": ["BlueLake"],
+                    "sender_name": "codex-wsl-semantics-1",
+                    "to": ["codex-wsl-semantics-2"],
                     "subject": "Stale approval",
                     "body_md": "expired approvals must not authorize delivery",
                     "auto_contact_if_blocked": False,
                     "idempotency_key": "send-expired-local",
                 },
             )
-        assert "Contact approval required for recipients: BlueLake" in str(exc_info.value)
+        assert "Contact approval required for recipients: codex-wsl-semantics-2" in str(exc_info.value)
 
 
 @pytest.mark.asyncio
@@ -694,36 +801,45 @@ async def test_reply_message_rejects_expired_local_approved_contact(isolated_env
         await client.call_tool("ensure_project", {"human_key": project_key})
         await client.call_tool(
             "register_agent",
-            {"project_key": project_key, "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {"project_key": project_key, "program": "codex", "model": "gpt-5", "name": "codex-wsl-semantics-1"},
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": project_key, "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": project_key, "program": "codex", "model": "gpt-5", "name": "codex-wsl-semantics-2"},
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": project_key, "program": "codex", "model": "gpt-5", "name": "PurpleBear"},
+            {"project_key": project_key, "program": "codex", "model": "gpt-5", "name": "codex-wsl-semantics-4"},
         )
         await client.call_tool(
             "set_contact_policy",
-            {"project_key": project_key, "agent_name": "PurpleBear", "policy": "contacts_only"},
+            {"project_key": project_key, "agent_name": "codex-wsl-semantics-4", "policy": "contacts_only"},
         )
         await client.call_tool(
             "request_contact",
-            {"project_key": project_key, "from_agent": "GreenCastle", "to_agent": "PurpleBear"},
+            {
+                "project_key": project_key,
+                "from_agent": "codex-wsl-semantics-1",
+                "to_agent": "codex-wsl-semantics-4",
+            },
         )
         await client.call_tool(
             "respond_contact",
-            {"project_key": project_key, "to_agent": "PurpleBear", "from_agent": "GreenCastle", "accept": True},
+            {
+                "project_key": project_key,
+                "to_agent": "codex-wsl-semantics-4",
+                "from_agent": "codex-wsl-semantics-1",
+                "accept": True,
+            },
         )
-        await _expire_contact_link(project_key, "GreenCastle", "PurpleBear")
+        await _expire_contact_link(project_key, "codex-wsl-semantics-1", "codex-wsl-semantics-4")
 
         seed = await client.call_tool(
             "send_message",
             {
                 "project_key": project_key,
-                "sender_name": "BlueLake",
-                "to": ["GreenCastle"],
+                "sender_name": "codex-wsl-semantics-2",
+                "to": ["codex-wsl-semantics-1"],
                 "subject": "Seed",
                 "body_md": "start thread before reply check",
                 "idempotency_key": "reply-expired-local-seed",
@@ -737,13 +853,13 @@ async def test_reply_message_rejects_expired_local_approved_contact(isolated_env
                 {
                     "project_key": project_key,
                     "message_id": seed_id,
-                    "sender_name": "GreenCastle",
-                    "to": ["PurpleBear"],
+                    "sender_name": "codex-wsl-semantics-1",
+                    "to": ["codex-wsl-semantics-4"],
                     "body_md": "expired approvals must not authorize replies",
                     "idempotency_key": "reply-expired-local-child",
                 },
             )
-        assert "Contact approval required for recipients: PurpleBear" in str(exc_info.value)
+        assert "Contact approval required for recipients: codex-wsl-semantics-4" in str(exc_info.value)
 
 
 @pytest.mark.asyncio
@@ -758,11 +874,21 @@ async def test_send_message_rejects_expired_cross_project_approved_contact(isola
 
         sender = await client.call_tool(
             "register_agent",
-            {"project_key": backend_key, "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {
+                "project_key": backend_key,
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-1",
+            },
         )
         receiver = await client.call_tool(
             "register_agent",
-            {"project_key": ops_key, "program": "codex", "model": "gpt-5"},
+            {
+                "project_key": ops_key,
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-2",
+            },
         )
         receiver_name = receiver.data["name"]
 
@@ -770,7 +896,7 @@ async def test_send_message_rejects_expired_cross_project_approved_contact(isola
             "macro_contact_handshake",
             {
                 "project_key": backend_key,
-                "requester": "GreenCastle",
+                "requester": "codex-wsl-semantics-1",
                 "target": receiver_name,
                 "to_project": ops_key,
                 "auto_accept": True,
@@ -778,14 +904,19 @@ async def test_send_message_rejects_expired_cross_project_approved_contact(isola
                 "target_registration_token": receiver.data["registration_token"],
             },
         )
-        await _expire_contact_link(backend_key, "GreenCastle", receiver_name, target_project_key=ops_key)
+        await _expire_contact_link(
+            backend_key,
+            "codex-wsl-semantics-1",
+            receiver_name,
+            target_project_key=ops_key,
+        )
 
         with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
                 "send_message",
                 {
                     "project_key": backend_key,
-                    "sender_name": "GreenCastle",
+                    "sender_name": "codex-wsl-semantics-1",
                     "sender_token": sender.data["registration_token"],
                     "to": [f"{receiver_name}@{ops_key}"],
                     "subject": "Expired external approval",
@@ -808,15 +939,30 @@ async def test_reply_message_supports_agent_at_project_external_address(isolated
         await client.call_tool("ensure_project", {"human_key": pkey("security/reply-xproj-ops")})
         green = await client.call_tool(
             "register_agent",
-            {"project_key": pkey("security/reply-xproj-backend"), "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {
+                "project_key": pkey("security/reply-xproj-backend"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-1",
+            },
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": pkey("security/reply-xproj-backend"), "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {
+                "project_key": pkey("security/reply-xproj-backend"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-2",
+            },
         )
         ops = await client.call_tool(
             "register_agent",
-            {"project_key": pkey("security/reply-xproj-ops"), "program": "codex", "model": "gpt-5", "name": "OpsBot"},
+            {
+                "project_key": pkey("security/reply-xproj-ops"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-5",
+            },
         )
         green_token = green.data["registration_token"]
         ops_token = ops.data["registration_token"]
@@ -826,7 +972,7 @@ async def test_reply_message_supports_agent_at_project_external_address(isolated
             "macro_contact_handshake",
             {
                 "project_key": pkey("security/reply-xproj-backend"),
-                "requester": "GreenCastle",
+                "requester": "codex-wsl-semantics-1",
                 "target": ops_name,
                 "to_project": pkey("security/reply-xproj-ops"),
                 "auto_accept": True,
@@ -839,8 +985,8 @@ async def test_reply_message_supports_agent_at_project_external_address(isolated
             "send_message",
             {
                 "project_key": pkey("security/reply-xproj-backend"),
-                "sender_name": "BlueLake",
-                "to": ["GreenCastle"],
+                "sender_name": "codex-wsl-semantics-2",
+                "to": ["codex-wsl-semantics-1"],
                 "subject": "Seed",
                 "body_md": "start thread",
                 "idempotency_key": "reply-at-project-seed",
@@ -853,7 +999,7 @@ async def test_reply_message_supports_agent_at_project_external_address(isolated
             {
                 "project_key": pkey("security/reply-xproj-backend"),
                 "message_id": seed_id,
-                "sender_name": "GreenCastle",
+                "sender_name": "codex-wsl-semantics-1",
                 "to": [f"{ops_name}@/security/reply-xproj-ops"],
                 "body_md": "routing externally from a reply",
                 "idempotency_key": "reply-at-project-child",
@@ -876,30 +1022,44 @@ async def test_cross_project_sender_identity_does_not_collide_with_same_name_loc
 
         source = await client.call_tool(
             "register_agent",
-            {"project_key": backend_key, "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {
+                "project_key": backend_key,
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-1",
+            },
         )
         receiver = await client.call_tool(
             "register_agent",
-            {"project_key": ops_key, "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {
+                "project_key": ops_key,
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-2",
+            },
         )
-        lookalike = await client.call_tool(
+        await client.call_tool(
             "register_agent",
-            {"project_key": ops_key, "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {
+                "project_key": ops_key,
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-1",
+            },
         )
         source_token = source.data["registration_token"]
         receiver_token = receiver.data["registration_token"]
-        lookalike_token = lookalike.data["registration_token"]
 
         await client.call_tool(
             "set_contact_policy",
-            {"project_key": ops_key, "agent_name": "GreenCastle", "policy": "contacts_only"},
+            {"project_key": ops_key, "agent_name": "codex-wsl-semantics-1", "policy": "contacts_only"},
         )
         await client.call_tool(
             "macro_contact_handshake",
             {
                 "project_key": backend_key,
-                "requester": "GreenCastle",
-                "target": "BlueLake",
+                "requester": "codex-wsl-semantics-1",
+                "target": "codex-wsl-semantics-2",
                 "to_project": ops_key,
                 "auto_accept": True,
                 "requester_registration_token": source_token,
@@ -911,9 +1071,9 @@ async def test_cross_project_sender_identity_does_not_collide_with_same_name_loc
             "send_message",
             {
                 "project_key": backend_key,
-                "sender_name": "GreenCastle",
+                "sender_name": "codex-wsl-semantics-1",
                 "sender_token": source_token,
-                "to": [f"BlueLake@{ops_key}"],
+                "to": [f"codex-wsl-semantics-2@{ops_key}"],
                 "subject": "Cross-project origin",
                 "body_md": "hello from the real backend sender",
                 "thread_id": "XPROJ-IDENTITY-1",
@@ -928,27 +1088,28 @@ async def test_cross_project_sender_identity_does_not_collide_with_same_name_loc
             "fetch_inbox",
             {
                 "project_key": ops_key,
-                "agent_name": "BlueLake",
+                "agent_name": "codex-wsl-semantics-2",
                 "registration_token": receiver_token,
                 "include_bodies": True,
             },
         )
         delivered = next(item for item in inbox.structured_content["result"] if item["id"] == ext_message_id)
-        assert delivered["from"] == "GreenCastle"
+        assert delivered["from"] == "codex-wsl-semantics-1"
         assert delivered["from_project"] == backend_key
-        assert delivered["from_address"].endswith("#GreenCastle")
+        assert delivered["from_address"].endswith("#codex-wsl-semantics-1")
 
         outbox_blocks = await client.read_resource(
-            f"resource://outbox/GreenCastle?project={ops_key}&agent_token={lookalike_token}"
+            f"resource://outbox/codex-wsl-semantics-1?project={ops_key}"
         )
         outbox_payload = json.loads(outbox_blocks[0].text or "{}")
         assert outbox_payload["count"] == 0
 
         msg_blocks = await client.read_resource(
-            f"resource://message/{ext_message_id}?project={ops_key}&agent=BlueLake&agent_token={receiver_token}"
+            f"resource://message/{ext_message_id}?project={ops_key}"
+            "&agent=codex-wsl-semantics-2"
         )
         msg_payload = json.loads(msg_blocks[0].text or "{}")
-        assert msg_payload["from"] == "GreenCastle"
+        assert msg_payload["from"] == "codex-wsl-semantics-1"
         assert msg_payload["from_project"] == backend_key
 
         with pytest.raises(ToolError) as exc_info:
@@ -957,21 +1118,21 @@ async def test_cross_project_sender_identity_does_not_collide_with_same_name_loc
                 {
                     "project_key": ops_key,
                     "message_id": ext_message_id,
-                    "sender_name": "BlueLake",
+                    "sender_name": "codex-wsl-semantics-2",
                     "sender_token": receiver_token,
-                    "to": ["GreenCastle"],
+                    "to": ["codex-wsl-semantics-1"],
                     "body_md": "trying to loop in the local lookalike",
                     "idempotency_key": "cross-project-local-lookalike-reply",
                 },
             )
-        assert "Contact approval required for recipients: GreenCastle" in str(exc_info.value)
+        assert "Contact approval required for recipients: codex-wsl-semantics-1" in str(exc_info.value)
 
         reply = await client.call_tool(
             "reply_message",
             {
                 "project_key": ops_key,
                 "message_id": ext_message_id,
-                "sender_name": "BlueLake",
+                "sender_name": "codex-wsl-semantics-2",
                 "sender_token": receiver_token,
                 "body_md": "replying to the actual external sender",
                 "idempotency_key": "cross-project-actual-sender-reply",
@@ -979,7 +1140,7 @@ async def test_cross_project_sender_identity_does_not_collide_with_same_name_loc
         )
         backend_delivery = next(delivery for delivery in reply.data["deliveries"] if delivery["project"] == backend_key)
         backend_payload = backend_delivery["message"]
-        assert backend_payload["from"] == "BlueLake"
+        assert backend_payload["from"] == "codex-wsl-semantics-2"
         assert backend_payload["from_project"] == ops_key
         assert get_db_health_status()["pool"]["checked_out"] == 0
 
@@ -996,15 +1157,30 @@ async def test_send_message_does_not_write_legacy_mailbox_artifacts(isolated_env
 
         sender = await client.call_tool(
             "register_agent",
-            {"project_key": backend_key, "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {
+                "project_key": backend_key,
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-1",
+            },
         )
         receiver = await client.call_tool(
             "register_agent",
-            {"project_key": ops_key, "program": "codex", "model": "gpt-5"},
+            {
+                "project_key": ops_key,
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-2",
+            },
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": ops_key, "program": "codex", "model": "gpt-5", "name": "RedStone"},
+            {
+                "project_key": ops_key,
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-3",
+            },
         )
         receiver_name = receiver.data["name"]
 
@@ -1012,7 +1188,7 @@ async def test_send_message_does_not_write_legacy_mailbox_artifacts(isolated_env
             "macro_contact_handshake",
             {
                 "project_key": backend_key,
-                "requester": "GreenCastle",
+                "requester": "codex-wsl-semantics-1",
                 "target": receiver_name,
                 "to_project": ops_key,
                 "auto_accept": True,
@@ -1025,7 +1201,7 @@ async def test_send_message_does_not_write_legacy_mailbox_artifacts(isolated_env
             "file_reservation_paths",
             {
                 "project_key": ops_key,
-                "agent_name": "RedStone",
+                "agent_name": "codex-wsl-semantics-3",
                 "paths": [f"agents/{receiver_name}/inbox/*/*/*.md"],
                 "ttl_seconds": 1800,
                 "exclusive": True,
@@ -1037,9 +1213,9 @@ async def test_send_message_does_not_write_legacy_mailbox_artifacts(isolated_env
             "send_message",
             {
                 "project_key": backend_key,
-                "sender_name": "GreenCastle",
+                "sender_name": "codex-wsl-semantics-1",
                 "sender_token": sender.data["registration_token"],
-                "to": ["GreenCastle", f"{receiver_name}@{ops_key}"],
+                "to": ["codex-wsl-semantics-1", f"{receiver_name}@{ops_key}"],
                 "subject": "Atomic multi-project delivery",
                 "body_md": "legacy mailbox reservations do not govern immutable delivery",
                 "idempotency_key": "send-partial-external",
@@ -1070,15 +1246,30 @@ async def test_reply_message_does_not_write_legacy_mailbox_artifacts(isolated_en
 
         sender = await client.call_tool(
             "register_agent",
-            {"project_key": backend_key, "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {
+                "project_key": backend_key,
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-1",
+            },
         )
         receiver = await client.call_tool(
             "register_agent",
-            {"project_key": ops_key, "program": "codex", "model": "gpt-5"},
+            {
+                "project_key": ops_key,
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-2",
+            },
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": backend_key, "program": "codex", "model": "gpt-5", "name": "RedStone"},
+            {
+                "project_key": backend_key,
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-3",
+            },
         )
         receiver_name = receiver.data["name"]
 
@@ -1086,7 +1277,7 @@ async def test_reply_message_does_not_write_legacy_mailbox_artifacts(isolated_en
             "macro_contact_handshake",
             {
                 "project_key": backend_key,
-                "requester": "GreenCastle",
+                "requester": "codex-wsl-semantics-1",
                 "target": receiver_name,
                 "to_project": ops_key,
                 "auto_accept": True,
@@ -1099,7 +1290,7 @@ async def test_reply_message_does_not_write_legacy_mailbox_artifacts(isolated_en
             "send_message",
             {
                 "project_key": backend_key,
-                "sender_name": "GreenCastle",
+                "sender_name": "codex-wsl-semantics-1",
                 "sender_token": sender.data["registration_token"],
                 "to": [f"{receiver_name}@{ops_key}"],
                 "subject": "Seed external thread",
@@ -1116,8 +1307,8 @@ async def test_reply_message_does_not_write_legacy_mailbox_artifacts(isolated_en
             "file_reservation_paths",
             {
                 "project_key": backend_key,
-                "agent_name": "RedStone",
-                "paths": ["agents/GreenCastle/inbox/*/*/*.md"],
+                "agent_name": "codex-wsl-semantics-3",
+                "paths": ["agents/codex-wsl-semantics-1/inbox/*/*/*.md"],
                 "ttl_seconds": 1800,
                 "exclusive": True,
             },
@@ -1150,15 +1341,30 @@ async def test_search_and_summarize_thread_respect_recipient_visibility(isolated
         await bootstrap_client.call_tool("ensure_project", {"human_key": pkey("security/private-thread")})
         green = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": pkey("security/private-thread"), "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {
+                "project_key": pkey("security/private-thread"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-1",
+            },
         )
         blue = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": pkey("security/private-thread"), "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {
+                "project_key": pkey("security/private-thread"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-2",
+            },
         )
         purple = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": pkey("security/private-thread"), "program": "codex", "model": "gpt-5", "name": "PurpleBear"},
+            {
+                "project_key": pkey("security/private-thread"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-semantics-4",
+            },
         )
         green_token = green.data["registration_token"]
         blue_token = blue.data["registration_token"]
@@ -1169,8 +1375,8 @@ async def test_search_and_summarize_thread_respect_recipient_visibility(isolated
             "macro_contact_handshake",
             {
                 "project_key": pkey("security/private-thread"),
-                "requester": "GreenCastle",
-                "target": "BlueLake",
+                "requester": "codex-wsl-semantics-1",
+                "target": "codex-wsl-semantics-2",
                 "auto_accept": True,
                 "requester_registration_token": green_token,
                 "target_registration_token": blue_token,
@@ -1180,10 +1386,10 @@ async def test_search_and_summarize_thread_respect_recipient_visibility(isolated
             "send_message",
             {
                 "project_key": pkey("security/private-thread"),
-                "sender_name": "GreenCastle",
+                "sender_name": "codex-wsl-semantics-1",
                 "sender_token": green_token,
-                "to": ["GreenCastle"],
-                "bcc": ["BlueLake"],
+                "to": ["codex-wsl-semantics-1"],
+                "bcc": ["codex-wsl-semantics-2"],
                 "subject": "Private plan",
                 "body_md": "ultra-secret launch sequence",
                 "thread_id": "SEC-THREAD-1",
@@ -1197,7 +1403,7 @@ async def test_search_and_summarize_thread_respect_recipient_visibility(isolated
             {
                 "project_key": pkey("security/private-thread"),
                 "query": "ultra-secret",
-                "agent_name": "BlueLake",
+                "agent_name": "codex-wsl-semantics-2",
                 "registration_token": blue_token,
             },
         )
@@ -1210,7 +1416,7 @@ async def test_search_and_summarize_thread_respect_recipient_visibility(isolated
                 "thread_id": "SEC-THREAD-1",
                 "include_examples": True,
                 "llm_mode": False,
-                "agent_name": "BlueLake",
+                "agent_name": "codex-wsl-semantics-2",
                 "registration_token": blue_token,
             },
         )
@@ -1223,7 +1429,7 @@ async def test_search_and_summarize_thread_respect_recipient_visibility(isolated
             {
                 "project_key": pkey("security/private-thread"),
                 "query": "ultra-secret",
-                "agent_name": "PurpleBear",
+                "agent_name": "codex-wsl-semantics-4",
                 "registration_token": purple_token,
             },
         )
@@ -1236,7 +1442,7 @@ async def test_search_and_summarize_thread_respect_recipient_visibility(isolated
                 "thread_id": "SEC-THREAD-1",
                 "include_examples": True,
                 "llm_mode": False,
-                "agent_name": "PurpleBear",
+                "agent_name": "codex-wsl-semantics-4",
                 "registration_token": purple_token,
             },
         )
@@ -1261,7 +1467,7 @@ async def test_send_message_keeps_db_invisible_when_archive_publish_is_pending(
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "codex-wsl-semantics-2"},
         )
 
         async def _boom(_archive, delivery_id, *_args, **_kwargs):
@@ -1273,8 +1479,8 @@ async def test_send_message_keeps_db_invisible_when_archive_publish_is_pending(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": "codex-wsl-semantics-2",
+                "to": ["codex-wsl-semantics-2"],
                 "subject": "Plan",
                 "body_md": "body",
                 "idempotency_key": "archive-publish-pending",

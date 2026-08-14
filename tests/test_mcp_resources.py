@@ -21,10 +21,10 @@ Reference: mcp_agent_mail-hqk
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 import pytest
 from fastmcp import Client
@@ -64,10 +64,15 @@ async def test_project_resource_returns_project_details(isolated_env):
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": pkey("projresource")})
 
-        # Register an agent (auto-generated name)
+        # Register one durable client/host slot.
         agent_result = await client.call_tool(
             "register_agent",
-            {"project_key": "ProjResource", "program": "test", "model": "test"},
+            {
+                "project_key": "ProjResource",
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-proj-resource-1",
+            },
         )
         agent_name = agent_result.data["name"]
 
@@ -114,14 +119,14 @@ async def test_agents_resource_returns_agent_list(isolated_env):
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": pkey("agentsres")})
 
-        # Register multiple agents with proper adjective+noun names
+        # Register multiple durable client/host slots.
         await client.call_tool(
             "register_agent",
             {
                 "project_key": "AgentsRes",
                 "program": "claude-code",
                 "model": "opus-4",
-                "name": "BlueLake",
+                "name": "claude-linux-agents-1",
                 "task_description": "Backend development",
             },
         )
@@ -131,7 +136,7 @@ async def test_agents_resource_returns_agent_list(isolated_env):
                 "project_key": "AgentsRes",
                 "program": "codex",
                 "model": "gpt-5",
-                "name": "GreenField",
+                "name": "codex-wsl-agents-1",
                 "task_description": "Frontend work",
             },
         )
@@ -167,13 +172,23 @@ async def test_agents_resource_shows_unread_count(isolated_env):
 
         sender_result = await client.call_tool(
             "register_agent",
-            {"project_key": "AgentsUnread", "program": "test", "model": "test"},
+            {
+                "project_key": "AgentsUnread",
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-agents-unread-1",
+            },
         )
         sender_name = sender_result.data["name"]
 
         receiver_result = await client.call_tool(
             "register_agent",
-            {"project_key": "AgentsUnread", "program": "test", "model": "test"},
+            {
+                "project_key": "AgentsUnread",
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-agents-unread-2",
+            },
         )
         receiver_name = receiver_result.data["name"]
 
@@ -217,7 +232,12 @@ async def test_inbox_resource_returns_messages(isolated_env):
 
         agent_result = await client.call_tool(
             "register_agent",
-            {"project_key": "InboxRes", "program": "test", "model": "test"},
+            {
+                "project_key": "InboxRes",
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-inbox-resource-1",
+            },
         )
         agent_name = agent_result.data["name"]
 
@@ -257,7 +277,12 @@ async def test_inbox_resource_with_limit_param(isolated_env):
 
         agent_result = await client.call_tool(
             "register_agent",
-            {"project_key": "InboxLimit", "program": "test", "model": "test"},
+            {
+                "project_key": "InboxLimit",
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-inbox-limit-1",
+            },
         )
         agent_name = agent_result.data["name"]
 
@@ -293,7 +318,12 @@ async def test_inbox_resource_with_include_bodies(isolated_env):
 
         agent_result = await client.call_tool(
             "register_agent",
-            {"project_key": "InboxBody", "program": "test", "model": "test"},
+            {
+                "project_key": "InboxBody",
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-inbox-body-1",
+            },
         )
         agent_name = agent_result.data["name"]
 
@@ -335,13 +365,23 @@ async def test_outbox_resource_returns_sent_messages(isolated_env):
 
         sender_result = await client.call_tool(
             "register_agent",
-            {"project_key": "OutboxRes", "program": "test", "model": "test"},
+            {
+                "project_key": "OutboxRes",
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-outbox-resource-1",
+            },
         )
         sender_name = sender_result.data["name"]
 
         receiver_result = await client.call_tool(
             "register_agent",
-            {"project_key": "OutboxRes", "program": "test", "model": "test"},
+            {
+                "project_key": "OutboxRes",
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-outbox-resource-2",
+            },
         )
         receiver_name = receiver_result.data["name"]
 
@@ -381,13 +421,23 @@ async def test_outbox_resource_with_limit(isolated_env):
 
         sender_result = await client.call_tool(
             "register_agent",
-            {"project_key": "OutboxLimit", "program": "test", "model": "test"},
+            {
+                "project_key": "OutboxLimit",
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-outbox-limit-1",
+            },
         )
         sender_name = sender_result.data["name"]
 
         receiver_result = await client.call_tool(
             "register_agent",
-            {"project_key": "OutboxLimit", "program": "test", "model": "test"},
+            {
+                "project_key": "OutboxLimit",
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-outbox-limit-2",
+            },
         )
         receiver_name = receiver_result.data["name"]
 
@@ -428,7 +478,12 @@ async def test_thread_resource_returns_thread_messages(isolated_env):
 
         agent_result = await client.call_tool(
             "register_agent",
-            {"project_key": "ThreadRes", "program": "test", "model": "test"},
+            {
+                "project_key": "ThreadRes",
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-thread-resource-1",
+            },
         )
         agent_name = agent_result.data["name"]
 
@@ -480,7 +535,12 @@ async def test_thread_resource_with_message_id(isolated_env):
 
         agent_result = await client.call_tool(
             "register_agent",
-            {"project_key": "ThreadId", "program": "test", "model": "test"},
+            {
+                "project_key": "ThreadId",
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-thread-id-1",
+            },
         )
         agent_name = agent_result.data["name"]
 
@@ -519,7 +579,12 @@ async def test_thread_resource_with_include_bodies(isolated_env):
 
         agent_result = await client.call_tool(
             "register_agent",
-            {"project_key": "ThreadBody", "program": "test", "model": "test"},
+            {
+                "project_key": "ThreadBody",
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-thread-body-1",
+            },
         )
         agent_name = agent_result.data["name"]
 
@@ -554,15 +619,30 @@ async def test_thread_resource_only_returns_visible_messages(isolated_env):
         await bootstrap_client.call_tool("ensure_project", {"human_key": pkey("threadprivate")})
         green = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": "ThreadPrivate", "program": "test", "model": "test", "name": "GreenCastle"},
+            {
+                "project_key": "ThreadPrivate",
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-thread-private-1",
+            },
         )
         blue = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": "ThreadPrivate", "program": "test", "model": "test", "name": "BlueLake"},
+            {
+                "project_key": "ThreadPrivate",
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-thread-private-2",
+            },
         )
         purple = await bootstrap_client.call_tool(
             "register_agent",
-            {"project_key": "ThreadPrivate", "program": "test", "model": "test", "name": "PurpleBear"},
+            {
+                "project_key": "ThreadPrivate",
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-thread-private-3",
+            },
         )
         green_token = green.data["registration_token"]
         blue_token = blue.data["registration_token"]
@@ -573,8 +653,8 @@ async def test_thread_resource_only_returns_visible_messages(isolated_env):
             "macro_contact_handshake",
             {
                 "project_key": "ThreadPrivate",
-                "requester": "GreenCastle",
-                "target": "BlueLake",
+                "requester": "codex-wsl-thread-private-1",
+                "target": "codex-wsl-thread-private-2",
                 "auto_accept": True,
                 "requester_registration_token": green_token,
                 "target_registration_token": blue_token,
@@ -584,10 +664,10 @@ async def test_thread_resource_only_returns_visible_messages(isolated_env):
             "send_message",
             {
                 "project_key": "ThreadPrivate",
-                "sender_name": "GreenCastle",
+                "sender_name": "codex-wsl-thread-private-1",
                 "sender_token": green_token,
-                "to": ["GreenCastle"],
-                "bcc": ["BlueLake"],
+                "to": ["codex-wsl-thread-private-1"],
+                "bcc": ["codex-wsl-thread-private-2"],
                 "subject": "Private thread",
                 "body_md": "Classified body",
                 "thread_id": "THREAD-PRIVATE-1",
@@ -596,17 +676,35 @@ async def test_thread_resource_only_returns_visible_messages(isolated_env):
         )
 
     async with Client(server) as outsider_client:
+        await outsider_client.call_tool(
+            "fetch_inbox",
+            {
+                "project_key": "ThreadPrivate",
+                "agent_name": "codex-wsl-thread-private-3",
+                "registration_token": purple_token,
+                "limit": 1,
+            },
+        )
         outsider_blocks = await outsider_client.read_resource(
             "resource://thread/THREAD-PRIVATE-1"
-            f"?project=ThreadPrivate&agent=PurpleBear&agent_token={quote(purple_token)}&include_bodies=true"
+            "?project=ThreadPrivate&agent=codex-wsl-thread-private-3&include_bodies=true"
         )
         outsider_data = parse_resource_json(outsider_blocks)
         assert outsider_data["messages"] == []
 
     async with Client(server) as bcc_client:
+        await bcc_client.call_tool(
+            "fetch_inbox",
+            {
+                "project_key": "ThreadPrivate",
+                "agent_name": "codex-wsl-thread-private-2",
+                "registration_token": blue_token,
+                "limit": 1,
+            },
+        )
         bcc_blocks = await bcc_client.read_resource(
             "resource://thread/THREAD-PRIVATE-1"
-            f"?project=ThreadPrivate&agent=BlueLake&agent_token={quote(blue_token)}&include_bodies=true"
+            "?project=ThreadPrivate&agent=codex-wsl-thread-private-2&include_bodies=true"
         )
         bcc_data = parse_resource_json(bcc_blocks)
         assert len(bcc_data["messages"]) == 1
@@ -622,7 +720,12 @@ async def test_message_resource_requires_project(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("messagereq")})
         agent_result = await client.call_tool(
             "register_agent",
-            {"project_key": "MessageReq", "program": "test", "model": "test"},
+            {
+                "project_key": "MessageReq",
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-message-required-1",
+            },
         )
         agent_name = agent_result.data["name"]
         result = await client.call_tool(
@@ -650,7 +753,12 @@ async def test_thread_resource_requires_project(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("threadreq")})
         agent_result = await client.call_tool(
             "register_agent",
-            {"project_key": "ThreadReq", "program": "test", "model": "test"},
+            {
+                "project_key": "ThreadReq",
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-thread-required-1",
+            },
         )
         agent_name = agent_result.data["name"]
         await client.call_tool(
@@ -684,7 +792,12 @@ async def test_file_reservations_resource_returns_reservations(isolated_env):
 
         agent_result = await client.call_tool(
             "register_agent",
-            {"project_key": "FileRes", "program": "test", "model": "test"},
+            {
+                "project_key": "FileRes",
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-file-resource-1",
+            },
         )
         agent_name = agent_result.data["name"]
 
@@ -728,7 +841,12 @@ async def test_file_reservations_resource_active_only(isolated_env):
 
         agent_result = await client.call_tool(
             "register_agent",
-            {"project_key": "FileActive", "program": "test", "model": "test"},
+            {
+                "project_key": "FileActive",
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-file-active-1",
+            },
         )
         agent_name = agent_result.data["name"]
 
@@ -781,7 +899,12 @@ async def test_file_reservations_resource_defaults_to_active_only(isolated_env):
 
         agent_result = await client.call_tool(
             "register_agent",
-            {"project_key": "FileDefaultActive", "program": "test", "model": "test"},
+            {
+                "project_key": "FileDefaultActive",
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-file-default-active-1",
+            },
         )
         agent_name = agent_result.data["name"]
 
@@ -837,7 +960,12 @@ async def test_file_reservations_resource_includes_metadata(isolated_env):
 
         agent_result = await client.call_tool(
             "register_agent",
-            {"project_key": "FileMeta", "program": "test", "model": "test"},
+            {
+                "project_key": "FileMeta",
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-file-metadata-1",
+            },
         )
         agent_name = agent_result.data["name"]
 
@@ -913,12 +1041,116 @@ async def test_agent_scoped_resources_require_project(isolated_env, uri_template
         await client.call_tool("ensure_project", {"human_key": pkey("project-required")})
         agent_result = await client.call_tool(
             "register_agent",
-            {"project_key": "project-required", "program": "test", "model": "test"},
+            {
+                "project_key": "project-required",
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-project-required-1",
+            },
         )
         agent_name = agent_result.data["name"]
 
         with pytest.raises(Exception, match="project"):
             await client.read_resource(uri_template.format(agent=agent_name))
+
+
+@pytest.mark.asyncio
+async def test_private_resources_never_transport_registration_tokens(isolated_env, caplog):
+    """Private resource URIs advertise no token and require prior structured auth."""
+    server = build_mcp_server()
+
+    async with Client(server) as bootstrap_client:
+        await bootstrap_client.call_tool(
+            "ensure_project",
+            {"human_key": pkey("resource-session-only")},
+        )
+        registered = await bootstrap_client.call_tool(
+            "register_agent",
+            {
+                "project_key": "resource-session-only",
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-resource-session-1",
+            },
+        )
+        registration_token = registered.data["registration_token"]
+
+    sentinel = registration_token
+    caplog.set_level(logging.DEBUG)
+    async with Client(server) as stateless_client:
+        templates = await stateless_client.list_resource_templates()
+        advertised_uris = [str(template.uriTemplate) for template in templates]
+        assert all("agent_token" not in uri for uri in advertised_uris)
+        assert all(sentinel not in uri for uri in advertised_uris)
+
+        private_reads = [
+            (
+                "resource://message/1?project=resource-session-only&agent=codex-wsl-resource-session-1",
+                "search_messages",
+            ),
+            (
+                "resource://thread/private-session-only?project=resource-session-only"
+                "&agent=codex-wsl-resource-session-1",
+                "summarize_thread",
+            ),
+            (
+                "resource://inbox/codex-wsl-resource-session-1?project=resource-session-only",
+                "fetch_inbox",
+            ),
+            (
+                "resource://views/urgent-unread/codex-wsl-resource-session-1?project=resource-session-only",
+                "fetch_inbox",
+            ),
+            (
+                "resource://views/ack-required/codex-wsl-resource-session-1?project=resource-session-only",
+                "fetch_inbox",
+            ),
+            (
+                "resource://views/acks-stale/codex-wsl-resource-session-1?project=resource-session-only",
+                "fetch_inbox",
+            ),
+            (
+                "resource://views/ack-overdue/codex-wsl-resource-session-1?project=resource-session-only",
+                "fetch_inbox",
+            ),
+            (
+                "resource://mailbox/codex-wsl-resource-session-1?project=resource-session-only",
+                "fetch_inbox",
+            ),
+            (
+                "resource://mailbox-with-commits/codex-wsl-resource-session-1?project=resource-session-only",
+                "fetch_inbox",
+            ),
+            (
+                "resource://outbox/codex-wsl-resource-session-1?project=resource-session-only",
+                "search_messages",
+            ),
+        ]
+        for uri, stateless_tool in private_reads:
+            with pytest.raises(Exception) as exc_info:
+                await stateless_client.read_resource(uri)
+
+            error_text = str(exc_info.value)
+            assert "already authenticated in this MCP session" in error_text
+            assert stateless_tool in error_text
+            assert sentinel not in error_text
+        assert sentinel not in caplog.text
+
+        await stateless_client.call_tool(
+            "fetch_inbox",
+            {
+                "project_key": "resource-session-only",
+                "agent_name": "codex-wsl-resource-session-1",
+                "registration_token": registration_token,
+                "limit": 1,
+            },
+        )
+        blocks = await stateless_client.read_resource(
+            "resource://inbox/codex-wsl-resource-session-1?project=resource-session-only"
+        )
+        payload = parse_resource_json(blocks)
+        assert payload["agent"] == "codex-wsl-resource-session-1"
+        assert sentinel not in caplog.text
 
 
 # When external corruption deletes an Agent row out from under an outstanding
@@ -932,7 +1164,12 @@ async def test_file_reservations_resource_surfaces_orphaned(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("orphan")})
         agent_result = await client.call_tool(
             "register_agent",
-            {"project_key": "orphan", "program": "test", "model": "test"},
+            {
+                "project_key": "orphan",
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-orphan-resource-1",
+            },
         )
         agent_name = agent_result.data["name"]
         agent_id = int(agent_result.data["id"])

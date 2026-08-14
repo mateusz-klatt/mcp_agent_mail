@@ -69,20 +69,20 @@ def get_inbox_items(result) -> list[dict]:
 
 
 async def setup_project_with_agents(client: Client, project_key: str, count: int = 2):
-    """Helper to set up a project with multiple agents (auto-generated names).
+    """Helper to set up a project with multiple durable agents.
 
     Returns a list of agent names in the order they were created.
     """
     await client.call_tool("ensure_project", {"human_key": project_key})
     agent_names = []
-    for _ in range(count):
+    for index in range(count):
         result = await client.call_tool(
             "register_agent",
             {
                 "project_key": project_key,
                 "program": "test",
                 "model": "test",
-                # Don't specify name - let system auto-generate valid adjective+noun name
+                "name": f"codex-wsl-delivery-{index + 1}",
             },
         )
         name = result.data["name"]
@@ -241,15 +241,25 @@ async def test_send_message_recipient_lookup_query_count(isolated_env):
 
         sender_payload = await client.call_tool(
             "register_agent",
-            {"project_key": project_key, "program": "test", "model": "test"},
+            {
+                "project_key": project_key,
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-query-sender-1",
+            },
         )
         sender = sender_payload.data["name"]
 
         recipients: list[str] = []
-        for _ in range(3):
+        for index in range(3):
             payload = await client.call_tool(
                 "register_agent",
-                {"project_key": project_key, "program": "test", "model": "test"},
+                {
+                    "project_key": project_key,
+                    "program": "test",
+                    "model": "test",
+                    "name": f"codex-wsl-query-recipient-{index + 1}",
+                },
             )
             recipients.append(payload.data["name"])
 
@@ -287,15 +297,25 @@ async def test_list_outbox_recipient_lookup_query_count(isolated_env):
 
         sender_payload = await client.call_tool(
             "register_agent",
-            {"project_key": project_key, "program": "test", "model": "test"},
+            {
+                "project_key": project_key,
+                "program": "test",
+                "model": "test",
+                "name": "codex-wsl-outbox-sender-1",
+            },
         )
         sender = sender_payload.data["name"]
 
         recipients: list[str] = []
-        for _ in range(3):
+        for index in range(3):
             payload = await client.call_tool(
                 "register_agent",
-                {"project_key": project_key, "program": "test", "model": "test"},
+                {
+                    "project_key": project_key,
+                    "program": "test",
+                    "model": "test",
+                    "name": f"codex-wsl-outbox-recipient-{index + 1}",
+                },
             )
             recipients.append(payload.data["name"])
 

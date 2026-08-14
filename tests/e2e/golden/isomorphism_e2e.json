@@ -3,8 +3,8 @@
     "approve_contact": {
       "approved": true,
       "expires_ts": "2025-01-01T00:15:52+00:00",
-      "from": "BlueLake",
-      "to": "PurpleBear",
+      "from": "codex-wsl-isomorphism-alpha-1",
+      "to": "codex-wsl-isomorphism-beta-5",
       "updated": 1
     },
     "cross_send": {
@@ -30,8 +30,8 @@
             "cc": [],
             "created_ts": "2025-01-01T00:03:26+00:00",
             "delivery_id": "<delivery-6>",
-            "from": "BlueLake",
-            "from_address": "project:alpha#BlueLake",
+            "from": "codex-wsl-isomorphism-alpha-1",
+            "from_address": "project:alpha#codex-wsl-isomorphism-alpha-1",
             "from_project": "/alpha",
             "from_project_slug": "alpha",
             "id": 6,
@@ -42,7 +42,7 @@
             "subject": "Cross Project",
             "thread_id": null,
             "to": [
-              "PurpleBear"
+              "codex-wsl-isomorphism-beta-5"
             ],
             "topic": null
           },
@@ -53,18 +53,18 @@
     },
     "denied_error": {
       "error_type": "ToolError",
-      "message": "Error calling tool 'send_message': Unable to send message \u2014 external recipients missing approved contact links: JadePond @ /beta; Use resource://agents/alpha to list registered agents or register new identities."
+      "message": "Error calling tool 'send_message': Unable to send message \u2014 external recipients missing approved contact links: codex-wsl-isomorphism-beta-6 @ /beta; Use resource://agents/alpha to list registered agents. Verify each external target is already registered in its own project, then request contact; request_contact never provisions the target mailbox."
     },
     "deny_contact": {
       "approved": false,
       "expires_ts": null,
-      "from": "BlueLake",
-      "to": "JadePond",
+      "from": "codex-wsl-isomorphism-alpha-1",
+      "to": "codex-wsl-isomorphism-beta-6",
       "updated": 1
     },
     "deny_request": {
       "expires_ts": "2025-01-01T00:15:51+00:00",
-      "from": "BlueLake",
+      "from": "codex-wsl-isomorphism-alpha-1",
       "from_project": "/alpha",
       "notification_message": {
         "delivery": {
@@ -86,8 +86,8 @@
           "cc": [],
           "created_ts": "2025-01-01T00:16:11+00:00",
           "delivery_id": "<delivery-5>",
-          "from": "BlueLake",
-          "from_address": "project:alpha#BlueLake",
+          "from": "codex-wsl-isomorphism-alpha-1",
+          "from_address": "project:alpha#codex-wsl-isomorphism-alpha-1",
           "from_project": "/alpha",
           "from_project_slug": "alpha",
           "id": 5,
@@ -95,16 +95,16 @@
           "project_id": 2,
           "reply_to": null,
           "sender_id": 1,
-          "subject": "Contact request from BlueLake",
+          "subject": "Contact request from codex-wsl-isomorphism-alpha-1",
           "thread_id": null,
           "to": [
-            "JadePond"
+            "codex-wsl-isomorphism-beta-6"
           ],
           "topic": null
         }
       },
       "status": "pending",
-      "to": "JadePond",
+      "to": "codex-wsl-isomorphism-beta-6",
       "to_project": "/beta"
     },
     "list_contacts": [
@@ -114,7 +114,7 @@
         "is_expired": false,
         "reason": "deny-case",
         "status": "blocked",
-        "to": "JadePond",
+        "to": "codex-wsl-isomorphism-beta-6",
         "to_project": "/beta",
         "updated_ts": "2025-01-01T00:15:01+00:00"
       },
@@ -124,14 +124,14 @@
         "is_expired": true,
         "reason": "e2e",
         "status": "approved",
-        "to": "PurpleBear",
+        "to": "codex-wsl-isomorphism-beta-5",
         "to_project": "/beta",
         "updated_ts": "2025-01-01T00:15:02+00:00"
       }
     ],
     "request_contact": {
       "expires_ts": "2025-01-01T00:15:52+00:00",
-      "from": "BlueLake",
+      "from": "codex-wsl-isomorphism-alpha-1",
       "from_project": "/alpha",
       "notification_message": {
         "delivery": {
@@ -153,8 +153,8 @@
           "cc": [],
           "created_ts": "2025-01-01T00:16:12+00:00",
           "delivery_id": "<delivery-4>",
-          "from": "BlueLake",
-          "from_address": "project:alpha#BlueLake",
+          "from": "codex-wsl-isomorphism-alpha-1",
+          "from_address": "project:alpha#codex-wsl-isomorphism-alpha-1",
           "from_project": "/alpha",
           "from_project_slug": "alpha",
           "id": 4,
@@ -162,16 +162,16 @@
           "project_id": 2,
           "reply_to": null,
           "sender_id": 1,
-          "subject": "Contact request from BlueLake",
+          "subject": "Contact request from codex-wsl-isomorphism-alpha-1",
           "thread_id": null,
           "to": [
-            "PurpleBear"
+            "codex-wsl-isomorphism-beta-5"
           ],
           "topic": null
         }
       },
       "status": "pending",
-      "to": "PurpleBear",
+      "to": "codex-wsl-isomorphism-beta-5",
       "to_project": "/beta"
     }
   },
@@ -181,7 +181,7 @@
         {
           "holders": [
             {
-              "agent": "BlueLake",
+              "agent": "codex-wsl-isomorphism-alpha-1",
               "exclusive": true,
               "expires_ts": "2025-01-01T00:10:01+00:00",
               "path_pattern": "src/core.py"
@@ -238,7 +238,7 @@
     },
     "snapshot": [
       {
-        "agent": "BlueLake",
+        "agent": "codex-wsl-isomorphism-alpha-1",
         "agent_id": 1,
         "created_ts": "2025-01-01T00:08:21+00:00",
         "exclusive": true,
@@ -259,7 +259,7 @@
         ]
       },
       {
-        "agent": "GreenCastle",
+        "agent": "codex-wsl-isomorphism-alpha-3",
         "agent_id": 3,
         "created_ts": "2025-01-01T00:08:22+00:00",
         "exclusive": true,
@@ -348,18 +348,7 @@
           "inception_ts": "2025-01-01T00:01:41+00:00",
           "last_active_ts": "2025-01-01T00:02:01+00:00",
           "model": "gpt-5",
-          "name": "BlueLake",
-          "program": "codex",
-          "project_id": 1,
-          "task_description": ""
-        },
-        {
-          "attachments_policy": "auto",
-          "id": 3,
-          "inception_ts": "2025-01-01T00:01:43+00:00",
-          "last_active_ts": "2025-01-01T00:02:03+00:00",
-          "model": "gpt-5",
-          "name": "GreenCastle",
+          "name": "codex-wsl-isomorphism-alpha-1",
           "program": "codex",
           "project_id": 1,
           "task_description": ""
@@ -370,7 +359,18 @@
           "inception_ts": "2025-01-01T00:01:42+00:00",
           "last_active_ts": "2025-01-01T00:02:02+00:00",
           "model": "gpt-5",
-          "name": "RedStone",
+          "name": "codex-wsl-isomorphism-alpha-2",
+          "program": "codex",
+          "project_id": 1,
+          "task_description": ""
+        },
+        {
+          "attachments_policy": "auto",
+          "id": 3,
+          "inception_ts": "2025-01-01T00:01:43+00:00",
+          "last_active_ts": "2025-01-01T00:02:03+00:00",
+          "model": "gpt-5",
+          "name": "codex-wsl-isomorphism-alpha-3",
           "program": "codex",
           "project_id": 1,
           "task_description": ""
@@ -381,7 +381,7 @@
           "inception_ts": "2025-01-01T00:01:44+00:00",
           "last_active_ts": "2025-01-01T00:02:04+00:00",
           "model": "gpt-5",
-          "name": "StormyCanyon",
+          "name": "codex-wsl-isomorphism-alpha-4",
           "program": "codex",
           "project_id": 1,
           "task_description": ""
@@ -390,6 +390,7 @@
       "created_at": "2025-01-01T00:00:01+00:00",
       "human_key": "/alpha",
       "id": 1,
+      "project_uid": "a164c0c98d6a913b0814",
       "slug": "alpha"
     },
     "project_resource_beta": {
@@ -400,18 +401,7 @@
           "inception_ts": "2025-01-01T00:01:47+00:00",
           "last_active_ts": "2025-01-01T00:02:07+00:00",
           "model": "gpt-5",
-          "name": "BlueLake",
-          "program": "codex",
-          "project_id": 2,
-          "task_description": ""
-        },
-        {
-          "attachments_policy": "auto",
-          "id": 6,
-          "inception_ts": "2025-01-01T00:01:46+00:00",
-          "last_active_ts": "2025-01-01T00:02:06+00:00",
-          "model": "gpt-5",
-          "name": "JadePond",
+          "name": "codex-wsl-isomorphism-alpha-1",
           "program": "codex",
           "project_id": 2,
           "task_description": ""
@@ -422,7 +412,18 @@
           "inception_ts": "2025-01-01T00:01:45+00:00",
           "last_active_ts": "2025-01-01T00:02:05+00:00",
           "model": "gpt-5",
-          "name": "PurpleBear",
+          "name": "codex-wsl-isomorphism-beta-5",
+          "program": "codex",
+          "project_id": 2,
+          "task_description": ""
+        },
+        {
+          "attachments_policy": "auto",
+          "id": 6,
+          "inception_ts": "2025-01-01T00:01:46+00:00",
+          "last_active_ts": "2025-01-01T00:02:06+00:00",
+          "model": "gpt-5",
+          "name": "codex-wsl-isomorphism-beta-6",
           "program": "codex",
           "project_id": 2,
           "task_description": ""
@@ -431,6 +432,7 @@
       "created_at": "2025-01-01T00:00:02+00:00",
       "human_key": "/beta",
       "id": 2,
+      "project_uid": "a78ae1d5150177e0bb6f",
       "slug": "beta"
     },
     "whois": {
@@ -439,7 +441,7 @@
       "inception_ts": "2025-01-01T00:01:41+00:00",
       "last_active_ts": "2025-01-01T00:02:01+00:00",
       "model": "gpt-5",
-      "name": "BlueLake",
+      "name": "codex-wsl-isomorphism-alpha-1",
       "program": "codex",
       "project_id": 1,
       "recent_commits": [],
@@ -454,7 +456,7 @@
         "body_md": "Launch kickoff\n\n![inline](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=)\n",
         "created_ts": "2025-01-01T00:03:21+00:00",
         "delivery_id": "<delivery-1>",
-        "from": "BlueLake",
+        "from": "codex-wsl-isomorphism-alpha-1",
         "id": 1,
         "importance": "normal",
         "kind": "to",
@@ -471,7 +473,7 @@
         "body_md": "Follow up details",
         "created_ts": "2025-01-01T00:03:22+00:00",
         "delivery_id": "<delivery-2>",
-        "from": "BlueLake",
+        "from": "codex-wsl-isomorphism-alpha-1",
         "id": 2,
         "importance": "normal",
         "kind": "to",
@@ -485,7 +487,7 @@
     ],
     "fetch_inbox_since": "2025-01-01T00:03:21",
     "mailbox": {
-      "agent": "RedStone",
+      "agent": "codex-wsl-isomorphism-alpha-2",
       "count": 2,
       "messages": [
         {
@@ -513,7 +515,7 @@
           },
           "created_ts": "2025-01-01T00:03:21+00:00",
           "delivery_id": "<delivery-1>",
-          "from": "BlueLake",
+          "from": "codex-wsl-isomorphism-alpha-1",
           "id": 1,
           "importance": "normal",
           "kind": "to",
@@ -547,7 +549,7 @@
           },
           "created_ts": "2025-01-01T00:03:22+00:00",
           "delivery_id": "<delivery-2>",
-          "from": "BlueLake",
+          "from": "codex-wsl-isomorphism-alpha-1",
           "id": 2,
           "importance": "normal",
           "kind": "to",
@@ -562,17 +564,17 @@
       "project": "/alpha"
     },
     "outbox": {
-      "agent": "BlueLake",
+      "agent": "codex-wsl-isomorphism-alpha-1",
       "count": 2,
       "messages": [
         {
           "ack_required": true,
           "attachments": [],
           "bcc": [
-            "StormyCanyon"
+            "codex-wsl-isomorphism-alpha-4"
           ],
           "cc": [
-            "GreenCastle"
+            "codex-wsl-isomorphism-alpha-3"
           ],
           "commit": {
             "authored_ts": "<commit_authored_ts>",
@@ -596,7 +598,7 @@
           },
           "created_ts": "2025-01-01T00:03:21+00:00",
           "delivery_id": "<delivery-1>",
-          "from": "BlueLake",
+          "from": "codex-wsl-isomorphism-alpha-1",
           "id": 1,
           "importance": "normal",
           "project_id": 1,
@@ -605,7 +607,7 @@
           "subject": "Launch Plan",
           "thread_id": "THREAD-1",
           "to": [
-            "RedStone"
+            "codex-wsl-isomorphism-alpha-2"
           ],
           "topic": null
         },
@@ -634,7 +636,7 @@
           },
           "created_ts": "2025-01-01T00:03:22+00:00",
           "delivery_id": "<delivery-2>",
-          "from": "BlueLake",
+          "from": "codex-wsl-isomorphism-alpha-1",
           "id": 2,
           "importance": "normal",
           "project_id": 1,
@@ -643,7 +645,7 @@
           "subject": "Follow Up",
           "thread_id": "THREAD-1",
           "to": [
-            "RedStone"
+            "codex-wsl-isomorphism-alpha-2"
           ],
           "topic": null
         }
@@ -658,7 +660,7 @@
       "body_md": "beta side",
       "created_ts": "2025-01-01T00:03:23+00:00",
       "delivery_id": "<delivery-3>",
-      "from": "PurpleBear",
+      "from": "codex-wsl-isomorphism-beta-5",
       "id": 3,
       "importance": "normal",
       "project_id": 2,
@@ -674,7 +676,7 @@
       "body_md": "Follow up details",
       "created_ts": "2025-01-01T00:03:22+00:00",
       "delivery_id": "<delivery-2>",
-      "from": "BlueLake",
+      "from": "codex-wsl-isomorphism-alpha-1",
       "id": 2,
       "importance": "normal",
       "project_id": 1,
@@ -690,7 +692,7 @@
       "body_md": "Launch kickoff\n\n![inline](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=)\n",
       "created_ts": "2025-01-01T00:03:21+00:00",
       "delivery_id": "<delivery-1>",
-      "from": "BlueLake",
+      "from": "codex-wsl-isomorphism-alpha-1",
       "id": 1,
       "importance": "normal",
       "project_id": 1,
@@ -709,7 +711,7 @@
         "body_md": "beta side",
         "created_ts": "2025-01-01T00:03:23+00:00",
         "delivery_id": "<delivery-3>",
-        "from": "PurpleBear",
+        "from": "codex-wsl-isomorphism-beta-5",
         "id": 3,
         "importance": "normal",
         "kind": "to",
@@ -777,19 +779,19 @@
       "examples": [
         {
           "created_ts": "2025-01-01T00:03:21+00:00",
-          "from": "BlueLake",
+          "from": "codex-wsl-isomorphism-alpha-1",
           "id": 1,
           "subject": "Launch Plan"
         },
         {
           "created_ts": "2025-01-01T00:03:22+00:00",
-          "from": "BlueLake",
+          "from": "codex-wsl-isomorphism-alpha-1",
           "id": 2,
           "subject": "Follow Up"
         },
         {
           "created_ts": "2025-01-01T00:03:23+00:00",
-          "from": "PurpleBear",
+          "from": "codex-wsl-isomorphism-beta-5",
           "id": 3,
           "subject": "Beta Hello"
         }
@@ -801,8 +803,8 @@
         "mentions": [],
         "open_actions": 0,
         "participants": [
-          "BlueLake",
-          "PurpleBear"
+          "codex-wsl-isomorphism-alpha-1",
+          "codex-wsl-isomorphism-beta-5"
         ],
         "total_messages": 3
       },
@@ -816,7 +818,7 @@
         {
           "ack_required": 1,
           "created_ts": "2025-01-01T00:03:21+00:00",
-          "from": "BlueLake",
+          "from": "codex-wsl-isomorphism-alpha-1",
           "id": 1,
           "importance": "normal",
           "subject": "Launch Plan",

@@ -629,6 +629,7 @@ async def _load_agent_snapshot(
         or agent.project_id != snapshot.project.project_id
         or agent.name != snapshot.name
         or agent.agent_generation != snapshot.generation
+        or agent.provisioning_state != "active"
         or agent.retired_at is not None
     ):
         raise MessageDeliveryValidationError(

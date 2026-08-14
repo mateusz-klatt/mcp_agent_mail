@@ -4,7 +4,7 @@
 
 > "It's like gmail for your coding agents!"
 
-Iris is the human-facing name of MCP Agent Mail: a mail-like coordination layer for coding agents, exposed as an HTTP-only FastMCP server. It gives agents memorable identities, an inbox/outbox, searchable message history, and voluntary file reservation "leases" to avoid stepping on each other. The Python package, CLI, protocol paths, and deployment identifiers remain `mcp_agent_mail` and `mcp-agent-mail`.
+Iris is the human-facing name of MCP Agent Mail: a mail-like coordination layer for coding agents, exposed as an HTTP-only FastMCP server. It gives clients durable host-slot identities, execution-scoped session/subagent lifetimes, an inbox/outbox, searchable message history, and voluntary file reservation "leases" to avoid stepping on each other. The Python package, CLI, protocol paths, and deployment identifiers remain `mcp_agent_mail` and `mcp-agent-mail`.
 
 Think of it as asynchronous email + directory + change-intent signaling for your agents, backed by Git (for human-auditable artifacts) and SQLite (for indexing and queries).
 
@@ -20,7 +20,8 @@ Modern projects often run multiple coding agents at once (backend, frontend, scr
 
 This project provides a lightweight, interoperable layer so agents can:
 
-- Register a temporary-but-persistent identity (e.g., GreenCastle)
+- Register one durable client/OS/host/slot identity (for example,
+  `codex-wsl-home-1`) and represent sessions/subagents as `AgentExecution`
 - Send/receive GitHub-Flavored Markdown messages with images
 - Search, summarize, and thread conversations
 - Declare advisory file reservations (leases) on files/globs to signal intent
@@ -70,7 +71,7 @@ What this does:
 - Installs/updates the Beads Viewer `bv` TUI for interactive task browsing and AI-friendly robot commands (pass `--skip-bv` to opt out)
 - Prints a short on-exit summary of each setup step so you immediately know what changed
 
-Prefer a specific location or options? Add flags like `--dir <path>`, `--project-dir <path>`, `--no-start`, `--start-only`, `--port <number>`, or `--token <hex>`.
+Prefer a specific location or options? Add flags like `--dir <path>`, `--project-dir <path>`, `--no-start`, `--start-only`, or `--port <number>`.
 
 Already have Beads or Beads Viewer installed? Append `--skip-beads` and/or `--skip-bv` to bypass automatic installation.
 
@@ -170,8 +171,8 @@ How to use effectively
 1) Same repository
    - Register an identity: call `ensure_project`, then `register_agent` with the same canonical project key on every host. For a GitHub-style origin, normalize `git@github.com:owner/repo.git` (or its HTTPS form) to the synthetic absolute key `/owner/repo`. Never substitute the local checkout path.
    - Reserve files before you edit: `file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true)` to signal intent and avoid conflict.
-   - Communicate with threads: use `send_message(..., thread_id="FEAT-123")`; check inbox with `fetch_inbox` and acknowledge with `acknowledge_message`.
-   - Read fast: `resource://inbox/{Agent}?project=<url-encoded-canonical-key>&limit=20&agent_token=<registration_token>` or `resource://thread/{id}?project=<url-encoded-canonical-key>&agent=<Agent>&agent_token=<registration_token>&include_bodies=true` unless the current MCP session already authenticated as that agent.
+   - Communicate with threads: use `send_message(..., thread_id="FEAT-123", idempotency_key="feat-123-start")`; check inbox with `fetch_inbox` and acknowledge with `acknowledge_message`.
+   - Read fast from an already authenticated MCP session: `resource://inbox/{Agent}?project=<url-encoded-canonical-key>&limit=20` or `resource://thread/{id}?project=<url-encoded-canonical-key>&agent=<Agent>&include_bodies=true`. Private resource URIs never accept registration tokens; stateless callers use the equivalent tools (`fetch_inbox`, `search_messages`, or `summarize_thread`) with structured authentication arguments.
    - Tip: set `AGENT_NAME` in your environment so the pre-commit guard can block commits that conflict with others' active exclusive file reservations.
 
 2) Across different repos in one project (e.g., Next.js frontend + FastAPI backend)
@@ -220,7 +221,7 @@ Typical flow (agents)
 2) **Reserve edit surface** (Mail)
    - `file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true, reason="bd-123")`
 3) **Announce start** (Mail)
-   - `send_message(..., thread_id="bd-123", subject="[bd-123] Start: <short title>", ack_required=true)`
+   - `send_message(..., thread_id="bd-123", subject="[bd-123] Start: <short title>", idempotency_key="bd-123-start", ack_required=true)`
 4) **Work and update**
    - Reply in-thread with progress and attach artifacts/images; keep the discussion in one thread per issue id
 5) **Complete and release**
@@ -304,7 +305,7 @@ Combine bv insights with Agent Mail coordination:
 
 1. **Agent A** runs `bv --robot-priority` → identifies `bd-42` as highest-impact
 2. **Agent A** reserves files: `file_reservation_paths(..., reason="bd-42")`
-3. **Agent A** announces: `send_message(..., thread_id="bd-42", subject="[bd-42] Starting high-impact refactor")`
+3. **Agent A** announces: `send_message(..., thread_id="bd-42", subject="[bd-42] Starting high-impact refactor", idempotency_key="bd-42-start")`
 4. **Other agents** see the reservation and Mail announcement, pick different tasks
 5. **Agent A** completes, runs `bv --robot-diff` to report downstream unblocks
 
@@ -316,7 +317,8 @@ This creates a feedback loop where graph intelligence drives coordination.
 - Dual persistence model:
   - Human-readable markdown in a per-project Git repo for every canonical message and per-recipient inbox/outbox copy
   - SQLite with FTS5 for fast search, directory queries, and file reservations/leases
-- "Directory/LDAP" style queries for agents; memorable adjective+noun names
+- "Directory/LDAP" style queries for durable `client-os-host-slot` Agents and
+  their session/subagent execution history
 - Advisory file reservations for editing surfaces; optional pre-commit guard
 - Resource layer for convenient reads (e.g., `resource://inbox/{agent}`)
 
@@ -751,8 +753,10 @@ The UI shares the same parsing as the API's `_parse_fts_query`:
 The UI reads from the same SQLite + Git artifacts as the MCP tools. To populate content:
 1) Ensure a project exists (via tool call or CLI):
    - Ensure/create project: `ensure_project(human_key)`
-2) Register one or more agents: `register_agent(project_key, program, model, name?)`
-3) Send messages: `send_message(...)` (attachments and inline images are supported; images may be converted to WebP).
+2) Register one or more durable mailboxes: `register_agent(project_key, program, model, name)`, where `name` follows `client-os-host-slot`
+3) Send messages: `send_message(..., idempotency_key="<stable-operation-key>")`.
+   The current atomic-delivery contract is Markdown-body only; attachment inputs
+   fail closed until canonical inline normalization is available.
 
 Once messages exist, visit `/mail`, click your project, then open an agent inbox or search.
 
@@ -1403,7 +1407,7 @@ age-keygen -o key.txt
 
 The export pipeline supports configurable scrubbing to remove sensitive data:
 
-- `standard`: Clears acknowledgment/read state, removes operational data, scrubs common secret shapes from message bodies, and omits all source attachments because arbitrary file bytes cannot be safely redacted. Retains agent names (which are already meaningless pseudonyms like "BlueMountain") and scrubbed message bodies.
+- `standard`: Clears acknowledgment/read state, removes operational data, scrubs common secret shapes from message bodies, and omits all source attachments because arbitrary file bytes cannot be safely redacted. Retains stable Agent mailbox addresses and scrubbed message bodies; treat those addresses as public metadata when exporting.
 
 - `strict`: All standard redactions plus replaces entire message bodies with "[Message body redacted]" placeholder and removes all attachments from the bundle.
 
@@ -1706,8 +1710,8 @@ Messages are GitHub-Flavored Markdown with JSON frontmatter (fenced by `---json`
   "thread_id": "TKT-123",
   "project": "/owner/backend",
   "project_slug": "backend-abc123",
-  "from": "GreenCastle",
-  "to": ["BlueLake"],
+  "from": "codex-linux-backend-1",
+  "to": ["claude-linux-frontend-1"],
   "cc": [],
   "created": "2025-10-23T15:22:14Z",
   "importance": "high",
@@ -1725,11 +1729,13 @@ Messages are GitHub-Flavored Markdown with JSON frontmatter (fenced by `---json`
 
 ### Data model (SQLite)
 
-- `projects(id, human_key, slug, created_at)`
-- `agents(id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)`
+- `projects(id, project_uid, project_generation, human_key, slug, created_at, archived_at)`
+- `agents(id, project_id, agent_generation, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, provisioning_state, retired_at)`
+- `agent_executions(id, project_id, agent_id, parent_execution_id, external_id, client_name, kind, status, lifecycle_protocol_version, Git/worktree metadata, started_ts, last_active_ts, ended_ts)`
 - `messages(id, project_id, sender_id, thread_id, subject, body_md, created_ts, importance, ack_required, attachments)`
 - `message_recipients(message_id, agent_id, kind, read_ts, ack_ts)`
-- `file_reservations(id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)`
+- `message_deliveries(...)` + `message_delivery_recipients(...)` preserve immutable idempotency, provenance, publication, and recipient snapshots
+- `file_reservations(id, project_id, agent_id, execution_id, origin, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts, archive_revision, archive_synced_revision)`
 - `agent_links(id, a_project_id, a_agent_id, b_project_id, b_agent_id, status, reason, created_ts, updated_ts, expires_ts)`
 - `project_sibling_suggestions(id, project_a_id, project_b_id, score, status, rationale, created_ts, evaluated_ts, confirmed_ts, dismissed_ts)`
 - `fts_messages(message_id UNINDEXED, subject, body)` + triggers for incremental updates
@@ -1747,13 +1753,14 @@ Messages are GitHub-Flavored Markdown with JSON frontmatter (fenced by `---json`
 
 1) Create an identity
 
-- `register_agent(project_key, program, model, name?, task_description?)` → creates/updates a named identity, persists profile to Git, and commits.
+- `register_agent(project_key, program, model, name, task_description?)` → creates/updates a durable `client-os-host-slot` mailbox, persists its profile to Git, and commits.
+- `start_agent_execution(...)` → creates one root-session or native-subagent lifetime beneath that mailbox; heartbeat/end keep execution-owned reservations and build slots scoped to the correct lifetime.
 
 2) Send a message
 
-- `send_message(project_key, sender_name, to[], subject, body_md, cc?, bcc?, attachment_paths?, convert_images?, importance?, ack_required?, thread_id?, auto_contact_if_blocked?)`
-- Writes a canonical message under `messages/YYYY/MM/`, an outbox copy for the sender, and inbox copies for each recipient; commits all artifacts.
-- Optionally converts images (local paths or data URIs) to WebP and embeds small ones inline.
+- `send_message(project_key, sender_name, to[], subject, body_md, idempotency_key, cc?, bcc?, importance?, ack_required?, thread_id?, auto_contact_if_blocked?)`
+- Publishes an immutable delivery request and canonical Markdown message, then commits its Git artifacts atomically. Retry only with the same idempotency key and canonical payload.
+- `attachment_paths` and `convert_images` currently fail closed with `ATTACHMENTS_NOT_SUPPORTED`; do not send local paths or arbitrary attachment bytes.
 
 ```mermaid
 sequenceDiagram
@@ -1779,8 +1786,9 @@ sequenceDiagram
 
 4) Avoid conflicts with file reservations (leases)
 
-- `file_reservation_paths(project_key, agent_name, paths[], ttl_seconds, exclusive, reason)` records an advisory lease in DB and writes JSON reservation artifacts in Git; conflicts are reported if overlapping active exclusives exist (reservations are still granted; conflicts are returned alongside grants).
-- `release_file_reservations(project_key, agent_name, paths? | file_reservation_ids?)` releases active leases (all if none specified). JSON artifacts remain for audit history.
+- `file_reservation_paths(project_key, agent_name, paths[], ttl_seconds, exclusive, reason, execution_id?, execution_token?, lifecycle_protocol_version?)` records an advisory lease in DB and writes JSON reservation artifacts in Git; conflicts are reported if overlapping active exclusives exist.
+- `release_file_reservations(project_key, agent_name, paths? | file_reservation_ids?, execution_id?, execution_token?, lifecycle_protocol_version?)` releases active leases (all if none specified). JSON artifacts remain for audit history.
+- In rollout `observe`, an unscoped legacy call is accepted with a warning. In `enforce`, execution capability plus lifecycle protocol v1 are required.
 - Optional: install a pre-commit hook in your code repo that blocks commits conflicting with other agents' active exclusive file reservations.
 
 ```mermaid
@@ -1803,22 +1811,25 @@ sequenceDiagram
 
 - `search_messages(project_key, query, limit?)` uses FTS5 over subject and body.
 - `summarize_thread(project_key, thread_id, include_examples?)` extracts key points, actions, and participants from the thread.
-- `reply_message(project_key, message_id, sender_name, body_md, ..., sender_token?)` creates a subject-prefixed reply, preserving or creating a thread.
+- `reply_message(project_key, message_id, sender_name, body_md, idempotency_key, ..., sender_token?)` creates a subject-prefixed idempotent reply, preserving or creating a thread.
 
 ### Semantics & invariants
 
 - Identity
-  - Names are memorable adjective+noun and unique per project; `name_hint` is sanitized (alnum) and used if available
+  - New durable names use the explicit `client-os-host-slot` convention and are
+    unique per project. Existing legacy names remain addressable, but sessions
+    and native subagents never mint additional Agent rows.
+  - `AgentExecution` records each root session or native subagent beneath its
+    durable Agent, including parentage, lifecycle status, and Git/worktree
+    context. A worktree is execution context, not mailbox identity.
   - `whois` returns the stored profile; `list_agents` can filter by recent activity
   - `last_active_ts` is bumped on relevant interactions (messages, inbox checks, etc.)
 - Threads
   - Replies inherit `thread_id` from the original; if missing, the reply sets `thread_id` to the original message id
   - Subject lines are prefixed (e.g., `Re:`) for readability in mailboxes
 - Attachments
-  - Image references (file path or data URI) are converted to WebP; small images embed inline when policy allows
-  - Non-absolute `attachment_paths` (and markdown image paths) resolve relative to the project archive root under `STORAGE_ROOT/projects/<slug>/`, not the code repo root
-  - Absolute attachment paths are disabled by default. Enabling `ALLOW_ABSOLUTE_ATTACHMENT_PATHS=true` on a networked deployment turns message sending into a filesystem read primitive for whatever paths the server process can access.
-  - Stored under `attachments/<xx>/<sha1>.webp` and referenced by relative path in frontmatter
+  - Existing stored attachment metadata remains readable for historical mail.
+  - New `send_message` calls reject `attachment_paths` and `convert_images`; the atomic delivery API currently accepts Markdown bodies only.
 - File Reservations
   - TTL-based; exclusive means "please don't modify overlapping surfaces" for others until expiry or release
   - Conflict detection is per exact path pattern; shared reservations can coexist, exclusive conflicts are surfaced
@@ -1852,7 +1863,7 @@ Use `set_contact_policy(project_key, agent_name, policy)` to update.
 - `list_contacts(project_key, agent_name)` surfaces outbound links with target projects and audit flags for expiry/messageability.
 
 Auth note: these tools require either an agent already authenticated in the current MCP session, or the relevant `registration_token`. `send_message(..., auto_contact_if_blocked=true)` only auto-approves when both agents are already authenticated in the same MCP session; otherwise it creates a pending `request_contact` and **fails loud** with `CONTACT_REQUIRED` (the underlying message body is *not* queued — once the recipient approves, the sender must re-call `send_message` to actually deliver the payload).
-`macro_contact_handshake(..., auto_accept=true)` follows the same rule for new approvals: it only auto-approves when the target agent is already authenticated in the current MCP session or when `target_registration_token` is supplied explicitly. If the link is already approved, the macro reuses that approval. Otherwise the request remains pending and the macro reports a `response_error`.
+`request_contact` and `macro_contact_handshake` require the target Agent to already exist. A sender never creates somebody else's durable mailbox: the target must self-register, or an operator must explicitly provision it. `macro_contact_handshake(..., auto_accept=true)` only auto-approves when that registered target is already authenticated in the current MCP session or when `target_registration_token` is supplied explicitly. If the link is already approved, the macro reuses that approval. Otherwise the request remains pending and the macro reports a `response_error`.
 
 ### Auto-allow heuristics (no explicit request required)
 
@@ -1869,10 +1880,10 @@ When two repos represent the same underlying project (e.g., `frontend` and `back
 1) Use the same `project_key` across both workspaces. Agents in both repos operate under one project namespace and benefit from full inbox/outbox coordination automatically.
 
 2) Keep separate `project_key`s and establish explicit contact:
-   - In `backend`, agent `GreenCastle` calls:
-     - `request_contact(project_key="/owner/backend", from_agent="GreenCastle", to_agent="BlueLake", reason="API contract changes", registration_token="<GreenCastle token>")`
-   - In `frontend`, `BlueLake` calls:
-     - `respond_contact(project_key="/owner/backend", to_agent="BlueLake", from_agent="GreenCastle", accept=true, registration_token="<BlueLake token>")`
+   - In `backend`, `codex-linux-backend-1` calls:
+     - `request_contact(project_key="/owner/backend", from_agent="codex-linux-backend-1", to_agent="claude-linux-frontend-1", to_project="/owner/frontend", reason="API contract changes", registration_token="<requester token>")`
+   - In `frontend`, `claude-linux-frontend-1` calls:
+     - `respond_contact(project_key="/owner/frontend", to_agent="claude-linux-frontend-1", from_agent="codex-linux-backend-1", from_project="/owner/backend", accept=true, registration_token="<target token>")`
    - After approval, messages can be exchanged; in default `auto` policy the server allows follow-up threads/reservation-based coordination without re-requesting.
 
 Important: You can also create reciprocal links or set `open` policy for trusted pairs. The consent layer is on by default (CONTACT_ENFORCEMENT_ENABLED=true) but is designed to be non-blocking in obvious collaboration contexts.
@@ -1888,9 +1899,15 @@ Example (conceptual) resource read:
 ```json
 {
   "method": "resources/read",
-  "params": {"uri": "resource://inbox/BlueLake?project=%2Fowner%2Fbackend&limit=20&agent_token=<registration_token>"}
+  "params": {"uri": "resource://inbox/codex-linux-backend-1?project=%2Fowner%2Fbackend&limit=20"}
 }
 ```
+
+Private mailbox/message/thread resources require the target Agent to be
+authenticated in the current MCP session. Registration tokens are intentionally
+excluded from resource URIs because URIs are commonly copied into logs, history,
+telemetry, and prompts. A stateless client must call the corresponding tool with
+its token in structured arguments instead.
 
 <!-- Parameters consolidated in API Quick Reference → Resources -->
 
@@ -1942,6 +1959,24 @@ sequenceDiagram
   4) Remote fingerprint: normalized `origin` URL + default branch
   5) `git-common-dir` hash; else dir hash
 
+- `project_uid` is the durable database identity; `slug` and `human_key` are
+  stable aliases retained from the first successful ensure. Consequently,
+  linked worktrees and host-local clones with the same resolved UID return the
+  same Project id and mailbox history even when their paths differ.
+- Rows created before durable UIDs remain nullable until first use. The server
+  claims only one exact, independently verifiable legacy row. If a UID, path,
+  or slug points at competing historical rows it fails closed with
+  `PROJECT_IDENTITY_CONFLICT`; it never guesses or silently merges archives.
+- `ensure_project(identity_mode=...)` applies the override before the DB
+  lookup/create. The selected mode therefore affects the persisted row, not
+  just the diagnostic identity payload.
+
+The global Claude/Codex hook path normally sends the canonical synthetic remote
+key (for example `/owner/repo`) directly, so it does not probe a local checkout
+for the marker precedence above. Local markers are an explicit opt-in and
+identity source for path-based CLI/MCP calls and repositories without a shared
+remote; use `mail status` to verify which path is active.
+
 - Migration helpers:
   - Write committed marker: `mcp-agent-mail projects mark-identity . --commit`
   - Scaffold discovery file: `mcp-agent-mail projects discovery-init . --product <product_uid>`
@@ -1984,10 +2019,10 @@ Consolidate legacy per-worktree projects into a canonical one (safe, explicit, a
 
 - `amctl env` prints helpful environment keys:
   - `SLUG`, `PROJECT_UID`, `BRANCH`, `AGENT`, `CACHE_KEY`, `ARTIFACT_DIR`
-  - Example: `mcp-agent-mail amctl env --path . --agent AliceDev`
+  - Example: `mcp-agent-mail amctl env --path . --agent codex-wsl-home-1`
 - `am-run` wraps a command with those keys set:
   - Example: `mcp-agent-mail am-run frontend-build -- npm run dev`
-  - Auth: when talking to the HTTP server, `am-run` now auto-loads the local agent `registration_token` from the database when possible. You can also pass `--registration-token` or set `AGENT_MAIL_REGISTRATION_TOKEN`.
+  - Auth: when talking to the HTTP server, `am-run` auto-loads the local agent `registration_token` from the database when possible, or reads `AGENT_MAIL_REGISTRATION_TOKEN` from the environment. Secret values are never accepted as CLI arguments.
 
 - Build slots (advisory, per-project coarse locking):
   - Flags:
@@ -1995,13 +2030,14 @@ Consolidate legacy per-worktree projects into a canonical one (safe, explicit, a
     - `--shared/--exclusive`: non-exclusive or exclusive lease (default exclusive)
     - `--block-on-conflicts`: exit non-zero if exclusive conflicts are detected before starting
   - Acquire:
-    - Tool: `acquire_build_slot(project_key, agent_name, slot, ttl_seconds=3600, exclusive=true)`
+    - Tool: `acquire_build_slot(project_key, agent_name, slot, ttl_seconds=3600, exclusive=true, execution_id?, execution_token?, lifecycle_protocol_version?)`
   - Renew:
-    - Tool: `renew_build_slot(project_key, agent_name, slot, extend_seconds=1800)`
+    - Tool: `renew_build_slot(project_key, agent_name, slot, extend_seconds=1800, execution_id?, execution_token?, lifecycle_protocol_version?)`
   - Release (non-destructive; marks released):
-    - Tool: `release_build_slot(project_key, agent_name, slot)`
+    - Tool: `release_build_slot(project_key, agent_name, slot, execution_id?, execution_token?, lifecycle_protocol_version?)`
   - Notes:
-    - Slots are recorded under the project archive `build_slots/<slot>/<agent>__<branch>.json`
+    - Scoped slots are recorded under a collision-resistant encoded slot directory and keyed by execution UUID; observe-mode legacy leases retain the older Agent+branch holder shape.
+    - In `enforce`, all three operations require execution capability plus lifecycle protocol v1. `am-run` creates and ends that execution independently of worktree enablement.
     - `exclusive=true` reports conflicts if another active exclusive holder exists
     - Intended for long-running tasks (dev servers, watchers); pair with `am-run` and `amctl env`
 
@@ -2016,13 +2052,13 @@ Group multiple repositories (e.g., frontend, backend, infra) under a single prod
 - Inspect product and linked projects:
   - `mcp-agent-mail products status MyProduct`
 - Product‑wide message search (FTS):
-  - `mcp-agent-mail products search MyProduct "urgent AND deploy" --agent Alice --registration-token "$AGENT_MAIL_REGISTRATION_TOKEN" --limit 50`
+  - `AGENT_MAIL_REGISTRATION_TOKEN=... mcp-agent-mail products search MyProduct "urgent AND deploy" --agent codex-wsl-home-1 --limit 50`
 - Product‑wide inbox:
-  - `mcp-agent-mail products inbox MyProduct Alice --registration-token "$AGENT_MAIL_REGISTRATION_TOKEN" --limit 50 --urgent-only --include-bodies --since-ts "2025-11-01T00:00:00Z"`
+  - `AGENT_MAIL_REGISTRATION_TOKEN=... mcp-agent-mail products inbox MyProduct codex-wsl-home-1 --limit 50 --urgent-only --include-bodies --since-ts "2025-11-01T00:00:00Z"`
 - Product‑wide thread summarization:
-  - `mcp-agent-mail products summarize-thread MyProduct "bd-123" --agent Alice --registration-token "$AGENT_MAIL_REGISTRATION_TOKEN" --per-thread-limit 100 --no-llm`
+  - `AGENT_MAIL_REGISTRATION_TOKEN=... mcp-agent-mail products summarize-thread MyProduct "bd-123" --agent codex-wsl-home-1 --per-thread-limit 100 --no-llm`
 - Auth note:
-  - Product-wide search, inbox, and thread summarization now require an authenticated agent identity. These commands accept `--registration-token` / `AGENT_MAIL_REGISTRATION_TOKEN` and will auto-use a single unambiguous locally stored token when that is possible.
+  - Product-wide search, inbox, and thread summarization require an authenticated agent identity. They read `AGENT_MAIL_REGISTRATION_TOKEN` from the environment or auto-use one unambiguous locally stored token; registration capabilities are never placed in process arguments.
 
 ## Containers
 
@@ -2180,7 +2216,7 @@ Common variables you may set:
 | `HTTP_CORS_ALLOW_METHODS` | `*` | CSV of allowed methods or `*` |
 | `HTTP_CORS_ALLOW_HEADERS` | `*` | CSV of allowed headers or `*` |
 | `HTTP_BEARER_TOKEN` |  | Static MCP/service bearer; not a human `/mail` login |
-| `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED` | `true` | Allow local MCP transport requests without auth; does not bypass human UI sessions |
+| `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED` | `true` in development; forced `false` in production | Allow local MCP transport requests without auth; production startup rejects an attempted opt-in and human UI sessions are never bypassed |
 | `MAIL_UI_AUTH_ENABLED` | `true` | Require human session authentication and project-scoped UI authorization; disable only for isolated test/development use |
 | `MAIL_UI_SESSION_SECRET` |  | Required secret used to sign human viewer sessions when UI auth is enabled |
 | `MAIL_UI_COOKIE_SECURE` | environment-dependent | Send the human session cookie only over HTTPS in production |
@@ -2210,6 +2246,10 @@ Common variables you may set:
 | `FILE_RESERVATION_INACTIVITY_SECONDS` | `1800` | Inactivity threshold (seconds) before a reservation is considered stale |
 | `FILE_RESERVATION_ACTIVITY_GRACE_SECONDS` | `900` | Grace window for recent mail/filesystem/git activity to keep a reservation active |
 | `FILE_RESERVATIONS_ENFORCEMENT_ENABLED` | `true` | Block message writes on conflicting file reservations targeting mail archive paths (agents/, messages/, attachments/) |
+| `AGENT_EXECUTION_ENFORCEMENT_MODE` | `observe` | Execution rollout gate: `observe` accepts legacy unscoped claims with warnings; `enforce` requires an active AgentExecution, its capability, and lifecycle protocol v1 for execution-owned operations. Drain legacy claims before switching to `enforce`. |
+| `AGENT_EXECUTION_REAPER_ENABLED` | `true` | Enable the FastMCP-lifespan task that expires stale active AgentExecutions and their automatic claims |
+| `AGENT_EXECUTION_REAPER_INTERVAL_SECONDS` | `60` | AgentExecution reaper scan interval |
+| `AGENT_EXECUTION_REAPER_THRESHOLD_SECONDS` | `86400` | Last-activity age after which an active AgentExecution expires. Hooks are event-driven rather than timer daemons, so use a shorter threshold only for clients that guarantee periodic heartbeat events. |
 | `ACK_TTL_ENABLED` | `false` | Enable overdue ACK scanning (logs/panels; see views/resources) |
 | `ACK_TTL_SECONDS` | `1800` | Age threshold (seconds) for overdue ACKs |
 | `ACK_TTL_SCAN_INTERVAL_SECONDS` | `60` | Scan interval for overdue ACKs |
@@ -2222,7 +2262,6 @@ Common variables you may set:
 | `CONTACT_AUTO_TTL_SECONDS` | `86400` | TTL for in-session auto-approved contact links and the "recent contact" recency window (1 day) |
 | `CONTACT_PENDING_TTL_SECONDS` | `604800` | TTL for the *pending* contact-request fallback created by `send_message(auto_contact_if_blocked=True)` when in-session auto-approval is not possible — i.e. how long an async human approver has to respond (7 days) |
 | `CONTACT_AUTO_RETRY_ENABLED` | `true` | Auto-retry contact requests on policy violations |
-| `MESSAGING_AUTO_REGISTER_RECIPIENTS` | `true` | Automatically create missing local recipients during `send_message` and retry routing |
 | `MESSAGING_AUTO_HANDSHAKE_ON_BLOCK` | `true` | When contact policy blocks delivery, attempt a contact handshake (auto-accept) and retry |
 | `TOOLS_LOG_ENABLED` | `true` | Log tool invocations for debugging |
 | `LOG_RICH_ENABLED` | `true` | Enable Rich console logging |
@@ -2236,7 +2275,6 @@ Common variables you may set:
 | `QUOTA_ATTACHMENTS_LIMIT_BYTES` | `0` | Max attachment storage per project (0=unlimited) |
 | `QUOTA_INBOX_LIMIT_COUNT` | `0` | Max inbox messages per agent (0=unlimited) |
 | `RETENTION_IGNORE_PROJECT_PATTERNS` | `demo,test*,testproj*,testproject,backendproj*,frontendproj*` | CSV of project patterns to ignore in retention/quota reports |
-| `AGENT_NAME_ENFORCEMENT_MODE` | `coerce` | Agent naming policy: `strict` (reject invalid adjective+noun names), `coerce` (auto-generate if invalid), `always_auto` (always auto-generate) |
 
 ## Development quick start
 
@@ -2344,11 +2382,14 @@ This section has been removed to keep the README focused. Client code samples be
 ## Troubleshooting
 
 - "sender_name not registered"
-  - Create the agent first with `register_agent` or `create_agent_identity`, or check the `project_key` you're using matches the sender's project
+  - A durable parent client or operator must provision the mailbox once with
+    `register_agent` or `create_agent_identity`; a native subagent reports
+    through its parent and must not create another Agent row. Also confirm the
+    `project_key` matches the sender's project.
 - Pre-commit hook blocks commits
   - Set `AGENT_NAME` to your agent identity; release or wait for conflicting exclusive file reservations; inspect `.git/hooks/pre-commit`
-- Inline images didn't embed
-  - Ensure `convert_images=true`; images are automatically inlined if the compressed WebP size is below the server's `INLINE_IMAGE_MAX_BYTES` threshold (default 64KB). Larger images are stored as attachments instead.
+- Attachment input was rejected
+  - This is expected for the current atomic delivery API: `attachment_paths` and `convert_images` fail closed. Send the Markdown body without attachment inputs.
 - Message not found
   - Confirm the `project` disambiguation when using `resource://message/{id}`; ids are unique per project
 - Inbox empty but messages exist
@@ -2375,14 +2416,18 @@ This section has been removed to keep the README focused. Client code samples be
 - Why advisory file reservations instead of global locks?
   - Agents coordinate asynchronously; hard locks create head-of-line blocking and brittle failures. Advisory reservations surface intent and conflicts while the optional pre-commit guard enforces locally where it matters.
 
-- Why are agent names adjective+noun?
-  - Memorable identities reduce confusion in inboxes, commit logs, and UI. The scheme yields low collision risk while staying human-friendly (vs GUIDs) and predictable for directory listings.
+- Why do new Agent names use `client-os-host-slot`?
+  - An Agent is a durable mailbox that must be resumed predictably across
+    process restarts. The explicit name identifies the client, execution
+    environment, host and stable slot. Root sessions and native subagents are
+    separate `AgentExecution` rows, so temporary work never creates another
+    mailbox or a random directory entry.
 
 - Why is `project_key` path-shaped?
   - The server validates it with absolute-path syntax, but treats it as an opaque identity rather than a filesystem probe. Multi-host clients must therefore use one synthetic absolute key such as `/owner/repo`, normally derived from the normalized Git origin. A checkout path such as `/home/alice/repo`, `/Users/bob/repo`, or `C:\src\repo` would create three unrelated mail projects.
 
-- Why WebP attachments and optional inlining?
-  - WebP provides compact, high-quality images. Small images can be inlined for readability; larger ones are stored as attachments. You can keep originals when needed (`KEEP_ORIGINAL_IMAGES=true`).
+- Why are historical attachments still present while new attachment input fails?
+  - Existing archives keep their content-addressed WebP metadata and bytes for read compatibility. New atomic deliveries currently accept Markdown only and reject attachment inputs until a canonical, secret-safe normalization contract is implemented.
 
 - Why both static bearer and JWT/JWKS support?
   - Local development should be zero-friction (single bearer). Production benefits from verifiable JWTs with role claims, rotating keys via JWKS, and layered RBAC.
@@ -2406,14 +2451,22 @@ Output format (all tools/resources):
 
 | Name | Signature | Returns | Notes |
 | :-- | :-- | :-- | :-- |
-| `health_check` | `health_check()` | `{status, environment, http_host, http_port, database_url}` | Lightweight readiness probe |
-| `ensure_project` | `ensure_project(human_key: str)` | `{id, slug, human_key, created_at}` | Idempotently creates/ensures project |
-| `register_agent` | `register_agent(project_key: str, program: str, model: str, name?: str, task_description?: str, attachments_policy?: str)` | Agent profile dict | Creates/updates agent; writes profile to Git |
+| `health_check` | `health_check()` | `{status, environment, http_host, http_port, http_path}` | Lightweight readiness probe; never exposes connection URLs |
+| `ensure_project` | `ensure_project(human_key: str, identity_mode?: str)` | `{id, project_uid, slug, human_key, project_generation, created_at}` | Idempotently resolves the durable Git/project identity and ensures its archive |
+| `register_agent` | `register_agent(project_key: str, program: str, model: str, name: str, task_description?: str, attachments_policy?: str)` | Agent profile dict | Creates/updates one durable mailbox; a token is issued exactly once on creation and never echoed on resume |
 | `whois` | `whois(project_key: str, agent_name: str, include_recent_commits?: bool, commit_limit?: int)` | Agent profile dict | Enriched profile for one agent (optionally includes recent commits) |
-| `create_agent_identity` | `create_agent_identity(project_key: str, program: str, model: str, name_hint?: str, task_description?: str, attachments_policy?: str)` | Agent profile dict | Always creates a new unique agent |
+| `create_agent_identity` | `create_agent_identity(project_key: str, program: str, model: str, name_hint: str, task_description?: str, attachments_policy?: str)` | Agent profile dict | Provisions one explicitly named durable mailbox and returns its one-time credential; never use this for a subagent |
+| `start_agent_execution` | `start_agent_execution(project_key, agent_name, external_id, client_name, execution_token, kind?, parent_execution_id?, parent_execution_token?, ...)` | AgentExecution dict | Starts or idempotently resumes a capability-bound root/session execution |
+| `heartbeat_agent_execution` | `heartbeat_agent_execution(project_key, agent_name, execution_id?, execution_token?, ...)` | AgentExecution dict | Refreshes one active execution and its observed Git/worktree metadata |
+| `end_agent_execution` | `end_agent_execution(project_key, agent_name, status?, execution_id?, execution_token?, ...)` | `{execution, descendants_ended, released_reservations, released_build_slots}` | Terminalizes an execution tree and releases only its automatic claims |
+| `list_agent_executions` | `list_agent_executions(project_key, agent_name, status?, kind?, limit?)` | AgentExecution list | Authenticated execution audit history for one durable mailbox |
+| `retire_agent` | `retire_agent(project_key: str, agent_name: str, registration_token?: str)` | `{status, agent_name, project_key}` | Reversibly retires one mailbox; it disappears from active routing while history remains |
+| `unretire_agent` | `unretire_agent(project_key: str, agent_name: str, registration_token?: str)` | `{status, agent_name, project_key}` | Restores a retired mailbox after authenticating that same identity |
 | `sweep_stale_agents` | `sweep_stale_agents(project_key: str, agent_name: str, threshold_seconds?: int, require_no_active_reservations?: bool, registration_token?: str)` | `{project_key, requested_by, threshold_seconds, retired[], retired_agents[], count}` | Authenticated project-scoped retirement; caller is excluded and active reservations block retirement by default |
-| `send_message` | `send_message(project_key: str, sender_name: str, to: list[str], subject: str, body_md: str, cc?: list[str], bcc?: list[str], attachment_paths?: list[str], convert_images?: bool, importance?: str, ack_required?: bool, thread_id?: str, auto_contact_if_blocked?: bool, sender_token?: str)` | `{deliveries: list, count: int, attachments?}` | Writes canonical + inbox/outbox, converts images. Non-absolute `attachment_paths` resolve relative to the project archive root. |
-| `reply_message` | `reply_message(project_key: str, message_id: int, sender_name: str, body_md: str, to?: list[str], cc?: list[str], bcc?: list[str], subject_prefix?: str, sender_token?: str)` | `{thread_id, reply_to, deliveries: list, count: int, attachments?}` | Preserves/creates thread, inherits flags |
+| `archive_project` | `archive_project(project_key: str, registration_token?: str)` | `{status, project_key, slug}` | Reversibly hides a project from active listings; messages and audit history remain |
+| `unarchive_project` | `unarchive_project(project_key: str, registration_token?: str)` | `{status, project_key, slug}` | Restores an archived project after project-admin authentication |
+| `send_message` | `send_message(project_key: str, sender_name: str, to: list[str], subject: str, body_md: str, idempotency_key: str, cc?: list[str], bcc?: list[str], importance?: str, ack_required?: bool, thread_id?: str, auto_contact_if_blocked?: bool, sender_token?: str)` | `{deliveries: [{project, delivery, message?}], count: int}` | Publishes an idempotent atomic delivery; attachment inputs currently fail closed |
+| `reply_message` | `reply_message(project_key: str, message_id: int, sender_name: str, body_md: str, idempotency_key: str, to?: list[str], cc?: list[str], bcc?: list[str], subject_prefix?: str, sender_token?: str)` | `{thread_id, reply_to, deliveries: [{project, delivery, message?}], count: int}` | Publishes an idempotent reply and preserves/creates the thread |
 | `request_contact` | `request_contact(project_key: str, from_agent: str, to_agent: str, to_project?: str, reason?: str, ttl_seconds?: int, registration_token?: str)` | Contact link dict | Request permission to message another agent |
 | `respond_contact` | `respond_contact(project_key: str, to_agent: str, from_agent: str, accept: bool, from_project?: str, ttl_seconds?: int, registration_token?: str)` | Contact link dict | Approve or deny a contact request |
 | `list_contacts` | `list_contacts(project_key: str, agent_name: str, registration_token?: str)` | `list[dict]` | List outbound contact links with target-project and expiry audit metadata |
@@ -2421,18 +2474,21 @@ Output format (all tools/resources):
 | `fetch_inbox` | `fetch_inbox(project_key: str, agent_name: str, limit?: int, urgent_only?: bool, include_bodies?: bool, since_ts?: str, topic?: str, unread_only?: bool, registration_token?: str)` | `list[dict]` | Non-mutating inbox read. `unread_only=true` filters to messages where this recipient's `read_ts` is NULL. |
 | `mark_message_read` | `mark_message_read(project_key: str, agent_name: str, message_id: int, registration_token?: str)` | `{message_id, read, read_at}` | Per-recipient read receipt |
 | `acknowledge_message` | `acknowledge_message(project_key: str, agent_name: str, message_id: int, registration_token?: str)` | `{message_id, acknowledged, acknowledged_at, read_at}` | Sets ack and read |
-| `macro_start_session` | `macro_start_session(human_key: str, program: str, model: str, task_description?: str, agent_name?: str, registration_token?: str, file_reservation_paths?: list[str], file_reservation_reason?: str, file_reservation_ttl_seconds?: int, inbox_limit?: int)` | `{project, agent, file_reservations, inbox}` | Orchestrates ensure→register→optional file reservation→inbox fetch |
-| `macro_prepare_thread` | `macro_prepare_thread(project_key: str, thread_id: str, program: str, model: str, agent_name?: str, registration_token?: str, task_description?: str, register_if_missing?: bool, include_examples?: bool, inbox_limit?: int, include_inbox_bodies?: bool, llm_mode?: bool, llm_model?: str)` | `{project, agent, thread, inbox}` | Bundles registration, thread summary, and inbox context |
-| `macro_file_reservation_cycle` | `macro_file_reservation_cycle(project_key: str, agent_name: str, paths: list[str], ttl_seconds?: int, exclusive?: bool, reason?: str, auto_release?: bool, registration_token?: str)` | `{file_reservations, released}` | File Reservation + optionally release surfaces around a focused edit block |
-| `macro_contact_handshake` | `macro_contact_handshake(project_key: str, requester|agent_name: str, target|to_agent: str, to_project?: str, reason?: str, ttl_seconds?: int, auto_accept?: bool, welcome_subject?: str, welcome_body?: str, requester_registration_token?: str, target_registration_token?: str)` | `{request, response, welcome_message}` | Automates contact request/approval and optional welcome ping |
+| `macro_start_session` | `macro_start_session(human_key: str, program: str, model: str, agent_name: str, external_id: str, client_name: str, execution_token: str, task_description?: str, registration_token?: str, file_reservation_paths?: list[str], file_reservation_reason?: str, file_reservation_ttl_seconds?: int, inbox_limit?: int)` | `{project, agent, execution, file_reservations, inbox}` | Authenticates one durable mailbox without echoing its token, starts its session execution, optionally reserves files, then fetches inbox context |
+| `macro_prepare_thread` | `macro_prepare_thread(project_key: str, thread_id: str, program: str, model: str, agent_name: str, external_id: str, client_name: str, execution_token: str, registration_token?: str, task_description?: str, include_examples?: bool, inbox_limit?: int, include_inbox_bodies?: bool, llm_mode?: bool, llm_model?: str)` | `{project, agent, execution, thread, inbox}` | Authenticates one pre-provisioned durable mailbox without echoing its token, starts its session execution, and bundles thread plus inbox context |
+| `macro_file_reservation_cycle` | `macro_file_reservation_cycle(project_key: str, agent_name: str, paths: list[str], ttl_seconds?: int, exclusive?: bool, reason?: str, auto_release?: bool, execution_id?: str, execution_token?: str, registration_token?: str)` | `{file_reservations, released}` | Execution-scoped reservation cycle; forwards lifecycle protocol v1 |
+| `macro_contact_handshake` | `macro_contact_handshake(project_key: str, requester|agent_name: str, target|to_agent: str, to_project?: str, reason?: str, ttl_seconds?: int, auto_accept?: bool, welcome_subject?: str, welcome_body?: str, requester_registration_token?: str, target_registration_token?: str)` | `{request, response, welcome_message}` | Connects two already registered Agents; never provisions the target mailbox |
 | `search_messages` | `search_messages(project_key: str, query: str, limit?: int, agent_name?: str, registration_token?: str)` | `list[dict]` | FTS5 search (bm25) scoped to the authenticated agent's visible messages |
 | `summarize_thread` | `summarize_thread(project_key: str, thread_id: str, include_examples?: bool, llm_mode?: bool, llm_model?: str, per_thread_limit?: int, agent_name?: str, registration_token?: str)` | Single: `{thread_id, summary, examples}` Multi (comma-sep): `{threads[], aggregate}` | Extracts participants, key points, actions. Use comma-separated thread_id for multi-thread digest. |
 | `install_precommit_guard` | `install_precommit_guard(project_key: str, code_repo_path: str)` | `{hook}` | Install a Git pre-commit guard in a target repo |
 | `uninstall_precommit_guard` | `uninstall_precommit_guard(code_repo_path: str)` | `{removed}` | Remove the guard from a repo |
-| `file_reservation_paths` | `file_reservation_paths(project_key: str, agent_name: str, paths: list[str], ttl_seconds?: int, exclusive?: bool, reason?: str, registration_token?: str)` | `{granted: list, conflicts: list}` | Advisory leases; Git artifact per path |
-| `release_file_reservations` | `release_file_reservations(project_key: str, agent_name: str, paths?: list[str], file_reservation_ids?: list[int], registration_token?: str)` | `{released, released_at}` | Releases agent's active file reservations |
+| `file_reservation_paths` | `file_reservation_paths(project_key: str, agent_name: str, paths: list[str], ttl_seconds?: int, exclusive?: bool, reason?: str, origin?: str, execution_id?: str, execution_token?: str, lifecycle_protocol_version?: int, registration_token?: str)` | `{granted: list, conflicts: list, execution_id?, legacy_unscoped}` | Advisory leases owned by an execution in enforce mode; Git artifact per path |
+| `release_file_reservations` | `release_file_reservations(project_key: str, agent_name: str, paths?: list[str], file_reservation_ids?: list[int], execution_id?: str, execution_token?: str, lifecycle_protocol_version?: int, registration_token?: str)` | `{released, released_at}` | Releases active reservations within the authenticated execution scope |
 | `force_release_file_reservation` | `force_release_file_reservation(project_key: str, agent_name: str, file_reservation_id: int, notify_previous?: bool, note?: str, registration_token?: str)` | `{released, released_at, reservation}` | Clears stale reservations using inactivity/mail/fs/git heuristics and notifies the previous holder |
-| `renew_file_reservations` | `renew_file_reservations(project_key: str, agent_name: str, extend_seconds?: int, paths?: list[str], file_reservation_ids?: list[int], registration_token?: str)` | `{renewed, file reservations[]}` | Extend TTL of existing file reservations |
+| `renew_file_reservations` | `renew_file_reservations(project_key: str, agent_name: str, extend_seconds?: int, paths?: list[str], file_reservation_ids?: list[int], execution_id?: str, execution_token?: str, lifecycle_protocol_version?: int, registration_token?: str)` | `{renewed, file_reservations[]}` | Extends active reservations within the authenticated execution scope |
+| `acquire_build_slot` | `acquire_build_slot(project_key: str, agent_name: str, slot: str, branch?: str, ttl_seconds?: int, exclusive?: bool, execution_id?: str, execution_token?: str, lifecycle_protocol_version?: int, registration_token?: str)` | `{granted, conflicts, execution_id?, legacy_unscoped}` | Acquires an execution-owned coarse build lease; observe mode accepts legacy unscoped calls with a warning |
+| `renew_build_slot` | `renew_build_slot(project_key: str, agent_name: str, slot: str, branch?: str, extend_seconds?: int, execution_id?: str, execution_token?: str, lifecycle_protocol_version?: int, registration_token?: str)` | `{renewed, expires_ts, execution_id?, legacy_unscoped}` | Renews the exact scoped or legacy holder lease |
+| `release_build_slot` | `release_build_slot(project_key: str, agent_name: str, slot: str, branch?: str, execution_id?: str, execution_token?: str, lifecycle_protocol_version?: int, registration_token?: str)` | `{released, released_at?, execution_id?, legacy_unscoped}` | Soft-releases the exact scoped or legacy holder lease |
 
 ### Resources
 
@@ -2444,7 +2500,7 @@ Output format (resources):
 
 | URI | Params | Returns | Notes |
 | :-- | :-- | :-- | :-- |
-| `resource://config/environment{?format}` | — | `{environment, database_url, http}` | Inspect server settings |
+| `resource://config/environment{?format}` | — | `{environment, http}` | Inspect non-secret runtime coordinates; database URLs and credentials are never exposed |
 | `resource://tooling/directory{?format}` | — | `{generated_at, metrics_uri, clusters[], playbooks[]}` | Grouped tool directory + workflow playbooks |
 | `resource://tooling/schemas{?format}` | — | `{tools: {<name>: {required[], optional[], aliases{}}}}` | Argument hints for tools |
 | `resource://tooling/metrics{?format}` | — | `{generated_at, tools[]}` | Aggregated call/error counts per tool |
@@ -2454,16 +2510,16 @@ Output format (resources):
 | `resource://tooling/projects{?format}` | — | `list[project]` | All projects |
 | `resource://project/{slug}` | `slug` | `{project..., agents[]}` | Project detail + agents |
 | `resource://file_reservations/{slug}{?active_only}` | `slug`, `active_only?` | `list[file reservation]` | File reservations plus staleness metadata (heuristics, last activity timestamps) |
-| `resource://message/{id}{?project,agent,agent_token}` | `id`, `project`, `agent?`, `agent_token?` | `message` | Single message with body; provide agent auth unless this MCP session already authenticated for the project |
-| `resource://thread/{thread_id}{?project,agent,agent_token,include_bodies}` | `thread_id`, `project`, `agent?`, `agent_token?`, `include_bodies?` | `{project, thread_id, messages[]}` | Thread listing scoped to the authenticated viewer |
-| `resource://inbox/{agent}{?project,since_ts,urgent_only,include_bodies,limit,agent_token}` | listed | `{project, agent, count, messages[]}` | Inbox listing |
-| `resource://mailbox/{agent}{?project,limit,agent_token}` | `project`, `limit`, `agent_token?` | `{project, agent, count, messages[]}` | Mailbox listing |
-| `resource://mailbox-with-commits/{agent}{?project,limit,agent_token}` | `project`, `limit`, `agent_token?` | `{project, agent, count, messages[]}` | Mailbox listing enriched with commit metadata |
-| `resource://outbox/{agent}{?project,limit,include_bodies,since_ts,agent_token}` | listed | `{project, agent, count, messages[]}` | Messages sent by the agent |
-| `resource://views/acks-stale/{agent}{?project,ttl_seconds,limit,agent_token}` | listed | `{project, agent, ttl_seconds, count, messages[]}` | Ack-required older than TTL without ack |
-| `resource://views/urgent-unread/{agent}{?project,limit,agent_token}` | listed | `{project, agent, count, messages[]}` | High/urgent importance messages not yet read |
-| `resource://views/ack-required/{agent}{?project,limit,agent_token}` | listed | `{project, agent, count, messages[]}` | Pending acknowledgements for an agent |
-| `resource://views/ack-overdue/{agent}{?project,ttl_minutes,limit,agent_token}` | listed | `{project, agent, ttl_minutes, count, messages[]}` | Ack-required older than TTL without ack |
+| `resource://message/{id}{?project,agent}` | `id`, `project`, `agent?` | `message` | Single message with body; the viewer must already be bound to the MCP session; stateless callers use `search_messages` |
+| `resource://thread/{thread_id}{?project,agent,include_bodies}` | `thread_id`, `project`, `agent?`, `include_bodies?` | `{project, thread_id, messages[]}` | Thread listing scoped to a viewer already bound to the MCP session; stateless callers use `summarize_thread` |
+| `resource://inbox/{agent}{?project,since_ts,urgent_only,include_bodies,limit}` | listed | `{project, agent, count, messages[]}` | Inbox listing for an Agent already bound to the MCP session; stateless callers use `fetch_inbox` |
+| `resource://mailbox/{agent}{?project,limit}` | `project`, `limit` | `{project, agent, count, messages[]}` | Mailbox listing for an Agent already bound to the MCP session |
+| `resource://mailbox-with-commits/{agent}{?project,limit}` | `project`, `limit` | `{project, agent, count, messages[]}` | Mailbox listing enriched with commit metadata; requires an existing session binding |
+| `resource://outbox/{agent}{?project,limit,include_bodies,since_ts}` | listed | `{project, agent, count, messages[]}` | Messages sent by an Agent already bound to the MCP session |
+| `resource://views/acks-stale/{agent}{?project,ttl_seconds,limit}` | listed | `{project, agent, ttl_seconds, count, messages[]}` | Ack-required older than TTL without ack; requires an existing session binding |
+| `resource://views/urgent-unread/{agent}{?project,limit}` | listed | `{project, agent, count, messages[]}` | High/urgent importance messages not yet read; requires an existing session binding |
+| `resource://views/ack-required/{agent}{?project,limit}` | listed | `{project, agent, count, messages[]}` | Pending acknowledgements for an Agent already bound to the MCP session |
+| `resource://views/ack-overdue/{agent}{?project,ttl_minutes,limit}` | listed | `{project, agent, ttl_minutes, count, messages[]}` | Ack-required older than TTL without ack; requires an existing session binding |
 
 ### Client Integration Guide
 
@@ -2643,7 +2699,7 @@ uv run python -m mcp_agent_mail.cli config set-port 9000
 uv run python -m mcp_agent_mail.cli guard install /owner/backend /abs/path/backend
 
 # List pending acknowledgements for an agent
-uv run python -m mcp_agent_mail.cli acks pending /owner/backend BlueLake --limit 10
+uv run python -m mcp_agent_mail.cli acks pending /owner/backend codex-linux-backend-1 --limit 10
 
 # Run mailbox health diagnostics
 uv run python -m mcp_agent_mail.cli doctor check
@@ -2808,7 +2864,7 @@ The global hooks read this shared machine configuration from
 |----------|-------------|---------|
 | `AGENT_MAIL_URL` | Streamable-HTTP MCP endpoint; hooks derive the same host's stateless `/api/` endpoint | `http://127.0.0.1:8765/mcp/` |
 | `HTTP_BEARER_TOKEN` | Principal server bearer | *required for authenticated servers* |
-| `AGENT_MAIL_STATE_DIR` | Private credentials/rate-limit state | `$XDG_STATE_HOME/agent-mail` |
+| `AGENT_MAIL_STATE_DIR` | Private credentials, execution capabilities, and rate-limit state. Must be absolute and outside every Git worktree/Git directory. | `$XDG_STATE_HOME/agent-mail` |
 
 Client, slot, project, agent name and registration token are intentionally not
 loaded from this shared file. `AGENT_MAIL_CLAUDE_SLOT`,

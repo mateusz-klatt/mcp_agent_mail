@@ -12,6 +12,8 @@ from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.http import build_http_app
 from tests.keys import pkey
 
+HTTP_WORKER_AGENT = "codex-wsl-http-worker-1"
+
 
 def _rpc(method: str, params: dict) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": "1", "method": method, "params": params}
@@ -33,7 +35,21 @@ async def test_http_ack_ttl_worker_log_mode(isolated_env, monkeypatch):
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         # Create one ack-required message so worker will warn
         await client.post(settings.http.path, json=_rpc("tools/call", {"name": "ensure_project", "arguments": {"human_key": pkey("backend")}}))
-        await client.post(settings.http.path, json=_rpc("tools/call", {"name": "register_agent", "arguments": {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"}}))
+        await client.post(
+            settings.http.path,
+            json=_rpc(
+                "tools/call",
+                {
+                    "name": "register_agent",
+                    "arguments": {
+                        "project_key": "Backend",
+                        "program": "codex",
+                        "model": "gpt-5",
+                        "name": HTTP_WORKER_AGENT,
+                    },
+                },
+            ),
+        )
         await client.post(
             settings.http.path,
             json=_rpc(
@@ -42,8 +58,8 @@ async def test_http_ack_ttl_worker_log_mode(isolated_env, monkeypatch):
                     "name": "send_message",
                     "arguments": {
                         "project_key": "Backend",
-                        "sender_name": "BlueLake",
-                        "to": ["BlueLake"],
+                        "sender_name": HTTP_WORKER_AGENT,
+                        "to": [HTTP_WORKER_AGENT],
                         "subject": "TTL",
                         "body_md": "x",
                         "ack_required": True,
@@ -78,7 +94,21 @@ async def test_http_ack_ttl_worker_file_reservation_escalation(isolated_env, mon
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         await client.post(settings.http.path, json=_rpc("tools/call", {"name": "ensure_project", "arguments": {"human_key": pkey("backend")}}))
-        await client.post(settings.http.path, json=_rpc("tools/call", {"name": "register_agent", "arguments": {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"}}))
+        await client.post(
+            settings.http.path,
+            json=_rpc(
+                "tools/call",
+                {
+                    "name": "register_agent",
+                    "arguments": {
+                        "project_key": "Backend",
+                        "program": "codex",
+                        "model": "gpt-5",
+                        "name": HTTP_WORKER_AGENT,
+                    },
+                },
+            ),
+        )
         # Trigger ack-required to self to make overdue soon
         await client.post(
             settings.http.path,
@@ -88,8 +118,8 @@ async def test_http_ack_ttl_worker_file_reservation_escalation(isolated_env, mon
                     "name": "send_message",
                     "arguments": {
                         "project_key": "Backend",
-                        "sender_name": "BlueLake",
-                        "to": ["BlueLake"],
+                        "sender_name": HTTP_WORKER_AGENT,
+                        "to": [HTTP_WORKER_AGENT],
                         "subject": "Overdue",
                         "body_md": "x",
                         "ack_required": True,
@@ -122,4 +152,3 @@ async def test_http_request_logging_and_cors_headers(isolated_env, monkeypatch):
         assert r0.status_code in (200, 204)
         r = await client.post(settings.http.path, json=_rpc("tools/call", {"name": "health_check", "arguments": {}}))
         assert r.status_code in (200, 401, 403)
-

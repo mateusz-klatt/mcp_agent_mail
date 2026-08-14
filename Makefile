@@ -1,8 +1,9 @@
-.PHONY: serve-http migrate lint lint-fix typecheck test smoke check check-all \
+.PHONY: serve-http migrate lint lint-fix typecheck test smoke showcase check check-all \
 	guard-install guard-uninstall claims
 
 PY=uv run
 CLI=$(PY) python -m mcp_agent_mail.cli
+TY_VERSION=0.0.71
 
 serve-http:
 	$(CLI) serve-http
@@ -13,18 +14,14 @@ migrate:
 # ---------------------------------------------------------------------------
 # Quality gates
 #
-# The four recipes under `check` are the CI gate copied verbatim from
-# .github/workflows/ci.yml, in the order CI runs them, so `make check` stops at
-# the same step CI would. That ordering is the point: for most of a day the
-# type gate held and pytest never ran once in CI, while four machines were
-# running pytest locally and reporting numbers CI could not have produced.
+# The recipes under `check` are the local backend subset of CI, in CI order.
+# They deliberately do not claim to reproduce the frontend, browser, benchmark,
+# or cross-OS jobs in .github/workflows/ci.yml.
 #
-# What this CANNOT reproduce: CI runs a three-operating-system matrix and
-# `uv sync --dev` first. A green `make check-all` says "the
-# gate passes here", not "the build is green" — `ty` in particular returns
-# different counts on different hosts, because diagnostics like the missing
-# `resource` module on Windows are properties of the machine running the
-# checker, not of the repository.
+# CI also performs `uv sync --dev --frozen`, installs its browser runtimes, and
+# runs independent React, WebKit, benchmark, macOS, and Windows jobs. A green
+# `make check-all` therefore means only "the local backend subset passes here",
+# never "the remote build is green".
 # ---------------------------------------------------------------------------
 
 # Checks, never mutates. This recipe used to be `ruff check --fix
@@ -40,12 +37,10 @@ lint:
 lint-fix:
 	$(PY) ruff check --fix
 
-# `uvx`, not `uv run` — this is what CI invokes, and it resolves its own pinned
-# copy rather than the project's. The two disagree: the version in uv.lock has
-# ASYNC240 behind --preview, a newer one has it stable, and that difference
-# alone accounted for one machine reporting 78 errors against another's 22.
+# `uvx`, not `uv run` — this is what CI invokes. Keep TY_VERSION synchronized
+# with ci.yml so local and hosted checks use the same isolated tool build.
 typecheck:
-	uvx ty check --python-version 3.14 --python-platform all
+	uvx --from "ty==$(TY_VERSION)" ty check --python-version 3.14 --python-platform all
 
 test:
 	$(PY) -m pytest -q
@@ -53,11 +48,13 @@ test:
 smoke:
 	$(CLI) am-run ci-slot -- echo "ok"
 
-check: lint typecheck test smoke
+showcase:
+	$(PY) python scripts/integration_showcase.py
 
-# Canonical local quality gate. Keep `check` as a compatibility spelling for
-# existing contributors, while instructions and automation can converge on one
-# explicit full-gate name.
+check: lint typecheck test showcase smoke
+
+# Explicit spelling for the local backend subset; the authoritative complete
+# gate is the multi-job GitHub Actions workflow.
 check-all: check
 
 guard-install:

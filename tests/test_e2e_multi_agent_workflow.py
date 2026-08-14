@@ -5,12 +5,12 @@ collaborate on a feature, using file reservations, threaded messaging,
 and acknowledgments.
 
 Scenario:
-1. BlueLake reserves backend/**
-2. GreenMountain reserves frontend/**
-3. BlueLake sends "Starting API work" [bd-100]
-4. GreenMountain replies "UI ready when you are"
-5. BlueLake completes, releases reservation
-6. RedStone reviews, sends feedback in thread
+1. The backend agent reserves backend/**
+2. The frontend agent reserves frontend/**
+3. The backend agent sends "Starting API work" [bd-100]
+4. The frontend agent replies "UI ready when you are"
+5. The backend agent completes and releases its reservation
+6. The review agent sends feedback in the thread
 7. All acknowledge completion
 
 Verification:
@@ -37,6 +37,11 @@ from mcp_agent_mail.db import get_session
 THREAD_ID = "bd-100"  # Simulated Beads issue ID
 BACKEND_PATTERN = "backend/**"
 FRONTEND_PATTERN = "frontend/**"
+WORKFLOW_BACKEND_AGENT = "codex-wsl-workflow-1"
+WORKFLOW_FRONTEND_AGENT = "codex-wsl-workflow-2"
+WORKFLOW_REVIEW_AGENT = "codex-wsl-workflow-3"
+WORKFLOW_MACRO_AGENT = "codex-wsl-workflow-macro-4"
+WORKFLOW_MACRO_EXECUTION_TOKEN = "d" * 64
 
 
 # ============================================================================
@@ -242,6 +247,7 @@ async def setup_three_agents(
             "program": "test-backend",
             "model": "test",
             "task_description": "Backend development",
+            "name": WORKFLOW_BACKEND_AGENT,
         },
     )
     blue_lake = blue_result.data["name"]
@@ -253,6 +259,7 @@ async def setup_three_agents(
             "program": "test-frontend",
             "model": "test",
             "task_description": "Frontend development",
+            "name": WORKFLOW_FRONTEND_AGENT,
         },
     )
     green_mountain = green_result.data["name"]
@@ -264,6 +271,7 @@ async def setup_three_agents(
             "program": "test-reviewer",
             "model": "test",
             "task_description": "Code review",
+            "name": WORKFLOW_REVIEW_AGENT,
         },
     )
     red_stone = red_result.data["name"]
@@ -657,7 +665,7 @@ async def test_inbox_multi_agent_messages(isolated_env):
                 "project_key": project_key,
                 "sender_name": blue_lake,
                 "to": [red_stone],
-                "subject": "From BlueLake",
+                "subject": f"From {blue_lake}",
                 "body_md": "Message from backend team",
                 "idempotency_key": "inbox-multi-backend",
             },
@@ -669,7 +677,7 @@ async def test_inbox_multi_agent_messages(isolated_env):
                 "project_key": project_key,
                 "sender_name": green_mountain,
                 "to": [red_stone],
-                "subject": "From GreenMountain",
+                "subject": f"From {green_mountain}",
                 "body_md": "Message from frontend team",
                 "idempotency_key": "inbox-multi-frontend",
             },
@@ -788,6 +796,17 @@ async def test_workflow_with_macro_start_session(isolated_env):
     async with Client(server) as client:
         project_key = "/test/e2e/macro_session"
 
+        await client.call_tool("ensure_project", {"human_key": project_key})
+        provisioned = await client.call_tool(
+            "register_agent",
+            {
+                "project_key": project_key,
+                "program": "test-workflow",
+                "model": "test",
+                "name": WORKFLOW_MACRO_AGENT,
+            },
+        )
+
         # Use macro to start session with file reservation
         session_result = await client.call_tool(
             "macro_start_session",
@@ -795,6 +814,11 @@ async def test_workflow_with_macro_start_session(isolated_env):
                 "human_key": project_key,
                 "program": "test-workflow",
                 "model": "test",
+                "agent_name": WORKFLOW_MACRO_AGENT,
+                "external_id": "workflow-macro-session-1",
+                "client_name": "codex",
+                "execution_token": WORKFLOW_MACRO_EXECUTION_TOKEN,
+                "registration_token": provisioned.data["registration_token"],
                 "task_description": "E2E workflow testing",
                 "file_reservation_paths": ["src/**"],
                 "file_reservation_reason": "workflow-testing",

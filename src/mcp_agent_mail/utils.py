@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import os
 import random
@@ -167,17 +168,76 @@ _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _AGENT_NAME_RE = re.compile(r"[^A-Za-z0-9]+")
 _THREAD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _CLIENT_PLATFORM_HOST_AGENT_ID_RE = re.compile(
-    r"^(?:claude|codex|copilot|gemini)"
+    r"^(?:claude|codex|copilot|gemini|factory|cursor|cline|windsurf|opencode)"
     r"-(?:linux|wsl|win|mac|other)"
     r"-[A-Za-z0-9][A-Za-z0-9._-]{0,95}"
     r"-[1-9][0-9]*$",
 )
 
-# Pre-built frozenset of all valid agent names (lowercase) for O(1) validation lookup.
-# This is computed once at module load time rather than O(n*m) per validation call.
+# Legacy adjective+noun names remain recognizable for migrations, existing
+# mailboxes, display aliases, and historical fixtures. New durable Agent rows
+# use the client-os-host-slot contract below.
 _VALID_AGENT_NAMES: frozenset[str] = frozenset(
     f"{adj}{noun}".lower() for adj in ADJECTIVES for noun in NOUNS
 )
+
+_BUILD_PATH_COMPONENT_MAX_BYTES = 80
+_BUILD_PATH_COMPONENT_HASH_LENGTH = 32
+_WINDOWS_RESERVED_COMPONENT_STEMS = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{index}" for index in range(1, 10)}
+    | {f"LPT{index}" for index in range(1, 10)}
+)
+
+
+def _truncate_utf8_component(value: str, max_bytes: int) -> str:
+    """Truncate on a character boundary to a portable component byte budget."""
+    result: list[str] = []
+    used = 0
+    for char in value:
+        encoded_size = len(char.encode("utf-8", errors="surrogatepass"))
+        if used + encoded_size > max_bytes:
+            break
+        result.append(char)
+        used += encoded_size
+    return "".join(result)
+
+
+def safe_build_path_component(value: str) -> str:
+    """Return a readable, portable component without lossy-name collisions."""
+    original = value
+    unsafe_chars = frozenset('/\\:*?"<>|')
+    sanitized = "".join(
+        "_" if char in unsafe_chars or char.isspace() or ord(char) < 32 else char
+        for char in original.strip()
+    ).rstrip(" .")
+    if sanitized in {"", ".", ".."}:
+        sanitized = "unknown"
+
+    reserved_on_windows = (
+        sanitized.partition(".")[0].upper() in _WINDOWS_RESERVED_COMPONENT_STEMS
+    )
+    if reserved_on_windows:
+        sanitized = f"safe-{sanitized}"
+
+    encoded = sanitized.encode("utf-8", errors="surrogatepass")
+    transformed = (
+        sanitized != original
+        or reserved_on_windows
+        or len(encoded) > _BUILD_PATH_COMPONENT_MAX_BYTES
+    )
+    if not transformed:
+        return sanitized
+
+    digest = hashlib.sha256(
+        original.encode("utf-8", errors="surrogatepass")
+    ).hexdigest()
+    suffix = f"-{digest[:_BUILD_PATH_COMPONENT_HASH_LENGTH]}"
+    prefix_budget = _BUILD_PATH_COMPONENT_MAX_BYTES - len(suffix)
+    prefix = (
+        _truncate_utf8_component(sanitized, prefix_budget).rstrip(" ._-") or "value"
+    )
+    return f"{prefix}{suffix}"
 
 
 def slugify(value: str) -> str:
@@ -188,28 +248,19 @@ def slugify(value: str) -> str:
 
 
 def generate_agent_name() -> str:
-    """Return a random adjective+noun combination."""
+    """Return a legacy adjective+noun alias for migration/test tooling."""
     adjective = random.choice(tuple(ADJECTIVES))
     noun = random.choice(tuple(NOUNS))
     return f"{adjective}{noun}"
 
 
 def validate_agent_name_format(name: str) -> bool:
-    """
-    Validate that an agent name matches the required adjective+noun format.
+    """Recognize a legacy adjective+noun Agent name.
 
-    CRITICAL: Agent names MUST be randomly generated two-word combinations
-    like "GreenLake" or "BlueDog", NOT descriptive names like "BackendHarmonizer".
-
-    Names should be:
-    - Unique and easy to remember
-    - NOT descriptive of the agent's role or task
-    - One of the predefined adjective+noun combinations
-
-    Note: This validation is case-insensitive to match the database behavior
-    where "GreenLake", "greenlake", and "GREENLAKE" are treated as the same.
-
-    Returns True if valid, False otherwise.
+    This case-insensitive predicate exists only for compatibility with
+    persisted historical identities and non-durable display aliases. It must
+    not be used to authorize creation of a new durable Agent; those identities
+    require :func:`validate_client_platform_host_agent_id`.
     """
     if not name:
         return False
@@ -222,18 +273,11 @@ _EXPLICIT_ID_SEPARATOR_RE = re.compile(r"[._-]")
 
 
 def validate_explicit_agent_id(name: str) -> bool:
-    """Validate that a caller-supplied identity is safe for use as an agent name.
+    """Validate the generic safe syntax used by explicit identity-like IDs.
 
-    Explicit IDs allow stable, human-chosen identities like ``cc-0``,
-    ``alpha-one``, or ``worker_42`` — useful for swarm workflows where agents
-    are relaunched onto the same identity.  The format mirrors thread IDs:
-    ASCII alphanumerics plus ``._-``, starting with an alphanumeric, max 128
-    characters.
-
-    To distinguish explicit IDs from adjective+noun names, the ID must
-    contain at least one separator character (``-``, ``_``, or ``.``).
-    Purely alphanumeric strings go through the adjective+noun validation
-    path instead.
+    This is a lexical helper, not the durable Agent-name policy. Durable
+    mailbox creation additionally requires
+    :func:`validate_client_platform_host_agent_id`.
     """
     if not name:
         return False

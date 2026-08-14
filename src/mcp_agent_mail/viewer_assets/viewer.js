@@ -753,7 +753,21 @@ function viewerController() {
     _mobileMediaListener: null,
     _onMobileScroll: null,
 
-    async init() {
+    init() {
+      // Alpine invokes data-object init hooks while it is still walking the
+      // component tree.  Defer the asynchronous work until that walk has
+      // installed every reactive directive, then invoke it through Alpine's
+      // proxy.  Otherwise async continuations mutate the raw controller and
+      // x-show bindings can remain stuck in their initial loading state.
+      document.addEventListener('alpine:initialized', () => {
+        const controller = window.Alpine?.$data(document.body);
+        if (controller) {
+          void controller.initializeReactiveState();
+        }
+      }, { once: true });
+    },
+
+    async initializeReactiveState() {
       console.info('[Alpine] Initializing viewer controller');
       // Initialize dark mode state
       try {
@@ -1903,11 +1917,14 @@ function viewerController() {
       };
 
       const scheduleRender = () => {
-        if (virtualState.renderRaf) cancelAnimationFrame(virtualState.renderRaf);
-        virtualState.renderRaf = requestAnimationFrame(() => {
+        if (virtualState.renderRaf) clearTimeout(virtualState.renderRaf);
+        virtualState.renderRaf = setTimeout(() => {
           virtualState.renderRaf = null;
-          this.renderVirtualSlice();
-        });
+          const controller = window.Alpine?.$data(document.body);
+          if (controller) {
+            controller.renderVirtualSlice();
+          }
+        }, 0);
       };
 
       const measureRowHeight = () => {
@@ -1936,16 +1953,18 @@ function viewerController() {
           const selectionControl = event.target.closest('[data-select-message-id]');
           if (selectionControl) {
             const selectedId = Number(selectionControl.getAttribute('data-select-message-id'));
-            this.toggleMessageSelection(selectedId);
-            this.renderVirtualSlice(true);
+            const controller = window.Alpine?.$data(document.body);
+            controller?.toggleMessageSelection(selectedId);
+            controller?.renderVirtualSlice(true);
             return;
           }
           const row = event.target.closest('[data-message-id]');
           if (!row) return;
           const id = Number(row.getAttribute('data-message-id'));
-          const msg = this.filteredMessages.find(m => m.id === id);
+          const controller = window.Alpine?.$data(document.body);
+          const msg = controller?.filteredMessages.find(m => m.id === id);
           if (msg) {
-            this.handleMessageClick(msg);
+            controller.handleMessageClick(msg);
           }
         };
       }
@@ -1956,7 +1975,9 @@ function viewerController() {
       this._onResize = onResize;
       window.addEventListener('resize', this._onResize);
 
-      this.virtualList = { ...virtualState, scheduleRender, measureRowHeight };
+      this.virtualList = virtualState;
+      this.virtualList.scheduleRender = scheduleRender;
+      this.virtualList.measureRowHeight = measureRowHeight;
 
       // Wait for fonts to load before first measurement to avoid layout jumps
       try {
@@ -2127,6 +2148,9 @@ function viewerController() {
         try {
           this.virtualList.scrollElem.removeEventListener('scroll', this._onVirtualScroll);
           this.virtualList.scrollElem.removeEventListener('click', this._onRowClick);
+          if (this.virtualList.renderRaf) {
+            clearTimeout(this.virtualList.renderRaf);
+          }
         } catch (_) {}
       }
       if (this._onVirtualScroll) {

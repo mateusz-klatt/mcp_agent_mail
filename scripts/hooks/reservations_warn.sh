@@ -54,6 +54,14 @@ export AM_PROJECT_FOR_NAME="$PROJECT"
 am_project_is_active "$PROJECT" claude "${AGENT_MAIL_CLAUDE_SLOT:-1}" \
     "$(dirname "$(am_norm_path "$target")")" || exit 0
 SELF="$(am_agent_name claude "${AGENT_MAIL_CLAUDE_SLOT:-1}")"
+TOKEN="$(am_cred_get "$PROJECT" "$SELF")"
+if [ -n "$TOKEN" ]; then
+    am_execution_reconcile_for_payload "$PROJECT" "$SELF" "$TOKEN" claude \
+        >/dev/null 2>&1 || true
+fi
+COMPATIBLE_EXECUTION_IDS="$(am_execution_compatible_ids_for_payload \
+    "$PROJECT" "$SELF" claude)"
+[ -n "$COMPATIBLE_EXECUTION_IDS" ] || COMPATIBLE_EXECUTION_IDS='[]'
 
 rel="$(am_relpath "$target")"
 [ -z "$rel" ] && exit 0
@@ -75,12 +83,54 @@ if [ "$rc" -ne 0 ]; then
 fi
 [ -z "$body" ] && exit 0
 
-# Ignore our own holds: at one path per edit, re-editing a file we already
-# reserved is the common case, and a warning that is usually wrong gets ignored.
-conflict="$(printf '%s' "$body" | jq -r --arg me "$SELF" \
-    '[.reservations[]? | select(.agent != $me)][0] // empty
-     | "\(.path_pattern) is reserved by \(.agent)\(if (.reason // "") == "" then "" else " (" + .reason + ")" end)"' 2>/dev/null)"
+# Ignore this execution and its ancestor chain only. A child cooperates with
+# its root/ancestors; sibling executions still conflict even though all share
+# the durable Agent name. Legacy NULL ownership never belongs to the compatible
+# set and therefore always warns.
+claim="$(printf '%s' "$body" | jq -c \
+    --arg self "$SELF" \
+    --argjson compatible_execution_ids "$COMPATIBLE_EXECUTION_IDS" \
+    '[.reservations[]?
+      | select((.execution_id // null) as $id |
+          $id == null or ($compatible_execution_ids | index($id)) == null)] as $claims
+     | ([$claims[]
+         | select(((.legacy_unscoped == true or .execution_id == null)
+                    and .agent == $self) | not)][0]
+        // [$claims[]
+            | select((.legacy_unscoped == true or .execution_id == null)
+                     and .agent == $self)][0]
+        // empty)' 2>/dev/null)"
+if [ -z "$claim" ] || [ "$claim" = "null" ]; then
+    exit 0
+fi
+
+legacy_self="$(printf '%s' "$claim" | jq -r --arg self "$SELF" \
+    '(.legacy_unscoped == true or .execution_id == null) and .agent == $self' \
+    2>/dev/null)"
+conflict="$(printf '%s' "$claim" | jq -r --arg self "$SELF" '
+     . as $claim
+     | ($claim.agent // "<orphaned>") as $holder
+     | [
+         (if ($claim.legacy_unscoped == true or $claim.execution_id == null)
+          then "legacy claim sprzed migracji" else empty end),
+         (if ($claim.orphaned == true or $holder == "<orphaned>")
+          then "orphaned claim" else empty end),
+         (if $claim.execution_id == null then empty
+          elif ($claim.execution_status // "missing") != "active"
+          then "inactive execution " + ($claim.execution_status // "missing")
+          elif $holder == $self
+          then "sibling execution " + $claim.execution_id
+          else "execution " + $claim.execution_id end),
+         "expires " + ($claim.expires_ts // "unknown")
+       ] as $labels
+     | "\($claim.path_pattern) is reserved by \($holder) [\($labels | join(", "))]\(if ($claim.reason // "") == "" then "" else " (" + $claim.reason + ")" end)"' 2>/dev/null)"
 [ -z "$conflict" ] && exit 0
+
+if [ "$legacy_self" = "true" ]; then
+    am_emit_context "PreToolUse" \
+        "Agent Mail: ${conflict}. This is your durable Agent's legacy claim sprzed migracji, not a sibling execution conflict. It remains unscoped from the observe rollout; explicitly release or let it expire before switching the server to enforce mode."
+    exit 0
+fi
 
 am_emit_context "PreToolUse" \
     "Agent Mail: ${conflict}. Coordinate before editing — see ${AGENT_MAIL_PUBLIC_URL:-$AM_BASE_URL}/mail"

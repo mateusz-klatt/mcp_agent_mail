@@ -6,6 +6,8 @@ from fastmcp import Client
 from mcp_agent_mail.app import build_mcp_server
 from tests.keys import pkey
 
+RESOURCE_AGENT = "codex-wsl-resources-1"
+
 
 @pytest.mark.asyncio
 async def test_core_resources(isolated_env):
@@ -14,14 +16,14 @@ async def test_core_resources(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": RESOURCE_AGENT},
         )
         msg = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": RESOURCE_AGENT,
+                "to": [RESOURCE_AGENT],
                 "subject": "R1",
                 "body_md": "b",
                 "idempotency_key": "more-resources-r1",
@@ -42,5 +44,7 @@ async def test_core_resources(isolated_env):
         mres = await client.read_resource(f"resource://message/{mid}?project=Backend")
         assert mres
         # inbox
-        ires = await client.read_resource("resource://inbox/BlueLake?project=Backend&limit=5")
+        ires = await client.read_resource(
+            f"resource://inbox/{RESOURCE_AGENT}?project=Backend&limit=5"
+        )
         assert ires

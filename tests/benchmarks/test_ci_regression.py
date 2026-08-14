@@ -21,6 +21,7 @@ Environment variables:
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -44,8 +45,17 @@ def _is_strict_mode() -> bool:
     return os.getenv("CI_REGRESSION_STRICT") == "1"
 
 
+def _is_explicit_regression_run(pytestconfig: pytest.Config) -> bool:
+    """Return whether pytest was pointed at the benchmark gate explicitly."""
+    for argument in pytestconfig.invocation_params.args:
+        selected_path = Path(str(argument).split("::", maxsplit=1)[0])
+        if selected_path.name in {"benchmarks", Path(__file__).name}:
+            return True
+    return False
+
+
 @pytest.mark.ci_regression
-def test_performance_regression_check():
+def test_performance_regression_check(pytestconfig: pytest.Config):
     """Main CI regression check - fails if thresholds exceeded.
 
     This test:
@@ -58,6 +68,8 @@ def test_performance_regression_check():
     """
     if _should_skip_regression():
         pytest.skip("Skipped by CI_REGRESSION_SKIP=1")
+    if not _is_explicit_regression_run(pytestconfig):
+        pytest.skip("Regression gate runs explicitly after benchmark artifacts are generated")
 
     # This will raise AssertionError on violations
     assert_no_regressions()
@@ -78,11 +90,64 @@ def test_baselines_file_valid():
         assert "p95_max" in config["latency_ms"], f"Baseline for {tool} missing 'latency_ms.p95_max'"
 
 
+def test_missing_baseline_result_is_fatal():
+    """Every baseline-configured benchmark must produce a result."""
+    baselines = {"version": 1, "baselines": {"send_message": {}}}
+
+    report = check_regressions(baselines, {}, expected_git_sha="a" * 40)
+
+    assert report.has_errors
+    assert [(violation.benchmark, violation.metric) for violation in report.violations] == [
+        ("send_message", "missing_result")
+    ]
+
+
+def test_result_without_git_sha_is_fatal():
+    """A result without commit attribution must not satisfy the CI gate."""
+    baselines = {"version": 1, "baselines": {"send_message": {}}}
+
+    report = check_regressions(baselines, {"send_message": {"tool": "send_message"}}, expected_git_sha="a" * 40)
+
+    assert report.has_errors
+    assert [(violation.benchmark, violation.metric) for violation in report.violations] == [
+        ("send_message", "git_sha_mismatch")
+    ]
+    assert report.passed_checks == []
+
+
+def test_result_from_different_git_sha_is_fatal():
+    """A stale result from another commit must not satisfy the CI gate."""
+    baselines = {"version": 1, "baselines": {"send_message": {}}}
+    results = {"send_message": {"git_sha": "b" * 7}}
+
+    report = check_regressions(baselines, results, expected_git_sha="a" * 40)
+
+    assert report.has_errors
+    assert [(violation.benchmark, violation.metric) for violation in report.violations] == [
+        ("send_message", "git_sha_mismatch")
+    ]
+    assert report.passed_checks == []
+
+
+def test_abbreviated_result_git_sha_matches_current_checkout():
+    """The generator's abbreviated SHA may identify the full checkout SHA."""
+    current_git_sha = "a" * 40
+    baselines = {"version": 1, "baselines": {"send_message": {}}}
+    results = {"send_message": {"git_sha": current_git_sha[:7]}}
+
+    report = check_regressions(baselines, results, expected_git_sha=current_git_sha)
+
+    assert not report.has_errors
+    assert report.passed_checks == ["send_message"]
+
+
 @pytest.mark.ci_regression
-def test_regression_report_json_artifact():
+def test_regression_report_json_artifact(pytestconfig: pytest.Config):
     """Test that regression report JSON artifact is properly generated."""
     if _should_skip_regression():
         pytest.skip("Skipped by CI_REGRESSION_SKIP=1")
+    if not _is_explicit_regression_run(pytestconfig):
+        pytest.skip("Regression report is generated explicitly after benchmark artifacts")
 
     report = check_regressions()
     json_path = write_report_json(report)
@@ -99,7 +164,7 @@ def test_regression_report_json_artifact():
 
 
 @pytest.mark.ci_regression
-def test_regression_with_strict_mode():
+def test_regression_with_strict_mode(pytestconfig: pytest.Config):
     """Test regression check in strict mode (fails on warnings too).
 
     Only runs if CI_REGRESSION_STRICT=1 is set.
@@ -109,6 +174,8 @@ def test_regression_with_strict_mode():
 
     if _should_skip_regression():
         pytest.skip("Skipped by CI_REGRESSION_SKIP=1")
+    if not _is_explicit_regression_run(pytestconfig):
+        pytest.skip("Regression gate runs explicitly after benchmark artifacts are generated")
 
     report = check_regressions()
     render_report(report)
@@ -169,6 +236,7 @@ class TestQueryCountIntegration:
                     "project_key": project_key,
                     "program": "ci-test",
                     "model": "test",
+                    "name_hint": "codex-wsl-ci-query-send-1",
                 },
             )
             agent_name = agent_result.data.get("name")
@@ -211,6 +279,7 @@ class TestQueryCountIntegration:
                     "project_key": project_key,
                     "program": "ci-test",
                     "model": "test",
+                    "name_hint": "codex-wsl-ci-query-inbox-1",
                 },
             )
             agent_name = agent_result.data.get("name")
@@ -264,6 +333,7 @@ class TestQueryCountIntegration:
                     "project_key": project_key,
                     "program": "ci-test",
                     "model": "test",
+                    "name_hint": "codex-wsl-ci-query-outbox-1",
                 },
             )
             agent_name = agent_result.data.get("name")

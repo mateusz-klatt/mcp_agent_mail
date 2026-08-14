@@ -26,6 +26,7 @@ async def test_bench_list_outbox(bench_factory):
                     "project_key": harness.project_key,
                     "program": "benchmark",
                     "model": "test",
+                    "name_hint": f"codex-wsl-bench-outbox-{i + 1}",
                     "task_description": f"Recipient {i}",
                 },
             )

@@ -20,7 +20,6 @@ Reference: mcp_agent_mail-mm2
 from __future__ import annotations
 
 import asyncio
-import threading
 from pathlib import Path
 
 import pytest
@@ -210,7 +209,12 @@ async def test_ensure_project_keeps_symlinked_paths_distinct(isolated_env, tmp_p
         # An agent registered through the symlink belongs to the symlink project.
         agent_result = await client.call_tool(
             "register_agent",
-            {"project_key": symlink_path, "program": "test-program", "model": "test-model"},
+            {
+                "project_key": symlink_path,
+                "program": "test-program",
+                "model": "test-model",
+                "name": "codex-wsl-symlink-1",
+            },
         )
         project = await get_project_from_db(symlink_path)
         assert project is not None, "the symlinked project exists in its own right"
@@ -231,13 +235,14 @@ async def test_register_agent_creates_new_agent(isolated_env):
         # Setup project
         await client.call_tool("ensure_project", {"human_key": pkey("test/setup/agent")})
 
-        # Register agent (let server generate name)
+        # Register a durable client-os-host-slot identity.
         result = await client.call_tool(
             "register_agent",
             {
                 "project_key": pkey("test/setup/agent"),
                 "program": "test-program",
                 "model": "test-model",
+                "name": "codex-wsl-setup-agent-1",
                 "task_description": "Testing agent creation",
             },
         )
@@ -272,6 +277,7 @@ async def test_register_agent_updates_existing_agent(isolated_env):
                 "project_key": pkey("test/setup/update"),
                 "program": "original-program",
                 "model": "original-model",
+                "name": "codex-wsl-setup-update-1",
                 "task_description": "Original task",
             },
         )
@@ -319,7 +325,7 @@ async def test_register_agent_existing_identity_requires_token_across_sessions(i
                 "project_key": pkey("test/setup/takeover"),
                 "program": "bootstrap-program",
                 "model": "bootstrap-model",
-                "name": "BlueLake",
+                "name": "codex-wsl-takeover-1",
                 "task_description": "Original owner",
             },
         )
@@ -333,7 +339,7 @@ async def test_register_agent_existing_identity_requires_token_across_sessions(i
                     "project_key": pkey("test/setup/takeover"),
                     "program": "attacker-program",
                     "model": "attacker-model",
-                    "name": "BlueLake",
+                    "name": "codex-wsl-takeover-1",
                     "task_description": "Hijacked",
                 },
             )
@@ -350,12 +356,12 @@ async def test_register_agent_existing_identity_requires_token_across_sessions(i
                 "project_key": pkey("test/setup/takeover"),
                 "program": "bootstrap-program",
                 "model": "bootstrap-model",
-                "name": "BlueLake",
+                "name": "codex-wsl-takeover-1",
                 "task_description": "Updated by owner",
                 "registration_token": registration_token,
             },
         )
-    assert updated.data["name"] == "BlueLake"
+    assert updated.data["name"] == "codex-wsl-takeover-1"
     assert updated.data["task_description"] == "Updated by owner"
 
 
@@ -408,34 +414,31 @@ async def test_concurrent_registration_token_initialization_returns_database_win
 
 
 @pytest.mark.asyncio
-async def test_register_agent_generates_valid_name(isolated_env):
-    """register_agent generates valid adjective+noun names."""
+async def test_register_agent_preserves_explicit_durable_names(isolated_env):
+    """register_agent preserves distinct explicit durable mailbox identities."""
     server = build_mcp_server()
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": pkey("test/setup/names")})
 
-        # Register several agents and verify name format
+        requested_names = [
+            "codex-wsl-setup-names-1",
+            "claude-wsl-setup-names-1",
+            "copilot-win-setup-names-1",
+        ]
         names = []
-        for _ in range(3):
+        for requested_name in requested_names:
             result = await client.call_tool(
                 "register_agent",
                 {
                     "project_key": pkey("test/setup/names"),
                     "program": "test",
                     "model": "test",
+                    "name": requested_name,
                 },
             )
             name = result.data["name"]
             names.append(name)
-
-            # Name should be CamelCase (adjective+noun pattern)
-            assert name[0].isupper(), f"Name should start with capital: {name}"
-            # Should have at least 2 capital letters (adjective + noun)
-            capitals = sum(1 for c in name if c.isupper())
-            assert capitals >= 2, f"Name should be adjective+noun pattern: {name}"
-
-        # All names should be unique
-        assert len(set(names)) == 3, "All generated names should be unique"
+        assert names == requested_names
 
 
 # ============================================================================
@@ -444,8 +447,8 @@ async def test_register_agent_generates_valid_name(isolated_env):
 
 
 @pytest.mark.asyncio
-async def test_create_agent_identity_always_creates_new(isolated_env):
-    """create_agent_identity always creates a new agent, never updates."""
+async def test_create_agent_identity_creates_distinct_explicit_names(isolated_env):
+    """create_agent_identity creates each distinct explicit durable mailbox."""
     server = build_mcp_server()
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": pkey("test/setup/identity")})
@@ -457,6 +460,7 @@ async def test_create_agent_identity_always_creates_new(isolated_env):
                 "project_key": pkey("test/setup/identity"),
                 "program": "identity-test",
                 "model": "test-model",
+                "name_hint": "codex-wsl-identity-1",
             },
         )
         name1 = result1.data["name"]
@@ -468,6 +472,7 @@ async def test_create_agent_identity_always_creates_new(isolated_env):
                 "project_key": pkey("test/setup/identity"),
                 "program": "identity-test",
                 "model": "test-model",
+                "name_hint": "codex-wsl-identity-2",
             },
         )
         name2 = result2.data["name"]
@@ -498,27 +503,26 @@ async def test_create_agent_identity_with_name_hint(isolated_env):
                 "project_key": pkey("test/setup/hint"),
                 "program": "test",
                 "model": "test",
-                "name_hint": "GreenCastle",
+                "name_hint": "codex-wsl-hint-1",
             },
         )
 
         # Should use the hint
-        assert result.data["name"] == "GreenCastle"
+        assert result.data["name"] == "codex-wsl-hint-1"
 
 
 @pytest.mark.asyncio
-async def test_create_agent_identity_offloads_archive_name_check(isolated_env, monkeypatch):
-    """Archive-side name availability checks should not block the event loop."""
-    main_thread = threading.main_thread()
+async def test_create_agent_identity_does_not_treat_profile_as_identity_authority(
+    isolated_env,
+    monkeypatch,
+):
+    """A stale projection cannot reserve a durable name after DB rollback."""
     path_type = type(Path("/"))
     original_exists = path_type.exists
-    seen_archive_exists = False
 
     def checked_exists(self: Path) -> bool:
-        nonlocal seen_archive_exists
-        if self.name == "BlueRiver" and "agents" in self.parts:
-            seen_archive_exists = True
-            assert threading.current_thread() is not main_thread
+        if self.name == "codex-wsl-blue-river-1" and "agents" in self.parts:
+            raise AssertionError("profile projection must not decide name availability")
         return original_exists(self)
 
     monkeypatch.setattr(path_type, "exists", checked_exists)
@@ -532,12 +536,11 @@ async def test_create_agent_identity_offloads_archive_name_check(isolated_env, m
                 "project_key": pkey("test/setup/hint-offload"),
                 "program": "test",
                 "model": "test",
-                "name_hint": "BlueRiver",
+                "name_hint": "codex-wsl-blue-river-1",
             },
         )
 
-    assert result.data["name"] == "BlueRiver"
-    assert seen_archive_exists is True
+    assert result.data["name"] == "codex-wsl-blue-river-1"
 
 
 # ============================================================================
@@ -559,6 +562,7 @@ async def test_last_active_ts_updated_on_activity(isolated_env):
                 "project_key": pkey("test/setup/active"),
                 "program": "test",
                 "model": "test",
+                "name": "codex-wsl-active-1",
             },
         )
         agent_name = result.data["name"]
@@ -609,6 +613,7 @@ async def test_whois_returns_agent_details(isolated_env):
                 "project_key": pkey("test/setup/whois"),
                 "program": "whois-test-program",
                 "model": "whois-test-model",
+                "name": "codex-wsl-whois-1",
                 "task_description": "Testing whois functionality",
             },
         )
@@ -645,6 +650,7 @@ async def test_whois_with_recent_commits(isolated_env):
                 "project_key": pkey("test/setup/commits"),
                 "program": "test",
                 "model": "test",
+                "name": "codex-wsl-commits-1",
             },
         )
         agent_name = reg_result.data["name"]
@@ -687,6 +693,7 @@ async def test_agent_profile_written_to_git_archive(isolated_env):
                 "project_key": pkey("test/setup/archive"),
                 "program": "archive-test",
                 "model": "test-model",
+                "name": "codex-wsl-archive-1",
                 "task_description": "Testing archive writes",
             },
         )
@@ -717,32 +724,25 @@ async def test_agent_profile_written_to_git_archive(isolated_env):
 
 @pytest.mark.asyncio
 async def test_register_agent_invalid_name_rejected(isolated_env):
-    """register_agent rejects or handles invalid agent names appropriately."""
+    """register_agent rejects a placeholder without mutating the Agent table."""
     server = build_mcp_server()
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": pkey("test/setup/invalid")})
+        project = await client.call_tool(
+            "ensure_project", {"human_key": pkey("test/setup/invalid")}
+        )
 
-        # Try to register with invalid name (placeholder name)
-        # Some placeholder names may be caught, others may be accepted with warnings
-        try:
-            result = await client.call_tool(
+        with pytest.raises(ToolError, match="must match client-os-host-slot"):
+            await client.call_tool(
                 "register_agent",
                 {
                     "project_key": pkey("test/setup/invalid"),
                     "program": "test",
                     "model": "test",
-                    "name": "YourAgentName",  # Should be caught as placeholder
+                    "name": "YourAgentName",
                 },
             )
-            # If it was accepted, verify an agent was created (test passes)
-            # This tests the graceful handling path
-            assert result.data["name"] is not None
-        except Exception as e:
-            # If rejected, verify error message is meaningful
-            error_msg = str(e).lower()
-            assert any(keyword in error_msg for keyword in [
-                "placeholder", "adjective", "noun", "invalid", "agent", "name"
-            ]), f"Error should mention name validation: {e}"
+
+    assert await count_agents_in_project(project.data["id"]) == 0
 
 
 @pytest.mark.asyncio
@@ -802,6 +802,7 @@ async def test_get_agents_batch_mixed_case(isolated_env):
                 "project_key": pkey("test/setup/batch-case"),
                 "program": "test",
                 "model": "test",
+                "name_hint": "codex-wsl-batch-case-1",
                 "task_description": "Batch case test",
             },
         )
@@ -824,6 +825,7 @@ async def test_get_agents_batch_missing_name_uses_get_agent_error(isolated_env):
                 "project_key": pkey("test/setup/batch-missing"),
                 "program": "test",
                 "model": "test",
+                "name_hint": "codex-wsl-batch-missing-1",
                 "task_description": "Batch missing test",
             },
         )

@@ -23,6 +23,7 @@ TTL="${AGENT_MAIL_AUTORESERVE_TTL:-900}"
 
 am_read_payload
 AM_SESSION_ID="$(am_payload_field '.session_id')"
+PAYLOAD_PROJECT="$(am_project_key)"
 target="$(am_payload_field '.tool_input.file_path')"
 [ -z "$target" ] && target="$(am_payload_field '.tool_input.notebook_path')"
 [ -z "$target" ] && exit 0
@@ -62,14 +63,52 @@ rel="$(am_relpath "$target")"
 [ -z "$rel" ] && exit 0
 
 token="$(am_cred_get "$PROJECT" "$AGENT")"
-# No credential means SessionStart never ran. Registering here would work, but
-# doing it from a per-edit hook races every sibling session on the same host for
-# the same name; leave identity establishment to SessionStart.
+# A cross-project edit may be the first lifecycle event this project sees. The
+# durable name is deterministic, so establish that project's credential here;
+# this is still the same mailbox identity, not a new subagent Agent.
+if [ -z "$token" ]; then
+    # In the payload's own project, a missing credential means SessionStart did
+    # not establish identity; preserve the long-standing network-free fail-open
+    # behavior. Only a genuine cross-project edit needs lazy enrollment because
+    # that target project could not have seen the original SessionStart.
+    [ "$PROJECT" != "$PAYLOAD_PROJECT" ] || exit 0
+    token="$(am_ensure_agent_credential \
+        "$PROJECT" "$AGENT" claude "${AGENT_MAIL_CLAUDE_SLOT:-1}" \
+        "claude-code" "$(am_model_id)")"
+fi
 [ -z "$token" ] && exit 0
 
+execution_cwd="$(git -C "$(dirname "$(am_norm_path "$target")")" \
+    rev-parse --show-toplevel 2>/dev/null)"
+if ! AM_EXECUTION_CWD_OVERRIDE="$execution_cwd" \
+    am_execution_ensure_for_payload "$PROJECT" "$AGENT" "$token" claude \
+        >/dev/null; then
+    am_emit_context "PostToolUse" \
+        "Agent Mail: NO reservation was filed for ${rel} — this project's AgentExecution could not be started. Do not register another Agent; treat this file as unguarded."
+    exit 0
+fi
+
+am_execution_reconcile_for_payload "$PROJECT" "$AGENT" "$token" claude \
+    >/dev/null 2>&1 || true
+
+execution_id="$(am_execution_id_for_payload "$PROJECT" "$AGENT" claude)"
+execution_token="$(am_execution_token_for_payload "$PROJECT" "$AGENT" claude)"
+if [ -z "$execution_id" ] || [ -z "$execution_token" ]; then
+    am_emit_context "PostToolUse" \
+        "Agent Mail: NO reservation was filed for ${rel} — this tool call has no active AgentExecution. Do not register another Agent; restart the durable parent session or repair its lifecycle hook. Treat this file as unguarded."
+    exit 0
+fi
+
 resp="$(am_call file_reservation_paths "$(AGENT_MAIL_JQ_REGISTRATION_TOKEN="$token" \
-    jq -nc --arg p "$PROJECT" --arg a "$AGENT" --arg path "$rel" --argjson ttl "$TTL" \
-    '{project_key:$p,agent_name:$a,registration_token:env.AGENT_MAIL_JQ_REGISTRATION_TOKEN,paths:[$path],ttl_seconds:$ttl,reason:"auto: edited in session"}')")"
+    AGENT_MAIL_JQ_EXECUTION_TOKEN="$execution_token" \
+    jq -nc --arg p "$PROJECT" --arg a "$AGENT" --arg path "$rel" \
+    --arg execution_id "$execution_id" \
+    --argjson ttl "$TTL" \
+    '{project_key:$p,agent_name:$a,registration_token:env.AGENT_MAIL_JQ_REGISTRATION_TOKEN,
+      execution_id:$execution_id,
+      execution_token:env.AGENT_MAIL_JQ_EXECUTION_TOKEN,
+      lifecycle_protocol_version:1,origin:"auto",paths:[$path],ttl_seconds:$ttl,
+      reason:"auto: edited in execution"}')")"
 rc=$?
 # Silence here reads as "reservation filed" — the hook only speaks on conflict,
 # so saying nothing is how success looks. When the server is unreachable that
@@ -78,16 +117,16 @@ rc=$?
 # they are alone. Announce the failure even though the ordinary path stays
 # quiet, because this is the one case where quiet is a false statement.
 if [ "$rc" -ne 0 ]; then
+    am_execution_marker_end "$(am_payload_field '.cwd')" "$execution_id" \
+        unverified >/dev/null 2>&1 || true
     why="$(am_failure_reason "$rc" "$resp")"
     am_emit_context "PostToolUse" \
         "Agent Mail: NO reservation was filed for ${rel} — ${why}. Nobody else will be warned that you are editing it, and you were not warned about them. Treat this file as unguarded until coordination is back."
     exit 0
 fi
+am_execution_marker_refresh_for_payload "$PROJECT" "$AGENT" claude \
+    >/dev/null 2>&1 || true
 [ -z "$resp" ] && exit 0
-
-# Remember it so SessionEnd can release exactly this session's paths and leave a
-# concurrent session's holds on the same identity untouched.
-am_session_log_add "$PROJECT" "$rel"
 
 # Speak only on conflict. Announcing every successful self-reservation would put
 # a line in the model's context on each edit, which is how a signal becomes noise.

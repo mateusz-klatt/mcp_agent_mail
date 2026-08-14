@@ -28,6 +28,13 @@ from mcp_agent_mail.storage import (
 from mcp_agent_mail.utils import sanitize_agent_name, validate_agent_name_format
 from tests.keys import pkey
 
+SECURITY_BROAD_AGENT = "codex-wsl-security-broad-1"
+SECURITY_TRAVERSAL_AGENT = "codex-wsl-security-traversal-2"
+SECURITY_ATTACHMENT_AGENT = "codex-wsl-security-attachment-3"
+SECURITY_MARKDOWN_AGENT = "codex-wsl-security-markdown-4"
+SECURITY_ABSOLUTE_AGENT = "codex-wsl-security-absolute-5"
+SECURITY_PROJECT_PATH_AGENT = "codex-wsl-security-project-path-6"
+
 # ============================================================================
 # Agent Name Sanitization Tests
 # ============================================================================
@@ -243,7 +250,7 @@ class TestFileReservationPathTraversal:
                     "project_key": pkey("backend"),
                     "program": "test",
                     "model": "test",
-                    "name": "BlueLake",
+                    "name": SECURITY_BROAD_AGENT,
                 },
             )
             # Very broad pattern should still work but gets logged as warning
@@ -251,7 +258,7 @@ class TestFileReservationPathTraversal:
                 "file_reservation_paths",
                 {
                     "project_key": pkey("backend"),
-                    "agent_name": "BlueLake",
+                    "agent_name": SECURITY_BROAD_AGENT,
                     "paths": ["**/*"],
                     "ttl_seconds": 3600,
                 },
@@ -271,7 +278,7 @@ class TestFileReservationPathTraversal:
                     "project_key": pkey("backend"),
                     "program": "test",
                     "model": "test",
-                    "name": "GreenCastle",
+                    "name": SECURITY_TRAVERSAL_AGENT,
                 },
             )
             # Path traversal pattern - advisory model allows it but it's contained
@@ -279,7 +286,7 @@ class TestFileReservationPathTraversal:
                 "file_reservation_paths",
                 {
                     "project_key": pkey("backend"),
-                    "agent_name": "GreenCastle",
+                    "agent_name": SECURITY_TRAVERSAL_AGENT,
                     "paths": ["../../../etc/passwd"],
                     "ttl_seconds": 3600,
                 },
@@ -314,7 +321,7 @@ class TestAttachmentPathTraversal:
                     "project_key": pkey("backend"),
                     "program": "test",
                     "model": "test",
-                    "name": "PurpleBear",
+                    "name": SECURITY_ATTACHMENT_AGENT,
                 },
             )
             # Try to attach a nonexistent file with traversal path
@@ -324,8 +331,8 @@ class TestAttachmentPathTraversal:
                     "send_message",
                     {
                         "project_key": pkey("backend"),
-                        "sender_name": "PurpleBear",
-                        "to": ["PurpleBear"],
+                        "sender_name": SECURITY_ATTACHMENT_AGENT,
+                        "to": [SECURITY_ATTACHMENT_AGENT],
                         "subject": "Test missing attachment",
                         "body_md": "Test message",
                         "attachment_paths": ["../../../nonexistent.bin"],
@@ -354,7 +361,7 @@ class TestAttachmentPathTraversal:
                     "project_key": pkey("backend"),
                     "program": "test",
                     "model": "test",
-                    "name": "RedStone",
+                    "name": SECURITY_MARKDOWN_AGENT,
                 },
             )
             # Path traversal in markdown body - should be preserved as text
@@ -363,8 +370,8 @@ class TestAttachmentPathTraversal:
                 "send_message",
                 {
                     "project_key": pkey("backend"),
-                    "sender_name": "RedStone",
-                    "to": ["RedStone"],
+                    "sender_name": SECURITY_MARKDOWN_AGENT,
+                    "to": [SECURITY_MARKDOWN_AGENT],
                     "subject": "Test traversal in body",
                     "body_md": "Check ![image](../../../etc/passwd)",
                     "idempotency_key": "security-markdown-traversal-body",
@@ -394,7 +401,7 @@ class TestAttachmentPathTraversal:
                     "project_key": pkey("backend"),
                     "program": "test",
                     "model": "test",
-                    "name": "BlueLake",
+                    "name": SECURITY_ABSOLUTE_AGENT,
                 },
             )
 
@@ -403,8 +410,8 @@ class TestAttachmentPathTraversal:
                     "send_message",
                     {
                         "project_key": pkey("backend"),
-                        "sender_name": "BlueLake",
-                        "to": ["BlueLake"],
+                        "sender_name": SECURITY_ABSOLUTE_AGENT,
+                        "to": [SECURITY_ABSOLUTE_AGENT],
                         "subject": "Absolute attachment",
                         "body_md": "Should be rejected",
                         "attachment_paths": [str(secret_file.resolve())],
@@ -486,15 +493,14 @@ class TestPathTraversalIntegration:
             project_slug = proj_result.data.get("slug", "")
             assert ".." not in project_slug
 
-            # Register agent with a name that would be sanitized
-            # Note: register_agent requires valid adjective+noun names
+            # Register an agent with an explicit durable identity.
             await client.call_tool(
                 "register_agent",
                 {
                     "project_key": pkey("test/project/path"),
                     "program": "test",
                     "model": "test",
-                    "name": "BlueLake",  # Valid name
+                    "name": SECURITY_PROJECT_PATH_AGENT,
                 },
             )
 
@@ -503,8 +509,8 @@ class TestPathTraversalIntegration:
                 "send_message",
                 {
                     "project_key": pkey("test/project/path"),
-                    "sender_name": "BlueLake",
-                    "to": ["BlueLake"],
+                    "sender_name": SECURITY_PROJECT_PATH_AGENT,
+                    "to": [SECURITY_PROJECT_PATH_AGENT],
                     "subject": "Path test",
                     "body_md": "Check file at ../../../etc/passwd",
                     "idempotency_key": "security-project-path-body",
@@ -517,7 +523,7 @@ class TestPathTraversalIntegration:
                 "fetch_inbox",
                 {
                     "project_key": pkey("test/project/path"),
-                    "agent_name": "BlueLake",
+                    "agent_name": SECURITY_PROJECT_PATH_AGENT,
                 },
             )
             assert isinstance(inbox_result.data, list)

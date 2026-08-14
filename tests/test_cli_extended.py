@@ -276,11 +276,26 @@ def test_cli_products_search_disambiguates_cross_project_sender(isolated_env, mo
     monkeypatch.setattr("httpx.Client.post", fake_post)
     res = runner.invoke(
         app,
-        ["products", "search", "Suite", "Cross", "--agent", "BlueLake", "--registration-token", "shared-token"],
+        ["products", "search", "Suite", "Cross", "--agent", "BlueLake"],
+        env={"AGENT_MAIL_REGISTRATION_TOKEN": "shared-token"},
     )
     assert res.exit_code == 0
     assert "BlueLake@source" in res.stdout
     assert "Private Cross Message" not in res.stdout
+
+
+def test_cli_products_search_rejects_registration_token_argv(isolated_env):
+    runner = CliRunner()
+    argv_secret = "argv-secret-must-not-leak"
+
+    res = runner.invoke(
+        app,
+        ["products", "search", "Suite", "Cross", "--agent", "BlueLake", "--registration-token", argv_secret],
+    )
+
+    assert res.exit_code == 2
+    assert "No such option: --registration-token" in res.output
+    assert argv_secret not in res.output
 
 
 def test_cli_products_search_falls_back_when_fts_query_fails(isolated_env, monkeypatch):
@@ -303,7 +318,8 @@ def test_cli_products_search_falls_back_when_fts_query_fails(isolated_env, monke
     monkeypatch.setattr("httpx.Client.post", fake_post)
     res = runner.invoke(
         app,
-        ["products", "search", "Suite", "Cross", "--agent", "BlueLake", "--registration-token", "shared-token"],
+        ["products", "search", "Suite", "Cross", "--agent", "BlueLake"],
+        env={"AGENT_MAIL_REGISTRATION_TOKEN": "shared-token"},
     )
     assert res.exit_code == 0
     assert "BlueLake@source" in res.stdout
@@ -320,7 +336,8 @@ def test_cli_products_inbox_fallback_disambiguates_cross_project_sender(isolated
     monkeypatch.setattr("httpx.Client.post", fake_post)
     res = runner.invoke(
         app,
-        ["products", "inbox", "Suite", "BlueLake", "--registration-token", "shared-token", "--limit", "5"],
+        ["products", "inbox", "Suite", "BlueLake", "--limit", "5"],
+        env={"AGENT_MAIL_REGISTRATION_TOKEN": "shared-token"},
     )
     assert res.exit_code == 0
     assert "BlueLake@source" in res.stdout
@@ -364,7 +381,8 @@ def test_cli_products_inbox_fallback_resolves_agent_case_insensitively(isolated_
     monkeypatch.setattr("httpx.Client.post", fake_post)
     res = runner.invoke(
         app,
-        ["products", "inbox", "Suite", "bluelake", "--registration-token", "shared-token", "--limit", "5"],
+        ["products", "inbox", "Suite", "bluelake", "--limit", "5"],
+        env={"AGENT_MAIL_REGISTRATION_TOKEN": "shared-token"},
     )
     assert res.exit_code == 0
     assert "BlueLake@source" in res.stdout
@@ -467,7 +485,8 @@ def test_cli_products_inbox_reads_structured_content_response(isolated_env, monk
     monkeypatch.setattr("httpx.Client.post", fake_post)
     res = runner.invoke(
         app,
-        ["products", "inbox", "Suite", "BlueLake", "--registration-token", "shared-token", "--limit", "5"],
+        ["products", "inbox", "Suite", "BlueLake", "--limit", "5"],
+        env={"AGENT_MAIL_REGISTRATION_TOKEN": "shared-token"},
     )
     assert res.exit_code == 0
     assert "BlueLake@source" in res.stdout
@@ -500,7 +519,8 @@ def test_cli_products_inbox_reads_list_shaped_structured_content_response(isolat
     monkeypatch.setattr("httpx.Client.post", fake_post)
     res = runner.invoke(
         app,
-        ["products", "inbox", "Suite", "BlueLake", "--registration-token", "shared-token", "--limit", "5"],
+        ["products", "inbox", "Suite", "BlueLake", "--limit", "5"],
+        env={"AGENT_MAIL_REGISTRATION_TOKEN": "shared-token"},
     )
     assert res.exit_code == 0
     assert "BlueLake@source" in res.stdout
@@ -523,7 +543,8 @@ def test_cli_products_inbox_does_not_fallback_when_server_returns_empty_result(i
     monkeypatch.setattr("httpx.Client.post", fake_post)
     res = runner.invoke(
         app,
-        ["products", "inbox", "Suite", "BlueLake", "--registration-token", "shared-token", "--limit", "5"],
+        ["products", "inbox", "Suite", "BlueLake", "--limit", "5"],
+        env={"AGENT_MAIL_REGISTRATION_TOKEN": "shared-token"},
     )
     assert res.exit_code == 0
     assert "No messages found." in res.stdout
@@ -546,7 +567,8 @@ def test_cli_products_inbox_surfaces_server_error_without_local_fallback(isolate
     monkeypatch.setattr("httpx.Client.post", fake_post)
     res = runner.invoke(
         app,
-        ["products", "inbox", "Suite", "BlueLake", "--registration-token", "shared-token", "--limit", "5"],
+        ["products", "inbox", "Suite", "BlueLake", "--limit", "5"],
+        env={"AGENT_MAIL_REGISTRATION_TOKEN": "shared-token"},
     )
     assert res.exit_code == 1
     assert "BlueLake@source" not in res.stdout
@@ -595,10 +617,9 @@ def test_cli_products_summarize_thread_reads_structured_content_response(isolate
             "cross-thread",
             "--agent",
             "BlueLake",
-            "--registration-token",
-            "shared-token",
             "--no-llm",
         ],
+        env={"AGENT_MAIL_REGISTRATION_TOKEN": "shared-token"},
     )
     assert res.exit_code == 0
     assert "Server summary point" in res.stdout

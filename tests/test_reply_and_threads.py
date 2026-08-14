@@ -8,13 +8,16 @@ from fastmcp import Client
 from mcp_agent_mail.app import build_mcp_server
 from tests.keys import pkey
 
+REPLY_AGENT_ONE = "codex-wsl-reply-1"
+REPLY_AGENT_TWO = "codex-wsl-reply-2"
+
 
 @pytest.mark.asyncio
 async def test_reply_preserves_thread_and_subject_prefix(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
-        for n in ("GreenCastle", "BlueLake"):
+        for n in (REPLY_AGENT_ONE, REPLY_AGENT_TWO):
             await client.call_tool(
                 "register_agent",
                 {"project_key": "Backend", "program": "x", "model": "y", "name": n},
@@ -22,15 +25,15 @@ async def test_reply_preserves_thread_and_subject_prefix(isolated_env):
         # Allow direct messaging without contact gating for this test
         await client.call_tool(
             "set_contact_policy",
-            {"project_key": "Backend", "agent_name": "BlueLake", "policy": "open"},
+            {"project_key": "Backend", "agent_name": REPLY_AGENT_TWO, "policy": "open"},
         )
 
         orig = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "GreenCastle",
-                "to": ["BlueLake"],
+                "sender_name": REPLY_AGENT_ONE,
+                "to": [REPLY_AGENT_TWO],
                 "subject": "Plan",
                 "body_md": "body",
                 "idempotency_key": "reply-thread-parent",
@@ -44,7 +47,7 @@ async def test_reply_preserves_thread_and_subject_prefix(isolated_env):
             {
                 "project_key": "Backend",
                 "message_id": mid,
-                "sender_name": "BlueLake",
+                "sender_name": REPLY_AGENT_TWO,
                 "body_md": "ack",
                 "idempotency_key": "reply-thread-first",
             },
@@ -59,7 +62,7 @@ async def test_reply_preserves_thread_and_subject_prefix(isolated_env):
             {
                 "project_key": "Backend",
                 "message_id": mid,
-                "sender_name": "BlueLake",
+                "sender_name": REPLY_AGENT_TWO,
                 "body_md": "second",
                 "subject_prefix": "Re:",
                 "idempotency_key": "reply-thread-second",
@@ -84,26 +87,26 @@ async def test_reply_to_round_trips_through_db(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
-        for n in ("GreenCastle", "BlueLake"):
+        for n in (REPLY_AGENT_ONE, REPLY_AGENT_TWO):
             await client.call_tool(
                 "register_agent",
                 {"project_key": "Backend", "program": "x", "model": "y", "name": n},
             )
         await client.call_tool(
             "set_contact_policy",
-            {"project_key": "Backend", "agent_name": "BlueLake", "policy": "open"},
+            {"project_key": "Backend", "agent_name": REPLY_AGENT_TWO, "policy": "open"},
         )
         await client.call_tool(
             "set_contact_policy",
-            {"project_key": "Backend", "agent_name": "GreenCastle", "policy": "open"},
+            {"project_key": "Backend", "agent_name": REPLY_AGENT_ONE, "policy": "open"},
         )
 
         orig = await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "GreenCastle",
-                "to": ["BlueLake"],
+                "sender_name": REPLY_AGENT_ONE,
+                "to": [REPLY_AGENT_TWO],
                 "subject": "Plan",
                 "body_md": "body",
                 "idempotency_key": "reply-edge-parent",
@@ -118,7 +121,7 @@ async def test_reply_to_round_trips_through_db(isolated_env):
             {
                 "project_key": "Backend",
                 "message_id": original_id,
-                "sender_name": "BlueLake",
+                "sender_name": REPLY_AGENT_TWO,
                 "body_md": "ack",
                 "idempotency_key": "reply-edge-child",
             },
@@ -139,4 +142,3 @@ async def test_reply_to_round_trips_through_db(isolated_env):
                 await session.execute(sa_select(Message).where(cast(Any, Message.id) == original_id))
             ).scalars().one()
             assert original.reply_to is None, "top-level message must have NULL reply_to (#188)"
-

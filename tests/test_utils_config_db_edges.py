@@ -45,14 +45,12 @@ def test_config_valid_explicit_values_parse(monkeypatch):
     monkeypatch.setenv("HTTP_PORT", "9999")
     monkeypatch.setenv("HTTP_RATE_LIMIT_ENABLED", "yes")
     monkeypatch.setenv("LLM_TEMPERATURE", "0.7")
-    monkeypatch.setenv("AGENT_NAME_ENFORCEMENT_MODE", "strict")
     monkeypatch.setenv("HTTP_RATE_LIMIT_BACKEND", "redis")
     clear_settings_cache()
     s = get_settings()
     assert s.http.port == 9999
     assert s.http.rate_limit_enabled is True
     assert s.llm.temperature == pytest.approx(0.7)
-    assert s.agent_name_enforcement_mode == "strict"
     assert s.http.rate_limit_backend == "redis"
 
 
@@ -61,13 +59,11 @@ def test_config_empty_value_falls_back_to_default(monkeypatch):
     monkeypatch.setenv("HTTP_PORT", "")
     monkeypatch.setenv("HTTP_RATE_LIMIT_ENABLED", "")
     monkeypatch.setenv("DATABASE_POOL_SIZE", "")
-    monkeypatch.setenv("AGENT_NAME_ENFORCEMENT_MODE", "")
     clear_settings_cache()
     s = get_settings()
     assert s.http.port == 8765
     assert s.http.rate_limit_enabled is False
     assert s.database.pool_size == 50  # empty -> the configured default (50)
-    assert s.agent_name_enforcement_mode == "coerce"  # default
 
 
 def test_config_malformed_int_raises_with_key(monkeypatch):
@@ -95,13 +91,13 @@ def test_config_malformed_float_raises_with_key(monkeypatch):
 
 
 def test_config_unknown_enum_raises_with_key_and_allowed(monkeypatch):
-    monkeypatch.setenv("AGENT_NAME_ENFORCEMENT_MODE", "bogus")
+    monkeypatch.setenv("TOOLS_FILTER_MODE", "bogus")
     clear_settings_cache()
     with pytest.raises(ConfigError) as exc:
         get_settings()
     msg = str(exc.value)
-    assert "AGENT_NAME_ENFORCEMENT_MODE" in msg
-    assert "strict" in msg  # surfaces the allowed values
+    assert "TOOLS_FILTER_MODE" in msg
+    assert "include" in msg  # surfaces the allowed values
 
 
 def test_config_unknown_rate_limit_backend_raises(monkeypatch):

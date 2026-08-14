@@ -17,8 +17,6 @@ Reference: mcp_agent_mail-kkp
 
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 from fastmcp import Client
 from sqlalchemy import text
@@ -139,6 +137,7 @@ async def test_file_reservation_create_persists_to_database(isolated_env):
                 "project_key": pkey("test/session/reserve"),
                 "program": "test",
                 "model": "test",
+                "name": "codex-wsl-session-reserve-1",
             },
         )
         agent_name = agent_result.data["name"]
@@ -177,6 +176,7 @@ async def test_file_reservation_release_persists_to_database(isolated_env):
                 "project_key": pkey("test/session/release"),
                 "program": "test",
                 "model": "test",
+                "name": "codex-wsl-session-release-1",
             },
         )
         agent_name = agent_result.data["name"]
@@ -226,6 +226,7 @@ async def test_file_reservation_renew_persists_to_database(isolated_env):
                 "project_key": pkey("test/session/renew"),
                 "program": "test",
                 "model": "test",
+                "name": "codex-wsl-session-renew-1",
             },
         )
         agent_name = agent_result.data["name"]
@@ -285,7 +286,7 @@ async def test_force_release_file_reservation_persists_to_database(isolated_env)
     """
     server = build_mcp_server()
     async with Client(server) as client:
-        # Setup - create project and two agents
+        # Setup - create the durable Agent that owns the reservation.
         await client.call_tool("ensure_project", {"human_key": pkey("test/session/force")})
         holder_result = await client.call_tool(
             "register_agent",
@@ -293,19 +294,11 @@ async def test_force_release_file_reservation_persists_to_database(isolated_env)
                 "project_key": pkey("test/session/force"),
                 "program": "test",
                 "model": "test",
+                "name": "codex-wsl-session-force-1",
             },
         )
         holder_name = holder_result.data["name"]
-
-        releaser_result = await client.call_tool(
-            "register_agent",
-            {
-                "project_key": pkey("test/session/force"),
-                "program": "test",
-                "model": "test",
-            },
-        )
-        releaser_name = releaser_result.data["name"]
+        holder_token = holder_result.data["registration_token"]
 
         # Create reservation (held by holder)
         create_result = await client.call_tool(
@@ -324,31 +317,33 @@ async def test_force_release_file_reservation_persists_to_database(isolated_env)
         before_state = await verify_file_reservation_in_db(reservation_id, expected_released=False)
         assert not before_state["is_released"], "Should not be released before force release"
 
-        # Wait a moment and simulate inactivity for the holder
-        await asyncio.sleep(0.1)
-
-        # Try force release - may fail if reservation is not stale enough
-        # In that case we accept that the function works as designed
-        try:
-            await client.call_tool(
-                "force_release_file_reservation",
-                {
-                    "project_key": pkey("test/session/force"),
-                    "agent_name": releaser_name,
-                    "file_reservation_id": reservation_id,
-                    "notify_previous": False,
-                },
+        # Expiry is an unambiguous stale signal. The owner capability remains
+        # required: another durable Agent may not release this claim.
+        async with get_session() as session:
+            await session.execute(
+                text(
+                    "UPDATE file_reservations "
+                    "SET expires_ts = datetime('now', '-1 second') WHERE id = :id"
+                ),
+                {"id": reservation_id},
             )
+            await session.commit()
 
-            # If force release succeeded, verify it persisted
-            after_state = await verify_file_reservation_in_db(reservation_id, expected_released=True)
-            assert after_state["is_released"], "Force release should persist to database"
-        except Exception as e:
-            # If refused due to "still active", that's expected behavior
-            error_str = str(e).lower()
-            if "still shows recent activity" in error_str or "refusing forced release" in error_str:
-                pytest.skip("Reservation not stale enough for force release test")
-            raise
+        await client.call_tool(
+            "force_release_file_reservation",
+            {
+                "project_key": pkey("test/session/force"),
+                "agent_name": holder_name,
+                "registration_token": holder_token,
+                "file_reservation_id": reservation_id,
+                "notify_previous": False,
+            },
+        )
+
+        after_state = await verify_file_reservation_in_db(
+            reservation_id, expected_released=True
+        )
+        assert after_state["is_released"], "Force release should persist to database"
 
 
 # ============================================================================
@@ -370,6 +365,7 @@ async def test_contact_request_persists_to_database(isolated_env):
                 "project_key": pkey("test/session/contact"),
                 "program": "test",
                 "model": "test",
+                "name": "codex-wsl-session-contact-1",
             },
         )
         agent_a_name = agent_a_result.data["name"]
@@ -380,6 +376,7 @@ async def test_contact_request_persists_to_database(isolated_env):
                 "project_key": pkey("test/session/contact"),
                 "program": "test",
                 "model": "test",
+                "name": "codex-wsl-session-contact-2",
             },
         )
         agent_b_name = agent_b_result.data["name"]
@@ -423,6 +420,7 @@ async def test_contact_respond_persists_to_database(isolated_env):
                 "project_key": pkey("test/session/respond"),
                 "program": "test",
                 "model": "test",
+                "name": "codex-wsl-session-respond-1",
             },
         )
         agent_a_name = agent_a_result.data["name"]
@@ -433,6 +431,7 @@ async def test_contact_respond_persists_to_database(isolated_env):
                 "project_key": pkey("test/session/respond"),
                 "program": "test",
                 "model": "test",
+                "name": "codex-wsl-session-respond-2",
             },
         )
         agent_b_name = agent_b_result.data["name"]
@@ -494,6 +493,7 @@ async def test_message_read_persists_to_database(isolated_env):
                 "project_key": pkey("test/session/read"),
                 "program": "test",
                 "model": "test",
+                "name": "codex-wsl-session-read-1",
             },
         )
         sender_name = sender_result.data["name"]
@@ -504,6 +504,7 @@ async def test_message_read_persists_to_database(isolated_env):
                 "project_key": pkey("test/session/read"),
                 "program": "test",
                 "model": "test",
+                "name": "codex-wsl-session-read-2",
             },
         )
         receiver_name = receiver_result.data["name"]
@@ -562,6 +563,7 @@ async def test_message_acknowledge_persists_to_database(isolated_env):
                 "project_key": pkey("test/session/ack"),
                 "program": "test",
                 "model": "test",
+                "name": "codex-wsl-session-ack-1",
             },
         )
         sender_name = sender_result.data["name"]
@@ -572,6 +574,7 @@ async def test_message_acknowledge_persists_to_database(isolated_env):
                 "project_key": pkey("test/session/ack"),
                 "program": "test",
                 "model": "test",
+                "name": "codex-wsl-session-ack-2",
             },
         )
         receiver_name = receiver_result.data["name"]
@@ -636,6 +639,7 @@ async def test_agent_registration_persists_to_database(isolated_env):
                 "project_key": pkey("test/session/agent"),
                 "program": "test-program",
                 "model": "test-model",
+                "name": "codex-wsl-session-agent-1",
                 "task_description": "Test task",
             },
         )
@@ -676,6 +680,7 @@ async def test_agent_update_persists_to_database(isolated_env):
                 "project_key": pkey("test/session/update"),
                 "program": "original-program",
                 "model": "original-model",
+                "name": "codex-wsl-session-update-1",
             },
         )
         agent_name = agent_result.data["name"]

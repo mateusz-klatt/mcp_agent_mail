@@ -40,7 +40,12 @@ async def test_summarize_threads_llm_refinement(isolated_env, monkeypatch):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "x", "model": "y", "name": "BlueLake"},
+            {
+                "project_key": "Backend",
+                "program": "x",
+                "model": "y",
+                "name": "codex-wsl-summarize-on-1",
+            },
         )
         # Seed two threads to trigger multi-thread mode
         for tid in ("T-1", "T-2"):
@@ -48,8 +53,8 @@ async def test_summarize_threads_llm_refinement(isolated_env, monkeypatch):
                 "send_message",
                 {
                     "project_key": "Backend",
-                    "sender_name": "BlueLake",
-                    "to": ["BlueLake"],
+                "sender_name": "codex-wsl-summarize-on-1",
+                "to": ["codex-wsl-summarize-on-1"],
                     "subject": f"Msg in {tid}",
                     "body_md": "body",
                     "thread_id": tid,

@@ -11,13 +11,13 @@ set -uo pipefail
 
 EVENT="${1:-}"
 case "$EVENT" in
-  session-start|stop|session-end) ;;
+  session-start|subagent-start|subagent-stop|heartbeat|stop|session-end) ;;
   *) exit 0 ;;
 esac
 
 # shellcheck source=/dev/null
 . "$(dirname "$0")/agent_mail_common.sh" 2>/dev/null || {
-  [[ "$EVENT" == "stop" ]] && printf '{}\n'
+  [[ "$EVENT" == "stop" || "$EVENT" == "subagent-stop" ]] && printf '{}\n'
   exit 0
 }
 
@@ -45,7 +45,7 @@ case "$HOOK_CLIENT" in
 esac
 
 hook_empty_stop_output() {
-  [[ "$EVENT" == "stop" ]] && printf '{}\n'
+  [[ "$EVENT" == "stop" || "$EVENT" == "subagent-stop" ]] && printf '{}\n'
 }
 
 hook_nonblocking_message() {
@@ -59,11 +59,34 @@ hook_nonblocking_message() {
   fi
 }
 
+# PostToolUse warnings must reach both the human-facing hook UI and the model.
+# Codex ignores plain stdout for model context, so keep the documented
+# hookSpecificOutput envelope alongside systemMessage.  This is deliberately
+# separate from Stop output, whose decision contract must remain unchanged.
+hook_post_tool_context() {
+  if [[ "$HOOK_SURFACE" == "codex" ]]; then
+    jq -nc --arg context "$1" \
+      '{systemMessage:$context,
+        hookSpecificOutput:{hookEventName:"PostToolUse",
+                            additionalContext:$context}}'
+  else
+    printf '{}\n'
+  fi
+}
+
 hook_start_context() {
   if [[ "$HOOK_SURFACE" == "copilot" ]]; then
     jq -nc --arg context "$1" '{additionalContext:$context}'
   else
     am_emit_context "SessionStart" "$1"
+  fi
+}
+
+hook_subagent_start_context() {
+  if [[ "$HOOK_SURFACE" == "copilot" ]]; then
+    jq -nc --arg context "$1" '{additionalContext:$context}'
+  else
+    am_emit_context "SubagentStart" "$1"
   fi
 }
 
@@ -171,50 +194,19 @@ hook_fetch_inbox() {
   return 0
 }
 
-# These clients do not install an autoreserve hook, so SessionEnd must not release
-# every reservation held by the shared client slot.  If a session-scoped log
-# exists (for example after a future explicit integration), release only its
-# recorded paths.  With today's Codex hook set this is a local no-op.
-hook_release_session_paths() {
-  local log slug project paths agent token response response_rc migration
-  AM_SESSION_ID="$(am_payload_field '.session_id')"
-  [[ -n "$AM_SESSION_ID" ]] || return 0
-  while IFS= read -r log; do
-    [[ -r "$log" ]] || continue
-    slug="${log##*__}"
-    slug="${slug%.list}"
-    [[ -n "$slug" ]] || continue
-    paths="$(sort -u "$log" 2>/dev/null | jq -Rsc 'split("\n") | map(select(length > 0))' 2>/dev/null)"
-    [[ -n "$paths" && "$paths" != "[]" ]] || continue
-    project="$(jq -r --arg s "$slug" \
-      'keys[] | select((. | gsub("[^A-Za-z0-9._-]"; "")) == $s)' \
-      "$AM_CRED_FILE" 2>/dev/null | head -n 1)"
-    [[ -n "$project" ]] || continue
-    export AM_PROJECT_FOR_NAME="$project"
-    if migration="$(am_identity_migration_pair "$project" "$HOOK_CLIENT" "$HOOK_SLOT")"; then
-      continue
-    fi
-    agent="$(am_agent_name "$HOOK_CLIENT" "$HOOK_SLOT")" || continue
-    token="$(am_cred_get "$project" "$agent")"
-    [[ -n "$token" ]] || continue
-    response="$(am_call release_file_reservations "$(
-      AGENT_MAIL_JQ_REGISTRATION_TOKEN="$token" \
-      jq -nc --arg p "$project" --arg a "$agent" --argjson paths "$paths" \
-      '{project_key:$p,agent_name:$a,registration_token:env.AGENT_MAIL_JQ_REGISTRATION_TOKEN,paths:$paths}'
-    )")"
-    response_rc=$?
-    if [[ $response_rc -eq 0 ]]; then
-      # Retain the state file itself; an empty log is enough to prevent a
-      # repeated release and avoids deleting user state from a lifecycle hook.
-      printf '' > "$log" 2>/dev/null || true
-    fi
-  done <<EOF
-$(am_session_logs)
-EOF
-}
-
-if [[ "$EVENT" == "session-end" ]]; then
-  hook_release_session_paths
+# End events must not depend on the payload cwd still being a Git checkout, nor
+# on the repository remaining opted in. SessionEnd persists its lifecycle
+# tombstone before scanning every exact private execution; SubagentStop likewise
+# resolves the native child entirely from private state.
+if [[ "$EVENT" == "session-end" || "$EVENT" == "subagent-stop" ]]; then
+  if [[ "$EVENT" == "subagent-stop" ]]; then
+    am_subagent_executions_request_stop_all_for_payload "$HOOK_CLIENT" \
+      >/dev/null 2>&1 || true
+  else
+    am_root_executions_end_all_for_payload "$HOOK_CLIENT" completed \
+      >/dev/null 2>&1 || true
+  fi
+  hook_empty_stop_output
   exit 0
 fi
 
@@ -231,6 +223,8 @@ export AM_PROJECT_FOR_NAME="$PROJECT"
 if ! am_project_is_active "$PROJECT" "$HOOK_CLIENT" "$HOOK_SLOT" .; then
   if [[ "$EVENT" == "session-start" ]]; then
     hook_start_context "$(am_project_activation_message "$PROJECT")"
+  elif [[ "$EVENT" == "subagent-start" ]]; then
+    hook_subagent_start_context "$(am_project_activation_message "$PROJECT")"
   else
     hook_empty_stop_output
   fi
@@ -246,8 +240,150 @@ if MIGRATION_PAIR="$(am_identity_migration_pair "$PROJECT" "$HOOK_CLIENT" "$HOOK
   MIGRATION_MESSAGE="$(am_identity_migration_message "$LEGACY_AGENT" "$CLIENT_AGENT")"
   if [[ "$EVENT" == "session-start" ]]; then
     hook_start_context "$MIGRATION_MESSAGE"
-  else
+  elif [[ "$EVENT" == "subagent-start" ]]; then
+    hook_subagent_start_context "$MIGRATION_MESSAGE"
+  elif [[ "$EVENT" == "stop" ]]; then
     hook_nonblocking_message "$MIGRATION_MESSAGE"
+  else
+    hook_empty_stop_output
+  fi
+  exit 0
+fi
+
+if [[ "$EVENT" == "session-start" ]]; then
+  SESSION_SOURCE="$(am_payload_field '.source')"
+  if ! am_session_run_begin "$HOOK_CLIENT" "$SESSION_SOURCE" >/dev/null; then
+    hook_start_context \
+      "Agent Mail: this ${HOOK_SURFACE} lifecycle is already ended and could not be resumed safely. The durable mailbox remains available, but execution-owned reservations are unavailable."
+    exit 0
+  fi
+fi
+
+# SubagentStart receives the parent session id plus a native agent_id. Reuse the
+# durable mailbox credential and create a child execution beneath the active
+# root execution; never call register_agent from this path.
+if [[ "$EVENT" == "subagent-start" ]]; then
+  HOOK_AGENT="$(am_agent_name "$HOOK_CLIENT" "$HOOK_SLOT")"
+  HOOK_TOKEN="$(am_cred_get "$PROJECT" "$HOOK_AGENT")"
+  if [[ -z "$HOOK_TOKEN" ]]; then
+    hook_subagent_start_context \
+      "Agent Mail: this subagent has no active durable parent identity. Do not call register_agent or create_agent_identity; report through the parent session. Execution-owned reservations are unavailable."
+    exit 0
+  fi
+  if EXECUTION_ID="$(am_subagent_execution_start \
+      "$PROJECT" "$HOOK_AGENT" "$HOOK_TOKEN" "$HOOK_CLIENT")"; then
+    hook_subagent_start_context \
+      "Agent Mail: execute as ${HOOK_AGENT} using subagent execution ${EXECUTION_ID}. Do not register or create another Agent. Reservations belong to this execution; the Git worktree is execution context, not identity."
+  else
+    hook_subagent_start_context \
+      "Agent Mail: could not start the subagent execution for ${HOOK_AGENT}. Do not register or create another Agent; report through the parent. Treat reservation coordination as unavailable."
+  fi
+  exit 0
+fi
+
+if [[ "$EVENT" == "heartbeat" ]]; then
+  HOOK_AGENT="$(am_agent_name "$HOOK_CLIENT" "$HOOK_SLOT")"
+  HOOK_TOKEN="$(am_cred_get "$PROJECT" "$HOOK_AGENT")"
+  # Codex documents cwd as the session working directory, not as a per-tool
+  # target. If it names another opted-in repository on this event, establish the
+  # same durable mailbox and lifecycle generation there before heartbeating it.
+  # Never infer a second repository from command text.
+  # A prior root state elsewhere proves SessionStart ran; without that proof a
+  # global PostToolUse hook must not silently replace a missed lifecycle start.
+  if [[ -n "$HOOK_AGENT" ]] \
+    && ! am_session_end_intent_exists "$HOOK_CLIENT" \
+    && am_session_has_root_execution_state "$HOOK_CLIENT" \
+    && am_project_is_active "$PROJECT" "$HOOK_CLIENT" "$HOOK_SLOT" . \
+    && ! am_identity_migration_pair "$PROJECT" "$HOOK_CLIENT" \
+      "$HOOK_SLOT" >/dev/null; then
+    if [[ -z "$HOOK_TOKEN" ]]; then
+      HOOK_TOKEN="$(am_ensure_agent_credential \
+        "$PROJECT" "$HOOK_AGENT" "$HOOK_CLIENT" "$HOOK_SLOT" \
+        "$HOOK_PROGRAM" "$(hook_model_id)")"
+    fi
+    if [[ -n "$HOOK_TOKEN" ]]; then
+      am_execution_ensure_for_payload "$PROJECT" "$HOOK_AGENT" \
+        "$HOOK_TOKEN" "$HOOK_CLIENT" >/dev/null 2>&1 || true
+    fi
+  fi
+  if [[ -n "$HOOK_AGENT" && -n "$HOOK_TOKEN" ]]; then
+    am_execution_reconcile_for_payload "$PROJECT" "$HOOK_AGENT" \
+      "$HOOK_TOKEN" "$HOOK_CLIENT" >/dev/null 2>&1 || true
+    am_execution_heartbeat "$PROJECT" "$HOOK_AGENT" "$HOOK_TOKEN" \
+      "$HOOK_CLIENT" >/dev/null 2>&1 || true
+  fi
+  # A PostToolUse payload can name a file owned by a repository other than the
+  # session cwd. The target project never saw SessionStart, so establish the
+  # same deterministic durable mailbox and native execution chain there before
+  # touching liveness. This is lifecycle attribution only: Codex still has no
+  # automatic reservation hook, and no claim is filed here.
+  TARGET_PATH="$(am_payload_field '.tool_input.file_path')"
+  [[ -n "$TARGET_PATH" ]] \
+    || TARGET_PATH="$(am_payload_field '.tool_input.notebook_path')"
+  TARGET_PROJECT=""
+  [[ -z "$TARGET_PATH" ]] \
+    || TARGET_PROJECT="$(am_project_key_for_file "$TARGET_PATH")"
+  if [[ -n "$TARGET_PROJECT" && "$TARGET_PROJECT" != "$PROJECT" ]]; then
+    TARGET_DIR="$(dirname "$(am_norm_path "$TARGET_PATH")")"
+    TARGET_REPO="$(git -C "$TARGET_DIR" rev-parse --show-toplevel 2>/dev/null)"
+    if [[ -n "$TARGET_REPO" ]] \
+      && ! am_session_end_intent_exists "$HOOK_CLIENT" \
+      && am_project_is_active "$TARGET_PROJECT" "$HOOK_CLIENT" "$HOOK_SLOT" \
+        "$TARGET_DIR" \
+      && ! am_identity_migration_pair "$TARGET_PROJECT" "$HOOK_CLIENT" \
+        "$HOOK_SLOT" >/dev/null; then
+      export AM_PROJECT_FOR_NAME="$TARGET_PROJECT"
+      TARGET_AGENT="$(am_agent_name "$HOOK_CLIENT" "$HOOK_SLOT")"
+      TARGET_TOKEN="$(am_cred_get "$TARGET_PROJECT" "$TARGET_AGENT")"
+      if [[ -z "$TARGET_TOKEN" ]]; then
+        TARGET_TOKEN="$(am_ensure_agent_credential \
+          "$TARGET_PROJECT" "$TARGET_AGENT" "$HOOK_CLIENT" "$HOOK_SLOT" \
+          "$HOOK_PROGRAM" "$(hook_model_id)")"
+      fi
+      if [[ -n "$TARGET_AGENT" && -n "$TARGET_TOKEN" ]] \
+        && ! am_session_end_intent_exists "$HOOK_CLIENT"; then
+        if AM_EXECUTION_CWD_OVERRIDE="$TARGET_REPO" \
+          am_execution_ensure_for_payload "$TARGET_PROJECT" "$TARGET_AGENT" \
+            "$TARGET_TOKEN" "$HOOK_CLIENT" >/dev/null; then
+          AM_EXECUTION_CWD_OVERRIDE="$TARGET_REPO" \
+            am_execution_reconcile_for_payload "$TARGET_PROJECT" \
+              "$TARGET_AGENT" "$TARGET_TOKEN" "$HOOK_CLIENT" \
+              >/dev/null 2>&1 || true
+          AM_EXECUTION_CWD_OVERRIDE="$TARGET_REPO" \
+            am_execution_heartbeat "$TARGET_PROJECT" "$TARGET_AGENT" \
+              "$TARGET_TOKEN" "$HOOK_CLIENT" >/dev/null 2>&1 || true
+        fi
+      fi
+    fi
+  fi
+
+  # Keep every root chain for this exact native session generation alive. The
+  # current cwd and any explicit file target were enrolled above, so they are
+  # included in the same exact-state scan without guessing paths from command
+  # text.
+  am_root_executions_heartbeat_all_for_payload "$HOOK_CLIENT" \
+    >/dev/null 2>&1 || true
+
+  TOOL_NAME="$(am_payload_field '.tool_name')"
+  if [[ "$TOOL_NAME" == "apply_patch" || "$TOOL_NAME" == "Bash" ]] \
+    && [[ -z "$(am_payload_field '.tool_input.file_path')" ]] \
+    && [[ -z "$(am_payload_field '.tool_input.notebook_path')" ]]; then
+    WARN_GENERATION="$(am_session_lifecycle_generation "$HOOK_CLIENT")"
+    WARN_KEY="$(am_state_component \
+      "${HOOK_CLIENT}|$(am_payload_field '.session_id')|${WARN_GENERATION}|${TOOL_NAME}|unattributable-target" \
+      2>/dev/null || true)"
+    WARN_FILE="${AM_STATE_DIR}/rate/${WARN_KEY}.warned"
+    WARN_LOCK="${WARN_FILE}.lock"
+    if [[ -n "$WARN_KEY" ]] && am_lock_acquire "$WARN_LOCK"; then
+      if [[ ! -f "$WARN_FILE" ]]; then
+        printf '%s\n' "$(date +%s)" > "$WARN_FILE" 2>/dev/null || true
+        am_lock_release "$WARN_LOCK"
+        hook_post_tool_context \
+          "Agent Mail lifecycle scope: ${TOOL_NAME} was attributed only to the Git project containing the hook cwd. Its command payload is intentionally not parsed for paths, so writes into another repository cannot be enrolled or guarded automatically; run the tool from that repository or coordinate/reserve it explicitly."
+      else
+        am_lock_release "$WARN_LOCK"
+      fi
+    fi
   fi
   exit 0
 fi
@@ -258,14 +394,20 @@ if [[ "$EVENT" == "session-start" ]]; then
       "Agent Mail: could not register ${PROJECT} — ${HOOK_ERROR}. No inbox or reservation coordination is active for this ${HOOK_SURFACE} session."
     exit 0
   fi
+  if EXECUTION_ID="$(am_root_execution_start \
+      "$PROJECT" "$HOOK_AGENT" "$HOOK_TOKEN" "$HOOK_CLIENT")"; then
+    EXECUTION_CONTEXT=" Root execution: ${EXECUTION_ID}."
+  else
+    EXECUTION_CONTEXT=" The durable mailbox is connected, but its root execution could not be started; execution-owned reservations are unavailable."
+  fi
   if hook_fetch_inbox; then
     COUNTS="$(printf '%s' "$HOOK_INBOX" | jq -r \
       '[length, (map(select(.importance == "urgent" or .importance == "high")) | length)] | @tsv')"
     MESSAGE_COUNT="${COUNTS%%$'\t'*}"
     URGENT_COUNT="${COUNTS#*$'\t'}"
-    START_CONTEXT="Agent Mail: you are ${HOOK_AGENT} on ${PROJECT}. Unread inbox: ${MESSAGE_COUNT} message(s), ${URGENT_COUNT} high/urgent. Use fetch_inbox before proceeding when mail is pending."
+    START_CONTEXT="Agent Mail: you are ${HOOK_AGENT} on ${PROJECT}.${EXECUTION_CONTEXT} Unread inbox: ${MESSAGE_COUNT} message(s), ${URGENT_COUNT} high/urgent. Use fetch_inbox before proceeding when mail is pending."
   else
-    START_CONTEXT="Agent Mail: you are ${HOOK_AGENT} on ${PROJECT}, but the inbox check failed — ${HOOK_ERROR}."
+    START_CONTEXT="Agent Mail: you are ${HOOK_AGENT} on ${PROJECT}.${EXECUTION_CONTEXT} The inbox check failed — ${HOOK_ERROR}."
   fi
   hook_start_context "$START_CONTEXT"
   exit 0
@@ -282,13 +424,24 @@ AGENT="$(am_agent_name "$HOOK_CLIENT" "$HOOK_SLOT")" || {
   printf '{}\n'
   exit 0
 }
+STOP_TOKEN="$(am_cred_get "$PROJECT" "$AGENT")"
+if [[ -n "$STOP_TOKEN" ]]; then
+  am_execution_reconcile_for_payload "$PROJECT" "$AGENT" "$STOP_TOKEN" \
+    "$HOOK_CLIENT" >/dev/null 2>&1 || true
+fi
 INTERVAL="${AGENT_MAIL_INTERVAL:-120}"
 case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=120 ;; esac
 
 # Identity and repository derivation are local.  The rate gate sits after them
 # but before ensure/register/fetch so an ordinary turn cannot update last_active
 # or otherwise touch the server inside the interval.
-RATE_KEY="$(am_state_component "${PROJECT}|${AGENT}" 2>/dev/null || true)"
+ROOT_EXECUTION_ID="$(am_execution_state_value \
+  "$PROJECT" "$AGENT" "$HOOK_CLIENT" session \
+  "$(am_payload_field '.session_id')" \
+  'select(.status == "active") | .execution_id')"
+RATE_SCOPE="${ROOT_EXECUTION_ID:-session:$(am_payload_field '.session_id')}"
+RATE_KEY="$(am_state_component \
+  "${PROJECT}|${AGENT}|${RATE_SCOPE}" 2>/dev/null || true)"
 RATE_FILE=""
 if [[ -n "$RATE_KEY" ]]; then
   mkdir -p "${AM_STATE_DIR}/rate" 2>/dev/null || true
@@ -310,6 +463,10 @@ if ! hook_ensure_agent 0; then
     "Agent Mail inbox check failed for ${PROJECT}: ${HOOK_ERROR}."
   exit 0
 fi
+am_execution_reconcile_for_payload "$PROJECT" "$HOOK_AGENT" "$HOOK_TOKEN" \
+  "$HOOK_CLIENT" >/dev/null 2>&1 || true
+am_execution_heartbeat "$PROJECT" "$HOOK_AGENT" "$HOOK_TOKEN" \
+  "$HOOK_CLIENT" >/dev/null 2>&1 || true
 if ! hook_fetch_inbox; then
   hook_nonblocking_message \
     "Agent Mail inbox check failed for ${HOOK_AGENT}: ${HOOK_ERROR}."

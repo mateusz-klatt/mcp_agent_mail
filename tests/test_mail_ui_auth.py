@@ -4781,6 +4781,141 @@ class TestMailUiRbacSurface:
         assert wrong_token.status_code == 401
 
     @pytest.mark.asyncio
+    async def test_file_reservation_read_exposes_execution_diagnostics_without_capability(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """Hook reads distinguish live, terminal, and legacy claims safely."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        project_id, _message_id = await _seed_project(
+            "execution-reservations",
+            subject="Execution diagnostics",
+            agent_name="ServiceAgent",
+            sound="low",
+        )
+        active_id = "11111111-1111-4111-8111-111111111111"
+        ended_id = "22222222-2222-4222-8222-222222222222"
+        async with get_session() as session:
+            agent_id = int(
+                (
+                    await session.execute(
+                        text(
+                            "SELECT id FROM agents WHERE project_id = :project_id "
+                            "AND name = 'ServiceAgent'"
+                        ),
+                        {"project_id": project_id},
+                    )
+                ).scalar_one()
+            )
+            await session.execute(
+                text(
+                    "INSERT INTO agent_executions "
+                    "(id, project_id, agent_id, external_id, client_name, "
+                    "execution_token_hash, lifecycle_protocol_version, kind, status, "
+                    "task_description, started_ts, last_active_ts) VALUES "
+                    "(:id, :project_id, :agent_id, :external_id, 'codex', :token_hash, "
+                    "1, 'session', 'active', '', datetime('now', '-5 minutes'), "
+                    "datetime('now'))"
+                ),
+                {
+                    "id": active_id,
+                    "project_id": project_id,
+                    "agent_id": agent_id,
+                    "external_id": "live-native-session",
+                    "token_hash": "a" * 64,
+                },
+            )
+            await session.execute(
+                text(
+                    "INSERT INTO agent_executions "
+                    "(id, project_id, agent_id, external_id, client_name, "
+                    "execution_token_hash, lifecycle_protocol_version, kind, status, "
+                    "task_description, started_ts, last_active_ts) VALUES "
+                    "(:id, :project_id, :agent_id, :external_id, 'codex', :token_hash, "
+                    "1, 'session', 'active', '', datetime('now', '-5 minutes'), "
+                    "datetime('now'))"
+                ),
+                {
+                    "id": ended_id,
+                    "project_id": project_id,
+                    "agent_id": agent_id,
+                    "external_id": "ended-native-session",
+                    "token_hash": "b" * 64,
+                },
+            )
+            for values in (
+                {
+                    "agent_id": agent_id,
+                    "execution_id": active_id,
+                    "origin": "auto",
+                    "path": "src/live.py",
+                },
+                {
+                    "agent_id": agent_id,
+                    "execution_id": ended_id,
+                    "origin": "explicit",
+                    "path": "src/ended.py",
+                },
+                {
+                    "agent_id": None,
+                    "execution_id": None,
+                    "origin": "explicit",
+                    "path": "src/legacy.py",
+                },
+            ):
+                await session.execute(
+                    text(
+                        "INSERT INTO file_reservations "
+                        "(project_id, agent_id, execution_id, origin, path_pattern, "
+                        "exclusive, reason, created_ts, expires_ts) VALUES "
+                        "(:project_id, :agent_id, :execution_id, :origin, :path, 1, '', "
+                        "datetime('now'), datetime('now', '+1 hour'))"
+                    ),
+                    {"project_id": project_id, **values},
+                )
+            await session.execute(
+                text(
+                    "UPDATE agent_executions SET status = 'completed', "
+                    "last_active_ts = CURRENT_TIMESTAMP, ended_ts = CURRENT_TIMESTAMP "
+                    "WHERE id = :execution_id"
+                ),
+                {"execution_id": ended_id},
+            )
+            await session.commit()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.get(
+                "/mail/api/file-reservations",
+                params={"project": "execution-reservations"},
+                headers={"Authorization": f"Bearer {BEARER}"},
+            )
+
+        assert response.status_code == 200
+        by_path = {
+            item["path_pattern"]: item for item in response.json()["reservations"]
+        }
+        expected_live = {
+            "execution_id": active_id,
+            "origin": "auto",
+            "execution_status": "active",
+            "orphaned": False,
+            "legacy_unscoped": False,
+        }
+        assert {
+            key: by_path["src/live.py"][key] for key in expected_live
+        } == expected_live
+        assert by_path["src/ended.py"]["execution_status"] == "completed"
+        assert by_path["src/ended.py"]["orphaned"] is True
+        assert by_path["src/legacy.py"]["legacy_unscoped"] is True
+        assert by_path["src/legacy.py"]["orphaned"] is True
+        for item in by_path.values():
+            assert "execution_token" not in item
+            assert "execution_token_hash" not in item
+
+    @pytest.mark.asyncio
     async def test_valid_jwt_is_not_the_file_reservation_service_principal(
         self,
         isolated_env,

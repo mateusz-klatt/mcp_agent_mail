@@ -11,6 +11,9 @@ from mcp_agent_mail.db import ensure_schema, get_db_health_status, get_session
 from mcp_agent_mail.models import Agent, AgentLink, Project
 from tests.keys import pkey
 
+ROUTING_AGENT_ONE = "codex-wsl-routing-1"
+ROUTING_AGENT_TWO = "codex-wsl-routing-2"
+
 
 @pytest.mark.asyncio
 async def test_contact_auto_allow_same_thread(isolated_env):
@@ -19,16 +22,16 @@ async def test_contact_auto_allow_same_thread(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": ROUTING_AGENT_ONE},
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": ROUTING_AGENT_TWO},
         )
         # Tighten policy to require contact; enforcement enabled by default
         await client.call_tool(
             "set_contact_policy",
-            {"project_key": "Backend", "agent_name": "BlueLake", "policy": "contacts_only"},
+            {"project_key": "Backend", "agent_name": ROUTING_AGENT_TWO, "policy": "contacts_only"},
         )
 
         # Seed thread with ack-required message (bypasses enforcement)
@@ -36,8 +39,8 @@ async def test_contact_auto_allow_same_thread(isolated_env):
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "GreenCastle",
-                "to": ["BlueLake"],
+                "sender_name": ROUTING_AGENT_ONE,
+                "to": [ROUTING_AGENT_TWO],
                 "subject": "ThreadSeed",
                 "body_md": "seed",
                 "ack_required": True,
@@ -57,7 +60,7 @@ async def test_contact_auto_allow_same_thread(isolated_env):
             {
                 "project_key": "Backend",
                 "message_id": seed_id,
-                "sender_name": "BlueLake",
+                "sender_name": ROUTING_AGENT_TWO,
                 "body_md": "ack",
                 "idempotency_key": "contact-thread-reply",
             },
@@ -69,8 +72,8 @@ async def test_contact_auto_allow_same_thread(isolated_env):
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "GreenCastle",
-                "to": ["BlueLake"],
+                "sender_name": ROUTING_AGENT_ONE,
+                "to": [ROUTING_AGENT_TWO],
                 "subject": "Followup",
                 "body_md": "details",
                 "thread_id": str(thread_id),
@@ -159,7 +162,7 @@ async def test_bare_name_prefers_cross_project_over_local_shadow(isolated_env):
     """Regression for PR #138 Bug 1 (send_message shadow-routing).
 
     When a bare recipient name has BOTH a local agent (e.g. a stale shadow
-    auto-registered by a prior auto_contact_if_blocked cycle) AND an approved
+    explicitly provisioned by an old integration) AND an approved
     cross-project AgentLink, send_message must route to the cross-project
     recipient — silently delivering to the local shadow has caused production
     message loss.
@@ -183,8 +186,7 @@ async def test_bare_name_prefers_cross_project_over_local_shadow(isolated_env):
             registration_token="geordi-token",
         )
         # Local "shadow" Adama — same name as the real cross-project recipient.
-        # Simulates the residue of a prior auto_contact_if_blocked + auto-register
-        # cycle that left a placeholder local agent in this project.
+        # Simulates an explicitly provisioned legacy placeholder in this project.
         local_shadow = Agent(
             project_id=p_local.id,
             name="Adama",

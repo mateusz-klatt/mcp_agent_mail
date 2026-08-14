@@ -13,6 +13,11 @@ set -uo pipefail
 . "$(dirname "$0")/agent_mail_common.sh" 2>/dev/null || exit 0
 
 am_read_payload
+HOOK_EVENT="$(am_payload_field '.hook_event_name')"
+case "$HOOK_EVENT" in
+    SessionStart|SubagentStart) ;;
+    *) HOOK_EVENT="SessionStart" ;;
+esac
 PROJECT="$(am_project_key)"
 # am_agent_name resolves the project itself when AM_PROJECT_FOR_NAME is unset,
 # which means a second `git config` and `git rev-parse` for a value this hook
@@ -26,7 +31,7 @@ export AM_PROJECT_FOR_NAME="$PROJECT"
 # project state is required before migration checks and, crucially, before the
 # first ensure_project/register_agent request.
 if ! am_project_is_active "$PROJECT" claude "${AGENT_MAIL_CLAUDE_SLOT:-1}" .; then
-    am_emit_context "SessionStart" "$(am_project_activation_message "$PROJECT")"
+    am_emit_context "$HOOK_EVENT" "$(am_project_activation_message "$PROJECT")"
     exit 0
 fi
 
@@ -39,12 +44,35 @@ fi
 if migration_pair="$(am_identity_migration_pair "$PROJECT" claude "${AGENT_MAIL_CLAUDE_SLOT:-1}")"; then
     legacy_agent="${migration_pair%%$'\t'*}"
     client_agent="${migration_pair#*$'\t'}"
-    am_emit_context "SessionStart" \
+    am_emit_context "$HOOK_EVENT" \
         "$(am_identity_migration_message "$legacy_agent" "$client_agent")"
     exit 0
 fi
 
 AGENT="$(am_agent_name claude "${AGENT_MAIL_CLAUDE_SLOT:-1}")" || exit 0
+
+# A native subagent is an execution of the durable Claude mailbox, never a new
+# Agent registration.  Its parent SessionStart already established both the
+# credential and the root execution.  Fail open when either is missing: the
+# subagent still starts, but gets an explicit warning that reservation ownership
+# is unavailable instead of silently creating a random adjective+noun identity.
+if [ "$HOOK_EVENT" = "SubagentStart" ]; then
+    token="$(am_cred_get "$PROJECT" "$AGENT")"
+    if [ -z "$token" ]; then
+        am_emit_context "SubagentStart" \
+            "Agent Mail: this subagent has no active durable parent identity. Do not call register_agent or create_agent_identity; report through the parent session. Execution-owned reservations are unavailable for this subagent."
+        exit 0
+    fi
+    if execution_id="$(am_subagent_execution_start \
+        "$PROJECT" "$AGENT" "$token" claude)"; then
+        am_emit_context "SubagentStart" \
+            "Agent Mail: execute as ${AGENT} using subagent execution ${execution_id}. Do not register or create another Agent. Reservations belong to this execution; the Git worktree is execution context, not identity."
+    else
+        am_emit_context "SubagentStart" \
+            "Agent Mail: could not start the subagent execution for ${AGENT}. Do not register or create another Agent; report through the parent. Treat reservation coordination as unavailable."
+    fi
+    exit 0
+fi
 
 am_call ensure_project "$(jq -nc --arg k "$PROJECT" '{human_key:$k}')" >/dev/null 2>&1
 
@@ -131,7 +159,15 @@ if [ "$(printf '%s' "$resp" | jq -r '.retired_at // empty' 2>/dev/null)" != "" ]
     exit 0
 fi
 
-summary="Agent Mail: you are ${got_name} on ${PROJECT}."
+execution_summary=""
+if execution_id="$(am_root_execution_start \
+    "$PROJECT" "$got_name" "${got_token:-$token}" claude)"; then
+    execution_summary=" Root execution: ${execution_id}."
+else
+    execution_summary=" The durable mailbox is connected, but its root execution could not be started; execution-owned reservations are unavailable."
+fi
+
+summary="Agent Mail: you are ${got_name} on ${PROJECT}.${execution_summary}"
 res="$(am_get /mail/api/file-reservations --data "project=$(am_urlencode "$PROJECT")")"
 if [ $? -ne 0 ]; then
     # Registration worked, so this is a blip rather than an outage — but an

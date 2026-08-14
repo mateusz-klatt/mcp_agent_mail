@@ -79,16 +79,15 @@ class TestArchiveAutoCreation:
         assert repo is not None
 
     @pytest.mark.asyncio
-    async def test_ensure_archive_creates_project_directory(self, isolated_env):
-        """ensure_archive creates project-specific directory."""
+    async def test_ensure_archive_materializes_validated_project_directory(self, isolated_env):
+        """Archive resolution creates the canonical directory under its stable lock."""
         settings = get_settings()
         storage_root = Path(settings.storage.root).expanduser().resolve()
 
         archive = await ensure_archive(settings, "test-project")
 
-        # Project directory should exist
         project_dir = storage_root / "projects" / "test-project"
-        assert project_dir.exists()
+        assert project_dir.is_dir()
         assert archive.root == project_dir
 
     @pytest.mark.asyncio
@@ -111,9 +110,10 @@ class TestArchiveAutoCreation:
 
         archive = await ensure_archive(settings, "lock-test")
 
-        # Lock path should be inside project directory
-        assert archive.lock_path.name == ".archive.lock"
-        assert archive.lock_path.parent == archive.root
+        # The lock must survive removal of the project subtree while held.
+        assert archive.lock_path.name.endswith(".archive.lock")
+        assert archive.lock_path.parent == archive.repo_root / ".git" / "agent-mail-locks"
+        assert not archive.lock_path.is_relative_to(archive.root)
 
 
 # ============================================================================

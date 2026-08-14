@@ -26,6 +26,7 @@ Reference: mcp_agent_mail-aew
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -48,7 +49,8 @@ async def get_file_reservation_from_db(reservation_id: int) -> dict | None:
         result = await session.execute(
             text(
                 "SELECT id, path_pattern, exclusive, reason, "
-                "created_ts, expires_ts, released_ts, agent_id, project_id "
+                "created_ts, expires_ts, released_ts, agent_id, project_id, "
+                "archive_revision, archive_synced_revision "
                 "FROM file_reservations WHERE id = :id"
             ),
             {"id": reservation_id},
@@ -66,6 +68,8 @@ async def get_file_reservation_from_db(reservation_id: int) -> dict | None:
             "released_ts": row[6],
             "agent_id": row[7],
             "project_id": row[8],
+            "archive_revision": row[9],
+            "archive_synced_revision": row[10],
         }
 
 
@@ -113,15 +117,44 @@ async def get_agent_id(project_id: int, agent_name: str) -> int | None:
 async def setup_project_and_agent(client, project_key: str) -> tuple[str, str]:
     """Create project and agent, return (project_key, agent_name)."""
     await client.call_tool("ensure_project", {"human_key": project_key})
+    agent, _execution = await register_agent_execution(
+        client,
+        project_key,
+        name="codex-linux-reservation-1",
+        token_character="1",
+    )
+    return project_key, agent["name"]
+
+
+async def register_agent_execution(
+    client,
+    project_key: str,
+    *,
+    name: str,
+    token_character: str,
+) -> tuple[dict, dict]:
+    """Create one durable test Agent and bind a root execution to the session."""
     result = await client.call_tool(
         "register_agent",
         {
             "project_key": project_key,
             "program": "test",
             "model": "test",
+            "name": name,
         },
     )
-    return project_key, result.data["name"]
+    execution = await client.call_tool(
+        "start_agent_execution",
+        {
+            "project_key": project_key,
+            "agent_name": result.data["name"],
+            "external_id": f"pytest-session-{name}",
+            "client_name": "pytest",
+            "execution_token": token_character * 64,
+            "lifecycle_protocol_version": 1,
+        },
+    )
+    return result.data, execution.data
 
 
 # ============================================================================
@@ -168,6 +201,8 @@ async def test_create_exclusive_reservation(isolated_env):
         assert reservation["path_pattern"] == "src/**"
         assert reservation["exclusive"] == 1  # SQLite stores bool as int
         assert reservation["released_ts"] is None
+        assert reservation["archive_revision"] == 1
+        assert reservation["archive_synced_revision"] == 1
 
 
 @pytest.mark.asyncio
@@ -211,9 +246,11 @@ async def test_file_reservation_paths_batches_commits(isolated_env):
         project_key = "/test/res/batch-commits"
         project = await client.call_tool("ensure_project", {"human_key": project_key})
         slug = project.data["slug"]
-        agent = await client.call_tool(
-            "register_agent",
-            {"project_key": project_key, "program": "test", "model": "test", "name": "BatchAgent"},
+        agent, _execution = await register_agent_execution(
+            client,
+            project_key,
+            name="codex-linux-batch-1",
+            token_character="1",
         )
 
         settings = get_settings()
@@ -224,7 +261,7 @@ async def test_file_reservation_paths_batches_commits(isolated_env):
             "file_reservation_paths",
             {
                 "project_key": project_key,
-                "agent_name": agent.data["name"],
+                "agent_name": agent["name"],
                 "paths": ["src/a.py", "src/b.py"],
                 "ttl_seconds": 3600,
                 "exclusive": True,
@@ -258,17 +295,22 @@ async def test_conflict_exclusive_vs_exclusive(isolated_env):
         await client.call_tool("ensure_project", {"human_key": project_key})
 
         # Create first agent and reserve
-        agent1_result = await client.call_tool(
-            "register_agent",
-            {"project_key": project_key, "program": "test", "model": "test"},
+        agent1, agent1_execution = await register_agent_execution(
+            client,
+            project_key,
+            name="codex-linux-conflict-1",
+            token_character="1",
         )
-        agent1_name = agent1_result.data["name"]
+        agent1_name = agent1["name"]
 
         await client.call_tool(
             "file_reservation_paths",
             {
                 "project_key": project_key,
                 "agent_name": agent1_name,
+                "execution_id": agent1_execution["id"],
+                "execution_token": "1" * 64,
+                "lifecycle_protocol_version": 1,
                 "paths": ["src/**"],
                 "ttl_seconds": 3600,
                 "exclusive": True,
@@ -276,11 +318,13 @@ async def test_conflict_exclusive_vs_exclusive(isolated_env):
         )
 
         # Create second agent and try to reserve same pattern
-        agent2_result = await client.call_tool(
-            "register_agent",
-            {"project_key": project_key, "program": "test", "model": "test"},
+        agent2, _agent2_execution = await register_agent_execution(
+            client,
+            project_key,
+            name="codex-linux-conflict-2",
+            token_character="2",
         )
-        agent2_name = agent2_result.data["name"]
+        agent2_name = agent2["name"]
 
         result = await client.call_tool(
             "file_reservation_paths",
@@ -313,11 +357,13 @@ async def test_conflict_exclusive_vs_shared(isolated_env):
         await client.call_tool("ensure_project", {"human_key": project_key})
 
         # First agent creates shared reservation
-        agent1_result = await client.call_tool(
-            "register_agent",
-            {"project_key": project_key, "program": "test", "model": "test"},
+        agent1, _agent1_execution = await register_agent_execution(
+            client,
+            project_key,
+            name="codex-linux-conflict-1",
+            token_character="1",
         )
-        agent1_name = agent1_result.data["name"]
+        agent1_name = agent1["name"]
 
         await client.call_tool(
             "file_reservation_paths",
@@ -331,11 +377,13 @@ async def test_conflict_exclusive_vs_shared(isolated_env):
         )
 
         # Second agent tries exclusive on same pattern
-        agent2_result = await client.call_tool(
-            "register_agent",
-            {"project_key": project_key, "program": "test", "model": "test"},
+        agent2, _agent2_execution = await register_agent_execution(
+            client,
+            project_key,
+            name="codex-linux-conflict-2",
+            token_character="2",
         )
-        agent2_name = agent2_result.data["name"]
+        agent2_name = agent2["name"]
 
         result = await client.call_tool(
             "file_reservation_paths",
@@ -362,11 +410,13 @@ async def test_no_conflict_shared_vs_shared(isolated_env):
         await client.call_tool("ensure_project", {"human_key": project_key})
 
         # First agent creates shared reservation
-        agent1_result = await client.call_tool(
-            "register_agent",
-            {"project_key": project_key, "program": "test", "model": "test"},
+        agent1, _agent1_execution = await register_agent_execution(
+            client,
+            project_key,
+            name="codex-linux-shared-1",
+            token_character="1",
         )
-        agent1_name = agent1_result.data["name"]
+        agent1_name = agent1["name"]
 
         await client.call_tool(
             "file_reservation_paths",
@@ -380,11 +430,13 @@ async def test_no_conflict_shared_vs_shared(isolated_env):
         )
 
         # Second agent creates shared on same pattern
-        agent2_result = await client.call_tool(
-            "register_agent",
-            {"project_key": project_key, "program": "test", "model": "test"},
+        agent2, _agent2_execution = await register_agent_execution(
+            client,
+            project_key,
+            name="codex-linux-shared-2",
+            token_character="2",
         )
-        agent2_name = agent2_result.data["name"]
+        agent2_name = agent2["name"]
 
         result = await client.call_tool(
             "file_reservation_paths",
@@ -417,11 +469,13 @@ async def test_pattern_overlap_detection(isolated_env):
         await client.call_tool("ensure_project", {"human_key": project_key})
 
         # First agent reserves broad pattern
-        agent1_result = await client.call_tool(
-            "register_agent",
-            {"project_key": project_key, "program": "test", "model": "test"},
+        agent1, _agent1_execution = await register_agent_execution(
+            client,
+            project_key,
+            name="codex-linux-overlap-1",
+            token_character="1",
         )
-        agent1_name = agent1_result.data["name"]
+        agent1_name = agent1["name"]
 
         await client.call_tool(
             "file_reservation_paths",
@@ -435,11 +489,13 @@ async def test_pattern_overlap_detection(isolated_env):
         )
 
         # Second agent tries specific file within that pattern
-        agent2_result = await client.call_tool(
-            "register_agent",
-            {"project_key": project_key, "program": "test", "model": "test"},
+        agent2, _agent2_execution = await register_agent_execution(
+            client,
+            project_key,
+            name="codex-linux-overlap-2",
+            token_character="2",
         )
-        agent2_name = agent2_result.data["name"]
+        agent2_name = agent2["name"]
 
         result = await client.call_tool(
             "file_reservation_paths",
@@ -473,11 +529,13 @@ async def test_pattern_overlap_reverse(isolated_env):
         await client.call_tool("ensure_project", {"human_key": project_key})
 
         # First agent reserves specific file
-        agent1_result = await client.call_tool(
-            "register_agent",
-            {"project_key": project_key, "program": "test", "model": "test"},
+        agent1, _agent1_execution = await register_agent_execution(
+            client,
+            project_key,
+            name="codex-linux-overlap-1",
+            token_character="1",
         )
-        agent1_name = agent1_result.data["name"]
+        agent1_name = agent1["name"]
 
         await client.call_tool(
             "file_reservation_paths",
@@ -491,11 +549,13 @@ async def test_pattern_overlap_reverse(isolated_env):
         )
 
         # Second agent tries broad pattern
-        agent2_result = await client.call_tool(
-            "register_agent",
-            {"project_key": project_key, "program": "test", "model": "test"},
+        agent2, _agent2_execution = await register_agent_execution(
+            client,
+            project_key,
+            name="codex-linux-overlap-2",
+            token_character="2",
         )
-        agent2_name = agent2_result.data["name"]
+        agent2_name = agent2["name"]
 
         result = await client.call_tool(
             "file_reservation_paths",
@@ -806,22 +866,30 @@ async def test_renew_does_not_revive_expired_reservation_after_overlap_reacquire
         project_key = "/test/res/renew_expired"
         await client.call_tool("ensure_project", {"human_key": project_key})
 
-        agent1_result = await client.call_tool(
-            "register_agent",
-            {"project_key": project_key, "program": "test", "model": "test", "name": "BlueLake"},
+        agent1, agent1_execution = await register_agent_execution(
+            client,
+            project_key,
+            name="codex-linux-renew-1",
+            token_character="1",
         )
-        agent2_result = await client.call_tool(
-            "register_agent",
-            {"project_key": project_key, "program": "test", "model": "test", "name": "GreenHill"},
+        agent1_name = agent1["name"]
+
+        agent2, _agent2_execution = await register_agent_execution(
+            client,
+            project_key,
+            name="codex-linux-renew-2",
+            token_character="2",
         )
-        agent1_name = agent1_result.data["name"]
-        agent2_name = agent2_result.data["name"]
+        agent2_name = agent2["name"]
 
         first = await client.call_tool(
             "file_reservation_paths",
             {
                 "project_key": project_key,
                 "agent_name": agent1_name,
+                "execution_id": agent1_execution["id"],
+                "execution_token": "1" * 64,
+                "lifecycle_protocol_version": 1,
                 "paths": ["src/**"],
                 "ttl_seconds": 1,
                 "exclusive": True,
@@ -848,6 +916,9 @@ async def test_renew_does_not_revive_expired_reservation_after_overlap_reacquire
             {
                 "project_key": project_key,
                 "agent_name": agent1_name,
+                "execution_id": agent1_execution["id"],
+                "execution_token": "1" * 64,
+                "lifecycle_protocol_version": 1,
                 "file_reservation_ids": [first_id],
                 "extend_seconds": 600,
             },
@@ -871,67 +942,60 @@ async def test_renew_does_not_revive_expired_reservation_after_overlap_reacquire
 
 @pytest.mark.asyncio
 async def test_force_release_stale_reservation(isolated_env):
-    """Force release a reservation held by an inactive agent.
-
-    Note: This test may skip if the reservation isn't considered stale
-    enough by the server's activity heuristics.
-    """
+    """A durable Agent can recover its own explicit claim after execution end."""
     server = build_mcp_server()
     async with Client(server) as client:
         project_key = "/test/res/force"
         await client.call_tool("ensure_project", {"human_key": project_key})
 
-        # Create first agent and reserve
-        agent1_result = await client.call_tool(
-            "register_agent",
-            {"project_key": project_key, "program": "test", "model": "test"},
+        agent, execution = await register_agent_execution(
+            client,
+            project_key,
+            name="codex-linux-force-1",
+            token_character="1",
         )
-        agent1_name = agent1_result.data["name"]
+        agent_name = agent["name"]
 
         result = await client.call_tool(
             "file_reservation_paths",
             {
                 "project_key": project_key,
-                "agent_name": agent1_name,
+                "agent_name": agent_name,
                 "paths": ["stale/**"],
                 "ttl_seconds": 3600,
                 "exclusive": True,
+                "origin": "explicit",
             },
         )
         reservation_id = result.data["granted"][0]["id"]
 
-        # Create second agent to do the force release
-        agent2_result = await client.call_tool(
-            "register_agent",
-            {"project_key": project_key, "program": "test", "model": "test"},
+        await client.call_tool(
+            "end_agent_execution",
+            {
+                "project_key": project_key,
+                "agent_name": agent_name,
+                "execution_id": execution["id"],
+                "execution_token": "1" * 64,
+                "lifecycle_protocol_version": 1,
+                "status": "completed",
+            },
         )
-        agent2_name = agent2_result.data["name"]
+        force_result = await client.call_tool(
+            "force_release_file_reservation",
+            {
+                "project_key": project_key,
+                "agent_name": agent_name,
+                "file_reservation_id": reservation_id,
+                "note": "Recovering own ended execution claim",
+                "notify_previous": False,
+            },
+        )
+        assert force_result.data["released"] == 1
+        assert force_result.data["reservation"]["orphaned"] is True
 
-        # Try force release - may fail if agent1 is still considered active
-        try:
-            force_result = await client.call_tool(
-                "force_release_file_reservation",
-                {
-                    "project_key": project_key,
-                    "agent_name": agent2_name,
-                    "file_reservation_id": reservation_id,
-                    "note": "Force releasing for test",
-                    "notify_previous": True,
-                },
-            )
-            # If successful, verify the release
-            assert "released" in str(force_result.data).lower() or force_result.data
-
-            # Verify database shows released
-            reservation = await get_file_reservation_from_db(reservation_id)
-            if reservation:
-                assert reservation["released_ts"] is not None
-        except Exception as e:
-            # Expected if agent is still considered active
-            error_str = str(e).lower()
-            if "still shows recent activity" in error_str or "refusing" in error_str:
-                pytest.skip("Reservation not stale enough for force release")
-            raise
+        reservation = await get_file_reservation_from_db(reservation_id)
+        assert reservation is not None
+        assert reservation["released_ts"] is not None
 
 
 # ============================================================================
@@ -1149,23 +1213,40 @@ async def test_ttl_minimum_enforced(isolated_env):
 
 
 @pytest.mark.asyncio
-async def test_file_reservation_rolls_back_db_row_when_archive_write_fails(isolated_env, monkeypatch):
-    """#180: file_reservation_paths commits reservation rows before writing the
-    Git archive. A failed archive write must delete the just-created rows so we
-    never leave a committed reservation with no archive artifact — mirroring the
-    message-creation compensation."""
+async def test_partial_create_archive_failure_remains_pending_and_repeat_repairs(
+    isolated_env,
+    monkeypatch,
+):
+    """A partial create publication retains DB ownership and retries exactly."""
     from fastmcp.exceptions import ToolError
 
     import mcp_agent_mail.app as app_module
 
     server = build_mcp_server()
     async with Client(server) as client:
-        project_key, agent_name = await setup_project_and_agent(client, "/test/res/archive-fail")
+        project_key, agent_name = await setup_project_and_agent(
+            client,
+            "/test/res/archive-fail",
+        )
+        project_result = await client.call_tool(
+            "ensure_project",
+            {"human_key": project_key},
+        )
+        original_write = app_module.write_file_reservation_records
+        write_attempts = 0
 
-        async def _boom(*_args, **_kwargs):
-            raise RuntimeError("simulated reservation archive write failure")
+        async def write_then_fail_once(*args, **kwargs):
+            nonlocal write_attempts
+            write_attempts += 1
+            await original_write(*args, **kwargs)
+            if write_attempts == 1:
+                raise RuntimeError("simulated partial create archive failure")
 
-        monkeypatch.setattr(app_module, "write_file_reservation_records", _boom)
+        monkeypatch.setattr(
+            app_module,
+            "write_file_reservation_records",
+            write_then_fail_once,
+        )
 
         with pytest.raises(ToolError):
             await client.call_tool(
@@ -1176,18 +1257,401 @@ async def test_file_reservation_rolls_back_db_row_when_archive_write_fails(isola
                     "paths": ["src/**"],
                     "ttl_seconds": 3600,
                     "exclusive": True,
-                    "reason": "should be rolled back on archive failure",
+                    "reason": "durable pending create",
                 },
             )
 
         project_id = await get_project_id(project_key)
         assert project_id is not None
-        # No reservation row should survive the archive-write failure.
         async with get_session() as session:
-            count = (
+            row = (
                 await session.execute(
-                    text("SELECT COUNT(*) FROM file_reservations WHERE project_id = :pid"),
+                    text(
+                        "SELECT id, archive_revision, archive_synced_revision "
+                        "FROM file_reservations WHERE project_id = :pid"
+                    ),
                     {"pid": project_id},
                 )
-            ).scalar() or 0
-        assert count == 0, "orphaned file_reservation row left after archive write failure (#180)"
+            ).one()
+        reservation_id = int(row[0])
+        assert int(row[2]) < int(row[1])
+
+        archive = await ensure_archive(get_settings(), project_result.data["slug"])
+        artifact_path = archive.root / "file_reservations" / f"id-{reservation_id}.json"
+        partially_published = json.loads(artifact_path.read_text(encoding="utf-8"))
+        assert partially_published["id"] == reservation_id
+        assert partially_published.get("released_ts") is None
+
+        repeated = await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": project_key,
+                "agent_name": agent_name,
+                "paths": ["src/**"],
+                "ttl_seconds": 3600,
+                "exclusive": True,
+                "reason": "durable pending create",
+            },
+        )
+        assert repeated.data["granted"][0]["id"] == reservation_id
+        assert repeated.data["granted"][0]["reused"] is True
+
+        repaired = await get_file_reservation_from_db(reservation_id)
+        assert repaired is not None
+        assert repaired["archive_synced_revision"] == repaired["archive_revision"]
+        repaired_artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        assert repaired_artifact["archive_revision"] == repaired["archive_revision"]
+        assert repaired_artifact["reason"] == "durable pending create"
+
+
+@pytest.mark.asyncio
+async def test_release_archive_failure_remains_pending_and_repeat_repairs(
+    isolated_env,
+    monkeypatch,
+):
+    """A post-commit release failure is retried by an idempotent repeat call."""
+    from fastmcp.exceptions import ToolError
+
+    import mcp_agent_mail.app as app_module
+
+    server = build_mcp_server()
+    async with Client(server) as client:
+        project_key, agent_name = await setup_project_and_agent(
+            client,
+            "/test/res/release-reconcile",
+        )
+        project_result = await client.call_tool(
+            "ensure_project",
+            {"human_key": project_key},
+        )
+        created = await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": project_key,
+                "agent_name": agent_name,
+                "paths": ["release-pending/**"],
+                "ttl_seconds": 3600,
+                "exclusive": True,
+            },
+        )
+        reservation_id = int(created.data["granted"][0]["id"])
+        archive = await ensure_archive(get_settings(), project_result.data["slug"])
+        artifact_path = archive.root / "file_reservations" / f"id-{reservation_id}.json"
+        assert json.loads(artifact_path.read_text(encoding="utf-8")).get(
+            "released_ts"
+        ) is None
+
+        original_write = app_module.write_file_reservation_records
+        write_attempts = 0
+
+        async def fail_first_write(*args, **kwargs):
+            nonlocal write_attempts
+            write_attempts += 1
+            if write_attempts == 1:
+                raise RuntimeError("simulated post-commit release archive failure")
+            return await original_write(*args, **kwargs)
+
+        monkeypatch.setattr(
+            app_module,
+            "write_file_reservation_records",
+            fail_first_write,
+        )
+
+        with pytest.raises(ToolError):
+            await client.call_tool(
+                "release_file_reservations",
+                {
+                    "project_key": project_key,
+                    "agent_name": agent_name,
+                    "file_reservation_ids": [reservation_id],
+                },
+            )
+
+        pending = await get_file_reservation_from_db(reservation_id)
+        assert pending is not None
+        assert pending["released_ts"] is not None
+        assert pending["archive_synced_revision"] < pending["archive_revision"]
+        assert json.loads(artifact_path.read_text(encoding="utf-8")).get(
+            "released_ts"
+        ) is None
+
+        repeated = await client.call_tool(
+            "release_file_reservations",
+            {
+                "project_key": project_key,
+                "agent_name": agent_name,
+                "file_reservation_ids": [reservation_id],
+            },
+        )
+        assert repeated.data["released"] == 0
+
+        repaired = await get_file_reservation_from_db(reservation_id)
+        assert repaired is not None
+        assert repaired["archive_synced_revision"] == repaired["archive_revision"]
+        repaired_artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        assert repaired_artifact["released_ts"] is not None
+        assert repaired_artifact["archive_revision"] == repaired["archive_revision"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_mutation_cannot_falsely_ack_stale_artifact(
+    isolated_env,
+    monkeypatch,
+):
+    """A newer DB revision wins and is republished before reconciliation acks."""
+    import mcp_agent_mail.app as app_module
+
+    server = build_mcp_server()
+    async with Client(server) as client:
+        project_key, agent_name = await setup_project_and_agent(
+            client,
+            "/test/res/concurrent-reconcile",
+        )
+        project_result = await client.call_tool(
+            "ensure_project",
+            {"human_key": project_key},
+        )
+        created = await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": project_key,
+                "agent_name": agent_name,
+                "paths": ["concurrent-pending/**"],
+                "ttl_seconds": 3600,
+                "exclusive": True,
+                "reason": "initial",
+            },
+        )
+        reservation_id = int(created.data["granted"][0]["id"])
+        archive = await ensure_archive(get_settings(), project_result.data["slug"])
+        artifact_path = archive.root / "file_reservations" / f"id-{reservation_id}.json"
+
+        original_write = app_module.write_file_reservation_records
+        write_attempts = 0
+
+        async def mutate_during_first_write(*args, **kwargs):
+            nonlocal write_attempts
+            write_attempts += 1
+            if write_attempts == 1:
+                async with get_session() as session:
+                    await session.execute(
+                        text(
+                            "UPDATE file_reservations "
+                            "SET reason = 'concurrent mutation' WHERE id = :id"
+                        ),
+                        {"id": reservation_id},
+                    )
+                    await session.commit()
+            return await original_write(*args, **kwargs)
+
+        monkeypatch.setattr(
+            app_module,
+            "write_file_reservation_records",
+            mutate_during_first_write,
+        )
+
+        released = await client.call_tool(
+            "release_file_reservations",
+            {
+                "project_key": project_key,
+                "agent_name": agent_name,
+                "file_reservation_ids": [reservation_id],
+            },
+        )
+        assert released.data["released"] == 1
+        assert write_attempts == 2
+
+        current = await get_file_reservation_from_db(reservation_id)
+        assert current is not None
+        assert current["reason"] == "concurrent mutation"
+        assert current["archive_synced_revision"] == current["archive_revision"]
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        assert artifact["reason"] == "concurrent mutation"
+        assert artifact["archive_revision"] == current["archive_revision"]
+
+
+@pytest.mark.asyncio
+async def test_ttl_archive_failure_is_repaired_by_next_empty_sweep(
+    isolated_env,
+    monkeypatch,
+):
+    """A later TTL sweep republishes a release even when it expires no new row."""
+    import mcp_agent_mail.app as app_module
+
+    server = build_mcp_server()
+    async with Client(server) as client:
+        project_key, agent_name = await setup_project_and_agent(
+            client,
+            "/test/res/ttl-reconcile",
+        )
+        project_result = await client.call_tool(
+            "ensure_project",
+            {"human_key": project_key},
+        )
+        created = await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": project_key,
+                "agent_name": agent_name,
+                "paths": ["ttl-pending/**"],
+                "ttl_seconds": 3600,
+                "exclusive": True,
+            },
+        )
+        reservation_id = int(created.data["granted"][0]["id"])
+        project_id = await get_project_id(project_key)
+        assert project_id is not None
+        archive = await ensure_archive(get_settings(), project_result.data["slug"])
+        artifact_path = archive.root / "file_reservations" / f"id-{reservation_id}.json"
+
+        expired = datetime.now(timezone.utc) - timedelta(minutes=5)
+        async with get_session() as session:
+            await session.execute(
+                text(
+                    "UPDATE file_reservations SET expires_ts = :expired "
+                    "WHERE id = :reservation_id"
+                ),
+                {
+                    "expired": expired.replace(tzinfo=None).strftime(
+                        "%Y-%m-%d %H:%M:%S.%f"
+                    ),
+                    "reservation_id": reservation_id,
+                },
+            )
+            await session.commit()
+
+        original_write = app_module.write_file_reservation_records
+        write_attempts = 0
+
+        async def fail_first_write(*args, **kwargs):
+            nonlocal write_attempts
+            write_attempts += 1
+            if write_attempts == 1:
+                raise RuntimeError("simulated TTL release archive failure")
+            return await original_write(*args, **kwargs)
+
+        monkeypatch.setattr(
+            app_module,
+            "write_file_reservation_records",
+            fail_first_write,
+        )
+
+        with pytest.raises(RuntimeError, match="simulated TTL"):
+            await app_module._expire_stale_file_reservations(project_id)
+
+        pending = await get_file_reservation_from_db(reservation_id)
+        assert pending is not None
+        assert pending["released_ts"] is not None
+        assert pending["archive_synced_revision"] < pending["archive_revision"]
+        assert json.loads(artifact_path.read_text(encoding="utf-8")).get(
+            "released_ts"
+        ) is None
+
+        assert await app_module._expire_stale_file_reservations(project_id) == []
+        repaired = await get_file_reservation_from_db(reservation_id)
+        assert repaired is not None
+        assert repaired["archive_synced_revision"] == repaired["archive_revision"]
+        assert json.loads(artifact_path.read_text(encoding="utf-8"))[
+            "released_ts"
+        ] is not None
+
+
+@pytest.mark.asyncio
+async def test_execution_reaper_retries_pending_reservation_on_empty_sweep(
+    isolated_env,
+    monkeypatch,
+):
+    """The execution reaper retries DB-pending artifacts without a new expiry."""
+    import mcp_agent_mail.app as app_module
+
+    server = build_mcp_server()
+    async with Client(server) as client:
+        project_key = "/test/res/execution-reaper-reconcile"
+        project_result = await client.call_tool(
+            "ensure_project",
+            {"human_key": project_key},
+        )
+        agent, execution = await register_agent_execution(
+            client,
+            project_key,
+            name="codex-linux-reaper-1",
+            token_character="8",
+        )
+        created = await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": project_key,
+                "agent_name": agent["name"],
+                "paths": ["reaper-pending/**"],
+                "ttl_seconds": 3600,
+                "exclusive": True,
+            },
+        )
+        reservation_id = int(created.data["granted"][0]["id"])
+        project_id = await get_project_id(project_key)
+        assert project_id is not None
+        archive = await ensure_archive(get_settings(), project_result.data["slug"])
+        artifact_path = archive.root / "file_reservations" / f"id-{reservation_id}.json"
+
+        now = datetime.now(timezone.utc)
+        old = now - timedelta(hours=2)
+        async with get_session() as session:
+            await session.execute(
+                text(
+                    "UPDATE agent_executions "
+                    "SET started_ts = :old, last_active_ts = :old "
+                    "WHERE id = :execution_id"
+                ),
+                {
+                    "old": old.replace(tzinfo=None).strftime(
+                        "%Y-%m-%d %H:%M:%S.%f"
+                    ),
+                    "execution_id": execution["id"],
+                },
+            )
+            await session.commit()
+
+        original_write = app_module.write_file_reservation_records
+        write_attempts = 0
+
+        async def fail_first_write(*args, **kwargs):
+            nonlocal write_attempts
+            write_attempts += 1
+            if write_attempts == 1:
+                raise RuntimeError("simulated execution reaper archive failure")
+            return await original_write(*args, **kwargs)
+
+        monkeypatch.setattr(
+            app_module,
+            "write_file_reservation_records",
+            fail_first_write,
+        )
+
+        first_sweep = await app_module.expire_stale_agent_executions(
+            3600,
+            project_id=project_id,
+            now=now,
+        )
+        assert first_sweep["expired"] == 1
+        assert first_sweep["archive_warnings"]
+        pending = await get_file_reservation_from_db(reservation_id)
+        assert pending is not None
+        assert pending["released_ts"] is not None
+        assert pending["archive_synced_revision"] < pending["archive_revision"]
+        assert json.loads(artifact_path.read_text(encoding="utf-8")).get(
+            "released_ts"
+        ) is None
+
+        second_sweep = await app_module.expire_stale_agent_executions(
+            3600,
+            project_id=project_id,
+            now=now,
+        )
+        assert second_sweep["expired"] == 0
+        assert second_sweep["archive_warnings"] == []
+        repaired = await get_file_reservation_from_db(reservation_id)
+        assert repaired is not None
+        assert repaired["archive_synced_revision"] == repaired["archive_revision"]
+        assert json.loads(artifact_path.read_text(encoding="utf-8"))[
+            "released_ts"
+        ] is not None

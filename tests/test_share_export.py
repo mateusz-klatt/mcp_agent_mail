@@ -19,6 +19,7 @@ from zipfile import ZipFile
 import pytest
 from typer.testing import CliRunner
 
+import hatch_build
 import mcp_agent_mail.share as share
 from mcp_agent_mail import cli as cli_module
 from mcp_agent_mail.config import clear_settings_cache
@@ -865,6 +866,17 @@ def test_checksum_verified_viewer_assets_are_not_rewritten_by_git() -> None:
 def test_wheel_and_sdist_exclude_repository_only_clusterize(tmp_path: Path) -> None:
     """Built Python distributions must never contain the retained GPL sources."""
     repository_root = Path(__file__).resolve().parents[1]
+    try:
+        node = hatch_build._resolve_tool("node")
+        npm_cli = hatch_build._resolve_npm_cli(node)
+        hatch_build._verify_toolchain(
+            repository_root,
+            node=node,
+            npm_cli=npm_cli,
+            environment=os.environ.copy(),
+        )
+    except hatch_build.HermesUiBuildError as exc:
+        pytest.skip(f"Distribution build requires the release-pinned UI toolchain: {exc}")
     result = subprocess.run(
         [
             "uv",

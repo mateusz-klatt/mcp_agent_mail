@@ -19,7 +19,12 @@ async def test_summarize_threads_non_llm_mode_and_limit(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "x", "model": "y", "name": "BlueLake"},
+            {
+                "project_key": "Backend",
+                "program": "x",
+                "model": "y",
+                "name": "codex-wsl-summarize-extended-1",
+            },
         )
         # Create messages under two threads
         for tid in ("T1", "T2"):
@@ -28,8 +33,8 @@ async def test_summarize_threads_non_llm_mode_and_limit(isolated_env):
                     "send_message",
                     {
                         "project_key": "Backend",
-                        "sender_name": "BlueLake",
-                        "to": ["BlueLake"],
+                "sender_name": "codex-wsl-summarize-extended-1",
+                "to": ["codex-wsl-summarize-extended-1"],
                         "subject": f"{tid}-{i}",
                         "body_md": f"body {tid} {i}",
                         "thread_id": tid,
@@ -46,4 +51,3 @@ async def test_summarize_threads_non_llm_mode_and_limit(isolated_env):
         # Expect summaries for both thread ids
         tids = {t.get("thread_id") for t in data.get("threads")}
         assert {"T1", "T2"}.issubset(tids)
-

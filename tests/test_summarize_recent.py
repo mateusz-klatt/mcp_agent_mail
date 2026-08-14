@@ -57,6 +57,7 @@ async def _setup_project_with_agents(client, project_key: str, count: int) -> li
                 "project_key": project_key,
                 "program": "test-prog",
                 "model": "test-model",
+                "name": f"codex-wsl-summarize-{i + 1}",
                 "task_description": f"agent-{i}",
             },
         )

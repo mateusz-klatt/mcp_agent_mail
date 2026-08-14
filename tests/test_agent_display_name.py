@@ -19,6 +19,8 @@ from fastmcp.exceptions import ToolError
 from mcp_agent_mail.app import build_mcp_server
 
 KEY = "/test/aliases"
+FIRST_AGENT = "codex-linux-aliases-1"
+SECOND_AGENT = "claude-mac-aliases-1"
 
 
 def _data(result):
@@ -30,13 +32,23 @@ async def _two_agents(client):
     first = _data(
         await client.call_tool(
             "register_agent",
-            {"project_key": KEY, "name": "box-linux-1", "program": "probe", "model": "probe"},
+            {
+                "project_key": KEY,
+                "name": FIRST_AGENT,
+                "program": "probe",
+                "model": "probe",
+            },
         )
     )
     second = _data(
         await client.call_tool(
             "register_agent",
-            {"project_key": KEY, "name": "box-mac-1", "program": "probe", "model": "probe"},
+            {
+                "project_key": KEY,
+                "name": SECOND_AGENT,
+                "program": "probe",
+                "model": "probe",
+            },
         )
     )
     return first, second
@@ -52,13 +64,13 @@ async def test_alias_is_reported_alongside_the_name(isolated_env):
                 "set_agent_display_name",
                 {
                     "project_key": KEY,
-                    "agent_name": "box-linux-1",
+                    "agent_name": FIRST_AGENT,
                     "display_name": "Kitchen Box",
                     "registration_token": first["registration_token"],
                 },
             )
         )
-        assert result["agent"] == "box-linux-1"
+        assert result["agent"] == FIRST_AGENT
         assert result["display_name"] == "Kitchen Box"
 
         seen = _data(
@@ -66,13 +78,13 @@ async def test_alias_is_reported_alongside_the_name(isolated_env):
                 "whois",
                 {
                     "project_key": KEY,
-                    "agent_name": "box-linux-1",
+                    "agent_name": FIRST_AGENT,
                     "registration_token": first["registration_token"],
                 },
             )
         )
         # Alongside, never instead: the name is what must be typed into `to:`.
-        assert seen["name"] == "box-linux-1"
+        assert seen["name"] == FIRST_AGENT
         assert seen["display_name"] == "Kitchen Box"
 
 
@@ -86,7 +98,7 @@ async def test_alias_is_not_an_address(isolated_env):
             "set_agent_display_name",
             {
                 "project_key": KEY,
-                "agent_name": "box-linux-1",
+                "agent_name": FIRST_AGENT,
                 "display_name": "Kitchen",
                 "registration_token": first["registration_token"],
             },
@@ -96,7 +108,7 @@ async def test_alias_is_not_an_address(isolated_env):
                 "send_message",
                 {
                     "project_key": KEY,
-                    "sender_name": "box-mac-1",
+                    "sender_name": SECOND_AGENT,
                     "to": ["Kitchen"],
                     "subject": "s",
                     "body_md": "b",
@@ -119,12 +131,12 @@ async def test_alias_may_not_impersonate_another_agents_name(isolated_env):
                 "set_agent_display_name",
                 {
                     "project_key": KEY,
-                    "agent_name": "box-linux-1",
-                    "display_name": "box-mac-1",
+                    "agent_name": FIRST_AGENT,
+                    "display_name": SECOND_AGENT,
                     "registration_token": first["registration_token"],
                 },
             )
-        assert "box-mac-1" in str(excinfo.value)
+        assert SECOND_AGENT in str(excinfo.value)
 
 
 @pytest.mark.asyncio
@@ -136,7 +148,7 @@ async def test_alias_may_not_duplicate_another_agents_alias(isolated_env):
             "set_agent_display_name",
             {
                 "project_key": KEY,
-                "agent_name": "box-linux-1",
+                "agent_name": FIRST_AGENT,
                 "display_name": "Kitchen",
                 "registration_token": first["registration_token"],
             },
@@ -146,7 +158,7 @@ async def test_alias_may_not_duplicate_another_agents_alias(isolated_env):
                 "set_agent_display_name",
                 {
                     "project_key": KEY,
-                    "agent_name": "box-mac-1",
+                    "agent_name": SECOND_AGENT,
                     "display_name": "kitchen",
                     "registration_token": second["registration_token"],
                 },
@@ -161,7 +173,7 @@ async def test_an_agent_may_re_set_its_own_alias(isolated_env):
         first, _ = await _two_agents(client)
         args = {
             "project_key": KEY,
-            "agent_name": "box-linux-1",
+            "agent_name": FIRST_AGENT,
             "display_name": "Kitchen",
             "registration_token": first["registration_token"],
         }
@@ -182,7 +194,7 @@ async def test_control_characters_are_stripped(isolated_env):
                 "set_agent_display_name",
                 {
                     "project_key": KEY,
-                    "agent_name": "box-linux-1",
+                    "agent_name": FIRST_AGENT,
                     "display_name": "Kitchen\nBox\r\t",
                     "registration_token": first["registration_token"],
                 },
@@ -201,13 +213,13 @@ async def test_empty_clears_the_alias(isolated_env):
         token = first["registration_token"]
         await client.call_tool(
             "set_agent_display_name",
-            {"project_key": KEY, "agent_name": "box-linux-1",
+            {"project_key": KEY, "agent_name": FIRST_AGENT,
              "display_name": "Kitchen", "registration_token": token},
         )
         result = _data(
             await client.call_tool(
                 "set_agent_display_name",
-                {"project_key": KEY, "agent_name": "box-linux-1",
+                {"project_key": KEY, "agent_name": FIRST_AGENT,
                  "display_name": "", "registration_token": token},
             )
         )
@@ -216,7 +228,11 @@ async def test_empty_clears_the_alias(isolated_env):
         seen = _data(
             await client.call_tool(
                 "whois",
-                {"project_key": KEY, "agent_name": "box-linux-1", "registration_token": token},
+                {
+                    "project_key": KEY,
+                    "agent_name": FIRST_AGENT,
+                    "registration_token": token,
+                },
             )
         )
         # Absent rather than empty, so no consumer has to tell "" from unset.
@@ -244,7 +260,7 @@ async def test_a_wrong_token_cannot_rename_someone_else(isolated_env):
                 "set_agent_display_name",
                 {
                     "project_key": KEY,
-                    "agent_name": "box-linux-1",
+                    "agent_name": FIRST_AGENT,
                     "display_name": "Hijacked",
                     "registration_token": second["registration_token"],
                 },

@@ -82,11 +82,53 @@ Why it's useful
 - Keeps communication out of your token budget by storing messages in a per-project archive.
 - Offers quick reads (`resource://inbox/...`, `resource://thread/...`) and macros that bundle common flows.
 
+### Durable Agents, executions, and native subagents
+
+- An **Agent** is a durable mailbox/personality with the stable
+  `<client>-<os>-<host>-<slot>` identity. A CLI session or native subagent is an
+  **AgentExecution** beneath that Agent; a Git worktree is execution-location
+  context, never identity.
+- Native subagents must **never** call `register_agent`,
+  `create_agent_identity`, `macro_start_session`, or any other path that creates
+  another Agent row. They inherit the durable parent Agent through lifecycle
+  hooks and use the execution id supplied there. Random adjective+noun Agent
+  names are not a subagent lifecycle mechanism.
+- `SessionStart` starts the root execution. `SubagentStart` starts a child
+  execution using the client's native `agent_id`. Because both Claude and Codex
+  allow another hook to block `SubagentStop` and continue the child, that event
+  records a provisional local stop; child tool activity cancels it, while the
+  first later parent event finalizes it. `SessionEnd` ends the root and its
+  descendants. Ending an execution atomically releases only that execution's
+  automatic reservations; explicit reservations retain their TTL and require
+  an explicit release.
+- Read-only subagents need no mailbox registration and report through their
+  parent. Writers reserve exact paths with their `execution_id`. Use a dedicated
+  worktree/branch when writers need filesystem isolation, while keeping the
+  same durable Agent mailbox.
+- If lifecycle state is unavailable, fail open for the task but do not create a
+  replacement Agent. Report through the parent and treat reservation ownership
+  as unavailable until the lifecycle hook is repaired.
+- Keep `AGENT_MAIL_STATE_DIR` outside every Git worktree and Git directory. It
+  contains registration and execution capabilities; hooks reject a path inside
+  Git rather than risk staging those secrets.
+- A native session may touch more than one project. Hooks create a distinct
+  execution chain under the same deterministic durable Agent when the target
+  project is explicit in a file path or is the hook's session `cwd`;
+  `apply_patch` and shell command text are never parsed to guess another repo.
+  `SessionEnd` closes every exact execution for that client/session generation.
+- If `SessionEnd` races an in-flight root start, lifecycle state records the end
+  intent first. The returned server UUID is used only for the exact authenticated
+  end call and must never be published as an active guard context.
+- `SessionEnd` writes a private tombstone for the exact client and native
+  session before scanning projects. Concurrent first-touch enrollment must
+  observe that barrier, preventing a late project execution after cleanup.
+
 How to use effectively
 1) Same repository
-   - Register an identity: call `ensure_project`, then `register_agent` with the same canonical project key on every host. Normalize the Git origin to a synthetic absolute key (`git@github.com:owner/repo.git` → `/owner/repo`); never use the local checkout path.
-   - Reserve files before you edit: `file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true)` to signal intent and avoid conflict.
-   - Communicate with threads: use `send_message(..., thread_id="FEAT-123")`; check inbox with `fetch_inbox` and acknowledge with `acknowledge_message`.
+   - The durable parent registers once: call `ensure_project`, then `register_agent` with the same canonical project key on every host. Normalize the Git origin to a synthetic absolute key (`git@github.com:owner/repo.git` → `/owner/repo`); never use the local checkout path.
+   - Start an execution for the session/subagent and reserve before editing. In the exact MCP session bound by `start_agent_execution`, omit explicit execution credentials: `file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true)`. A stateless caller that supplies `execution_id="<uuid>"` must also supply that execution's private `execution_token`; never copy or expose the token through messages, Git metadata, or shared configuration.
+   - Codex lifecycle hooks and ordinary Codex MCP calls use separate stateless/session transports. The hook capability is intentionally not exposed to the ordinary MCP session, so a manual Codex reservation cannot claim ownership of the hook execution until a secure handoff exists.
+   - Communicate with threads: use `send_message(..., thread_id="FEAT-123", idempotency_key="feat-123-start")`; check inbox with `fetch_inbox` and acknowledge with `acknowledge_message`.
    - Read fast: `resource://inbox/{Agent}?project=<url-encoded-canonical-key>&limit=20` or `resource://thread/{id}?project=<url-encoded-canonical-key>&include_bodies=true`.
    - Tip: set `AGENT_NAME` in your environment so the pre-commit guard can block commits that conflict with others' active exclusive file reservations.
    - Tip: worktree mode (opt-in): set `WORKTREES_ENABLED=1`, and during trials set `AGENT_MAIL_GUARD_MODE=warn`. Check hooks with `mcp-agent-mail guard status .` and identity with `mcp-agent-mail mail status .`.
@@ -187,7 +229,9 @@ Server tools (for orchestrators)
 - `search_messages_product(product_key, query, limit=20)`
 
 Common pitfalls
-- "from_agent not registered": always `register_agent` in the correct `project_key` first.
+- "from_agent not registered": the durable parent must register in the correct
+  `project_key`; a subagent must reuse that parent Agent through its execution,
+  never register a replacement.
 - "FILE_RESERVATION_CONFLICT": adjust patterns, wait for expiry, or use a non-exclusive reservation when appropriate.
 - Auth errors: if JWT+JWKS is enabled, include a bearer token with a `kid` that matches server JWKS; static bearer is used only when JWT is disabled.
 
@@ -208,7 +252,7 @@ Typical flow (agents)
 2) **Reserve edit surface** (Mail)
    - `file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true, reason="br-123")`
 3) **Announce start** (Mail)
-   - `send_message(..., thread_id="br-123", subject="[br-123] Start: <short title>", ack_required=true)`
+   - `send_message(..., thread_id="br-123", subject="[br-123] Start: <short title>", idempotency_key="br-123-start", ack_required=true)`
 4) **Work and update**
    - Reply in‑thread with progress and attach artifacts/images; keep the discussion in one thread per issue id
 5) **Complete and release**

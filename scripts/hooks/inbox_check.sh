@@ -62,16 +62,26 @@ AGENT="$(am_agent_name claude "${AGENT_MAIL_CLAUDE_SLOT:-1}")"
 token="$(am_cred_get "$PROJECT" "$AGENT")"
 [ -z "$token" ] && exit 0   # SessionStart has not run; nothing to authenticate as
 
+am_execution_reconcile_for_payload "$PROJECT" "$AGENT" "$token" claude \
+    >/dev/null 2>&1 || true
+
 # Separators MAPPED, not deleted — third instance of a defect fixed twice
 # already (am_granted_name_file, then am_sync_model). `tr -cd` alone drops the
 # slashes rather than replacing them, so `/a/b` and `/ab` collapse onto one key.
 #
 # This one is the worst of the three. The other two guard a name and a cached
-# model string; these guard `.seen`, the high-water mark of what this agent has
-# already been shown. Two projects sharing it means mail from one is recorded as
-# seen by the other and never surfaces — a silently lost message, which is the
-# single failure this hook exists to prevent.
-slug="$(am_state_component "${PROJECT}|${AGENT}")" || exit 0
+# model string; these guard `.seen`, the high-water mark of what one execution
+# has already been shown. Projects, root sessions, and child executions must all
+# have distinct state: otherwise a child can record a message as seen before the
+# root receives it, a silently lost announcement from the root's perspective.
+native_agent_id="$(am_payload_field '.agent_id')"
+native_session_id="$(am_payload_field '.session_id')"
+if [ -n "$native_agent_id" ]; then
+    inbox_scope="subagent:${native_agent_id}"
+else
+    inbox_scope="session:${native_session_id}"
+fi
+slug="$(am_state_component "${PROJECT}|${AGENT}|${inbox_scope}")" || exit 0
 stamp="${AM_STATE_DIR}/inbox/${slug}.stamp"
 seen="${AM_STATE_DIR}/inbox/${slug}.seen"
 mkdir -p "$(dirname "$stamp")" 2>/dev/null || exit 0
@@ -102,6 +112,7 @@ fi
 # the field ever becomes true. It cannot fail the hook: am_sync_model returns 0
 # unconditionally and reaches the network only when the value actually changed.
 am_sync_model "$PROJECT" "$AGENT" "$token"
+am_execution_heartbeat "$PROJECT" "$AGENT" "$token" claude
 
 # ── what has already been announced ──────────────────────────────────────────
 #

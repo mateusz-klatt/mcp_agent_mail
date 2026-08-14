@@ -24,7 +24,13 @@ async def test_attachment_policy_does_not_normalize_inline_markdown(isolated_env
         # Register agent with explicit inline policy
         await client.call_tool(
             "register_agent",
-            {"project_key": pkey("backend"), "program": "codex", "model": "gpt-5", "name": "BlueLake", "attachments_policy": "inline"},
+            {
+                "project_key": pkey("backend"),
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-attachment-policy-1",
+                "attachments_policy": "inline",
+            },
         )
         # Create a tiny inline image as data URI in body
         body = "Here is an image ![pic](data:image/webp;base64,AAECAwQ=)"
@@ -32,8 +38,8 @@ async def test_attachment_policy_does_not_normalize_inline_markdown(isolated_env
             "send_message",
             {
                 "project_key": pkey("backend"),
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": "codex-wsl-attachment-policy-1",
+                "to": ["codex-wsl-attachment-policy-1"],
                 "subject": "Inline",
                 "body_md": body,
                 "idempotency_key": "attachment-policy-inline-markdown",
@@ -42,4 +48,3 @@ async def test_attachment_policy_does_not_normalize_inline_markdown(isolated_env
         message = (res.data.get("deliveries") or [{}])[0].get("message", {})
         assert message.get("body_md") == body
         assert message.get("attachments") == []
-

@@ -33,7 +33,7 @@ async def _setup_project_and_agents(settings: _config.Settings) -> dict:
         # Create project via MCP tool
         await client.call_tool("ensure_project", {"human_key": pkey("tmp/concurrent-test")})
 
-        # Create multiple agents with auto-generated adjective+noun names
+        # Create multiple explicit durable identities for concurrent writers.
         agents = []
         tokens_by_name: dict[str, str] = {}
         for i in range(5):
@@ -43,6 +43,7 @@ async def _setup_project_and_agents(settings: _config.Settings) -> dict:
                     "project_key": pkey("tmp/concurrent-test"),
                     "program": "claude-code",
                     "model": "opus-4",
+                    "name": f"claude-wsl-concurrent-{i + 1}",
                     "task_description": f"Task {i}",
                 },
             )
@@ -439,6 +440,7 @@ async def test_concurrent_agent_registration(isolated_env):
                     "project_key": pkey("tmp/reg-test"),
                     "program": "claude-code",
                     "model": "opus-4",
+                    "name": f"claude-wsl-concurrent-register-{i + 1}",
                     "task_description": f"Task {i}",
                 },
             )

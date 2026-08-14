@@ -33,14 +33,19 @@ async def test_ack_views_resources(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {
+                "project_key": "Backend",
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "codex-wsl-tooling-views-1",
+            },
         )
         await client.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
-                "sender_name": "BlueLake",
-                "to": ["BlueLake"],
+                "sender_name": "codex-wsl-tooling-views-1",
+                "to": ["codex-wsl-tooling-views-1"],
                 "subject": "AckReq",
                 "body_md": "x",
                 "ack_required": True,
@@ -49,13 +54,12 @@ async def test_ack_views_resources(isolated_env):
         )
         # Views may be empty/non-empty; ensure they respond with JSON
         for uri in [
-            "resource://views/ack-required/BlueLake?project=Backend",
-            "resource://views/acks-stale/BlueLake?project=Backend",
-            "resource://views/ack-overdue/BlueLake?project=Backend",
-            "resource://views/urgent-unread/BlueLake?project=Backend",
-            "resource://mailbox/BlueLake?project=Backend",
-            "resource://outbox/BlueLake?project=Backend",
+            "resource://views/ack-required/codex-wsl-tooling-views-1?project=Backend",
+            "resource://views/acks-stale/codex-wsl-tooling-views-1?project=Backend",
+            "resource://views/ack-overdue/codex-wsl-tooling-views-1?project=Backend",
+            "resource://views/urgent-unread/codex-wsl-tooling-views-1?project=Backend",
+            "resource://mailbox/codex-wsl-tooling-views-1?project=Backend",
+            "resource://outbox/codex-wsl-tooling-views-1?project=Backend",
         ]:
             blocks = await client.read_resource(uri)
             assert blocks and isinstance(blocks[0].text, str)
-

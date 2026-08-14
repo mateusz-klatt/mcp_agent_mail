@@ -16,14 +16,30 @@ from datetime import datetime, timedelta
 
 import pytest
 from fastmcp import Client
+from fastmcp.exceptions import ToolError
 from sqlalchemy import text
 
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import get_session
-from mcp_agent_mail.utils import validate_agent_name_format
+from mcp_agent_mail.utils import validate_client_platform_host_agent_id
 from tests.keys import pkey
 
 logger = logging.getLogger(__name__)
+
+WINDOW_CREATED_AGENT = "codex-wsl-window-created-1"
+WINDOW_REUSED_AGENT = "codex-wsl-window-reused-2"
+WINDOW_MONOTONIC_AGENT = "codex-wsl-window-monotonic-3"
+WINDOW_NO_ENV_AGENT = "codex-wsl-window-no-env-4"
+WINDOW_INVALID_ENV_AGENT = "codex-wsl-window-invalid-env-5"
+WINDOW_PRIORITY_AGENT = "codex-wsl-window-priority-6"
+WINDOW_UNIQUE_AGENT_ONE = "codex-wsl-window-unique-7"
+WINDOW_UNIQUE_AGENT_TWO = "codex-wsl-window-unique-8"
+WINDOW_LIST_AGENT = "codex-wsl-window-list-9"
+WINDOW_RENAME_AGENT = "codex-wsl-window-rename-10"
+WINDOW_EXPIRE_AGENT = "codex-wsl-window-expire-11"
+WINDOW_SHARED_AGENT_ONE = "codex-wsl-window-shared-12"
+WINDOW_SHARED_AGENT_TWO = "codex-wsl-window-shared-13"
+WINDOW_PERSIST_AGENT = "codex-wsl-window-persist-14"
 
 
 def _parse_db_datetime(value):
@@ -56,12 +72,13 @@ async def test_window_id_created_on_first_registration(isolated_env, monkeypatch
                 "project_key": pkey("test/window"),
                 "program": "test-program",
                 "model": "test-model",
+                "name": WINDOW_CREATED_AGENT,
             },
         )
 
         agent_name = result.data["name"]
         assert agent_name is not None
-        assert validate_agent_name_format(agent_name)
+        assert validate_client_platform_host_agent_id(agent_name)
         # Window identity fields should be present
         assert result.data.get("window_id") == window_uuid
         assert result.data.get("window_display_name") == agent_name
@@ -87,6 +104,7 @@ async def test_window_id_reused_on_subsequent_registration(isolated_env, monkeyp
                 "project_key": pkey("test/window"),
                 "program": "test-program",
                 "model": "test-model",
+                "name": WINDOW_REUSED_AGENT,
             },
         )
         name1 = result1.data["name"]
@@ -98,6 +116,7 @@ async def test_window_id_reused_on_subsequent_registration(isolated_env, monkeyp
                 "project_key": pkey("test/window"),
                 "program": "test-program-v2",
                 "model": "test-model-v2",
+                "name": WINDOW_REUSED_AGENT,
             },
         )
         name2 = result2.data["name"]
@@ -118,16 +137,19 @@ async def test_window_id_reregister_does_not_shorten_active_expiry(isolated_env,
 
     server = build_mcp_server()
     project_key = "/test/window_monotonic"
+    registration_token: str
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": project_key})
-        await client.call_tool(
+        registered = await client.call_tool(
             "register_agent",
             {
                 "project_key": project_key,
                 "program": "test-program",
                 "model": "test-model",
+                "name": WINDOW_MONOTONIC_AGENT,
             },
         )
+        registration_token = registered.data["registration_token"]
 
     async with get_session() as session:
         result = await session.execute(
@@ -167,6 +189,8 @@ async def test_window_id_reregister_does_not_shorten_active_expiry(isolated_env,
                 "project_key": project_key,
                 "program": "test-program-v2",
                 "model": "test-model-v2",
+                "name": WINDOW_MONOTONIC_AGENT,
+                "registration_token": registration_token,
             },
         )
 
@@ -205,6 +229,7 @@ async def test_window_id_without_env_var(isolated_env, monkeypatch):
                 "project_key": pkey("test/window"),
                 "program": "test-program",
                 "model": "test-model",
+                "name": WINDOW_NO_ENV_AGENT,
             },
         )
 
@@ -231,12 +256,13 @@ async def test_window_id_invalid_format(isolated_env, monkeypatch):
                 "project_key": pkey("test/window"),
                 "program": "test-program",
                 "model": "test-model",
+                "name": WINDOW_INVALID_ENV_AGENT,
             },
         )
 
         # Should still work but without window identity
         assert result.data["name"] is not None
-        assert validate_agent_name_format(result.data["name"])
+        assert validate_client_platform_host_agent_id(result.data["name"])
         assert "window_id" not in result.data
 
 
@@ -264,11 +290,11 @@ async def test_explicit_name_takes_priority_over_window(isolated_env, monkeypatc
                 "project_key": pkey("test/window"),
                 "program": "test-program",
                 "model": "test-model",
-                "name": "GreenCastle",
+                "name": WINDOW_PRIORITY_AGENT,
             },
         )
 
-        assert result.data["name"] == "GreenCastle"
+        assert result.data["name"] == WINDOW_PRIORITY_AGENT
         # Window identity should still be created for tracking
         assert result.data.get("window_id") == window_uuid
         logger.debug(
@@ -299,6 +325,7 @@ async def test_window_display_name_unique_per_project(isolated_env, monkeypatch)
                 "project_key": pkey("test/window"),
                 "program": "test",
                 "model": "test",
+                "name": WINDOW_UNIQUE_AGENT_ONE,
             },
         )
 
@@ -312,6 +339,7 @@ async def test_window_display_name_unique_per_project(isolated_env, monkeypatch)
                 "project_key": pkey("test/window"),
                 "program": "test",
                 "model": "test",
+                "name": WINDOW_UNIQUE_AGENT_TWO,
             },
         )
 
@@ -341,6 +369,7 @@ async def test_list_window_identities(isolated_env, monkeypatch):
                 "project_key": pkey("test/window"),
                 "program": "test",
                 "model": "test",
+                "name": WINDOW_LIST_AGENT,
             },
         )
 
@@ -374,6 +403,7 @@ async def test_rename_window(isolated_env, monkeypatch):
                 "project_key": pkey("test/window"),
                 "program": "test",
                 "model": "test",
+                "name": WINDOW_RENAME_AGENT,
             },
         )
         old_name = reg.data["name"]
@@ -409,6 +439,7 @@ async def test_expire_window(isolated_env, monkeypatch):
                 "project_key": pkey("test/window"),
                 "program": "test",
                 "model": "test",
+                "name": WINDOW_EXPIRE_AGENT,
             },
         )
 
@@ -456,6 +487,7 @@ async def test_multiple_agents_same_window(isolated_env, monkeypatch):
                 "project_key": pkey("test/window"),
                 "program": "agent-1",
                 "model": "model-1",
+                "name": WINDOW_SHARED_AGENT_ONE,
             },
         )
 
@@ -466,7 +498,7 @@ async def test_multiple_agents_same_window(isolated_env, monkeypatch):
                 "project_key": pkey("test/window"),
                 "program": "agent-2",
                 "model": "model-2",
-                "name": "BlueLake",
+                "name": WINDOW_SHARED_AGENT_TWO,
             },
         )
 
@@ -476,8 +508,8 @@ async def test_multiple_agents_same_window(isolated_env, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_window_persistence_across_sessions(isolated_env, monkeypatch):
-    """Window identity should persist across separate client sessions."""
+async def test_window_persists_but_cannot_authenticate_a_new_session(isolated_env, monkeypatch):
+    """A server-global window UUID is history, never authentication proof."""
     window_uuid = str(uuid.uuid4())
     monkeypatch.setenv("MCP_AGENT_MAIL_WINDOW_ID", window_uuid)
 
@@ -495,20 +527,38 @@ async def test_window_persistence_across_sessions(isolated_env, monkeypatch):
                 "project_key": pkey("test/window"),
                 "program": "session-1",
                 "model": "test",
+                "name": WINDOW_PERSIST_AGENT,
             },
         )
         name1 = r1.data["name"]
+        registration_token = r1.data["registration_token"]
 
-    # Second session (new client, same server/DB)
+    # A separate session sees the same server-global WindowIdentity mapping,
+    # but must still prove the durable Agent credential. This is especially
+    # important for HTTP, where unrelated clients share one server process.
     async with Client(server) as client:
+        with pytest.raises(ToolError, match="requires registration_token"):
+            await client.call_tool(
+                "register_agent",
+                {
+                    "project_key": pkey("test/window"),
+                    "program": "session-2",
+                    "model": "test",
+                    "name": WINDOW_PERSIST_AGENT,
+                },
+            )
+
         r2 = await client.call_tool(
             "register_agent",
             {
                 "project_key": pkey("test/window"),
                 "program": "session-2",
                 "model": "test",
+                "name": WINDOW_PERSIST_AGENT,
+                "registration_token": registration_token,
             },
         )
         name2 = r2.data["name"]
 
     assert name1 == name2, "Window identity should persist across sessions"
+    assert r2.data["window_id"] == window_uuid

@@ -187,7 +187,7 @@ async def test_file_reservation_expiration_comparison_no_error(isolated_env):
     """
     server = build_mcp_server()
     async with Client(server) as client:
-        # Setup: create project and agent (let server auto-generate name)
+        # Setup: create project and one explicit durable agent identity.
         await client.call_tool("ensure_project", {"human_key": pkey("test/regression")})
         agent_result = await client.call_tool(
             "register_agent",
@@ -195,6 +195,7 @@ async def test_file_reservation_expiration_comparison_no_error(isolated_env):
                 "project_key": pkey("test/regression"),
                 "program": "test",
                 "model": "test",
+                "name": "codex-wsl-datetime-regression-1",
             },
         )
         agent_name = agent_result.data["name"]
@@ -240,6 +241,7 @@ async def test_file_reservation_release_and_renew_datetime_handling(isolated_env
                 "project_key": pkey("test/datetime"),
                 "program": "test",
                 "model": "test",
+                "name": "codex-wsl-datetime-renew-2",
             },
         )
         agent_name = agent_result.data["name"]
@@ -295,6 +297,7 @@ async def test_agent_link_expiration_comparison(isolated_env):
                 "project_key": pkey("test/links"),
                 "program": "test",
                 "model": "test",
+                "name": "codex-wsl-datetime-link-3",
             },
         )
         agent_a_name = agent_a_result.data["name"]
@@ -305,6 +308,7 @@ async def test_agent_link_expiration_comparison(isolated_env):
                 "project_key": pkey("test/links"),
                 "program": "test",
                 "model": "test",
+                "name": "codex-wsl-datetime-link-4",
             },
         )
         agent_b_name = agent_b_result.data["name"]
@@ -352,6 +356,7 @@ async def test_message_recipient_timestamp_updates(isolated_env):
                 "project_key": pkey("test/msg"),
                 "program": "test",
                 "model": "test",
+                "name": "codex-wsl-datetime-message-5",
             },
         )
         sender_name = sender_result.data["name"]
@@ -362,6 +367,7 @@ async def test_message_recipient_timestamp_updates(isolated_env):
                 "project_key": pkey("test/msg"),
                 "program": "test",
                 "model": "test",
+                "name": "codex-wsl-datetime-message-6",
             },
         )
         receiver_name = receiver_result.data["name"]
@@ -423,6 +429,7 @@ async def test_inbox_fetch_with_since_ts_datetime_handling(isolated_env):
                 "project_key": pkey("test/inbox"),
                 "program": "test",
                 "model": "test",
+                "name": "codex-wsl-datetime-inbox-7",
             },
         )
         agent_name = agent_result.data["name"]

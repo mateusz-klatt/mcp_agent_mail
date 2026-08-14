@@ -18,7 +18,12 @@ async def test_convert_images_override_fails_closed(isolated_env, monkeypatch):
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "x", "model": "y", "name": "BlueLake"},
+            {
+                "project_key": "Backend",
+                "program": "x",
+                "model": "y",
+                "name": "codex-wsl-storage-inline-1",
+            },
         )
         body = "Inline ![p](data:image/webp;base64,AAECAwQ=) only"
         with pytest.raises(ToolError, match="bounded canonical inline representation"):
@@ -26,12 +31,11 @@ async def test_convert_images_override_fails_closed(isolated_env, monkeypatch):
                 "send_message",
                 {
                     "project_key": "Backend",
-                    "sender_name": "BlueLake",
-                    "to": ["BlueLake"],
+                "sender_name": "codex-wsl-storage-inline-1",
+                "to": ["codex-wsl-storage-inline-1"],
                     "subject": "InlineOnly",
                     "body_md": body,
                     "convert_images": False,
                     "idempotency_key": "inline-fallback-convert-disabled",
                 },
             )
-

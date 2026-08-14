@@ -177,6 +177,12 @@ The MCP Agent Mail server also has a database-backed window identity system (`MC
 The file-based identity contract documented here serves a different purpose: it allows **shell scripts, hooks, and external tools** to discover which agent is running in which pane without needing to query the MCP server. The two systems are complementary:
 
 - File-based: for shell-level identity discovery (hooks, integration scripts, cron jobs).
-- DB-based: for server-level identity persistence (MCP tool calls, session continuity).
+- DB-based: for server-level window history, display, and management only.
+
+`WindowIdentity` is never authentication proof. `MCP_AGENT_MAIL_WINDOW_ID` is
+loaded from the server process environment, so every HTTP client served by that
+process observes the same value. A new MCP session must present the Agent's
+registration token; only a binding already established in that exact MCP
+session may omit it.
 
 A future enhancement could have `register_agent` in the server also call `identity-write.sh` to keep both systems in sync.

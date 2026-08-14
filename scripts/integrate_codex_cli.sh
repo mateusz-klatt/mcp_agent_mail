@@ -320,6 +320,27 @@ SESSION_START_GROUP="$(jq -nc \
     type:"command",command:$command,commandWindows:$command_windows,
     timeout:20,statusMessage:"Connecting Agent Mail",additionalContextLimit:2500
   }]}')"
+SUBAGENT_START_GROUP="$(jq -nc \
+  --arg command "$(_posix_hook_command subagent-start)" \
+  --arg command_windows "$(_windows_hook_command subagent-start)" \
+  '{hooks:[{
+    type:"command",command:$command,commandWindows:$command_windows,
+    timeout:20,statusMessage:"Starting Agent Mail execution",additionalContextLimit:2500
+  }]}')"
+SUBAGENT_STOP_GROUP="$(jq -nc \
+  --arg command "$(_posix_hook_command subagent-stop)" \
+  --arg command_windows "$(_windows_hook_command subagent-stop)" \
+  '{hooks:[{
+    type:"command",command:$command,commandWindows:$command_windows,
+    timeout:20,statusMessage:"Closing Agent Mail execution"
+  }]}')"
+POST_TOOL_HEARTBEAT_GROUP="$(jq -nc \
+  --arg command "$(_posix_hook_command heartbeat)" \
+  --arg command_windows "$(_windows_hook_command heartbeat)" \
+  '{matcher:"*",hooks:[{
+    type:"command",command:$command,commandWindows:$command_windows,
+    timeout:20,async:true,statusMessage:"Refreshing Agent Mail execution"
+  }]}')"
 STOP_GROUP="$(jq -nc \
   --arg command "$(_posix_hook_command stop)" \
   --arg command_windows "$(_windows_hook_command stop)" \
@@ -340,6 +361,9 @@ SESSION_END_GROUP="$(jq -nc \
 # survive, and re-running the installer cannot duplicate the managed set.
 MERGED_HOOKS="$(printf '%s' "$EXISTING_HOOKS" | jq \
   --argjson session_start "$SESSION_START_GROUP" \
+  --argjson subagent_start "$SUBAGENT_START_GROUP" \
+  --argjson subagent_stop "$SUBAGENT_STOP_GROUP" \
+  --argjson post_tool_heartbeat "$POST_TOOL_HEARTBEAT_GROUP" \
   --argjson stop "$STOP_GROUP" \
   --argjson session_end "$SESSION_END_GROUP" '
   def agent_mail_handler:
@@ -360,8 +384,11 @@ MERGED_HOOKS="$(printf '%s' "$EXISTING_HOOKS" | jq \
     else .hooks = (.hooks // {}) end
   | .hooks |= with_entries(
       if (.value | type) == "array" then .value |= clean_groups else . end
-    )
+  )
   | .hooks.SessionStart = ((.hooks.SessionStart // []) + [$session_start])
+  | .hooks.SubagentStart = ((.hooks.SubagentStart // []) + [$subagent_start])
+  | .hooks.SubagentStop = ((.hooks.SubagentStop // []) + [$subagent_stop])
+  | .hooks.PostToolUse = ((.hooks.PostToolUse // []) + [$post_tool_heartbeat])
   | .hooks.Stop = ((.hooks.Stop // []) + [$stop])
   | .hooks.SessionEnd = ((.hooks.SessionEnd // []) + [$session_end])
   | if has("description") then . else

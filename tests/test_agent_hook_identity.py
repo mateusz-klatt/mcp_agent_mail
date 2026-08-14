@@ -1027,8 +1027,15 @@ def test_integrators_install_lf_only_hooks_from_crlf_sources(
         directory.mkdir(parents=True)
 
     integrator = source_scripts / INTEGRATORS[client].name
-    integrator.write_bytes(INTEGRATORS[client].read_bytes())
-    (source_scripts / "lib.sh").write_bytes(LIB.read_bytes())
+    # Normalize the staged copies: under core.autocrlf the working tree may be
+    # CRLF even though the blob is LF, and a CRLF integrator breaks under bash
+    # before the behaviour under test is ever reached.
+    integrator.write_bytes(
+        INTEGRATORS[client].read_bytes().replace(b"\r\n", b"\n")
+    )
+    (source_scripts / "lib.sh").write_bytes(
+        LIB.read_bytes().replace(b"\r\n", b"\n")
+    )
     hook_names = (
         (
             "agent_mail_common.sh",
@@ -1045,8 +1052,10 @@ def test_integrators_install_lf_only_hooks_from_crlf_sources(
     )
     for hook_name in hook_names:
         source = ROOT / "scripts" / "hooks" / hook_name
-        source_bytes = source.read_bytes()
-        assert b"\r" not in source_bytes
+        # The contract under test is that the integrator PUBLISHES LF-only
+        # hooks from CRLF sources; the checkout's own line endings (CRLF under
+        # core.autocrlf) are not part of it, so normalize before re-CRLFing.
+        source_bytes = source.read_bytes().replace(b"\r\n", b"\n")
         crlf_bytes = source_bytes.replace(b"\n", b"\r\n")
         assert b"\r\n" in crlf_bytes
         (source_hooks / hook_name).write_bytes(crlf_bytes)

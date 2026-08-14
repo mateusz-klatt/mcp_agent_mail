@@ -7963,6 +7963,17 @@ printf '%s\n200' "$envelope"
         "systemMessage"
     ]
 
+    # This bound exists to catch a session-end that BLOCKS, not to police how
+    # fast it is.  Three seconds never had the headroom for that: the step ends
+    # executions in two projects and measured 2.295/2.297/2.325 s on an idle
+    # M-series Mac, i.e. 23% of margin before a hosted runner adds any load at
+    # all — so macos-latest failed it on 5828d1d while ubuntu passed.  The cause
+    # is the budget, not a regression: the same test measured 8.12/8.00/8.13 s
+    # end to end at cb14179 against 8.23/8.23/8.25 s with the pre-287decd hook
+    # library restored, so the worktree-guard rewrite is marginally faster, not
+    # slower.  Scale the deadline like the watcher case above does, keeping it
+    # bounded so a genuine hang still fails.
+    end_deadline = 30 if os.name == "nt" else 10
     end_started = time.monotonic()
     end = subprocess.run(
         [*command, "session-end"],
@@ -7972,11 +7983,11 @@ printf '%s\n200' "$envelope"
         check=False,
         capture_output=True,
         text=True,
-        timeout=3,
+        timeout=end_deadline,
     )
     end_elapsed = time.monotonic() - end_started
     assert end.returncode == 0, end.stderr
-    assert end_elapsed < 3
+    assert end_elapsed < end_deadline
     calls = [
         json.loads(line) for line in calls_log.read_text(encoding="utf-8").splitlines()
     ]

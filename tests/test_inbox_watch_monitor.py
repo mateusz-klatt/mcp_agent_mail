@@ -18,6 +18,7 @@ twelve existing assertions about inbox_watch.sh keep a file to themselves.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import time
@@ -87,12 +88,7 @@ def _harness_can_actually_run_the_script(tmp_path_factory: pytest.TempPathFactor
     )
     time.sleep(3)
     alive = proc.poll() is None
-    proc.terminate()
-    try:
-        _stdout, stderr = proc.communicate(timeout=15)
-    except subprocess.TimeoutExpired:  # pragma: no cover - failure path
-        proc.kill()
-        _stdout, stderr = proc.communicate()
+    _stdout, stderr = _stop_and_read(proc)
 
     if not alive:
         pytest.fail(
@@ -104,6 +100,46 @@ def _harness_can_actually_run_the_script(tmp_path_factory: pytest.TempPathFactor
         )
 
 
+def _stop_and_read(proc: subprocess.Popen[str], *, budget: float = 15.0) -> tuple[str, str]:
+    """Stop the monitor and read what it said, without ever blocking forever.
+
+    `communicate()` returns when the pipes reach EOF, and a pipe stays open
+    while ANY holder is alive. The monitor is a bash script that spawns
+    children, and on Windows `terminate()` is TerminateProcess against the
+    direct child only -- the grandchildren keep the pipe open and the reader
+    thread waits for ever. Measured: chunk 5 of the Windows leg died on the
+    300s per-test ceiling with a `_readerthread` stack and no culprit named.
+
+    So: ask the whole tree to stop, and bound every wait. If the pipes still
+    do not close, say so instead of hanging -- a caller asserting on the text
+    then fails on its own terms rather than taking the run down with it.
+    """
+    if os.name == "nt":
+        # No process groups to signal here; taskkill walks the tree.
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            check=False,
+            capture_output=True,
+        )
+    else:
+        proc.terminate()
+    try:
+        return proc.communicate(timeout=budget)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    try:
+        return proc.communicate(timeout=budget)
+    except subprocess.TimeoutExpired:
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
+        raise AssertionError(
+            "the monitor's output pipes never closed after the process tree was "
+            f"killed, so something still holds them (pid {proc.pid})"
+        ) from None
+
+
+
 @pytest.mark.parametrize(
     "arguments",
     [
@@ -112,6 +148,7 @@ def _harness_can_actually_run_the_script(tmp_path_factory: pytest.TempPathFactor
         ["claude", "1", "extra"],
     ],
 )
+
 def test_monitor_refuses_a_wrong_number_of_arguments(
     tmp_path: Path,
     arguments: list[str],
@@ -216,12 +253,7 @@ def test_monitor_stays_alive_and_silent_without_an_identity(tmp_path: Path) -> N
         time.sleep(5)
         assert proc.poll() is None, "monitor exited without an identity"
     finally:
-        proc.terminate()
-        try:
-            stdout, _stderr = proc.communicate(timeout=15)
-        except subprocess.TimeoutExpired:  # pragma: no cover - failure path
-            proc.kill()
-            stdout, _stderr = proc.communicate()
+        stdout, _stderr = _stop_and_read(proc)
 
     assert stdout == "", f"monitor spoke when it had nothing to report: {stdout!r}"
 
@@ -262,8 +294,11 @@ def test_monitor_exits_promptly_on_sigterm(tmp_path: Path) -> None:
     try:
         proc.communicate(timeout=15)
     except subprocess.TimeoutExpired:  # pragma: no cover - failure path
+        # Bounded on purpose: a test that fails must fail, not hang the run
+        # waiting on pipes a killed process's children may still hold.
         proc.kill()
-        proc.communicate()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.communicate(timeout=15)
         pytest.fail("monitor ignored SIGTERM")
 
     assert time.monotonic() - sent < 15

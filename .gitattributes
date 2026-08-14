@@ -13,3 +13,9 @@ src/mcp_agent_mail/viewer_assets/coi-serviceworker.js -text
 # The Windows flag fallback is hash-pinned by the UI build hook.  Keep Git from
 # applying any text conversion before that byte-for-byte validation runs.
 ui/public/assets/TwemojiCountryFlags.woff2 -text
+
+# Every tracked .sh is executed by bash (hooks, integrators, deploy). Git for
+# Windows ships core.autocrlf=true system-wide (GHA runners included), which
+# smudges these to CRLF on checkout; bash then misparses them and tests that
+# execute or copy them from the working tree fail on every Windows checkout.
+*.sh text eol=lf

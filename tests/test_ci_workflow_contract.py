@@ -112,13 +112,40 @@ def test_sonar_uses_ubuntu_gate_while_portability_remains_required() -> None:
     portability = _job_block(workflow, "portability")
     sonar = _job_block(workflow, "sonar")
 
+    windows = _job_block(workflow, "portability-windows")
+    windows_summary = _job_block(workflow, "portability-windows-summary")
+
     visible_check_name = "    name: Lint, Type Check, Test (${{ matrix.os }}, py${{ matrix.python-version }})"
     assert visible_check_name in ubuntu
     assert visible_check_name in portability
     assert "        os: [ubuntu-latest]" in ubuntu
-    assert "        os: [macos-latest, windows-latest]" in portability
+    assert "        os: [macos-latest]" in portability
     assert "      fail-fast: false" in portability
     assert not any(line.startswith("    continue-on-error:") for line in portability)
+
+    # Windows runs as eight parallel chunks. The full leg needed ~4.5 h and was
+    # killed by the ceiling with no output at all, so a failure anywhere was
+    # invisible; the split is what makes failures reportable. fail-fast must
+    # stay off or one failing chunk would hide the other seven.
+    assert (
+        "    name: Lint, Type Check, Test (windows-latest, py${{ matrix.python-version }}, chunk ${{ matrix.group }}/8)"
+        in windows
+    )
+    assert "        group: [1, 2, 3, 4, 5, 6, 7, 8]" in windows
+    assert "      fail-fast: false" in windows
+    assert not any(line.startswith("    continue-on-error:") for line in windows)
+    assert any(
+        line.strip() == "--durations=50 --splits 8 --group ${{ matrix.group }}"
+        for line in windows
+    )
+
+    # The summary job deliberately carries the name the single Windows job used
+    # to have, so branch protection requiring that exact check keeps working.
+    assert "    name: Lint, Type Check, Test (windows-latest, py3.14)" in windows_summary
+    assert "    needs: [portability-windows]" in windows_summary
+    assert not any(
+        line.startswith("    continue-on-error:") for line in windows_summary
+    )
 
     common_commands = (
         "uv sync --dev --frozen",

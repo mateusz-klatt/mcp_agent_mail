@@ -8116,9 +8116,18 @@ def build_mcp_server() -> FastMCP:
         What it checks vs what it does not
         ----------------------------------
         - Reports current environment and HTTP binding details.
+        - Reads one indexed row from the database. `SELECT MAX(id) FROM
+          messages` walks the table's own b-tree, which is the tree that went
+          bad in all three corruptions on 2026-08-14 -- and while it failed for
+          hours this probe reported `ok`, because it touched nothing. It costs
+          ~5 ms on a 19 MB database, against ~150 ms for `PRAGMA quick_check`,
+          which is too slow for something orchestrators call before every
+          workflow. Note that `COUNT(*)` is NOT a substitute: it can be served
+          from a different index and passed throughout that outage.
         - Deliberately omits the configured database URL because connection URLs
-          may contain credentials or sensitive filesystem locations.
-        - Does not perform deep dependency health checks or connection attempts.
+          may contain credentials or sensitive filesystem locations, and reports
+          only the exception TYPE for the same reason.
+        - Does not perform deep dependency health checks beyond that one read.
 
         Returns
         -------
@@ -8143,8 +8152,23 @@ def build_mcp_server() -> FastMCP:
         - If status != ok, sleep/retry with backoff and log `environment`/`http_host`/`http_port`.
         """
         await ctx.info("Running health check.")
+        database_status: str | None = None
+        try:
+            async with get_session() as session:
+                await session.execute(text("SELECT MAX(id) FROM messages"))
+        except Exception as exc:
+            # The class of failure matters more than the instance, and the
+            # message can name filesystem paths, so report the type only.
+            database_status = type(exc).__name__
+
+        if database_status is None:
+            return {
+                "status": "ok",
+                **_public_runtime_descriptor(settings),
+            }
         return {
-            "status": "ok",
+            "status": "degraded",
+            "database": f"unreadable ({database_status})",
             **_public_runtime_descriptor(settings),
         }
 

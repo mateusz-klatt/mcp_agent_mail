@@ -951,20 +951,18 @@ def _lifespan_factory(settings: Settings) -> Callable[[FastMCP], AsyncContextMan
                 execution_reaper_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await execution_reaper_task
-            cancelled: BaseException | None = None
-            with suppress(Exception):
-                engine = get_engine()
-                dispose_task = asyncio.create_task(
-                    asyncio.to_thread(dispose_engine_blocking, engine)
-                )
-                try:
+            # suppress(Exception) leaves CancelledError free to propagate; the
+            # finally still clears the repo cache before cancellation re-raises.
+            try:
+                with suppress(Exception):
+                    engine = get_engine()
+                    dispose_task = asyncio.create_task(
+                        asyncio.to_thread(dispose_engine_blocking, engine)
+                    )
                     await await_database_cleanup_task(dispose_task)
-                except asyncio.CancelledError as exc:
-                    cancelled = exc
-            with suppress(BaseException):
-                clear_repo_cache()
-            if cancelled is not None:
-                raise cancelled
+            finally:
+                with suppress(BaseException):
+                    clear_repo_cache()
 
     return lifespan
 
@@ -2249,7 +2247,7 @@ def _compute_project_slug(human_key: str, mode_override: Optional[str] = None) -
         return slugify(human_key)
     # Helpers for identity modes (privacy-safe)
     def _short_sha1(text: str, n: int = 10) -> str:
-        return hashlib.sha1(text.encode("utf-8")).hexdigest()[:n]
+        return hashlib.sha1(text.encode("utf-8"), usedforsecurity=False).hexdigest()[:n]
 
     # Delegate to the single shared normalizer so slug/uid can never diverge.
     _norm_remote = _normalize_git_remote
@@ -2422,7 +2420,9 @@ def _resolve_project_identity(
         # (Avoid touching GitPython / spawning git subprocesses unnecessarily.)
         slug_value = _compute_project_slug(target_path)
         try:
-            project_uid = hashlib.sha1(target_path.encode("utf-8")).hexdigest()[:20]
+            project_uid = hashlib.sha1(
+                target_path.encode("utf-8"), usedforsecurity=False
+            ).hexdigest()[:20]
         except Exception:
             project_uid = str(uuid.uuid4())
         return {
@@ -2590,19 +2590,25 @@ def _resolve_project_identity(
         try:
             if normalized_remote:
                 fingerprint = f"{normalized_remote}@{default_branch or 'main'}"
-                remote_uid = hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()[:20]
+                remote_uid = hashlib.sha1(
+                    fingerprint.encode("utf-8"), usedforsecurity=False
+                ).hexdigest()[:20]
         except Exception:
             remote_uid = None
         if remote_uid:
             project_uid = remote_uid
     if not project_uid and git_common_dir_abs:
         try:
-            project_uid = hashlib.sha1(git_common_dir_abs.encode("utf-8")).hexdigest()[:20]
+            project_uid = hashlib.sha1(
+                git_common_dir_abs.encode("utf-8"), usedforsecurity=False
+            ).hexdigest()[:20]
         except Exception:
             project_uid = None
     if not project_uid:
         try:
-            project_uid = hashlib.sha1(target_path.encode("utf-8")).hexdigest()[:20]
+            project_uid = hashlib.sha1(
+                target_path.encode("utf-8"), usedforsecurity=False
+            ).hexdigest()[:20]
         except Exception:
             project_uid = str(uuid.uuid4())
 

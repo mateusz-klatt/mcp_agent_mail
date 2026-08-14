@@ -23,8 +23,8 @@ import hashlib
 import json
 import logging
 import os
-import random
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -59,6 +59,9 @@ from .utils import (
 )
 
 _logger = logging.getLogger(__name__)
+# Backoff jitter source; SystemRandom keeps the uniform distribution while
+# avoiding the seedable module-level Mersenne Twister state.
+_jitter_rng = secrets.SystemRandom()
 _IMAGE_PATTERN = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<path>[^)]+)\)")
 _SUBJECT_SLUG_RE = re.compile(r"[^a-zA-Z0-9._-]+")
 _CANONICAL_PROJECT_SLUG_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,254}")
@@ -1300,7 +1303,7 @@ class AsyncFileLock:
 
                     # Add jittered backoff before retry (0.05s to 0.5s)
                     backoff = min(0.05 * (2 ** attempt), 0.5)
-                    jitter = backoff * 0.25 * (2 * random.random() - 1)
+                    jitter = backoff * 0.25 * (2 * _jitter_rng.random() - 1)
                     await asyncio.sleep(backoff + jitter)
 
         except BaseException:
@@ -2712,6 +2715,27 @@ async def inspect_agent_archive_rename(
     )
 
 
+def _safe_identity_path_component(name: str) -> str:
+    """Refuse identity names that would traverse outside their archive directory."""
+    if (
+        not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+        or os.sep in name
+        or (os.altsep is not None and os.altsep in name)
+    ):
+        raise ValueError(f"Agent identity is not a safe path component: {name!r}")
+    return name
+
+
+def _require_archive_confined_path(archive: ProjectArchive, path: Path) -> Path:
+    """Refuse writes that resolve outside the archive working tree."""
+    if not path.resolve().is_relative_to(archive.root.resolve()):
+        raise ValueError(f"Identity rename path escapes the archive working tree: {path}")
+    return path
+
+
 def _write_json_atomic_sync(path: Path, payload: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
@@ -2746,7 +2770,9 @@ def _apply_agent_archive_rename_sync(
     if inspection["state"] == "pending":
         if old_dir is None:
             raise ValueError(f"Legacy archive directory disappeared during preflight: {old_name}")
-        target_dir = old_dir.parent / new_name
+        target_dir = _require_archive_confined_path(
+            archive, old_dir.parent / _safe_identity_path_component(new_name)
+        )
         old_directory_name = old_dir.name
         old_dir.replace(target_dir)
     else:
@@ -2827,7 +2853,12 @@ def _apply_agent_archive_rename_sync(
         ledger["renames"] = ledger_entries
         _write_json_atomic_sync(ledger_path, ledger)
 
-    tombstone_path = archive.root / IDENTITY_TOMBSTONES_DIRNAME / f"{old_name}.json"
+    tombstone_path = _require_archive_confined_path(
+        archive,
+        archive.root
+        / IDENTITY_TOMBSTONES_DIRNAME
+        / f"{_safe_identity_path_component(old_name)}.json",
+    )
     if existing_tombstone is None:
         _write_json_atomic_sync(
             tombstone_path,

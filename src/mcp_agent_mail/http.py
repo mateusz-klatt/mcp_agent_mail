@@ -1584,7 +1584,9 @@ def _mail_login_accept_language_locale(raw: str) -> MailUiLocale:
             if not math.isfinite(quality) or not 0.0 <= quality <= 1.0:
                 invalid_quality = True
                 break
-        if invalid_quality or quality == 0.0:
+        # The range check above pins quality to [0.0, 1.0], so <= 0.0 is the
+        # RFC 9110 "not acceptable" q=0 case without a float equality test.
+        if invalid_quality or quality <= 0.0:
             continue
         locale = MailUiLocale.canonicalize(language_range)
         folded = language_range.casefold()

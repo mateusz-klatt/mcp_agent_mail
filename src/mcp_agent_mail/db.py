@@ -20,7 +20,6 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import logging
-import random
 import re
 import secrets
 import threading
@@ -54,6 +53,10 @@ from .models import (
 
 T = TypeVar("T")
 _logger = logging.getLogger(__name__)
+
+# Backoff jitter source; SystemRandom keeps the uniform distribution while
+# avoiding the seedable module-level Mersenne Twister state.
+_jitter_rng = secrets.SystemRandom()
 
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
@@ -301,7 +304,7 @@ def retry_on_db_lock(
                     # Calculate exponential backoff with jitter
                     delay = min(base_delay * (2**attempt), max_delay)
                     # Add ±25% jitter to prevent thundering herd
-                    jitter = delay * 0.25 * (2 * random.random() - 1)
+                    jitter = delay * 0.25 * (2 * _jitter_rng.random() - 1)
                     total_delay = max(0.01, delay + jitter)  # Ensure positive delay
 
                     error_type = "pool_exhausted" if is_pool else "db_locked"
@@ -1410,22 +1413,23 @@ def reset_database_state() -> None:
 
 def dispose_engine_blocking(engine: AsyncEngine, timeout_seconds: float = 5.0) -> None:
     """Dispose an async engine in a helper thread so shutdown survives active event loops/cancellation."""
-    dispose_error: BaseException | None = None
+    # The helper thread hands its failure back through this shared cell;
+    # Thread.join() below establishes the happens-before for the read.
+    dispose_errors: list[BaseException] = []
 
     def _dispose_in_thread() -> None:
-        nonlocal dispose_error
         try:
             asyncio.run(engine.dispose())
         except BaseException as exc:  # pragma: no cover - best-effort fallback path
-            dispose_error = exc
+            dispose_errors.append(exc)
 
     dispose_thread = threading.Thread(target=_dispose_in_thread, name="db-dispose", daemon=True)
     dispose_thread.start()
     dispose_thread.join(timeout=timeout_seconds)
     if dispose_thread.is_alive():
         raise TimeoutError("Timed out waiting for async engine disposal in helper thread.")
-    if dispose_error is not None:
-        raise dispose_error
+    if dispose_errors:
+        raise dispose_errors[0]
 
 
 def _is_sqlite_connection(connection: Any) -> bool:

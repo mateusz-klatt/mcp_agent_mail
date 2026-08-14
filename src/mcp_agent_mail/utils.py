@@ -5,8 +5,8 @@ from __future__ import annotations
 import hashlib
 import importlib
 import os
-import random
 import re
+import secrets
 from typing import Any, Iterable, Optional, cast
 
 # Agent name word lists - used to generate memorable adjective+noun combinations
@@ -253,8 +253,8 @@ def generate_agent_name() -> str:
     Production callers use this only for the non-addressable ``display_name``
     of a newly provisioned Agent; durable identities are never generated.
     """
-    adjective = random.choice(tuple(ADJECTIVES))
-    noun = random.choice(tuple(NOUNS))
+    adjective = secrets.choice(tuple(ADJECTIVES))
+    noun = secrets.choice(tuple(NOUNS))
     return f"{adjective}{noun}"
 
 

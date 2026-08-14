@@ -7098,18 +7098,23 @@ def _collect_doc_candidates(roots: Sequence[Path], max_depth: int) -> list[DocCa
     return sorted(candidates, key=lambda c: str(c.path).lower())
 
 
-def _append_snippet_to_doc(path: Path, snippet: str) -> None:
+def _append_snippet_to_doc(path: Path, snippet: str, allowed_roots: Sequence[Path]) -> None:
+    # Confine writes to the scanned roots so a crafted candidate path cannot
+    # redirect the snippet into an unrelated file.
+    resolved = path.resolve()
+    if not any(resolved.is_relative_to(root.resolve()) for root in allowed_roots):
+        raise RuntimeError(f"Refusing to write outside the scanned directories: {resolved}")
     try:
-        content = path.read_text(encoding="utf-8")
+        content = resolved.read_text(encoding="utf-8")
     except OSError as exc:  # pragma: no cover - IO failure protection
-        raise RuntimeError(f"Failed to read {path}: {exc}") from exc
+        raise RuntimeError(f"Failed to read {resolved}: {exc}") from exc
     if content and not content.endswith("\n"):
         content += "\n"
     addition = f"\n{DOC_BLOCK_START}\n\n{snippet}\n\n{DOC_BLOCK_END}\n"
     try:
-        path.write_text(content + addition, encoding="utf-8")
+        resolved.write_text(content + addition, encoding="utf-8")
     except OSError as exc:  # pragma: no cover - IO failure protection
-        raise RuntimeError(f"Failed to write {path}: {exc}") from exc
+        raise RuntimeError(f"Failed to write {resolved}: {exc}") from exc
 
 
 @docs_app.command("insert-blurbs")
@@ -7174,7 +7179,7 @@ def docs_insert_blurbs(
         if dry_run:
             console.print(f"[yellow]Dry run:[/yellow] would insert snippet into {candidate.path}")
         else:
-            _append_snippet_to_doc(candidate.path, snippet)
+            _append_snippet_to_doc(candidate.path, snippet, roots)
             console.print(f"[green]Inserted snippet into {candidate.path}[/green]")
             inserted += 1
 

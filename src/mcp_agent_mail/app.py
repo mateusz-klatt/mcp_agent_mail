@@ -36,6 +36,7 @@ from fastmcp import Context, FastMCP
 from git import Repo
 from git.exc import InvalidGitRepositoryError, NoSuchPathError
 from sqlalchemy import and_ as _sa_and, asc as _sa_asc, bindparam, delete as _sa_delete, desc as _sa_desc, exists as _sa_exists, func, or_ as _sa_or, select as _sa_select, text, update as _sa_update
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError, NoResultFound, OperationalError, TimeoutError as SATimeoutError
 from sqlalchemy.orm import aliased
 
@@ -106,6 +107,7 @@ from .storage import (
     write_file_reservation_records,
 )
 from .utils import (
+    generate_agent_name,
     safe_build_path_component,
     sanitize_agent_name,
     slugify,
@@ -4056,6 +4058,80 @@ async def _generate_unique_agent_name(
     return candidate
 
 
+_GENERATED_ALIAS_ATTEMPTS = 12
+
+
+async def _resolve_new_agent_display_name(
+    session: AsyncSession,
+    project_id: int,
+    canonical_name: str,
+    explicit_label: str | None,
+) -> str | None:
+    """Pick the display alias for a brand-new Agent row, inside its insert tx.
+
+    An explicitly supplied label wins and is validated with the same clash rule
+    as ``set_agent_display_name``: it may not equal another agent's name or
+    alias in this project (case-insensitive). A generated adjective+noun
+    candidate that collides is simply retried; after
+    ``_GENERATED_ALIAS_ATTEMPTS`` misses the row is created without an alias,
+    because the alias is presentation only and must never fail provisioning.
+    Runs inside the caller's IMMEDIATE transaction, so the check-then-insert
+    cannot race another writer.
+    """
+    clash_sql = text(
+        "SELECT name FROM agents WHERE project_id = :pid "
+        "AND lower(name) != lower(:own) "
+        "AND (lower(name) = lower(:label) "
+        "OR lower(COALESCE(display_name, '')) = lower(:label)) LIMIT 1"
+    )
+    if explicit_label is not None:
+        clash = (
+            await session.execute(
+                clash_sql,
+                {"pid": project_id, "own": canonical_name, "label": explicit_label},
+            )
+        ).fetchone()
+        if clash is not None:
+            raise ToolExecutionError(
+                error_type="INVALID_ARGUMENT",
+                message=(
+                    f"Display name {explicit_label!r} is already taken by agent "
+                    f"{clash[0]!r} in this project, as its name or its alias."
+                ),
+                recoverable=True,
+                data={
+                    "argument": "display_name",
+                    "provided": explicit_label,
+                    "conflicts_with": clash[0],
+                },
+            )
+        return explicit_label
+    for _ in range(_GENERATED_ALIAS_ATTEMPTS):
+        candidate = generate_agent_name()
+        clash = (
+            await session.execute(
+                clash_sql,
+                {"pid": project_id, "own": canonical_name, "label": candidate},
+            )
+        ).fetchone()
+        if clash is None:
+            return candidate
+    return None
+
+
+def _sanitize_display_name_argument(value: str | None) -> str | None:
+    """Normalize a caller-supplied display label; empty collapses to None.
+
+    Mirrors ``set_agent_display_name``: control characters would corrupt every
+    rendering of the label, and 128 characters is the column contract.
+    """
+    label = (value or "").strip()
+    label = "".join(ch for ch in label if ch.isprintable())
+    if len(label) > 128:
+        label = label[:128].rstrip()
+    return label or None
+
+
 async def _create_agent_record(
     project: Project,
     name: str,
@@ -4064,6 +4140,7 @@ async def _create_agent_record(
     task_description: str,
     registration_token: str,
     attachments_policy: str,
+    display_name: str | None = None,
 ) -> Agent:
     if project.id is None:
         raise ValueError("Project must have an id before creating agents.")
@@ -4074,6 +4151,9 @@ async def _create_agent_record(
             project=project,
             action="Agent creation",
         )
+        alias = await _resolve_new_agent_display_name(
+            session, project.id, name, display_name
+        )
         agent = Agent(
             project_id=project.id,
             name=name,
@@ -4083,6 +4163,7 @@ async def _create_agent_record(
             attachments_policy=attachments_policy,
             registration_token=registration_token,
             provisioning_state="provisioning",
+            display_name=alias,
         )
         session.add(agent)
         await session.commit()
@@ -4103,6 +4184,7 @@ async def _get_or_create_agent(
     expected_existing_agent_id: int | None = None,
     expected_existing_agent_generation: str | None = None,
     expected_project_generation: str | None = None,
+    display_name: str | None = None,
 ) -> tuple[Agent, bool]:
     if project.id is None:
         raise ValueError("Project must have an id before creating agents.")
@@ -4221,6 +4303,9 @@ async def _get_or_create_agent(
                     data={"provided_name": desired_name},
                 )
 
+            alias = await _resolve_new_agent_display_name(
+                session, project.id, desired_name, display_name
+            )
             candidate = Agent(
                 project_id=project.id,
                 name=desired_name,
@@ -4230,6 +4315,7 @@ async def _get_or_create_agent(
                 attachments_policy=attachments_policy or "auto",
                 registration_token=registration_token_on_create,
                 provisioning_state="provisioning",
+                display_name=alias,
             )
             if (
                 expected_existing_agent_id is not None
@@ -7431,6 +7517,7 @@ def build_mcp_server() -> FastMCP:
         action: str,
         allow_create: bool,
         attachments_policy: str | None = None,
+        display_name: str | None = None,
     ) -> tuple[Agent, bool]:
         """Create an identity or authenticate before updating an existing one.
 
@@ -7495,6 +7582,7 @@ def build_mcp_server() -> FastMCP:
             registration_token_on_create=candidate_token,
             attachments_policy=attachments_policy,
             update_existing=False,
+            display_name=display_name,
         )
         if newly_created:
             return agent, True
@@ -8181,6 +8269,7 @@ def build_mcp_server() -> FastMCP:
         task_description: str = "",
         attachments_policy: str = "auto",
         registration_token: Optional[str] = None,
+        display_name: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """
@@ -8219,6 +8308,13 @@ def build_mcp_server() -> FastMCP:
             Names are unique per project; passing the same name updates the profile.
         task_description : str
             Short description of current focus (shows up in directory listings).
+        display_name : Optional[str]
+            Human-readable label for a NEWLY provisioned Agent. When omitted, a
+            friendly adjective+noun alias (for example ``BlueCastle``) is
+            generated automatically for the insert winner. The alias is
+            presentation only — it is never an address, never a credential, and
+            authentication or profile updates of an existing Agent never touch
+            it (use ``set_agent_display_name`` to change it later).
         Returns
         -------
         dict
@@ -8275,6 +8371,7 @@ def build_mcp_server() -> FastMCP:
             action="register_agent for an existing identity",
             allow_create=True,
             attachments_policy=ap,
+            display_name=_sanitize_display_name_argument(display_name),
         )
         if newly_created:
             # Provisioning inserted the one-time credential before publishing
@@ -9390,6 +9487,7 @@ def build_mcp_server() -> FastMCP:
         name_hint: str,
         task_description: str = "",
         attachments_policy: str = "auto",
+        display_name: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """
@@ -9461,6 +9559,7 @@ def build_mcp_server() -> FastMCP:
             task_description,
             token,
             ap,
+            display_name=_sanitize_display_name_argument(display_name),
         )
         try:
             async with _archive_write_lock(archive):

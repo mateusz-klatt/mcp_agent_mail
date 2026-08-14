@@ -266,3 +266,135 @@ async def test_a_wrong_token_cannot_rename_someone_else(isolated_env):
                 },
             )
         assert "Invalid registration_token" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Automatic friendly aliases at provisioning (docs/roadmap-next.md).
+#
+# The generator returns to production here and ONLY here: the presentation
+# field of the insert winner. These tests pin the boundary from both sides —
+# a new Agent always has a readable label, and nothing about authentication,
+# resume or explicit labels is ever overwritten by the generator.
+# ---------------------------------------------------------------------------
+
+THIRD_AGENT = "codex-win-aliases-1"
+
+
+@pytest.mark.asyncio
+async def test_new_agent_gets_a_generated_alias(isolated_env):
+    """Omitting display_name at registration yields an adjective+noun alias."""
+    from mcp_agent_mail.utils import validate_agent_name_format
+
+    server = build_mcp_server()
+    async with Client(server) as client:
+        first, second = await _two_agents(client)
+    for created in (first, second):
+        alias = created.get("display_name")
+        assert alias, f"expected a generated alias, got {alias!r}"
+        assert validate_agent_name_format(alias), alias
+        assert alias.lower() != created["name"].lower()
+
+
+@pytest.mark.asyncio
+async def test_explicit_display_name_at_registration_wins(isolated_env):
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": KEY})
+        created = _data(
+            await client.call_tool(
+                "register_agent",
+                {
+                    "project_key": KEY,
+                    "name": THIRD_AGENT,
+                    "program": "probe",
+                    "model": "probe",
+                    "display_name": "Custom Label 42",
+                },
+            )
+        )
+    assert created["display_name"] == "Custom Label 42"
+
+
+@pytest.mark.asyncio
+async def test_reregistration_never_touches_the_alias(isolated_env):
+    """The generator runs for the insert winner only — resume regenerates nothing.
+
+    A cleared alias staying cleared is the strongest form of the property: if
+    any authentication or update path re-ran the generator, this NULL would be
+    exactly where the regression shows up.
+    """
+    server = build_mcp_server()
+    async with Client(server) as client:
+        first, _ = await _two_agents(client)
+        assert first.get("display_name")
+        await client.call_tool(
+            "set_agent_display_name",
+            {
+                "project_key": KEY,
+                "agent_name": FIRST_AGENT,
+                "display_name": None,
+                "registration_token": first["registration_token"],
+            },
+        )
+        again = _data(
+            await client.call_tool(
+                "register_agent",
+                {
+                    "project_key": KEY,
+                    "name": FIRST_AGENT,
+                    "program": "probe",
+                    "model": "probe",
+                    "registration_token": first["registration_token"],
+                    "display_name": "MustNotLand",
+                },
+            )
+        )
+    assert again.get("display_name") is None
+
+
+@pytest.mark.asyncio
+async def test_generated_alias_skips_taken_labels(isolated_env, monkeypatch):
+    """A colliding generated candidate is retried, not inserted twice."""
+    import mcp_agent_mail.app as app_module
+
+    server = build_mcp_server()
+    async with Client(server) as client:
+        first, _ = await _two_agents(client)
+        taken = first["display_name"]
+        assert taken
+        candidates = iter([taken, taken, "RedFox"])
+        monkeypatch.setattr(
+            app_module, "generate_agent_name", lambda: next(candidates)
+        )
+        created = _data(
+            await client.call_tool(
+                "register_agent",
+                {
+                    "project_key": KEY,
+                    "name": THIRD_AGENT,
+                    "program": "probe",
+                    "model": "probe",
+                },
+            )
+        )
+    assert created["display_name"] == "RedFox"
+
+
+@pytest.mark.asyncio
+async def test_explicit_alias_may_not_take_anothers_name_at_registration(isolated_env):
+    """The set_agent_display_name clash rule applies at provisioning too."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await _two_agents(client)
+        with pytest.raises(ToolError) as excinfo:
+            await client.call_tool(
+                "register_agent",
+                {
+                    "project_key": KEY,
+                    "name": THIRD_AGENT,
+                    "program": "probe",
+                    "model": "probe",
+                    "display_name": FIRST_AGENT,
+                },
+            )
+        assert "already taken" in str(excinfo.value)

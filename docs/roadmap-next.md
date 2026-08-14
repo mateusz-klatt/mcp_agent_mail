@@ -140,7 +140,7 @@ Keep the derived `<host>-<platform>-N` as the immutable key; add an alias for
 display only. `Agent.display_name` (nullable, 128) plus one line in the
 idempotent migration list in `db.py`.
 
-### Next session: automatic friendly aliases during provisioning
+### Implemented: automatic friendly aliases during provisioning
 
 When a **new** Agent is provisioned and the caller omits `display_name`, assign
 an adjective+noun display alias such as `BlueCastle`. This deliberately brings

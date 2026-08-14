@@ -248,7 +248,11 @@ def slugify(value: str) -> str:
 
 
 def generate_agent_name() -> str:
-    """Return a legacy adjective+noun alias for migration/test tooling."""
+    """Return an adjective+noun alias.
+
+    Production callers use this only for the non-addressable ``display_name``
+    of a newly provisioned Agent; durable identities are never generated.
+    """
     adjective = random.choice(tuple(ADJECTIVES))
     noun = random.choice(tuple(NOUNS))
     return f"{adjective}{noun}"

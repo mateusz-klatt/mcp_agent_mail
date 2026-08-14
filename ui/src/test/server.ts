@@ -67,6 +67,9 @@ export const messageOne = {
   sender: "claude-linux-holzera-1",
   sender_name: "claude-linux-holzera-1",
   sender_display_name: "Gospodarz",
+  // Two senders with different tones, so a test can tell the
+  // per-sender lookup apart from the default fallback.
+  sender_notify_sound: "chime",
   importance: "high" as const,
   ack_required: true,
   thread_id: "release-101",
@@ -83,6 +86,7 @@ export const messageTwo = {
   sender: "archive-agent",
   sender_name: "archive-agent",
   sender_display_name: null,
+  sender_notify_sound: null,
   importance: "normal" as const,
   ack_required: false,
   thread_id: null,

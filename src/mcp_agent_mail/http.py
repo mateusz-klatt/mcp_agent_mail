@@ -2290,6 +2290,11 @@ class MailUiMessageSummary(BaseModel):
     sender: str
     sender_name: str
     sender_display_name: str | None
+    # The sender's chosen tone, carried on the message rather than looked up
+    # separately. The reader needs it wherever messages are shown, and the
+    # recipient directory that used to supply it is only fetched on the compose
+    # route -- so every sender sounded identical anywhere else.
+    sender_notify_sound: str | None
     importance: MailUiImportance
     ack_required: bool
     thread_id: str | None
@@ -4240,6 +4245,11 @@ def _mail_ui_message_summary_from_row(
         sender_display_name=(
             str(row["sender_display_name"])
             if row["sender_display_name"] is not None
+            else None
+        ),
+        sender_notify_sound=(
+            str(row["sender_notify_sound"])
+            if row["sender_notify_sound"] is not None
             else None
         ),
         importance=_mail_ui_importance(row["importance"]),
@@ -6935,6 +6945,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         "m.importance, m.ack_required, m.thread_id, m.reply_to, "
                         f"m.created_ts, {_MAIL_UI_CREATED_TS_KEY_SQL} AS cursor_created_ts, "
                         "sender.name AS sender_name, sender.display_name AS sender_display_name, "
+                        "sender.notify_sound AS sender_notify_sound, "
                         "sender.project_id AS sender_project_id, "
                         "sender_project.slug AS sender_project_slug "
                         "FROM messages m "
@@ -7077,6 +7088,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                             "snippet(fts_messages, -1, '', '', '…', 24) AS search_snippet, "
                             "sender.name AS sender_name, "
                             "sender.display_name AS sender_display_name, "
+                            "sender.notify_sound AS sender_notify_sound, "
                             "sender.project_id AS sender_project_id, "
                             "sender_project.slug AS sender_project_slug "
                             "FROM fts_messages "
@@ -7169,6 +7181,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                             "AND sender.agent_generation = delivery.sender_generation_snapshot "
                             "AND sender.project_id = delivery.sender_project_id_snapshot) "
                             "THEN sender.display_name ELSE NULL END AS sender_display_name, "
+                            # The tone follows the same gate as the display name. That CASE
+                            # suppresses a recreated sender lifetime; letting the tone past it
+                            # would announce, by ear, an identity the row deliberately hides.
+                            "CASE WHEN delivery.id IS NULL OR ("
+                            "sender.id = delivery.sender_id "
+                            "AND sender.agent_generation = delivery.sender_generation_snapshot "
+                            "AND sender.project_id = delivery.sender_project_id_snapshot) "
+                            "THEN sender.notify_sound ELSE NULL END AS sender_notify_sound, "
                             "coalesce(delivery.sender_project_id_snapshot, sender.project_id) "
                             "AS sender_project_id, "
                             "coalesce(delivery.sender_project_slug_snapshot, sender_project.slug) "
@@ -7586,6 +7606,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         "AND sender.agent_generation = delivery.sender_generation_snapshot "
                         "AND sender.project_id = delivery.sender_project_id_snapshot) "
                         "THEN sender.display_name ELSE NULL END AS sender_display_name, "
+                        # The tone follows the same gate as the display name. That CASE
+                        # suppresses a recreated sender lifetime; letting the tone past it
+                        # would announce, by ear, an identity the row deliberately hides.
+                        "CASE WHEN delivery.id IS NULL OR ("
+                        "sender.id = delivery.sender_id "
+                        "AND sender.agent_generation = delivery.sender_generation_snapshot "
+                        "AND sender.project_id = delivery.sender_project_id_snapshot) "
+                        "THEN sender.notify_sound ELSE NULL END AS sender_notify_sound, "
                         "coalesce(delivery.sender_project_id_snapshot, sender.project_id) "
                         "AS sender_project_id, "
                         "coalesce(delivery.sender_project_slug_snapshot, sender_project.slug) "

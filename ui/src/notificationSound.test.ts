@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   playNotificationTone,
+  resetNotificationAudio,
   setSoundEnabled,
   soundEnabled,
   soundPreferenceKey,
@@ -33,7 +34,62 @@ function throwingStorage() {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  resetNotificationAudio();
 });
+
+interface OscillatorStub {
+  connect: ReturnType<typeof vi.fn>;
+  disconnect: ReturnType<typeof vi.fn>;
+  frequency: { value: number };
+  type: OscillatorType;
+  start: ReturnType<typeof vi.fn>;
+  stop: ReturnType<typeof vi.fn>;
+  onended: (() => void) | null;
+}
+
+interface ContextStub {
+  state: string;
+  resume: ReturnType<typeof vi.fn>;
+}
+
+function audioStub() {
+  const oscillators: OscillatorStub[] = [];
+  const constructed: ContextStub[] = [];
+  const make = () => {
+    const oscillator = {
+      connect: vi.fn(),
+      disconnect: vi.fn(),
+      frequency: { value: 0 },
+      type: "" as OscillatorType,
+      start: vi.fn(),
+      stop: vi.fn(),
+      onended: null as (() => void) | null,
+    };
+    oscillators.push(oscillator);
+    return oscillator;
+  };
+  const Ctor = vi.fn(function AudioContextStub(this: unknown) {
+    const ctx = {
+      createOscillator: make,
+      createGain: () => ({
+        connect: vi.fn(),
+        disconnect: vi.fn(),
+        gain: {
+          setValueAtTime: vi.fn(),
+          exponentialRampToValueAtTime: vi.fn(),
+        },
+      }),
+      currentTime: 0,
+      destination: {},
+      state: "running",
+      resume: vi.fn().mockResolvedValue(undefined),
+    };
+    constructed.push(ctx);
+    return ctx;
+  });
+  vi.stubGlobal("AudioContext", Ctor);
+  return { oscillators, constructed };
+}
 
 describe("toneFor", () => {
   it("resolves each word in the set_agent_notify_sound vocabulary", () => {
@@ -92,90 +148,63 @@ describe("playNotificationTone", () => {
     expect(AudioContextSpy).not.toHaveBeenCalled();
   });
 
-  it("plays the sender's tone and closes the context afterwards", () => {
-    const oscillator = {
-      connect: vi.fn(),
-      frequency: { value: 0 },
-      type: "" as OscillatorType,
-      start: vi.fn(),
-      stop: vi.fn(),
-      onended: null as (() => void) | null,
-    };
-    const gain = {
-      connect: vi.fn(),
-      gain: {
-        setValueAtTime: vi.fn(),
-        exponentialRampToValueAtTime: vi.fn(),
-      },
-    };
-    const close = vi.fn().mockResolvedValue(undefined);
-    // A plain function, not an arrow: the module calls `new AudioContext()`,
-    // and an arrow function is not a constructor — the resulting TypeError is
-    // swallowed by the silence-is-acceptable catch, so the test would fail on a
-    // zeroed oscillator with no hint as to why.
-    vi.stubGlobal(
-      "AudioContext",
-      vi.fn(function AudioContextStub(this: unknown) {
-        return {
-          createOscillator: () => oscillator,
-          createGain: () => gain,
-          currentTime: 0,
-          destination: {},
-          close,
-        };
-      }),
-    );
-    const storage = memoryStorage({ [soundPreferenceKey]: "on" });
+  it("plays the sender's tone", () => {
+    const { oscillators } = audioStub();
 
-    playNotificationTone("click", storage);
+    playNotificationTone("click", memoryStorage({ [soundPreferenceKey]: "on" }));
 
-    expect(oscillator.frequency.value).toBe(tones.click.hz);
-    expect(oscillator.type).toBe(tones.click.wave);
-    expect(oscillator.start).toHaveBeenCalledOnce();
-
-    // Unlike the server-rendered original, this client does not reload after a
-    // notification, so an unclosed context per message would accumulate.
-    oscillator.onended?.();
-    expect(close).toHaveBeenCalledOnce();
+    expect(oscillators).toHaveLength(1);
+    expect(oscillators[0]!.frequency).toEqual({ value: tones.click.hz });
+    expect(oscillators[0]!.type).toBe(tones.click.wave);
+    expect(oscillators[0]!.start).toHaveBeenCalledOnce();
   });
 
-  it("swallows a context that refuses to close", () => {
-    // `close()` returning a rejected promise must not surface as an unhandled
-    // rejection: the notification has already been delivered by then, so there
-    // is nothing left to salvage and nothing worth reporting.
-    const oscillator = {
-      connect: vi.fn(),
-      frequency: { value: 0 },
-      type: "" as OscillatorType,
-      start: vi.fn(),
-      stop: vi.fn(),
-      onended: null as (() => void) | null,
-    };
-    const gain = {
-      connect: vi.fn(),
-      gain: {
-        setValueAtTime: vi.fn(),
-        exponentialRampToValueAtTime: vi.fn(),
-      },
-    };
-    const close = vi.fn().mockRejectedValue(new Error("already closed"));
-    vi.stubGlobal(
-      "AudioContext",
-      vi.fn(function AudioContextStub(this: unknown) {
-        return {
-          createOscillator: () => oscillator,
-          createGain: () => gain,
-          currentTime: 0,
-          destination: {},
-          close,
-        };
-      }),
-    );
+  it("reuses one context across notifications and releases only the nodes", () => {
+    // The regression this guards: one context per notification hits the
+    // browser's per-document cap during a burst, construction starts throwing,
+    // and the silence is swallowed by the catch -- "sometimes there is no
+    // sound", with nothing in the console to say why.
+    const { oscillators, constructed } = audioStub();
+    const storage = memoryStorage({ [soundPreferenceKey]: "on" });
 
-    playNotificationTone("soft", memoryStorage({ [soundPreferenceKey]: "on" }));
+    playNotificationTone("chime", storage);
+    playNotificationTone("high", storage);
+    playNotificationTone("soft", storage);
 
-    expect(() => oscillator.onended?.()).not.toThrow();
-    expect(close).toHaveBeenCalledOnce();
+    expect(constructed).toHaveLength(1);
+    expect(oscillators).toHaveLength(3);
+
+    oscillators[0]!.onended?.();
+    expect(oscillators[0]!.disconnect).toHaveBeenCalledOnce();
+  });
+
+  it("stays quiet when resuming the context is refused", async () => {
+    // A rejected resume must not surface as an unhandled rejection: the
+    // notification is already lost at that point and there is nothing to do
+    // about it.
+    const { constructed } = audioStub();
+    const storage = memoryStorage({ [soundPreferenceKey]: "on" });
+
+    playNotificationTone("chime", storage);
+    const ctx = constructed[0]!;
+    ctx.state = "suspended";
+    ctx.resume.mockRejectedValueOnce(new Error("not allowed"));
+
+    expect(() => playNotificationTone("chime", storage)).not.toThrow();
+    await Promise.resolve();
+  });
+
+  it("resumes a context the browser suspended", () => {
+    const { constructed } = audioStub();
+    const storage = memoryStorage({ [soundPreferenceKey]: "on" });
+
+    playNotificationTone("chime", storage);
+    const ctx = constructed[0]!;
+    ctx.state = "suspended";
+
+    playNotificationTone("chime", storage);
+
+    expect(ctx.resume).toHaveBeenCalledOnce();
   });
 
   it("survives a browser with no audio support", () => {

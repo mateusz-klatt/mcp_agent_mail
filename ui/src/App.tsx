@@ -814,12 +814,6 @@ export function App({
   const [composeRecipients, setComposeRecipients] = useState<string[]>([]);
   const [composeAgents, setComposeAgents] = useState<MailRecipientAgent[]>([]);
   const [soundOn, setSoundOn] = useState<boolean>(() => soundEnabled());
-  // Name -> chosen tone, accumulated across every project directory this
-  // session has loaded. The inbox is unified while the directory is per
-  // project, so the map fills in as the reader moves around; an unknown sender
-  // simply gets the default tone, which is how the server-rendered UI behaved
-  // on pages that carried no sound island.
-  const agentSoundsRef = useRef<Map<string, string>>(new Map());
   // `null` means "nothing observed yet". Without that distinction the first
   // load would look like an arrival and ding at every page open.
   const newestMessageIdRef = useRef<number | null>(null);
@@ -998,22 +992,17 @@ export function App({
     };
   }, [createEventSource, mailRouteActive]);
 
-  // Learn who sounds like what as directories load. Only agents that actually
-  // chose a tone are recorded; everyone else falls through to the default.
-  useEffect(() => {
-    for (const agent of composeAgents) {
-      if (agent.notify_sound) {
-        agentSoundsRef.current.set(agent.name, agent.notify_sound);
-      }
-    }
-  }, [composeAgents]);
-
   // Sound one tone per arrival, in the voice of whoever wrote.
   //
   // The stream frame deliberately carries no sender — so that a project watcher
   // cannot learn who a BCC went to — which leaves the re-rendered list as the
   // only honest source. Comparing the newest id is enough: the list is ordered
   // newest first, and a refresh that changes nothing must stay silent.
+  //
+  // The tone rides on the message. It was first read from the recipient
+  // directory, which is fetched only on the compose route and cleared
+  // everywhere else, so on the inbox the map was always empty and every sender
+  // sounded like the default.
   useEffect(() => {
     const newest = messages[0];
     if (!newest) {
@@ -1024,7 +1013,7 @@ export function App({
     if (previous === null || newest.id === previous) {
       return;
     }
-    playNotificationTone(agentSoundsRef.current.get(newest.sender_name));
+    playNotificationTone(newest.sender_notify_sound);
   }, [messages]);
 
   useEffect(() => {

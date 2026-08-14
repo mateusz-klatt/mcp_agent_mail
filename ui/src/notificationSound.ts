@@ -95,8 +95,45 @@ function audioContextConstructor(): AudioContextConstructor | null {
 }
 
 /**
+ * One context for the life of the page.
+ *
+ * The first implementation opened a fresh `AudioContext` per notification and
+ * closed it when the oscillator ended. That is what the server-rendered UI
+ * effectively did -- but only because it reloaded the page after every ding, so
+ * a context never outlived one tone. This client does not reload, and browsers
+ * cap how many contexts a document may hold (Chrome allows roughly six):
+ * a burst of messages, or a `close()` that has not settled yet, and the next
+ * construction throws. The failure is invisible, because a notification path
+ * must never surface an error -- it just goes quiet. "Sometimes there is no
+ * sound" is exactly that.
+ */
+let sharedContext: AudioContext | null = null;
+
+function acquireContext(): AudioContext | null {
+  if (sharedContext !== null && sharedContext.state !== "closed") {
+    return sharedContext;
+  }
+  const Ctor = audioContextConstructor();
+  if (Ctor === null) {
+    return null;
+  }
+  try {
+    sharedContext = new Ctor();
+    return sharedContext;
+  } catch {
+    sharedContext = null;
+    return null;
+  }
+}
+
+/** Test seam: drop the cached context so each case starts from nothing. */
+export function resetNotificationAudio(): void {
+  sharedContext = null;
+}
+
+/**
  * Play one short tone for `sound`. Pass nothing when the caller cannot know who
- * sent the message — that yields the default tone, which is what every caller
+ * sent the message -- that yields the default tone, which is what every caller
  * did before per-sender tones existed.
  */
 export function playNotificationTone(
@@ -108,13 +145,18 @@ export function playNotificationTone(
   if (!soundEnabled(storage)) {
     return;
   }
-  const Ctor = audioContextConstructor();
-  if (Ctor === null) {
+  const ctx = acquireContext();
+  if (ctx === null) {
     return;
   }
   const tone = toneFor(sound);
   try {
-    const ctx = new Ctor();
+    // A context created outside a user gesture starts suspended and stays
+    // silent until resumed. The toggle creates it during a click, but a page
+    // restored from the back/forward cache can hand back a suspended one.
+    if (ctx.state === "suspended") {
+      void ctx.resume().catch(() => undefined);
+    }
     const oscillator = ctx.createOscillator();
     const gain = ctx.createGain();
     oscillator.connect(gain);
@@ -128,12 +170,11 @@ export function playNotificationTone(
     gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.35);
     oscillator.start();
     oscillator.stop(ctx.currentTime + 0.36);
+    // Only the nodes are disposable; the context is not. Releasing the nodes
+    // keeps a long-lived context from accumulating them.
     oscillator.onended = () => {
-      // The server-rendered original reloaded the page after every ding, so a
-      // leaked context never outlived one notification. This client does not
-      // reload, so an unclosed context per message would accumulate until the
-      // browser refuses to open more.
-      void ctx.close().catch(() => undefined);
+      oscillator.disconnect();
+      gain.disconnect();
     };
   } catch {
     /* no device, or autoplay blocked: silence is acceptable */

@@ -42,6 +42,7 @@ const messageSummary: InboxMessage = {
   sender: "claude-linux-holzera-1",
   sender_name: "claude-linux-holzera-1",
   sender_display_name: "Gospodarz",
+  sender_notify_sound: "chime",
   importance: "high",
   thread_id: "release-101",
   reply_to: null,

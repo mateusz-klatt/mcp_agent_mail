@@ -178,6 +178,13 @@ export interface InboxMessage {
   sender: string;
   sender_name: string;
   sender_display_name: string | null;
+  /**
+   * The sender's chosen tone, from `set_agent_notify_sound`. It travels on the
+   * message because the reader needs it wherever messages appear, and the
+   * recipient directory that could otherwise supply it is fetched only on the
+   * compose route.
+   */
+  sender_notify_sound: string | null;
   importance: Importance;
   thread_id: string | null;
   reply_to: number | null;
@@ -440,6 +447,7 @@ const inboxMessageKeys = [
   "sender",
   "sender_name",
   "sender_display_name",
+  "sender_notify_sound",
   "importance",
   "thread_id",
   "reply_to",
@@ -467,6 +475,10 @@ function parseInboxMessage(
     sender_display_name: nullableString(
       candidate.sender_display_name,
       "sender display name",
+    ),
+    sender_notify_sound: nullableString(
+      candidate.sender_notify_sound,
+      "sender notify sound",
     ),
     importance: importance(candidate.importance),
     thread_id: nullableString(candidate.thread_id, "message thread id"),

@@ -240,7 +240,59 @@ export const adminAccessResponse = {
   projects: adminProjects,
 };
 
+export const reservationsResponse = {
+  items: [
+    {
+      id: 501,
+      project_id: projectOne.id,
+      project_slug: projectOne.slug,
+      holder_name: "claude-wsl-home-1",
+      holder_display_name: "Kanarek",
+      path_pattern: "src/mcp_agent_mail/http.py",
+      exclusive: true,
+      reason: "editing the reservations endpoint",
+      created_ts: "2026-08-14 18:00:00.000000",
+      expires_ts: "2026-08-14 19:00:00.000000",
+      origin: "auto",
+      scope_state: "execution_scoped" as const,
+    },
+    {
+      id: 502,
+      project_id: projectOne.id,
+      project_slug: projectOne.slug,
+      holder_name: "codex-wsl-home-1",
+      holder_display_name: null,
+      path_pattern: "docs/**",
+      exclusive: false,
+      reason: "",
+      created_ts: "2026-08-14 17:00:00.000000",
+      expires_ts: null,
+      origin: "explicit",
+      scope_state: "legacy_unscoped" as const,
+    },
+    {
+      id: 503,
+      project_id: projectOne.id,
+      project_slug: projectOne.slug,
+      // The agent row is gone; the claim outlives it on purpose.
+      holder_name: null,
+      holder_display_name: null,
+      path_pattern: "scripts/hooks/**",
+      exclusive: true,
+      reason: "",
+      created_ts: "2026-08-14 16:00:00.000000",
+      expires_ts: "2026-08-14 20:00:00.000000",
+      origin: "auto",
+      scope_state: "orphaned" as const,
+    },
+  ],
+  next_cursor: null,
+};
+
 export const server = setupServer(
+  http.get("*/mail/api/v1/reservations", () =>
+    HttpResponse.json(reservationsResponse),
+  ),
   http.get("http://localhost/mail/api/v1/health", () =>
     HttpResponse.json({ status: "ok" }),
   ),

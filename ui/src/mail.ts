@@ -170,6 +170,36 @@ export interface ComposeRecipientReference {
   expected_agent_generation: string;
 }
 
+export type ReservationScopeState =
+  | "execution_scoped"
+  | "legacy_unscoped"
+  | "orphaned";
+
+export interface ReservationClaim {
+  id: number;
+  project_id: number;
+  project_slug: string;
+  /** Null once the owning agent row is gone; the claim outlives it on purpose. */
+  holder_name: string | null;
+  holder_display_name: string | null;
+  path_pattern: string;
+  exclusive: boolean;
+  reason: string;
+  created_ts: string;
+  /**
+   * Null only when the stored value cannot be parsed. The claim is still live
+   * and still applies -- it is reported without its expiry rather than hidden.
+   */
+  expires_ts: string | null;
+  origin: string;
+  scope_state: ReservationScopeState;
+}
+
+export interface ReservationsPage {
+  items: ReservationClaim[];
+  next_cursor: string | null;
+}
+
 export interface InboxMessage {
   id: number;
   project_id: number;
@@ -275,7 +305,8 @@ export type MailRoute =
       order: SearchOrder;
     }
   | { view: "message"; projectId: number; messageId: number }
-  | { view: "thread"; projectId: number; threadId: string };
+  | { view: "thread"; projectId: number; threadId: string }
+  | { view: "reservations"; projectId: number | null };
 
 interface FetchOptions {
   signal?: AbortSignal;
@@ -410,6 +441,65 @@ function importance(value: unknown): Importance {
     throw new TypeError("Invalid message importance.");
   }
   return value;
+}
+
+function reservationScopeState(value: unknown): ReservationScopeState {
+  if (
+    value !== "execution_scoped" &&
+    value !== "legacy_unscoped" &&
+    value !== "orphaned"
+  ) {
+    throw new TypeError("Invalid reservation scope state.");
+  }
+  return value;
+}
+
+const reservationKeys = [
+  "id",
+  "project_id",
+  "project_slug",
+  "holder_name",
+  "holder_display_name",
+  "path_pattern",
+  "exclusive",
+  "reason",
+  "created_ts",
+  "expires_ts",
+  "origin",
+  "scope_state",
+] as const;
+
+export function parseReservationsPage(payload: unknown): ReservationsPage {
+  const response = exactRecord(payload, "reservations response", [
+    "items",
+    "next_cursor",
+  ]);
+  if (!Array.isArray(response.items)) {
+    throw new TypeError("Invalid reservation items.");
+  }
+  return {
+    items: response.items.map((value) => {
+      const candidate = exactRecord(value, "reservation", reservationKeys);
+      return {
+        id: positiveInteger(candidate.id, "reservation id"),
+        project_id: positiveInteger(candidate.project_id, "reservation project id"),
+        project_slug: stringValue(candidate.project_slug, "reservation project slug"),
+        holder_name: nullableString(candidate.holder_name, "reservation holder"),
+        holder_display_name: nullableString(
+          candidate.holder_display_name,
+          "reservation holder display name",
+        ),
+        path_pattern: stringValue(candidate.path_pattern, "reservation path"),
+        exclusive: booleanValue(candidate.exclusive, "reservation exclusivity"),
+        reason: stringValue(candidate.reason, "reservation reason"),
+        created_ts: stringValue(candidate.created_ts, "reservation created"),
+        expires_ts: nullableString(candidate.expires_ts, "reservation expiry"),
+        origin: stringValue(candidate.origin, "reservation origin"),
+        scope_state: reservationScopeState(candidate.scope_state),
+      };
+    }),
+    next_cursor: nullableString(response.next_cursor, "reservations cursor"),
+  };
 }
 
 function deliveryStatus(value: unknown): DeliveryStatus {
@@ -758,6 +848,27 @@ export function loadProjects(options: FetchOptions = {}): Promise<ProjectsPage> 
   return mailRequest(projectsEndpoint, parseProjects, options);
 }
 
+export const reservationsEndpoint = "/mail/api/v1/reservations";
+
+export async function loadReservations(
+  options: FetchOptions & { projectId?: number | null; cursor?: string | null } = {},
+): Promise<ReservationsPage> {
+  const { projectId, cursor, ...fetchOptions } = options;
+  const query = new URLSearchParams();
+  if (projectId !== undefined && projectId !== null) {
+    query.set("project_id", String(positiveInteger(projectId, "reservation project id")));
+  }
+  if (cursor !== undefined && cursor !== null) {
+    query.set("cursor", cursor);
+  }
+  const suffix = query.toString();
+  return mailRequest(
+    suffix === "" ? reservationsEndpoint : `${reservationsEndpoint}?${suffix}`,
+    parseReservationsPage,
+    fetchOptions,
+  );
+}
+
 export async function loadProjectAgents(
   projectId: number,
   options: FetchOptions = {},
@@ -1000,6 +1111,12 @@ export function parseMailRoute(hash: string): MailRoute {
     const projectId = routeInteger(new URLSearchParams(query).get("project") ?? undefined);
     return { view: "inbox", projectId };
   }
+  if (path === "reservations") {
+    return {
+      view: "reservations",
+      projectId: routeInteger(new URLSearchParams(query).get("project") ?? undefined),
+    };
+  }
   if (path === "search") {
     const params = new URLSearchParams(query);
     const rawQuery = params.get("q") ?? "";
@@ -1064,6 +1181,11 @@ export function mailRouteHash(route: MailRoute): string {
       throw new TypeError("Invalid thread route id.");
     }
     return threadHash;
+  }
+  if (route.view === "reservations") {
+    return route.projectId === null
+      ? "#reservations"
+      : `#reservations?project=${route.projectId}`;
   }
   if (route.view === "search") {
     const params = new URLSearchParams();

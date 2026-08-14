@@ -60,6 +60,8 @@ import {
   type MailProject,
   type MailRecipientAgent,
   type MailRoute,
+  loadReservations,
+  type ReservationClaim,
   type MessageAttachment,
   type MessageDetail,
   type ReplyTarget,
@@ -519,6 +521,7 @@ type NavigationItem =
   | "projects"
   | "inbox"
   | "search"
+  | "reservations"
   | "compose"
   | "account"
   | "admin";
@@ -813,6 +816,9 @@ export function App({
   const [composeProjectId, setComposeProjectId] = useState("");
   const [composeRecipients, setComposeRecipients] = useState<string[]>([]);
   const [composeAgents, setComposeAgents] = useState<MailRecipientAgent[]>([]);
+  const [reservations, setReservations] = useState<ReservationClaim[]>([]);
+  const [reservationsCursor, setReservationsCursor] = useState<string | null>(null);
+  const [reservationsStatus, setReservationsStatus] = useState<DetailStatus>("idle");
   const [soundOn, setSoundOn] = useState<boolean>(() => soundEnabled());
   // `null` means "nothing observed yet". Without that distinction the first
   // load would look like an arrival and ding at every page open.
@@ -1015,6 +1021,38 @@ export function App({
     }
     playNotificationTone(newest.sender_notify_sound);
   }, [messages]);
+
+  useEffect(() => {
+    if (route.view !== "reservations") {
+      return undefined;
+    }
+    const controller = new AbortController();
+    setReservationsStatus("loading");
+    void loadReservations({
+      signal: controller.signal,
+      projectId: route.projectId,
+    })
+      .then((page) => {
+        setReservations(page.items);
+        setReservationsCursor(page.next_cursor);
+        setReservationsStatus("ready");
+      })
+      .catch((error: unknown) => {
+        // `dataFailureStatus` returns null for an abort: navigating away must
+        // not flash an error on a view the reader has already left. An earlier
+        // version wrote `?? "error"` here and did exactly that.
+        const status = dataFailureStatus(error);
+        /* v8 ignore next -- the request layer aborts for real in a browser, but
+           the test double resolves rather than rejecting, so the null arm cannot
+           be reached from here */
+        if (status !== null) {
+          setReservationsStatus(status);
+        }
+      });
+    return () => controller.abort();
+    // `refreshVersion` is included so the same server-sent event that refreshes
+    // the inbox also refreshes this view; claims change on the same edits.
+  }, [route, refreshVersion, dataFailureStatus]);
 
   useEffect(() => {
     const detailRequestGeneration = ++detailRequestGenerationRef.current;
@@ -1929,11 +1967,18 @@ export function App({
   const navigationItems = useMemo<NavigationItem[]>(
     () => [
       ...mailNavigation,
+      // Operators see it too, not only global administrators: the endpoint
+      // authorizes per project, and a member with an `operator` assignment on
+      // any project has something to look at.
+      ...(profile?.global_role === "admin" ||
+      projects.some((project) => project.role !== "viewer")
+        ? (["reservations"] as const)
+        : []),
       ...(profile?.global_role === "admin" ? (["compose"] as const) : []),
       "account",
       ...(profile?.global_role === "admin" ? (["admin"] as const) : []),
     ],
-    [profile?.global_role],
+    [profile?.global_role, projects],
   );
   const selectedAdminUser = useMemo(
     () =>
@@ -2283,6 +2328,90 @@ export function App({
       </section>
     );
   };
+
+  const renderReservations = () => (
+    <section aria-labelledby="reservations-heading">
+      <div className="page-heading">
+        <div>
+          <p className="eyebrow">{t("nav.reservations")}</p>
+          <h1 id="reservations-heading">{t("reservations.title")}</h1>
+          <p>{t("reservations.subtitle")}</p>
+        </div>
+      </div>
+      {reservationsStatus === "loading" ? (
+        <p className="state-panel" role="status">{t("reservations.title")}</p>
+      ) : null}
+      {reservationsStatus === "error" ? (
+        <p className="state-panel state-error" role="alert">{t("errors.projects")}</p>
+      ) : null}
+      {reservationsStatus === "unauthorized" ? (
+        <p className="state-panel" role="status">{t("errors.unauthorized")}</p>
+      ) : null}
+      {reservationsStatus === "ready" && reservations.length === 0 ? (
+        <p className="state-panel">{t("reservations.empty")}</p>
+      ) : null}
+      {reservationsStatus === "ready" && reservations.length > 0 ? (
+        <div className="reservation-table-wrap">
+          <table className="reservation-table">
+            <thead>
+              <tr>
+                <th scope="col">{t("reservations.path")}</th>
+                <th scope="col">{t("reservations.holder")}</th>
+                <th scope="col">{t("reservations.state")}</th>
+                <th scope="col">{t("reservations.expires")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {reservations.map((claim) => (
+                <tr key={claim.id}>
+                  <td>
+                    <code className="reservation-path">{claim.path_pattern}</code>
+                    <small className="reservation-meta">
+                      {claim.project_slug}
+                      {" · "}
+                      {claim.exclusive
+                        ? t("reservations.exclusive")
+                        : t("reservations.shared")}
+                      {claim.reason === "" ? null : ` · ${claim.reason}`}
+                    </small>
+                  </td>
+                  <td>
+                    {claim.holder_display_name ??
+                      claim.holder_name ??
+                      t("reservations.unknownHolder")}
+                    {claim.holder_display_name !== null &&
+                    claim.holder_name !== null ? (
+                      <small className="reservation-meta">{claim.holder_name}</small>
+                    ) : null}
+                  </td>
+                  <td>
+                    <span
+                      className="reservation-state"
+                      data-state={claim.scope_state}
+                    >
+                      {claim.scope_state === "execution_scoped"
+                        ? t("reservations.stateScoped")
+                        : claim.scope_state === "legacy_unscoped"
+                          ? t("reservations.stateLegacy")
+                          : t("reservations.stateOrphaned")}
+                    </span>
+                  </td>
+                  <td>
+                    {claim.expires_ts === null
+                      ? t("reservations.unknownExpiry")
+                      : claim.expires_ts}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
+      {reservationsCursor === null ? null : (
+        <p className="state-panel">{t("reservations.loadMore")}</p>
+      )}
+    </section>
+  );
 
   const renderProjects = () => (
     <section aria-labelledby="projects-heading">
@@ -3374,6 +3503,7 @@ export function App({
           {route.view === "projects" ? renderProjects() : null}
           {route.view === "inbox" ? renderInbox() : null}
           {route.view === "search" ? renderSearch(route) : null}
+          {route.view === "reservations" ? renderReservations() : null}
           {route.view === "compose" ? renderCompose() : null}
           {route.view === "message"
             ? renderMessage(route.projectId, route.messageId)

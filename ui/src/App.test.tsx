@@ -31,7 +31,9 @@ import {
   loadSearch,
   loadThread,
   MailHttpError,
+  loadReservations,
   mailRouteHash,
+  parseReservationsPage,
   mailThreadRouteHash,
   markdownUrlTransform,
   parseInboxPage,
@@ -67,6 +69,7 @@ import {
   messageTwo,
   preferencesResponse,
   projectAgentsResponse,
+  reservationsResponse,
   projectOne,
   projectsResponse,
   projectTwo,
@@ -600,6 +603,224 @@ describe("Iris landing shell", () => {
     vi.unstubAllGlobals();
   });
 
+  it("refuses a reservations payload it cannot trust", () => {
+    const claim = reservationsResponse.items[0];
+    // A scope state the client does not know is a contract change, not a value
+    // to render blank.
+    expect(() =>
+      parseReservationsPage({
+        items: [{ ...claim, scope_state: "released" }],
+        next_cursor: null,
+      }),
+    ).toThrow(TypeError);
+    expect(() =>
+      parseReservationsPage({ items: "not-a-list", next_cursor: null }),
+    ).toThrow(TypeError);
+    // Extra and missing keys are both rejected, as everywhere else in v1.
+    expect(() =>
+      parseReservationsPage({
+        items: [{ ...claim, surprise: true }],
+        next_cursor: null,
+      }),
+    ).toThrow(TypeError);
+  });
+
+  it("ignores a reservations response that arrives after navigating away", async () => {
+    // The abort path must stay silent. Reporting it would flash an error on a
+    // view the reader has already left.
+    server.use(
+      http.get("*/mail/api/v1/reservations", async () => {
+        // Long enough that navigating away always wins the race; the abort
+        // cancels the request, so the test does not wait for this.
+        await new Promise((resolve) => setTimeout(resolve, 5_000));
+        return HttpResponse.json(reservationsResponse);
+      }),
+    );
+    window.history.replaceState({}, "", "/mail/#reservations");
+
+    render(<App />);
+    await waitForEnglishPreferences();
+    act(() => {
+      window.history.replaceState({}, "", "/mail/#projects");
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+
+    expect(
+      await screen.findByRole("heading", { name: "Projects" }),
+    ).toBeVisible();
+    // The abort rejection is delivered on a later turn than the navigation, so
+    // give it one before asserting that nothing was reported.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("round-trips the reservations route through the hash", () => {
+    expect(mailRouteHash({ view: "reservations", projectId: null })).toBe(
+      "#reservations",
+    );
+    expect(mailRouteHash({ view: "reservations", projectId: 11 })).toBe(
+      "#reservations?project=11",
+    );
+    expect(parseMailRoute("#reservations")).toEqual({
+      view: "reservations",
+      projectId: null,
+    });
+    expect(parseMailRoute("#reservations?project=11")).toEqual({
+      view: "reservations",
+      projectId: 11,
+    });
+  });
+
+  it("narrows the reservations request by project and cursor", async () => {
+    const requested: string[] = [];
+    server.use(
+      http.get("*/mail/api/v1/reservations", ({ request }) => {
+        requested.push(new URL(request.url).search);
+        return HttpResponse.json({ items: [], next_cursor: null });
+      }),
+    );
+
+    await loadReservations();
+    await loadReservations({ projectId: 11 });
+    await loadReservations({ projectId: 11, cursor: "opaque-cursor" });
+    // Explicit nulls mean "no filter", not "filter by null".
+    await loadReservations({ projectId: null, cursor: null });
+
+    expect(requested).toEqual([
+      "",
+      "?project_id=11",
+      "?project_id=11&cursor=opaque-cursor",
+      "",
+    ]);
+  });
+
+  it("sends an expired session to sign-in rather than showing an empty table", async () => {
+    server.use(
+      http.get("*/mail/api/v1/reservations", () =>
+        HttpResponse.json({ detail: "expired" }, { status: 401 }),
+      ),
+    );
+    window.history.replaceState({}, "", "/mail/#reservations");
+
+    render(<App />);
+    await waitForEnglishPreferences();
+
+    // The locale hint is also a status region, so assert the text rather than
+    // the role.
+    expect(
+      await screen.findByText("Your session expired. Redirecting to sign in."),
+    ).toBeVisible();
+    expect(screen.queryByText("No live reservations.")).toBeNull();
+  });
+
+  it("says there is more to load when the page is not the last", async () => {
+    server.use(
+      http.get("*/mail/api/v1/reservations", () =>
+        HttpResponse.json({
+          ...reservationsResponse,
+          next_cursor: "opaque-cursor",
+        }),
+      ),
+    );
+    window.history.replaceState({}, "", "/mail/#reservations");
+
+    render(<App />);
+    await waitForEnglishPreferences();
+
+    expect(await screen.findByText("Load more")).toBeVisible();
+  });
+
+  it("reports a reservations failure instead of showing an empty list", async () => {
+    // An empty table and a failed request look identical to a reader, and only
+    // one of them means nothing is held.
+    server.use(
+      http.get("*/mail/api/v1/reservations", () =>
+        HttpResponse.json({ detail: "boom" }, { status: 500 }),
+      ),
+    );
+    window.history.replaceState({}, "", "/mail/#reservations");
+
+    render(<App />);
+    await waitForEnglishPreferences();
+
+    expect(await screen.findByRole("alert")).toBeVisible();
+    expect(screen.queryByText("No live reservations.")).toBeNull();
+  });
+
+  it("shows who holds which paths, including claims whose owner is gone", async () => {
+    window.history.replaceState({}, "", "/mail/#reservations");
+
+    render(<App />);
+    await waitForEnglishPreferences();
+
+    expect(
+      await screen.findByRole("heading", { name: "File reservations" }),
+    ).toBeVisible();
+
+    // The claim with a live run: display name in front, canonical name under it.
+    expect(screen.getByText("src/mcp_agent_mail/http.py")).toBeVisible();
+    expect(screen.getByText("Kanarek")).toBeVisible();
+    expect(screen.getByText("claude-wsl-home-1")).toBeVisible();
+    expect(screen.getByText("Active run")).toBeVisible();
+
+    // No display name: the canonical name is the only thing to show, and it
+    // must not be repeated underneath itself.
+    expect(screen.getByText("docs/**")).toBeVisible();
+    expect(screen.getAllByText("codex-wsl-home-1")).toHaveLength(1);
+    expect(screen.getByText("Legacy claim")).toBeVisible();
+    // An unreadable expiry is reported, not hidden -- the claim still applies.
+    expect(screen.getByText("Unknown")).toBeVisible();
+
+    // The agent row is gone. The claim outlives it, so it still appears.
+    expect(screen.getByText("scripts/hooks/**")).toBeVisible();
+    expect(screen.getByText("Former agent")).toBeVisible();
+    expect(screen.getByText("Inactive owner")).toBeVisible();
+  });
+
+  it("keeps the reservations view out of a viewer's navigation", async () => {
+    // The endpoint authorizes per project; the navigation must agree with it,
+    // and hiding the link is presentation, never the boundary.
+    server.use(
+      http.get("*/mail/api/v1/me/profile", () =>
+        HttpResponse.json({ ...adminProfile, global_role: "member" }),
+      ),
+      http.get("*/mail/api/v1/projects", () =>
+        HttpResponse.json({
+          items: [{ ...projectOne, role: "viewer", can_reply: false }],
+          total: 1,
+        }),
+      ),
+    );
+    render(<App />);
+    await waitForEnglishPreferences();
+
+    const navigation = await screen.findByRole("navigation", {
+      name: "Primary navigation",
+    });
+    await waitFor(() =>
+      expect(within(navigation).getAllByRole("link").length).toBeGreaterThan(0),
+    );
+    expect(
+      within(navigation).queryByRole("link", { name: "Reservations" }),
+    ).toBeNull();
+  });
+
+  it("tells an operator when nothing is held", async () => {
+    server.use(
+      http.get("*/mail/api/v1/reservations", () =>
+        HttpResponse.json({ items: [], next_cursor: null }),
+      ),
+    );
+    window.history.replaceState({}, "", "/mail/#reservations");
+
+    render(<App />);
+    await waitForEnglishPreferences();
+
+    expect(await screen.findByText("No live reservations.")).toBeVisible();
+  });
+
   it("renders the real inbox without demo controls or invented unread data", async () => {
     render(<App />);
     await waitForEnglishPreferences();
@@ -611,11 +832,14 @@ describe("Iris landing shell", () => {
     expect(screen.getByText("Durable delivery")).toBeVisible();
     const navigation = screen.getByRole("navigation", { name: "Primary navigation" });
     const links = within(navigation).getAllByRole("link");
-    expect(links).toHaveLength(6);
+    expect(links).toHaveLength(7);
     expect(links.map((link) => link.textContent)).toEqual([
       "Projects",
       "Inbox",
       "Search",
+      // Between Search and Compose: reading who holds what belongs with the
+      // other read views, not with the administrative ones.
+      "Reservations",
       "Compose",
       "Account",
       "Administration",

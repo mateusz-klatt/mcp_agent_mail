@@ -120,9 +120,6 @@ const resources = {
       navigation: "Primary navigation",
       language: "Language",
       signOut: "Sign out",
-      // Only the English catalog carries these: `fallbackLng: "en"` means the
-      // other 43 locales show English until somebody translates them, which is
-      // strictly better than shipping the feature without a label.
       notificationSoundOn: "Notification sound on. Click to mute.",
       notificationSoundOff: "Notification sound off. Click to unmute.",
       localePicker: {
@@ -144,9 +141,27 @@ const resources = {
         projects: "Projects",
         inbox: "Inbox",
         search: "Search",
+        reservations: "Reservations",
         compose: "Compose",
         account: "Account",
         admin: "Administration",
+      },
+      reservations: {
+        title: "File reservations",
+        subtitle: "Who is holding which paths right now.",
+        empty: "No live reservations.",
+        loadMore: "Load more",
+        path: "Path",
+        holder: "Held by",
+        state: "State",
+        expires: "Expires",
+        exclusive: "Exclusive",
+        shared: "Shared",
+        unknownExpiry: "Unknown",
+        unknownHolder: "Former agent",
+        stateScoped: "Active run",
+        stateLegacy: "Legacy claim",
+        stateOrphaned: "Inactive owner",
       },
       globalRole: { admin: "Administrator", member: "Member" },
       account: {

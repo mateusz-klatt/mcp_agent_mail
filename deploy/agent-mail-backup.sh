@@ -119,9 +119,19 @@ final = raw + '.gz'
 # _fsync_archive_initialization_tree_sync in storage.py).
 con = sqlite3.connect('file:/data/mailbox/storage.sqlite3?mode=ro', uri=True)
 try:
-    con.execute('PRAGMA query_only=1')
     con.execute('PRAGMA busy_timeout=60000')
-    con.execute('VACUUM INTO ?', (raw,))
+    # Connection.backup(), not VACUUM INTO: VACUUM is a write statement and
+    # SQLite rejects it on a read-only connection ('attempt to write a
+    # readonly database'), which silently cost us every snapshot between
+    # 16:43Z and 17:49Z on 2026-08-14. The online backup API only reads the
+    # source, so the connection can stay read-only -- and a read-only second
+    # process cannot checkpoint or unlink the live -wal/-shm, which is the
+    # half of the corruption chain this script is responsible for.
+    destination = sqlite3.connect(raw)
+    try:
+        con.backup(destination)
+    finally:
+        destination.close()
 finally:
     con.close()
 

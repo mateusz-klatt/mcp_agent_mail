@@ -159,8 +159,16 @@ if [ "$(printf '%s' "$resp" | jq -r '.retired_at // empty' 2>/dev/null)" != "" ]
     exit 0
 fi
 
+# Begin or resume this native lifecycle before starting the root execution.
+# A resumed CLI session keeps its session_id, so the SessionEnd tombstone the
+# previous process wrote still stands; only am_session_run_begin advances the
+# generation past it, and skipping this made every resumed session fail the
+# end-intent barrier inside am_execution_start for its whole lifetime. The
+# codex path has done this since the barrier existed (codex_notify.sh).
 execution_summary=""
-if execution_id="$(am_root_execution_start \
+if ! am_session_run_begin claude "$(am_payload_field '.source')" >/dev/null; then
+    execution_summary=" The durable mailbox is connected, but this native session lifecycle is already ended and could not be resumed safely; execution-owned reservations are unavailable."
+elif execution_id="$(am_root_execution_start \
     "$PROJECT" "$got_name" "${got_token:-$token}" claude)"; then
     execution_summary=" Root execution: ${execution_id}."
 else

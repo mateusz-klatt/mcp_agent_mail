@@ -1838,6 +1838,141 @@ printf '%s\n200' "$envelope"
     assert f"you are {agent_name} on /owner/repo" in context
 
 
+def test_claude_session_start_resumes_ended_lifecycle_generation(
+    tmp_path: Path,
+) -> None:
+    """A resumed CLI session reuses its session_id, so the SessionEnd tombstone
+    from the previous process still stands. SessionStart must advance the
+    lifecycle generation past it — exactly as the codex path does — or the
+    resumed session fails the end-intent barrier and runs without a root
+    execution for its whole lifetime."""
+    home = tmp_path / "home"
+    state = tmp_path / "state"
+    fake_bin = tmp_path / "bin"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    (repo / ".agent-mail-project-id").write_text("project-id\n", encoding="utf-8")
+    _install_fake_curl(
+        fake_bin,
+        """#!/usr/bin/env bash
+if [[ " $* " == *"/mail/api/file-reservations"* ]]; then
+  cat >/dev/null
+  printf '{"reservations":[]}\n200'
+  exit 0
+fi
+body="$(cat)"
+tool="$(printf '%s' "$body" | jq -r '.params.name // empty')"
+arguments="$(printf '%s' "$body" | jq -c '.params.arguments // {}')"
+jq -nc --arg tool "$tool" --argjson arguments "$arguments" \
+  '{tool:$tool,arguments:$arguments}' >> "$FAKE_CALLS_LOG"
+case "$tool" in
+  register_agent)
+    name="$(printf '%s' "$arguments" | jq -r '.name')"
+    result="$(jq -nc --arg name "$name" '{name:$name,retired_at:null}')"
+    ;;
+  start_agent_execution)
+    result='{"id":"11111111-1111-4111-8111-111111111111","status":"active","ancestor_execution_ids":[],"reused":false}'
+    ;;
+  end_agent_execution)
+    result='{"execution":{"status":"completed"},"already_ended":false,"released_reservations":0}'
+    ;;
+  *) result='{}' ;;
+esac
+envelope="$(jq -nc --arg text "$result" \
+  '{result:{content:[{type:"text",text:$text}],isError:false}}')"
+printf '%s\n200' "$envelope"
+""",
+    )
+    env = _hook_env(home, state, fake_bin)
+    _, agent, _ = _hook_names(env)
+    _put_credential(state, agent)
+    calls_log = tmp_path / "calls.jsonl"
+    env["FAKE_CALLS_LOG"] = _git_bash_path(calls_log)
+    payload = {
+        "cwd": str(repo),
+        "session_id": "claude-resumed-root",
+        "hook_event_name": "SessionStart",
+        "source": "startup",
+    }
+    start_command = [
+        BASH,
+        _git_bash_path(ROOT / "scripts" / "hooks" / "session_start.sh"),
+    ]
+
+    first_start = subprocess.run(
+        start_command,
+        cwd=repo,
+        env=env,
+        input=json.dumps(payload),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert first_start.returncode == 0, first_start.stderr
+    first_context = json.loads(first_start.stdout)["hookSpecificOutput"][
+        "additionalContext"
+    ]
+    assert "Root execution: 11111111-1111-4111-8111-111111111111" in first_context
+
+    session_end = subprocess.run(
+        [BASH, _git_bash_path(ROOT / "scripts" / "hooks" / "session_end.sh")],
+        cwd=repo,
+        env=env,
+        input=json.dumps(
+            {**payload, "hook_event_name": "SessionEnd", "reason": "other"}
+        ),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert session_end.returncode == 0, session_end.stderr
+    intent_path = next((state / "session-end-intents").glob("*.json"))
+    ended_intent = json.loads(intent_path.read_text(encoding="utf-8"))
+    assert ended_intent["status"] == "ended"
+    assert ended_intent["generation"] == 1
+
+    resumed_start = subprocess.run(
+        start_command,
+        cwd=repo,
+        env=env,
+        input=json.dumps({**payload, "source": "resume"}),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert resumed_start.returncode == 0, resumed_start.stderr
+    resumed_context = json.loads(resumed_start.stdout)["hookSpecificOutput"][
+        "additionalContext"
+    ]
+    assert "Root execution: 11111111-1111-4111-8111-111111111111" in resumed_context
+    assert "could not be started" not in resumed_context
+    assert "could not be resumed" not in resumed_context
+
+    resumed_intent = json.loads(intent_path.read_text(encoding="utf-8"))
+    assert resumed_intent["status"] == "active"
+    assert resumed_intent["generation"] == 2
+    calls = [json.loads(line) for line in calls_log.read_text().splitlines()]
+    root_starts = [
+        item["arguments"]
+        for item in calls
+        if item["tool"] == "start_agent_execution"
+        and item["arguments"]["kind"] == "session"
+    ]
+    assert [item["external_id"] for item in root_starts] == [
+        "claude-resumed-root",
+        "claude-resumed-root#run-2",
+    ]
+    resumed_state = next(
+        item
+        for item in (
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in (state / "executions").glob("*.json")
+        )
+        if item.get("lifecycle_generation") == 2
+    )
+    assert resumed_state["status"] == "active"
+
+
 def test_claude_fresh_registration_without_token_persists_no_identity_state(
     tmp_path: Path,
 ) -> None:

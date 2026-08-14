@@ -112,8 +112,15 @@ stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
 raw = os.path.join(BACKUP, f'storage-{stamp}.sqlite3')
 final = raw + '.gz'
 
-con = sqlite3.connect('/data/mailbox/storage.sqlite3')
+# Read-only, and never a writer: a read-write connection from this second
+# process checkpoints the WAL and unlinks -wal/-shm out from under the live
+# server, which is one half of the corruption chain measured on 2026-08-14
+# (the other half is the server dropping its own POSIX locks -- see
+# _fsync_archive_initialization_tree_sync in storage.py).
+con = sqlite3.connect('file:/data/mailbox/storage.sqlite3?mode=ro', uri=True)
 try:
+    con.execute('PRAGMA query_only=1')
+    con.execute('PRAGMA busy_timeout=60000')
     con.execute('VACUUM INTO ?', (raw,))
 finally:
     con.close()

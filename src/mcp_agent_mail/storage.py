@@ -49,7 +49,11 @@ from git.objects.tree import Tree
 from PIL import Image
 
 from .config import Settings
-from .db import get_sqlite_pre_restore_path, get_sqlite_sidecar_paths
+from .db import (
+    get_database_path,
+    get_sqlite_pre_restore_path,
+    get_sqlite_sidecar_paths,
+)
 from .utils import (
     pid_is_alive,
     validate_agent_name_format,
@@ -1959,8 +1963,25 @@ def _ensure_archive_attributes_durable_sync(attributes_path: Path) -> None:
     _fsync_message_delivery_directory_sync(attributes_path.parent)
 
 
-def _fsync_archive_initialization_tree_sync(root: Path) -> None:
-    """Persist Git initialization files and directory entries bottom-up."""
+def _fsync_archive_initialization_tree_sync(
+    root: Path,
+    database_path: Path | None = None,
+) -> None:
+    """Persist Git initialization files and directory entries bottom-up.
+
+    The database and its sidecars are skipped even when they live inside the
+    archive root. `_fsync_readonly_file_sync` opens and closes a descriptor,
+    and closing ANY descriptor to a file releases every POSIX lock this
+    process holds on it -- so fsyncing the live database made the server
+    invisible as a reader, after which the hourly backup's connection
+    checkpointed and unlinked `-wal`/`-shm` underneath it. Measured as the
+    cause of three corruptions on 2026-08-14.
+    """
+    reserved: set[str] = set()
+    if database_path is not None:
+        reserved.add(database_path.name)
+        for suffix in ("-wal", "-shm", "-journal"):
+            reserved.add(f"{database_path.name}{suffix}")
     directories: list[Path] = []
     for directory_name, child_directories, filenames in os.walk(
         root,
@@ -1975,6 +1996,8 @@ def _fsync_archive_initialization_tree_sync(root: Path) -> None:
             if not (directory / child).is_symlink()
         ]
         for filename in filenames:
+            if filename in reserved:
+                continue
             path = directory / filename
             if path.is_symlink() or not path.is_file():
                 continue
@@ -2058,6 +2081,7 @@ async def _create_repo_for_cache(root: Path, settings: Settings, cache_key: str)
                 await _to_thread_cancellation_safe(
                     _fsync_archive_initialization_tree_sync,
                     root,
+                    get_database_path(settings),
                 )
             await _to_thread_cancellation_safe(
                 _fsync_message_delivery_directory_sync,

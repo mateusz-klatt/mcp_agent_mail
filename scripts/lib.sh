@@ -1192,7 +1192,12 @@ integration_project_key() {
     printf '%s' "${AGENT_MAIL_PROJECT_KEY}"
     return 0
   fi
-  remote=$(git -C "$target_dir" remote get-url origin 2>/dev/null) || remote=""
+  # Enter the directory instead of `git -C <path>`: the same probe-dialect
+  # hazard as path_is_inside_git above.  With `-C`, a git that cannot chdir
+  # (path dialect, permissions, a hostile PATH) silently yields remote="" and
+  # the installer dies before printing anything at all.
+  remote=$( cd -- "$target_dir" >/dev/null 2>&1 \
+    && git remote get-url origin 2>/dev/null ) || remote=""
   if [[ -n "$remote" ]]; then
     printf '%s' "$remote" \
       | sed -E 's#^[a-zA-Z]+://[^/]+/#/#; s#^[^@]+@[^:]+:#/#; s#\.git$##; s#/+$##' \

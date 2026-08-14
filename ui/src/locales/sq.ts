@@ -8,6 +8,8 @@ const translation = {
   navigation: "Navigimi kryesor",
   language: "Gjuha",
   signOut: "Dilni",
+  notificationSoundOn: "Tingulli i njoftimeve është aktiv. Klikoni për ta heshtur.",
+  notificationSoundOff: "Tingulli i njoftimeve është joaktiv. Klikoni për ta aktivizuar.",
   localePicker: {
     trigger: "Zgjidhni gjuhën. Gjuha aktuale: {{language}}",
     menu: "Zgjidhni gjuhën e ndërfaqes",

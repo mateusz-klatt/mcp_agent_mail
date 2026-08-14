@@ -8,6 +8,8 @@ const translation = {
   navigation: "Aðalleiðsögn",
   language: "Tungumál",
   signOut: "Skrá út",
+  notificationSoundOn: "Tilkynningahljóð er kveikt. Smelltu til að þagga.",
+  notificationSoundOff: "Tilkynningahljóð er slökkt. Smelltu til að kveikja.",
   localePicker: {
     trigger: "Veldu tungumál. Núverandi tungumál: {{language}}",
     menu: "Veldu tungumál viðmótsins",

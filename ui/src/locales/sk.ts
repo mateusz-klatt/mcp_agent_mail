@@ -8,6 +8,8 @@ const translation = {
   navigation: "Hlavná navigácia",
   language: "Jazyk",
   signOut: "Odhlásiť sa",
+  notificationSoundOn: "Zvuk upozornení je zapnutý. Kliknutím ho stlmíte.",
+  notificationSoundOff: "Zvuk upozornení je vypnutý. Kliknutím ho zapnete.",
   localePicker: {
     trigger: "Vybrať jazyk. Aktuálny jazyk: {{language}}",
     menu: "Vybrať jazyk rozhrania",

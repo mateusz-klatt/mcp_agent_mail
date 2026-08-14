@@ -150,6 +150,12 @@ export interface MailRecipientAgent {
   agent_generation: string;
   name: string;
   display_name: string | null;
+  /**
+   * Vocabulary word from `set_agent_notify_sound`, not an audio resource. The
+   * browser synthesises the tone; nothing is ever fetched from a host a
+   * colleague chose.
+   */
+  notify_sound: string | null;
 }
 
 export interface ProjectAgentsPage {
@@ -568,6 +574,7 @@ export function parseProjectAgents(payload: unknown): ProjectAgentsPage {
         "agent_generation",
         "name",
         "display_name",
+        "notify_sound",
       ]);
       return {
         agent_id: positiveInteger(candidate.agent_id, "recipient agent id"),
@@ -577,6 +584,7 @@ export function parseProjectAgents(payload: unknown): ProjectAgentsPage {
         ),
         name: stringValue(candidate.name, "agent name"),
         display_name: nullableString(candidate.display_name, "agent display name"),
+        notify_sound: nullableString(candidate.notify_sound, "agent notify sound"),
       };
     }),
     total: nonNegativeInteger(response.total, "project agent total"),

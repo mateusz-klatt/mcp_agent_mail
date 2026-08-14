@@ -8,6 +8,8 @@ const translation = {
   navigation: "ناوبری اصلی",
   language: "زبان",
   signOut: "خروج از حساب",
+  notificationSoundOn: "صدای اعلان روشن است. برای بی‌صدا کردن کلیک کنید.",
+  notificationSoundOff: "صدای اعلان خاموش است. برای روشن کردن کلیک کنید.",
   localePicker: {
     trigger: "انتخاب زبان. زبان فعلی: {{language}}",
     menu: "انتخاب زبان رابط کاربری",

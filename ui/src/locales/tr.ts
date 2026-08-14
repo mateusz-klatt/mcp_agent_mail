@@ -8,6 +8,8 @@ const translation = {
   navigation: "Ana gezinme",
   language: "Dil",
   signOut: "Oturumu kapat",
+  notificationSoundOn: "Bildirim sesi açık. Sessize almak için tıklayın.",
+  notificationSoundOff: "Bildirim sesi kapalı. Açmak için tıklayın.",
   localePicker: {
     trigger: "Dil seçin. Geçerli dil: {{language}}",
     menu: "Arayüz dilini seçin",

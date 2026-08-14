@@ -8,6 +8,8 @@ const translation = {
   navigation: "Κύρια πλοήγηση",
   language: "Γλώσσα",
   signOut: "Αποσύνδεση",
+  notificationSoundOn: "Ήχος ειδοποιήσεων ενεργός. Κάντε κλικ για σίγαση.",
+  notificationSoundOff: "Ήχος ειδοποιήσεων ανενεργός. Κάντε κλικ για ενεργοποίηση.",
   localePicker: {
     trigger: "Επιλέξτε γλώσσα. Τρέχουσα γλώσσα: {{language}}",
     menu: "Επιλέξτε γλώσσα διεπαφής",

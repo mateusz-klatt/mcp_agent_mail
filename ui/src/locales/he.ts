@@ -8,6 +8,8 @@ const translation = {
   navigation: "ניווט ראשי",
   language: "שפה",
   signOut: "התנתקות",
+  notificationSoundOn: "צליל התראה מופעל. לחץ להשתקה.",
+  notificationSoundOff: "צליל התראה מושתק. לחץ להפעלה.",
   localePicker: {
     trigger: "בחירת שפה. השפה הנוכחית: {{language}}",
     menu: "בחירת שפת הממשק",

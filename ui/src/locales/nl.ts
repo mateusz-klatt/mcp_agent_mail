@@ -8,6 +8,8 @@ const translation = {
   navigation: "Hoofdnavigatie",
   language: "Taal",
   signOut: "Uitloggen",
+  notificationSoundOn: "Meldingsgeluid aan. Klik om te dempen.",
+  notificationSoundOff: "Meldingsgeluid uit. Klik om aan te zetten.",
   localePicker: {
     trigger: "Kies een taal. Huidige taal: {{language}}",
     menu: "Kies de interfacetaal",

@@ -8,6 +8,8 @@ const translation = {
   navigation: "Elsődleges navigáció",
   language: "Nyelv",
   signOut: "Kijelentkezés",
+  notificationSoundOn: "Értesítési hang bekapcsolva. Kattintson a némításhoz.",
+  notificationSoundOff: "Értesítési hang kikapcsolva. Kattintson a bekapcsoláshoz.",
   localePicker: {
     trigger: "Nyelv kiválasztása. Jelenlegi nyelv: {{language}}",
     menu: "A felület nyelvének kiválasztása",

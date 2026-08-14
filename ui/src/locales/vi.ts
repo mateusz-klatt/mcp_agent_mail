@@ -8,6 +8,8 @@ const translation = {
   navigation: "Điều hướng chính",
   language: "Ngôn ngữ",
   signOut: "Đăng xuất",
+  notificationSoundOn: "Âm thanh thông báo đang bật. Nhấp để tắt tiếng.",
+  notificationSoundOff: "Âm thanh thông báo đang tắt. Nhấp để bật.",
   localePicker: {
     trigger: "Chọn ngôn ngữ. Ngôn ngữ hiện tại: {{language}}",
     menu: "Chọn ngôn ngữ giao diện",

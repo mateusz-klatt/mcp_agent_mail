@@ -8,6 +8,8 @@ const translation = {
   navigation: "التنقل الرئيسي",
   language: "اللغة",
   signOut: "تسجيل الخروج",
+  notificationSoundOn: "صوت الإشعارات مفعَّل. انقر للكتم.",
+  notificationSoundOff: "صوت الإشعارات مكتوم. انقر لإلغاء الكتم.",
   localePicker: {
     trigger: "اختر اللغة. اللغة الحالية: {{language}}",
     menu: "اختر لغة الواجهة",

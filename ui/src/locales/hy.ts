@@ -8,6 +8,8 @@ const translation = {
   navigation: "Հիմնական նավարկում",
   language: "Լեզու",
   signOut: "Դուրս գալ",
+  notificationSoundOn: "Ծանուցման ձայնը միացված է։ Սեղմեք՝ անջատելու համար։",
+  notificationSoundOff: "Ծանուցման ձայնը անջատված է։ Սեղմեք՝ միացնելու համար։",
   localePicker: {
     trigger: "Ընտրեք լեզուն։ Ընթացիկ լեզուն՝ {{language}}",
     menu: "Ընտրեք միջերեսի լեզուն",

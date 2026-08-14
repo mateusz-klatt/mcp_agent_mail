@@ -75,6 +75,11 @@ import {
   saveUiLocale,
   type MailUiPreferences,
 } from "./preferences";
+import {
+  playNotificationTone,
+  setSoundEnabled,
+  soundEnabled,
+} from "./notificationSound";
 import "./app.css";
 
 const mailNavigation = ["projects", "inbox", "search"] as const;
@@ -808,6 +813,16 @@ export function App({
   const [composeProjectId, setComposeProjectId] = useState("");
   const [composeRecipients, setComposeRecipients] = useState<string[]>([]);
   const [composeAgents, setComposeAgents] = useState<MailRecipientAgent[]>([]);
+  const [soundOn, setSoundOn] = useState<boolean>(() => soundEnabled());
+  // Name -> chosen tone, accumulated across every project directory this
+  // session has loaded. The inbox is unified while the directory is per
+  // project, so the map fills in as the reader moves around; an unknown sender
+  // simply gets the default tone, which is how the server-rendered UI behaved
+  // on pages that carried no sound island.
+  const agentSoundsRef = useRef<Map<string, string>>(new Map());
+  // `null` means "nothing observed yet". Without that distinction the first
+  // load would look like an arrival and ding at every page open.
+  const newestMessageIdRef = useRef<number | null>(null);
   const [composeAgentsTotal, setComposeAgentsTotal] = useState(0);
   const [composeProjectGeneration, setComposeProjectGeneration] =
     useState<string | null>(null);
@@ -982,6 +997,35 @@ export function App({
       events.close();
     };
   }, [createEventSource, mailRouteActive]);
+
+  // Learn who sounds like what as directories load. Only agents that actually
+  // chose a tone are recorded; everyone else falls through to the default.
+  useEffect(() => {
+    for (const agent of composeAgents) {
+      if (agent.notify_sound) {
+        agentSoundsRef.current.set(agent.name, agent.notify_sound);
+      }
+    }
+  }, [composeAgents]);
+
+  // Sound one tone per arrival, in the voice of whoever wrote.
+  //
+  // The stream frame deliberately carries no sender — so that a project watcher
+  // cannot learn who a BCC went to — which leaves the re-rendered list as the
+  // only honest source. Comparing the newest id is enough: the list is ordered
+  // newest first, and a refresh that changes nothing must stay silent.
+  useEffect(() => {
+    const newest = messages[0];
+    if (!newest) {
+      return;
+    }
+    const previous = newestMessageIdRef.current;
+    newestMessageIdRef.current = newest.id;
+    if (previous === null || newest.id === previous) {
+      return;
+    }
+    playNotificationTone(agentSoundsRef.current.get(newest.sender_name));
+  }, [messages]);
 
   useEffect(() => {
     const detailRequestGeneration = ++detailRequestGenerationRef.current;
@@ -3255,6 +3299,31 @@ export function App({
           <span className="read-only-badge">
             {t("mailboxSecureDelivery")}
           </span>
+          {/* Browsers refuse audio until a gesture inside the page, and arriving
+              from the login form does not count — so the reader arms it here,
+              once, and the choice persists. */}
+          <button
+            className="sound-toggle"
+            type="button"
+            data-on={soundOn ? "yes" : "no"}
+            aria-pressed={soundOn}
+            aria-label={t(
+              soundOn ? "notificationSoundOn" : "notificationSoundOff",
+            )}
+            title={t(soundOn ? "notificationSoundOn" : "notificationSoundOff")}
+            onClick={() => {
+              const next = !soundOn;
+              setSoundEnabled(next);
+              setSoundOn(next);
+              // Play the default tone on enabling: it doubles as the gesture the
+              // browser wants and as proof to the reader that audio works here.
+              if (next) {
+                playNotificationTone();
+              }
+            }}
+          >
+            <span aria-hidden="true">{soundOn ? "🔊" : "🔇"}</span>
+          </button>
           <div className="locale-control">
             <span className="locale-control-label">{t("language")}</span>
             <LocalePicker

@@ -120,6 +120,11 @@ const resources = {
       navigation: "Primary navigation",
       language: "Language",
       signOut: "Sign out",
+      // Only the English catalog carries these: `fallbackLng: "en"` means the
+      // other 43 locales show English until somebody translates them, which is
+      // strictly better than shipping the feature without a label.
+      notificationSoundOn: "Notification sound on. Click to mute.",
+      notificationSoundOff: "Notification sound off. Click to unmute.",
       localePicker: {
         trigger: "Choose language. Current language: {{language}}",
         menu: "Choose interface language",

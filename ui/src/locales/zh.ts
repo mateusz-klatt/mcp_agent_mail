@@ -8,6 +8,8 @@ const translation = {
   navigation: "主导航",
   language: "语言",
   signOut: "退出登录",
+  notificationSoundOn: "通知声音已开启。点击静音。",
+  notificationSoundOff: "通知声音已关闭。点击开启。",
   localePicker: {
     trigger: "选择语言。当前语言：{{language}}",
     menu: "选择界面语言",

@@ -8,6 +8,8 @@ const translation = {
   navigation: "मुख्य नेविगेशन",
   language: "भाषा",
   signOut: "साइन आउट करें",
+  notificationSoundOn: "सूचना ध्वनि चालू है. म्यूट करने के लिए क्लिक करें.",
+  notificationSoundOff: "सूचना ध्वनि बंद है. चालू करने के लिए क्लिक करें.",
   localePicker: {
     trigger: "भाषा चुनें। वर्तमान भाषा: {{language}}",
     menu: "इंटरफ़ेस की भाषा चुनें",

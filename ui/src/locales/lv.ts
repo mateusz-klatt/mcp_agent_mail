@@ -8,6 +8,8 @@ const translation = {
   navigation: "Galvenā navigācija",
   language: "Valoda",
   signOut: "Izrakstīties",
+  notificationSoundOn: "Paziņojumu skaņa ieslēgta. Noklikšķiniet, lai izslēgtu.",
+  notificationSoundOff: "Paziņojumu skaņa izslēgta. Noklikšķiniet, lai ieslēgtu.",
   localePicker: {
     trigger: "Izvēlieties valodu. Pašreizējā valoda: {{language}}",
     menu: "Izvēlieties saskarnes valodu",

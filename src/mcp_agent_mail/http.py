@@ -2253,6 +2253,12 @@ class MailUiAgentDirectoryItem(BaseModel):
     agent_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
     name: str = Field(min_length=1, max_length=128)
     display_name: str | None
+    # The tone this colleague picked, so a reader can tell who wrote without
+    # looking. Only the vocabulary word travels; the browser synthesises the
+    # tone locally. Nothing here may become a request to a host a colleague
+    # chose — that was the rule when the server-rendered UI grew this, and it
+    # survives the move to the React client unchanged.
+    notify_sound: str | None = None
 
 
 class MailUiProjectAgentsResponse(BaseModel):
@@ -6829,7 +6835,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     )
                 rows = await session.execute(
                     text(
-                        "SELECT id, agent_generation, name, display_name FROM agents "
+                        "SELECT id, agent_generation, name, display_name, notify_sound "
+                        "FROM agents "
                         "WHERE project_id = :project_id AND retired_at IS NULL "
                         "AND name <> :human_overseer "
                         "AND contact_policy <> 'block_all' "
@@ -6848,6 +6855,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         display_name=(
                             str(row["display_name"])
                             if row["display_name"] is not None
+                            else None
+                        ),
+                        notify_sound=(
+                            str(row["notify_sound"])
+                            if row["notify_sound"] is not None
                             else None
                         ),
                     )

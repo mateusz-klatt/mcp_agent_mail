@@ -8,6 +8,8 @@ const translation = {
   navigation: "Hauptnavigation",
   language: "Sprache",
   signOut: "Abmelden",
+  notificationSoundOn: "Benachrichtigungston an. Zum Stummschalten klicken.",
+  notificationSoundOff: "Benachrichtigungston aus. Zum Einschalten klicken.",
   localePicker: {
     trigger: "Sprache wählen. Aktuelle Sprache: {{language}}",
     menu: "Sprache der Oberfläche wählen",

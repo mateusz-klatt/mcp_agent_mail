@@ -8,6 +8,8 @@ const translation = {
   navigation: "Ensisijainen navigointi",
   language: "Kieli",
   signOut: "Kirjaudu ulos",
+  notificationSoundOn: "Ilmoitusääni käytössä. Mykistä napsauttamalla.",
+  notificationSoundOff: "Ilmoitusääni pois käytöstä. Ota käyttöön napsauttamalla.",
   localePicker: {
     trigger: "Valitse kieli. Nykyinen kieli: {{language}}",
     menu: "Valitse käyttöliittymän kieli",

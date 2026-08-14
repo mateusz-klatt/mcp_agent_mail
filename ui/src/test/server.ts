@@ -37,18 +37,23 @@ export const projectAgentsResponse = {
       agent_generation: "1".repeat(64),
       name: "BlueLake",
       display_name: null,
+      // Deliberately mixed: an agent with no chosen tone must fall through to
+      // the default rather than silence the notification.
+      notify_sound: null,
     },
     {
       agent_id: 2,
       agent_generation: "2".repeat(64),
       name: "GreenDog",
       display_name: "Release operator",
+      notify_sound: "chime",
     },
     {
       agent_id: 3,
       agent_generation: "3".repeat(64),
       name: "IndigoBridge",
       display_name: "Schema keeper",
+      notify_sound: "click",
     },
   ],
   total: 3,

@@ -8,6 +8,8 @@ const translation = {
   navigation: "Navigare principală",
   language: "Limbă",
   signOut: "Deconectare",
+  notificationSoundOn: "Sunetul notificărilor este activat. Faceți clic pentru a dezactiva.",
+  notificationSoundOff: "Sunetul notificărilor este dezactivat. Faceți clic pentru a activa.",
   localePicker: {
     trigger: "Alege limba. Limba actuală: {{language}}",
     menu: "Alege limba interfeței",

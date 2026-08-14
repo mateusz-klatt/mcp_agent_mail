@@ -8,6 +8,8 @@ const translation = {
   navigation: "Pagrindinis naršymas",
   language: "Kalba",
   signOut: "Atsijungti",
+  notificationSoundOn: "Pranešimų garsas įjungtas. Spustelėkite, kad nutildytumėte.",
+  notificationSoundOff: "Pranešimų garsas išjungtas. Spustelėkite, kad įjungtumėte.",
   localePicker: {
     trigger: "Pasirinkite kalbą. Dabartinė kalba: {{language}}",
     menu: "Pasirinkite sąsajos kalbą",

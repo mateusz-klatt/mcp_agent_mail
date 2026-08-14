@@ -76,12 +76,16 @@ const projectAgents: ProjectAgentsPage = {
       agent_generation: "1".repeat(64),
       name: "BlueLake",
       display_name: null,
+      // One agent with a chosen tone and one without, so the fixture exercises
+      // both the per-sender lookup and the default fallback.
+      notify_sound: null,
     },
     {
       agent_id: 2,
       agent_generation: "2".repeat(64),
       name: "GreenDog",
       display_name: "Release operator",
+      notify_sound: "chime",
     },
   ],
   total: 2,

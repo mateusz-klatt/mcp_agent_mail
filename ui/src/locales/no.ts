@@ -8,6 +8,8 @@ const translation = {
   navigation: "Hovednavigasjon",
   language: "Språk",
   signOut: "Logg ut",
+  notificationSoundOn: "Varsellyd på. Klikk for å slå av.",
+  notificationSoundOff: "Varsellyd av. Klikk for å slå på.",
   localePicker: {
     trigger: "Velg språk. Gjeldende språk: {{language}}",
     menu: "Velg grensesnittspråk",

@@ -1121,6 +1121,7 @@ describe("Iris landing shell", () => {
       agent_generation: (index % 16).toString(16).repeat(64),
       name: `Agent${String(index + 1).padStart(3, "0")}`,
       display_name: index === 100 ? "Overflow agent" : null,
+      notify_sound: null,
     }));
     server.use(
       http.get("*/mail/api/v1/projects/:projectId/agents", ({ params }) =>

@@ -8,6 +8,8 @@ const translation = {
   navigation: "Urambazaji mkuu",
   language: "Lugha",
   signOut: "Ondoka",
+  notificationSoundOn: "Sauti ya arifa imewashwa. Bofya kuizima.",
+  notificationSoundOff: "Sauti ya arifa imezimwa. Bofya kuiwasha.",
   localePicker: {
     trigger: "Chagua lugha. Lugha ya sasa: {{language}}",
     menu: "Chagua lugha ya kiolesura",

@@ -376,6 +376,33 @@ html[data-flag-polyfill="true"] select {
   background: rgb(255 255 255 / 12%);
 }
 
+/* Matches .logout-button rather than inventing a second control language, and
+   keeps the 44px target the rest of the bar holds to. */
+.sound-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  min-width: 44px;
+  border: 1px solid rgb(255 255 255 / 25%);
+  border-radius: 10px;
+  padding: 0.6rem;
+  color: #fff;
+  background: transparent;
+  cursor: pointer;
+  font-size: 1.05rem;
+  line-height: 1;
+}
+
+.sound-toggle:hover {
+  background: rgb(255 255 255 / 12%);
+}
+
+/* Muted is the quieter state visually as well, so the bar reads at a glance. */
+.sound-toggle[data-on="no"] {
+  opacity: 0.65;
+}
+
 .read-only-badge,
 .role-pill,
 .status {

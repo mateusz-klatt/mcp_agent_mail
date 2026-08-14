@@ -8,6 +8,8 @@ const translation = {
   navigation: "Главна навигација",
   language: "Језик",
   signOut: "Одјави се",
+  notificationSoundOn: "Звук обавештења је укључен. Кликните да га искључите.",
+  notificationSoundOff: "Звук обавештења је искључен. Кликните да га укључите.",
   localePicker: {
     trigger: "Изаберите језик. Тренутни језик: {{language}}",
     menu: "Изаберите језик интерфејса",

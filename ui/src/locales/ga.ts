@@ -8,6 +8,8 @@ const translation = {
   navigation: "Príomh-nascleanúint",
   language: "Teanga",
   signOut: "Logáil amach",
+  notificationSoundOn: "Fuaim fógra ann. Cliceáil chun é a bhalbhú.",
+  notificationSoundOff: "Fuaim fógra as. Cliceáil chun é a chur ar siúl.",
   localePicker: {
     trigger: "Roghnaigh teanga. Teanga reatha: {{language}}",
     menu: "Roghnaigh teanga an chomhéadain",

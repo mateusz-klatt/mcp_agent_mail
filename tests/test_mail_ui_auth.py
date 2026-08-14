@@ -2413,6 +2413,7 @@ class TestMailUiPreferences:
             "agent_generation",
             "name",
             "display_name",
+            "notify_sound",
         }
 
         search_operation = mail_paths["/mail/api/v1/search"]["get"]
@@ -5859,6 +5860,7 @@ class TestMailUiV1ReadApi:
                     ],
                     "name": "Alpha",
                     "display_name": None,
+                    "notify_sound": None,
                 },
                 {
                     "agent_id": recipient_refs[1]["agent_id"],
@@ -5867,6 +5869,7 @@ class TestMailUiV1ReadApi:
                     ],
                     "name": "bravo",
                     "display_name": "Bravo Person",
+                    "notify_sound": None,
                 },
                 {
                     "agent_id": recipient_refs[2]["agent_id"],
@@ -5875,13 +5878,25 @@ class TestMailUiV1ReadApi:
                     ],
                     "name": "zulu",
                     "display_name": "Zulu Person",
+                    # Seeded with sound="soft": the reader needs the word to
+                    # synthesise a per-sender tone locally. "Minimal" here means
+                    # no program, model, task or token — a presentational
+                    # preference the server-rendered UI already handed to this
+                    # same authenticated reader does not breach that.
+                    "notify_sound": "soft",
                 },
             ],
             "total": 3,
         }
         assert all(
             set(item)
-            == {"agent_id", "agent_generation", "name", "display_name"}
+            == {
+                "agent_id",
+                "agent_generation",
+                "name",
+                "display_name",
+                "notify_sound",
+            }
             for item in response.json()["items"]
         )
         for private_value in (

@@ -8,6 +8,8 @@ const translation = {
   navigation: "အဓိက လမ်းညွှန်",
   language: "ဘာသာစကား",
   signOut: "ထွက်ရန်",
+  notificationSoundOn: "အသိပေးချက်အသံ ဖွင့်ထားသည်။ ပိတ်ရန် နှိပ်ပါ။",
+  notificationSoundOff: "အသိပေးချက်အသံ ပိတ်ထားသည်။ ဖွင့်ရန် နှိပ်ပါ။",
   localePicker: {
     trigger: "ဘာသာစကား ရွေးပါ။ လက်ရှိဘာသာစကား: {{language}}",
     menu: "အင်တာဖေ့စ် ဘာသာစကား ရွေးပါ",

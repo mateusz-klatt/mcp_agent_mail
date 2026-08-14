@@ -8,6 +8,8 @@ const translation = {
   navigation: "Pangunahing nabigasyon",
   language: "Wika",
   signOut: "Mag-sign out",
+  notificationSoundOn: "Naka-on ang tunog ng abiso. I-click para i-mute.",
+  notificationSoundOff: "Naka-off ang tunog ng abiso. I-click para i-unmute.",
   localePicker: {
     trigger: "Pumili ng wika. Kasalukuyang wika: {{language}}",
     menu: "Pumili ng wika ng interface",

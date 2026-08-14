@@ -63,15 +63,6 @@ wheels = [
 ]
 
 [[package]]
-name = "aiolimiter"
-version = "1.2.1"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/f1/23/b52debf471f7a1e42e362d959a3982bdcb4fe13a5d46e63d28868807a79c/aiolimiter-1.2.1.tar.gz", hash = "sha256:e02a37ea1a855d9e832252a105420ad4d15011505512a1a1d814647451b5cca9", size = 7185, upload-time = "2024-12-08T15:31:51.496Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/f3/ba/df6e8e1045aebc4778d19b8a3a9bc1808adb1619ba94ca354d9ba17d86c3/aiolimiter-1.2.1-py3-none-any.whl", hash = "sha256:d3f249e9059a20badcb56b61601a83556133655c11d1eb3dd3e04ff069e5f3c7", size = 6711, upload-time = "2024-12-08T15:31:49.874Z" },
-]
-
-[[package]]
 name = "aiosignal"
 version = "1.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1225,10 +1216,8 @@ name = "mcp-agent-mail"
 version = "0.4.0"
 source = { editable = "." }
 dependencies = [
-    { name = "aiolimiter" },
     { name = "aiosqlite" },
     { name = "alembic" },
-    { name = "attrs" },
     { name = "authlib" },
     { name = "bleach" },
     { name = "fastapi" },
@@ -1237,7 +1226,6 @@ dependencies = [
     { name = "gitpython" },
     { name = "httpx", extra = ["http2"] },
     { name = "jinja2" },
-    { name = "jsonschema" },
     { name = "litellm" },
     { name = "markdown2" },
     { name = "orjson" },
@@ -1253,8 +1241,6 @@ dependencies = [
     { name = "sqlalchemy", extra = ["asyncio"] },
     { name = "sqlmodel" },
     { name = "structlog" },
-    { name = "tenacity" },
-    { name = "tiktoken" },
     { name = "tinycss2" },
     { name = "typer" },
     { name = "uvicorn", extra = ["standard"] },
@@ -1284,11 +1270,9 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aiolimiter", specifier = ">=1.1.0" },
     { name = "aiosqlite", specifier = ">=0.20.0" },
     { name = "alembic", specifier = ">=1.19.1" },
     { name = "asyncpg", marker = "extra == 'postgres'", specifier = ">=0.30.0" },
-    { name = "attrs", specifier = ">=24.2.0" },
     { name = "authlib", specifier = ">=1.5.2,<1.6" },
     { name = "bleach", specifier = ">=6.1.0" },
     { name = "fastapi", specifier = ">=0.110.0" },
@@ -1298,7 +1282,6 @@ requires-dist = [
     { name = "httpx", extras = ["http2"], specifier = ">=0.27.2" },
     { name = "ipython", marker = "extra == 'dev'", specifier = ">=8.27.0" },
     { name = "jinja2", specifier = ">=3.1.4" },
-    { name = "jsonschema", specifier = ">=4.23.0" },
     { name = "litellm", specifier = ">=1.40.0,<2" },
     { name = "markdown2", specifier = ">=2.4.12" },
     { name = "orjson", specifier = ">=3.10.7,<4" },
@@ -1318,8 +1301,6 @@ requires-dist = [
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.35" },
     { name = "sqlmodel", specifier = ">=0.0.16" },
     { name = "structlog", specifier = ">=24.1.0" },
-    { name = "tenacity", specifier = ">=8.3.0" },
-    { name = "tiktoken", specifier = ">=0.7.0" },
     { name = "tinycss2", specifier = ">=1.4.0" },
     { name = "typer", specifier = ">=0.15.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32.0" },
@@ -2304,15 +2285,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/ef/52/9ba0f43b686e7f3ddfeaa78ac3af750292662284b3661e91ad5494f21dbc/structlog-25.5.0.tar.gz", hash = "sha256:098522a3bebed9153d4570c6d0288abf80a031dfdb2048d59a49e9dc2190fc98", size = 1460830, upload-time = "2025-10-27T08:28:23.028Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a8/45/a132b9074aa18e799b891b91ad72133c98d8042c70f6240e4c5f9dabee2f/structlog-25.5.0-py3-none-any.whl", hash = "sha256:a8453e9b9e636ec59bd9e79bbd4a72f025981b3ba0f5837aebf48f02f37a7f9f", size = 72510, upload-time = "2025-10-27T08:28:21.535Z" },
-]
-
-[[package]]
-name = "tenacity"
-version = "9.1.2"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/0a/d4/2b0cd0fe285e14b36db076e78c93766ff1d529d70408bd1d2a5a84f1d929/tenacity-9.1.2.tar.gz", hash = "sha256:1169d376c297e7de388d18b4481760d478b0e99a777cad3a9c86e556f4b697cb", size = 48036, upload-time = "2025-04-02T08:25:09.966Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/e5/30/643397144bfbfec6f6ef821f36f33e57d35946c44a2352d3c9f0ae847619/tenacity-9.1.2-py3-none-any.whl", hash = "sha256:f77bf36710d8b73a50b2dd155c97b870017ad21afe6ab300326b0371b3b05138", size = 28248, upload-time = "2025-04-02T08:25:07.678Z" },
 ]
 
 [[package]]

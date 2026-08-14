@@ -1,0 +1,59 @@
+name: Bug report
+description: Something behaves differently from what it claims.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For a security vulnerability, stop and use the private route in
+        `SECURITY.md` instead.
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: Output of `git rev-parse --short HEAD`, or the image tag.
+      placeholder: 5828d1d
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Where it happens
+      description: >
+        Several defects here have been specific to one of these, so a wrong
+        guess costs more than "not sure".
+      options:
+        - Linux
+        - macOS
+        - Windows (native)
+        - Windows (Git Bash / MSYS)
+        - WSL
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and where you read it
+      description: >
+        A file and line, a docs section, or a tool docstring. If the
+        documentation is what is wrong, that is a valid bug and this is the
+        field that proves it.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+      description: >
+        Paste the command and its output. An error message beats a description
+        of an error message.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Smallest reproduction you have
+    validations:
+      required: false

@@ -394,10 +394,15 @@ graph LR
 
 ## Web UI (human-facing mail viewer)
 
-The server ships a lightweight, server-rendered Web UI for humans. It lets you browse projects, agents, inboxes, single messages, attachments, file reservations, and perform full-text search with FTS5 when available (with an automatic LIKE fallback).
+Iris serves a React single-page interface at `/mail` for people reviewing and
+steering agent activity. It provides projects, a unified inbox, message and
+thread detail, full-text search with FTS5 and a SQL LIKE fallback, composing
+and replying, account preferences, and administration of human users and
+project roles.
 
-- Where it lives: built into the HTTP server in `mcp_agent_mail.http` under the `/mail` path.
-- Who it's for: humans reviewing activity; agents should continue to use the MCP tools/resources API.
+- Where it lives: `ui/`, built into `mcp_agent_mail.http` and served under
+  `/mail`.
+- Who it is for: human users. Agents use the MCP tools and resources.
 
 ### Launching the Web UI
 
@@ -532,52 +537,46 @@ Project arguments resolve by slug or canonical human key/path. Grants are never 
 
 ### Routes and what you can do
 
-- `/mail` (Unified inbox + Projects + Related Projects Discovery)
-  - Shows a unified, reverse-chronological inbox of recent messages across all projects with excerpts, relative timestamps, sender/recipients, and project badges.
-  - Below the inbox, lists all projects (slug, human name, created time) with sibling suggestions.
-  - Suggests **likely sibling projects** when two slugs appear to be parts of the same product (e.g., backend vs. frontend). Suggestions are ranked with heuristics and, when `LLM_ENABLED=true`, an LLM pass across key docs (`README.md`, `AGENTS.md`, etc.).
-  - Admins can **Confirm Link** or **Dismiss** suggestions from the dashboard. Confirmed siblings become highlighted badges but *do not* automatically authorize either human project access or cross-project messaging; human assignments remain explicit, and agents must still establish `AgentLink` approvals via `request_contact`/`respond_contact`.
+The middleware allowlist rejects unlisted `/mail` paths before authentication
+or route handling. Every unlisted path returns 404.
 
-- `/mail/projects` (Projects index)
-  - Dedicated projects list view; click a project to drill in.
+| Surface | What you can do |
+|---|---|
+| `/mail` | Use the interface: projects, inbox, search, message and thread detail, compose and reply, account, and administration. |
+| `/mail/login`, `/mail/logout` | Sign in and out. |
+| `/mail/events` | Receive server-sent events used by the interface. |
+| `/mail/api/v1/**` | Use the typed JSON API consumed by the interface. Every response has a declared Pydantic model, and every route has an explicit security class. |
+| `/mail/api/file-reservations` | Use the untyped JSON API for editor and pre-commit hooks. This is not part of the browser interface. |
+| `/mail/assets/**` | Load the interface assets. |
 
-- `/mail/{project}` (Project overview + search + agents)
-  - Rich search form with filters:
-    - Scope: subject/body/both, Order: relevance or time, optional "boost subject".
-    - Query tokens: supports `subject:foo`, `body:"multi word"`, quoted phrases, and bare terms.
-    - Uses FTS5 bm25 scoring when available; otherwise falls back to SQL LIKE on subject/body with your chosen scope.
-  - Results show subject, sender, created time, thread id, and a highlighted snippet when using FTS.
-  - Agents panel shows registered agents for the project with a link to each inbox.
-  - Quick links to File Reservations and Attachments for the project header.
+Older bookmarks to `/mail/projects` and `/mail/unified-inbox` redirect to the
+interface. These are the only legacy paths that still resolve.
 
-- `/mail/{project}/inbox/{agent}` (Inbox for one agent)
-  - Reverse-chronological list with subject, sender, created time, importance badge, thread id.
-  - Pagination (`?page=N&limit=M`).
+#### Retired surfaces
 
-- `/mail/{project}/message/{id}` (Message detail)
-  - Shows subject, sender, created time, importance, recipients (To/Cc/Bcc), thread messages.
-  - Body rendering:
-    - If the server pre-converted markdown to HTML, it's sanitized with Bleach (limited tags/attributes, safe CSS via CSSSanitizer) and then displayed.
-    - Otherwise markdown is rendered client-side with Marked + Prism for code highlighting.
-  - Attachments are referenced from the message frontmatter (WebP files or inline data URIs).
+The source still contains the former per-agent inbox, attachments browser,
+file-reservations page, archive explorer, and UI write routes. The allowlist
+returns 404 for those paths.
 
-- `/mail/{project}/search?q=...` (Dedicated search page)
-  - Same query syntax as the project overview search, with a token "pill" UI for assembling/removing filters.
-
-- `/mail/{project}/file_reservations` (File Reservations list)
-  - Displays active and historical file reservations (exclusive/shared, path pattern, timestamps, released/expired state).
-
-- `/mail/{project}/attachments` (Messages with attachments)
-  - Lists messages that contain any attachments, with subject and created time.
-  
-- `/mail/unified-inbox` (Cross-project activity)
-  - Shows recent messages across all projects with thread counts and sender/recipients.
+- **File reservations** are available to operators and administrators through
+  `GET /mail/api/v1/reservations`, and through MCP tools and
+  `iris file_reservations active|list|soon`.
+- **Attachment metadata** appears in message detail, but attachments cannot be
+  downloaded there.
+- **Mark-read, message deletion, agent retirement, and project archiving** are
+  available through MCP tools and the `iris` CLI, not the browser.
+- **Archive operations** are available through
+  `iris archive list|save|restore`.
 
 ### Human Overseer: Sending Messages to Agents
 
 Sometimes a human operator needs to guide or redirect agents directly, whether to handle an urgent issue, provide clarification, or adjust priorities. The **Human Overseer** feature provides a web-based message composer that lets humans send high-priority messages to any combination of agents in a project.
 
-**Access:** Admins may click the prominent **"Send Message"** button in any project view or navigate directly to `/mail/{project}/overseer/compose`. Members never receive arbitrary compose access. A member with an `operator` assignment may use **Reply** on a message in that assigned project; routing, subject, and thread are locked to the original conversation. A `viewer` assignment is read-only.
+**Access:** administrators can compose messages from the **Compose** view.
+Members cannot compose arbitrary messages. A member with an `operator`
+assignment can **Reply** within the assigned project; routing, subject, and
+thread remain locked to the original conversation. A `viewer` assignment is
+read-only.
 
 #### What Makes Overseer Messages Special
 

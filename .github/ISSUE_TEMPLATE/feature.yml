@@ -1,0 +1,34 @@
+name: Feature request
+description: Propose a capability that does not exist yet.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This project is built for one operator's fleet. A proposal is more
+        likely to land if it removes a problem someone actually hit than if it
+        adds a capability that might be useful later.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >
+        What went wrong, or what you could not do. Describe the situation, not
+        the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: today
+    attributes:
+      label: What you do today instead
+      description: >
+        The workaround, however awkward. If there is none, say so — that is
+        useful information.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you propose
+    validations:
+      required: false

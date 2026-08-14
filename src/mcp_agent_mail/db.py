@@ -22,6 +22,7 @@ import contextvars
 import logging
 import re
 import secrets
+import sqlite3
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -3972,6 +3973,36 @@ def get_database_path(settings: Settings | None = None) -> Path | None:
         return None
 
     return Path(db_path)
+
+
+def connect_sqlite_readonly(
+    db_path: Path,
+    *,
+    busy_timeout_ms: int = 60_000,
+) -> sqlite3.Connection:
+    """Open a database that another process may be writing, without writing to it.
+
+    Every tool that reads the live database from a SECOND process has to use
+    this. A read-write connection there is what completes the corruption chain
+    measured on 2026-08-14: it can checkpoint the WAL and unlink `-wal`/`-shm`
+    when it closes, and if the server has meanwhile lost its own POSIX locks it
+    will do exactly that underneath a running server.
+
+    `mode=ro` and not `immutable=1`: immutable promises SQLite the file cannot
+    change and it then skips locking entirely, which is true of a snapshot and
+    false of a live database -- SQLite's own documentation says incorrect
+    results and SQLITE_CORRUPT may follow if the file does change. `query_only`
+    is belt and braces: it turns an accidental write into an error here rather
+    than a surprise for whoever is writing.
+    """
+    connection = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+    try:
+        connection.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+        connection.execute("PRAGMA query_only=ON")
+    except Exception:
+        connection.close()
+        raise
+    return connection
 
 
 def get_sqlite_sidecar_paths(db_path: Path) -> tuple[Path, Path]:

@@ -62,6 +62,7 @@ from .app import (
 )
 from .config import clear_settings_cache, get_settings
 from .db import (
+    connect_sqlite_readonly,
     ensure_schema,
     get_immediate_session,
     get_session,
@@ -3301,7 +3302,7 @@ def share_export(
 
 def _list_projects_for_wizard(database_path: Path) -> list[tuple[str, str]]:
     projects: list[tuple[str, str]] = []
-    conn = sqlite3.connect(str(database_path))
+    conn = connect_sqlite_readonly(database_path)
     try:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("SELECT slug, human_key FROM projects ORDER BY slug COLLATE NOCASE").fetchall()
@@ -7271,7 +7272,9 @@ def doctor_check(
         db_path = get_database_path(settings)
         if db_path and db_path.exists():
             try:
-                conn = sqlite3.connect(str(db_path))
+                # Read-only: doctor exists to be run against a LIVE deployment,
+                # so it must never be the second writer (connect_sqlite_readonly).
+                conn = connect_sqlite_readonly(db_path)
                 try:
                     cursor = conn.execute("PRAGMA integrity_check")
                     integrity_result = cursor.fetchone()

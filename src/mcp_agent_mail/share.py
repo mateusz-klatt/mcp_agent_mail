@@ -25,6 +25,7 @@ from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 from sqlalchemy.engine import make_url
 
 from .config import get_settings
+from .db import connect_sqlite_readonly
 
 
 class ShareExportError(RuntimeError):
@@ -863,13 +864,14 @@ def create_sqlite_snapshot(source: Path, destination: Path, *, checkpoint: bool 
             f"Destination snapshot already exists at {destination}. Choose a new path or remove it manually."
         )
 
-    source_conn = sqlite3.connect(str(source))
+    # Read-only: the source may be a LIVE database, and a read-write connection
+    # from this second process can checkpoint and unlink its -wal/-shm on close.
+    # The `checkpoint` argument is accepted for compatibility and deliberately
+    # ignored -- measured 2026-08-14: Connection.backup() through a read-only
+    # connection already copies committed WAL frames, so the checkpoint bought
+    # nothing and was a write against a database someone else owns.
+    source_conn = connect_sqlite_readonly(source)
     try:
-        if checkpoint:
-            try:
-                source_conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
-            except sqlite3.Error as exc:  # pragma: no cover - defensive
-                raise ShareExportError(f"Failed to run WAL checkpoint: {exc}") from exc
         dest_conn = sqlite3.connect(str(destination))
         try:
             source_conn.backup(dest_conn)
@@ -948,7 +950,8 @@ def _create_viewer_snapshot(
         )
     destination.parent.mkdir(parents=True, exist_ok=True)
 
-    source_conn = sqlite3.connect(str(source))
+    # Read-only: the source may be the live database (see connect_sqlite_readonly).
+    source_conn = connect_sqlite_readonly(source)
     destination_conn: sqlite3.Connection | None = None
     try:
         source_conn.row_factory = sqlite3.Row

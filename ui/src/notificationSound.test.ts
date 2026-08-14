@@ -139,6 +139,45 @@ describe("playNotificationTone", () => {
     expect(close).toHaveBeenCalledOnce();
   });
 
+  it("swallows a context that refuses to close", () => {
+    // `close()` returning a rejected promise must not surface as an unhandled
+    // rejection: the notification has already been delivered by then, so there
+    // is nothing left to salvage and nothing worth reporting.
+    const oscillator = {
+      connect: vi.fn(),
+      frequency: { value: 0 },
+      type: "" as OscillatorType,
+      start: vi.fn(),
+      stop: vi.fn(),
+      onended: null as (() => void) | null,
+    };
+    const gain = {
+      connect: vi.fn(),
+      gain: {
+        setValueAtTime: vi.fn(),
+        exponentialRampToValueAtTime: vi.fn(),
+      },
+    };
+    const close = vi.fn().mockRejectedValue(new Error("already closed"));
+    vi.stubGlobal(
+      "AudioContext",
+      vi.fn(function AudioContextStub(this: unknown) {
+        return {
+          createOscillator: () => oscillator,
+          createGain: () => gain,
+          currentTime: 0,
+          destination: {},
+          close,
+        };
+      }),
+    );
+
+    playNotificationTone("soft", memoryStorage({ [soundPreferenceKey]: "on" }));
+
+    expect(() => oscillator.onended?.()).not.toThrow();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
   it("survives a browser with no audio support", () => {
     vi.stubGlobal("AudioContext", undefined);
     vi.stubGlobal("webkitAudioContext", undefined);

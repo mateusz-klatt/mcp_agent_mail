@@ -44,9 +44,11 @@ export const tones = {
 const defaultTone: Tone = { hz: 880, wave: "sine" };
 
 export function soundEnabled(
-  storage: Pick<Storage, "getItem"> | undefined = typeof localStorage === "undefined"
-    ? undefined
-    : localStorage,
+  // Read off `globalThis` rather than the bare identifier: in a non-DOM
+  // environment `localStorage` is an undeclared name and evaluating it throws,
+  // while the property is simply absent. That keeps the default a plain lookup
+  // instead of an environment test with a branch no browser ever takes.
+  storage: Pick<Storage, "getItem"> | undefined = globalThis.localStorage,
 ): boolean {
   try {
     return storage?.getItem(soundPreferenceKey) === "on";
@@ -59,10 +61,10 @@ export function soundEnabled(
 
 export function setSoundEnabled(
   on: boolean,
-  storage: Pick<Storage, "setItem"> = localStorage,
+  storage: Pick<Storage, "setItem"> | undefined = globalThis.localStorage,
 ): void {
   try {
-    storage.setItem(soundPreferenceKey, on ? "on" : "off");
+    storage?.setItem(soundPreferenceKey, on ? "on" : "off");
   } catch {
     /* nothing to do: the toggle simply will not persist */
   }
@@ -101,10 +103,9 @@ export function playNotificationTone(
   sound?: string | null,
   storage?: Pick<Storage, "getItem">,
 ): void {
-  // Resolved lazily rather than defaulted in the signature: `localStorage` does
-  // not exist in a non-DOM environment, and evaluating it there would throw
-  // before the guard below could decline.
-  if (!soundEnabled(storage ?? (typeof localStorage === "undefined" ? undefined : localStorage))) {
+  // `soundEnabled` supplies the same default when `storage` is omitted, so the
+  // environment lookup lives in exactly one place.
+  if (!soundEnabled(storage)) {
     return;
   }
   const Ctor = audioContextConstructor();

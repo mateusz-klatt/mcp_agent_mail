@@ -519,6 +519,87 @@ describe("Iris landing shell", () => {
     vi.unstubAllGlobals();
   });
 
+  it("arms and mutes the notification sound from the topbar", async () => {
+    // The control is the only way a reader can turn tones on: browsers refuse
+    // audio until a gesture inside the page, and arriving from the login form
+    // does not count.
+    const user = userEvent.setup();
+    // Node 26 ships its own `localStorage` global that stays unavailable
+    // without `--localstorage-file`, and it shadows the one jsdom would
+    // provide — so the preference store has to be supplied here or every
+    // persistence path silently no-ops.
+    const stored = new Map<string, string>();
+    vi.stubGlobal("localStorage", {
+      getItem: (key: string) => stored.get(key) ?? null,
+      setItem: (key: string, value: string) => {
+        stored.set(key, value);
+      },
+      removeItem: (key: string) => {
+        stored.delete(key);
+      },
+    });
+    const contexts: unknown[] = [];
+    vi.stubGlobal(
+      "AudioContext",
+      vi.fn(function AudioContextStub(this: unknown) {
+        const ctx = {
+          createOscillator: () => ({
+            connect: vi.fn(),
+            frequency: { value: 0 },
+            type: "sine" as OscillatorType,
+            start: vi.fn(),
+            stop: vi.fn(),
+            onended: null,
+          }),
+          createGain: () => ({
+            connect: vi.fn(),
+            gain: {
+              setValueAtTime: vi.fn(),
+              exponentialRampToValueAtTime: vi.fn(),
+            },
+          }),
+          currentTime: 0,
+          destination: {},
+          close: vi.fn().mockResolvedValue(undefined),
+        };
+        contexts.push(ctx);
+        return ctx;
+      }),
+    );
+
+    render(<App />);
+    await waitForEnglishPreferences();
+
+    const toggle = await screen.findByRole("button", {
+      name: "Notification sound off. Click to unmute.",
+    });
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+
+    await user.click(toggle);
+
+    // Enabling plays the default tone: it doubles as the gesture the browser
+    // wants and as proof to the reader that audio works here.
+    expect(stored.get("agentMailSound")).toBe("on");
+    expect(contexts).toHaveLength(1);
+    const armed = await screen.findByRole("button", {
+      name: "Notification sound on. Click to mute.",
+    });
+    expect(armed).toHaveAttribute("aria-pressed", "true");
+
+    await user.click(armed);
+
+    // Muting must stay silent — no second context.
+    expect(contexts).toHaveLength(1);
+    expect(stored.get("agentMailSound")).toBe("off");
+    expect(
+      await screen.findByRole("button", {
+        name: "Notification sound off. Click to unmute.",
+      }),
+    ).toHaveAttribute("aria-pressed", "false");
+
+    vi.unstubAllGlobals();
+  });
+
   it("renders the real inbox without demo controls or invented unread data", async () => {
     render(<App />);
     await waitForEnglishPreferences();
@@ -1209,6 +1290,12 @@ describe("Iris landing shell", () => {
                   agent_generation: "b".repeat(64),
                   name: "OldOnly",
                   display_name: null,
+                  // Required by the parser. Without it the response fails to
+                  // parse and the late handler never runs at all — which the
+                  // assertions below cannot tell apart from the stale-guard
+                  // doing its job, so the test would keep passing while
+                  // silently stopping testing the guard.
+                  notify_sound: null,
                 }],
                 total: 1,
               }),

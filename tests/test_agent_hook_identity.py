@@ -8473,3 +8473,97 @@ def test_hook_refuses_secret_state_and_recovers_crash_locks_without_aba(
     second_healer = healers[second_index]
     release_markers[second_index].write_text("release\n", encoding="utf-8")
     assert second_healer.wait(timeout=5) == 0
+
+
+def test_execution_manifest_enumeration_survives_crlf_from_jq(tmp_path: Path) -> None:
+    """The manifest scan must not drop entries when jq writes CRLF.
+
+    ``jq`` is the only producer in the hook library that feeds a ``read`` loop
+    directly, and the Git Bash ``jq.exe`` opens stdout in text mode, so on
+    native Windows every name arrives as ``<file>.json\r``. The CR survives
+    ``read -r`` and defeats the ``*.json`` glob, which emptied this enumeration
+    and silently turned all nine of its consumers — subagent stop, root
+    heartbeat, root end — into no-ops. Nothing reported it because the whole
+    path is deliberately failure-open.
+
+    The shim is load-bearing: real ``jq`` emits LF on Linux and macOS, so
+    without it this test passes with or without the fix on the two platforms
+    that run it most, and would be pure decoration. ``SHIM_CRLF`` is asserted
+    for the same reason — it fails the test if the shim ever stops reproducing
+    the condition, rather than letting the assertion below go vacuous.
+    """
+    real_jq = shutil.which("jq")
+    if real_jq is None:
+        pytest.skip("jq is required to exercise the manifest enumeration")
+
+    state_dir = tmp_path / "state"
+    (state_dir / "executions").mkdir(parents=True)
+    (state_dir / "execution-manifests").mkdir(parents=True)
+
+    shim_dir = tmp_path / "bin"
+    shim_dir.mkdir()
+    shim = shim_dir / "jq"
+    # Not `sed 's/$/\r/'`: MSYS sed strips the CR it is being asked to add,
+    # so the shim silently degrades to a no-op on the very platform this test
+    # exists for. Normalising to exactly one CR also keeps it deterministic
+    # where the real jq already emits CRLF - a second CR would survive the
+    # single-CR strip in the library and fail this test against correct code.
+    shim.write_text(
+        "#!/usr/bin/env bash\n"
+        r'''"$REAL_JQ" "$@" | while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    printf '%s\r\n' "$line"
+done
+exit "${PIPESTATUS[0]}"
+''',
+        encoding="utf-8",
+        # Windows would otherwise translate the shebang's LF to CRLF and
+        # `env` would look for a program literally named "bash\r".
+        newline="\n",
+    )
+    shim.chmod(shim.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    script = r"""
+set -uo pipefail
+. scripts/hooks/agent_mail_common.sh || { echo "SOURCE_FAILED"; exit 1; }
+sid=11111111-2222-3333-4444-555555555555
+manifest="$(am_execution_manifest_file claude "$sid" 1)" || {
+    echo "NO_MANIFEST_PATH"; exit 1; }
+printf '{"kind":"subagent"}' > "$AM_STATE_DIR/executions/state-one.json"
+printf '{"kind":"subagent"}' > "$AM_STATE_DIR/executions/state-two.json"
+printf '%s' '{"version":1,"client":"claude","session_id":"'"$sid"'",
+"lifecycle_generation":1,
+"state_files":["state-one.json","state-two.json"]}' > "$manifest"
+# Read the CR back through the exact mechanism under test. On MSYS, sed and
+# grep silently normalise CRLF and command substitution strips the CR too, so
+# all three report "no CR" on bytes that demonstrably contain one and would
+# quietly disarm this control. `read -r` from a process substitution is what
+# the library itself uses, and it is the one that preserves the byte.
+probe=""
+while IFS= read -r probe; do break; done \
+    < <(jq -r '.state_files[]' "$manifest")
+case "$probe" in
+    *$'\r') echo "SHIM_CRLF=yes" ;;
+    *) echo "SHIM_CRLF=no" ;;
+esac
+echo "COUNT=$(am_execution_manifest_state_files claude "$sid" 1 | grep -c .)"
+"""
+
+    result = _bash(
+        script,
+        env={
+            "AGENT_MAIL_STATE_DIR": state_dir.as_posix(),
+            "REAL_JQ": real_jq,
+            "PATH": f"{shim_dir.as_posix()}{os.pathsep}{os.environ.get('PATH', '')}",
+        },
+    )
+
+    assert "SOURCE_FAILED" not in result.stdout, result.stderr
+    assert "SHIM_CRLF=yes" in result.stdout, (
+        "the jq shim stopped emitting CRLF, so this test no longer reproduces "
+        f"the Windows condition it exists for: {result.stdout!r} {result.stderr!r}"
+    )
+    assert "COUNT=2" in result.stdout, (
+        f"manifest enumeration dropped CRLF-terminated names: "
+        f"{result.stdout!r} {result.stderr!r}"
+    )

@@ -1386,6 +1386,14 @@ am_execution_manifest_state_files() {
         "$client" "$session_id" "$generation")" || return 1
     [ -r "$manifest_file" ] || return 0
     while IFS= read -r name; do
+        # jq is the only producer in this library that feeds a read loop
+        # directly, and the Git Bash jq.exe opens stdout in text mode, so every
+        # line arrives as "<name>.json\r". The trailing CR survives `read -r`
+        # and makes the *.json glob below fail, which emptied this enumeration
+        # on native Windows and silently turned all nine of its consumers —
+        # subagent stop, root heartbeat, root end — into no-ops. Failure is
+        # open by design here, so nothing reported it.
+        name="${name%$'\r'}"
         case "$name" in ''|*/*|*\\*) continue ;; esac
         case "$name" in *.json) ;; *) continue ;; esac
         printf '%s/executions/%s\n' "$AM_STATE_DIR" "$name"

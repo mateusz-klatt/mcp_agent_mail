@@ -292,7 +292,10 @@ class TestCommitRetryIntegration:
         test_file = Path(working_tree) / relative_path
         test_file.parent.mkdir(parents=True)
         content = "long-path capable\n"
-        test_file.write_text(content, encoding="utf-8")
+        # newline="" keeps Python from translating the \n to \r\n on
+        # Windows: the assertion below compares the committed blob against
+        # these exact bytes, so a translated write fails there and only there.
+        test_file.write_text(content, encoding="utf-8", newline="")
 
         original_call_process = Git._call_process
         write_options: dict[str, tuple[str, ...]] = {}

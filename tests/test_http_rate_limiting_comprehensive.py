@@ -17,11 +17,34 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import sys
+import time
 from types import ModuleType
 from typing import Any, cast
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+
+
+class _ControlledClock:
+    """A monotonic clock the test advances by hand.
+
+    The token-bucket limiter refills against elapsed wall time, so asserting
+    "the next request is refused" silently depends on the machine finishing
+    the previous requests faster than the refill interval. On the Windows
+    runner it does not: five requests took over a second, a token refilled,
+    and the request that had to be 429 came back 200. Driving the clock makes
+    the assertion about the limiter instead of about the runner.
+    """
+
+    def __init__(self, start: float = 10_000.0) -> None:
+        self._now = start
+
+    def __call__(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
+
 
 from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
@@ -195,6 +218,9 @@ class TestBurstCapacity:
         monkeypatch.setenv("HTTP_RATE_LIMIT_TOOLS_PER_MINUTE", "60")  # 1 per second
         monkeypatch.setenv("HTTP_RATE_LIMIT_TOOLS_BURST", "5")  # Allow 5 burst
         monkeypatch.setenv("HTTP_RBAC_ENABLED", "false")
+        # Frozen: the six requests below must consume the bucket without any
+        # refill, whatever the runner's speed.
+        monkeypatch.setattr(time, "monotonic", _ControlledClock())
         with contextlib.suppress(Exception):
             _config.clear_settings_cache()
         settings = _config.get_settings()
@@ -274,6 +300,8 @@ class TestTokenRefill:
         monkeypatch.setenv("HTTP_RATE_LIMIT_TOOLS_PER_MINUTE", "60")
         monkeypatch.setenv("HTTP_RATE_LIMIT_TOOLS_BURST", "1")
         monkeypatch.setenv("HTTP_RBAC_ENABLED", "false")
+        clock = _ControlledClock()
+        monkeypatch.setattr(time, "monotonic", clock)
         with contextlib.suppress(Exception):
             _config.clear_settings_cache()
         settings = _config.get_settings()
@@ -297,8 +325,9 @@ class TestTokenRefill:
             )
             assert r2.status_code == 429
 
-            # Wait for refill (1 second for 1 token at 60/min rate)
-            await asyncio.sleep(1.1)
+            # Refill one token at 60/min. Advancing the clock instead of
+            # sleeping keeps this deterministic and costs no wall time.
+            clock.advance(1.1)
 
             # Should succeed again
             r3 = await client.post(

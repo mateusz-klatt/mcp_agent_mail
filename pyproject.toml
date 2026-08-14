@@ -179,5 +179,10 @@ dev = [
     "playwright==1.62.0",
     "pytest-asyncio>=1.2.0",
     "pytest-cov>=7.0.0",
+    # Splits the Windows leg across parallel runners.  That leg needs ~4.5 h for
+    # the full suite while Ubuntu needs 19 min, so it was being killed by the
+    # 180-minute ceiling at ~59% having printed nothing at all — failures in the
+    # first five minutes were as invisible as failures in the last hour.
+    "pytest-split>=0.10.0",
     "pytest-timeout>=2.4.0",
 ]

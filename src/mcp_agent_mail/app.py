@@ -21,7 +21,7 @@ import stat
 import subprocess
 import time
 from collections import defaultdict, deque
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -33,6 +33,9 @@ from urllib.parse import parse_qsl
 import uuid
 
 from fastmcp import Context, FastMCP
+from fastmcp.exceptions import ToolError as _FastMCPToolError
+from fastmcp.server.middleware import Middleware
+from pydantic import ValidationError
 from git import Repo
 from git.exc import InvalidGitRepositoryError, NoSuchPathError
 from sqlalchemy import and_ as _sa_and, asc as _sa_asc, bindparam, delete as _sa_delete, desc as _sa_desc, exists as _sa_exists, func, or_ as _sa_or, select as _sa_select, text, update as _sa_update
@@ -6932,6 +6935,70 @@ async def _agent_execution_reaper_worker(settings: Settings) -> None:
         await asyncio.sleep(interval_seconds)
 
 
+_CREDENTIAL_ARGUMENT_PATTERN = re.compile(
+    r"token|secret|credential|password|bearer", re.IGNORECASE
+)
+
+
+def _redacted_validation_message(
+    tool_name: str,
+    error: ValidationError,
+    arguments: Mapping[str, Any],
+) -> str:
+    """Render a validation failure without echoing anything credential-shaped.
+
+    Pydantic reports the offending value, and for an unexpected keyword that
+    value IS the argument. So a typo in a token's own field name -- writing
+    `registration_tokens` instead of `registration_token` -- prints the token
+    in full and untruncated. Measured on 2026-08-14; it burned a live token,
+    and it hit three agents in one day because the argument names are long
+    and similar.
+
+    Field name, message and error type are kept: they are what makes the
+    error actionable, and none of them carry the value. An input is echoed
+    only when neither its own name nor any credential-named argument's value
+    could be hiding in it.
+    """
+    secrets_in_call = {
+        str(value)
+        for key, value in arguments.items()
+        if _CREDENTIAL_ARGUMENT_PATTERN.search(str(key)) and isinstance(value, str) and value
+    }
+
+    def _safe_input(location: tuple[Any, ...], value: Any) -> str:
+        if any(_CREDENTIAL_ARGUMENT_PATTERN.search(str(part)) for part in location):
+            return "<redacted>"
+        rendered = repr(value)
+        if any(secret in rendered for secret in secrets_in_call):
+            return "<redacted>"
+        return rendered if len(rendered) <= 120 else f"{rendered[:117]}..."
+
+    lines = [f"{len(error.errors())} validation error(s) for {tool_name}"]
+    for entry in error.errors():
+        location = tuple(entry.get("loc", ()))
+        where = ".".join(str(part) for part in location) or "<call>"
+        lines.append(
+            f"  {where}: {entry.get('msg', 'invalid')} "
+            f"[type={entry.get('type', 'unknown')}, input={_safe_input(location, entry.get('input'))}]"
+        )
+    return "\n".join(lines)
+
+
+class _CredentialSafeValidationErrors(Middleware):
+    """Keep argument validation failures from quoting credentials back."""
+
+    async def on_call_tool(self, context: Any, call_next: Any) -> Any:
+        try:
+            return await call_next(context)
+        except ValidationError as exc:
+            arguments = getattr(context.message, "arguments", None) or {}
+            raise _FastMCPToolError(
+                _redacted_validation_message(
+                    getattr(context.message, "name", "<tool>"), exc, arguments
+                )
+            ) from None
+
+
 def build_mcp_server() -> FastMCP:
     """Create and configure the FastMCP server instance."""
     settings: Settings = get_settings()
@@ -6945,6 +7012,7 @@ def build_mcp_server() -> FastMCP:
     )
 
     mcp = FastMCP(name="mcp-agent-mail", instructions=instructions, lifespan=lifespan)
+    mcp.add_middleware(_CredentialSafeValidationErrors())
 
     # Session bindings are keyed by `ctx.session_id` (the FastMCP-assigned
     # ID derived from the `mcp-session-id` header for HTTP transport, or a

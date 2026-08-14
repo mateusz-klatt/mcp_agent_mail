@@ -434,15 +434,29 @@ async def test_isomorphism_e2e_suite(
             ISOMORPH_BETA_DENIED,
             ISOMORPH_ALPHA_SENDER,
         ]
+        # Explicit display_name keeps the golden deterministic: provisioning
+        # would otherwise assign a random adjective+noun alias to each agent.
         for name in agents_alpha:
             await client.call_tool(
                 "register_agent",
-                {"project_key": alpha_key, "program": "codex", "model": "gpt-5", "name": name},
+                {
+                    "project_key": alpha_key,
+                    "program": "codex",
+                    "model": "gpt-5",
+                    "name": name,
+                    "display_name": f"{name} Display",
+                },
             )
         for name in agents_beta:
             await client.call_tool(
                 "register_agent",
-                {"project_key": beta_key, "program": "codex", "model": "gpt-5", "name": name},
+                {
+                    "project_key": beta_key,
+                    "program": "codex",
+                    "model": "gpt-5",
+                    "name": name,
+                    "display_name": f"{name} Display",
+                },
             )
         await client.call_tool(
             "set_contact_policy",

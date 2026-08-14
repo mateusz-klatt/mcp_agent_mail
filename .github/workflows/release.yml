@@ -54,6 +54,23 @@ jobs:
       - name: Sync dependencies (dev)
         run: uv sync --dev --frozen
 
+      # The image build and its two-architecture smoke take well over an hour.
+      # A missing Docker Hub credential must fail here, not after that work.
+      - name: Verify Docker Hub credentials are configured
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [[ -n "${DOCKERHUB_USERNAME:-}" ]] || missing+=(DOCKERHUB_USERNAME)
+          [[ -n "${DOCKERHUB_TOKEN:-}" ]] || missing+=(DOCKERHUB_TOKEN)
+          if (( ${#missing[@]} )); then
+            echo "::error::Missing repository secret(s): ${missing[*]}."
+            echo "::error::Set them with: gh secret set <NAME> --repo ${GITHUB_REPOSITORY}"
+            exit 1
+          fi
+
       - name: Verify exact tag, checkout, and project version
         id: version
         shell: bash
@@ -263,11 +280,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Docker Hub is the public shop window, alongside klattm/hestia. The
+      # candidates were built and smoked against GHCR; nothing is rebuilt for
+      # this registry, the promote step below copies the exact same digests.
+      - name: Log in to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Extract metadata (tags, labels)
         id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
-          images: ghcr.io/${{ github.repository }}
+          # Both registries receive the identical tag set, so a digest can be
+          # traced from either one without knowing which was published first.
+          images: |
+            ghcr.io/${{ github.repository }}
+            docker.io/klattm/iris
           tags: |
             type=raw,value=latest,enable=${{ needs.validate-release.outputs.prerelease == 'false' }}
             type=ref,event=tag
@@ -276,7 +306,7 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
-      - name: Promote exact candidates to release tags
+      - name: Promote exact candidates to release tags on both registries
         id: promote
         shell: bash
         env:
@@ -300,6 +330,17 @@ jobs:
             echo "::error::Metadata action produced no release tags"
             exit 1
           fi
+
+          # A mistake in the `images:` list would publish to one registry and
+          # silently skip the other, which nothing downstream would notice.
+          # Match on the repository path rather than the registry prefix:
+          # metadata-action may normalise `docker.io/` away, but never the path.
+          for repository in "ghcr.io/" "klattm/iris"; do
+            if ! grep -q "$repository" <<< "$RELEASE_TAGS"; then
+              echo "::error::No release tag targets ${repository}; refusing a half-published release"
+              exit 1
+            fi
+          done
 
           for digest in "$AMD64_DIGEST" "$ARM64_DIGEST"; do
             if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -346,5 +387,12 @@ jobs:
           prerelease: ${{ needs.validate-release.outputs.prerelease == 'true' }}
           body: |
             Container digest: `${{ steps.promote.outputs.digest }}`
+
+            The same digest is published to both registries:
+
+            ```
+            docker run -p 8765:8765 -v iris-data:/data klattm/iris:${{ github.ref_name }}
+            docker run -p 8765:8765 -v iris-data:/data ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ```
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

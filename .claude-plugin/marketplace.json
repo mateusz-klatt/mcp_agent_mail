@@ -6,13 +6,13 @@
   },
   "metadata": {
     "description": "MCP Agent Mail — coordinated multi-agent messaging. Ships the night monitor that delivers mail to an unattended Claude Code session, armed on demand by the bundled `wake` skill.",
-    "version": "0.3.4"
+    "version": "0.4.0"
   },
   "plugins": [
     {
       "name": "mcp-agent-mail",
       "source": "./",
-      "version": "0.3.4",
+      "version": "0.4.0",
       "description": "Night-time instant mail delivery for Claude Code. Declares a background monitor that streams Agent Mail hints for the life of the session, armed on demand by the bundled `wake` skill. Identity, credentials and message delivery still come from the lifecycle hooks installed by scripts/integrate_claude_code.sh; this plugin adds only the arming.",
       "author": {
         "name": "Mateusz Klatt",

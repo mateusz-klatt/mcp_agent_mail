@@ -23,6 +23,25 @@ The Python package, CLI, protocol paths and deployment identifiers stay `mcp_age
 
 ## Install this fork
 
+To just get a server running, take the published image — nothing to build, no
+toolchain to install:
+
+```bash
+docker run -d --name iris -p 8765:8765 -v iris-data:/data \
+  -e MAIL_UI_SESSION_SECRET="$(openssl rand -hex 32)" \
+  klattm/iris
+
+# create the first human account, then open http://127.0.0.1:8765/mail
+docker exec -it iris /app/.venv/bin/python -m mcp_agent_mail.cli \
+  ui-users add admin --role admin
+```
+
+The session secret has no default on purpose: a shipped one would let anyone
+forge a signed session. Keep the value — changing it signs everyone out.
+
+To install the client-side pieces — the lifecycle hooks that give each agent its
+identity, and the per-client integrators:
+
 ```bash
 curl -fsSL "https://raw.githubusercontent.com/mateusz-klatt/mcp_agent_mail/main/scripts/install.sh?$(date +%s)" | bash -s -- --yes
 ```
@@ -2112,6 +2131,45 @@ Group multiple repositories (e.g., frontend, backend, infra) under a single prod
   - Product-wide search, inbox, and thread summarization require an authenticated agent identity. They read `AGENT_MAIL_REGISTRATION_TOKEN` from the environment or auto-use one unambiguous locally stored token; registration capabilities are never placed in process arguments.
 
 ## Containers
+
+Running the published image is the shortest path to a working server — there is
+nothing to build and no Python, Node or Rust toolchain to install.
+
+```bash
+docker run -d --name iris -p 8765:8765 -v iris-data:/data \
+  -e MAIL_UI_SESSION_SECRET="$(openssl rand -hex 32)" \
+  klattm/iris
+
+docker exec -it iris /app/.venv/bin/python -m mcp_agent_mail.cli \
+  ui-users add admin --role admin
+```
+
+The image defaults `STORAGE_ROOT` and `DATABASE_URL` under `/data`, so a single
+volume carries both the archive and the database. `MAIL_UI_SESSION_SECRET` is
+deliberately not defaulted — a shipped secret would let anyone forge a signed
+session — so supply one and keep it; changing it signs everyone out.
+
+The same image, byte for byte, is published to both registries:
+
+| Registry | Image |
+|---|---|
+| Docker Hub | `klattm/iris` |
+| GHCR | `ghcr.io/mateusz-klatt/mcp_agent_mail` |
+
+Each release publishes `:<version>`, `:sha-<commit>` and — for non-prereleases —
+`:latest`, for `linux/amd64` and `linux/arm64`. A tag is only created after that
+exact digest has been started on both architectures and answered
+`/health/liveness` and `/health/readiness`, so `latest` can never point at an
+image that has not run.
+
+Pin the version for anything you depend on:
+
+```bash
+docker run -p 8765:8765 -v iris-data:/data klattm/iris:0.4.0
+```
+
+Building it yourself is still supported, and is what you want when changing the
+image itself:
 
 - Build and run locally:
   ```bash

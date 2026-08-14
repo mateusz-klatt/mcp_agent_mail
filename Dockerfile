@@ -174,9 +174,18 @@ RUN uv sync --frozen --no-dev
 RUN test ! -e ./src/mcp_agent_mail/ui_dist
 COPY --from=ui-builder /ui/dist ./src/mcp_agent_mail/ui_dist
 
-# Defaults suitable for container
+# Defaults suitable for container.
+#
+# DATABASE_URL is set here for the same reason as STORAGE_ROOT: the application
+# default is `sqlite+aiosqlite:///./storage.sqlite3`, which resolves against the
+# working directory (/app) and therefore lands in the container's writable
+# layer rather than on the mounted volume. `docker run -v iris-data:/data` would
+# then appear to work and lose the whole mailbox on `docker rm`. Pointing it at
+# /data/mailbox makes the documented one-command run durable by default; both
+# variables remain overridable, and docker-compose.yml sets its own.
 ENV HTTP_HOST=0.0.0.0 \
-    STORAGE_ROOT=/data/mailbox
+    STORAGE_ROOT=/data/mailbox \
+    DATABASE_URL=sqlite+aiosqlite:////data/mailbox/iris.sqlite3
 
 EXPOSE 8765
 VOLUME ["/data"]

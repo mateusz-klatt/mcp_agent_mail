@@ -114,6 +114,13 @@ is unavailable; Git Bash itself does not guarantee it. Verify `curl --version`
 and `jq --version` in that same shell before installing. The generated Codex
 `commandWindows` also points directly to Git for Windows `bash.exe`.
 
+Both lifecycle integrators are idempotent upgrades. After a Git pull, rerun
+`scripts/integrate_claude_code.sh --yes` and
+`scripts/integrate_codex_cli.sh --yes`; do not uninstall their user-level hook
+definitions first. The separate `plugin uninstall` followed by `plugin install`
+sequence described above applies only when refreshing Claude's copied plugin
+snapshot (the `/wake` skill and monitor), not these lifecycle hook copies.
+
 Installed Git guards are deliberately standalone programs. They read the
 short-lived process signals `AGENT_NAME`, `AGENT_EXECUTION_ID`,
 `AGENT_EXECUTION_ANCESTOR_IDS`, `AGENT_EXECUTION_MARKER_MAX_AGE_SECONDS`, and
@@ -415,6 +422,24 @@ likewise removes only the old Agent Mail top-level `notify`; an unrelated
 `notify` command survives. Codex requires the exact hash of non-managed command
 hooks to be reviewed, so open `/hooks` after installation or after any hook
 update and trust the displayed user-level definitions.
+
+On a Windows host Codex can run in three distinct runtime modes, and a
+profile's physical location never determines Agent identity:
+
+- Codex launched from WSL Bash uses the WSL `~/.codex` profile and a
+  `codex-wsl-...` identity.
+- Codex launched from CMD or PowerShell uses the Windows profile and its
+  `commandWindows` Git Bash launcher, producing a `codex-win-...` identity.
+- Codex Desktop configured to run in WSL may expose that same Windows profile
+  as `CODEX_HOME=/mnt/<drive>/...`. It executes the POSIX `command`, resolves
+  the wrapper through its runtime `CODEX_HOME`, and remains `codex-wsl-...`.
+
+The installed POSIX command therefore expands `${CODEX_HOME:-$HOME/.codex}`
+only when the hook runs. `am_platform` then identifies WSL from the actual
+Linux process (`WSL_DISTRO_NAME` or the Microsoft kernel marker),
+while native Git Bash identifies Windows. This mirrors local MCP launchers that
+branch on Node's runtime `process.platform`; neither mechanism infers the
+operating system from a shared configuration file's path.
 The wire formats and trust behavior follow the current
 [Codex hooks reference](https://learn.chatgpt.com/docs/hooks).
 

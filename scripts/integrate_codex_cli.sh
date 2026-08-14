@@ -53,7 +53,8 @@ _normalize_codex_user_path() {
   esac
 }
 
-CODEX_DIR="$(_normalize_codex_user_path "${CODEX_HOME:-${HOME}/.codex}")" || exit 1
+_CODEX_HOME_INPUT="${CODEX_HOME:-${HOME}/.codex}"
+CODEX_DIR="$(_normalize_codex_user_path "$_CODEX_HOME_INPUT")" || exit 1
 SHARED_ENV_FILE="$(_normalize_codex_user_path \
   "${AGENT_MAIL_ENV_FILE:-${HOME}/.agent-mail.env}")" || exit 1
 AGENT_MAIL_ENV_FILE="$SHARED_ENV_FILE"
@@ -204,9 +205,13 @@ if ! bash -n <<<"$CODEX_WRAPPER_CONTENT"; then
   exit 1
 fi
 
-printf -v _HOOK_WRAPPER_Q '%q' "$HOOK_WRAPPER"
+# Resolve the POSIX hook path in the Codex runtime, not in this installer.
+# That distinction lets one Windows-hosted profile serve all supported modes:
+# native Windows selects commandWindows below, native WSL uses its Linux HOME,
+# and Codex Desktop in WSL uses its /mnt/... CODEX_HOME.  The hook's actual
+# process environment remains the sole source of the win/wsl identity segment.
 _posix_hook_command() {
-  printf 'bash %s %s' "$_HOOK_WRAPPER_Q" "$1"
+  printf 'bash "${CODEX_HOME:-${HOME}/.codex}/hooks/mcp-agent-mail/hook_wrapper.sh" %s' "$1"
 }
 
 # commandWindows is explicit even when the file is generated on a POSIX host,
@@ -214,6 +219,13 @@ _posix_hook_command() {
 # resolve the actual Git for Windows installation and the actual hook path.
 _WINDOWS_BASH='C:\Program Files\Git\bin\bash.exe'
 _WINDOWS_WRAPPER='%USERPROFILE%\.codex\hooks\mcp-agent-mail\hook_wrapper.sh'
+case "$_CODEX_HOME_INPUT" in
+  [a-zA-Z]:\\*|[a-zA-Z]:/*)
+    _WINDOWS_CODEX_HOME="${_CODEX_HOME_INPUT//\//\\}"
+    _WINDOWS_CODEX_HOME="${_WINDOWS_CODEX_HOME%\\}"
+    _WINDOWS_WRAPPER="${_WINDOWS_CODEX_HOME}\\hooks\\mcp-agent-mail\\hook_wrapper.sh"
+    ;;
+esac
 # A Windows Codex desktop can share CODEX_HOME with this installer through a
 # /mnt/<drive> WSL path.  commandWindows must point back to that exact profile,
 # not assume it lives below the WSL user's unrelated HOME.

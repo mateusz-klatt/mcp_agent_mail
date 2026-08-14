@@ -3601,13 +3601,13 @@ esac
         )
     else:
         hooks = json.loads((codex_dir / "hooks.json").read_text())
-        managed_handlers = [
-            handler
-            for groups in hooks["hooks"].values()
+        managed_handlers = {
+            event: handler
+            for event, groups in hooks["hooks"].items()
             for group in groups
             for handler in group["hooks"]
             if "mcp-agent-mail" in handler.get("command", "")
-        ]
+        }
         assert len(managed_handlers) == 6
         expected_bash = (
             "D:/Portable Git/bin/bash.exe"
@@ -3616,13 +3616,26 @@ esac
         )
         assert all(
             expected_bash in handler["commandWindows"]
-            for handler in managed_handlers
+            for handler in managed_handlers.values()
         )
         assert all(
             r"D:\Portable Git\usr\bin\bash.exe" not in handler["commandWindows"]
             and "D:/Portable Git/usr/bin/bash.exe" not in handler["commandWindows"]
-            for handler in managed_handlers
+            for handler in managed_handlers.values()
         )
+        event_arguments = {
+            "SessionStart": "session-start",
+            "SubagentStart": "subagent-start",
+            "SubagentStop": "subagent-stop",
+            "PostToolUse": "heartbeat",
+            "Stop": "stop",
+            "SessionEnd": "session-end",
+        }
+        for event, handler in managed_handlers.items():
+            assert handler["command"] == (
+                'bash "${CODEX_HOME:-${HOME}/.codex}/hooks/'
+                f'mcp-agent-mail/hook_wrapper.sh" {event_arguments[event]}'
+            )
 
 
 @pytest.mark.parametrize("client", ["claude", "codex", "copilot"])
@@ -4879,8 +4892,20 @@ def test_auto_installer_isolates_windows_desktop_and_native_wsl_codex_profiles(
     native_commands = _managed_codex_commands(native_profile)
     assert len(windows_commands) == 6
     assert len(native_commands) == 6
-    assert all(_git_bash_path(windows_profile) in item for item in windows_commands)
-    assert all(_git_bash_path(native_profile) in item for item in native_commands)
+    expected_runtime_commands = {
+        'bash "${CODEX_HOME:-${HOME}/.codex}/hooks/'
+        f'mcp-agent-mail/hook_wrapper.sh" {event}'
+        for event in (
+            "session-start",
+            "subagent-start",
+            "subagent-stop",
+            "heartbeat",
+            "stop",
+            "session-end",
+        )
+    }
+    assert set(windows_commands) == expected_runtime_commands
+    assert set(native_commands) == expected_runtime_commands
     assert windows_state.read_bytes() == b"desktop-state"
     assert native_state.read_bytes() == b"native-state"
 
@@ -4902,6 +4927,34 @@ def test_auto_installer_isolates_windows_desktop_and_native_wsl_codex_profiles(
     assert dry_run.returncode == 0, dry_run.stdout + dry_run.stderr
     assert "no files or directories were changed" in dry_run.stdout
     assert _tree_snapshot(tmp_path) == before_dry_run
+
+    # The same installed command must resolve the profile at hook runtime.
+    # This is the three-mode boundary: native Windows selects commandWindows,
+    # while both WSL CLI and Desktop-in-WSL execute this POSIX command and let
+    # the actual Linux process identify itself as WSL.
+    for label, profile in (
+        ("desktop-wsl", windows_profile),
+        ("native-wsl", native_profile),
+    ):
+        runtime = profile / "hooks" / "mcp-agent-mail" / "agent_mail_hook.sh"
+        runtime.write_text(
+            "#!/usr/bin/env bash\n"
+            '. "$(dirname "$0")/agent_mail_common.sh"\n'
+            f"printf '{label}|%s' \"$(am_platform)\"\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        runtime.chmod(0o700)
+        probe = subprocess.run(
+            [BASH, "-c", windows_commands[0]],
+            cwd=project,
+            env={**env, "CODEX_HOME": _git_bash_path(profile)},
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert probe.returncode == 0, probe.stderr
+        assert probe.stdout == f"{label}|wsl"
 
 
 @pytest.mark.skipif(

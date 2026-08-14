@@ -206,9 +206,9 @@ if ! bash -n <<<"$CODEX_WRAPPER_CONTENT"; then
 fi
 
 # Resolve the POSIX hook path in the Codex runtime, not in this installer.
-# That distinction lets one Windows-hosted profile serve all supported modes:
-# native Windows selects commandWindows below, native WSL uses its Linux HOME,
-# and Codex Desktop in WSL uses its /mnt/... CODEX_HOME.  The hook's actual
+# The same generated command therefore serves every supported POSIX runtime:
+# native WSL expands its Linux HOME, while Codex Desktop in WSL expands its
+# /mnt/... CODEX_HOME. Native Windows selects commandWindows below. The actual
 # process environment remains the sole source of the win/wsl identity segment.
 _posix_hook_command() {
   printf 'bash "${CODEX_HOME:-${HOME}/.codex}/hooks/mcp-agent-mail/hook_wrapper.sh" %s' "$1"

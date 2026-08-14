@@ -7,7 +7,7 @@
   <!-- Alpine evaluates expressions at runtime, so unsafe-eval and the existing
        inline bootstrap snippets still require unsafe-inline. All executable,
        stylesheet, font, database, and WASM resources are bundled with the export. -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: blob:; connect-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none';" /> <!-- NOSONAR: reviewed; see constraint above (offline bundle, no server to issue nonces) -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: blob:; connect-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none';" />
   <title>Iris · Agent Mail Viewer</title>
 
   <!-- Preload critical assets to reduce time-to-interactive -->

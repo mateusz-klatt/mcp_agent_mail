@@ -85,6 +85,11 @@ FROM node:26.7.0-trixie-slim AS node-runtime
 FROM python:3.14-slim AS ui-builder
 
 COPY --from=uv-bin /uv /uvx /usr/local/bin/
+# Node 26 links against libatomic (Node 22 did not) and only the bare binary
+# is copied in, so the builder has to provide that library itself. Build
+# stage only — it never reaches the runtime image.
+RUN apt-get update && apt-get install -y --no-install-recommends libatomic1 && \
+    rm -rf /var/lib/apt/lists/*
 COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
 COPY --from=node-runtime /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 

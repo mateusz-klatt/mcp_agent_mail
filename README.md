@@ -1,14 +1,57 @@
 # Iris
 
+### Private coordination for concurrent coding agents — with a human in the loop.
+
+Durable mailboxes · execution-scoped file reservations · authenticated real-time wake-ups · human operator console · Windows, WSL, macOS and Linux
+
 ![Iris Agent Mail Showcase](screenshots/output/agent_mail_showcase.gif)
 
-> "It's like gmail for your coding agents!"
+Iris is the human-facing name of MCP Agent Mail: a mail-like coordination layer for coding agents, exposed as an HTTP-only FastMCP server. Run several agents on the same repository — across machines, worktrees and vendors — and give them one durable identity each, one inbox, and a way to announce what they are about to edit before they edit it.
 
-Iris is the human-facing name of MCP Agent Mail: a mail-like coordination layer for coding agents, exposed as an HTTP-only FastMCP server. It gives clients durable host-slot identities, execution-scoped session/subagent lifetimes, an inbox/outbox, searchable message history, and voluntary file reservation "leases" to avoid stepping on each other. The Python package, CLI, protocol paths, and deployment identifiers remain `mcp_agent_mail` and `mcp-agent-mail`.
+The Python package, CLI, protocol paths and deployment identifiers stay `mcp_agent_mail` and `mcp-agent-mail`. Iris is the product name; the module names are unchanged.
 
-Think of it as asynchronous email + directory + change-intent signaling for your agents, backed by Git (for human-auditable artifacts) and SQLite (for indexing and queries).
+> **This is a fork.** It builds on [Dicklesworthstone/mcp_agent_mail](https://github.com/Dicklesworthstone/mcp_agent_mail) and keeps its documentation below. Install from *this* repository if you want the features listed next — the upstream installer does not ship them.
 
-Status: Under active development. The design is captured in detail in `docs/planning/project_idea_and_guide.md` (start with the original prompt at the top of that file).
+## What this fork adds
+
+- **A four-level identity model.** A durable `Agent` (`<client>-<os>-<host>-<slot>`) owns the mailbox; each session or subagent is a separate `AgentExecution` with a parent link, heartbeat and status. A Git worktree is execution *context*, never identity, so the same agent keeps one mailbox across worktrees and branches.
+- **Execution-scoped file reservations.** Claims record which execution took them and why: `origin=auto` for incidental claims filed by an edit hook, `origin=explicit` for deliberate holds. Session end releases only the incidental ones; deliberate holds survive and expire on their own TTL.
+- **Conflict-aware pre-edit warnings.** A hook warns before a write lands on a path someone else has claimed, and claim compatibility is linear over the execution ancestry — your own and your ancestors' claims never block you, siblings and strangers do.
+- **Authenticated real-time wake-ups.** An armed session is woken by a single line naming the message id instead of polling. A quiet mailbox costs nothing.
+- **A human operator console.** A web UI for reading threads, broadcasting instructions and requiring acknowledgement, so a person can steer a fleet without a terminal per agent.
+- **Lifecycle integrations that survive real machines.** Installers for Claude Code, Codex CLI, Gemini CLI, Copilot, Cursor, Windsurf, Cline, OpenCode and Factory Droid, hardened for native Windows, Git Bash, WSL and macOS.
+
+## Install this fork
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/mateusz-klatt/mcp_agent_mail/main/scripts/install.sh?$(date +%s)" | bash -s -- --yes
+```
+
+Or from a checkout:
+
+```bash
+git clone https://github.com/mateusz-klatt/mcp_agent_mail
+cd mcp_agent_mail
+bash scripts/install.sh --yes
+```
+
+Once the first tagged release exists, prefer pinning to it rather than tracking `main`:
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/mateusz-klatt/mcp_agent_mail/<tag>/scripts/install.sh" | bash -s -- --yes
+```
+
+`scripts/install.sh --help` lists the flags. Per-client integrators live in `scripts/integrate_*.sh` and are safe to re-run — each one re-derives its own managed entries, so a second run updates rather than duplicates. **Re-run the integrator after pulling**: the installed hooks are copies, not links, and nothing warns when they fall behind.
+
+## Licence — read before redistributing
+
+This project is **not** plain MIT. `LICENSE` is "MIT License (with OpenAI/Anthropic Rider)": the rider withholds all rights from OpenAI, Anthropic and their affiliates, terminates permission automatically on breach, and must be redistributed unmodified. Because it discriminates against named parties it is not an OSI-approved open-source licence, which is why package metadata declares `License :: Other/Proprietary License` and GitHub resolves the repository to `NOASSERTION`. The rider comes from upstream and is preserved here unchanged.
+
+## Status
+
+Under active development. The design is captured in `docs/planning/project_idea_and_guide.md`; start with the original prompt at the top of that file.
+
+---
 
 ## Why this exists
 
@@ -29,26 +72,11 @@ This project provides a lightweight, interoperable layer so agents can:
 
 It's designed for: FastMCP clients and CLI tools (Claude Code, Codex, Gemini CLI, Factory Droid, etc.) coordinating across one or more codebases.
 
-## From Idea Spark to Shipping Swarm
+---
 
-If a blank repo feels daunting, follow the field-tested workflow we documented in `docs/planning/project_idea_and_guide.md` (“Appendix: From Blank Repo to Coordinated Swarm”):
+# Upstream documentation
 
-- **Ideate fast:** Write a scrappy email-style blurb about the problem, desired UX, and any must-have stack picks (≈15 minutes).
-- **Promote it to a plan:** Feed that blurb to GPT-5 Pro (and optionally Grok4 Heavy / Opus 4.1) until you get a granular Markdown plan, then iterate on the plan file while it’s still cheap to change. The Markdown Web Browser sample plan shows the level of detail to aim for.
-- **Codify the rules:** Clone a tuned `AGENTS.md`, add any tech-specific best-practice guides, and let Codex scaffold the repo plus Beads tasks straight from the plan.
-- **Spin up the swarm:** Launch multiple Codex panes (or any agent mix), register each identity with Agent Mail, and have them acknowledge `AGENTS.md`, the plan document, and the Beads backlog before touching code.
-- **Keep everyone fed:** Reuse the canned instruction cadence from the tweet thread or, better yet, let the commercial Companion app’s Message Stacks broadcast those prompts automatically so you never hand-feed panes again.
-
-Watch the full 23-minute walkthrough (https://youtu.be/68VVcqMEDrs?si=pCm6AiJAndtZ6u7q) to see the loop in action.
-
-## Productivity Math & Automation Loop
-
-One disciplined hour of GPT-5 Codex—when it isn’t waiting on human prompts—often produces 10–20 “human hours” of work because the agents reason and type at machine speed. Agent Mail multiplies that advantage in two layers:
-
-1. **Base OSS server:** Git-backed mailboxes, advisory file reservations, Typer CLI helpers, and searchable archives keep independent agents aligned without babysitting. Every instruction, lease, and attachment is auditable.
-2. **Companion stack (commercial):** The iOS app + host automation can provision, pair, and steer heterogeneous fleets (Claude Code, Codex, Gemini CLI, Factory Droid, etc.) from your phone using customizable Message Stacks, Human Overseer broadcasts, Beads awareness, and plan editing tools—no manual tmux choreography required. The automation closes the loop by scheduling prompts, honoring Limited Mode, and enforcing Double-Arm confirmations for destructive work.
-
-Result: you invest 1–2 hours of human supervision, but dozens of agent-hours execute in parallel with clear audit trails and conflict-avoidance baked in.
+Everything below this line is inherited from the upstream project and is kept for reference. It describes upstream's installer, its commercial Companion stack, and its Beads integration. **Where it disagrees with the sections above, the sections above win for this fork** — in particular, install commands below may point at the upstream repository.
 
 ## TLDR Quickstart
 

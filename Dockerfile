@@ -187,6 +187,17 @@ ENV HTTP_HOST=0.0.0.0 \
     STORAGE_ROOT=/data/mailbox \
     DATABASE_URL=sqlite+aiosqlite:////data/mailbox/iris.sqlite3
 
+# Registries display this field, and the default assumption for a repository
+# like this one would be plain MIT -- which is wrong. LICENSE is "MIT License
+# (with OpenAI/Anthropic Rider)"; the rider withholds all rights from named
+# parties and must travel unmodified with every distribution, which is why the
+# file itself is copied into /app above. There is no SPDX identifier for it, so
+# the label points at the file rather than asserting a licence that does not
+# apply.
+LABEL org.opencontainers.image.licenses="SEE LICENSE IN /app/LICENSE" \
+      org.opencontainers.image.title="Iris" \
+      org.opencontainers.image.description="Private coordination for concurrent coding agents, with a human in the loop."
+
 EXPOSE 8765
 VOLUME ["/data"]
 

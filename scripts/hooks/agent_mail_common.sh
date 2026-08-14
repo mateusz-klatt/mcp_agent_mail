@@ -153,10 +153,20 @@ am_state_dir_is_inside_git() {
         [ -n "$parent" ] && [ "$parent" != "$probe" ] || return 1
         probe="$parent"
     done
-    inside_worktree="$(git -C "$probe" rev-parse --is-inside-work-tree \
-        2>/dev/null)"
-    inside_git_dir="$(git -C "$probe" rev-parse --is-inside-git-dir \
-        2>/dev/null)"
+    # Deliberately `cd` and run git with NO `-C`.  This file exports
+    # MSYS_NO_PATHCONV=1 a few lines above, so under Git Bash a POSIX path
+    # handed to the NATIVE git.exe is no longer translated and `git -C /c/...`
+    # cannot chdir — it exits 128, both probes come back empty, and this
+    # function then reports "not inside Git" for a directory that is.  Letting
+    # git inherit the cwd gives the same answer with and without that variable.
+    # Fail CLOSED: if we cannot even reach the directory, we do not know, and
+    # not knowing must not read as safe.
+    command -v git >/dev/null 2>&1 || return 0
+    ( cd -- "$probe" ) >/dev/null 2>&1 || return 0
+    inside_worktree="$( cd -- "$probe" >/dev/null 2>&1 \
+        && git rev-parse --is-inside-work-tree 2>/dev/null )"
+    inside_git_dir="$( cd -- "$probe" >/dev/null 2>&1 \
+        && git rev-parse --is-inside-git-dir 2>/dev/null )"
     [ "$inside_worktree" = "true" ] || [ "$inside_git_dir" = "true" ]
 }
 if [ "${AM_PATH_CONFIGURATION_VALID:-0}" = "1" ] \

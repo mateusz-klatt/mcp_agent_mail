@@ -208,6 +208,48 @@ normalize_agent_mail_state_dir() {
   printf '%s\n' "$normalized"
 }
 
+# Answer "is this directory inside a Git worktree or gitdir?", failing CLOSED.
+#
+# Exit 0 means REFUSE: it either is inside Git, or we could not find out.
+# Exit 1 means a definite no.
+#
+# Two things here are deliberate and neither is stylistic.
+#
+# 1. It `cd`s into the directory and runs `git rev-parse` with NO `-C`.  Passing
+#    a path to a NATIVE git.exe is what broke this guard on Windows: the hook
+#    library exports MSYS_NO_PATHCONV=1 at file scope and six installers source
+#    it, after which `git -C /c/...` can no longer chdir and exits 128.  Letting
+#    git inherit the cwd instead makes the answer identical with and without
+#    that variable — measured on native Windows — so the guard stops depending
+#    on path translation rather than working around it.
+#
+# 2. It does NOT branch on git's exit code, because that code does not
+#    discriminate: `rc=128` is git's ordinary answer for "not a repository",
+#    which is the very case a healthy install must be allowed through.  Nor does
+#    it match on git's message, which is localised and would be disarmed by a
+#    user running with LANG set to anything but English.
+#
+# What it does not catch, stated so the gap is a decision and not an oversight:
+# a corrupt `.git` that still lets `cd` succeed reads as "not a worktree".
+path_is_inside_git() {
+  local dir="$1" verdict
+
+  if ! command -v git >/dev/null 2>&1; then
+    log_err "Cannot verify ${dir} lies outside Git: git is not on PATH. Refusing."
+    return 0
+  fi
+  if ! ( cd -- "$dir" ) >/dev/null 2>&1; then
+    log_err "Cannot verify ${dir} lies outside Git: directory is unreachable. Refusing."
+    return 0
+  fi
+
+  verdict="$( cd -- "$dir" >/dev/null 2>&1 && git rev-parse --is-inside-work-tree 2>/dev/null )"
+  [[ "$verdict" == "true" ]] && return 0
+  verdict="$( cd -- "$dir" >/dev/null 2>&1 && git rev-parse --is-inside-git-dir 2>/dev/null )"
+  [[ "$verdict" == "true" ]] && return 0
+  return 1
+}
+
 # Keep the shared hook environment intentionally small.  Client, slot, project,
 # agent name and per-agent registration tokens belong to a client wrapper or to
 # credentials.json, never to this cross-client file.

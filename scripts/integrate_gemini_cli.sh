@@ -63,9 +63,7 @@ while [[ ! -e "$_ENV_PROBE" ]]; do
   [[ "$_NEXT" != "$_ENV_PROBE" ]] || break
   _ENV_PROBE="$_NEXT"
 done
-if [[ -L "$_ENV_PROBE" ]] \
-    || [[ "$(git -C "$_ENV_PROBE" rev-parse --is-inside-work-tree 2>/dev/null || true)" == "true" ]] \
-    || [[ "$(git -C "$_ENV_PROBE" rev-parse --is-inside-git-dir 2>/dev/null || true)" == "true" ]]; then
+if [[ -L "$_ENV_PROBE" ]] || path_is_inside_git "$_ENV_PROBE"; then
   log_err "Shared Agent Mail environment must live outside every Git worktree: ${SHARED_ENV_FILE}"
   exit 1
 fi
@@ -80,9 +78,7 @@ while [[ ! -e "$_PROBE" ]]; do
   [[ "$_NEXT" != "$_PROBE" ]] || break
   _PROBE="$_NEXT"
 done
-if [[ -L "$_PROBE" ]] \
-    || [[ "$(git -C "$_PROBE" rev-parse --is-inside-work-tree 2>/dev/null || true)" == "true" ]] \
-    || [[ "$(git -C "$_PROBE" rev-parse --is-inside-git-dir 2>/dev/null || true)" == "true" ]]; then
+if [[ -L "$_PROBE" ]] || path_is_inside_git "$_PROBE"; then
   log_err "Gemini user settings must live outside every Git worktree: ${USER_CONFIG}"
   exit 1
 fi

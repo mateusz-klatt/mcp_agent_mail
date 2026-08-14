@@ -8096,9 +8096,14 @@ printf '%s\n200' "$envelope"
         item for item in starts if item["project_key"] == "/owner/other"
     )
     assert target_start["client_name"] == "codex"
-    assert target_start["cwd"] == str(edited_repo)
-    assert target_start["repo_root"] == str(edited_repo)
-    assert target_start["worktree_path"] == str(edited_repo)
+    # Compare places, not spellings: the hook now derives these from
+    # `git rev-parse` run inside the directory, which reports C:/... on
+    # Windows, while str(WindowsPath) spells C:\... — same directory, two
+    # renderings.  Third occurrence of this assertion shape; the other two
+    # were converted in the execution-hooks test.
+    assert Path(target_start["cwd"]) == edited_repo
+    assert Path(target_start["repo_root"]) == edited_repo
+    assert Path(target_start["worktree_path"]) == edited_repo
     heartbeats = [
         item["arguments"]
         for item in calls

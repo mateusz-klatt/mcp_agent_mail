@@ -138,20 +138,23 @@ def _retry_windows_readonly_removal(
 def delete_database_and_storage(settings) -> tuple[Path, Path]:
     """Delete the database and storage directory, returning their paths.
 
-    Also drops the cached engine. Unlinking a SQLite file does not disturb a
-    connection already open on it: the handle keeps reading the unlinked inode,
-    so queries after a restore answer from the database this function believed
-    it had deleted. That reads as a successful restore whenever the archive
-    happens to hold everything the old file held — which is why restoring the
-    *latest* archive passed here while restoring an *earlier* one, the only
-    case where the two states differ, did not.
+    Also drops the cached engine and Git repository. Unlinking a SQLite file
+    does not disturb a connection already open on it: the handle keeps reading
+    the unlinked inode, so queries after a restore answer from the database this
+    function believed it had deleted. A cached GitPython repository can also
+    keep ``git cat-file`` alive with the storage directory as its working
+    directory, which prevents native Windows from removing that directory.
+    Both caches must therefore be closed before the simulated disaster mutates
+    either resource.
     """
     from mcp_agent_mail.cli import resolve_sqlite_database_path
     from mcp_agent_mail.db import reset_database_state
+    from mcp_agent_mail.storage import clear_repo_cache
 
     db_path = resolve_sqlite_database_path(settings.database.url)
     storage_path = Path(settings.storage.root)
 
+    clear_repo_cache()
     reset_database_state()
 
     # Delete database files
@@ -167,6 +170,34 @@ def delete_database_and_storage(settings) -> tuple[Path, Path]:
         shutil.rmtree(storage_path, onexc=_retry_windows_readonly_removal)
 
     return db_path, storage_path
+
+
+@pytest.mark.asyncio
+async def test_disaster_simulation_clears_repo_cache_before_storage_removal(
+    disaster_recovery_env,
+    monkeypatch,
+):
+    """The destructive test helper must not leave a Git child in storage."""
+    from mcp_agent_mail.storage import ensure_archive, get_repo_cache_stats
+
+    settings = disaster_recovery_env["settings"]
+    storage_path = Path(settings.storage.root)
+    await ensure_archive(settings, "cache-order-probe")
+    assert get_repo_cache_stats()["cached"] == 1
+
+    real_rmtree = shutil.rmtree
+    cached_counts_at_removal: list[int] = []
+
+    def assert_cache_closed_before_removal(path, *args, **kwargs):
+        if Path(path) == storage_path:
+            cached_counts_at_removal.append(get_repo_cache_stats()["cached"])
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", assert_cache_closed_before_removal)
+
+    delete_database_and_storage(settings)
+
+    assert cached_counts_at_removal == [0]
 
 
 def get_inbox_items(result) -> list[dict]:

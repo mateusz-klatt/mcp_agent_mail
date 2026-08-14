@@ -66,6 +66,9 @@ IDENTITY_RENAMES_FILENAME = "identity_renames.json"
 IDENTITY_TOMBSTONES_DIRNAME = "identity_tombstones"
 _IDENTITY_RENAME_SCHEMA_VERSION = 1
 _MESSAGE_DELIVERY_PENDING_EXCLUDE = "/projects/*/message_deliveries/*.pending"
+_GIT_LONG_PATHS_CONFIG = ["core.longpaths=true"]
+_GIT_LONG_PATHS_CLONE_OPTIONS = ["-c", "core.longpaths=true"]
+
 
 def _is_reparse_or_symlink_stat(path_stat: os.stat_result) -> bool:
     return stat.S_ISLNK(path_stat.st_mode) or bool(
@@ -1594,6 +1597,24 @@ def _list_rglob_paths(root: Path, pattern: str) -> list[Path]:
     return list(root.rglob(pattern))
 
 
+def _retry_windows_readonly_removal(
+    function: Any,
+    path: str,
+    error: BaseException,
+) -> None:
+    """Retry removal of one native-Windows Git object after clearing read-only.
+
+    Git may mark loose objects and packs read-only.  ``shutil.rmtree`` cannot
+    remove those files on Windows until the attribute is cleared.  Other
+    platforms and other failure classes remain fail-closed so restore never
+    hides an unrelated filesystem error.
+    """
+    if os.name != "nt" or not isinstance(error, PermissionError):
+        raise error
+    Path(path).chmod(stat.S_IWRITE)
+    function(path)
+
+
 def _restore_bundle_into_archive(bundle_to_restore: Path, target_root: Path) -> None:
     """Restore a Git bundle into the archive root without deleting the source bundle first."""
     import shutil
@@ -1616,11 +1637,20 @@ def _restore_bundle_into_archive(bundle_to_restore: Path, target_root: Path) -> 
     if target_root.exists():
         backup_archive = target_root.with_suffix(".pre-restore")
         if backup_archive.exists():
-            shutil.rmtree(backup_archive)
+            shutil.rmtree(backup_archive, onexc=_retry_windows_readonly_removal)
         shutil.copytree(target_root, backup_archive)
-        shutil.rmtree(target_root)
+        shutil.rmtree(target_root, onexc=_retry_windows_readonly_removal)
 
-    Repo.clone_from(str(source_bundle), str(target_root))
+    Repo.clone_from(
+        str(source_bundle),
+        str(target_root),
+        multi_options=_GIT_LONG_PATHS_CLONE_OPTIONS,
+        # GitPython classifies every ``git clone -c`` as unsafe because callers
+        # could otherwise inject arbitrary configuration.  This option is a
+        # module-owned constant, and GitPython still places ``--`` before the
+        # caller-provided local bundle path, so no untrusted option is enabled.
+        allow_unsafe_options=True,
+    )
 
 
 def _ensure_str(value: str | bytes) -> str:
@@ -2005,6 +2035,7 @@ async def _create_repo_for_cache(root: Path, settings: Settings, cache_key: str)
                         with repo.config_writer() as cw:
                             cw.set_value("commit", "gpgsign", "false")
                             cw.set_value("core", "autocrlf", "false")
+                            cw.set_value("core", "longpaths", "true")
 
                     await _to_thread_cancellation_safe(_configure_repo)
                 except Exception:
@@ -2829,7 +2860,7 @@ def _apply_agent_archive_rename_sync(
         )
         and _is_ephemeral_archive_path(value)
     )
-    archive.repo.git.add(
+    archive.repo.git(c=_GIT_LONG_PATHS_CONFIG).add(
         "--all",
         "--",
         relative_project_root,
@@ -2958,6 +2989,7 @@ class _VerifiedMessageDeliveryCommit:
 
 
 _MESSAGE_DELIVERY_GIT_DURABILITY_CONFIG = [
+    *_GIT_LONG_PATHS_CONFIG,
     "core.fsync=all",
     "core.fsyncMethod=fsync",
 ]
@@ -4223,7 +4255,11 @@ async def _commit_direct(
     def _perform_commit(target_repo: Repo) -> None:
         _normalize_archive_text_line_endings(repo_root, rel_paths)
         literal_pathspecs = [f":(literal){path}" for path in rel_paths]
-        target_repo.git.add("--all", "--", *literal_pathspecs)
+        target_repo.git(c=_GIT_LONG_PATHS_CONFIG).add(
+            "--all",
+            "--",
+            *literal_pathspecs,
+        )
         staged_paths = target_repo.git.diff(
             "--cached",
             "--name-only",
@@ -4264,7 +4300,7 @@ async def _commit_direct(
             GIT_COMMITTER_NAME=settings.storage.git_author_name,
             GIT_COMMITTER_EMAIL=settings.storage.git_author_email,
         ):
-            target_repo.git.commit(
+            target_repo.git(c=_GIT_LONG_PATHS_CONFIG).commit(
                 "--only",
                 "--no-gpg-sign",
                 "--no-verify",

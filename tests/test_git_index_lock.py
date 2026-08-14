@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from git import Git
+from git import Git, Repo
 from git.exc import GitCommandError
 
 from mcp_agent_mail.storage import (
@@ -265,6 +265,100 @@ class TestCommitRetryIntegration:
         # A new commit should exist
         final_commits = len(list(repo.iter_commits()))
         assert final_commits == initial_commits + 1
+
+    @pytest.mark.asyncio
+    async def test_commit_forces_long_path_support_for_git_writes(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """Archive add/commit commands do not depend on a caller's Git config."""
+        from mcp_agent_mail.config import get_settings
+        from mcp_agent_mail.storage import _commit, ensure_archive_root
+
+        settings = get_settings()
+        _repo_root, repo = await ensure_archive_root(settings)
+        working_tree = repo.working_tree_dir
+        assert working_tree is not None
+        assert repo.config_reader("repository").get_value(
+            "core", "longpaths"
+        ) is True
+        path_segments = [
+            f"segment-{index:02d}-{'x' * 24}"
+            for index in range(8)
+        ]
+        relative_path = "/".join([*path_segments, "write.txt"])
+        assert len(relative_path) > 260
+        test_file = Path(working_tree) / relative_path
+        test_file.parent.mkdir(parents=True)
+        content = "long-path capable\n"
+        test_file.write_text(content, encoding="utf-8")
+
+        original_call_process = Git._call_process
+        write_options: dict[str, tuple[str, ...]] = {}
+
+        def capture_git_options(git, method, *args, **kwargs):
+            if method in {"add", "commit"} and any(
+                relative_path in str(argument) for argument in args
+            ):
+                write_options[method] = tuple(git._git_options)
+            return original_call_process(git, method, *args, **kwargs)
+
+        monkeypatch.setattr(Git, "_call_process", capture_git_options)
+
+        await _commit(
+            repo,
+            settings,
+            "test: command-local long path support",
+            [relative_path],
+            use_queue=False,
+        )
+
+        expected_options = ("-c", "core.longpaths=true")
+        assert write_options == {
+            "add": expected_options,
+            "commit": expected_options,
+        }
+        committed_blob = repo.head.commit.tree / relative_path
+        assert committed_blob.data_stream.read() == content.encode()
+
+    def test_bundle_clone_enables_long_paths_before_checkout(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Bundle restore persists long-path support before clone checkout."""
+        from mcp_agent_mail import storage as storage_module
+
+        bundle = tmp_path / "archive.bundle"
+        target = tmp_path / "restored-archive"
+        bundle.write_bytes(b"test bundle placeholder")
+        clone_calls: list[tuple[str, str, list[str] | None, bool]] = []
+
+        def capture_clone(
+            url,
+            to_path,
+            *,
+            multi_options=None,
+            allow_unsafe_options=False,
+        ):
+            clone_calls.append(
+                (url, to_path, multi_options, allow_unsafe_options)
+            )
+            return object()
+
+        monkeypatch.setattr(Repo, "clone_from", capture_clone)
+
+        storage_module._restore_bundle_into_archive(bundle, target)
+
+        assert clone_calls == [
+            (
+                str(bundle),
+                str(target),
+                ["-c", "core.longpaths=true"],
+                True,
+            )
+        ]
 
     @pytest.mark.asyncio
     async def test_subtree_deletion_retries_git_command_index_lock_once(

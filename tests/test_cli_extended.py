@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 
 import httpx
+from click.utils import strip_ansi
 from typer.testing import CliRunner
 
 from mcp_agent_mail.cli import app
@@ -294,7 +295,8 @@ def test_cli_products_search_rejects_registration_token_argv(isolated_env):
     )
 
     assert res.exit_code == 2
-    assert "No such option: --registration-token" in res.output
+    normalized_error = "".join(strip_ansi(res.output).split())
+    assert "Nosuchoption:--registration-token" in normalized_error
     assert argv_secret not in res.output
 
 

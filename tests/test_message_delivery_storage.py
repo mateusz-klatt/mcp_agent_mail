@@ -391,6 +391,8 @@ async def test_delivery_git_writes_force_command_local_power_loss_durability(
 
     expected_options = (
         "-c",
+        "core.longpaths=true",
+        "-c",
         "core.fsync=all",
         "-c",
         "core.fsyncMethod=fsync",
@@ -453,6 +455,8 @@ async def test_first_archive_and_delivery_persist_every_power_loss_boundary(
     )
 
     expected_options = (
+        "-c",
+        "core.longpaths=true",
         "-c",
         "core.fsync=all",
         "-c",

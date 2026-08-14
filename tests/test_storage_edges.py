@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 import sys
 import tempfile
 import time
@@ -237,6 +238,12 @@ async def test_restore_from_backup_stages_bundle_inside_storage_root(isolated_en
 
     settings = get_settings()
     backup_path = await create_diagnostic_backup(settings, reason="restore-check")
+    stale_pre_restore = Path(settings.storage.root).with_suffix(".pre-restore")
+    stale_pre_restore.mkdir(parents=True)
+    readonly_git_object = stale_pre_restore / "readonly-git-object"
+    readonly_git_object.write_bytes(b"stale object")
+    readonly_git_object.chmod(stat.S_IREAD)
+
     result = await restore_from_backup(settings, backup_path)
     assert result["errors"] == []
     assert len(result["bundles_restored"]) == 1

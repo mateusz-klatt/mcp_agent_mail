@@ -185,6 +185,116 @@ print(f'OK {os.path.basename(final)} bytes={os.path.getsize(final)} messages={ro
     fi
 fi
 
+# --- 1b. SQL dump, kept as delta-compressed history -------------------------
+# The page copy above is the restore and forensic artifact: it preserves the
+# file as it actually is, which is what let us recover a message the day a page
+# went bad. It is also opaque to git, so every snapshot is a fresh ~5.6 MB blob.
+# A text dump delta-compresses instead -- measured on this database: three
+# snapshots cost 17 MB as gzipped page copies and 6.5 MB as dumps once packed.
+# Measure that only AFTER `git gc`: before packing, loose objects are merely
+# zlib-compressed and the dump looks like the more expensive of the two.
+#
+# Verification restores the dump with the documented recipe, so this job proves
+# the recipe still works rather than only that a file was written.
+if ! docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q true; then
+    log "ERROR: container ${CONTAINER} is not running; skipping SQL dump"
+    fail=1
+else
+    dump_out="$(docker compose -f "$COMPOSE_FILE" exec -T "$CONTAINER" \
+        /app/.venv/bin/python -c "
+import os, sqlite3, subprocess, sys
+
+DUMPS = '/backup/dumps'
+os.makedirs(DUMPS, exist_ok=True)
+target = os.path.join(DUMPS, 'storage.dump.sql')
+
+con = sqlite3.connect('file:/data/mailbox/storage.sqlite3?mode=ro', uri=True)
+try:
+    con.execute('PRAGMA busy_timeout=60000')
+    con.execute('PRAGMA query_only=1')
+    # Filter while iterdump yields, where each item is already one complete
+    # statement. Splitting the finished file by hand does not work: message
+    # bodies contain semicolons and newlines, so a naive splitter cuts an
+    # INSERT in half and the restore dies on a fragment.
+    #
+    # The FTS5 index is dropped on purpose. It is derived from messages, it
+    # doubles the dump because every body appears twice, and iterdump encodes
+    # the virtual table as an INSERT INTO sqlite_master that executescript
+    # refuses anyway. The restore rebuilds it -- with explicit rowids, because
+    # rowid must equal message_id or search returns the wrong message.
+    skipped = 0
+    with open(target, 'w', encoding='utf-8') as handle:
+        for statement in con.iterdump():
+            plain = statement.lstrip().replace(chr(34), '').replace(chr(39), '')
+            if plain.startswith('INSERT INTO sqlite_master') or plain.startswith('PRAGMA writable_schema'):
+                skipped += 1
+                continue
+            if plain.startswith('CREATE TABLE fts_messages') or plain.startswith('INSERT INTO fts_messages'):
+                skipped += 1
+                continue
+            handle.write(statement + chr(10))
+    expected = con.execute('select count(*) from messages').fetchone()[0]
+finally:
+    con.close()
+
+# The stored dump is directly restorable; verification proves exactly that,
+# then rebuilds the derived index the same way a real restore would.
+verify_path = target + '.verify.sqlite3'
+if os.path.exists(verify_path):
+    os.unlink(verify_path)
+try:
+    check = sqlite3.connect(verify_path)
+    try:
+        check.executescript(open(target, encoding='utf-8').read())
+        check.executescript(
+            'CREATE VIRTUAL TABLE fts_messages USING fts5(message_id UNINDEXED, subject, body);'
+            'INSERT INTO fts_messages(rowid, message_id, subject, body) '
+            'SELECT id, id, subject, body_md FROM messages;'
+        )
+        status = check.execute('PRAGMA integrity_check').fetchone()[0]
+        restored = check.execute('select count(*) from messages').fetchone()[0]
+        misaligned = check.execute('select count(*) from fts_messages where rowid != message_id').fetchone()[0]
+    finally:
+        check.close()
+finally:
+    if os.path.exists(verify_path):
+        os.unlink(verify_path)
+
+if status != 'ok' or restored != expected or misaligned:
+    print('ERROR restore check integrity=' + str(status) + ' rows=' + str(restored) + '/' + str(expected) + ' fts_misaligned=' + str(misaligned))
+    sys.exit(1)
+
+def git(*args):
+    return subprocess.run(['git', '-C', DUMPS] + list(args), capture_output=True, text=True, check=False)
+
+if not os.path.isdir(os.path.join(DUMPS, '.git')):
+    git('init', '-q')
+    git('config', 'user.email', 'backup@localhost')
+    git('config', 'user.name', 'agent-mail-backup')
+git('add', 'storage.dump.sql')
+committed = git('commit', '-q', '-m', 'dump: ' + str(restored) + ' messages')
+# Without this the saving never appears: a fresh commit is a loose object,
+# zlib-compressed only, costing ~2.4 MB an hour here. Delta compression is a
+# packing-time property, and --auto packs only once git's own thresholds say
+# it is worth it, so this is a no-op on most runs. Measured on two snapshots:
+# 4.79 MB loose, 1.99 MB packed, against 11.2 MB for the same two as page
+# copies.
+git('gc', '--auto', '--quiet')
+size = os.path.getsize(target)
+usage = subprocess.run(['du', '-sb', os.path.join(DUMPS, '.git')], capture_output=True, text=True)
+history = usage.stdout.split()[0] if usage.returncode == 0 else '?'
+state = 'unchanged' if committed.returncode != 0 else 'committed'
+print('OK dump bytes=' + str(size) + ' fts_stmts_dropped=' + str(skipped) + ' messages=' + str(restored) + ' history=' + history + ' ' + state)
+" 2>&1)"
+
+    if printf '%s' "$dump_out" | grep -q '^OK '; then
+        log "${dump_out#OK }"
+    else
+        log "ERROR: SQL dump failed: ${dump_out}"
+        fail=1
+    fi
+fi
+
 # --- 2. Git archive mirror (host-side) --------------------------------------
 # Pull INTO the bare repo rather than pushing FROM the live one. A fetch touches
 # only the bare repo's refs and objects, so nothing here can take a lock in the

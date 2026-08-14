@@ -1370,9 +1370,10 @@ function viewerController() {
         importanceMap.set(importance, (importanceMap.get(importance) || 0) + 1);
       });
 
-      this.uniqueProjects = Array.from(projects).sort();
-      this.uniqueSenders = Array.from(senders).sort();
-      this.uniqueRecipients = Array.from(recipients).sort();
+      const byName = (a, b) => a.localeCompare(b);
+      this.uniqueProjects = Array.from(projects).sort(byName);
+      this.uniqueSenders = Array.from(senders).sort(byName);
+      this.uniqueRecipients = Array.from(recipients).sort(byName);
 
       const order = new Map([
         ['urgent', 0],
@@ -1981,7 +1982,7 @@ function viewerController() {
 
       // Wait for fonts to load before first measurement to avoid layout jumps
       try {
-        if (document.fonts && document.fonts.ready) {
+        if (document.fonts && typeof document.fonts.ready?.then === 'function') {
           document.fonts.ready.then(() => {
             if (this.virtualList) {
               this.virtualList.measureRowHeight();

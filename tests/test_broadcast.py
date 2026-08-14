@@ -367,14 +367,14 @@ async def test_invalid_topic_rejected(isolated_env):
                     "idempotency_key": "topic-invalid-spaces",
                 },
             )
-            # If no exception, check is_error flag or error in content
-            assert getattr(result, "is_error", False) or "INVALID_TOPIC" in str(result), (
-                f"Expected INVALID_TOPIC error, got: {result}"
-            )
         except Exception as exc:
-            assert "INVALID_TOPIC" in str(exc) or "topic" in str(exc).lower(), (
-                f"Expected topic validation error, got: {exc}"
-            )
+            rejected = "INVALID_TOPIC" in str(exc) or "topic" in str(exc).lower()
+            detail = f"Expected topic validation error, got: {exc}"
+        else:
+            # If no exception, check is_error flag or error in content
+            rejected = getattr(result, "is_error", False) or "INVALID_TOPIC" in str(result)
+            detail = f"Expected INVALID_TOPIC error, got: {result}"
+        assert rejected, detail
 
 
 @pytest.mark.asyncio
@@ -425,13 +425,13 @@ async def test_topic_rejects_traversal_and_unsafe_shapes(isolated_env, bad_topic
                     "idempotency_key": "topic-traversal-invalid",
                 },
             )
-            assert getattr(result, "is_error", False) or "INVALID_TOPIC" in str(result), (
-                f"Expected INVALID_TOPIC error for {bad_topic!r}, got: {result}"
-            )
         except Exception as exc:
-            assert "INVALID_TOPIC" in str(exc) or "topic" in str(exc).lower(), (
-                f"Expected topic validation error for {bad_topic!r}, got: {exc}"
-            )
+            rejected = "INVALID_TOPIC" in str(exc) or "topic" in str(exc).lower()
+            detail = f"Expected topic validation error for {bad_topic!r}, got: {exc}"
+        else:
+            rejected = getattr(result, "is_error", False) or "INVALID_TOPIC" in str(result)
+            detail = f"Expected INVALID_TOPIC error for {bad_topic!r}, got: {result}"
+        assert rejected, detail
 
 
 # ============================================================================

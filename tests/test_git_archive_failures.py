@@ -16,6 +16,7 @@ import asyncio
 import gc
 import os
 import time
+from configparser import NoOptionError, NoSectionError
 from pathlib import Path
 
 import pytest
@@ -161,10 +162,10 @@ class TestGitRepoInitialization:
         # Check config
         try:
             gpg_sign = repo.config_reader().get_value("commit", "gpgsign")
-            assert gpg_sign in ("false", False)
-        except Exception:
+        except (NoSectionError, NoOptionError):
             # If not set, that's also fine (defaults to false)
-            pass
+            gpg_sign = False
+        assert gpg_sign in ("false", False)
 
 
 # ============================================================================

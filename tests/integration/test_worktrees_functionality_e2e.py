@@ -212,9 +212,10 @@ def test_worktrees_functionality_e2e(
         console.print(Panel.fit(json.dumps(link, indent=2), title="products_link result"))
 
         payload = __import__("asyncio").run(_read_json_resource(_build_server(), f"resource://product/{prod['product_uid']}"))
-        console.print(Panel.fit(json.dumps(payload, indent=2), title="resource://product payload"))
-        assert any(p.get("slug") == slug for p in payload.get("projects", [])), "Linked project missing from product view"
     except Exception as exc:
         console.print(Panel.fit(str(exc), title="Product Bus skipped (not registered)", style="yellow"))
+    else:
+        console.print(Panel.fit(json.dumps(payload, indent=2), title="resource://product payload"))
+        assert any(p.get("slug") == slug for p in payload.get("projects", [])), "Linked project missing from product view"
 
     console.print(Panel.fit("E2E orchestration completed successfully", title="Done", border_style="green"))

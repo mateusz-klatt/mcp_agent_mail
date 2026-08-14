@@ -76,7 +76,12 @@ FROM ghcr.io/astral-sh/uv:0.11.2 AS uv-bin
 # Must match the toolchain hatch_build.py validates (_NODE_VERSION /
 # _NPM_VERSION) and the node-version in ci.yml: the wheel is built here, so a
 # divergence fails the image build rather than any test.
-FROM node:26.7.0-bookworm-slim AS node-runtime
+#
+# trixie, not bookworm: only the bare node binary is copied into the
+# python:3.14-slim builder (also trixie), and the bookworm build needs
+# libatomic.so.1 / libstdc++.so.6 from its own base — absent there, so
+# `node --version` exits 127 and the UI build fails with a bare (127).
+FROM node:26.7.0-trixie-slim AS node-runtime
 FROM python:3.14-slim AS ui-builder
 
 COPY --from=uv-bin /uv /uvx /usr/local/bin/
@@ -85,7 +90,7 @@ COPY --from=node-runtime /usr/local/lib/node_modules/npm /usr/local/lib/node_mod
 
 ENV SOURCE_DATE_EPOCH=0
 WORKDIR /build
-COPY pyproject.toml uv.lock README.md hatch_build.py ./
+COPY pyproject.toml uv.lock README.md LICENSE hatch_build.py ./
 COPY ui ./ui
 COPY src/mcp_agent_mail/__init__.py ./src/mcp_agent_mail/__init__.py
 COPY src/mcp_agent_mail/templates ./src/mcp_agent_mail/templates
@@ -149,7 +154,7 @@ WORKDIR /app
 
 # Copy locked project metadata and sync deps first for better caching.
 # README.md is required by hatchling since pyproject.toml references it.
-COPY pyproject.toml uv.lock README.md hatch_build.py ./
+COPY pyproject.toml uv.lock README.md LICENSE hatch_build.py ./
 # Install runtime deps only — the project itself (hatchling wheel from
 # src/mcp_agent_mail) can't be built yet because src/ isn't present, so defer
 # its install with --no-install-project to keep this dependency layer cached.

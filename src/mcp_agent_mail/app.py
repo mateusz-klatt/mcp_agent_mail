@@ -16102,57 +16102,38 @@ def build_mcp_server() -> FastMCP:
 
     if settings.worktrees_enabled:
         @mcp.resource("resource://product/{key}{?format}", mime_type="application/json")
-        def product_resource(key: str, format: Optional[str] = None) -> dict[str, Any]:
+        async def product_resource(key: str, format: Optional[str] = None) -> dict[str, Any]:
             """
             Inspect product and list linked projects.
             """
+            # Async like every other DB-backed resource. The previous sync
+            # variant bridged into a worker thread's private event loop while
+            # blocking the serving loop's thread on a queue; the cached engine
+            # is bound to the serving loop, so the worker could deadlock the
+            # whole process (observed as multi-hour CI unit-suite hangs).
             key, query_params = _split_slug_and_query(key)
             format_value = format or query_params.get("format")
-            # Safe runner that works even if an event loop is already running
-            def _run_coro_sync(coro):
-                try:
-                    asyncio.get_running_loop()
-                    # Run in a separate thread to avoid nested loop issues
-                except RuntimeError:
-                    return asyncio.run(coro)
-                import threading
-                import queue
-                q: "queue.Queue[tuple[bool, Any]]" = queue.Queue()
-                def _runner():
-                    try:
-                        q.put((True, asyncio.run(coro)))
-                    except Exception as e:
-                        q.put((False, e))
-                t = threading.Thread(target=_runner, daemon=True)
-                t.start()
-                ok, val = q.get()
-                if ok:
-                    return val
-                raise val
-            async def _load() -> dict[str, Any]:
-                await ensure_schema()
-                async with get_session() as session:
-                    prod = await _get_product_by_key(session, key.strip())
-                    if prod is None:
-                        raise ToolExecutionError("NOT_FOUND", f"Product '{key}' not found.", recoverable=True)
-                    proj_rows = await session.execute(
-                        select(Project).join(ProductProjectLink, cast(Any, ProductProjectLink.project_id) == Project.id).where(
-                            cast(Any, ProductProjectLink.product_id) == cast(Any, prod.id)
-                        )
+            await ensure_schema()
+            async with get_session() as session:
+                prod = await _get_product_by_key(session, key.strip())
+                if prod is None:
+                    raise ToolExecutionError("NOT_FOUND", f"Product '{key}' not found.", recoverable=True)
+                proj_rows = await session.execute(
+                    select(Project).join(ProductProjectLink, cast(Any, ProductProjectLink.project_id) == Project.id).where(
+                        cast(Any, ProductProjectLink.product_id) == cast(Any, prod.id)
                     )
-                    projects = [
-                        {"id": p.id, "slug": p.slug, "human_key": p.human_key, "created_at": _iso(p.created_at)}
-                        for p in proj_rows.scalars().all()
-                    ]
-                    return {
-                        "id": prod.id,
-                        "product_uid": prod.product_uid,
-                        "name": prod.name,
-                        "created_at": _iso(prod.created_at),
-                        "projects": projects,
-                    }
-            # Run async in a synchronous resource
-            payload = _run_coro_sync(_load())
+                )
+                projects = [
+                    {"id": p.id, "slug": p.slug, "human_key": p.human_key, "created_at": _iso(p.created_at)}
+                    for p in proj_rows.scalars().all()
+                ]
+                payload = {
+                    "id": prod.id,
+                    "product_uid": prod.product_uid,
+                    "name": prod.name,
+                    "created_at": _iso(prod.created_at),
+                    "projects": projects,
+                }
             return _apply_resource_output_format(
                 payload,
                 settings=settings,

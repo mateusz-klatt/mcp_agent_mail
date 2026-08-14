@@ -1622,10 +1622,37 @@ def _retry_windows_readonly_removal(
     function(path)
 
 
-def _restore_bundle_into_archive(bundle_to_restore: Path, target_root: Path) -> None:
-    """Restore a Git bundle into the archive root without deleting the source bundle first."""
+def _restore_bundle_into_archive(
+    bundle_to_restore: Path,
+    target_root: Path,
+    database_path: Path | None,
+) -> None:
+    """Restore a Git bundle into the archive root without deleting the source bundle first.
+
+    `database_path` is required rather than defaulted: this function calls
+    `shutil.rmtree(target_root)`, and in the deployed layout the database
+    lives inside that root (`STORAGE_ROOT=/data/mailbox`), so a restore
+    would delete the very database the surrounding restore had just
+    rebuilt. It must fail closed, and a parameter that can be omitted is
+    not fail-closed -- pass None only when there is genuinely no database.
+    """
     import shutil
     import tempfile
+
+    if database_path is not None and target_root.exists():
+        try:
+            resolved_database = database_path.resolve()
+            resolved_root = target_root.resolve()
+        except OSError:  # pragma: no cover - resolution failure is itself a refusal
+            resolved_database = database_path
+            resolved_root = target_root
+        if resolved_database.is_relative_to(resolved_root):
+            raise RuntimeError(
+                "Refusing to restore an archive bundle into "
+                f"{target_root}: the database {database_path} lives inside it "
+                "and the restore would delete it. Move the database outside "
+                "STORAGE_ROOT (see .env.example) and retry."
+            )
 
     clear_repo_cache()
     source_bundle = bundle_to_restore
@@ -1636,7 +1663,7 @@ def _restore_bundle_into_archive(bundle_to_restore: Path, target_root: Path) -> 
             with tempfile.TemporaryDirectory(prefix="mcp-agent-mail-restore-") as temp_dir_str:
                 staged_bundle = Path(temp_dir_str) / bundle_to_restore.name
                 shutil.copy2(bundle_to_restore, staged_bundle)
-                _restore_bundle_into_archive(staged_bundle, target_root)
+                _restore_bundle_into_archive(staged_bundle, target_root, database_path)
             return
     except Exception:
         source_bundle = bundle_to_restore
@@ -1965,7 +1992,7 @@ def _ensure_archive_attributes_durable_sync(attributes_path: Path) -> None:
 
 def _fsync_archive_initialization_tree_sync(
     root: Path,
-    database_path: Path | None = None,
+    database_path: Path | None,
 ) -> None:
     """Persist Git initialization files and directory entries bottom-up.
 
@@ -5922,7 +5949,12 @@ async def restore_from_backup(
             continue
 
         try:
-            await _to_thread(_restore_bundle_into_archive, bundle_path, archive_root)
+            await _to_thread(
+                _restore_bundle_into_archive,
+                bundle_path,
+                archive_root,
+                get_database_path(settings),
+            )
             results["bundles_restored"].append(str(bundle_path))
         except Exception as e:
             results["errors"].append(f"Bundle restore failed for {bundle_path}: {e}")

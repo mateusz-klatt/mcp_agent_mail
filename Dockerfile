@@ -73,7 +73,10 @@ RUN git init -q /build/toon_rust && \
 # a wheel. The extraction below copies only the validated ui_dist members.
 # --------------------------------------------------------------------------
 FROM ghcr.io/astral-sh/uv:0.11.2 AS uv-bin
-FROM node:22.22.2-bookworm-slim AS node-runtime
+# Must match the toolchain hatch_build.py validates (_NODE_VERSION /
+# _NPM_VERSION) and the node-version in ci.yml: the wheel is built here, so a
+# divergence fails the image build rather than any test.
+FROM node:26.7.0-bookworm-slim AS node-runtime
 FROM python:3.14-slim AS ui-builder
 
 COPY --from=uv-bin /uv /uvx /usr/local/bin/

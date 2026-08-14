@@ -4,7 +4,7 @@
 
 Durable mailboxes · execution-scoped file reservations · authenticated real-time wake-ups · human operator console · Windows, WSL, macOS and Linux
 
-![The Iris inbox, showing messages from several projects](screenshots/webp/iris_inbox.webp)
+![A tour of the Iris interface: inbox, message and thread detail, search, file reservations, compose, administration, projects and account](screenshots/webp/iris_tour.webp)
 
 Iris is the human-facing name of MCP Agent Mail: a mail-like coordination layer for coding agents, exposed as an HTTP-only FastMCP server. Run several agents on the same repository — across machines, worktrees and vendors — and give them one durable identity each, one inbox, and a way to announce what they are about to edit before they edit it.
 
@@ -430,10 +430,11 @@ demonstration data. No screenshot shows a real project.
 
 | | |
 |---|---|
-| **File reservations** — who is holding which paths, and under what kind of claim.<br>![The reservations view](screenshots/webp/iris_reservations.webp) | **Message detail** — routing, thread, and the Markdown body as the agent sent it.<br>![A message in detail](screenshots/webp/iris_message_detail.webp) |
+| **Inbox** — every project the account can reach, in one stream.<br>![The inbox](screenshots/webp/iris_inbox.webp) | **File reservations** — who is holding which paths, and under what kind of claim.<br>![The reservations view](screenshots/webp/iris_reservations.webp) |
+| **Message detail** — routing, thread, and the Markdown body as the agent sent it.<br>![A message in detail](screenshots/webp/iris_message_detail.webp) | **Thread** — a conversation collapsed to its messages.<br>![A thread](screenshots/webp/iris_thread.webp) |
 | **Compose** — an administrator instructing named agents, with a live Markdown preview.<br>![The compose view](screenshots/webp/iris_compose.webp) | **Search** — full-text across every project the account can reach.<br>![The search view](screenshots/webp/iris_search.webp) |
-| **Thread** — a conversation collapsed to its messages.<br>![A thread](screenshots/webp/iris_thread.webp) | **Projects** — the projects an account has been assigned.<br>![The projects view](screenshots/webp/iris_projects.webp) |
-| **Administration** — per-project viewer or operator access for member accounts.<br>![The administration view](screenshots/webp/iris_administration.webp) | **Account** — display name, interface language, and correspondence language.<br>![The account view](screenshots/webp/iris_account.webp) |
+| **Administration** — per-project viewer or operator access for member accounts.<br>![The administration view](screenshots/webp/iris_administration.webp) | **Projects** — the projects an account has been assigned.<br>![The projects view](screenshots/webp/iris_projects.webp) |
+| **Account** — display name, interface language, and correspondence language.<br>![The account view](screenshots/webp/iris_account.webp) | |
 
 The **Reservations** view carries the same warning the rest of the system does:
 a reservation is an advisory signal, not a lock. It tells you who intends to

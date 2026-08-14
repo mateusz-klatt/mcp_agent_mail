@@ -71,6 +71,16 @@ class _ViewerAssetReferenceCollector(HTMLParser):
             self.csp = attributes.get("content") or ""
 
 
+
+# This test shells out to two complete distribution builds (`uv build`, which
+# compiles the UI). On the Windows runner that exceeds the suite's 300s
+# per-test ceiling, and pytest-timeout then killed the whole chunk with a
+# thread dump instead of naming a culprit. Give the builds a ceiling of their
+# own so a genuine hang is reported by this test, and raise the per-test one
+# above it so a merely slow runner is not a failure.
+_DISTRIBUTION_BUILD_TIMEOUT = 900
+
+
 def _build_snapshot(tmp_path: Path) -> Path:
     snapshot = tmp_path / "snapshot.sqlite3"
     conn = sqlite3.connect(snapshot)
@@ -863,6 +873,7 @@ def test_checksum_verified_viewer_assets_are_not_rewritten_by_git() -> None:
     ]
 
 
+@pytest.mark.timeout(_DISTRIBUTION_BUILD_TIMEOUT + 120)
 def test_wheel_and_sdist_exclude_repository_only_clusterize(tmp_path: Path) -> None:
     """Built Python distributions must never contain the retained GPL sources."""
     repository_root = Path(__file__).resolve().parents[1]
@@ -890,6 +901,7 @@ def test_wheel_and_sdist_exclude_repository_only_clusterize(tmp_path: Path) -> N
         check=False,
         capture_output=True,
         text=True,
+        timeout=_DISTRIBUTION_BUILD_TIMEOUT,
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -934,6 +946,7 @@ def test_wheel_and_sdist_exclude_repository_only_clusterize(tmp_path: Path) -> N
         check=False,
         capture_output=True,
         text=True,
+        timeout=_DISTRIBUTION_BUILD_TIMEOUT,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     node_free_wheel = next(wheel_from_sdist.glob("*.whl"))

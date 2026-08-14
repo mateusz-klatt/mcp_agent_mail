@@ -78,8 +78,11 @@ if [ -z "$token" ]; then
 fi
 [ -z "$token" ] && exit 0
 
-execution_cwd="$(git -C "$(dirname "$(am_norm_path "$target")")" \
-    rev-parse --show-toplevel 2>/dev/null)"
+# am_git, never `git -C`: with MSYS_NO_PATHCONV=1 exported by the library a
+# POSIX-form directory argument makes native git.exe exit 128 and this would
+# silently pin the execution to the session cwd instead of the edited repo.
+execution_cwd="$(am_git "$(dirname "$(am_norm_path "$target")")" \
+    rev-parse --show-toplevel)"
 if ! AM_EXECUTION_CWD_OVERRIDE="$execution_cwd" \
     am_execution_ensure_for_payload "$PROJECT" "$AGENT" "$token" claude \
         >/dev/null; then

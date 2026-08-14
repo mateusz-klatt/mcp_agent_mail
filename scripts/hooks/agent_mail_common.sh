@@ -513,7 +513,7 @@ am_repository_opted_in() {
 
     marker="${root}/.agent-mail-project-id"
     # The committed identity marker is meaningful only when it contains an id.
-    [ -r "$marker" ] && grep -Eq '[^[:space:]]' "$marker" 2>/dev/null && return 0
+    [ -r "$marker" ] && grep -Eq '[^[:space:]]' < "$marker" 2>/dev/null && return 0
 
     discovery="${root}/.agent-mail.yaml"
     # Discovery YAML is an opt-in only when it declares the documented project
@@ -1389,11 +1389,11 @@ am_execution_manifest_add() {
               .session_id == $session_id and
               .lifecycle_generation == $generation and
               (.state_files | type == "array")
-            ' "$manifest_file" >/dev/null 2>&1 \
+            ' < "$manifest_file" >/dev/null 2>&1 \
             && jq --arg state_file "$state_name" '
               .state_files = ((.state_files + [$state_file]) | unique) |
               .updated_at = (now | todateiso8601)
-            ' "$manifest_file" > "$tmp" 2>/dev/null; then
+            ' < "$manifest_file" > "$tmp" 2>/dev/null; then
             rc=0
         fi
     elif jq -nc --arg client "$client" --arg session_id "$session_id" \
@@ -1441,7 +1441,7 @@ am_execution_manifest_state_files() {
                      .lifecycle_generation == $generation and
                      (.state_files | type == "array")) |
               .state_files[] | select(type == "string")
-            ' "$manifest_file" 2>/dev/null
+            ' < "$manifest_file" 2>/dev/null
     )
 }
 
@@ -1483,7 +1483,7 @@ am_session_lifecycle_generation() {
         then .generation
         elif .version == 1 and .status == "ended" then 1
         else empty end
-      ' "$intent_file" 2>/dev/null)"
+      ' < "$intent_file" 2>/dev/null)"
     [ -n "$generation" ] || generation=1
     printf '%s' "$generation"
 }
@@ -1593,7 +1593,7 @@ am_session_end_intent_exists() {
          (if $expected_generation == "" then .status == "ended"
           else ($generation != ($expected_generation | tonumber)) or
                .status == "ended" end))
-      ' "$intent_file" >/dev/null 2>&1
+      ' < "$intent_file" >/dev/null 2>&1
 }
 
 # Rewrite a confirmed terminal state to the small non-secret resume/audit
@@ -1675,7 +1675,7 @@ am_execution_manifest_mark_terminal() {
           .status = "terminal" |
           .ended_at = (now | todateiso8601) |
           .retain_until_epoch = $retain_until
-        ' "$manifest_file" > "$tmp" 2>/dev/null \
+        ' < "$manifest_file" > "$tmp" 2>/dev/null \
         || ! chmod 600 "$tmp" 2>/dev/null \
         || ! mv -f "$tmp" "$manifest_file" 2>/dev/null; then
         rm -f "$tmp" 2>/dev/null || true
@@ -1712,12 +1712,12 @@ am_execution_retention_prune_marker() {
     local marker_file="$1" now="$2" client session_id generation retain_until
     local manifest_name intent_name manifest_file intent_file state_file state_lock
     local state_status state_generation project agent execution_id stamp manifest_lock
-    client="$(jq -r '.client // empty' "$marker_file" 2>/dev/null)"
-    session_id="$(jq -r '.session_id // empty' "$marker_file" 2>/dev/null)"
-    generation="$(jq -r '.lifecycle_generation // empty' "$marker_file" 2>/dev/null)"
-    retain_until="$(jq -r '.retain_until_epoch // empty' "$marker_file" 2>/dev/null)"
-    manifest_name="$(jq -r '.manifest_file // empty' "$marker_file" 2>/dev/null)"
-    intent_name="$(jq -r '.intent_file // empty' "$marker_file" 2>/dev/null)"
+    client="$(jq -r '.client // empty' < "$marker_file" 2>/dev/null)"
+    session_id="$(jq -r '.session_id // empty' < "$marker_file" 2>/dev/null)"
+    generation="$(jq -r '.lifecycle_generation // empty' < "$marker_file" 2>/dev/null)"
+    retain_until="$(jq -r '.retain_until_epoch // empty' < "$marker_file" 2>/dev/null)"
+    manifest_name="$(jq -r '.manifest_file // empty' < "$marker_file" 2>/dev/null)"
+    intent_name="$(jq -r '.intent_file // empty' < "$marker_file" 2>/dev/null)"
     case "$generation" in ''|*[!0-9]*) return 1 ;; esac
     case "$retain_until" in ''|*[!0-9]*) return 1 ;; esac
     [ "$retain_until" -le "$now" ] || return 1
@@ -1737,7 +1737,7 @@ am_execution_retention_prune_marker() {
           .session_id == $session_id and
           .lifecycle_generation == $generation and .status == "terminal" and
           .retain_until_epoch == $retain_until
-        ' "$manifest_file" >/dev/null 2>&1; then
+        ' < "$manifest_file" >/dev/null 2>&1; then
         am_lock_release "$manifest_lock"
         return 1
     fi
@@ -1779,7 +1779,7 @@ am_execution_retention_prune_marker() {
         --argjson retain_until "$retain_until" '
           .lifecycle_generation == $generation and .status == "terminal" and
           .retain_until_epoch == $retain_until
-        ' "$manifest_file" >/dev/null 2>&1; then
+        ' < "$manifest_file" >/dev/null 2>&1; then
         rm -f "$manifest_file" 2>/dev/null || true
     else
         am_lock_release "$manifest_lock"
@@ -1796,7 +1796,7 @@ am_execution_retention_prune_marker() {
                 --argjson generation "$generation" '
                   .client == $client and .session_id == $session_id and
                   .generation == $generation and .status == "ended"
-                ' "$intent_file" >/dev/null 2>&1; then
+                ' < "$intent_file" >/dev/null 2>&1; then
                 rm -f "$intent_file" 2>/dev/null || true
             fi
             am_lock_release "$state_lock"
@@ -1979,7 +1979,7 @@ am_execution_marker_touch() {
     [ -r "$marker" ] || return 1
     lock_dir="${marker}.lock"
     am_lock_acquire "$lock_dir" || return 1
-    current_id="$(jq -r '.execution_id // empty' "$marker" 2>/dev/null)"
+    current_id="$(jq -r '.execution_id // empty' < "$marker" 2>/dev/null)"
     if [ "$current_id" != "$execution_id" ] \
         && ! printf '%s' "$compatible_ids" | jq -e --arg id "$current_id" \
             'type == "array" and index($id) != null' >/dev/null 2>&1; then
@@ -1995,7 +1995,7 @@ am_execution_marker_touch() {
     tmp="${marker}.${BASHPID:-$$}.tmp"
     if jq --arg heartbeat_ts "$now" \
         '.status = "active" | .heartbeat_ts = $heartbeat_ts' \
-        "$marker" > "$tmp" 2>/dev/null \
+        < "$marker" > "$tmp" 2>/dev/null \
         && chmod 600 "$tmp" 2>/dev/null \
         && mv -f "$tmp" "$marker" 2>/dev/null; then
         rc=0
@@ -2011,7 +2011,7 @@ am_execution_marker_end() {
     [ -r "$marker" ] || return 1
     lock_dir="${marker}.lock"
     am_lock_acquire "$lock_dir" || return 1
-    current_id="$(jq -r '.execution_id // empty' "$marker" 2>/dev/null)"
+    current_id="$(jq -r '.execution_id // empty' < "$marker" 2>/dev/null)"
     if [ "$current_id" != "$execution_id" ]; then
         am_lock_release "$lock_dir"
         return 1
@@ -2022,7 +2022,7 @@ am_execution_marker_end() {
             (.status == "completed" or .status == "failed" or
              .status == "cancelled" or .status == "expired")
          then . else .status = $status end' \
-        "$marker" > "$tmp" 2>/dev/null \
+        < "$marker" > "$tmp" 2>/dev/null \
         && chmod 600 "$tmp" 2>/dev/null \
         && mv -f "$tmp" "$marker" 2>/dev/null; then
         rc=0
@@ -2409,7 +2409,7 @@ am_execution_state_value() {
     state_file="$(am_execution_state_file "$project" "$agent" "$client" \
         "$session_id" "$kind" "$native_id")" || return 1
     [ -r "$state_file" ] || return 1
-    jq -r "$query // empty" "$state_file" 2>/dev/null
+    jq -r "$query // empty" < "$state_file" 2>/dev/null
 }
 
 am_execution_state_token() {
@@ -2483,8 +2483,8 @@ am_execution_compatible_ids_for_payload() {
         (.heartbeat_ts | type == "string") and
         ((.heartbeat_ts | fromdateiso8601) as $heartbeat |
           $heartbeat >= (now - $max_age) and $heartbeat <= (now + 300))
-      ' "$marker" >/dev/null 2>&1 || return 1
-    marker_id="$(jq -r '.execution_id' "$marker" 2>/dev/null)"
+      ' < "$marker" >/dev/null 2>&1 || return 1
+    marker_id="$(jq -r '.execution_id' < "$marker" 2>/dev/null)"
     printf '%s' "$compatible_ids" | jq -e --arg id "$marker_id" \
         'index($id) != null' >/dev/null 2>&1 || return 1
     # State lineage came from the authenticated start response. The marker is

@@ -1435,6 +1435,88 @@ def test_user_scope_integrator_rejects_shared_environment_inside_git(
     assert after_repo_files == before_repo_files
 
 
+def _install_dash_c_hostile_git(fake_bin: Path) -> None:
+    """Break `git -C <path>` exactly the way native git.exe breaks under Git Bash.
+
+    The hook library exports MSYS_NO_PATHCONV=1 at file scope, and six
+    installers *source* that library, so they inherit it.  From then on a POSIX
+    path handed to a native git.exe is no longer translated: `git -C /c/...`
+    cannot chdir and exits 128.  Everything else keeps working, which is what
+    made the resulting hole so quiet — the worktree guard swallowed the failure
+    with `2>/dev/null || true`, compared "" against "true", stayed silent, and
+    let a bearer token be written inside the checkout.
+
+    Shimming the same failure keeps this a regression test on *every* platform
+    rather than only on the one Windows host, so the gate survives that host
+    being unavailable.
+    """
+    real_git = shutil.which("git")
+    assert real_git is not None, "git is required to build this shim"
+    shim = fake_bin / "git"
+    shim.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "$1" = "-C" ]; then\n'
+        "  printf 'fatal: cannot change to %s: No such file or directory\\n' \"$2\" >&2\n"
+        "  exit 128\n"
+        "fi\n"
+        f'exec "{_git_bash_path(Path(real_git))}" "$@"\n',
+        encoding="utf-8",
+        # Windows would translate the shebang's LF into CRLF and `env` would
+        # then look for a program literally named "bash\r".
+        newline="\n",
+    )
+    shim.chmod(0o755)
+
+
+@pytest.mark.parametrize("client", USER_SCOPE_BOOTSTRAP_INTEGRATORS)
+def test_user_scope_integrator_guard_survives_a_probe_that_cannot_answer(
+    tmp_path: Path,
+    client: str,
+) -> None:
+    """The worktree guard must not fall silent when its own probe fails.
+
+    This is the security half of the MSYS_NO_PATHCONV leak: with `git -C`
+    broken, the old guard produced "" instead of "true" and therefore did not
+    fire, so the installer wrote `.agent-mail.env` — containing the bearer
+    token — inside a Git worktree, which is precisely what the guard exists to
+    prevent.  A guard that treats "I could not find out" as "safe" is wrong
+    regardless of what broke the probe: permissions, a corrupt `.git`, git
+    missing from PATH, or a path dialect the binary cannot read.
+    """
+    home = tmp_path / "home"
+    fake_bin = tmp_path / "bin"
+    repo = tmp_path / "checkout"
+    _init_git_repo(repo)
+    env = {**os.environ, **_integration_env(home, fake_bin)}
+    # After _integration_env, so fake_bin exists and is already on PATH.
+    _install_dash_c_hostile_git(fake_bin)
+    unsafe_env_file = repo / ".agent-mail.env"
+    env["AGENT_MAIL_ENV_FILE"] = _git_bash_path(unsafe_env_file)
+
+    result = subprocess.run(
+        [
+            BASH,
+            _git_bash_path(USER_SCOPE_BOOTSTRAP_INTEGRATORS[client]),
+            "--yes",
+            "--dry-run",
+            "--project-dir",
+            _git_bash_path(repo),
+        ],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert "must live outside every Git worktree" in output, output
+    # The token must never reach a file inside the checkout, nor the transcript.
+    assert "test-bearer" not in output
+    assert not unsafe_env_file.exists()
+
+
 def test_legacy_inbox_hook_keeps_credentials_off_process_argv(
     tmp_path: Path,
 ) -> None:
@@ -6182,8 +6264,10 @@ printf '%s\n200' "$envelope"
     assert all(item["lifecycle_protocol_version"] == 1 for item in root_starts)
     assert all(item["model"] == "gpt-5.6" for item in root_starts)
     assert all(item["permission_mode"] == "default" for item in root_starts)
-    assert all(item["repo_root"] == str(repo) for item in root_starts)
-    assert all(item["worktree_path"] == str(repo) for item in root_starts)
+    # Compare places, not spellings: git reports C:/... on Windows while
+    # str(WindowsPath) spells C:\..., and the two name the same directory.
+    assert all(Path(item["repo_root"]) == repo for item in root_starts)
+    assert all(Path(item["worktree_path"]) == repo for item in root_starts)
     assert all(re.fullmatch(r"[0-9a-f]{40}", item["head_sha"]) for item in root_starts)
 
     marker_rel = subprocess.run(
@@ -6204,11 +6288,13 @@ printf '%s\n200' "$envelope"
     if not marker_path.is_absolute():
         marker_path = repo / marker_path
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
-    assert marker == {
+    # Compare the place, not the spelling: git reports C:/... on Windows while
+    # str(WindowsPath) spells C:\..., and both name the same worktree.
+    assert Path(marker["worktree_path"]) == repo
+    assert {k: v for k, v in marker.items() if k != "worktree_path"} == {
         "execution_id": "11111111-1111-4111-8111-111111111111",
         "status": "active",
         "kind": "session",
-        "worktree_path": str(repo),
         "heartbeat_ts": marker["heartbeat_ts"],
         "ancestor_execution_ids": [],
     }
@@ -6703,7 +6789,13 @@ exec {shlex.quote(_git_bash_path(Path(real_jq).resolve()))} "$@"
     start_process.stdin.write(json.dumps(payload))
     start_process.stdin.close()
 
-    deadline = time.monotonic() + 10
+    # Wall-clock generosity, not laxness: reaching the start RPC costs a chain
+    # of bash+jq spawns whose price is the machine's, not the hook's.  Measured
+    # on the native Windows host: a full session-start takes 15.5 s while the
+    # hook is perfectly healthy, so the old 10 s window failed on spawn cost
+    # alone.  The loop exits the moment the marker appears, so a fast machine
+    # pays nothing for the headroom.
+    deadline = time.monotonic() + (60 if os.name == "nt" else 20)
     while not start_entered.exists() and time.monotonic() < deadline:
         time.sleep(0.01)
     assert start_entered.exists(), "start_agent_execution RPC was not reached"
@@ -8160,7 +8252,12 @@ printf '%s\n200' "$envelope"
     enrollment.stdin.write(json.dumps(post_tool_payload))
     enrollment.stdin.close()
     enrollment.stdin = None
-    deadline = time.monotonic() + 5
+    # Same spawn-cost headroom as the racing test above: cross-project
+    # enrollment sits behind register + ensure + execution bookkeeping, each a
+    # separate bash+jq process, and on the native Windows host the healthy
+    # path needs more than the 5 s this wait used to allow.  The loop returns
+    # the instant the marker appears.
+    deadline = time.monotonic() + (60 if os.name == "nt" else 20)
     while not register_entered.exists() and time.monotonic() < deadline:
         time.sleep(0.02)
     assert register_entered.exists(), "target enrollment never reached register_agent"
@@ -8183,7 +8280,11 @@ printf '%s\n200' "$envelope"
         check=False,
         capture_output=True,
         text=True,
-        timeout=3,
+        # A kill this high catches a genuinely hung hook while letting a slow
+        # machine finish: measured session-end on the native Windows host is
+        # 6.8 s of pure spawn cost with the hook healthy, so the old 3 s kill
+        # reported TimeoutExpired — an error, not a verdict — on speed alone.
+        timeout=60 if os.name == "nt" else 20,
     )
     assert end.returncode == 0, end.stderr
     tombstones = list((state / "session-end-intents").glob("*.json"))

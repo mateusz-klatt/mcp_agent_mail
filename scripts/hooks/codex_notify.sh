@@ -325,7 +325,11 @@ if [[ "$EVENT" == "heartbeat" ]]; then
     || TARGET_PROJECT="$(am_project_key_for_file "$TARGET_PATH")"
   if [[ -n "$TARGET_PROJECT" && "$TARGET_PROJECT" != "$PROJECT" ]]; then
     TARGET_DIR="$(dirname "$(am_norm_path "$TARGET_PATH")")"
-    TARGET_REPO="$(git -C "$TARGET_DIR" rev-parse --show-toplevel 2>/dev/null)"
+    # am_git, never `git -C`: under this hook's MSYS_NO_PATHCONV=1 export a
+    # POSIX-form TARGET_DIR handed to native git.exe as an argument is not
+    # translated, `git -C` exits 128, TARGET_REPO comes back empty, and the
+    # whole cross-project enrollment below is silently skipped.
+    TARGET_REPO="$(am_git "$TARGET_DIR" rev-parse --show-toplevel)"
     if [[ -n "$TARGET_REPO" ]] \
       && ! am_session_end_intent_exists "$HOOK_CLIENT" \
       && am_project_is_active "$TARGET_PROJECT" "$HOOK_CLIENT" "$HOOK_SLOT" \

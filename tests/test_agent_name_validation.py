@@ -275,7 +275,12 @@ async def test_register_agent_requires_explicit_name_without_mutation(isolated_e
             "ensure_project", {"human_key": pkey("test/names")}
         )
 
-        with pytest.raises(ToolError, match=r"name\n\s+Missing required argument"):
+        # Match the field and the message, not the layout between them. Pydantic
+        # put them on two lines; the redacting middleware added in a164c6b
+        # renders the failure itself and joins them with ": ". Both are the same
+        # assertion — that the failure names the missing field — so accept
+        # either separator rather than re-coupling this test to one rendering.
+        with pytest.raises(ToolError, match=r"name[:\s]\s*Missing required argument"):
             await client.call_tool(
                 "register_agent",
                 {
@@ -595,7 +600,11 @@ async def test_create_agent_identity_requires_name_hint_without_mutation(isolate
             "ensure_project", {"human_key": pkey("test/identity")}
         )
 
-        with pytest.raises(ToolError, match=r"name_hint\n\s+Missing required argument"):
+        # Same reason as the register_agent case above: assert the field and the
+        # message, not the separator the renderer happens to use.
+        with pytest.raises(
+            ToolError, match=r"name_hint[:\s]\s*Missing required argument"
+        ):
             await client.call_tool(
                 "create_agent_identity",
                 {

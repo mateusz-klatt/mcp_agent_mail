@@ -5498,6 +5498,75 @@ class TestMailUiRbacSurface:
             "retired-404",
         }
 
+    @pytest.mark.asyncio
+    async def test_options_on_a_retired_path_never_reaches_the_router(
+        self, isolated_env, monkeypatch
+    ):
+        """OPTIONS is filtered by the allowlist, not by the method branch below it.
+
+        The middleware does call `call_next` for OPTIONS, which reads like a
+        bypass. It is not: the active-path check runs first, so a retired path
+        is already answered, and a legacy bookmark is rejected by the
+        GET/HEAD-only guard. This is the least obvious of the reachability
+        guarantees and the one that would silently regress if those three
+        checks were ever reordered.
+        """
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            retired = await client.options("/mail/archive/activity")
+            bookmark = await client.options("/mail/projects")
+            live = await client.options("/mail/login")
+
+        assert retired.status_code == 404
+        assert bookmark.status_code == 404
+        # The live path is the control: a 404 here would mean the assertions
+        # above passed because everything 404s, which would prove nothing.
+        assert live.status_code != 404
+
+    @pytest.mark.asyncio
+    async def test_retired_paths_stay_404_with_the_session_gate_disabled(
+        self, isolated_env, monkeypatch, tmp_path
+    ):
+        """Turning the session gate off in development does not restore the old UI.
+
+        That branch exists so a developer can run without cookies, and it
+        reaches `call_next` — but only after the same allowlist check. A
+        regression here would expose the retired surface on exactly the
+        configuration nobody runs in production and therefore nobody watches.
+        """
+        _install_react_dist(monkeypatch, tmp_path)
+        test_settings, _app = _build(
+            monkeypatch,
+            MAIL_UI_AUTH_ENABLED="false",
+            MAIL_UI_SESSION_SECRET="",
+        )
+        settings = replace(test_settings, environment="development")
+        app = build_http_app(settings, build_mcp_server())
+
+        # Disabling the session gate hands the UI to the bearer layer — the
+        # middleware says so itself — so every request here carries the bearer.
+        # Without it the retired paths would 401 and the case would prove
+        # nothing about the allowlist.
+        headers = {"Authorization": f"Bearer {BEARER}"}
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            retired = await client.get("/mail/archive/activity", headers=headers)
+            retired_project = await client.get(
+                "/mail/some-project/attachments", headers=headers
+            )
+            shell = await client.get("/mail", headers=headers)
+
+        assert retired.status_code == 404
+        assert retired_project.status_code == 404
+        # Control: authenticated to the bearer layer, the shell must be served,
+        # otherwise the two 404s above are indistinguishable from a broken app.
+        assert shell.status_code == 200
+
+
 
 class TestMailUiV1ReadApi:
     """The React read API is typed, project-scoped, and privacy-minimal."""

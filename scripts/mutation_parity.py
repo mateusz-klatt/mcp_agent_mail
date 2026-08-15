@@ -47,7 +47,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-# Same three-way convention as scripts/relicense_debt.py, and for the same
+# A three-way exit convention, and the reason is the same
 # reason. `1` has to mean "a real finding" and nothing else, or a CI job cannot
 # tell a broken instrument from a broken test. The first draft of this file
 # exited 1 on a malformed mutation set -- indistinguishable from "the new test

@@ -20,6 +20,18 @@ services:
     restart: unless-stopped
     stop_grace_period: 30s    # let SQLite checkpoint the WAL and the git commit queue drain
 
+    # Docker's json-file driver has NO default cap, so the log grows until the
+    # disk does. Measured on this deployment: 25 MB an hour, ~600 MB a day, of
+    # which 26% is the box-drawing characters of the rich panels the server
+    # prints per tool call. That rate is a function of how much traffic we
+    # generate, so it climbs on exactly the busy days when nobody is watching
+    # disk. 50m x 5 bounds it at 250 MB and still holds several hours of history.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
     # Loopback ONLY. Apache on the host is the sole ingress; the container must never
     # be reachable from the LAN, because BearerAuthMiddleware lets any path starting
     # with /health/ (and /api/health) through unauthenticated.

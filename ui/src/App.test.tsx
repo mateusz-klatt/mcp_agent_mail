@@ -696,6 +696,49 @@ describe("Iris landing shell", () => {
     ]);
   });
 
+  it("reads a reservation expiry as UTC, not as the viewer's local clock", async () => {
+    window.history.replaceState({}, "", "/mail/#reservations");
+
+    render(<App />);
+    await waitForEnglishPreferences();
+
+    // The fixture's `2026-08-14 19:00:00.000000` carries no offset but means
+    // 19:00 UTC. Assert against the machine-readable attribute rather than the
+    // rendered text: the visible string is deliberately locale- and
+    // timezone-dependent, so asserting it would only restate whatever the
+    // runner's clock happens to be. Reading the raw value as local time — the
+    // defect this guards — yields a different instant here, and a plausible
+    // wrong hour rather than an obvious failure.
+    const expiry = await screen.findByText((_, element) =>
+      element?.tagName === "TIME" &&
+      element.getAttribute("dateTime") === "2026-08-14T19:00:00.000000Z",
+    );
+    expect(expiry).toBeVisible();
+    expect(expiry.textContent).not.toContain("19:00:00.000000");
+  });
+
+  it("shows an unparseable expiry verbatim instead of 'Invalid Date'", async () => {
+    server.use(
+      http.get("*/mail/api/v1/reservations", () =>
+        HttpResponse.json({
+          ...reservationsResponse,
+          items: [
+            { ...reservationsResponse.items[0], expires_ts: "not-a-timestamp" },
+          ],
+        }),
+      ),
+    );
+    window.history.replaceState({}, "", "/mail/#reservations");
+
+    render(<App />);
+    await waitForEnglishPreferences();
+
+    // The server normalises this column, so this shape should never arrive. If
+    // it ever does, showing the stored value beats showing "Invalid Date":
+    // one is a lead, the other destroys the only evidence of what went wrong.
+    expect(await screen.findByText("not-a-timestamp")).toBeVisible();
+  });
+
   it("sends an expired session to sign-in rather than showing an empty table", async () => {
     server.use(
       http.get("*/mail/api/v1/reservations", () =>

@@ -2023,6 +2023,24 @@ export function App({
       timeStyle: "short",
     }).format(new Date(timestamp));
 
+  // Reservation timestamps do not carry an offset. The server normalises them to
+  // `YYYY-MM-DD HH:MM:SS.ffffff` (see `_mail_ui_optional_timestamp_key`) from a
+  // value produced by `datetime.now(timezone.utc).replace(tzinfo=None)`, so the
+  // instant is UTC while the text says nothing about it. `new Date()` reads that
+  // shape as LOCAL time, which would render every expiry shifted by the viewer's
+  // offset — an hour that looks entirely plausible and is simply wrong. Message
+  // timestamps are unaffected: those arrive with an explicit `+00:00`.
+  const formatUtcNaiveDate = (timestamp: string) => {
+    const normalised = `${timestamp.replace(" ", "T")}Z`;
+    const parsed = new Date(normalised);
+    return Number.isNaN(parsed.getTime())
+      ? timestamp
+      : new Intl.DateTimeFormat(locale, {
+          dateStyle: "medium",
+          timeStyle: "short",
+        }).format(parsed);
+  };
+
   const attachmentText = (attachment: MessageAttachment) =>
     t("message.attachment", {
       type: attachment.type ?? t("message.unknownType"),
@@ -2397,9 +2415,13 @@ export function App({
                     </span>
                   </td>
                   <td>
-                    {claim.expires_ts === null
-                      ? t("reservations.unknownExpiry")
-                      : claim.expires_ts}
+                    {claim.expires_ts === null ? (
+                      t("reservations.unknownExpiry")
+                    ) : (
+                      <time dateTime={`${claim.expires_ts.replace(" ", "T")}Z`}>
+                        {formatUtcNaiveDate(claim.expires_ts)}
+                      </time>
+                    )}
                   </td>
                 </tr>
               ))}

@@ -29,6 +29,22 @@ Coverage thresholds are 100% on statements, branches, functions and lines.
 That is deliberate. It has already caught a test that kept passing after it had
 silently stopped exercising its own subject.
 
+The Windows CI leg runs the suite in eight parallel chunks, split by
+`pytest-split` using the committed `.test_durations`. Refresh it after a change
+that moves the timings materially:
+
+```bash
+uv run pytest --store-durations          # rewrites .test_durations in place
+```
+
+Keep every collected test in that file, including the fast ones. `pytest-split`
+substitutes the *average* known duration for any test it cannot find there, so
+a file covering only the slow tests balances the chunks **worse** than having no
+file at all — the omitted tests come back weighing several seconds each. The
+first version of this file was built from a `--durations=0` dump, which hides
+anything under 0.005 s per phase; the 411 tests that dump omitted had to be
+written back explicitly at a floor value.
+
 A distribution build needs exactly the pinned Node and npm; `hatch_build.py`
 validates the pair and refuses anything else. The same version is pinned in
 `.github/workflows/ci.yml` and in the `Dockerfile`. Those three must move

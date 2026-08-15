@@ -323,10 +323,13 @@ jobs:
     # gap is diagnosed, and `fail-fast: false` keeps every chunk reporting.
     name: Lint, Type Check, Test (windows-latest, py${{ matrix.python-version }}, chunk ${{ matrix.group }}/8)
     runs-on: windows-latest
-    # Generous while `.test_durations` is still absent: without it pytest-split
-    # balances by test COUNT, and this suite's slowness is concentrated (one
-    # measured band spent 44m45s on 72 tests next to bands of 26 s), so one
-    # chunk can be far heavier than the average.
+    # `.test_durations` now exists, so pytest-split balances by measured time
+    # rather than by test COUNT, and the chunks stop being wildly uneven: the
+    # predicted spread is 23.8-25.1 min against the 13-50 min this leg actually
+    # ran without the file.  The ceiling stays at 90 for one run — it is a
+    # kill for a HANG, not a budget for slowness, and it is not worth risking a
+    # red chunk on a predicted number the day after this leg first went green.
+    # Drop it to 45 once a real run confirms the spread.
     timeout-minutes: 90
     strategy:
       fail-fast: false

@@ -130,9 +130,19 @@ def _stop_and_read(proc: subprocess.Popen[str], *, budget: float = 15.0) -> tupl
     try:
         return proc.communicate(timeout=budget)
     except subprocess.TimeoutExpired:
-        for stream in (proc.stdout, proc.stderr):
-            if stream is not None:
-                stream.close()
+        # Do NOT close the pipes here. On Windows `communicate()` reads through
+        # a `_readerthread` per pipe, and closing a file whose reader thread is
+        # still blocked blocks too -- so the one unbudgeted wait in a helper
+        # that promises never to block forever was the error path, the branch
+        # that only runs once things have already gone wrong. Measured: it hung
+        # exactly here, and because --timeout-method=thread ends the pytest
+        # process rather than the test, it took the whole Windows chunk (~280
+        # tests) down with it and left a log with no summary at all.
+        #
+        # The reason to skip the close is not that the tree is dead -- reaching
+        # this line proves it is not. It is that closing cannot help here and
+        # can only hang. Leaking two descriptors from a test that is failing on
+        # its own terms is bounded; losing the chunk is not.
         raise AssertionError(
             "the monitor's output pipes never closed after the process tree was "
             f"killed, so something still holds them (pid {proc.pid})"

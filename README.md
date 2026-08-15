@@ -2165,11 +2165,12 @@ The same image, byte for byte, is published to both registries:
 | Docker Hub | `klattm/iris` |
 | GHCR | `ghcr.io/mateusz-klatt/mcp_agent_mail` |
 
-Each release publishes `:<version>`, `:sha-<commit>` and — for non-prereleases —
-`:latest`, for `linux/amd64` and `linux/arm64`. A tag is only created after that
-exact digest has been started on both architectures and answered
-`/health/liveness` and `/health/readiness`, so `latest` can never point at an
-image that has not run.
+Each release publishes `:<version>` and `:v<version>` — both spellings, so
+either guess works — plus `:sha-<commit>` and, for non-prereleases, `:latest`,
+for `linux/amd64` and `linux/arm64`. A tag is only created after that exact
+digest has been started on both architectures and answered `/health/liveness`
+and `/health/readiness`, so `latest` can never point at an image that has not
+run.
 
 Pin the version for anything you depend on:
 

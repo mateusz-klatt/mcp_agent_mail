@@ -298,8 +298,15 @@ jobs:
           images: |
             ghcr.io/${{ github.repository }}
             docker.io/klattm/iris
+          # `type=ref,event=tag` publishes the git ref verbatim, so it yields
+          # `v0.4.0`. The documented pull command is `klattm/iris:0.4.0`, which
+          # is also the ordinary Docker spelling — without `type=semver` that
+          # command would 404 against a release that had otherwise succeeded,
+          # and nothing in this workflow would notice. Publish both spellings so
+          # the tag a reader guesses is the tag that exists.
           tags: |
             type=raw,value=latest,enable=${{ needs.validate-release.outputs.prerelease == 'false' }}
+            type=semver,pattern={{version}}
             type=ref,event=tag
             type=sha,format=long,prefix=sha-
 

@@ -1,203 +1,222 @@
+"""Edge cases in the two thinnest layers: environment parsing and database wiring.
+
+The configuration half pins one distinction and nothing else. A variable that is
+absent, or present but blank, is *not configured*: the compile-time default
+applies and start-up continues, which is what lets a fresh deployment boot with
+no ``.env`` at all. A variable holding a non-empty value that will not parse is
+an operator mistake instead, and it has to stop start-up with the variable's own
+name in the message -- folding it into the default would run the server with the
+opposite of the setting its operator believed they had written.
+
+The database half pins the SQLite-only policy (refused early, and refused without
+repeating the credential the URL carried) and the filename arithmetic that the
+backup/restore path depends on.
+"""
+
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
+import pathlib
 
-import pytest
+from pytest import approx, mark, raises
 
-from mcp_agent_mail.config import ConfigError, clear_settings_cache, get_settings
-from mcp_agent_mail.db import (
-    UnsupportedDatabaseBackendError,
-    _assert_supported_backend,
-    ensure_schema,
-    get_engine,
-    get_sqlite_pre_restore_path,
-    get_sqlite_sidecar_paths,
-    reset_database_state,
-)
-from mcp_agent_mail.utils import sanitize_agent_name, slugify
+from mcp_agent_mail import config as config_module, db as db_module, utils as utils_module
+
+# Planted in every rejected database URL. The refusal has to name the backend
+# and nothing else: the URL it was handed routinely carries a password, and an
+# exception that quotes it turns a configuration mistake into a credential in
+# the terminal scrollback and in whatever ships the logs.
+URL_SECRET = "hunter2-never-print-me"
 
 
-def test_slugify_and_sanitize_edges():
-    assert slugify("  Hello World!!  ") == "hello-world"
-    assert slugify("") == "project"
-    assert sanitize_agent_name(" A!@#$ ") == "A"
-    assert sanitize_agent_name("!!!") is None
+def _settings_from(monkeypatch, **environment: str):
+    """Settings loaded fresh after ``environment`` is installed over the real one."""
+    for variable, written in environment.items():
+        monkeypatch.setenv(variable, written)
+    config_module.clear_settings_cache()
+    return config_module.get_settings()
 
 
-def test_config_csv_and_bool_parsing(monkeypatch):
-    monkeypatch.setenv("HTTP_RBAC_READER_ROLES", "reader, ro ,, read ")
-    monkeypatch.setenv("HTTP_RATE_LIMIT_ENABLED", "true")
-    clear_settings_cache()
-    s = get_settings()
-    assert {"reader", "ro", "read"}.issubset(set(s.http.rbac_reader_roles))
-    assert s.http.rate_limit_enabled is True
+def _refusal_for(monkeypatch, variable: str, written: str) -> str:
+    """The ConfigError text produced when ``variable`` holds an unparseable value."""
+    monkeypatch.setenv(variable, written)
+    config_module.clear_settings_cache()
+    with raises(config_module.ConfigError) as refusal:
+        config_module.get_settings()
+    return str(refusal.value)
 
 
-# ============================================================================
-# #169: configuration parsers must fail-closed on malformed *explicit* values
-# while still falling back to defaults for empty/unset values.
-# ============================================================================
+def test_slugify_folds_punctuation_and_names_the_nameless():
+    assert utils_module.slugify("  Hello World!!  ") == "hello-world"
+    assert utils_module.slugify("") == "project"
 
 
-def test_config_valid_explicit_values_parse(monkeypatch):
-    """Valid explicit values must parse to their typed forms."""
-    monkeypatch.setenv("HTTP_PORT", "9999")
-    monkeypatch.setenv("HTTP_RATE_LIMIT_ENABLED", "yes")
-    monkeypatch.setenv("LLM_TEMPERATURE", "0.7")
-    monkeypatch.setenv("HTTP_RATE_LIMIT_BACKEND", "redis")
-    clear_settings_cache()
-    s = get_settings()
-    assert s.http.port == 9999
-    assert s.http.rate_limit_enabled is True
-    assert s.llm.temperature == pytest.approx(0.7)
-    assert s.http.rate_limit_backend == "redis"
+def test_agent_name_sanitiser_keeps_word_characters_and_refuses_pure_punctuation():
+    assert utils_module.sanitize_agent_name(" A!@#$ ") == "A"
+    assert utils_module.sanitize_agent_name("!!!") is None
 
 
-def test_config_empty_value_falls_back_to_default(monkeypatch):
-    """An explicitly-empty value is legitimate and must use the default, not raise."""
-    monkeypatch.setenv("HTTP_PORT", "")
-    monkeypatch.setenv("HTTP_RATE_LIMIT_ENABLED", "")
-    monkeypatch.setenv("DATABASE_POOL_SIZE", "")
-    clear_settings_cache()
-    s = get_settings()
-    assert s.http.port == 8765
-    assert s.http.rate_limit_enabled is False
-    assert s.database.pool_size == 50  # empty -> the configured default (50)
-
-
-def test_config_malformed_int_raises_with_key(monkeypatch):
-    monkeypatch.setenv("HTTP_PORT", "not-a-number")
-    clear_settings_cache()
-    with pytest.raises(ConfigError) as exc:
-        get_settings()
-    assert "HTTP_PORT" in str(exc.value)
-
-
-def test_config_malformed_bool_raises_with_key(monkeypatch):
-    monkeypatch.setenv("HTTP_RATE_LIMIT_ENABLED", "maybe")
-    clear_settings_cache()
-    with pytest.raises(ConfigError) as exc:
-        get_settings()
-    assert "HTTP_RATE_LIMIT_ENABLED" in str(exc.value)
-
-
-def test_config_malformed_float_raises_with_key(monkeypatch):
-    monkeypatch.setenv("LLM_TEMPERATURE", "hot")
-    clear_settings_cache()
-    with pytest.raises(ConfigError) as exc:
-        get_settings()
-    assert "LLM_TEMPERATURE" in str(exc.value)
-
-
-def test_config_unknown_enum_raises_with_key_and_allowed(monkeypatch):
-    monkeypatch.setenv("TOOLS_FILTER_MODE", "bogus")
-    clear_settings_cache()
-    with pytest.raises(ConfigError) as exc:
-        get_settings()
-    msg = str(exc.value)
-    assert "TOOLS_FILTER_MODE" in msg
-    assert "include" in msg  # surfaces the allowed values
-
-
-def test_config_unknown_rate_limit_backend_raises(monkeypatch):
-    monkeypatch.setenv("HTTP_RATE_LIMIT_BACKEND", "cassandra")
-    clear_settings_cache()
-    with pytest.raises(ConfigError) as exc:
-        get_settings()
-    assert "HTTP_RATE_LIMIT_BACKEND" in str(exc.value)
-
-
-def test_config_malformed_optional_int_raises_with_key(monkeypatch):
-    monkeypatch.setenv("DATABASE_POOL_SIZE", "lots")
-    clear_settings_cache()
-    with pytest.raises(ConfigError) as exc:
-        get_settings()
-    assert "DATABASE_POOL_SIZE" in str(exc.value)
-
-
-def test_database_pool_size_default_is_50(monkeypatch):
-    monkeypatch.delenv("DATABASE_POOL_SIZE", raising=False)
-    clear_settings_cache()
-    s = get_settings()
-    assert s.database.pool_size == 50
-
-
-def test_get_settings_cache_clear_reloads_decouple_snapshot(tmp_path, monkeypatch):
-    env_path = tmp_path / ".env"
-    env_path.write_text("HTTP_PORT=1111\n", encoding="utf-8")
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("HTTP_PORT", raising=False)
-    clear_settings_cache()
-    assert get_settings().http.port == 1111
-
-    env_path.write_text("HTTP_PORT=2222\n", encoding="utf-8")
-    get_settings.cache_clear()
-    assert get_settings().http.port == 2222
-
-
-def test_db_engine_reset_and_reinit(isolated_env):
-    # Reset and ensure engine can be re-initialized and schema ensured
-    reset_database_state()
-    # Access engine should lazy-init
-    _ = get_engine()
-    # Ensure schema executes without error
-    asyncio.run(ensure_schema())
-
-
-def test_assert_supported_backend_accepts_sqlite_variants():
-    """SQLite URLs (all supported aiosqlite/pysqlite variants) must not raise."""
-    for url in (
-        "sqlite+aiosqlite:///:memory:",
-        "sqlite+aiosqlite:////tmp/x.sqlite3",
-        "sqlite:///:memory:",
-    ):
-        _assert_supported_backend(url)  # should not raise
-
-
-def test_assert_supported_backend_rejects_postgres():
-    """Regression for #142 — we fail fast instead of blowing up at CREATE VIRTUAL TABLE."""
-    with pytest.raises(UnsupportedDatabaseBackendError) as excinfo:
-        _assert_supported_backend(
-            "postgresql+asyncpg://mcp:pw@example.invalid:5432/mail"
-        )
-    msg = str(excinfo.value)
-    assert "SQLite" in msg
-    assert "142" in msg  # points users at the tracking issue
-    assert "postgresql" in msg.lower()
-
-
-def test_assert_supported_backend_rejects_mysql():
-    with pytest.raises(UnsupportedDatabaseBackendError):
-        _assert_supported_backend("mysql+aiomysql://u:p@h/db")
-
-
-def test_assert_supported_backend_tolerates_empty_url():
-    # Empty / garbage URLs are left to surface their own errors downstream.
-    _assert_supported_backend("")
-    _assert_supported_backend("this is not a url")
-
-
-def test_init_engine_rejects_postgres_fast(monkeypatch, tmp_path):
-    """Regression for #142: init_engine must fail fast on Postgres.
-
-    Without this check, schema init proceeds and crashes deep inside
-    ``CREATE VIRTUAL TABLE ... USING fts5`` with a cryptic SQL error.
-    """
-    from mcp_agent_mail.db import init_engine
-
-    monkeypatch.setenv(
-        "DATABASE_URL",
-        "postgresql+asyncpg://mcp:pw@example.invalid:5432/mail",
+def test_reader_roles_split_on_commas_with_empty_positions_dropped(monkeypatch):
+    settings = _settings_from(
+        monkeypatch,
+        HTTP_RBAC_READER_ROLES="reader, ro ,, read ",
+        HTTP_RATE_LIMIT_ENABLED="true",
     )
-    clear_settings_cache()
-    reset_database_state()
-    with pytest.raises(UnsupportedDatabaseBackendError):
-        init_engine()
+    roles = list(settings.http.rbac_reader_roles)
+    assert {"reader", "ro", "read"}.issubset(roles)
+    assert "" not in roles
+    assert settings.http.rate_limit_enabled is True
 
 
-def test_sqlite_sidecar_paths_preserve_database_filename():
-    wal_path, shm_path = get_sqlite_sidecar_paths(Path("/tmp/mail.db"))
-    assert wal_path == Path("/tmp/mail.db-wal")
-    assert shm_path == Path("/tmp/mail.db-shm")
-    assert get_sqlite_pre_restore_path(Path("/tmp/mail.db")) == Path("/tmp/mail.db.pre-restore")
+def test_explicit_values_reach_settings_in_their_typed_form(monkeypatch):
+    settings = _settings_from(
+        monkeypatch,
+        HTTP_PORT="9999",
+        HTTP_RATE_LIMIT_ENABLED="yes",
+        LLM_TEMPERATURE="0.7",
+        HTTP_RATE_LIMIT_BACKEND="redis",
+    )
+    assert settings.http.port == 9999
+    assert settings.http.rate_limit_enabled is True
+    assert settings.llm.temperature == approx(0.7)
+    assert settings.http.rate_limit_backend == "redis"
+
+
+def test_a_blank_value_means_unconfigured_rather_than_wrong(monkeypatch):
+    settings = _settings_from(
+        monkeypatch,
+        HTTP_PORT="",
+        HTTP_RATE_LIMIT_ENABLED="",
+        DATABASE_POOL_SIZE="",
+    )
+    assert settings.http.port == 8765
+    assert settings.http.rate_limit_enabled is False
+    assert settings.database.pool_size == 50
+
+
+def test_an_absent_variable_takes_the_compiled_default(monkeypatch):
+    monkeypatch.delenv("DATABASE_POOL_SIZE", raising=False)
+    config_module.clear_settings_cache()
+    assert config_module.get_settings().database.pool_size == 50
+
+
+# (variable, what the operator typed, anything else the message must carry)
+UNPARSEABLE_SETTINGS = (
+    ("HTTP_PORT", "not-a-number", ()),
+    ("HTTP_RATE_LIMIT_ENABLED", "maybe", ()),
+    ("LLM_TEMPERATURE", "hot", ()),
+    ("DATABASE_POOL_SIZE", "lots", ()),
+    ("HTTP_RATE_LIMIT_BACKEND", "cassandra", ()),
+    # A near-miss on a closed vocabulary is unguessable from a bare rejection,
+    # so this one also has to print the vocabulary.
+    ("TOOLS_FILTER_MODE", "bogus", ("include",)),
+)
+
+
+@mark.parametrize(("variable", "written", "also_reported"), UNPARSEABLE_SETTINGS)
+def test_an_unparseable_value_stops_startup_naming_its_variable(monkeypatch, variable, written, also_reported):
+    message = _refusal_for(monkeypatch, variable, written)
+    assert variable in message
+    assert repr(written) in message
+    for token in also_reported:
+        assert token in message
+
+
+PORT_VARIABLE = "HTTP_PORT"
+
+
+def _dotenv_is_the_only_source_of_port(monkeypatch, directory, port: int) -> None:
+    """Leave ``directory``'s ``.env`` as the one place a port can be read from."""
+    (directory / ".env").write_text(f"{PORT_VARIABLE}={port}\n", encoding="utf-8")
+    monkeypatch.delenv(PORT_VARIABLE, raising=False)
+    monkeypatch.chdir(directory)
+
+
+def test_settings_are_cached_until_the_cache_is_cleared(tmp_path, monkeypatch):
+    _dotenv_is_the_only_source_of_port(monkeypatch, tmp_path, 1111)
+    config_module.clear_settings_cache()
+    assert config_module.get_settings().http.port == 1111
+
+    _dotenv_is_the_only_source_of_port(monkeypatch, tmp_path, 2222)
+    # Still the first reading: the snapshot is taken once, and an edit on disk
+    # stays invisible until something says otherwise.
+    assert config_module.get_settings().http.port == 1111
+    config_module.get_settings.cache_clear()
+    assert config_module.get_settings().http.port == 2222
+
+
+SQLITE_URLS = (
+    "sqlite+aiosqlite:///:memory:",
+    "sqlite+aiosqlite:////var/lib/mailbox/storage.sqlite3",
+    "sqlite:///:memory:",
+    # SQLAlchemy keeps whatever casing the environment used, so the guard has
+    # to case-fold before it compares.
+    "SQLite+aiosqlite:///:memory:",
+)
+
+
+@mark.parametrize("database_url", SQLITE_URLS)
+def test_every_sqlite_spelling_passes_the_backend_guard(database_url):
+    # Returning at all is the assertion: this guard speaks only by raising.
+    assert db_module._assert_supported_backend(database_url) is None
+
+
+UNREADABLE_URLS = ("", "this is not a url")
+
+
+@mark.parametrize("database_url", UNREADABLE_URLS)
+def test_a_string_that_is_not_a_url_is_left_for_the_engine_to_report(database_url):
+    # Backend policy has nothing to say about a value it cannot parse, and two
+    # components reporting the same mistake with different words is worse than
+    # one reporting it late.
+    assert db_module._assert_supported_backend(database_url) is None
+
+
+FOREIGN_URLS = (
+    (f"postgresql+asyncpg://mcp:{URL_SECRET}@example.invalid:5432/mail", "postgresql"),
+    (f"POSTGRESQL+asyncpg://mcp:{URL_SECRET}@example.invalid:5432/mail", "postgresql"),
+    (f"mysql+aiomysql://mcp:{URL_SECRET}@example.invalid/mail", "mysql"),
+)
+
+
+@mark.parametrize(("database_url", "backend"), FOREIGN_URLS)
+def test_a_backend_we_do_not_support_is_refused_without_echoing_the_url(database_url, backend):
+    with raises(db_module.UnsupportedDatabaseBackendError) as refusal:
+        db_module._assert_supported_backend(database_url)
+    message = str(refusal.value)
+    assert backend in message.lower()
+    assert "SQLite" in message
+    assert "142" in message  # the tracking issue, so the operator can follow it
+    assert URL_SECRET not in message
+    assert "example.invalid" not in message
+
+
+def test_engine_init_refuses_postgres_before_it_reaches_the_schema(isolated_env, monkeypatch):
+    # Without this the failure surfaces inside ``CREATE VIRTUAL TABLE ... fts5``,
+    # far from the setting that caused it.
+    monkeypatch.setenv("DATABASE_URL", f"postgresql+asyncpg://mcp:{URL_SECRET}@example.invalid:5432/mail")
+    config_module.clear_settings_cache()
+    db_module.reset_database_state()
+    with raises(db_module.UnsupportedDatabaseBackendError):
+        db_module.init_engine()
+
+
+def test_engine_is_rebuilt_lazily_after_a_reset(isolated_env):
+    db_module.reset_database_state()
+    assert db_module.get_engine() is not None
+    asyncio.run(db_module.ensure_schema())
+
+
+def test_sidecar_and_snapshot_names_append_to_the_whole_filename():
+    live = pathlib.Path("/var/lib/mailbox/mail.db")
+
+    write_ahead_log, shared_memory = db_module.get_sqlite_sidecar_paths(live)
+    assert write_ahead_log == pathlib.Path("/var/lib/mailbox/mail.db-wal")
+    assert shared_memory == pathlib.Path("/var/lib/mailbox/mail.db-shm")
+
+    parked = db_module.get_sqlite_pre_restore_path(live)
+    assert parked == pathlib.Path("/var/lib/mailbox/mail.db.pre-restore")
+    # Both sets exist at once during a restore, which deletes the stale snapshot
+    # sidecars; were the two naming rules to collide, that cleanup would take the
+    # freshly restored write-ahead log with it.
+    assert set(db_module.get_sqlite_sidecar_paths(parked)).isdisjoint({write_ahead_log, shared_memory})

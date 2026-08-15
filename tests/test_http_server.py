@@ -13,28 +13,62 @@ Reference: mcp_agent_mail-9z6
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
-import os
-import threading
-from datetime import datetime, timezone
+import datetime as dt
+import json
+from dataclasses import dataclass
+from os import utime
 from pathlib import Path
+from threading import Event, current_thread, main_thread
 from typing import Any
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import text
+from sqlalchemy import select as _sa_select, text
 
-from mcp_agent_mail import config as _config
+import mcp_agent_mail.http as http_module
+from mcp_agent_mail import config as _config, storage as storage_module
 from mcp_agent_mail.app import build_mcp_server
-from mcp_agent_mail.db import ensure_schema
-from mcp_agent_mail.http import _collect_retention_quota_report, build_http_app
-from mcp_agent_mail.storage import ensure_archive
+from mcp_agent_mail.db import ensure_schema, get_session
+from mcp_agent_mail.models import Agent, Message, MessageRecipient, Project
 from tests.keys import pkey
+
+
+def select(*entities: Any, **kwargs: Any) -> Any:
+    """Keep SQLModel descriptor typing out of behaviour tests.
+
+    Matches the shim already used in app.py, cli.py and test_agent_rename.py:
+    `ty` cannot match SQLAlchemy's select/join overloads against SQLModel
+    descriptors, so a column select or an ON clause reads as a plain bool and
+    the gate fails on code that is correct. Widening here beats scattering
+    ignores or rephrasing working queries to please a checker.
+    """
+    return _sa_select(*entities, **kwargs)
 
 
 def _rpc(method: str, params: dict[str, Any]) -> dict[str, Any]:
     """Create a JSON-RPC 2.0 request payload."""
     return {"jsonrpc": "2.0", "id": "1", "method": method, "params": params}
+
+
+def _now_naive_utc() -> dt.datetime:
+    """Return the current UTC instant with tzinfo stripped, the form ACK helpers take."""
+    return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+
+
+def _write_file(path: Path, body: str) -> Path:
+    """Create ``path`` and any missing parents, holding ``body``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def _backdate(path: Path, *, days: float) -> Path:
+    """Move ``path``'s modification time ``days`` into the past."""
+    stamp = path.stat().st_mtime - days * 86400.0
+    utime(path, (stamp, stamp))
+    return path
 
 
 # =============================================================================
@@ -50,7 +84,7 @@ class TestServerConfiguration:
         """Server builds successfully with default configuration."""
         settings = _config.get_settings()
         server = build_mcp_server()
-        app = build_http_app(settings, server)
+        app = http_module.build_http_app(settings, server)
 
         assert app is not None
         # FastAPI app should have routes
@@ -66,7 +100,7 @@ class TestServerConfiguration:
         assert settings.http.path == "/custom-mcp/"
 
         server = build_mcp_server()
-        app = build_http_app(settings, server)
+        app = http_module.build_http_app(settings, server)
         assert app is not None
 
     @pytest.mark.asyncio
@@ -77,7 +111,7 @@ class TestServerConfiguration:
             _config.clear_settings_cache()
         settings = _config.get_settings()
         server = build_mcp_server()
-        app = build_http_app(settings, server)
+        app = http_module.build_http_app(settings, server)
 
         mounted_paths = {getattr(route, "path", "") for route in app.routes}
         assert "/custom-mcp" in mounted_paths
@@ -97,7 +131,7 @@ class TestServerConfiguration:
         assert settings.http.port == 9999
 
         server = build_mcp_server()
-        app = build_http_app(settings, server)
+        app = http_module.build_http_app(settings, server)
         assert app is not None
 
     def test_production_proxy_trust_is_confined_to_sanitizing_loopback_ingress(self):
@@ -114,53 +148,142 @@ class TestServerConfiguration:
         assert 'RequestHeader set X-Forwarded-Proto "https"' in apache
         assert 'ProxyPass        "/" "http://127.0.0.1:8765/"' in apache
 
-    @pytest.mark.asyncio
-    async def test_retention_quota_report_offloads_scan(self, isolated_env, monkeypatch):
-        """Retention quota scans should run off the main event-loop thread."""
-        settings = _config.get_settings()
-        main_thread = threading.main_thread()
 
-        def fake_report(_settings):
-            assert threading.current_thread() is not main_thread
-            return {
-                "old_messages": 3,
-                "retention_max_age_days": 180,
-                "total_attachments_bytes": 1024,
-                "quota_limit_bytes": 2048,
-                "per_project_attach": {"backend": 1024},
-                "per_project_inbox_counts": {"backend": 2},
-            }
+# =============================================================================
+# Test: Retention And Quota Reporting
+# =============================================================================
 
-        monkeypatch.setattr("mcp_agent_mail.http._collect_retention_quota_report_sync", fake_report)
 
-        report = await _collect_retention_quota_report(settings)
-        assert report["old_messages"] == 3
-        assert report["per_project_attach"]["backend"] == 1024
+class TestRetentionQuotaReport:
+    """The maintenance scan: where it runs, where it looks, and what it counts."""
 
     @pytest.mark.asyncio
-    async def test_retention_quota_report_scans_project_archive_layout(self, isolated_env):
-        """Quota scans should read STORAGE_ROOT/projects/<slug>, not STORAGE_ROOT/<slug>."""
+    async def test_scan_leaves_the_event_loop_free_while_it_runs(
+        self, isolated_env, monkeypatch
+    ):
+        """The walk is unbounded, so it must not occupy the event-loop thread.
+
+        Asserted by blocking inside the scan until a coroutine on the same loop
+        releases it. A scan running inline would keep that coroutine from ever
+        reaching the release, so ``released`` comes back False and the test
+        fails on a bounded wait instead of hanging.
+        """
+        entered = Event()
+        release = Event()
+        observed: dict[str, Any] = {}
+        canned = {
+            "old_messages": 7,
+            "retention_max_age_days": 42,
+            "total_attachments_bytes": 99,
+            "quota_limit_bytes": 100,
+            "per_project_attach": {"frontend": 99},
+            "per_project_inbox_counts": {"frontend": 3},
+        }
+
+        def blocking_scan(passed_settings: Any) -> dict[str, Any]:
+            observed["settings"] = passed_settings
+            observed["thread"] = current_thread()
+            entered.set()
+            observed["released"] = release.wait(timeout=10.0)
+            return canned
+
+        monkeypatch.setattr(
+            http_module, "_collect_retention_quota_report_sync", blocking_scan
+        )
+
         settings = _config.get_settings()
-        archive = await ensure_archive(settings, "backend")
+        scan = asyncio.create_task(
+            http_module._collect_retention_quota_report(settings)
+        )
+        for _ in range(1000):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        release.set()
+        report = await asyncio.wait_for(scan, timeout=30.0)
 
-        message_path = archive.root / "messages" / "2026" / "04" / "retention-check.md"
-        message_path.parent.mkdir(parents=True, exist_ok=True)
-        message_path.write_text("message", encoding="utf-8")
-        old_ts = message_path.stat().st_mtime - (400 * 86400)
-        os.utime(message_path, (old_ts, old_ts))
+        assert observed["thread"] is not main_thread()
+        assert observed["released"] is True
+        assert observed["settings"] is settings
+        assert report == canned
 
-        inbox_path = archive.root / "agents" / "BlueLake" / "inbox" / "2026" / "04" / "msg.md"
-        inbox_path.parent.mkdir(parents=True, exist_ok=True)
-        inbox_path.write_text("inbox", encoding="utf-8")
+    @pytest.mark.asyncio
+    async def test_scan_counts_only_the_project_archive_subtree(self, isolated_env):
+        """Every figure comes from ``<storage root>/projects/<slug>`` and nowhere else."""
+        settings = _config.get_settings()
+        archive = await storage_module.ensure_archive(settings, "backend")
+        storage_root = archive.root.parent.parent
+        window_days = settings.retention_max_age_days
 
-        attachment_path = archive.root / "attachments" / "thumb.webp"
-        attachment_path.parent.mkdir(parents=True, exist_ok=True)
-        attachment_path.write_bytes(b"RIFFfakewebp")
+        _backdate(
+            _write_file(archive.root / "messages" / "2024" / "03" / "aged.md", "aged"),
+            days=window_days + 5,
+        )
+        # Inside the retention window, and a non-markdown file of the same age:
+        # neither belongs in the overdue count.
+        _backdate(
+            _write_file(archive.root / "messages" / "2026" / "08" / "fresh.md", "fresh"),
+            days=window_days - 5,
+        )
+        _backdate(
+            _write_file(archive.root / "messages" / "2024" / "03" / "aged.txt", "aged"),
+            days=window_days + 5,
+        )
 
-        report = await _collect_retention_quota_report(settings)
-        assert report["old_messages"] >= 1
-        assert report["per_project_inbox_counts"]["backend"] >= 1
-        assert report["per_project_attach"]["backend"] == attachment_path.stat().st_size
+        inbox = archive.root / "agents"
+        _write_file(inbox / "BlueLake" / "inbox" / "2026" / "08" / "one.md", "in")
+        _write_file(inbox / "GreenCastle" / "inbox" / "2026" / "08" / "two.md", "in")
+        # Inbox entries live at inbox/<year>/<month>/<name>.md; this one is shallower.
+        _write_file(inbox / "BlueLake" / "inbox" / "loose.md", "in")
+
+        first = _write_file(archive.root / "attachments" / "one.webp", "0123456789")
+        second = _write_file(archive.root / "attachments" / "nested" / "two.webp", "01234")
+        _write_file(archive.root / "attachments" / "note.txt", "not an attachment")
+
+        # A look-alike project tree one level too high. Reading the storage root
+        # instead of its ``projects`` subtree would pick all of this up.
+        decoy = storage_root / "backend"
+        _backdate(
+            _write_file(decoy / "messages" / "2024" / "03" / "decoy.md", "decoy"),
+            days=window_days + 5,
+        )
+        _write_file(decoy / "agents" / "BlueLake" / "inbox" / "2026" / "08" / "d.md", "in")
+        _write_file(decoy / "attachments" / "decoy.webp", "decoy-bytes")
+
+        report = await http_module._collect_retention_quota_report(settings)
+
+        attach_bytes = first.stat().st_size + second.stat().st_size
+        assert report["old_messages"] == 1
+        assert report["per_project_inbox_counts"] == {"backend": 2}
+        assert report["per_project_attach"] == {"backend": attach_bytes}
+        assert report["total_attachments_bytes"] == attach_bytes
+        assert report["retention_max_age_days"] == window_days
+        assert report["quota_limit_bytes"] == settings.quota_attachments_limit_bytes
+
+    @pytest.mark.asyncio
+    async def test_ignored_project_contributes_nothing_at_all(self, isolated_env):
+        """A slug matching the ignore patterns is absent from every figure and key."""
+        settings = _config.get_settings()
+        assert "demo" in settings.retention_ignore_project_patterns
+
+        counted = await storage_module.ensure_archive(settings, "backend")
+        ignored = await storage_module.ensure_archive(settings, "demo")
+        for archive in (counted, ignored):
+            _backdate(
+                _write_file(archive.root / "messages" / "2024" / "03" / "old.md", "old"),
+                days=settings.retention_max_age_days + 5,
+            )
+            _write_file(
+                archive.root / "agents" / "BlueLake" / "inbox" / "2026" / "08" / "m.md",
+                "in",
+            )
+            _write_file(archive.root / "attachments" / "a.webp", "12345")
+
+        report = await http_module._collect_retention_quota_report(settings)
+
+        assert report["old_messages"] == 1
+        assert report["per_project_inbox_counts"] == {"backend": 1}
+        assert report["per_project_attach"] == {"backend": 5}
 
 
 # =============================================================================
@@ -176,7 +299,7 @@ class TestHealthEndpoints:
         """Liveness endpoint returns 200 with status 'alive'."""
         settings = _config.get_settings()
         server = build_mcp_server()
-        app = build_http_app(settings, server)
+        app = http_module.build_http_app(settings, server)
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -193,7 +316,7 @@ class TestHealthEndpoints:
 
         settings = _config.get_settings()
         server = build_mcp_server()
-        app = build_http_app(settings, server)
+        app = http_module.build_http_app(settings, server)
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -212,7 +335,7 @@ class TestHealthEndpoints:
 
         settings = _config.get_settings()
         server = build_mcp_server()
-        app = build_http_app(settings, server)
+        app = http_module.build_http_app(settings, server)
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -238,7 +361,7 @@ class TestSSEConnection:
         """Server accepts SSE content type in Accept header."""
         settings = _config.get_settings()
         server = build_mcp_server()
-        app = build_http_app(settings, server)
+        app = http_module.build_http_app(settings, server)
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -256,7 +379,7 @@ class TestSSEConnection:
         """MCP endpoint accepts SSE content negotiation."""
         settings = _config.get_settings()
         server = build_mcp_server()
-        app = build_http_app(settings, server)
+        app = http_module.build_http_app(settings, server)
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -287,7 +410,7 @@ class TestToolCallsOverHTTP:
         """health_check tool call returns success over HTTP."""
         settings = _config.get_settings()
         server = build_mcp_server()
-        app = build_http_app(settings, server)
+        app = http_module.build_http_app(settings, server)
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -305,7 +428,7 @@ class TestToolCallsOverHTTP:
         """Tool calls return proper JSON-RPC 2.0 format."""
         settings = _config.get_settings()
         server = build_mcp_server()
-        app = build_http_app(settings, server)
+        app = http_module.build_http_app(settings, server)
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -328,7 +451,7 @@ class TestToolCallsOverHTTP:
 
         settings = _config.get_settings()
         server = build_mcp_server()
-        app = build_http_app(settings, server)
+        app = http_module.build_http_app(settings, server)
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -361,7 +484,7 @@ class TestResourceReadsOverHTTP:
         """resources/list returns available resources."""
         settings = _config.get_settings()
         server = build_mcp_server()
-        app = build_http_app(settings, server)
+        app = http_module.build_http_app(settings, server)
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -374,21 +497,60 @@ class TestResourceReadsOverHTTP:
             assert "result" in data or "error" not in data
 
     @pytest.mark.asyncio
-    async def test_resource_read_returns_jsonrpc(self, isolated_env):
-        """Resource reads return proper JSON-RPC response."""
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "resource://tooling/directory",
+            "resource://tooling/schemas",
+            "resource://tooling/projects",
+        ],
+    )
+    async def test_resource_read_returns_the_document_that_was_asked_for(
+        self, isolated_env, uri
+    ):
+        """A registered resource comes back as JSON, keyed by the requested URI."""
         settings = _config.get_settings()
         server = build_mcp_server()
-        app = build_http_app(settings, server)
+        app = http_module.build_http_app(settings, server)
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.post(
                 settings.http.path,
-                json=_rpc("resources/read", {"uri": "resource://tooling/projects"}),
+                json=_rpc("resources/read", {"uri": uri}),
             )
-            assert response.status_code == 200
-            data = response.json()
-            assert data.get("jsonrpc") == "2.0"
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["jsonrpc"] == "2.0"
+        assert body["id"] == "1"
+        contents = body["result"]["contents"]
+        assert [entry["uri"] for entry in contents] == [uri]
+        assert contents[0]["mimeType"] == "application/json"
+        json.loads(contents[0]["text"])
+
+    @pytest.mark.asyncio
+    async def test_unregistered_resource_fails_inside_the_jsonrpc_envelope(
+        self, isolated_env
+    ):
+        """An unknown URI is an in-band JSON-RPC error, not an HTTP failure."""
+        settings = _config.get_settings()
+        server = build_mcp_server()
+        app = http_module.build_http_app(settings, server)
+        uri = "resource://tooling/no-such-resource"
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                settings.http.path,
+                json=_rpc("resources/read", {"uri": uri}),
+            )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["jsonrpc"] == "2.0"
+        assert "result" not in body
+        assert uri in body["error"]["message"]
 
 
 # =============================================================================
@@ -409,7 +571,7 @@ class TestCORSHeaders:
 
         settings = _config.get_settings()
         server = build_mcp_server()
-        app = build_http_app(settings, server)
+        app = http_module.build_http_app(settings, server)
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -434,7 +596,7 @@ class TestCORSHeaders:
 
         settings = _config.get_settings()
         server = build_mcp_server()
-        app = build_http_app(settings, server)
+        app = http_module.build_http_app(settings, server)
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -456,7 +618,7 @@ class TestCORSHeaders:
 
         settings = _config.get_settings()
         server = build_mcp_server()
-        app = build_http_app(settings, server)
+        app = http_module.build_http_app(settings, server)
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -480,7 +642,7 @@ class TestHTTPErrorHandling:
         """Invalid JSON payload returns appropriate error."""
         settings = _config.get_settings()
         server = build_mcp_server()
-        app = build_http_app(settings, server)
+        app = http_module.build_http_app(settings, server)
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -497,7 +659,7 @@ class TestHTTPErrorHandling:
         """JSON-RPC request without method returns error."""
         settings = _config.get_settings()
         server = build_mcp_server()
-        app = build_http_app(settings, server)
+        app = http_module.build_http_app(settings, server)
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -529,7 +691,7 @@ class TestRequestLogging:
 
         settings = _config.get_settings()
         server = build_mcp_server()
-        app = build_http_app(settings, server)
+        app = http_module.build_http_app(settings, server)
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -540,336 +702,266 @@ class TestRequestLogging:
 
 
 # =============================================================================
-# Test: HTTP Lock Scope
+# Test: Withdrawn Mutations And Archive/DB Lock Ordering
 # =============================================================================
 
 
-@pytest.mark.usefixtures("open_mail_ui_gate")
-class TestHTTPLockScope:
-    """Regression tests for active and retired HTTP mutation boundaries.
+@dataclass(frozen=True)
+class _SeededMail:
+    """Identifiers for one project, its recipient, and one message addressed to them."""
 
-    Scoped to this class rather than the module: three of its cases drive /mail
-    routes and the rest do not, so switching the gate off file-wide would relax
-    it for tests that never touch it.
+    project_slug: str
+    recipient_name: str
+    message_id: int
+
+
+async def _seed_project(slug: str) -> Project:
+    """Persist an empty project under ``slug`` and return the stored row."""
+    await ensure_schema()
+    async with get_session() as session:
+        project = Project(slug=slug, human_key=pkey(f"tmp/{slug}"))
+        session.add(project)
+        await session.commit()
+        await session.refresh(project)
+    assert project.id is not None
+    return project
+
+
+async def _seed_agent(
+    project: Project,
+    name: str,
+    *,
+    program: str = "test",
+    model: str = "test",
+    role: str = "recipient",
+) -> Agent:
+    """Persist one agent inside ``project`` and return the stored row."""
+    async with get_session() as session:
+        agent = Agent(
+            project_id=project.id,
+            name=name,
+            program=program,
+            model=model,
+            task_description=role,
+        )
+        session.add(agent)
+        await session.commit()
+        await session.refresh(agent)
+    assert agent.id is not None
+    return agent
+
+
+async def _seed_delivered_message(slug: str) -> _SeededMail:
+    """Persist a project with a sender, a recipient, and one message between them."""
+    project = await _seed_project(slug)
+    sender = await _seed_agent(project, "GreenCastle", role="sender")
+    recipient = await _seed_agent(project, "BlueLake")
+
+    async with get_session() as session:
+        message = Message(
+            project_id=project.id,
+            sender_id=sender.id,
+            subject="Seeded",
+            body_md="body",
+            importance="normal",
+            ack_required=False,
+        )
+        session.add(message)
+        await session.commit()
+        await session.refresh(message)
+        assert message.id is not None
+        session.add(
+            MessageRecipient(message_id=message.id, agent_id=recipient.id, kind="to")
+        )
+        await session.commit()
+
+    return _SeededMail(
+        project_slug=project.slug,
+        recipient_name=recipient.name,
+        message_id=message.id,
+    )
+
+
+# Every /mail mutation route this server used to expose. Each entry turns a
+# seeded mailbox into the request that route accepted, so a route quietly
+# reinstated would be exercised here rather than merely absent.
+_WITHDRAWN_MAIL_MUTATIONS = {
+    "bulk-delete": lambda mail: (
+        "/mail/api/delete-messages",
+        {"message_ids": [mail.message_id]},
+    ),
+    "inbox-delete": lambda mail: (
+        f"/mail/{mail.project_slug}/inbox/{mail.recipient_name}/delete-messages",
+        {"message_ids": [mail.message_id]},
+    ),
+    "overseer-send": lambda mail: (
+        f"/mail/{mail.project_slug}/overseer/send",
+        {
+            "recipients": [mail.recipient_name],
+            "subject": "Withdrawn",
+            "body_md": "Should never be archived.",
+        },
+    ),
+}
+
+
+def _recording_call(sink: list[Any], original: Any) -> Any:
+    """Wrap an awaitable callable so each call is recorded before it runs."""
+
+    async def recorded(*args: Any, **kwargs: Any) -> Any:
+        sink.append(args)
+        return await original(*args, **kwargs)
+
+    return recorded
+
+
+def _recording_context(sink: list[Any], original: Any) -> Any:
+    """Wrap an async context-manager factory so each entry is recorded."""
+
+    @contextlib.asynccontextmanager
+    async def recorded(*args: Any, **kwargs: Any) -> Any:
+        sink.append(args)
+        async with original(*args, **kwargs) as value:
+            yield value
+
+    return recorded
+
+
+class _OpenSessionCounter:
+    """Count how many database sessions http.py holds open at any instant.
+
+    Both session factories are wrapped, not just ``get_session``: the ACK
+    escalation path inserts its holder through ``get_immediate_session``, so
+    tracking one of the two would report depth zero while a write transaction
+    was still open.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.depth = 0
+        for name in ("get_session", "get_immediate_session"):
+            monkeypatch.setattr(
+                http_module, name, self._tracked(getattr(http_module, name))
+            )
+
+    def _tracked(self, factory: Any) -> Any:
+        @contextlib.asynccontextmanager
+        async def tracked(*args: Any, **kwargs: Any) -> Any:
+            async with factory(*args, **kwargs) as session:
+                self.depth += 1
+                try:
+                    yield session
+                finally:
+                    self.depth -= 1
+
+        return tracked
+
+
+@pytest.mark.usefixtures("open_mail_ui_gate")
+class TestMailMutationLockBoundaries:
+    """Withdrawn /mail mutations, and the lock ordering the surviving writer keeps.
+
+    The /mail password gate is opened for this class rather than the module:
+    only the withdrawn-route case issues /mail requests and the rest call
+    http.py helpers directly, so switching the gate off file-wide would relax it
+    for tests that never touch it.
     """
 
     @pytest.mark.asyncio
-    async def test_retired_overseer_send_never_reaches_archive_write(self, isolated_env, monkeypatch):
-        import mcp_agent_mail.http as http_module
-        import mcp_agent_mail.storage as storage_module
-        from mcp_agent_mail.db import get_session as real_get_session
-        from mcp_agent_mail.models import Agent, Project
+    @pytest.mark.parametrize("route_id", sorted(_WITHDRAWN_MAIL_MUTATIONS))
+    async def test_withdrawn_mutation_route_is_refused_and_writes_nothing(
+        self, isolated_env, monkeypatch, route_id
+    ):
+        """A withdrawn /mail mutation is refused, and touches neither archive nor rows.
 
-        await ensure_schema()
-        async with real_get_session() as session:
-            project = Project(slug="http-overseer-lock", human_key=pkey("tmp/http-overseer-lock"))
-            session.add(project)
-            await session.commit()
-            await session.refresh(project)
-            assert project.id is not None
+        What holds the line is the ``_mail_ui_active_path`` allow list, not the
+        absence of a handler: the middleware answers 404 before routing, so
+        re-adding a handler alone changes nothing while widening that list would
+        expose whatever handler exists. The allow list is therefore asserted
+        directly, alongside the response.
 
-            recipient = Agent(
-                project_id=project.id,
-                name="BlueLake",
-                program="test",
-                model="test",
-                task_description="recipient",
-            )
-            session.add(recipient)
-            await session.commit()
+        The archive spies sit on http.py's own bindings for ``ensure_archive``
+        and ``archive_write_lock``, which are the only names by which this
+        module can reach an archive at all; a spy on the storage module would
+        be one the request could not trip even if the route came back.
+        """
+        mail = await _seed_delivered_message(f"withdrawn-{route_id}")
+        path, payload = _WITHDRAWN_MAIL_MUTATIONS[route_id](mail)
+        assert not http_module._mail_ui_active_path(path)
 
-        session_depth = 0
-        archive_write_depths: list[int] = []
-        original_write_message_bundle = storage_module.write_message_bundle
-        original_get_session = http_module.get_session
-
-        @contextlib.asynccontextmanager
-        async def tracking_get_session(*args: Any, **kwargs: Any):
-            nonlocal session_depth
-            async with original_get_session(*args, **kwargs) as session:
-                session_depth += 1
-                try:
-                    yield session
-                finally:
-                    session_depth -= 1
-
-        async def tracking_write_message_bundle(*args: Any, **kwargs: Any):
-            archive_write_depths.append(session_depth)
-            return await original_write_message_bundle(*args, **kwargs)
-
-        monkeypatch.setattr(http_module, "get_session", tracking_get_session)
-        monkeypatch.setattr(storage_module, "write_message_bundle", tracking_write_message_bundle)
+        archive_calls: list[Any] = []
+        monkeypatch.setattr(
+            http_module,
+            "ensure_archive",
+            _recording_call(archive_calls, http_module.ensure_archive),
+        )
+        monkeypatch.setattr(
+            http_module,
+            "archive_write_lock",
+            _recording_context(archive_calls, http_module.archive_write_lock),
+        )
 
         settings = _config.get_settings()
-        server = build_mcp_server()
-        app = build_http_app(settings, server)
+        app = http_module.build_http_app(settings, build_mcp_server())
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
-            response = await client.post(
-                f"/mail/{project.slug}/overseer/send",
-                json={
-                    "recipients": ["BlueLake"],
-                    "subject": "Lock Scope",
-                    "body_md": "Check DB/archive ordering.",
-                },
-            )
+            response = await client.post(path, json=payload)
 
         assert response.status_code == 404
         assert response.json() == {"detail": "Not Found"}
-        assert archive_write_depths == []
+        assert archive_calls == []
+
+        async with get_session() as session:
+            surviving = (await session.execute(select(Message.id))).scalars().all()
+        assert list(surviving) == [mail.message_id]
 
     @pytest.mark.asyncio
-    async def test_retired_bulk_delete_never_mutates_db_or_archive(self, isolated_env, monkeypatch):
-        import mcp_agent_mail.http as http_module
-        from mcp_agent_mail.db import get_session as real_get_session
-        from mcp_agent_mail.models import Agent, Message, MessageRecipient, Project
+    async def test_ack_holder_profile_is_published_with_no_session_open(
+        self, isolated_env, monkeypatch
+    ):
+        """The ops holder is inserted first and its profile published only afterwards.
 
-        await ensure_schema()
-        async with real_get_session() as session:
-            project = Project(slug="http-delete-lock", human_key=pkey("tmp/http-delete-lock"))
-            session.add(project)
-            await session.commit()
-            await session.refresh(project)
-            assert project.id is not None
+        Publishing while a session is still open nests the database lock inside
+        the archive lock, which is the ordering that deadlocks mixed HTTP and
+        MCP traffic. The recorded depth is therefore the point of the test, not
+        the fact that a profile is written.
+        """
+        project = await _seed_project("ack-holder-order")
+        recipient = await _seed_agent(project, "BlueLake")
 
-            sender = Agent(
-                project_id=project.id,
-                name="GreenCastle",
-                program="test",
-                model="test",
-                task_description="sender",
-            )
-            recipient = Agent(
-                project_id=project.id,
-                name="BlueLake",
-                program="test",
-                model="test",
-                task_description="recipient",
-            )
-            session.add(sender)
-            session.add(recipient)
-            await session.commit()
-            await session.refresh(sender)
-            await session.refresh(recipient)
-            assert sender.id is not None
-            assert recipient.id is not None
+        sessions = _OpenSessionCounter(monkeypatch)
+        depth_per_write: list[int] = []
 
-            message = Message(
-                project_id=project.id,
-                sender_id=sender.id,
-                subject="Delete Me",
-                body_md="body",
-                importance="normal",
-                ack_required=False,
-            )
-            session.add(message)
-            await session.commit()
-            await session.refresh(message)
-            assert message.id is not None
+        async def capture_profile_write(_archive: Any, _payload: Any) -> None:
+            depth_per_write.append(sessions.depth)
 
-            session.add(
-                MessageRecipient(
-                    message_id=message.id,
-                    agent_id=recipient.id,
-                    kind="to",
-                )
-            )
-            await session.commit()
+        monkeypatch.setattr(http_module, "write_agent_profile", capture_profile_write)
 
-        session_depth = 0
-        archive_depths: list[int] = []
-        original_get_session = http_module.get_session
-        original_ensure_archive = http_module.ensure_archive
-
-        @contextlib.asynccontextmanager
-        async def tracking_get_session(*args: Any, **kwargs: Any):
-            nonlocal session_depth
-            async with original_get_session(*args, **kwargs) as session:
-                session_depth += 1
-                try:
-                    yield session
-                finally:
-                    session_depth -= 1
-
-        async def tracking_ensure_archive(*args: Any, **kwargs: Any):
-            archive_depths.append(session_depth)
-            return await original_ensure_archive(*args, **kwargs)
-
-        monkeypatch.setattr(http_module, "get_session", tracking_get_session)
-        monkeypatch.setattr(http_module, "ensure_archive", tracking_ensure_archive)
-
-        settings = _config.get_settings()
-        server = build_mcp_server()
-        app = build_http_app(settings, server)
-
-        transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
-            response = await client.post(
-                "/mail/api/delete-messages",
-                json={"message_ids": [message.id]},
-            )
-
-        assert response.status_code == 404
-        assert response.json() == {"detail": "Not Found"}
-        assert archive_depths == []
-        async with real_get_session() as session:
-            assert await session.get(Message, message.id) is not None
-
-    @pytest.mark.asyncio
-    async def test_retired_inbox_delete_never_mutates_db_or_archive(self, isolated_env, monkeypatch):
-        import mcp_agent_mail.http as http_module
-        from mcp_agent_mail.db import get_session as real_get_session
-        from mcp_agent_mail.models import Agent, Message, MessageRecipient, Project
-
-        await ensure_schema()
-        async with real_get_session() as session:
-            project = Project(slug="http-inbox-delete-lock", human_key=pkey("tmp/http-inbox-delete-lock"))
-            session.add(project)
-            await session.commit()
-            await session.refresh(project)
-            assert project.id is not None
-
-            sender = Agent(
-                project_id=project.id,
-                name="GreenCastle",
-                program="test",
-                model="test",
-                task_description="sender",
-            )
-            recipient = Agent(
-                project_id=project.id,
-                name="BlueLake",
-                program="test",
-                model="test",
-                task_description="recipient",
-            )
-            session.add(sender)
-            session.add(recipient)
-            await session.commit()
-            await session.refresh(sender)
-            await session.refresh(recipient)
-            assert sender.id is not None
-            assert recipient.id is not None
-
-            message = Message(
-                project_id=project.id,
-                sender_id=sender.id,
-                subject="Delete In Inbox",
-                body_md="body",
-                importance="normal",
-                ack_required=False,
-            )
-            session.add(message)
-            await session.commit()
-            await session.refresh(message)
-            assert message.id is not None
-
-            session.add(
-                MessageRecipient(
-                    message_id=message.id,
-                    agent_id=recipient.id,
-                    kind="to",
-                )
-            )
-            await session.commit()
-
-        session_depth = 0
-        archive_depths: list[int] = []
-        original_get_session = http_module.get_session
-        original_ensure_archive = http_module.ensure_archive
-
-        @contextlib.asynccontextmanager
-        async def tracking_get_session(*args: Any, **kwargs: Any):
-            nonlocal session_depth
-            async with original_get_session(*args, **kwargs) as session:
-                session_depth += 1
-                try:
-                    yield session
-                finally:
-                    session_depth -= 1
-
-        async def tracking_ensure_archive(*args: Any, **kwargs: Any):
-            archive_depths.append(session_depth)
-            return await original_ensure_archive(*args, **kwargs)
-
-        monkeypatch.setattr(http_module, "get_session", tracking_get_session)
-        monkeypatch.setattr(http_module, "ensure_archive", tracking_ensure_archive)
-
-        settings = _config.get_settings()
-        server = build_mcp_server()
-        app = build_http_app(settings, server)
-
-        transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
-            response = await client.post(
-                f"/mail/{project.slug}/inbox/{recipient.name}/delete-messages",
-                json={"message_ids": [message.id]},
-            )
-
-        assert response.status_code == 404
-        assert response.json() == {"detail": "Not Found"}
-        assert archive_depths == []
-        async with real_get_session() as session:
-            assert await session.get(Message, message.id) is not None
-
-    @pytest.mark.asyncio
-    async def test_ack_escalation_profile_archives_after_db_session_closes(self, isolated_env, monkeypatch):
-        import mcp_agent_mail.http as http_module
-        from mcp_agent_mail.db import get_session as real_get_session
-        from mcp_agent_mail.models import Agent, Project
-
-        await ensure_schema()
-        async with real_get_session() as session:
-            project = Project(slug="http-ack-lock", human_key=pkey("tmp/http-ack-lock"))
-            session.add(project)
-            await session.commit()
-            await session.refresh(project)
-            assert project.id is not None
-
-            agent = Agent(
-                project_id=project.id,
-                name="BlueLake",
-                program="test",
-                model="test",
-                task_description="recipient",
-            )
-            session.add(agent)
-            await session.commit()
-            await session.refresh(agent)
-            assert agent.id is not None
-
-        session_depth = 0
-        archive_write_depths: list[int] = []
-        original_get_session = http_module.get_session
-
-        @contextlib.asynccontextmanager
-        async def tracking_get_session(*args: Any, **kwargs: Any):
-            nonlocal session_depth
-            async with original_get_session(*args, **kwargs) as session:
-                session_depth += 1
-                try:
-                    yield session
-                finally:
-                    session_depth -= 1
-
-        async def tracking_write_agent_profile(*args: Any, **kwargs: Any):
-            archive_write_depths.append(session_depth)
-
-        monkeypatch.setattr(http_module, "get_session", tracking_get_session)
-        monkeypatch.setattr(http_module, "write_agent_profile", tracking_write_agent_profile)
         settings = _config.get_settings()
         holder = await http_module._ensure_ack_escalation_holder(
             settings=settings,
             project=project,
-            recipient_agent=agent,
+            recipient_agent=recipient,
             claim_name="RedStone",
-            now_naive=datetime.now(timezone.utc).replace(tzinfo=None),
+            now_naive=_now_naive_utc(),
         )
 
-        assert holder.id != agent.id
         assert holder.name == "RedStone"
-        assert archive_write_depths == [0]
+        assert holder.id != recipient.id
+        assert holder.program == "ops"
+        assert depth_per_write == [0]
+
+        # A holder that already exists is reused, and nothing is republished.
+        reused = await http_module._ensure_ack_escalation_holder(
+            settings=settings,
+            project=project,
+            recipient_agent=recipient,
+            claim_name="RedStone",
+            now_naive=_now_naive_utc(),
+        )
+
+        assert reused.id == holder.id
+        assert depth_per_write == [0]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("delete_project", [False, True])
@@ -879,28 +971,11 @@ class TestHTTPLockScope:
         monkeypatch,
         delete_project,
     ):
-        import mcp_agent_mail.http as http_module
-        from mcp_agent_mail.db import get_immediate_session, get_session
-        from mcp_agent_mail.models import Agent, Project
+        from mcp_agent_mail.db import get_immediate_session
 
-        await ensure_schema()
         slug = f"http-ack-stale-{'project' if delete_project else 'agent'}"
-        async with get_session() as session:
-            project = Project(slug=slug, human_key=pkey(f"tmp/{slug}"))
-            session.add(project)
-            await session.commit()
-            await session.refresh(project)
-            assert project.id is not None
-            recipient = Agent(
-                project_id=project.id,
-                name="BlueLake",
-                program="test",
-                model="test",
-                task_description="recipient",
-            )
-            session.add(recipient)
-            await session.commit()
-            await session.refresh(recipient)
+        project = await _seed_project(slug)
+        recipient = await _seed_agent(project, "BlueLake")
 
         profile_writes = 0
 
@@ -945,10 +1020,10 @@ class TestHTTPLockScope:
                 project=project,
                 recipient_agent=recipient,
                 claim_name="RedStone",
-                now_naive=datetime.now(timezone.utc).replace(tzinfo=None),
+                now_naive=_now_naive_utc(),
             )
 
-        archive = await ensure_archive(_config.get_settings(), slug)
+        archive = await storage_module.ensure_archive(_config.get_settings(), slug)
         assert profile_writes == 0
         assert archive.root.is_dir()
         assert not (archive.root / "agents" / "RedStone" / "profile.json").exists()
@@ -958,37 +1033,23 @@ class TestHTTPLockScope:
         self,
         isolated_env,
     ):
-        import mcp_agent_mail.http as http_module
-        from mcp_agent_mail.db import get_session
-        from mcp_agent_mail.models import Agent, FileReservation, Project
+        from mcp_agent_mail.models import FileReservation
 
-        await ensure_schema()
-        async with get_session() as session:
-            project = Project(
-                slug="http-ack-reservation",
-                human_key=pkey("tmp/http-ack-reservation"),
-            )
-            session.add(project)
-            await session.commit()
-            await session.refresh(project)
-            assert project.id is not None
-            holder = Agent(
-                project_id=project.id,
-                name="RedStone",
-                program="ops",
-                model="system",
-                task_description="ops-escalation",
-            )
-            session.add(holder)
-            await session.commit()
-            await session.refresh(holder)
+        project = await _seed_project("http-ack-reservation")
+        holder = await _seed_agent(
+            project,
+            "RedStone",
+            program="ops",
+            model="system",
+            role="ops-escalation",
+        )
 
         reservation = await http_module._create_ack_escalation_reservation(
             project=project,
             holder=holder,
             path_pattern="agents/BlueLake/inbox/2026/08/*.md",
             exclusive=True,
-            now_naive=datetime.now(timezone.utc).replace(tzinfo=None),
+            now_naive=_now_naive_utc(),
             ttl_seconds=600,
         )
 
@@ -999,7 +1060,7 @@ class TestHTTPLockScope:
             assert persisted.reason == "ack-overdue"
             assert persisted.agent_id == holder.id
 
-        archive = await ensure_archive(_config.get_settings(), project.slug)
+        archive = await storage_module.ensure_archive(_config.get_settings(), project.slug)
         assert (
             archive.root
             / "file_reservations"

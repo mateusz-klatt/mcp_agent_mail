@@ -5,21 +5,23 @@ import os
 import shutil
 import sqlite3
 import subprocess
-import time
-from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+import sys
+from collections.abc import Callable, Coroutine, Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from zipfile import ZipFile
 
 import pytest
+from click.testing import Result
+from git import Repo
 from git.cmd import Git
 from sqlalchemy import select
 from sqlalchemy.sql import ColumnElement
 from typer.testing import CliRunner
 
-from mcp_agent_mail import cli as cli_module, share as share_module
+from mcp_agent_mail import cli as cli_module, share as share_module, storage as storage_module
 from mcp_agent_mail.cli import app
 from mcp_agent_mail.config import clear_settings_cache, get_settings
 from mcp_agent_mail.db import ensure_schema, get_session
@@ -118,6 +120,66 @@ def _path_tree(root: Path) -> tuple[tuple[str, ...], dict[str, bytes]]:
         if path.is_file()
     }
     return paths, contents
+
+
+# ---------- shared scaffolding ----------
+
+ADOPTED_AGENT = "BlueLake"
+
+
+def _run_cli(*args: str) -> Result:
+    """Invoke the CLI with a console wide enough that Rich never folds a line.
+
+    Many assertions here quote a message the command is contractually required
+    to print. Rich falls back to 80 columns when stdout is not a terminal,
+    which is narrower than several of those messages, so a substring check run
+    at the default width can pass or fail on where a line wrap happened to land
+    instead of on whether the message was printed at all.
+    """
+    return CliRunner().invoke(app, list(args), env={"COLUMNS": "400"})
+
+
+async def _insert_project(session: Any, *, slug: str, human_key: str) -> int:
+    """Insert one project and return the id the database assigned it."""
+    project = Project(slug=slug, human_key=human_key)
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+    project_id = project.id
+    assert project_id is not None, f"project {slug!r} was inserted without an id"
+    return project_id
+
+
+async def _insert_agent(session: Any, project_id: int, name: str) -> int:
+    """Insert one agent into ``project_id`` and return its assigned id."""
+    agent = Agent(
+        project_id=project_id,
+        name=name,
+        program="codex",
+        model="gpt-5",
+        task_description="",
+    )
+    session.add(agent)
+    await session.commit()
+    await session.refresh(agent)
+    agent_id = agent.id
+    assert agent_id is not None, f"agent {name!r} was inserted without an id"
+    return agent_id
+
+
+def _must_not_be_called(name: str) -> Callable[..., Coroutine[Any, Any, Any]]:
+    """Return an async stand-in that fails loudly if the CLI ever reaches it.
+
+    Used for the "this path must not happen" half of a contract. A plain
+    recording spy cannot express that: it only proves what did happen, and a
+    test that asserts a call count of zero still passes when the call is made
+    somewhere the spy was never installed.
+    """
+
+    async def _refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError(f"{name} must not run on this path")
+
+    return _refuse
 
 
 def test_copy_bundle_contents_rejects_owned_source_symlink(tmp_path: Path) -> None:
@@ -433,76 +495,105 @@ def test_share_update_preserves_host_repo_and_zips_only_fresh_owned_bundle(
         assert canary not in archived_payload
 
 
-def _init_projects_adopt_repo(tmp_path: Path) -> tuple[Path, Path]:
-    repo_root = tmp_path / "adopt-repo"
-    source_worktree = repo_root / "legacy-worktree"
-    target_worktree = repo_root / "canonical-worktree"
-    source_worktree.mkdir(parents=True, exist_ok=True)
-    target_worktree.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "init"], cwd=str(repo_root), check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo_root), check=True)
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo_root), check=True)
-    subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=str(repo_root), check=True)
+# ---------- projects adopt ----------
+#
+# Adoption folds a legacy per-worktree project into a canonical one. Three
+# things have to move together -- the archive files, the archive git index, and
+# the database rows -- and the command refuses outright unless both project
+# keys resolve to the same repository, so the fixtures below build exactly that
+# shape and nothing more.
+
+ADOPTED_ARTIFACT = "messages/legacy-note.md"
+ADOPTED_ARTIFACT_BODY = "legacy artifact\n"
+LEGACY_SLUG = "legacy"
+CANONICAL_SLUG = "canonical"
+# Quoted from cli.projects_adopt: the message it gives the archive move commit.
+MOVE_COMMIT_MESSAGE = f"adopt: move {LEGACY_SLUG} into {CANONICAL_SLUG}"
+
+
+def _one_repo_two_worktrees(tmp_path: Path) -> tuple[Path, Path]:
+    """Return two project keys that share a single git repository.
+
+    ``projects adopt`` compares ``git rev-parse --git-common-dir`` for the two
+    keys and declines the pair when they differ, so both directories are placed
+    inside one initialised repository rather than being separate repositories.
+    """
+    repo_root = tmp_path / "shared-repo"
+    legacy_key = repo_root / "worktree-legacy"
+    canonical_key = repo_root / "worktree-canonical"
+    legacy_key.mkdir(parents=True)
+    canonical_key.mkdir(parents=True)
+
+    repo = Repo.init(repo_root)
+    with repo.config_writer() as writer:
+        writer.set_value("user", "name", "Adopt Fixture")
+        writer.set_value("user", "email", "adopt@example.invalid")
+        writer.set_value("commit", "gpgsign", "false")
     (repo_root / "README.md").write_text("seed\n", encoding="utf-8")
-    subprocess.run(["git", "add", "README.md"], cwd=str(repo_root), check=True)
-    subprocess.run(
-        ["git", "commit", "-m", "init"],
-        cwd=str(repo_root),
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    return source_worktree, target_worktree
+    repo.index.add(["README.md"])
+    repo.index.commit("seed the shared repository")
+    return legacy_key, canonical_key
 
 
-def _seed_projects_adopt_state(source_worktree: Path, target_worktree: Path) -> tuple[Path, Path, Path, int]:
-    async def _seed() -> tuple[Path, Path, Path, int]:
+def _seed_adoptable_pair(legacy_key: Path, canonical_key: Path) -> SimpleNamespace:
+    """Create both projects, one agent in the legacy one, one committed artifact.
+
+    Returns the handles the adoption tests need to observe the outcome: both
+    archive roots, the shared archive repository, the two archive lock paths,
+    and the canonical project id the legacy agent is supposed to end up under.
+    """
+
+    async def _seed() -> SimpleNamespace:
         await ensure_schema()
         async with get_session() as session:
-            source_project = Project(slug="legacy", human_key=str(source_worktree))
-            target_project = Project(slug="canonical", human_key=str(target_worktree))
-            session.add(source_project)
-            session.add(target_project)
-            await session.commit()
-            await session.refresh(source_project)
-            await session.refresh(target_project)
-            assert source_project.id is not None
-            assert target_project.id is not None
-            session.add(
-                Agent(
-                    project_id=source_project.id,
-                    name="BlueLake",
-                    program="codex",
-                    model="gpt-5",
-                    task_description="legacy agent",
-                )
+            legacy_id = await _insert_project(
+                session, slug=LEGACY_SLUG, human_key=str(legacy_key)
             )
-            await session.commit()
+            canonical_id = await _insert_project(
+                session, slug=CANONICAL_SLUG, human_key=str(canonical_key)
+            )
+            await _insert_agent(session, legacy_id, ADOPTED_AGENT)
 
         settings = get_settings()
-        source_archive = await ensure_archive(settings, "legacy")
-        target_archive = await ensure_archive(settings, "canonical")
-        source_artifact = source_archive.root / "messages" / "legacy-note.md"
-        source_artifact.parent.mkdir(parents=True, exist_ok=True)
-        source_artifact.write_text("legacy artifact\n", encoding="utf-8")
+        legacy_archive = await ensure_archive(settings, LEGACY_SLUG)
+        canonical_archive = await ensure_archive(settings, CANONICAL_SLUG)
+        artifact = legacy_archive.root / ADOPTED_ARTIFACT
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text(ADOPTED_ARTIFACT_BODY, encoding="utf-8")
         await _archive_commit(
-            source_archive.repo,
+            legacy_archive.repo,
             settings,
             "seed: legacy artifact",
-            [source_artifact.relative_to(source_archive.repo_root).as_posix()],
+            [artifact.relative_to(legacy_archive.repo_root).as_posix()],
         )
-        return source_archive.root, target_archive.root, source_archive.repo_root, target_project.id
+        return SimpleNamespace(
+            legacy_root=legacy_archive.root,
+            canonical_root=canonical_archive.root,
+            archive_repo=legacy_archive.repo,
+            archive_repo_root=legacy_archive.repo_root,
+            lock_paths={
+                LEGACY_SLUG: Path(legacy_archive.lock_path),
+                CANONICAL_SLUG: Path(canonical_archive.lock_path),
+            },
+            canonical_id=canonical_id,
+        )
 
     return asyncio.run(_seed())
 
 
-def _git_output(repo_root: Path, *args: str) -> str:
-    return subprocess.run(
-        ["git", "-C", str(repo_root), *args],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+def _agent_project_id(name: str) -> int:
+    """Return the project the named agent currently belongs to."""
+
+    async def _read() -> int:
+        async with get_session() as session:
+            agent = (
+                await session.execute(
+                    select(Agent).where(cast(ColumnElement[bool], Agent.name == name))
+                )
+            ).scalars().one()
+            return agent.project_id
+
+    return asyncio.run(_read())
 
 
 def test_commit_archive_subtree_deletion_rejects_resolved_escape(isolated_env) -> None:
@@ -751,101 +842,91 @@ def test_migrate_agent_state_rejects_relative_global_state_before_mutation(
     assert registration_token not in explicit.output
 
 
-def test_projects_adopt_apply_moves_archive_state_and_keeps_archive_git_clean(isolated_env, tmp_path):
-    runner = CliRunner()
-    source_worktree, target_worktree = _init_projects_adopt_repo(tmp_path)
-    source_root, target_root, archive_repo_root, target_project_id = _seed_projects_adopt_state(source_worktree, target_worktree)
+def test_adopt_apply_relocates_files_index_and_rows_leaving_no_uncommitted_work(
+    isolated_env,
+    tmp_path,
+) -> None:
+    """One --apply must land all four of adoption's effects, and land them fully.
 
-    result = runner.invoke(app, ["projects", "adopt", "legacy", "canonical", "--apply"])
+    The archive move is only half-done if the file appears in the new tree
+    while git still tracks it under the old path, so the index is inspected
+    from both directions and the repository is required to come out clean.
+    """
+    legacy_key, canonical_key = _one_repo_two_worktrees(tmp_path)
+    seeded = _seed_adoptable_pair(legacy_key, canonical_key)
 
-    assert result.exit_code == 0
+    result = _run_cli("projects", "adopt", LEGACY_SLUG, CANONICAL_SLUG, "--apply")
+
+    assert result.exit_code == 0, result.output
     assert "Adoption apply completed." in result.stdout
-    assert not (source_root / "messages" / "legacy-note.md").exists()
-    assert (target_root / "messages" / "legacy-note.md").exists()
-    aliases = json.loads((target_root / "aliases.json").read_text(encoding="utf-8"))
-    assert aliases["former_slugs"] == ["legacy"]
 
-    async def _verify() -> int:
-        async with get_session() as session:
-            agent = (
-                await session.execute(
-                    select(Agent).where(cast(ColumnElement[bool], Agent.name == "BlueLake"))
-                )
-            ).scalars().one()
-            return agent.project_id
+    # 1. the artifact is in the canonical tree and gone from the legacy one
+    assert not (seeded.legacy_root / ADOPTED_ARTIFACT).exists()
+    assert (seeded.canonical_root / ADOPTED_ARTIFACT).read_text(
+        encoding="utf-8"
+    ) == ADOPTED_ARTIFACT_BODY
 
-    assert asyncio.run(_verify()) == target_project_id
+    # 2. git agrees: tracked under the new path, untracked under the old one
+    tracked = set(
+        seeded.archive_repo.git.ls_files(
+            "--", f"projects/{LEGACY_SLUG}", f"projects/{CANONICAL_SLUG}"
+        ).splitlines()
+    )
+    assert f"projects/{CANONICAL_SLUG}/{ADOPTED_ARTIFACT}" in tracked
+    assert f"projects/{LEGACY_SLUG}/{ADOPTED_ARTIFACT}" not in tracked
 
-    archive_status = subprocess.run(
-        ["git", "status", "--short"],
-        cwd=str(archive_repo_root),
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    assert archive_status == ""
+    # 3. nothing is left staged or dangling for a later run to trip over
+    assert seeded.archive_repo.git.status("--short") == ""
 
-    source_ls = subprocess.run(
-        ["git", "ls-files", "--", "projects/legacy/messages/legacy-note.md"],
-        cwd=str(archive_repo_root),
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    target_ls = subprocess.run(
-        ["git", "ls-files", "--", "projects/canonical/messages/legacy-note.md"],
-        cwd=str(archive_repo_root),
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    assert source_ls == ""
-    assert target_ls == "projects/canonical/messages/legacy-note.md"
+    # 4. the old slug stays resolvable through the alias, and the agent row now
+    #    points at the canonical project
+    aliases = json.loads(
+        (seeded.canonical_root / "aliases.json").read_text(encoding="utf-8")
+    )
+    assert aliases["former_slugs"] == [LEGACY_SLUG]
+    assert _agent_project_id(ADOPTED_AGENT) == seeded.canonical_id
 
 
-def test_projects_adopt_move_commit_holds_both_archive_locks(isolated_env, tmp_path, monkeypatch):
-    runner = CliRunner()
-    source_worktree, target_worktree = _init_projects_adopt_repo(tmp_path)
-    _seed_projects_adopt_state(source_worktree, target_worktree)
+def test_adopt_holds_both_archive_locks_while_the_move_is_committed(
+    isolated_env,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Neither archive may be open to another writer while the move commits.
 
-    active_locks: set[str] = set()
-    observed_lock_sets: list[set[str]] = []
-    original_archive_write_lock = cli_module.archive_write_lock
-    original_git_call_process = Git._call_process
+    Observed through the lock files themselves rather than through a wrapper
+    around ``archive_write_lock``: the on-disk ``.archive.lock`` is what a
+    second process actually contends on, so this remains a statement about
+    mutual exclusion even if the way the command acquires locks is rewritten.
+    """
+    legacy_key, canonical_key = _one_repo_two_worktrees(tmp_path)
+    seeded = _seed_adoptable_pair(legacy_key, canonical_key)
+    locks_at_commit: list[set[str]] = []
+    unpatched_call_process = Git._call_process
 
-    @asynccontextmanager
-    async def tracking_archive_write_lock(archive, *args, **kwargs):
-        async with original_archive_write_lock(archive, *args, **kwargs):
-            active_locks.add(archive.slug)
-            try:
-                yield
-            finally:
-                active_locks.remove(archive.slug)
+    def record_locks_then_run(self, method, *args, **kwargs):
+        if method == "commit" and MOVE_COMMIT_MESSAGE in args:
+            locks_at_commit.append(
+                {slug for slug, path in seeded.lock_paths.items() if path.exists()}
+            )
+        return unpatched_call_process(self, method, *args, **kwargs)
 
-    def tracking_git_call_process(self, method, *args, **kwargs):
-        if method == "commit" and "adopt: move legacy into canonical" in args:
-            observed_lock_sets.append(set(active_locks))
-        return original_git_call_process(self, method, *args, **kwargs)
+    monkeypatch.setattr(Git, "_call_process", record_locks_then_run)
 
-    monkeypatch.setattr("mcp_agent_mail.cli.archive_write_lock", tracking_archive_write_lock)
-    monkeypatch.setattr(Git, "_call_process", tracking_git_call_process)
+    result = _run_cli("projects", "adopt", LEGACY_SLUG, CANONICAL_SLUG, "--apply")
 
-    result = runner.invoke(app, ["projects", "adopt", "legacy", "canonical", "--apply"])
-
-    assert result.exit_code == 0
-    assert observed_lock_sets == [{"legacy", "canonical"}]
+    assert result.exit_code == 0, result.output
+    assert locks_at_commit == [{LEGACY_SLUG, CANONICAL_SLUG}]
 
 
 def test_projects_adopt_refuses_immutable_delivery_history_before_mutation(
     isolated_env,
     tmp_path,
 ) -> None:
-    runner = CliRunner()
-    source_worktree, target_worktree = _init_projects_adopt_repo(tmp_path)
-    source_root, target_root, _, _ = _seed_projects_adopt_state(
-        source_worktree,
-        target_worktree,
-    )
+    legacy_key, canonical_key = _one_repo_two_worktrees(tmp_path)
+    seeded = _seed_adoptable_pair(legacy_key, canonical_key)
+    source_root = seeded.legacy_root
+    target_root = seeded.canonical_root
 
     async def _seed_delivery() -> tuple[str, int]:
         async with get_session() as session:
@@ -899,7 +980,7 @@ def test_projects_adopt_refuses_immutable_delivery_history_before_mutation(
     pending_path.parent.mkdir(parents=True, exist_ok=True)
     pending_path.write_text("attempt\n", encoding="utf-8")
 
-    result = runner.invoke(app, ["projects", "adopt", "legacy", "canonical", "--apply"])
+    result = _run_cli("projects", "adopt", LEGACY_SLUG, CANONICAL_SLUG, "--apply")
 
     assert result.exit_code != 0
     assert "immutable message delivery history" in result.output
@@ -957,26 +1038,40 @@ def test_cli_serve_http_uses_settings(isolated_env, monkeypatch):
     assert call_args["forwarded_allow_ips"] == "172.19.0.1"
 
 
-def test_cli_config_set_port_clears_cached_settings(tmp_path, monkeypatch):
-    runner = CliRunner()
-    env_path = tmp_path / ".env"
-    env_path.write_text("HTTP_HOST=127.0.0.1\nHTTP_PORT=1111\nHTTP_PATH=/api/\n", encoding="utf-8")
+def test_config_set_port_is_visible_to_the_very_next_read(tmp_path, monkeypatch) -> None:
+    """Rewriting .env is not enough: the cached Settings must be invalidated too.
+
+    ``show-port`` reads through ``get_settings()``, which memoises. A ``set-port``
+    that writes the file without clearing that cache leaves the running process
+    reporting the old port -- the file and the answer disagree, and only a
+    restart reconciles them.
+    """
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "HTTP_HOST=127.0.0.1\nHTTP_PORT=4101\nHTTP_PATH=/api/\n", encoding="utf-8"
+    )
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("HTTP_HOST", raising=False)
-    monkeypatch.delenv("HTTP_PORT", raising=False)
-    monkeypatch.delenv("HTTP_PATH", raising=False)
+    for variable in ("HTTP_HOST", "HTTP_PORT", "HTTP_PATH"):
+        monkeypatch.delenv(variable, raising=False)
     clear_settings_cache()
 
-    show_before = runner.invoke(app, ["config", "show-port"])
-    assert show_before.exit_code == 0
-    assert "1111" in show_before.stdout
+    before = _run_cli("config", "show-port")
+    assert before.exit_code == 0, before.output
+    assert "4101" in before.stdout
 
-    set_result = runner.invoke(app, ["config", "set-port", "2222"])
-    assert set_result.exit_code == 0
+    changed = _run_cli("config", "set-port", "4202")
+    assert changed.exit_code == 0, changed.output
 
-    show_after = runner.invoke(app, ["config", "show-port"])
-    assert show_after.exit_code == 0
-    assert "2222" in show_after.stdout
+    # the file is edited in place: the port line is replaced, the rest survives
+    persisted = env_file.read_text(encoding="utf-8")
+    assert "HTTP_PORT=4202" in persisted
+    assert "HTTP_PORT=4101" not in persisted
+    assert "HTTP_HOST=127.0.0.1" in persisted
+    assert "HTTP_PATH=/api/" in persisted
+
+    after = _run_cli("config", "show-port")
+    assert after.exit_code == 0, after.output
+    assert "4202" in after.stdout
 
 
 def test_cli_serve_stdio(isolated_env, monkeypatch):
@@ -1011,46 +1106,60 @@ def test_cli_migrate(monkeypatch):
 
 
 def test_cli_list_projects(isolated_env):
-    runner = CliRunner()
-
     async def seed() -> None:
         await ensure_schema()
         async with get_session() as session:
-            project = Project(slug="demo", human_key="Demo")
-            session.add(project)
-            await session.commit()
-            await session.refresh(project)
-            assert project.id is not None
-            session.add(
-                Agent(
-                    project_id=project.id,
-                    name="BlueLake",
-                    program="codex",
-                    model="gpt-5",
-                    task_description="",
-                )
-            )
-            await session.commit()
+            project_id = await _insert_project(session, slug="demo", human_key="Demo")
+            await _insert_agent(session, project_id, "BlueLake")
 
     asyncio.run(seed())
-    result = runner.invoke(app, ["list-projects", "--include-agents"])
+    result = _run_cli("list-projects", "--include-agents")
     assert result.exit_code == 0
     assert "demo" in result.stdout
     assert "BlueLake" not in result.stdout
 
 
-def test_cli_list_projects_json_returns_structured_error_on_failure(monkeypatch):
-    runner = CliRunner()
+@pytest.mark.parametrize(
+    ("command", "failing_callable", "message"),
+    [
+        pytest.param(
+            ("list-projects", "--json"),
+            "ensure_schema",
+            "projects exploded",
+            id="list-projects",
+        ),
+        pytest.param(
+            ("doctor", "backups", "--json"),
+            "list_backups",
+            "backup listing exploded",
+            id="doctor-backups",
+        ),
+    ],
+)
+def test_json_mode_reports_a_failure_as_a_parseable_error_object(
+    monkeypatch,
+    command: tuple[str, ...],
+    failing_callable: str,
+    message: str,
+) -> None:
+    """--json output stays machine-readable on the failure path too.
 
-    async def failing_ensure_schema(_settings=None) -> None:
-        raise RuntimeError("projects exploded")
+    A caller that pipes these commands into a parser gets a traceback on stderr
+    and a truncated document on stdout if the error escapes uncaught, so both
+    the exit status and the shape of stdout are part of the contract. The key
+    name ``error`` is what such a caller reads, so it is quoted exactly.
+    """
+    owner = cli_module if failing_callable == "ensure_schema" else storage_module
 
-    monkeypatch.setattr("mcp_agent_mail.cli.ensure_schema", failing_ensure_schema)
+    async def explode(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError(message)
 
-    result = runner.invoke(app, ["list-projects", "--json"])
+    monkeypatch.setattr(owner, failing_callable, explode)
+
+    result = _run_cli(*command)
 
     assert result.exit_code == 1
-    assert json.loads(result.stdout) == {"error": "projects exploded"}
+    assert json.loads(result.stdout) == {"error": message}
 
 
 @pytest.mark.parametrize("command", ["hard-delete-agent", "hard-delete-project"])
@@ -1169,643 +1278,679 @@ def test_clear_and_reset_skips_archive_when_disabled(isolated_env, monkeypatch):
     assert result.exit_code == 0
 
 
-def test_doctor_check_reports_stale_locks(isolated_env):
-    runner = CliRunner()
-    settings = get_settings()
-    lock_path = Path(settings.storage.root) / "projects" / "backend" / ".archive.lock"
+# ---------- doctor: scaffolding ----------
+#
+# Each helper below builds only the *state* a doctor subcommand is supposed to
+# notice. None of them assert anything: every expectation is written out in the
+# test that holds it, so no helper can quietly soften a check for its callers.
+
+RESERVED_PATH = "src/{slug}.py"
+
+
+def _reaped_child_pid() -> int:
+    """A pid that belonged to a real process and no longer belongs to any.
+
+    Staleness is decided by asking ``pid_is_alive`` about the pid recorded in a
+    lock's owner sidecar, so the fixture has to supply a pid that is genuinely
+    gone. A large invented number is only *probably* absent -- it is a bet on
+    the platform's pid ceiling -- whereas a child this process spawned and
+    reaped provably ran and provably stopped. Computed at each call rather than
+    cached, to keep the window before the pid is used as short as possible.
+    """
+    with subprocess.Popen(
+        [sys.executable, "-c", "pass"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ) as child:
+        child.wait()
+    return child.pid
+
+
+def _abandon_archive_lock(
+    storage_root: str | Path,
+    slug: str,
+    *,
+    owner: str = "dead-owner",
+) -> Path:
+    """Leave an abandoned ``.archive.lock`` for ``slug``; return its resolved path.
+
+    ``AsyncFileLock`` has two independent grounds for calling a lock stale and
+    ``owner`` selects which one is on trial:
+
+    ``dead-owner``  the sidecar names a process that has exited. Stale on the
+                    owner alone, so ``created_ts`` is deliberately *fresh* --
+                    age must not be what rescues the assertion.
+    ``aged-out``    the sidecar names no process at all, leaving age as the only
+                    available evidence, so the lock is older than the 180-second
+                    stale timeout.
+    """
+    root = Path(storage_root).expanduser().resolve()
+    lock_path = root / "projects" / slug / ".archive.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path.write_text("", encoding="utf-8")
-    metadata_path = lock_path.parent / ".archive.lock.owner.json"
-    metadata_path.write_text(
-        json.dumps({"pid": 999999, "created_ts": time.time() - 3600}),
-        encoding="utf-8",
+    now = datetime.now(UTC)
+    if owner == "dead-owner":
+        sidecar: dict[str, Any] = {
+            "pid": _reaped_child_pid(),
+            "created_ts": now.timestamp(),
+        }
+    else:
+        sidecar = {"created_ts": (now - timedelta(days=1)).timestamp()}
+    lock_path.with_name(f"{lock_path.name}.owner.json").write_text(
+        json.dumps(sidecar), encoding="utf-8"
     )
-
-    result = runner.invoke(app, ["doctor", "check", "--json"])
-    assert result.exit_code == 0
-    payload = json.loads(result.stdout)
-    locks_diag = next(item for item in payload["diagnostics"] if item["name"] == "Locks")
-    assert locks_diag["status"] == "warning"
-    assert "stale" in locks_diag["message"].lower()
+    return lock_path
 
 
-def test_doctor_check_detects_non_sqlite3_wal_files(tmp_path, monkeypatch):
-    runner = CliRunner()
-    db_path = tmp_path / "mail.db"
-    wal_path = tmp_path / "mail.db-wal"
-    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
-    clear_settings_cache()
+def _seed_expired_reservations(*slugs: str) -> None:
+    """Give each named project one agent holding one already-expired reservation."""
 
-    sqlite3.connect(db_path).close()
-    wal_path.write_text("wal", encoding="utf-8")
-
-    result = runner.invoke(app, ["doctor", "check", "--json"])
-    assert result.exit_code == 0
-    payload = json.loads(result.stdout)
-    wal_diag = next(item for item in payload["diagnostics"] if item["name"] == "WAL Files")
-    assert wal_diag["status"] == "info"
-    assert "wal/shm file" in wal_diag["message"].lower()
-
-
-def test_doctor_check_scopes_project_specific_findings(isolated_env):
-    runner = CliRunner()
-
-    async def seed() -> None:
+    async def _seed() -> None:
         await ensure_schema()
+        # FileReservation stores naive UTC, so the comparison value must match.
+        expired_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=1)
         async with get_session() as session:
-            backend = Project(slug="backend", human_key=pkey("backend"))
-            frontend = Project(slug="frontend", human_key=pkey("frontend"))
-            session.add(backend)
-            session.add(frontend)
-            await session.commit()
-            await session.refresh(backend)
-            await session.refresh(frontend)
-            assert backend.id is not None
-            assert frontend.id is not None
-
-            backend_agent = Agent(project_id=backend.id, name="BlueLake", program="codex", model="gpt-5", task_description="")
-            frontend_agent = Agent(project_id=frontend.id, name="GreenCastle", program="codex", model="gpt-5", task_description="")
-            session.add(backend_agent)
-            session.add(frontend_agent)
-            await session.commit()
-            await session.refresh(backend_agent)
-            await session.refresh(frontend_agent)
-            assert backend_agent.id is not None
-            assert frontend_agent.id is not None
-
-            expired_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1)
-            session.add(
-                FileReservation(
-                    project_id=backend.id,
-                    agent_id=backend_agent.id,
-                    path_pattern="src/backend.py",
-                    expires_ts=expired_at,
+            for slug in slugs:
+                project_id = await _insert_project(
+                    session, slug=slug, human_key=pkey(slug)
                 )
-            )
-            session.add(
-                FileReservation(
-                    project_id=frontend.id,
-                    agent_id=frontend_agent.id,
-                    path_pattern="src/frontend.py",
-                    expires_ts=expired_at,
+                agent_id = await _insert_agent(
+                    session, project_id, f"{slug.capitalize()}Holder"
                 )
-            )
+                session.add(
+                    FileReservation(
+                        project_id=project_id,
+                        agent_id=agent_id,
+                        path_pattern=RESERVED_PATH.format(slug=slug),
+                        expires_ts=expired_at,
+                    )
+                )
             await session.commit()
 
-    asyncio.run(seed())
-
-    settings = get_settings()
-    for slug in ("backend", "frontend"):
-        lock_path = Path(settings.storage.root) / "projects" / slug / ".archive.lock"
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        lock_path.write_text("", encoding="utf-8")
-        (lock_path.parent / ".archive.lock.owner.json").write_text(
-            json.dumps({"pid": 999999, "created_ts": time.time() - 3600}),
-            encoding="utf-8",
-        )
-
-    result = runner.invoke(app, ["doctor", "check", "Backend", "--json"])
-    assert result.exit_code == 0
-    payload = json.loads(result.stdout)
-
-    locks_diag = next(item for item in payload["diagnostics"] if item["name"] == "Locks")
-    reservations_diag = next(item for item in payload["diagnostics"] if item["name"] == "File Reservations")
-    assert "1 stale lock" in locks_diag["message"].lower()
-    assert "1 expired reservation" in reservations_diag["message"].lower()
+    asyncio.run(_seed())
 
 
-def test_doctor_backups_json_returns_structured_error_on_failure(monkeypatch):
-    runner = CliRunner()
+def _released_reservation_paths() -> set[str]:
+    """Path patterns of every reservation the database now marks as released."""
 
-    async def failing_list_backups(_settings) -> list[dict[str, Any]]:
-        raise RuntimeError("backup listing exploded")
-
-    monkeypatch.setattr("mcp_agent_mail.storage.list_backups", failing_list_backups)
-
-    result = runner.invoke(app, ["doctor", "backups", "--json"])
-
-    assert result.exit_code == 1
-    assert json.loads(result.stdout) == {"error": "backup listing exploded"}
-
-
-def test_doctor_repair_scopes_project_specific_repairs(isolated_env, monkeypatch):
-    runner = CliRunner()
-
-    async def seed() -> None:
-        await ensure_schema()
+    async def _read() -> set[str]:
         async with get_session() as session:
-            backend = Project(slug="backend", human_key=pkey("backend"))
-            frontend = Project(slug="frontend", human_key=pkey("frontend"))
-            session.add(backend)
-            session.add(frontend)
-            await session.commit()
-            await session.refresh(backend)
-            await session.refresh(frontend)
-            assert backend.id is not None
-            assert frontend.id is not None
+            rows = (await session.execute(select(FileReservation))).scalars().all()
+            return {row.path_pattern for row in rows if row.released_ts is not None}
 
-            backend_agent = Agent(project_id=backend.id, name="BlueLake", program="codex", model="gpt-5", task_description="")
-            frontend_agent = Agent(project_id=frontend.id, name="GreenCastle", program="codex", model="gpt-5", task_description="")
-            session.add(backend_agent)
-            session.add(frontend_agent)
-            await session.commit()
-            await session.refresh(backend_agent)
-            await session.refresh(frontend_agent)
-            assert backend_agent.id is not None
-            assert frontend_agent.id is not None
-
-            expired_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1)
-            session.add(
-                FileReservation(
-                    project_id=backend.id,
-                    agent_id=backend_agent.id,
-                    path_pattern="src/backend.py",
-                    expires_ts=expired_at,
-                )
-            )
-            session.add(
-                FileReservation(
-                    project_id=frontend.id,
-                    agent_id=frontend_agent.id,
-                    path_pattern="src/frontend.py",
-                    expires_ts=expired_at,
-                )
-            )
-            await session.commit()
-
-    async def fake_backup(*args, **kwargs):
-        return Path("/tmp/fake-doctor-backup")
-
-    asyncio.run(seed())
-    monkeypatch.setattr("mcp_agent_mail.storage.create_diagnostic_backup", fake_backup)
-
-    settings = get_settings()
-    backend_lock = Path(settings.storage.root) / "projects" / "backend" / ".archive.lock"
-    backend_lock.parent.mkdir(parents=True, exist_ok=True)
-    backend_lock.write_text("", encoding="utf-8")
-    (backend_lock.parent / ".archive.lock.owner.json").write_text(
-        json.dumps({"pid": 999999, "created_ts": time.time() - 3600}),
-        encoding="utf-8",
-    )
-    frontend_lock = Path(settings.storage.root) / "projects" / "frontend" / ".archive.lock"
-    frontend_lock.parent.mkdir(parents=True, exist_ok=True)
-    frontend_lock.write_text("", encoding="utf-8")
-    (frontend_lock.parent / ".archive.lock.owner.json").write_text(
-        json.dumps({"pid": 999999, "created_ts": time.time() - 3600}),
-        encoding="utf-8",
-    )
-
-    result = runner.invoke(app, ["doctor", "repair", "Backend", "--yes"])
-    assert result.exit_code == 0
-
-    async def verify() -> tuple[list[FileReservation], list[FileReservation]]:
-        async with get_session() as session:
-            backend_rows = (
-                await session.execute(
-                    select(FileReservation)
-                    .join(Project, cast(ColumnElement[bool], FileReservation.project_id == Project.id))
-                    .where(cast(ColumnElement[bool], Project.slug == "backend"))
-                )
-            ).scalars().all()
-            frontend_rows = (
-                await session.execute(
-                    select(FileReservation)
-                    .join(Project, cast(ColumnElement[bool], FileReservation.project_id == Project.id))
-                    .where(cast(ColumnElement[bool], Project.slug == "frontend"))
-                )
-            ).scalars().all()
-            return list(backend_rows), list(frontend_rows)
-
-    backend_rows, frontend_rows = asyncio.run(verify())
-    assert backend_rows[0].released_ts is not None
-    assert frontend_rows[0].released_ts is None
-    assert backend_lock.exists() is False
-    assert frontend_lock.exists() is True
+    return asyncio.run(_read())
 
 
-def test_doctor_restore_creates_pre_restore_backup(tmp_path, monkeypatch):
-    runner = CliRunner()
-    current_archive = tmp_path / "current-archive"
-    (current_archive / ".git").mkdir(parents=True)
-    monkeypatch.setenv("STORAGE_ROOT", str(current_archive))
-    clear_settings_cache()
+def _diagnostic(stdout: str, name: str) -> dict[str, Any]:
+    """Pull exactly one named entry out of ``doctor check --json`` output.
 
-    backup_path = tmp_path / "restore-backup"
-    backup_path.mkdir()
-    (backup_path / "database.sqlite3").write_text("db", encoding="utf-8")
-    (backup_path / "manifest.json").write_text(
-        json.dumps({
-            "version": 1,
-            "created_at": "2026-04-10T00:00:00+00:00",
-            "reason": "test",
-            "database_path": "database.sqlite3",
-            "project_bundles": [],
-            "storage_root": str(tmp_path / "archive"),
-            "restore_instructions": "test",
-        }),
-        encoding="utf-8",
-    )
-
-    calls: dict[str, Any] = {}
-
-    async def fake_create_backup(*args: Any, **kwargs: Any) -> Path:
-        calls["reason"] = kwargs.get("reason")
-        return tmp_path / "pre-restore-snapshot"
-
-    async def fake_restore(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        calls["restore_backup_path"] = args[1]
-        calls["restore_dry_run"] = kwargs.get("dry_run")
-        return {"database_restored": True, "bundles_restored": [], "errors": []}
-
-    monkeypatch.setattr("mcp_agent_mail.storage.create_diagnostic_backup", fake_create_backup)
-    monkeypatch.setattr("mcp_agent_mail.storage.restore_from_backup", fake_restore)
-
-    result = runner.invoke(app, ["doctor", "restore", str(backup_path), "--yes"])
-    assert result.exit_code == 0
-    assert calls["reason"] == "pre-restore"
-    assert calls["restore_backup_path"] == backup_path
-    assert calls["restore_dry_run"] is False
-    assert "Pre-restore backup:" in result.stdout
+    Insisting on exactly one matters: a scoping bug that emitted a diagnostic
+    per project instead of one aggregate would still satisfy a "find the first
+    match" lookup, and the count is the only place that shows.
+    """
+    payload = json.loads(stdout)
+    matches = [item for item in payload["diagnostics"] if item["name"] == name]
+    assert len(matches) == 1, f"expected one {name!r} diagnostic, got {len(matches)}"
+    return matches[0]
 
 
-def test_doctor_restore_aborts_when_pre_restore_backup_fails(tmp_path, monkeypatch):
-    runner = CliRunner()
-    current_archive = tmp_path / "current-archive"
-    (current_archive / ".git").mkdir(parents=True, exist_ok=True)
-    monkeypatch.setenv("STORAGE_ROOT", str(current_archive))
-    clear_settings_cache()
-
-    backup_path = tmp_path / "restore-backup"
-    backup_path.mkdir()
-    (backup_path / "database.sqlite3").write_text("db", encoding="utf-8")
-    (backup_path / "manifest.json").write_text(
-        json.dumps({
-            "version": 1,
-            "created_at": "2026-04-10T00:00:00+00:00",
-            "reason": "test",
-            "database_path": "database.sqlite3",
-            "project_bundles": [],
-            "storage_root": str(current_archive),
-            "restore_instructions": "test",
-        }),
-        encoding="utf-8",
-    )
-
-    async def failing_create_backup(*args: Any, **kwargs: Any) -> Path:
-        raise RuntimeError("archive bundle failed")
-
-    def should_not_restore(*args: Any, **kwargs: Any) -> dict[str, Any]:  # pragma: no cover - defensive
-        raise AssertionError("restore should not proceed when pre-restore backup fails")
-
-    monkeypatch.setattr("mcp_agent_mail.storage.create_diagnostic_backup", failing_create_backup)
-    monkeypatch.setattr("mcp_agent_mail.storage.restore_from_backup", should_not_restore)
-
-    result = runner.invoke(app, ["doctor", "restore", str(backup_path), "--yes"])
-    assert result.exit_code == 1
-    assert "Restore failed" in result.stdout
-    assert "archive bundle failed" in result.stdout
+MANIFEST_DEFAULTS: dict[str, Any] = {
+    "version": 1,
+    "created_at": "2026-08-15T09:00:00+00:00",
+    "reason": "cli-test",
+    "restore_instructions": "am doctor restore <path>",
+}
 
 
-def test_doctor_restore_dry_run_skips_pre_restore_backup(tmp_path, monkeypatch):
-    runner = CliRunner()
-    backup_path = tmp_path / "restore-backup"
-    backup_path.mkdir()
-    (backup_path / "database.sqlite3").write_text("db", encoding="utf-8")
-    (backup_path / "manifest.json").write_text(
-        json.dumps({
-            "version": 1,
-            "created_at": "2026-04-10T00:00:00+00:00",
-            "reason": "test",
-            "database_path": "database.sqlite3",
-            "project_bundles": [],
-            "storage_root": str(tmp_path / "archive"),
-            "restore_instructions": "test",
-        }),
-        encoding="utf-8",
-    )
+def _write_backup_dir(
+    directory: Path,
+    *,
+    database_path: str | None = "database.sqlite3",
+    materialise_database: bool = True,
+    project_bundles: Sequence[str] = (),
+    storage_root: str = "/srv/agent-mail-archive",
+    **overrides: Any,
+) -> Path:
+    """Lay out a backup directory and the manifest describing it.
 
-    create_calls = 0
-    restore_calls: list[bool | None] = []
+    Defaults produce a backup ``doctor restore`` accepts; each keyword removes
+    one property so a test can put exactly one thing wrong at a time.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    if database_path is not None and materialise_database:
+        artifact = directory / database_path
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_bytes(b"SQLite format 3\x00")
+    manifest: dict[str, Any] = {
+        **MANIFEST_DEFAULTS,
+        "database_path": database_path,
+        "project_bundles": list(project_bundles),
+        "storage_root": storage_root,
+        **overrides,
+    }
+    (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return directory
 
-    async def fake_create_backup(*args: Any, **kwargs: Any) -> Path:
-        nonlocal create_calls
-        create_calls += 1
-        return tmp_path / "pre-restore-snapshot"
 
-    async def fake_restore(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        restore_calls.append(kwargs.get("dry_run"))
+def _completed_restore(**extra: Any) -> Callable[..., Coroutine[Any, Any, dict[str, Any]]]:
+    """A ``restore_from_backup`` stand-in reporting a clean, successful restore."""
+
+    async def _restore(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         return {
-            "database_restored": False,
+            "database_restored": True,
             "bundles_restored": [],
             "errors": [],
-            "would_restore_database": False,
-            "would_restore_bundles": [],
+            **extra,
         }
 
-    monkeypatch.setattr("mcp_agent_mail.storage.create_diagnostic_backup", fake_create_backup)
-    monkeypatch.setattr("mcp_agent_mail.storage.restore_from_backup", fake_restore)
-
-    result = runner.invoke(app, ["doctor", "restore", str(backup_path), "--dry-run"])
-    assert result.exit_code == 0
-    assert create_calls == 0
-    assert restore_calls == [True]
+    return _restore
 
 
-def test_doctor_restore_dry_run_exits_nonzero_when_preview_reports_errors(tmp_path, monkeypatch):
-    runner = CliRunner()
-    backup_path = tmp_path / "restore-backup"
-    backup_path.mkdir()
-    (backup_path / "database.sqlite3").write_text("db", encoding="utf-8")
-    (backup_path / "manifest.json").write_text(
-        json.dumps({
-            "version": 1,
-            "created_at": "2026-04-10T00:00:00+00:00",
-            "reason": "dry-run-error",
-            "database_path": "database.sqlite3",
-            "project_bundles": [],
-            "storage_root": str(tmp_path / "archive"),
-            "restore_instructions": "test",
-        }),
+# ---------- doctor check ----------
+
+
+@pytest.mark.parametrize("owner", ["dead-owner", "aged-out"])
+def test_doctor_check_reports_an_abandoned_archive_lock_and_names_it(
+    isolated_env,
+    owner: str,
+) -> None:
+    """A lock nobody is holding has to be surfaced, not silently tolerated.
+
+    Both of the lock's independent staleness grounds are exercised, because a
+    guard that only recognises one of them looks healthy from the other side.
+    The path is asserted too: a warning that does not say *which* lock is stale
+    cannot be acted on, and it is also what ``doctor repair`` goes on to remove.
+    """
+    lock_path = _abandon_archive_lock(
+        get_settings().storage.root, "backend", owner=owner
+    )
+
+    result = _run_cli("doctor", "check", "--json")
+
+    assert result.exit_code == 0, result.output
+    locks = _diagnostic(result.stdout, "Locks")
+    assert locks["status"] == "warning"
+    assert "stale" in locks["message"].lower()
+    assert locks["details"] == [str(lock_path)]
+    assert locks["repair_available"] is True
+
+
+def test_doctor_check_reports_no_stale_locks_when_the_lock_is_held(isolated_env) -> None:
+    """The control for the test above: a live owner must not be reported stale.
+
+    Without this, a check that answered "stale" unconditionally would pass the
+    abandoned-lock test and hand every future operator a false alarm -- and the
+    repair path would then delete a lock a running process still holds.
+    """
+    storage_root = Path(get_settings().storage.root).expanduser().resolve()
+    lock_path = storage_root / "projects" / "backend" / ".archive.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text("", encoding="utf-8")
+    lock_path.with_name(f"{lock_path.name}.owner.json").write_text(
+        json.dumps({"pid": os.getpid(), "created_ts": datetime.now(UTC).timestamp()}),
         encoding="utf-8",
     )
-    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://agent:mail@localhost:5432/mcp")
+
+    result = _run_cli("doctor", "check", "--json")
+
+    assert result.exit_code == 0, result.output
+    locks = _diagnostic(result.stdout, "Locks")
+    assert locks["status"] == "ok"
+    assert locks["repair_available"] is False
+
+
+def test_doctor_check_reports_sqlite_sidecar_files_as_information(
+    isolated_env,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A ``-wal`` companion is expected during operation, so it is info, not a fault.
+
+    The check reports presence and names the files; it deliberately does not
+    read them, so this plants a sidecar with contents no SQLite ever wrote and
+    still expects it listed. Anything stronger would be asserting a validation
+    the command does not perform.
+    """
+    database = tmp_path / "mail.sqlite3"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{database}")
     clear_settings_cache()
+    sqlite3.connect(database).close()
+    wal = database.with_name(f"{database.name}-wal")
+    wal.write_bytes(b"not anything a write-ahead log would contain")
 
-    result = runner.invoke(app, ["doctor", "restore", str(backup_path), "--dry-run"])
+    result = _run_cli("doctor", "check", "--json")
 
-    assert result.exit_code == 1
-    assert "Dry run found restore blockers" in result.stdout
-    assert "does not use a SQLite database file" in result.stdout
+    assert result.exit_code == 0, result.output
+    sidecars = _diagnostic(result.stdout, "WAL Files")
+    assert sidecars["status"] == "info"
+    assert "wal/shm file" in sidecars["message"].lower()
+    assert str(wal) in sidecars["details"]
 
 
-def test_doctor_repair_aborts_when_backup_creation_fails(isolated_env, monkeypatch):
-    runner = CliRunner()
+def test_doctor_check_counts_only_the_named_project(isolated_env) -> None:
+    """Naming a project must narrow the findings, and narrow them to the right one.
 
-    async def seed() -> None:
-        await ensure_schema()
-        async with get_session() as session:
-            backend = Project(slug="backend", human_key=pkey("backend"))
-            session.add(backend)
-            await session.commit()
-            await session.refresh(backend)
-            assert backend.id is not None
+    Run twice on purpose. The unscoped run is the control: without it, a command
+    that had lost the filter entirely -- or one that reported a fixed count of
+    one -- would still satisfy the scoped assertions, so the scoped numbers only
+    mean something next to the numbers they are supposed to differ from.
 
-            backend_agent = Agent(
-                project_id=backend.id,
-                name="BlueLake",
-                program="codex",
-                model="gpt-5",
-                task_description="",
-            )
-            session.add(backend_agent)
-            await session.commit()
-            await session.refresh(backend_agent)
-            assert backend_agent.id is not None
+    ``Backend`` is passed in a case the database does not hold, because the
+    identifier is slugified before lookup and that is part of the interface.
+    """
+    _seed_expired_reservations("backend", "frontend")
+    storage_root = get_settings().storage.root
+    for slug in ("backend", "frontend"):
+        _abandon_archive_lock(storage_root, slug)
 
-            expired_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1)
-            session.add(
-                FileReservation(
-                    project_id=backend.id,
-                    agent_id=backend_agent.id,
-                    path_pattern="src/backend.py",
-                    expires_ts=expired_at,
-                )
-            )
-            await session.commit()
+    everything = _run_cli("doctor", "check", "--json")
+    backend_only = _run_cli("doctor", "check", "Backend", "--json")
 
-    async def failing_backup(*args: Any, **kwargs: Any) -> Path:
-        raise RuntimeError("backup disk offline")
+    assert everything.exit_code == 0, everything.output
+    assert backend_only.exit_code == 0, backend_only.output
 
-    asyncio.run(seed())
-    monkeypatch.setattr("mcp_agent_mail.storage.create_diagnostic_backup", failing_backup)
+    assert "2 stale lock" in _diagnostic(everything.stdout, "Locks")["message"]
+    assert "2 expired reservation" in _diagnostic(
+        everything.stdout, "File Reservations"
+    )["message"]
 
-    settings = get_settings()
-    backend_lock = Path(settings.storage.root) / "projects" / "backend" / ".archive.lock"
-    backend_lock.parent.mkdir(parents=True, exist_ok=True)
-    backend_lock.write_text("", encoding="utf-8")
-    (backend_lock.parent / ".archive.lock.owner.json").write_text(
-        json.dumps({"pid": 999999, "created_ts": time.time() - 3600}),
-        encoding="utf-8",
-    )
+    assert "1 stale lock" in _diagnostic(backend_only.stdout, "Locks")["message"]
+    assert "1 expired reservation" in _diagnostic(
+        backend_only.stdout, "File Reservations"
+    )["message"]
 
-    result = runner.invoke(app, ["doctor", "repair", "Backend", "--yes"])
+
+# ---------- doctor repair ----------
+
+
+def test_doctor_repair_touches_only_the_named_project(
+    isolated_env,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Repair is a mutation, so the blast radius is the property under test.
+
+    Both projects are in the same repairable state and only one is named; the
+    other one is here purely as the thing that must come out untouched.
+    """
+    _seed_expired_reservations("backend", "frontend")
+    storage_root = get_settings().storage.root
+    backend_lock = _abandon_archive_lock(storage_root, "backend")
+    frontend_lock = _abandon_archive_lock(storage_root, "frontend")
+
+    async def _snapshot(*_args: Any, **_kwargs: Any) -> Path:
+        return tmp_path / "diagnostic-snapshot"
+
+    monkeypatch.setattr(storage_module, "create_diagnostic_backup", _snapshot)
+
+    result = _run_cli("doctor", "repair", "Backend", "--yes")
+
+    assert result.exit_code == 0, result.output
+    assert _released_reservation_paths() == {RESERVED_PATH.format(slug="backend")}
+    assert not backend_lock.exists()
+    assert frontend_lock.exists()
+
+
+def test_doctor_repair_changes_nothing_when_the_backup_cannot_be_taken(
+    isolated_env,
+    monkeypatch,
+) -> None:
+    """No backup, no repair. The repairable state must survive the refusal intact.
+
+    Asserting only the exit code would leave the dangerous case uncovered: a
+    version that took the backup failure as a warning and repaired anyway also
+    exits non-zero, and the operator would then have mutated state with no
+    snapshot to go back to.
+    """
+    _seed_expired_reservations("backend")
+    backend_lock = _abandon_archive_lock(get_settings().storage.root, "backend")
+
+    async def _backup_fails(*_args: Any, **_kwargs: Any) -> Path:
+        raise RuntimeError("backup volume offline")
+
+    monkeypatch.setattr(storage_module, "create_diagnostic_backup", _backup_fails)
+
+    result = _run_cli("doctor", "repair", "Backend", "--yes")
+
     assert result.exit_code == 1
     assert "Backup failed" in result.stdout
-
-    async def verify() -> list[FileReservation]:
-        async with get_session() as session:
-            backend_rows = (
-                await session.execute(
-                    select(FileReservation)
-                    .join(Project, cast(ColumnElement[bool], FileReservation.project_id == Project.id))
-                    .where(cast(ColumnElement[bool], Project.slug == "backend"))
-                )
-            ).scalars().all()
-            return list(backend_rows)
-
-    backend_rows = asyncio.run(verify())
-    assert backend_rows[0].released_ts is None
-    assert backend_lock.exists() is True
+    assert "backup volume offline" in result.stdout
+    assert _released_reservation_paths() == set()
+    assert backend_lock.exists()
 
 
-def test_doctor_repair_exits_nonzero_when_repair_reports_errors(isolated_env, monkeypatch, tmp_path):
-    runner = CliRunner()
+def test_doctor_repair_exits_nonzero_when_a_repair_step_reports_an_error(
+    isolated_env,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A step that failed must reach the exit status, not just the transcript.
 
-    async def fake_create_backup(*args: Any, **kwargs: Any) -> Path:
-        return tmp_path / "fake-doctor-backup"
+    Lock healing is caught and recorded rather than raised, so the command runs
+    to completion; the error count is the only thing that carries the failure
+    out to a caller, and it must not be printed and then discarded.
+    """
 
-    async def failing_heal_locks(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    async def _snapshot(*_args: Any, **_kwargs: Any) -> Path:
+        return tmp_path / "diagnostic-snapshot"
+
+    async def _healing_fails(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         raise RuntimeError("archive lock cleanup exploded")
 
-    monkeypatch.setattr("mcp_agent_mail.storage.create_diagnostic_backup", fake_create_backup)
-    monkeypatch.setattr("mcp_agent_mail.storage.heal_archive_locks", failing_heal_locks)
+    monkeypatch.setattr(storage_module, "create_diagnostic_backup", _snapshot)
+    monkeypatch.setattr(storage_module, "heal_archive_locks", _healing_fails)
 
-    result = runner.invoke(app, ["doctor", "repair", "--yes"])
+    result = _run_cli("doctor", "repair", "--yes")
 
     assert result.exit_code == 1
     assert "Lock healing failed" in result.stdout
+    assert "archive lock cleanup exploded" in result.stdout
     assert "Errors: 1" in result.stdout
 
 
-def test_doctor_restore_rejects_malformed_manifest(tmp_path):
-    runner = CliRunner()
-    backup_path = tmp_path / "restore-backup"
-    backup_path.mkdir()
-    (backup_path / "manifest.json").write_text("{not-json", encoding="utf-8")
-
-    result = runner.invoke(app, ["doctor", "restore", str(backup_path), "--yes"])
-    assert result.exit_code == 1
-    assert "Invalid backup manifest" in result.stdout
+# ---------- doctor restore: manifests that must be refused ----------
 
 
-def test_doctor_restore_rejects_manifest_without_restore_payload(tmp_path):
-    runner = CliRunner()
-    backup_path = tmp_path / "restore-backup"
-    backup_path.mkdir()
-    (backup_path / "manifest.json").write_text(
-        json.dumps({
-            "version": 1,
-            "created_at": "2026-04-10T00:00:00+00:00",
-            "reason": "empty",
-            "database_path": None,
-            "project_bundles": [],
-            "storage_root": "/tmp/archive",
-            "restore_instructions": "test",
-        }),
-        encoding="utf-8",
+def _backup_with_unparseable_manifest(root: Path) -> Path:
+    root.mkdir(parents=True)
+    (root / "manifest.json").write_text('{"version": 1,', encoding="utf-8")
+    return root
+
+
+def _backup_with_manifest_that_is_not_an_object(root: Path) -> Path:
+    root.mkdir(parents=True)
+    (root / "manifest.json").write_text('["version", 1]', encoding="utf-8")
+    return root
+
+
+def _backup_with_nothing_to_restore(root: Path) -> Path:
+    return _write_backup_dir(root, database_path=None, project_bundles=())
+
+
+def _backup_pointing_outside_itself(root: Path) -> Path:
+    outside = root.parent / "elsewhere.bundle"
+    outside.write_text("bundle", encoding="utf-8")
+    return _write_backup_dir(
+        root, database_path=None, project_bundles=[str(outside)]
     )
 
-    result = runner.invoke(app, ["doctor", "restore", str(backup_path), "--yes"])
-    assert result.exit_code == 1
-    assert "Invalid backup manifest" in result.stdout
 
-
-def test_doctor_restore_rejects_manifest_artifact_outside_backup(tmp_path):
-    runner = CliRunner()
-    external_bundle = tmp_path / "external.bundle"
-    external_bundle.write_text("bundle", encoding="utf-8")
-
-    backup_path = tmp_path / "restore-backup"
-    backup_path.mkdir()
-    (backup_path / "manifest.json").write_text(
-        json.dumps({
-            "version": 1,
-            "created_at": "2026-04-10T00:00:00+00:00",
-            "reason": "bad-paths",
-            "database_path": None,
-            "project_bundles": [str(external_bundle)],
-            "storage_root": "/tmp/archive",
-            "restore_instructions": "test",
-        }),
-        encoding="utf-8",
+def _backup_whose_database_is_absent(root: Path) -> Path:
+    return _write_backup_dir(
+        root, database_path="payload/db-copy.sqlite3", materialise_database=False
     )
 
-    result = runner.invoke(app, ["doctor", "restore", str(backup_path), "--yes"])
+
+def _backup_whose_database_is_a_directory(root: Path) -> Path:
+    backup = _write_backup_dir(
+        root, database_path="payload/db-copy.sqlite3", materialise_database=False
+    )
+    (backup / "payload" / "db-copy.sqlite3").mkdir(parents=True)
+    return backup
+
+
+@pytest.mark.parametrize(
+    ("build_backup", "expected_reason"),
+    [
+        pytest.param(
+            _backup_with_unparseable_manifest, None, id="manifest-is-not-json"
+        ),
+        pytest.param(
+            _backup_with_manifest_that_is_not_an_object,
+            "must contain a JSON object",
+            id="manifest-is-not-an-object",
+        ),
+        pytest.param(
+            _backup_with_nothing_to_restore,
+            "must include a database backup or at least one archive bundle",
+            id="manifest-describes-no-payload",
+        ),
+        pytest.param(
+            _backup_pointing_outside_itself,
+            "escapes backup directory",
+            id="artifact-outside-the-backup",
+        ),
+        pytest.param(
+            _backup_whose_database_is_absent,
+            "references missing artifact",
+            id="artifact-does-not-exist",
+        ),
+        pytest.param(
+            _backup_whose_database_is_a_directory,
+            "artifact is not a file",
+            id="artifact-is-a-directory",
+        ),
+    ],
+)
+def test_doctor_restore_refuses_a_manifest_it_cannot_vouch_for(
+    tmp_path,
+    monkeypatch,
+    build_backup: Callable[[Path], Path],
+    expected_reason: str | None,
+) -> None:
+    """Validation happens before anything is touched, and says which thing was wrong.
+
+    Two properties in one, and the second is the one a refusal test usually
+    loses: the refusal has to be a *pre*-condition. Both the restore and the
+    pre-restore snapshot are replaced with stand-ins that fail on contact, so
+    an implementation that validated halfway through the work would be caught
+    rather than credited with a correct exit code.
+
+    ``expected_reason`` is ``None`` only for the unparseable-JSON case, whose
+    wording belongs to CPython's decoder rather than to this project.
+    """
+    monkeypatch.setattr(
+        storage_module, "restore_from_backup", _must_not_be_called("restore_from_backup")
+    )
+    monkeypatch.setattr(
+        storage_module,
+        "create_diagnostic_backup",
+        _must_not_be_called("create_diagnostic_backup"),
+    )
+    backup = build_backup(tmp_path / "backup")
+
+    result = _run_cli("doctor", "restore", str(backup), "--yes")
+
     assert result.exit_code == 1
     assert "Invalid backup manifest" in result.stdout
+    if expected_reason is not None:
+        assert expected_reason in result.stdout
 
 
-def test_doctor_restore_exits_nonzero_when_restore_reports_errors(tmp_path, monkeypatch):
-    runner = CliRunner()
-    backup_path = tmp_path / "restore-backup"
-    backup_path.mkdir()
-    payload_dir = backup_path / "payload"
-    payload_dir.mkdir()
-    (payload_dir / "db-copy.sqlite3").write_text("db", encoding="utf-8")
-    (backup_path / "manifest.json").write_text(
-        json.dumps({
-            "version": 1,
-            "created_at": "2026-04-10T00:00:00+00:00",
-            "reason": "restore-error",
-            "database_path": "payload/db-copy.sqlite3",
-            "project_bundles": [],
-            "storage_root": "/tmp/archive",
-            "restore_instructions": "test",
-        }),
-        encoding="utf-8",
-    )
+# ---------- doctor restore: the restore itself ----------
 
-    async def fake_create_backup(*args: Any, **kwargs: Any) -> Path:
+
+def test_doctor_restore_snapshots_the_live_state_before_overwriting_it(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """The pre-restore snapshot is worthless unless it is taken *first*.
+
+    So the order is what is asserted, not merely that both calls happened: a
+    snapshot taken after the restore has already overwritten the database
+    captures the new state and there is no way back to the old one.
+    """
+    live_archive = tmp_path / "live-archive"
+    (live_archive / ".git").mkdir(parents=True)
+    monkeypatch.setenv("STORAGE_ROOT", str(live_archive))
+    clear_settings_cache()
+    backup = _write_backup_dir(tmp_path / "backup", storage_root=str(live_archive))
+    sequence: list[str] = []
+
+    async def _snapshot(_settings: Any, *_args: Any, **kwargs: Any) -> Path:
+        sequence.append(f"snapshot(reason={kwargs.get('reason')})")
         return tmp_path / "pre-restore-snapshot"
 
-    async def fake_restore(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        return {
-            "database_restored": False,
-            "bundles_restored": [],
-            "errors": ["simulated restore failure"],
-        }
-
-    monkeypatch.setattr("mcp_agent_mail.storage.create_diagnostic_backup", fake_create_backup)
-    monkeypatch.setattr("mcp_agent_mail.storage.restore_from_backup", fake_restore)
-
-    result = runner.invoke(app, ["doctor", "restore", str(backup_path), "--yes"])
-    assert result.exit_code == 1
-    assert "Restore completed with errors" in result.stdout
-    assert "simulated restore failure" in result.stdout
-
-
-def test_doctor_restore_skips_pre_restore_backup_on_empty_current_state(tmp_path, monkeypatch):
-    runner = CliRunner()
-    current_archive = tmp_path / "current-archive"
-    current_archive.mkdir()
-    current_db = tmp_path / "current-state" / "mail.db"
-    monkeypatch.setenv("STORAGE_ROOT", str(current_archive))
-    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{current_db}")
-    clear_settings_cache()
-
-    backup_path = tmp_path / "restore-backup"
-    backup_path.mkdir()
-    (backup_path / "database.sqlite3").write_text("db", encoding="utf-8")
-    (backup_path / "manifest.json").write_text(
-        json.dumps({
-            "version": 1,
-            "created_at": "2026-04-10T00:00:00+00:00",
-            "reason": "test",
-            "database_path": "database.sqlite3",
-            "project_bundles": [],
-            "storage_root": str(current_archive),
-            "restore_instructions": "test",
-        }),
-        encoding="utf-8",
-    )
-
-    def should_not_create_backup(*args: Any, **kwargs: Any) -> Path:  # pragma: no cover - defensive
-        raise AssertionError("pre-restore backup should be skipped for empty current state")
-
-    async def fake_restore(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    async def _restore(
+        _settings: Any, path: Path, *, dry_run: bool
+    ) -> dict[str, Any]:
+        sequence.append(f"restore(path={path}, dry_run={dry_run})")
         return {"database_restored": True, "bundles_restored": [], "errors": []}
 
-    monkeypatch.setattr("mcp_agent_mail.storage.create_diagnostic_backup", should_not_create_backup)
-    monkeypatch.setattr("mcp_agent_mail.storage.restore_from_backup", fake_restore)
+    monkeypatch.setattr(storage_module, "create_diagnostic_backup", _snapshot)
+    monkeypatch.setattr(storage_module, "restore_from_backup", _restore)
 
-    result = runner.invoke(app, ["doctor", "restore", str(backup_path), "--yes"])
-    assert result.exit_code == 0
+    result = _run_cli("doctor", "restore", str(backup), "--yes")
+
+    assert result.exit_code == 0, result.output
+    assert sequence == [
+        "snapshot(reason=pre-restore)",
+        f"restore(path={backup}, dry_run=False)",
+    ]
+    assert "Pre-restore backup:" in result.stdout
+
+
+def test_doctor_restore_stops_when_the_pre_restore_snapshot_fails(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A failed snapshot must abort the restore, not merely be reported.
+
+    The restore stand-in fails on contact, so proceeding without a snapshot is
+    a test failure rather than something the exit code happens to hide.
+    """
+    live_archive = tmp_path / "live-archive"
+    (live_archive / ".git").mkdir(parents=True)
+    monkeypatch.setenv("STORAGE_ROOT", str(live_archive))
+    clear_settings_cache()
+    backup = _write_backup_dir(tmp_path / "backup", storage_root=str(live_archive))
+
+    async def _snapshot_fails(*_args: Any, **_kwargs: Any) -> Path:
+        raise RuntimeError("snapshot volume offline")
+
+    monkeypatch.setattr(storage_module, "create_diagnostic_backup", _snapshot_fails)
+    monkeypatch.setattr(
+        storage_module, "restore_from_backup", _must_not_be_called("restore_from_backup")
+    )
+
+    result = _run_cli("doctor", "restore", str(backup), "--yes")
+
+    assert result.exit_code == 1
+    assert "Restore failed" in result.stdout
+    assert "snapshot volume offline" in result.stdout
+
+
+def test_doctor_restore_skips_the_snapshot_when_there_is_nothing_to_snapshot(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """No live database and no live archive means the snapshot is skipped and said so.
+
+    The skip must be visible in the output. A restore that silently omits the
+    safety net looks exactly like one that took it, and the operator finds out
+    only when they go looking for the snapshot.
+    """
+    empty_archive = tmp_path / "empty-archive"
+    empty_archive.mkdir()
+    absent_database = tmp_path / "nowhere" / "mail.sqlite3"
+    monkeypatch.setenv("STORAGE_ROOT", str(empty_archive))
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{absent_database}")
+    clear_settings_cache()
+    backup = _write_backup_dir(tmp_path / "backup", storage_root=str(empty_archive))
+
+    monkeypatch.setattr(
+        storage_module,
+        "create_diagnostic_backup",
+        _must_not_be_called("create_diagnostic_backup"),
+    )
+    monkeypatch.setattr(storage_module, "restore_from_backup", _completed_restore())
+
+    result = _run_cli("doctor", "restore", str(backup), "--yes")
+
+    assert result.exit_code == 0, result.output
     assert "Pre-restore backup skipped" in result.stdout
     assert "Database restored" in result.stdout
 
 
-def test_doctor_restore_rejects_manifest_with_missing_artifact(tmp_path):
-    runner = CliRunner()
-    backup_path = tmp_path / "restore-backup"
-    backup_path.mkdir()
-    (backup_path / "manifest.json").write_text(
-        json.dumps({
-            "version": 1,
-            "created_at": "2026-04-10T00:00:00+00:00",
-            "reason": "missing-db",
-            "database_path": "payload/db-copy.sqlite3",
-            "project_bundles": [],
-            "storage_root": "/tmp/archive",
-            "restore_instructions": "test",
-        }),
-        encoding="utf-8",
+def test_doctor_restore_exits_nonzero_when_the_restore_reports_errors(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Partial success is failure: the errors reach both the output and the status."""
+    backup = _write_backup_dir(
+        tmp_path / "backup", database_path="payload/db-copy.sqlite3"
     )
 
-    result = runner.invoke(app, ["doctor", "restore", str(backup_path), "--yes"])
+    async def _snapshot(*_args: Any, **_kwargs: Any) -> Path:
+        return tmp_path / "pre-restore-snapshot"
+
+    async def _partial_restore(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "database_restored": False,
+            "bundles_restored": [],
+            "errors": ["bundle for project demo could not be applied"],
+        }
+
+    monkeypatch.setattr(storage_module, "create_diagnostic_backup", _snapshot)
+    monkeypatch.setattr(storage_module, "restore_from_backup", _partial_restore)
+
+    result = _run_cli("doctor", "restore", str(backup), "--yes")
+
     assert result.exit_code == 1
-    assert "Invalid backup manifest" in result.stdout
-    assert "references missing artifact" in result.stdout
+    assert "Restore completed with errors" in result.stdout
+    assert "bundle for project demo could not be applied" in result.stdout
 
 
-def test_doctor_restore_rejects_manifest_directory_artifact(tmp_path):
-    runner = CliRunner()
-    backup_path = tmp_path / "restore-backup"
-    backup_path.mkdir()
-    (backup_path / "payload" / "db-copy.sqlite3").mkdir(parents=True, exist_ok=True)
-    (backup_path / "manifest.json").write_text(
-        json.dumps({
-            "version": 1,
-            "created_at": "2026-04-10T00:00:00+00:00",
-            "reason": "dir-db",
-            "database_path": "payload/db-copy.sqlite3",
-            "project_bundles": [],
-            "storage_root": "/tmp/archive",
-            "restore_instructions": "test",
-        }),
-        encoding="utf-8",
+# ---------- doctor restore: --dry-run ----------
+
+
+def test_doctor_restore_dry_run_previews_without_snapshotting_or_confirming(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A preview must write nothing -- including the snapshot that precedes a write.
+
+    ``--yes`` is deliberately absent: a preview that stopped to ask for
+    confirmation would hang a non-interactive caller, so the run completing at
+    all is part of what is being asserted.
+    """
+    backup = _write_backup_dir(tmp_path / "backup")
+    dry_run_flags: list[bool] = []
+
+    async def _preview(_settings: Any, _path: Path, *, dry_run: bool) -> dict[str, Any]:
+        dry_run_flags.append(dry_run)
+        return {
+            "database_restored": False,
+            "bundles_restored": [],
+            "errors": [],
+            "would_restore_database": True,
+            "would_restore_bundles": [],
+        }
+
+    monkeypatch.setattr(
+        storage_module,
+        "create_diagnostic_backup",
+        _must_not_be_called("create_diagnostic_backup"),
     )
+    monkeypatch.setattr(storage_module, "restore_from_backup", _preview)
 
-    result = runner.invoke(app, ["doctor", "restore", str(backup_path), "--yes"])
+    result = _run_cli("doctor", "restore", str(backup), "--dry-run")
+
+    assert result.exit_code == 0, result.output
+    assert dry_run_flags == [True]
+    assert "Would restore" in result.stdout
+
+
+def test_doctor_restore_dry_run_fails_when_the_target_cannot_take_the_payload(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A preview that finds blockers must exit non-zero and name them.
+
+    Nothing is stubbed here on purpose: the real ``restore_from_backup`` decides
+    that a manifest carrying a database payload cannot be applied to a
+    non-SQLite target, and a preview that reported the blocker while exiting 0
+    would be read by any script as permission to proceed.
+    """
+    backup = _write_backup_dir(tmp_path / "backup", reason="postgres-target")
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql+asyncpg://agent:mail@localhost:5432/mcp"
+    )
+    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "storage"))
+    clear_settings_cache()
+
+    result = _run_cli("doctor", "restore", str(backup), "--dry-run")
+
     assert result.exit_code == 1
-    assert "Invalid backup manifest" in result.stdout
-    assert "artifact is not a file" in result.stdout
+    assert "Dry run found restore blockers" in result.stdout
+    assert "does not use a SQLite database file" in result.stdout

@@ -1,1521 +1,1145 @@
-"""P1 Core Tests: Contact Management Flow.
+"""The contact-permission surface, end to end.
 
-Complete test of contact request/approval workflow.
+Four tools decide whether one agent may put a message in another's inbox:
+``request_contact`` opens a directed, expiring approval request, ``respond_contact``
+answers it, ``set_contact_policy`` sets the recipient's standing rule, and
+``list_contacts`` reports the state a sender can act on. ``macro_contact_handshake``
+composes the first two.
 
-Test Cases:
-1. Request contact from Agent A to Agent B
-2. Agent B receives contact request in inbox
-3. Agent B approves contact
-4. Agent A can now message Agent B
-5. Agent B denies contact
-6. Denied agent cannot message
-7. Contact policy: open (anyone can message)
-8. Contact policy: contacts_only (approved only)
-9. Contact policy: block_all (nobody)
-10. Contact expiration after TTL
-11. Cross-project contacts
+The properties worth guarding here are mostly *negative*, because every one of them
+is a way to hand out a permission nobody granted:
 
-Verification:
-- AgentLink records created with correct status
-- Policy enforcement blocks/allows messages
+* a repeated request must never shorten an active window, and must never downgrade
+  an approval back to pending;
+* a repeated request must never mint a second notification for a request that is
+  still outstanding -- but must notify again once the old one has lapsed;
+* a transient publish failure must leave one recoverable delivery intent, not two;
+* denial must clear the expiry so no clock can resurrect it;
+* an expired approval must stop reading as messageable;
+* ``block_all`` must refuse the contact request itself, not only later traffic.
 
-Reference: mcp_agent_mail-njf
+Where a send is used to prove that permission was granted or withheld, it passes
+``auto_contact_if_blocked=False``. The server's default is to auto-handshake on a
+blocked send, which in a single MCP session that holds both identities silently
+approves the link -- so a send that succeeds with the default on proves nothing
+about the approval under test.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 from fastmcp import Client
-from sqlalchemy import text
+from fastmcp.exceptions import ToolError
+from sqlalchemy import select as _sa_select
+from sqlalchemy.orm import aliased
 
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import get_session
-
-CONTACT_FLOW_AGENT_ONE = "codex-wsl-contact-flow-1"
-CONTACT_FLOW_AGENT_TWO = "codex-wsl-contact-flow-2"
-CONTACT_FLOW_SELF_REQUEST = "codex-wsl-contact-flow-3"
-CONTACT_FLOW_SELF_RESPONSE = "codex-wsl-contact-flow-4"
-CONTACT_FLOW_LIST_CROSS_ONE = "codex-wsl-contact-flow-5"
-CONTACT_FLOW_LIST_CROSS_TWO = "codex-wsl-contact-flow-6"
-CONTACT_FLOW_CROSS_ONE = "codex-wsl-contact-flow-7"
-CONTACT_FLOW_CROSS_TWO = "codex-wsl-contact-flow-8"
-CONTACT_FLOW_POLICY = "codex-wsl-contact-flow-9"
-
-# ============================================================================
-# Helper: Direct SQL verification
-# ============================================================================
+from mcp_agent_mail.models import Agent, AgentLink, MessageDelivery, Project
 
 
-async def get_agent_link_from_db(a_agent_id: int, b_agent_id: int) -> dict | None:
-    """Get agent link details from database."""
+def select(*entities: Any, **kwargs: Any) -> Any:
+    """Keep SQLModel descriptor typing out of behaviour tests.
+
+    Matches the shim already used in app.py, cli.py and test_agent_rename.py:
+    `ty` cannot match SQLAlchemy's select/join overloads against SQLModel
+    descriptors, so a column select or an ON clause reads as a plain bool and
+    the gate fails on code that is correct. Widening here beats scattering
+    ignores or rephrasing working queries to please a checker.
+    """
+    return _sa_select(*entities, **kwargs)
+
+SENDER = "claude-wsl-contactspec-1"
+RECEIVER = "claude-wsl-contactspec-2"
+SOLO = "claude-wsl-contactspec-3"
+NEAR = "claude-wsl-contactspec-4"
+FAR = "claude-wsl-contactspec-5"
+
+HOME = "/spec/contact/home"
+AWAY = "/spec/contact/away"
+
+
+# --------------------------------------------------------------------------
+# fixtures and database probes
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def mail(isolated_env):
+    """One in-process MCP client against a server with a private database."""
+    async with Client(build_mcp_server()) as client:
+        yield client
+
+
+async def register(client, project_key: str, name: str) -> str:
+    """Create the project if needed, register *name* in it, return its real name."""
+    await client.call_tool("ensure_project", {"human_key": project_key})
+    registered = await client.call_tool(
+        "register_agent",
+        {
+            "project_key": project_key,
+            "program": "test",
+            "model": "test",
+            "name": name,
+        },
+    )
+    return registered.data["name"]
+
+
+@pytest.fixture
+async def duo(mail):
+    """A sender and a receiver sharing one project."""
+    return (
+        await register(mail, HOME, SENDER),
+        await register(mail, HOME, RECEIVER),
+    )
+
+
+def rows(result) -> list[dict]:
+    """Rows returned by a list-shaped tool call."""
+    payload = result.structured_content
+    if isinstance(payload, dict):
+        payload = payload.get("result")
+    return [row for row in (payload or []) if isinstance(row, dict)]
+
+
+def subjects(result) -> list[str]:
+    """Every subject in an inbox listing, duplicates preserved."""
+    return [str(row.get("subject", "")) for row in rows(result)]
+
+
+async def read_inbox(client, project_key: str, agent_name: str):
+    return await client.call_tool(
+        "fetch_inbox",
+        {
+            "project_key": project_key,
+            "agent_name": agent_name,
+            "include_bodies": True,
+        },
+    )
+
+
+async def agent_pk(project_key: str, agent_name: str) -> int | None:
     async with get_session() as session:
-        result = await session.execute(
-            text(
-                "SELECT id, a_project_id, a_agent_id, b_project_id, b_agent_id, "
-                "status, created_ts, updated_ts, expires_ts "
-                "FROM agent_links "
-                "WHERE a_agent_id = :a AND b_agent_id = :b"
-            ),
-            {"a": a_agent_id, "b": b_agent_id},
+        found = await session.execute(
+            select(Agent.id)
+            .join(Project, Project.id == Agent.project_id)
+            .where(Project.human_key == project_key, Agent.name == agent_name)
         )
-        row = result.first()
-        if row is None:
+        return found.scalars().first()
+
+
+async def policy_of(project_key: str, agent_name: str) -> str | None:
+    async with get_session() as session:
+        found = await session.execute(
+            select(Agent.contact_policy)
+            .join(Project, Project.id == Agent.project_id)
+            .where(Project.human_key == project_key, Agent.name == agent_name)
+        )
+        return found.scalars().first()
+
+
+def _link_query(
+    home: str,
+    requester: str,
+    target: str,
+    away: str | None,
+):
+    side_a = aliased(Agent)
+    side_a_project = aliased(Project)
+    side_b = aliased(Agent)
+    side_b_project = aliased(Project)
+    return (
+        select(AgentLink)
+        .join(side_a_project, side_a_project.id == AgentLink.a_project_id)
+        .join(side_a, side_a.id == AgentLink.a_agent_id)
+        .join(side_b_project, side_b_project.id == AgentLink.b_project_id)
+        .join(side_b, side_b.id == AgentLink.b_agent_id)
+        .where(
+            side_a_project.human_key == home,
+            side_a.name == requester,
+            side_b_project.human_key == (away or home),
+            side_b.name == target,
+        )
+    )
+
+
+async def stored_link(
+    home: str,
+    requester: str,
+    target: str,
+    away: str | None = None,
+) -> dict | None:
+    """The persisted directed link as plain values, or None when absent.
+
+    Timestamps come back as the naive-UTC datetimes the column stores, so a test
+    can compare two of them without reparsing anything.
+    """
+    async with get_session() as session:
+        found = await session.execute(
+            _link_query(home, requester, target, away)
+        )
+        link = found.scalars().first()
+        if link is None:
             return None
         return {
-            "id": row[0],
-            "a_project_id": row[1],
-            "a_agent_id": row[2],
-            "b_project_id": row[3],
-            "b_agent_id": row[4],
-            "status": row[5],
-            "created_ts": row[6],
-            "updated_ts": row[7],
-            "expires_ts": row[8],
+            "id": link.id,
+            "status": link.status,
+            "reason": link.reason,
+            "created_ts": link.created_ts,
+            "updated_ts": link.updated_ts,
+            "expires_ts": link.expires_ts,
         }
 
 
-async def get_agent_policy(project_id: int, agent_name: str) -> str | None:
-    """Get agent's contact policy from database."""
-    async with get_session() as session:
-        result = await session.execute(
-            text(
-                "SELECT contact_policy FROM agents "
-                "WHERE project_id = :pid AND name = :name"
-            ),
-            {"pid": project_id, "name": agent_name},
-        )
-        row = result.first()
-        return row[0] if row else None
-
-
-async def get_agent_id(project_key: str, agent_name: str) -> int | None:
-    """Get agent ID from project_key and name."""
-    async with get_session() as session:
-        result = await session.execute(
-            text(
-                "SELECT a.id FROM agents a "
-                "JOIN projects p ON a.project_id = p.id "
-                "WHERE p.human_key = :key AND a.name = :name"
-            ),
-            {"key": project_key, "name": agent_name},
-        )
-        row = result.first()
-        return row[0] if row else None
-
-
-async def get_project_id(human_key: str) -> int | None:
-    """Get project ID from human_key."""
-    async with get_session() as session:
-        result = await session.execute(
-            text("SELECT id FROM projects WHERE human_key = :key"),
-            {"key": human_key},
-        )
-        row = result.first()
-        return row[0] if row else None
-
-
-def _parse_db_datetime(value):
-    dt = value
-    if isinstance(value, str):
-        dt = datetime.fromisoformat(value)
-    if isinstance(dt, datetime) and dt.tzinfo is None:
-        return dt.replace(tzinfo=UTC)
-    return dt
-
-
-async def _expire_contact_link(
-    project_key: str,
-    from_agent: str,
-    to_agent: str,
-    *,
-    target_project_key: str | None = None,
+async def lapse_link(
+    home: str,
+    requester: str,
+    target: str,
+    away: str | None = None,
 ) -> None:
-    target_key = target_project_key or project_key
-    expired_db = (
-        (datetime.now(UTC) - timedelta(minutes=5))
-        .astimezone(UTC)
-        .replace(tzinfo=None)
-        .strftime("%Y-%m-%d %H:%M:%S.%f")
-    )
+    """Push a link's expiry into the past, as a real clock eventually would."""
+    stale = datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=5)
     async with get_session() as session:
-        await session.execute(
-            text(
-                """
-                UPDATE agent_links
-                SET expires_ts = :expired, updated_ts = :expired
-                WHERE a_project_id = (SELECT id FROM projects WHERE human_key = :project_key)
-                  AND a_agent_id = (
-                      SELECT a.id
-                      FROM agents a
-                      JOIN projects p ON p.id = a.project_id
-                      WHERE p.human_key = :project_key AND a.name = :from_agent
-                  )
-                  AND b_project_id = (SELECT id FROM projects WHERE human_key = :target_project_key)
-                  AND b_agent_id = (
-                      SELECT a.id
-                      FROM agents a
-                      JOIN projects p ON p.id = a.project_id
-                      WHERE p.human_key = :target_project_key AND a.name = :to_agent
-                  )
-                """
-            ),
-            {
-                "expired": expired_db,
-                "project_key": project_key,
-                "from_agent": from_agent,
-                "target_project_key": target_key,
-                "to_agent": to_agent,
-            },
+        found = await session.execute(
+            _link_query(home, requester, target, away)
         )
+        link = found.scalars().one()
+        link.expires_ts = stale
+        link.updated_ts = stale
+        session.add(link)
         await session.commit()
 
 
-# ============================================================================
-# Helper: Extract inbox items from FastMCP response
-# ============================================================================
+async def make_delivery_due(delivery_id: str) -> None:
+    """Make a pending delivery eligible for its next publish attempt now."""
+    async with get_session() as session:
+        delivery = await session.get(MessageDelivery, delivery_id)
+        assert delivery is not None, f"no delivery row for {delivery_id}"
+        delivery.next_attempt_ts = datetime.now(UTC).replace(tzinfo=None) - timedelta(
+            seconds=1
+        )
+        session.add(delivery)
+        await session.commit()
 
 
-def get_inbox_items(result) -> list[dict]:
-    """Extract inbox items from a call_tool result as a list of dicts.
-
-    FastMCP returns structured_content['result'] for list data, not directly
-    accessible via .data for inbox items.
-    """
-    if hasattr(result, "structured_content") and result.structured_content:
-        sc = result.structured_content
-        if isinstance(sc, dict) and "result" in sc:
-            return sc["result"]
-        if isinstance(sc, list):
-            return sc
-    # Fall back to result.data if it's a proper list of dicts
-    if hasattr(result, "data") and isinstance(result.data, list):
-        items = []
-        for item in result.data:
-            if isinstance(item, dict):
-                items.append(item)
-            elif hasattr(item, "model_dump"):
-                items.append(item.model_dump())
-            elif hasattr(item, "__dict__") and item.__dict__:
-                items.append(item.__dict__)
-        return items
-    return []
+def parse_iso(value: str) -> datetime:
+    """A tool's ISO timestamp as a naive-UTC datetime, comparable with the column."""
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(UTC).replace(tzinfo=None)
+    return parsed
 
 
-def get_contacts_list(result) -> list[dict]:
-    """Extract contacts list from list_contacts result."""
-    if hasattr(result, "structured_content") and result.structured_content:
-        sc = result.structured_content
-        if isinstance(sc, dict) and "result" in sc and isinstance(sc["result"], list):
-            return [item for item in sc["result"] if isinstance(item, dict)]
-    if hasattr(result, "data"):
-        data = result.data
-        if isinstance(data, dict):
-            return data.get("contacts", [])
-        if isinstance(data, list):
-            items: list[dict] = []
-            for item in data:
-                if isinstance(item, dict):
-                    items.append(item)
-                elif hasattr(item, "model_dump"):
-                    items.append(item.model_dump())
-                elif hasattr(item, "__dict__") and item.__dict__:
-                    items.append(item.__dict__)
-            return items
-    return []
+# --------------------------------------------------------------------------
+# opening a request
+# --------------------------------------------------------------------------
 
 
-# ============================================================================
-# Setup helper
-# ============================================================================
+async def test_request_creates_a_pending_link_and_names_both_ends(mail, duo):
+    sender, receiver = duo
 
-
-async def setup_two_agents(client, project_key: str) -> tuple[str, str]:
-    """Create project and two agents, return (agent_a_name, agent_b_name)."""
-    await client.call_tool("ensure_project", {"human_key": project_key})
-
-    agent_a_result = await client.call_tool(
-        "register_agent",
+    opened = await mail.call_tool(
+        "request_contact",
         {
-            "project_key": project_key,
-            "program": "test",
-            "model": "test",
-            "name": CONTACT_FLOW_AGENT_ONE,
+            "project_key": HOME,
+            "from_agent": sender,
+            "to_agent": receiver,
+            "reason": "pairing on the parser",
+            "ttl_seconds": 3600,
         },
     )
-    agent_a_name = agent_a_result.data["name"]
 
-    agent_b_result = await client.call_tool(
-        "register_agent",
+    assert opened.data["status"] == "pending"
+    assert opened.data["from"] == sender
+    assert opened.data["to"] == receiver
+    assert opened.data["from_project"] == HOME
+    assert opened.data["to_project"] == HOME
+
+    link = await stored_link(HOME, sender, receiver)
+    assert link is not None, "the request must persist a link"
+    assert link["status"] == "pending"
+    assert link["reason"] == "pairing on the parser"
+    assert parse_iso(opened.data["expires_ts"]) == link["expires_ts"]
+
+    # The link is directed: nothing is created in the reverse direction.
+    assert await stored_link(HOME, receiver, sender) is None
+
+
+async def test_request_notifies_the_target_and_demands_an_ack(mail, duo):
+    sender, receiver = duo
+
+    opened = await mail.call_tool(
+        "request_contact",
         {
-            "project_key": project_key,
-            "program": "test",
-            "model": "test",
-            "name": CONTACT_FLOW_AGENT_TWO,
+            "project_key": HOME,
+            "from_agent": sender,
+            "to_agent": receiver,
+            "reason": "need write access to the same branch",
         },
     )
-    agent_b_name = agent_b_result.data["name"]
 
-    return agent_a_name, agent_b_name
+    notification = opened.data["notification_message"]
+    assert notification["delivery"]["status"] == "published"
+    posted = notification["message"]
+    assert posted["subject"] == f"Contact request from {sender}"
+    assert posted["body_md"] == "need write access to the same branch"
+    assert posted["ack_required"] is True
+
+    delivered = await read_inbox(mail, HOME, receiver)
+    assert subjects(delivered) == [f"Contact request from {sender}"]
+
+    # The requester does not notify itself.
+    assert subjects(await read_inbox(mail, HOME, sender)) == []
 
 
-# ============================================================================
-# Test: Contact Request Flow
-# ============================================================================
+async def test_request_without_a_reason_still_explains_itself(mail, duo):
+    sender, receiver = duo
+
+    opened = await mail.call_tool(
+        "request_contact",
+        {"project_key": HOME, "from_agent": sender, "to_agent": receiver},
+    )
+
+    body = opened.data["notification_message"]["message"]["body_md"]
+    assert sender in body and receiver in body
 
 
-@pytest.mark.asyncio
-async def test_request_contact_creates_pending_link(isolated_env):
-    """Request contact creates a pending AgentLink."""
-    server = build_mcp_server()
-    async with Client(server) as client:
-        project_key = "/test/contact/request"
-        agent_a, agent_b = await setup_two_agents(client, project_key)
+async def test_request_window_matches_the_requested_ttl(mail, duo):
+    sender, receiver = duo
+    week = 7 * 24 * 3600
 
-        # Request contact from A to B
-        result = await client.call_tool(
+    before = datetime.now(UTC).replace(tzinfo=None)
+    await mail.call_tool(
+        "request_contact",
+        {
+            "project_key": HOME,
+            "from_agent": sender,
+            "to_agent": receiver,
+            "ttl_seconds": week,
+        },
+    )
+    after = datetime.now(UTC).replace(tzinfo=None)
+
+    link = await stored_link(HOME, sender, receiver)
+    assert link is not None
+    assert link["expires_ts"] is not None
+    assert before + timedelta(seconds=week) <= link["expires_ts"]
+    assert link["expires_ts"] <= after + timedelta(seconds=week)
+
+
+async def test_request_lifts_a_sub_minute_ttl_to_the_one_minute_floor(mail, duo):
+    sender, receiver = duo
+
+    before = datetime.now(UTC).replace(tzinfo=None)
+    await mail.call_tool(
+        "request_contact",
+        {
+            "project_key": HOME,
+            "from_agent": sender,
+            "to_agent": receiver,
+            "ttl_seconds": 1,
+        },
+    )
+
+    link = await stored_link(HOME, sender, receiver)
+    assert link is not None
+    assert link["expires_ts"] is not None
+    assert link["expires_ts"] >= before + timedelta(seconds=60)
+
+
+# --------------------------------------------------------------------------
+# self-contact
+# --------------------------------------------------------------------------
+
+
+async def test_request_refuses_self_contact_and_writes_nothing(mail):
+    solo = await register(mail, HOME, SOLO)
+
+    with pytest.raises(ToolError, match="self-contact"):
+        await mail.call_tool(
             "request_contact",
+            {"project_key": HOME, "from_agent": solo, "to_agent": solo},
+        )
+
+    assert await agent_pk(HOME, solo) is not None, "the agent itself must survive"
+    assert await stored_link(HOME, solo, solo) is None
+    assert subjects(await read_inbox(mail, HOME, solo)) == []
+
+
+async def test_respond_refuses_self_contact_and_writes_nothing(mail):
+    solo = await register(mail, HOME, SOLO)
+
+    with pytest.raises(ToolError, match="self-contact"):
+        await mail.call_tool(
+            "respond_contact",
             {
-                "project_key": project_key,
-                "from_agent": agent_a,
-                "to_agent": agent_b,
-                "reason": "Testing contact request",
-                "ttl_seconds": 3600,
+                "project_key": HOME,
+                "to_agent": solo,
+                "from_agent": solo,
+                "accept": True,
             },
         )
 
-        # Verify response
-        assert result.data["status"] == "pending"
-
-        # Verify database record
-        agent_a_id = await get_agent_id(project_key, agent_a)
-        agent_b_id = await get_agent_id(project_key, agent_b)
-        assert agent_a_id is not None, "Agent A should exist"
-        assert agent_b_id is not None, "Agent B should exist"
-        link = await get_agent_link_from_db(agent_a_id, agent_b_id)
-        assert link is not None
-        assert link["status"] == "pending"
+    assert await agent_pk(HOME, solo) is not None
+    assert await stored_link(HOME, solo, solo) is None
 
 
-@pytest.mark.asyncio
-async def test_request_contact_rejects_same_agent_same_project(isolated_env):
-    """Self-contact in the same project should be rejected as unnecessary."""
-    server = build_mcp_server()
-    async with Client(server) as client:
-        project_key = "/test/contact/self-request"
-        await client.call_tool("ensure_project", {"human_key": project_key})
-        await client.call_tool(
-            "register_agent",
-            {
-                "project_key": project_key,
-                "program": "test",
-                "model": "test",
-                "name": CONTACT_FLOW_SELF_REQUEST,
-            },
-        )
-
-        with pytest.raises(Exception, match="self-contact"):
-            await client.call_tool(
-                "request_contact",
-                {
-                    "project_key": project_key,
-                    "from_agent": CONTACT_FLOW_SELF_REQUEST,
-                    "to_agent": CONTACT_FLOW_SELF_REQUEST,
-                },
-            )
-
-        agent_id = await get_agent_id(project_key, CONTACT_FLOW_SELF_REQUEST)
-        assert agent_id is not None
-        assert await get_agent_link_from_db(agent_id, agent_id) is None
-
-        inbox = await client.call_tool(
-            "fetch_inbox",
-            {
-                "project_key": project_key,
-                "agent_name": CONTACT_FLOW_SELF_REQUEST,
-                "include_bodies": True,
-            },
-        )
-        assert get_inbox_items(inbox) == []
+# --------------------------------------------------------------------------
+# repeating a request
+# --------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_contact_request_appears_in_inbox(isolated_env):
-    """Contact request sends a message to recipient's inbox."""
-    server = build_mcp_server()
-    async with Client(server) as client:
-        project_key = "/test/contact/inbox"
-        agent_a, agent_b = await setup_two_agents(client, project_key)
+async def test_repeat_request_never_shortens_an_open_window(mail, duo):
+    sender, receiver = duo
 
-        # Request contact
-        await client.call_tool(
-            "request_contact",
-            {
-                "project_key": project_key,
-                "from_agent": agent_a,
-                "to_agent": agent_b,
-                "reason": "Testing inbox notification",
-            },
-        )
+    first = await mail.call_tool(
+        "request_contact",
+        {
+            "project_key": HOME,
+            "from_agent": sender,
+            "to_agent": receiver,
+            "ttl_seconds": 3600,
+        },
+    )
+    opened = await stored_link(HOME, sender, receiver)
+    assert opened is not None and opened["expires_ts"] is not None
 
-        # Check agent B's inbox
-        inbox_result = await client.call_tool(
-            "fetch_inbox",
-            {
-                "project_key": project_key,
-                "agent_name": agent_b,
-                "include_bodies": True,
-            },
-        )
+    second = await mail.call_tool(
+        "request_contact",
+        {
+            "project_key": HOME,
+            "from_agent": sender,
+            "to_agent": receiver,
+            "ttl_seconds": 60,
+        },
+    )
 
-        # Should have a contact request message
-        items = get_inbox_items(inbox_result)
-        assert len(items) > 0, "Inbox should have messages"
-        # The message should mention contact request
-        has_contact_msg = any(
-            "contact" in msg.get("subject", "").lower()
-            or "contact" in msg.get("body_md", "").lower()
-            for msg in items
-        )
-        assert has_contact_msg, "Should have contact request in inbox"
+    assert first.data["status"] == "pending"
+    assert second.data["status"] == "pending"
+    assert parse_iso(second.data["expires_ts"]) >= parse_iso(first.data["expires_ts"])
+
+    still_open = await stored_link(HOME, sender, receiver)
+    assert still_open is not None
+    assert still_open["id"] == opened["id"], "the same link must be reused"
+    assert still_open["status"] == "pending"
+    assert still_open["expires_ts"] == opened["expires_ts"]
 
 
-@pytest.mark.asyncio
-async def test_request_contact_retries_pending_atomic_notification(
-    isolated_env,
-    monkeypatch,
+async def test_repeat_request_does_not_mint_a_second_notification(mail, duo):
+    sender, receiver = duo
+    payload = {"project_key": HOME, "from_agent": sender, "to_agent": receiver}
+
+    await mail.call_tool("request_contact", payload)
+    repeated = await mail.call_tool("request_contact", payload)
+
+    assert "notification_message" not in repeated.data
+    assert subjects(await read_inbox(mail, HOME, receiver)) == [
+        f"Contact request from {sender}"
+    ]
+
+
+async def test_request_notifies_again_once_the_window_has_lapsed(mail, duo):
+    sender, receiver = duo
+
+    await mail.call_tool(
+        "request_contact",
+        {
+            "project_key": HOME,
+            "from_agent": sender,
+            "to_agent": receiver,
+            "ttl_seconds": 60,
+        },
+    )
+    await lapse_link(HOME, sender, receiver)
+
+    renewed = await mail.call_tool(
+        "request_contact",
+        {
+            "project_key": HOME,
+            "from_agent": sender,
+            "to_agent": receiver,
+            "ttl_seconds": 3600,
+        },
+    )
+
+    assert renewed.data["status"] == "pending"
+    assert (
+        renewed.data["notification_message"]["message"]["subject"]
+        == f"Contact request from {sender}"
+    )
+    assert subjects(await read_inbox(mail, HOME, receiver)) == [
+        f"Contact request from {sender}",
+        f"Contact request from {sender}",
+    ]
+
+    revived = await stored_link(HOME, sender, receiver)
+    assert revived is not None
+    assert revived["status"] == "pending"
+    assert revived["expires_ts"] is not None
+    assert revived["expires_ts"] > datetime.now(UTC).replace(tzinfo=None)
+
+
+async def test_repeat_request_leaves_a_live_approval_approved(mail, duo):
+    sender, receiver = duo
+
+    await mail.call_tool(
+        "request_contact",
+        {"project_key": HOME, "from_agent": sender, "to_agent": receiver},
+    )
+    await mail.call_tool(
+        "respond_contact",
+        {
+            "project_key": HOME,
+            "to_agent": receiver,
+            "from_agent": sender,
+            "accept": True,
+        },
+    )
+    approved = await stored_link(HOME, sender, receiver)
+    assert approved is not None and approved["expires_ts"] is not None
+
+    repeated = await mail.call_tool(
+        "request_contact",
+        {
+            "project_key": HOME,
+            "from_agent": sender,
+            "to_agent": receiver,
+            "reason": "asking again by mistake",
+            "ttl_seconds": 60,
+        },
+    )
+
+    assert repeated.data["status"] == "approved", "a request must not undo an approval"
+    assert repeated.data["expires_ts"] is not None
+    assert "notification_message" not in repeated.data
+
+    unchanged = await stored_link(HOME, sender, receiver)
+    assert unchanged is not None
+    assert unchanged["status"] == "approved"
+    assert unchanged["expires_ts"] == approved["expires_ts"]
+
+    assert subjects(await read_inbox(mail, HOME, receiver)) == [
+        f"Contact request from {sender}"
+    ]
+
+
+# --------------------------------------------------------------------------
+# the notification is a durable intent, not a side effect
+# --------------------------------------------------------------------------
+
+
+async def test_a_stalled_notification_is_resumed_rather_than_duplicated(
+    mail, duo, monkeypatch
 ):
-    """A repeated pending request recovers the same durable notification intent."""
-    import mcp_agent_mail.delivery as delivery_service
+    """A publish that fails transiently leaves exactly one recoverable intent.
+
+    The intro message is keyed on the link's identity and its immutable pending
+    timestamp, so the retry that a caller naturally makes -- asking again --
+    finishes the delivery already on record instead of queueing a second one.
+    """
+    from mcp_agent_mail import delivery as delivery_module
     from mcp_agent_mail.storage import MessageDeliveryPendingError
 
-    server = build_mcp_server()
-    async with Client(server) as client:
-        project_key = "/test/contact/request-notify-retry"
-        agent_a, agent_b = await setup_two_agents(client, project_key)
-        original_publisher = delivery_service.publish_message_delivery
+    sender, receiver = duo
+    real_publisher = delivery_module.publish_message_delivery
+    subject = f"Contact request from {sender}"
 
-        async def transient_publisher(_archive, delivery_id, *_args, **_kwargs):
-            raise MessageDeliveryPendingError(delivery_id, "injected transient failure")
+    async def stalls(archive, delivery_id, *args, **kwargs):
+        raise MessageDeliveryPendingError(delivery_id, "storage briefly unavailable")
 
-        monkeypatch.setattr(
-            delivery_service,
-            "publish_message_delivery",
-            transient_publisher,
-        )
+    monkeypatch.setattr(delivery_module, "publish_message_delivery", stalls)
 
-        first = await client.call_tool(
+    stalled = await mail.call_tool(
+        "request_contact",
+        {
+            "project_key": HOME,
+            "from_agent": sender,
+            "to_agent": receiver,
+            "reason": "first attempt cannot publish",
+        },
+    )
+
+    assert stalled.data["status"] == "pending"
+    stalled_delivery = stalled.data["notification_message"]["delivery"]
+    assert stalled_delivery["status"] == "pending"
+    assert stalled.data["notification_message"]["message"] is None
+    assert subject not in subjects(await read_inbox(mail, HOME, receiver))
+
+    await make_delivery_due(stalled_delivery["id"])
+    monkeypatch.setattr(delivery_module, "publish_message_delivery", real_publisher)
+
+    resumed = await mail.call_tool(
+        "request_contact",
+        {
+            "project_key": HOME,
+            "from_agent": sender,
+            "to_agent": receiver,
+            "reason": "second attempt after storage recovered",
+        },
+    )
+
+    resumed_notification = resumed.data["notification_message"]
+    assert resumed.data["status"] == "pending"
+    assert resumed_notification["delivery"]["id"] == stalled_delivery["id"]
+    assert resumed_notification["delivery"]["status"] == "published"
+    assert resumed_notification["message"]["subject"] == subject
+    assert subjects(await read_inbox(mail, HOME, receiver)) == [subject]
+
+
+# --------------------------------------------------------------------------
+# answering a request
+# --------------------------------------------------------------------------
+
+
+async def test_acceptance_approves_the_link_and_dates_it(mail, duo):
+    sender, receiver = duo
+
+    await mail.call_tool(
+        "request_contact",
+        {"project_key": HOME, "from_agent": sender, "to_agent": receiver},
+    )
+    accepted = await mail.call_tool(
+        "respond_contact",
+        {
+            "project_key": HOME,
+            "to_agent": receiver,
+            "from_agent": sender,
+            "accept": True,
+            "ttl_seconds": 3600,
+        },
+    )
+
+    assert accepted.data["approved"] is True
+    assert accepted.data["updated"] == 1
+    assert accepted.data["from"] == sender
+    assert accepted.data["to"] == receiver
+
+    link = await stored_link(HOME, sender, receiver)
+    assert link is not None
+    assert link["status"] == "approved"
+    assert link["expires_ts"] == parse_iso(accepted.data["expires_ts"])
+
+
+async def test_denial_blocks_the_link_and_drops_its_expiry(mail, duo):
+    sender, receiver = duo
+
+    await mail.call_tool(
+        "request_contact",
+        {
+            "project_key": HOME,
+            "from_agent": sender,
+            "to_agent": receiver,
+            "ttl_seconds": 3600,
+        },
+    )
+    refused = await mail.call_tool(
+        "respond_contact",
+        {
+            "project_key": HOME,
+            "to_agent": receiver,
+            "from_agent": sender,
+            "accept": False,
+        },
+    )
+
+    assert refused.data["approved"] is False
+    assert refused.data["expires_ts"] is None
+
+    link = await stored_link(HOME, sender, receiver)
+    assert link is not None
+    assert link["status"] == "blocked"
+    # A denial that kept an expiry would quietly become an approval-shaped row
+    # the moment some later code read "not expired" as "still fine".
+    assert link["expires_ts"] is None
+
+
+async def test_repeat_acceptance_never_shortens_a_live_approval(mail, duo):
+    sender, receiver = duo
+
+    await mail.call_tool(
+        "request_contact",
+        {"project_key": HOME, "from_agent": sender, "to_agent": receiver},
+    )
+    first = await mail.call_tool(
+        "respond_contact",
+        {
+            "project_key": HOME,
+            "to_agent": receiver,
+            "from_agent": sender,
+            "accept": True,
+            "ttl_seconds": 3600,
+        },
+    )
+    approved = await stored_link(HOME, sender, receiver)
+    assert approved is not None
+
+    second = await mail.call_tool(
+        "respond_contact",
+        {
+            "project_key": HOME,
+            "to_agent": receiver,
+            "from_agent": sender,
+            "accept": True,
+            "ttl_seconds": 60,
+        },
+    )
+
+    assert second.data["approved"] is True
+    assert parse_iso(second.data["expires_ts"]) >= parse_iso(first.data["expires_ts"])
+
+    unchanged = await stored_link(HOME, sender, receiver)
+    assert unchanged is not None
+    assert unchanged["status"] == "approved"
+    assert unchanged["expires_ts"] == approved["expires_ts"]
+
+
+async def test_answering_an_unasked_request_only_writes_on_acceptance(mail, duo):
+    sender, receiver = duo
+
+    refused = await mail.call_tool(
+        "respond_contact",
+        {
+            "project_key": HOME,
+            "to_agent": receiver,
+            "from_agent": sender,
+            "accept": False,
+        },
+    )
+    assert refused.data["updated"] == 0
+    assert await stored_link(HOME, sender, receiver) is None
+
+    granted = await mail.call_tool(
+        "respond_contact",
+        {
+            "project_key": HOME,
+            "to_agent": receiver,
+            "from_agent": sender,
+            "accept": True,
+        },
+    )
+    assert granted.data["updated"] == 1
+    link = await stored_link(HOME, sender, receiver)
+    assert link is not None
+    assert link["status"] == "approved"
+
+
+# --------------------------------------------------------------------------
+# what the permission actually buys
+# --------------------------------------------------------------------------
+
+
+async def send(client, project_key, sender, receiver, key, *, auto_contact=False):
+    return await client.call_tool(
+        "send_message",
+        {
+            "project_key": project_key,
+            "sender_name": sender,
+            "to": [receiver],
+            "subject": f"probe {key}",
+            "body_md": "probe body",
+            "idempotency_key": key,
+            "auto_contact_if_blocked": auto_contact,
+        },
+    )
+
+
+async def test_approval_is_what_lets_the_message_through(mail, duo):
+    sender, receiver = duo
+    await mail.call_tool(
+        "set_contact_policy",
+        {"project_key": HOME, "agent_name": receiver, "policy": "contacts_only"},
+    )
+
+    # Before approval, with the auto-handshake rescue switched off.
+    with pytest.raises(ToolError, match="Contact approval required"):
+        await send(mail, HOME, sender, receiver, "contactspec-before")
+
+    await mail.call_tool(
+        "request_contact",
+        {"project_key": HOME, "from_agent": sender, "to_agent": receiver},
+    )
+    await mail.call_tool(
+        "respond_contact",
+        {
+            "project_key": HOME,
+            "to_agent": receiver,
+            "from_agent": sender,
+            "accept": True,
+        },
+    )
+
+    delivered = await send(mail, HOME, sender, receiver, "contactspec-after")
+    assert delivered.data["count"] == 1
+    assert delivered.data["deliveries"][0]["message"]["subject"] == "probe contactspec-after"
+    assert "probe contactspec-after" in subjects(await read_inbox(mail, HOME, receiver))
+
+
+async def test_a_denied_sender_stays_out(mail, duo):
+    sender, receiver = duo
+    await mail.call_tool(
+        "set_contact_policy",
+        {"project_key": HOME, "agent_name": receiver, "policy": "contacts_only"},
+    )
+    await mail.call_tool(
+        "request_contact",
+        {"project_key": HOME, "from_agent": sender, "to_agent": receiver},
+    )
+    await mail.call_tool(
+        "respond_contact",
+        {
+            "project_key": HOME,
+            "to_agent": receiver,
+            "from_agent": sender,
+            "accept": False,
+        },
+    )
+
+    with pytest.raises(ToolError) as refused:
+        await send(mail, HOME, sender, receiver, "contactspec-denied")
+    assert "Contact approval required" in str(refused.value)
+    assert receiver in str(refused.value)
+
+    assert "probe contactspec-denied" not in subjects(
+        await read_inbox(mail, HOME, receiver)
+    )
+
+
+async def test_an_expired_approval_stops_letting_messages_through(mail, duo):
+    sender, receiver = duo
+    await mail.call_tool(
+        "set_contact_policy",
+        {"project_key": HOME, "agent_name": receiver, "policy": "contacts_only"},
+    )
+    await mail.call_tool(
+        "request_contact",
+        {"project_key": HOME, "from_agent": sender, "to_agent": receiver},
+    )
+    await mail.call_tool(
+        "respond_contact",
+        {
+            "project_key": HOME,
+            "to_agent": receiver,
+            "from_agent": sender,
+            "accept": True,
+        },
+    )
+    await lapse_link(HOME, sender, receiver)
+
+    with pytest.raises(ToolError, match="Contact approval required"):
+        await send(mail, HOME, sender, receiver, "contactspec-lapsed")
+
+
+async def test_open_policy_takes_messages_from_a_stranger(mail, duo):
+    sender, receiver = duo
+
+    set_open = await mail.call_tool(
+        "set_contact_policy",
+        {"project_key": HOME, "agent_name": receiver, "policy": "open"},
+    )
+    assert set_open.data == {"agent": receiver, "policy": "open"}
+    assert await policy_of(HOME, receiver) == "open"
+
+    delivered = await send(mail, HOME, sender, receiver, "contactspec-open")
+    assert delivered.data["count"] == 1
+    assert "probe contactspec-open" in subjects(await read_inbox(mail, HOME, receiver))
+    assert await stored_link(HOME, sender, receiver) is None, (
+        "an open recipient needs no contact link at all"
+    )
+
+
+async def test_block_all_refuses_the_request_itself_not_only_the_traffic(mail, duo):
+    sender, receiver = duo
+    await mail.call_tool(
+        "set_contact_policy",
+        {"project_key": HOME, "agent_name": receiver, "policy": "block_all"},
+    )
+    assert await policy_of(HOME, receiver) == "block_all"
+
+    with pytest.raises(ToolError, match="not accepting messages"):
+        await mail.call_tool(
             "request_contact",
-            {
-                "project_key": project_key,
-                "from_agent": agent_a,
-                "to_agent": agent_b,
-                "reason": "Initial delivery blocked",
-            },
-        )
-        assert first.data["status"] == "pending"
-        first_notification = first.data.get("notification_message") or {}
-        first_delivery = first_notification["delivery"]
-        assert first_delivery["status"] == "pending"
-        assert first_notification["message"] is None
-
-        inbox_before = await client.call_tool(
-            "fetch_inbox",
-            {
-                "project_key": project_key,
-                "agent_name": agent_b,
-                "include_bodies": True,
-            },
-        )
-        items_before = get_inbox_items(inbox_before)
-        assert not any(item.get("subject") == f"Contact request from {agent_a}" for item in items_before)
-
-        async with get_session() as session:
-            await session.execute(
-                text(
-                    "UPDATE message_deliveries "
-                    "SET next_attempt_ts = :due "
-                    "WHERE id = :delivery_id"
-                ),
-                {
-                    "due": (datetime.now(UTC) - timedelta(seconds=1)).replace(
-                        tzinfo=None
-                    ),
-                    "delivery_id": first_delivery["id"],
-                },
-            )
-            await session.commit()
-        monkeypatch.setattr(
-            delivery_service,
-            "publish_message_delivery",
-            original_publisher,
+            {"project_key": HOME, "from_agent": sender, "to_agent": receiver},
         )
 
-        second = await client.call_tool(
-            "request_contact",
-            {
-                "project_key": project_key,
-                "from_agent": agent_a,
-                "to_agent": agent_b,
-                "reason": "Retry after delivery failure",
-            },
-        )
-        assert second.data["status"] == "pending"
-        notification_message = second.data.get("notification_message") or {}
-        assert notification_message["delivery"]["id"] == first_delivery["id"]
-        assert notification_message["delivery"]["status"] == "published"
-        assert notification_message["message"]["subject"] == f"Contact request from {agent_a}"
+    with pytest.raises(ToolError, match="not accepting messages"):
+        await send(mail, HOME, sender, receiver, "contactspec-blockall")
 
-        inbox_after = await client.call_tool(
-            "fetch_inbox",
-            {
-                "project_key": project_key,
-                "agent_name": agent_b,
-                "include_bodies": True,
-            },
-        )
-        items_after = get_inbox_items(inbox_after)
-        assert any(item.get("subject") == f"Contact request from {agent_a}" for item in items_after)
+    assert subjects(await read_inbox(mail, HOME, receiver)) == []
 
 
-@pytest.mark.asyncio
-async def test_request_contact_preserves_existing_pending_link(isolated_env):
-    """Re-requesting an active pending contact should not shorten its pending TTL."""
-    server = build_mcp_server()
-    async with Client(server) as client:
-        project_key = "/test/contact/re-request-pending"
-        agent_a, agent_b = await setup_two_agents(client, project_key)
+async def test_contact_policy_persists_and_can_be_replaced(mail):
+    lone = await register(mail, HOME, SOLO)
 
-        first = await client.call_tool(
-            "request_contact",
-            {
-                "project_key": project_key,
-                "from_agent": agent_a,
-                "to_agent": agent_b,
-                "ttl_seconds": 3600,
-            },
-        )
-        assert first.data["status"] == "pending"
-
-        agent_a_id = await get_agent_id(project_key, agent_a)
-        agent_b_id = await get_agent_id(project_key, agent_b)
-        assert agent_a_id is not None
-        assert agent_b_id is not None
-        first_link = await get_agent_link_from_db(agent_a_id, agent_b_id)
-        assert first_link is not None
-        first_expires = _parse_db_datetime(first_link["expires_ts"])
-
-        second = await client.call_tool(
-            "request_contact",
-            {
-                "project_key": project_key,
-                "from_agent": agent_a,
-                "to_agent": agent_b,
-                "ttl_seconds": 60,
-            },
-        )
-
-        second_link = await get_agent_link_from_db(agent_a_id, agent_b_id)
-        assert second_link is not None
-        second_expires = _parse_db_datetime(second_link["expires_ts"])
-        assert second.data["status"] == "pending"
-        assert datetime.fromisoformat(second.data["expires_ts"]) >= first_expires
-        assert second_link["status"] == "pending"
-        assert second_expires >= first_expires
-
-        inbox = await client.call_tool(
-            "fetch_inbox",
-            {
-                "project_key": project_key,
-                "agent_name": agent_b,
-                "include_bodies": True,
-            },
-        )
-        pending_requests = [
-            item for item in get_inbox_items(inbox) if item.get("subject") == f"Contact request from {agent_a}"
-        ]
-        assert len(pending_requests) == 1
-
-
-@pytest.mark.asyncio
-async def test_request_contact_renotifies_after_pending_link_expires(isolated_env):
-    """Retrying after a pending request expires should send a fresh notification."""
-    server = build_mcp_server()
-    async with Client(server) as client:
-        project_key = "/test/contact/re-request-expired-pending"
-        agent_a, agent_b = await setup_two_agents(client, project_key)
-
-        first = await client.call_tool(
-            "request_contact",
-            {
-                "project_key": project_key,
-                "from_agent": agent_a,
-                "to_agent": agent_b,
-                "ttl_seconds": 60,
-            },
-        )
-        assert first.data["status"] == "pending"
-        await _expire_contact_link(project_key, agent_a, agent_b)
-
-        second = await client.call_tool(
-            "request_contact",
-            {
-                "project_key": project_key,
-                "from_agent": agent_a,
-                "to_agent": agent_b,
-                "ttl_seconds": 3600,
-            },
-        )
-        assert second.data["status"] == "pending"
-        notification_message = second.data.get("notification_message") or {}
-        assert notification_message["message"]["subject"] == f"Contact request from {agent_a}"
-
-        inbox = await client.call_tool(
-            "fetch_inbox",
-            {
-                "project_key": project_key,
-                "agent_name": agent_b,
-                "include_bodies": True,
-            },
-        )
-        pending_requests = [
-            item for item in get_inbox_items(inbox) if item.get("subject") == f"Contact request from {agent_a}"
-        ]
-        assert len(pending_requests) == 2
-
-
-# ============================================================================
-# Test: Contact Approval
-# ============================================================================
-
-
-@pytest.mark.asyncio
-async def test_approve_contact_request(isolated_env):
-    """Approving a contact request creates approved link."""
-    server = build_mcp_server()
-    async with Client(server) as client:
-        project_key = "/test/contact/approve"
-        agent_a, agent_b = await setup_two_agents(client, project_key)
-
-        # Request contact
-        await client.call_tool(
-            "request_contact",
-            {
-                "project_key": project_key,
-                "from_agent": agent_a,
-                "to_agent": agent_b,
-            },
-        )
-
-        # Approve contact
-        approve_result = await client.call_tool(
-            "respond_contact",
-            {
-                "project_key": project_key,
-                "to_agent": agent_b,
-                "from_agent": agent_a,
-                "accept": True,
-            },
-        )
-
-        # Verify approval
-        assert approve_result.data["approved"] is True
-
-        # Verify database shows approved
-        agent_a_id = await get_agent_id(project_key, agent_a)
-        agent_b_id = await get_agent_id(project_key, agent_b)
-        assert agent_a_id is not None, "Agent A should exist"
-        assert agent_b_id is not None, "Agent B should exist"
-        link = await get_agent_link_from_db(agent_a_id, agent_b_id)
-        assert link is not None
-        assert link["status"] == "approved"
-
-
-@pytest.mark.asyncio
-async def test_request_contact_preserves_existing_approved_link(isolated_env):
-    """Re-requesting an already approved contact should not downgrade it back to pending."""
-    server = build_mcp_server()
-    async with Client(server) as client:
-        project_key = "/test/contact/re-request-approved"
-        agent_a, agent_b = await setup_two_agents(client, project_key)
-
-        await client.call_tool(
-            "request_contact",
-            {
-                "project_key": project_key,
-                "from_agent": agent_a,
-                "to_agent": agent_b,
-                "reason": "Initial request",
-            },
-        )
-        await client.call_tool(
-            "respond_contact",
-            {
-                "project_key": project_key,
-                "to_agent": agent_b,
-                "from_agent": agent_a,
-                "accept": True,
-            },
-        )
-        agent_a_id = await get_agent_id(project_key, agent_a)
-        agent_b_id = await get_agent_id(project_key, agent_b)
-        assert agent_a_id is not None
-        assert agent_b_id is not None
-        approved_link = await get_agent_link_from_db(agent_a_id, agent_b_id)
-        assert approved_link is not None
-        approved_expires = approved_link["expires_ts"]
-        assert approved_expires is not None
-
-        second = await client.call_tool(
-            "request_contact",
-            {
-                "project_key": project_key,
-                "from_agent": agent_a,
-                "to_agent": agent_b,
-                "reason": "Still approved",
-            },
-        )
-        assert second.data["status"] == "approved"
-        assert "notification_message" not in second.data
-        assert second.data["expires_ts"] is not None
-        link = await get_agent_link_from_db(agent_a_id, agent_b_id)
-        assert link is not None
-        assert link["status"] == "approved"
-        assert link["expires_ts"] >= approved_expires
-
-        inbox = await client.call_tool(
-            "fetch_inbox",
-            {
-                "project_key": project_key,
-                "agent_name": agent_b,
-                "include_bodies": True,
-            },
-        )
-        contact_requests = [
-            item for item in get_inbox_items(inbox) if item.get("subject") == f"Contact request from {agent_a}"
-        ]
-        assert len(contact_requests) == 1
-
-
-@pytest.mark.asyncio
-async def test_respond_contact_preserves_existing_approved_link(isolated_env):
-    """Re-approving an active contact should not shorten its approval window."""
-    server = build_mcp_server()
-    async with Client(server) as client:
-        project_key = "/test/contact/reapprove-approved"
-        agent_a, agent_b = await setup_two_agents(client, project_key)
-
-        await client.call_tool(
-            "request_contact",
-            {
-                "project_key": project_key,
-                "from_agent": agent_a,
-                "to_agent": agent_b,
-            },
-        )
-        await client.call_tool(
-            "respond_contact",
-            {
-                "project_key": project_key,
-                "to_agent": agent_b,
-                "from_agent": agent_a,
-                "accept": True,
-                "ttl_seconds": 3600,
-            },
-        )
-
-        agent_a_id = await get_agent_id(project_key, agent_a)
-        agent_b_id = await get_agent_id(project_key, agent_b)
-        assert agent_a_id is not None
-        assert agent_b_id is not None
-        first_link = await get_agent_link_from_db(agent_a_id, agent_b_id)
-        assert first_link is not None
-        first_expires = _parse_db_datetime(first_link["expires_ts"])
-
-        second = await client.call_tool(
-            "respond_contact",
-            {
-                "project_key": project_key,
-                "to_agent": agent_b,
-                "from_agent": agent_a,
-                "accept": True,
-                "ttl_seconds": 60,
-            },
-        )
-
-        second_link = await get_agent_link_from_db(agent_a_id, agent_b_id)
-        assert second_link is not None
-        second_expires = _parse_db_datetime(second_link["expires_ts"])
-        assert second.data["approved"] is True
-        assert datetime.fromisoformat(second.data["expires_ts"]) >= first_expires
-        assert second_link["status"] == "approved"
-        assert second_expires >= first_expires
-
-
-@pytest.mark.asyncio
-async def test_respond_contact_rejects_same_agent_same_project(isolated_env):
-    """Self-approval should not create a same-agent AgentLink."""
-    server = build_mcp_server()
-    async with Client(server) as client:
-        project_key = "/test/contact/self-respond"
-        await client.call_tool("ensure_project", {"human_key": project_key})
-        await client.call_tool(
-            "register_agent",
-            {
-                "project_key": project_key,
-                "program": "test",
-                "model": "test",
-                "name": CONTACT_FLOW_SELF_RESPONSE,
-            },
-        )
-
-        with pytest.raises(Exception, match="self-contact"):
-            await client.call_tool(
-                "respond_contact",
-                {
-                    "project_key": project_key,
-                    "to_agent": CONTACT_FLOW_SELF_RESPONSE,
-                    "from_agent": CONTACT_FLOW_SELF_RESPONSE,
-                    "accept": True,
-                },
-            )
-
-        agent_id = await get_agent_id(project_key, CONTACT_FLOW_SELF_RESPONSE)
-        assert agent_id is not None
-        assert await get_agent_link_from_db(agent_id, agent_id) is None
-
-
-@pytest.mark.asyncio
-async def test_approved_agent_can_message(isolated_env):
-    """After approval, agent A can message agent B."""
-    server = build_mcp_server()
-    async with Client(server) as client:
-        project_key = "/test/contact/can_msg"
-        agent_a, agent_b = await setup_two_agents(client, project_key)
-
-        # Request and approve contact
-        await client.call_tool(
-            "request_contact",
-            {
-                "project_key": project_key,
-                "from_agent": agent_a,
-                "to_agent": agent_b,
-            },
-        )
-        await client.call_tool(
-            "respond_contact",
-            {
-                "project_key": project_key,
-                "to_agent": agent_b,
-                "from_agent": agent_a,
-                "accept": True,
-            },
-        )
-
-        # Now agent A should be able to message agent B
-        send_result = await client.call_tool(
-            "send_message",
-            {
-                "project_key": project_key,
-                "sender_name": agent_a,
-                "to": [agent_b],
-                "subject": "Test after approval",
-                "body_md": "This should work!",
-                "idempotency_key": "contact-flow-approved-message",
-            },
-        )
-
-        # Verify message was delivered
-        assert send_result.data["count"] >= 1
-
-
-# ============================================================================
-# Test: Contact Denial
-# ============================================================================
-
-
-@pytest.mark.asyncio
-async def test_deny_contact_request(isolated_env):
-    """Denying a contact request creates denied link."""
-    server = build_mcp_server()
-    async with Client(server) as client:
-        project_key = "/test/contact/deny"
-        agent_a, agent_b = await setup_two_agents(client, project_key)
-
-        # Request contact
-        await client.call_tool(
-            "request_contact",
-            {
-                "project_key": project_key,
-                "from_agent": agent_a,
-                "to_agent": agent_b,
-            },
-        )
-
-        # Deny contact
-        deny_result = await client.call_tool(
-            "respond_contact",
-            {
-                "project_key": project_key,
-                "to_agent": agent_b,
-                "from_agent": agent_a,
-                "accept": False,
-            },
-        )
-
-        # Verify denial
-        assert deny_result.data["approved"] is False
-
-        # Verify database shows blocked (status is "blocked" when denied)
-        agent_a_id = await get_agent_id(project_key, agent_a)
-        agent_b_id = await get_agent_id(project_key, agent_b)
-        assert agent_a_id is not None, "Agent A should exist"
-        assert agent_b_id is not None, "Agent B should exist"
-        link = await get_agent_link_from_db(agent_a_id, agent_b_id)
-        assert link is not None
-        assert link["status"] in ("denied", "blocked"), f"Expected denied/blocked, got {link['status']}"
-
-
-@pytest.mark.asyncio
-async def test_denied_agent_message_blocked(isolated_env):
-    """Denied agent cannot send messages to the denier.
-
-    Note: This test verifies behavior based on contact policy.
-    With contacts_only policy, denied agent should be blocked.
-    """
-    server = build_mcp_server()
-    async with Client(server) as client:
-        project_key = "/test/contact/blocked"
-        agent_a, agent_b = await setup_two_agents(client, project_key)
-
-        # Set agent B's policy to contacts_only
-        await client.call_tool(
+    for chosen in ("contacts_only", "block_all", "auto", "open"):
+        applied = await mail.call_tool(
             "set_contact_policy",
-            {
-                "project_key": project_key,
-                "agent_name": agent_b,
-                "policy": "contacts_only",
-            },
+            {"project_key": HOME, "agent_name": lone, "policy": chosen},
+        )
+        assert applied.data["policy"] == chosen
+        assert await policy_of(HOME, lone) == chosen
+
+
+async def test_an_unknown_policy_is_refused_rather_than_coerced(mail):
+    lone = await register(mail, HOME, SOLO)
+    await mail.call_tool(
+        "set_contact_policy",
+        {"project_key": HOME, "agent_name": lone, "policy": "block_all"},
+    )
+
+    with pytest.raises(ToolError, match="Unknown contact policy"):
+        await mail.call_tool(
+            "set_contact_policy",
+            {"project_key": HOME, "agent_name": lone, "policy": "block"},
         )
 
-        # Request contact
-        await client.call_tool(
-            "request_contact",
-            {
-                "project_key": project_key,
-                "from_agent": agent_a,
-                "to_agent": agent_b,
-            },
-        )
+    # Silently reading "block" as "auto" would open a mailbox its owner shut.
+    assert await policy_of(HOME, lone) == "block_all"
 
-        # Deny contact
-        await client.call_tool(
-            "respond_contact",
-            {
-                "project_key": project_key,
-                "to_agent": agent_b,
-                "from_agent": agent_a,
-                "accept": False,
-            },
-        )
 
-        # Try to send message - should fail or be blocked
-        try:
-            result = await client.call_tool(
-                "send_message",
-                {
-                    "project_key": project_key,
-                    "sender_name": agent_a,
-                    "to": [agent_b],
-                    "subject": "Should be blocked",
-                    "body_md": "This should not work",
-                    "idempotency_key": "contact-flow-denied-message",
-                },
+# --------------------------------------------------------------------------
+# what the sender can see
+# --------------------------------------------------------------------------
+
+
+async def test_list_contacts_reports_a_live_approval_as_messageable(mail, duo):
+    sender, receiver = duo
+
+    await mail.call_tool(
+        "request_contact",
+        {"project_key": HOME, "from_agent": sender, "to_agent": receiver},
+    )
+    await mail.call_tool(
+        "respond_contact",
+        {
+            "project_key": HOME,
+            "to_agent": receiver,
+            "from_agent": sender,
+            "accept": True,
+        },
+    )
+
+    listed = rows(
+        await mail.call_tool(
+            "list_contacts", {"project_key": HOME, "agent_name": sender}
+        )
+    )
+    assert len(listed) == 1
+    entry = listed[0]
+    assert entry["to"] == receiver
+    assert entry["to_project"] == HOME
+    assert entry["status"] == "approved"
+    assert entry["is_expired"] is False
+    assert entry["allows_messaging"] is True
+
+    # The listing follows the link's direction: the approver holds no link of
+    # its own and must not inherit the requester's.
+    assert (
+        rows(
+            await mail.call_tool(
+                "list_contacts", {"project_key": HOME, "agent_name": receiver}
             )
-            # If it doesn't raise, check if message was actually delivered
-            # Some implementations may return success but not deliver
-            if result.data.get("count", 0) > 0:
-                # Message was delivered - check if there's a warning or it was blocked differently
-                pass
-        except Exception as e:
-            # Expected - message should be blocked
-            error_str = str(e).lower()
-            assert any(
-                keyword in error_str
-                for keyword in ["blocked", "denied", "contact", "policy", "not allowed"]
-            ), f"Error should indicate blocked: {e}"
-
-
-# ============================================================================
-# Test: Contact Policies
-# ============================================================================
-
-
-@pytest.mark.asyncio
-async def test_policy_open_allows_all_messages(isolated_env):
-    """With 'open' policy, anyone can message without approval."""
-    server = build_mcp_server()
-    async with Client(server) as client:
-        project_key = "/test/contact/policy_open"
-        agent_a, agent_b = await setup_two_agents(client, project_key)
-
-        # Set agent B's policy to open
-        await client.call_tool(
-            "set_contact_policy",
-            {
-                "project_key": project_key,
-                "agent_name": agent_b,
-                "policy": "open",
-            },
         )
+        == []
+    )
 
-        # Verify policy was set
-        project_id = await get_project_id(project_key)
-        assert project_id is not None, "Project should exist"
-        policy = await get_agent_policy(project_id, agent_b)
-        assert policy == "open"
 
-        # Agent A should be able to message B without any contact request
-        send_result = await client.call_tool(
-            "send_message",
-            {
-                "project_key": project_key,
-                "sender_name": agent_a,
-                "to": [agent_b],
-                "subject": "Open policy test",
-                "body_md": "Should work without contact approval",
-                "idempotency_key": "contact-flow-open-policy",
-            },
+async def test_list_contacts_stops_calling_a_lapsed_approval_messageable(mail, duo):
+    sender, receiver = duo
+
+    await mail.call_tool(
+        "request_contact",
+        {"project_key": HOME, "from_agent": sender, "to_agent": receiver},
+    )
+    await mail.call_tool(
+        "respond_contact",
+        {
+            "project_key": HOME,
+            "to_agent": receiver,
+            "from_agent": sender,
+            "accept": True,
+        },
+    )
+    await lapse_link(HOME, sender, receiver)
+
+    entry = rows(
+        await mail.call_tool(
+            "list_contacts", {"project_key": HOME, "agent_name": sender}
         )
+    )[0]
+    assert entry["status"] == "approved", "the stored answer is unchanged"
+    assert entry["is_expired"] is True
+    assert entry["allows_messaging"] is False
 
-        # Verify message delivered
-        assert send_result.data["count"] >= 1
 
+async def test_list_contacts_never_calls_a_pending_request_messageable(mail, duo):
+    sender, receiver = duo
 
-@pytest.mark.asyncio
-async def test_policy_contacts_only_requires_approval(isolated_env):
-    """With 'contacts_only' policy, only approved contacts can message."""
-    server = build_mcp_server()
-    async with Client(server) as client:
-        project_key = "/test/contact/policy_contacts"
-        agent_a, agent_b = await setup_two_agents(client, project_key)
+    await mail.call_tool(
+        "request_contact",
+        {"project_key": HOME, "from_agent": sender, "to_agent": receiver},
+    )
 
-        # Set agent B's policy to contacts_only
-        await client.call_tool(
-            "set_contact_policy",
-            {
-                "project_key": project_key,
-                "agent_name": agent_b,
-                "policy": "contacts_only",
-            },
+    entry = rows(
+        await mail.call_tool(
+            "list_contacts", {"project_key": HOME, "agent_name": sender}
         )
-
-        # Verify policy was set
-        project_id = await get_project_id(project_key)
-        assert project_id is not None, "Project should exist"
-        policy = await get_agent_policy(project_id, agent_b)
-        assert policy == "contacts_only"
-
-        # Without contact request/approval, message may fail or trigger auto-contact
-        try:
-            _result = await client.call_tool(
-                "send_message",
-                {
-                    "project_key": project_key,
-                    "sender_name": agent_a,
-                    "to": [agent_b],
-                    "subject": "Contacts only test",
-                    "body_md": "Should require approval",
-                    "idempotency_key": "contact-flow-contacts-only",
-                },
-            )
-            # If delivered, implementation may have auto_contact_if_blocked
-            pass
-        except Exception:
-            # Expected if strict contacts_only enforcement
-            pass
+    )[0]
+    assert entry["status"] == "pending"
+    assert entry["is_expired"] is False
+    assert entry["allows_messaging"] is False
 
 
-@pytest.mark.asyncio
-async def test_policy_block_all_blocks_everyone(isolated_env):
-    """With 'block_all' policy, nobody can message."""
-    server = build_mcp_server()
-    async with Client(server) as client:
-        project_key = "/test/contact/policy_block"
-        agent_a, agent_b = await setup_two_agents(client, project_key)
+# --------------------------------------------------------------------------
+# across projects
+# --------------------------------------------------------------------------
 
-        # Set agent B's policy to block_all
-        await client.call_tool(
-            "set_contact_policy",
-            {
-                "project_key": project_key,
-                "agent_name": agent_b,
-                "policy": "block_all",
-            },
+
+@pytest.fixture
+async def across(mail):
+    """A requester in HOME and a target in AWAY."""
+    return (
+        await register(mail, HOME, NEAR),
+        await register(mail, AWAY, FAR),
+    )
+
+
+async def test_a_request_can_cross_projects(mail, across):
+    near, far = across
+
+    opened = await mail.call_tool(
+        "request_contact",
+        {
+            "project_key": HOME,
+            "from_agent": near,
+            "to_agent": far,
+            "to_project": AWAY,
+            "reason": "shared release branch",
+        },
+    )
+
+    assert opened.data["status"] == "pending"
+    assert opened.data["from_project"] == HOME
+    assert opened.data["to_project"] == AWAY
+
+    link = await stored_link(HOME, near, far, AWAY)
+    assert link is not None
+    assert link["status"] == "pending"
+
+    # The request is addressed to the far project, not to a same-named local.
+    assert await stored_link(HOME, near, far) is None
+
+
+async def test_list_contacts_names_the_far_project(mail, across):
+    near, far = across
+
+    await mail.call_tool(
+        "request_contact",
+        {
+            "project_key": HOME,
+            "from_agent": near,
+            "to_agent": far,
+            "to_project": AWAY,
+        },
+    )
+
+    entry = rows(
+        await mail.call_tool(
+            "list_contacts", {"project_key": HOME, "agent_name": near}
         )
-
-        # Verify policy was set
-        project_id = await get_project_id(project_key)
-        assert project_id is not None, "Project should exist"
-        policy = await get_agent_policy(project_id, agent_b)
-        assert policy == "block_all"
-
-        # A block_all lifetime rejects even the contact-request notification.
-        with pytest.raises(Exception, match="not accepting messages"):
-            await client.call_tool(
-                "request_contact",
-                {
-                    "project_key": project_key,
-                    "from_agent": agent_a,
-                    "to_agent": agent_b,
-                },
-            )
-
-        # Try to message - should still be blocked due to block_all policy
-        try:
-            _result = await client.call_tool(
-                "send_message",
-                {
-                    "project_key": project_key,
-                    "sender_name": agent_a,
-                    "to": [agent_b],
-                    "subject": "Block all test",
-                    "body_md": "Should be blocked",
-                    "idempotency_key": "contact-flow-block-all",
-                },
-            )
-            # If it succeeds, block_all may not be enforced at message level
-            pass
-        except Exception as e:
-            # Expected - all messages should be blocked
-            error_str = str(e).lower()
-            assert any(
-                keyword in error_str
-                for keyword in ["blocked", "block_all", "policy", "not allowed", "not accepting"]
-            ), f"Error should indicate blocked: {e}"
-
-
-# ============================================================================
-# Test: List Contacts
-# ============================================================================
-
-
-@pytest.mark.asyncio
-async def test_list_contacts_shows_links(isolated_env):
-    """list_contacts exposes current audit metadata for approved links."""
-    server = build_mcp_server()
-    async with Client(server) as client:
-        project_key = "/test/contact/list"
-        agent_a, agent_b = await setup_two_agents(client, project_key)
-
-        # Create a contact
-        await client.call_tool(
-            "request_contact",
-            {
-                "project_key": project_key,
-                "from_agent": agent_a,
-                "to_agent": agent_b,
-            },
-        )
-        await client.call_tool(
-            "respond_contact",
-            {
-                "project_key": project_key,
-                "to_agent": agent_b,
-                "from_agent": agent_a,
-                "accept": True,
-            },
-        )
-
-        # List contacts for agent A (the requester)
-        contacts_a = await client.call_tool(
-            "list_contacts",
-            {
-                "project_key": project_key,
-                "agent_name": agent_a,
-            },
-        )
-
-        # List contacts for agent B (the approver)
-        contacts_b = await client.call_tool(
-            "list_contacts",
-            {
-                "project_key": project_key,
-                "agent_name": agent_b,
-            },
-        )
-
-        # At least one of them should show the contact link
-        contacts_a_list = get_contacts_list(contacts_a)
-        contacts_b_list = get_contacts_list(contacts_b)
-        assert not contacts_b_list
-
-        contact = next(item for item in contacts_a_list if item["to"] == agent_b)
-        assert contact["to_project"] == project_key
-        assert contact["status"] == "approved"
-        assert not contact["is_expired"]
-        assert contact["allows_messaging"]
-
-
-@pytest.mark.asyncio
-async def test_list_contacts_marks_expired_approval_not_messageable(isolated_env):
-    """Expired approvals should not still look messageable in list_contacts."""
-    server = build_mcp_server()
-    async with Client(server) as client:
-        project_key = "/test/contact/list_expired"
-        agent_a, agent_b = await setup_two_agents(client, project_key)
-
-        await client.call_tool(
-            "request_contact",
-            {
-                "project_key": project_key,
-                "from_agent": agent_a,
-                "to_agent": agent_b,
-            },
-        )
-        await client.call_tool(
-            "respond_contact",
-            {
-                "project_key": project_key,
-                "to_agent": agent_b,
-                "from_agent": agent_a,
-                "accept": True,
-            },
-        )
-
-        await _expire_contact_link(project_key, agent_a, agent_b)
-
-        contacts = await client.call_tool(
-            "list_contacts",
-            {
-                "project_key": project_key,
-                "agent_name": agent_a,
-            },
-        )
-        contact_items = get_contacts_list(contacts)
-        contact = next(item for item in contact_items if item["to"] == agent_b)
-        assert contact["status"] == "approved"
-        assert contact["is_expired"]
-        assert not contact["allows_messaging"]
-
-
-@pytest.mark.asyncio
-async def test_list_contacts_shows_cross_project_target(isolated_env):
-    """Cross-project contact listings should identify the target project."""
-    server = build_mcp_server()
-    async with Client(server) as client:
-        project_a = "/test/contact/list_cross_a"
-        project_b = "/test/contact/list_cross_b"
-
-        await client.call_tool("ensure_project", {"human_key": project_a})
-        await client.call_tool("ensure_project", {"human_key": project_b})
-
-        agent_a_result = await client.call_tool(
-            "register_agent",
-            {
-                "project_key": project_a,
-                "program": "test",
-                "model": "test",
-                "name": CONTACT_FLOW_LIST_CROSS_ONE,
-            },
-        )
-        agent_a_name = agent_a_result.data["name"]
-
-        agent_b_result = await client.call_tool(
-            "register_agent",
-            {
-                "project_key": project_b,
-                "program": "test",
-                "model": "test",
-                "name": CONTACT_FLOW_LIST_CROSS_TWO,
-            },
-        )
-        agent_b_name = agent_b_result.data["name"]
-
-        await client.call_tool(
-            "request_contact",
-            {
-                "project_key": project_a,
-                "from_agent": agent_a_name,
-                "to_agent": agent_b_name,
-                "to_project": project_b,
-            },
-        )
-
-        contacts = await client.call_tool(
-            "list_contacts",
-            {
-                "project_key": project_a,
-                "agent_name": agent_a_name,
-            },
-        )
-        contact_items = get_contacts_list(contacts)
-        contact = next(item for item in contact_items if item["to"] == agent_b_name)
-        assert contact["to_project"] == project_b
-        assert contact["status"] == "pending"
-        assert not contact["is_expired"]
-        assert not contact["allows_messaging"]
-
-
-# ============================================================================
-# Test: Contact TTL Expiration
-# ============================================================================
-
-
-@pytest.mark.asyncio
-async def test_contact_request_has_ttl(isolated_env):
-    """Contact request has expiration time (TTL)."""
-    server = build_mcp_server()
-    async with Client(server) as client:
-        project_key = "/test/contact/ttl"
-        agent_a, agent_b = await setup_two_agents(client, project_key)
-
-        # Request contact with specific TTL
-        result = await client.call_tool(
-            "request_contact",
-            {
-                "project_key": project_key,
-                "from_agent": agent_a,
-                "to_agent": agent_b,
-                "ttl_seconds": 604800,  # 7 days
-            },
-        )
-
-        assert result.data["status"] == "pending"
-
-        # Verify expires_ts is set in database
-        agent_a_id = await get_agent_id(project_key, agent_a)
-        agent_b_id = await get_agent_id(project_key, agent_b)
-        assert agent_a_id is not None, "Agent A should exist"
-        assert agent_b_id is not None, "Agent B should exist"
-        link = await get_agent_link_from_db(agent_a_id, agent_b_id)
-        assert link is not None
-        assert link["expires_ts"] is not None
-
-
-# ============================================================================
-# Test: Cross-Project Contacts
-# ============================================================================
-
-
-@pytest.mark.asyncio
-async def test_cross_project_contact_request(isolated_env):
-    """Contact can be requested across different projects."""
-    server = build_mcp_server()
-    async with Client(server) as client:
-        project_a = "/test/contact/cross_a"
-        project_b = "/test/contact/cross_b"
-
-        # Setup two separate projects
-        await client.call_tool("ensure_project", {"human_key": project_a})
-        await client.call_tool("ensure_project", {"human_key": project_b})
-
-        agent_a_result = await client.call_tool(
-            "register_agent",
-            {
-                "project_key": project_a,
-                "program": "test",
-                "model": "test",
-                "name": CONTACT_FLOW_CROSS_ONE,
-            },
-        )
-        agent_a_name = agent_a_result.data["name"]
-
-        agent_b_result = await client.call_tool(
-            "register_agent",
-            {
-                "project_key": project_b,
-                "program": "test",
-                "model": "test",
-                "name": CONTACT_FLOW_CROSS_TWO,
-            },
-        )
-        agent_b_name = agent_b_result.data["name"]
-
-        # Request cross-project contact
-        result = await client.call_tool(
-            "request_contact",
-            {
-                "project_key": project_a,
-                "from_agent": agent_a_name,
-                "to_agent": agent_b_name,
-                "to_project": project_b,
-            },
-        )
-
-        # Should create pending cross-project link
-        assert result.data["status"] == "pending"
-
-
-# ============================================================================
-# Test: Macro Contact Handshake
-# ============================================================================
-
-
-@pytest.mark.asyncio
-async def test_macro_contact_handshake(isolated_env):
-    """macro_contact_handshake automates contact request flow."""
-    server = build_mcp_server()
-    async with Client(server) as client:
-        project_key = "/test/contact/macro"
-        agent_a, agent_b = await setup_two_agents(client, project_key)
-
-        # Use macro for contact handshake
-        result = await client.call_tool(
-            "macro_contact_handshake",
-            {
-                "project_key": project_key,
-                "requester": agent_a,
-                "target": agent_b,
-                "reason": "Testing macro handshake",
-                "auto_accept": False,
-            },
-        )
-
-        # Should indicate contact request was made
-        # The macro returns request/response info
-        data = result.data
-        assert data is not None, "Macro should return data"
-        # Check if request was made (various possible response formats)
-        has_request = (
-            "request" in data
-            or "status" in data
-            or "link" in str(data).lower()
-            or "pending" in str(data).lower()
-        )
-        assert has_request, f"Should have request info, got: {data}"
-
-
-@pytest.mark.asyncio
-async def test_macro_contact_handshake_auto_accept(isolated_env):
-    """macro_contact_handshake with auto_accept approves immediately."""
-    server = build_mcp_server()
-    async with Client(server) as client:
-        project_key = "/test/contact/macro_auto"
-        agent_a, agent_b = await setup_two_agents(client, project_key)
-
-        # Use macro with auto_accept
-        await client.call_tool(
-            "macro_contact_handshake",
-            {
-                "project_key": project_key,
-                "requester": agent_a,
-                "target": agent_b,
-                "auto_accept": True,
-            },
-        )
-
-        # Should be approved
-        # Check database for approved status
-        agent_a_id = await get_agent_id(project_key, agent_a)
-        agent_b_id = await get_agent_id(project_key, agent_b)
-        assert agent_a_id is not None, "Agent A should exist"
-        assert agent_b_id is not None, "Agent B should exist"
-        link = await get_agent_link_from_db(agent_a_id, agent_b_id)
-        if link:
-            assert link["status"] == "approved"
-
-
-@pytest.mark.asyncio
-async def test_macro_contact_handshake_auto_accept_preserves_existing_approved_link(isolated_env):
-    """Repeated same-project auto-accept handshakes should not shorten an active approval."""
-    server = build_mcp_server()
-    async with Client(server) as client:
-        project_key = "/test/contact/macro_auto_monotonic"
-        agent_a, agent_b = await setup_two_agents(client, project_key)
-
-        first = await client.call_tool(
-            "macro_contact_handshake",
-            {
-                "project_key": project_key,
-                "requester": agent_a,
-                "target": agent_b,
-                "auto_accept": True,
-                "ttl_seconds": 3600,
-            },
-        )
-
-        agent_a_id = await get_agent_id(project_key, agent_a)
-        agent_b_id = await get_agent_id(project_key, agent_b)
-        assert agent_a_id is not None
-        assert agent_b_id is not None
-        first_link = await get_agent_link_from_db(agent_a_id, agent_b_id)
-        assert first_link is not None
-        first_expires = _parse_db_datetime(first_link["expires_ts"])
-
-        second = await client.call_tool(
-            "macro_contact_handshake",
-            {
-                "project_key": project_key,
-                "requester": agent_a,
-                "target": agent_b,
-                "auto_accept": True,
-                "ttl_seconds": 60,
-            },
-        )
-
-        second_link = await get_agent_link_from_db(agent_a_id, agent_b_id)
-        assert second_link is not None
-        second_expires = _parse_db_datetime(second_link["expires_ts"])
-        response = second.data["response"]
-        assert first.data["response"]["status"] == "approved"
-        assert response["status"] == "approved"
-        assert datetime.fromisoformat(response["expires_ts"]) >= first_expires
-        assert second_link["status"] == "approved"
-        assert second_expires >= first_expires
-
-
-# ============================================================================
-# Test: Policy Persistence
-# ============================================================================
-
-
-@pytest.mark.asyncio
-async def test_set_contact_policy_persists(isolated_env):
-    """set_contact_policy persists to database."""
-    server = build_mcp_server()
-    async with Client(server) as client:
-        project_key = "/test/contact/policy_persist"
-        await client.call_tool("ensure_project", {"human_key": project_key})
-
-        agent_result = await client.call_tool(
-            "register_agent",
-            {
-                "project_key": project_key,
-                "program": "test",
-                "model": "test",
-                "name": CONTACT_FLOW_POLICY,
-            },
-        )
-        agent_name = agent_result.data["name"]
-
-        # Set policy
-        await client.call_tool(
-            "set_contact_policy",
-            {
-                "project_key": project_key,
-                "agent_name": agent_name,
-                "policy": "contacts_only",
-            },
-        )
-
-        # Verify via database
-        project_id = await get_project_id(project_key)
-        assert project_id is not None, "Project should exist"
-        policy = await get_agent_policy(project_id, agent_name)
-        assert policy == "contacts_only"
-
-        # Change policy
-        await client.call_tool(
-            "set_contact_policy",
-            {
-                "project_key": project_key,
-                "agent_name": agent_name,
-                "policy": "open",
-            },
-        )
-
-        # Verify change
-        policy = await get_agent_policy(project_id, agent_name)
-        assert policy == "open"
+    )[0]
+    assert entry["to"] == far
+    assert entry["to_project"] == AWAY
+    assert entry["status"] == "pending"
+    assert entry["allows_messaging"] is False
+
+
+# --------------------------------------------------------------------------
+# the macro
+# --------------------------------------------------------------------------
+
+
+async def test_handshake_without_auto_accept_only_asks(mail, duo):
+    sender, receiver = duo
+
+    shaken = await mail.call_tool(
+        "macro_contact_handshake",
+        {
+            "project_key": HOME,
+            "requester": sender,
+            "target": receiver,
+            "reason": "may I write here",
+            "auto_accept": False,
+        },
+    )
+
+    assert shaken.data["request"]["status"] == "pending"
+    assert shaken.data["response"] is None, "nothing may answer on the target's behalf"
+    assert shaken.data["welcome_message"] is None
+
+    link = await stored_link(HOME, sender, receiver)
+    assert link is not None
+    assert link["status"] == "pending"
+    assert subjects(await read_inbox(mail, HOME, receiver)) == [
+        f"Contact request from {sender}"
+    ]
+
+
+async def test_handshake_with_auto_accept_approves_without_an_intro(mail, duo):
+    sender, receiver = duo
+
+    shaken = await mail.call_tool(
+        "macro_contact_handshake",
+        {
+            "project_key": HOME,
+            "requester": sender,
+            "target": receiver,
+            "auto_accept": True,
+        },
+    )
+
+    assert shaken.data["request"]["status"] == "approved"
+    assert shaken.data["response"]["status"] == "approved"
+
+    link = await stored_link(HOME, sender, receiver)
+    assert link is not None
+    assert link["status"] == "approved"
+    assert link["expires_ts"] is not None
+
+    # The same-project fast path approves directly, so nobody is asked to read
+    # a request that has already been granted.
+    assert subjects(await read_inbox(mail, HOME, receiver)) == []
+
+
+async def test_repeat_auto_accept_handshake_never_shortens_the_approval(mail, duo):
+    sender, receiver = duo
+    payload = {
+        "project_key": HOME,
+        "requester": sender,
+        "target": receiver,
+        "auto_accept": True,
+    }
+
+    first = await mail.call_tool(
+        "macro_contact_handshake", {**payload, "ttl_seconds": 3600}
+    )
+    approved = await stored_link(HOME, sender, receiver)
+    assert approved is not None
+
+    second = await mail.call_tool(
+        "macro_contact_handshake", {**payload, "ttl_seconds": 60}
+    )
+
+    assert first.data["response"]["status"] == "approved"
+    assert second.data["response"]["status"] == "approved"
+    assert parse_iso(second.data["response"]["expires_ts"]) >= parse_iso(
+        first.data["response"]["expires_ts"]
+    )
+
+    unchanged = await stored_link(HOME, sender, receiver)
+    assert unchanged is not None
+    assert unchanged["status"] == "approved"
+    assert unchanged["expires_ts"] == approved["expires_ts"]

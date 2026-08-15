@@ -1,14 +1,36 @@
+"""Behaviour of the ``am-run`` build wrapper and the ``amctl env`` helper.
+
+``am-run`` has two authorities for a build slot and they must never blend:
+
+* the **server** owns the slot whenever the MCP endpoint answers, and
+* a **local lease file** under ``<archive>/build_slots/<slot>/`` owns it only
+  when the endpoint is unreachable.
+
+Most of what is pinned below is therefore negative -- what must *not* happen.
+A local lease written after the server has already spoken would hand the same
+slot to two builders, so every server-side failure mode gets a test that says
+"and no local lease appeared". The same applies to the child process: it must
+not start when the slot was refused, and the argv it was given must not reach
+the console or the server, because build commands carry credentials.
+"""
+
+from __future__ import annotations
+
 import asyncio
 import contextlib
 import hashlib
 import json
 import re
+import subprocess
 import sys
 import threading
 import time
+import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, cast
+from types import SimpleNamespace
+from typing import Any, Callable, cast
 
 import click
 import httpx
@@ -17,10 +39,13 @@ import typer
 from sqlalchemy import select
 from typer.testing import CliRunner
 
+import mcp_agent_mail.cli as cli_module
 from mcp_agent_mail.app import _resolve_project_identity
 from mcp_agent_mail.cli import (
     _build_slot_renew_interval_seconds,
+    _canonical_project_path,
     _effective_build_slot_ttl_seconds,
+    _resolve_repo_worktree_root,
     _safe_build_path_component,
     am_run,
     app,
@@ -29,1409 +54,1271 @@ from mcp_agent_mail.config import get_settings
 from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.models import Agent, Project
 
-runner = CliRunner()
 pytestmark = pytest.mark.usefixtures("isolated_env")
 
+# Handed back by the stub endpoint as the id of the execution it opened. The
+# CLI must quote this value -- not the uuid4 it generated locally -- in every
+# later call and in the child's environment.
+SERVER_EXECUTION_ID = "3d5b1f7a-9c04-4e2b-8a61-77bd0c9e4f12"
 
-@pytest.mark.parametrize("value", ["CON", "CON.txt", "NUL.txt", "LPT1.log", "x" * 400])
-def test_safe_build_path_component_is_portable_and_bounded(value: str) -> None:
-    component = _safe_build_path_component(value)
+# Wire constants. These are contract with the server and with build scripts,
+# so they are written out rather than derived.
+PROTOCOL_VERSION = 1
+SLOT_TOOLS = ("acquire_build_slot", "renew_build_slot", "release_build_slot")
 
-    assert len(component.encode("utf-8")) <= 80
-    assert component != value
-    assert component == _safe_build_path_component(value)
-    assert component.partition(".")[0].upper() not in {"CON", "NUL", "LPT1"}
-    assert component.rsplit("-", 1)[-1] == hashlib.sha256(value.encode()).hexdigest()[:32]
-
-
-def test_safe_build_path_component_keeps_distinct_logical_names_distinct() -> None:
-    values = ["a/b", "a_b", ".", "..", "ż" * 100]
-    components = [_safe_build_path_component(value) for value in values]
-
-    assert len(set(components)) == len(values)
-    assert all(component not in {"", ".", ".."} for component in components)
-    assert all(len(component.encode("utf-8")) <= 80 for component in components)
+FAR_FUTURE = "2099-01-01T00:00:00+00:00"
+LONG_PAST = "2020-01-01T00:00:00+00:00"
 
 
-def test_am_run_creates_lease_when_enabled(tmp_path: Path, monkeypatch) -> None:
-    # Point archive to a temp root and enable worktrees features
-    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
-    monkeypatch.setenv("WORKTREES_ENABLED", "1")
-    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "warn")
-    monkeypatch.setenv("AGENT_NAME", "TestAgent")
-    get_settings.cache_clear()
-    monkeypatch.setattr(
-        "httpx.Client.post",
-        lambda *args, **kwargs: (_ for _ in ()).throw(httpx.ConnectError("server unavailable")),
-    )
-
-    proj = tmp_path / "proj"
-    proj.mkdir(parents=True, exist_ok=True)
-    # Run a trivial child that exits 0
-    am_run(
-        slot="unittest-slot",
-        cmd=[sys.executable, "-c", "import sys; sys.exit(0)"],
-        project_path=proj,
-        agent="TestAgent",
-        ttl_seconds=120,
-        shared=False,
-    )
-    # Confirm lease was created under archive build_slots
-    archive_root = Path(get_settings().storage.root).expanduser().resolve()
-    # We don't know the slug in advance; scan for build_slots presence
-    projects_dir = archive_root / "projects"
-    assert projects_dir.exists()
-    # At least one project directory should have a build_slots/unittest-slot/ file inside
-    found = False
-    for entry in projects_dir.glob("*/build_slots/unittest-slot/*.json"):
-        if entry.is_file():
-            found = True
-            break
-    assert found, "Expected a lease JSON file to be created for am-run"
+# --------------------------------------------------------------------------
+# Stub HTTP endpoint
+# --------------------------------------------------------------------------
 
 
-def test_am_run_contains_dotdot_slot_lease_under_build_slots(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
-    monkeypatch.setenv("WORKTREES_ENABLED", "1")
-    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "warn")
-    get_settings.cache_clear()
-    monkeypatch.setattr(
-        "httpx.Client.post",
-        lambda *args, **kwargs: (_ for _ in ()).throw(httpx.ConnectError("server unavailable")),
-    )
+class RpcResult:
+    """A 200 response whose ``structuredContent`` is ``payload``."""
 
-    class _CompletedProcess:
-        returncode = 0
+    def __init__(self, payload: dict[str, Any] | None = None) -> None:
+        self._payload = payload or {}
 
-    monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: _CompletedProcess())
+    def raise_for_status(self) -> None:
+        return None
 
-    project_path = tmp_path / "project"
-    project_path.mkdir()
-    am_run(
-        slot="..",
-        cmd=["unused"],
-        project_path=project_path,
-        agent="TestAgent",
-        ttl_seconds=120,
-        shared=False,
-    )
-
-    identity = _resolve_project_identity(str(project_path))
-    project_archive = Path(get_settings().storage.root).expanduser().resolve() / "projects" / identity["slug"]
-    build_slots_root = (project_archive / "build_slots").resolve()
-    lease_files = list(build_slots_root.rglob("*.json"))
-
-    assert len(lease_files) == 1
-    assert lease_files[0].resolve().is_relative_to(build_slots_root)
-    assert lease_files[0].parent.name.startswith("unknown-")
-    assert list(project_archive.glob("*.json")) == []
-
-
-def test_am_run_contains_malicious_agent_branch_artifacts_and_lease(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    storage_root = tmp_path / "archive"
-    monkeypatch.setenv("STORAGE_ROOT", str(storage_root))
-    monkeypatch.setenv("WORKTREES_ENABLED", "1")
-    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "warn")
-    get_settings.cache_clear()
-    monkeypatch.setattr(
-        "httpx.Client.post",
-        lambda *args, **kwargs: (_ for _ in ()).throw(httpx.ConnectError("server unavailable")),
-    )
-
-    identity = {
-        "slug": "safe-project",
-        "project_uid": "project-uid",
-        "branch": "../../outside-branch\\..\\escaped",
-    }
-    monkeypatch.setattr("mcp_agent_mail.app._resolve_project_identity", lambda _path: identity)
-    artifact_paths: list[Path] = []
-
-    class _CompletedProcess:
-        returncode = 0
-
-    def fake_run(*args, **kwargs):
-        child_env = cast(dict[str, str], kwargs["env"])
-        artifact_path = Path(child_env["ARTIFACT_DIR"])
-        artifact_paths.append(artifact_path)
-        artifact_path.mkdir(parents=True, exist_ok=True)
-        (artifact_path / "child-output.txt").write_text("ok", encoding="utf-8")
-        return _CompletedProcess()
-
-    monkeypatch.setattr("subprocess.run", fake_run)
-
-    project_path = tmp_path / "project"
-    project_path.mkdir()
-    am_run(
-        slot="safe-slot",
-        cmd=["unused"],
-        project_path=project_path,
-        agent="../outside-agent\\..\\escaped",
-        ttl_seconds=120,
-        shared=False,
-    )
-
-    project_archive = (storage_root / "projects" / identity["slug"]).resolve()
-    artifacts_root = (project_archive / "artifacts").resolve()
-    build_slots_root = (project_archive / "build_slots").resolve()
-    lease_files = list(build_slots_root.rglob("*.json"))
-    written_markers = list(tmp_path.rglob("child-output.txt"))
-
-    assert len(artifact_paths) == 1
-    assert artifact_paths[0].resolve().is_relative_to(artifacts_root)
-    assert written_markers == [artifact_paths[0] / "child-output.txt"]
-    assert written_markers[0].resolve().is_relative_to(project_archive)
-    assert len(lease_files) == 1
-    assert lease_files[0].resolve().is_relative_to(build_slots_root)
-
-
-def test_am_run_disambiguates_sanitized_branch_components(tmp_path: Path, monkeypatch) -> None:
-    storage_root = tmp_path / "archive"
-    monkeypatch.setenv("STORAGE_ROOT", str(storage_root))
-    monkeypatch.setenv("WORKTREES_ENABLED", "1")
-    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "warn")
-    get_settings.cache_clear()
-    monkeypatch.setattr(
-        "httpx.Client.post",
-        lambda *args, **kwargs: (_ for _ in ()).throw(httpx.ConnectError("server unavailable")),
-    )
-
-    branch = "feature/foo"
-
-    def identity_for_branch(_path: str) -> dict[str, str]:
+    def json(self) -> dict[str, Any]:
         return {
-            "slug": "safe-project",
-            "project_uid": "project-uid",
-            "branch": branch,
+            "jsonrpc": "2.0",
+            "id": "stub",
+            "result": {"structuredContent": self._payload},
         }
 
-    monkeypatch.setattr("mcp_agent_mail.app._resolve_project_identity", identity_for_branch)
-    artifact_paths: list[Path] = []
 
-    class _CompletedProcess:
-        returncode = 0
+class RpcError:
+    """A 200 response carrying a JSON-RPC ``error`` member."""
 
-    def fake_run(*args, **kwargs):
-        child_env = cast(dict[str, str], kwargs["env"])
-        artifact_paths.append(Path(child_env["ARTIFACT_DIR"]))
-        return _CompletedProcess()
+    def __init__(self, message: str) -> None:
+        self._message = message
 
-    monkeypatch.setattr("subprocess.run", fake_run)
-    project_path = tmp_path / "project"
-    project_path.mkdir()
-
-    for branch_value in ("feature/foo", "feature_foo"):
-        branch = branch_value
-        am_run(
-            slot="safe-slot",
-            cmd=["unused"],
-            project_path=project_path,
-            agent="TestAgent",
-            ttl_seconds=120,
-            shared=False,
-        )
-
-    project_archive = (storage_root / "projects" / "safe-project").resolve()
-    lease_files = list((project_archive / "build_slots" / "safe-slot").glob("*.json"))
-
-    assert len(artifact_paths) == 2
-    assert artifact_paths[0] != artifact_paths[1]
-    assert artifact_paths[0].name.startswith("feature_foo-")
-    assert artifact_paths[1].name == "feature_foo"
-    assert all(path.resolve().is_relative_to(project_archive) for path in artifact_paths)
-    assert len(lease_files) == 2
-    assert len({path.name for path in lease_files}) == 2
-
-
-class _StaticJsonResponse:
-    def __init__(self, payload):
-        self._payload = payload
-
-    def json(self):
-        return self._payload
-
-    def raise_for_status(self):
+    def raise_for_status(self) -> None:
         return None
 
-
-_TEST_AM_RUN_EXECUTION_ID = "11111111-2222-4333-8444-555555555555"
-
-
-def _am_run_lifecycle_response(tool_name: object) -> _StaticJsonResponse | None:
-    if tool_name == "start_agent_execution":
-        return _StaticJsonResponse(
-            {
-                "jsonrpc": "2.0",
-                "id": "am-run-execution-start",
-                "result": {
-                    "structuredContent": {
-                        "id": _TEST_AM_RUN_EXECUTION_ID,
-                        "status": "active",
-                    }
-                },
-            }
-        )
-    if tool_name == "end_agent_execution":
-        return _StaticJsonResponse(
-            {
-                "jsonrpc": "2.0",
-                "id": "am-run-execution-end",
-                "result": {"structuredContent": {"already_ended": False}},
-            }
-        )
-    return None
+    def json(self) -> dict[str, Any]:
+        return {"jsonrpc": "2.0", "id": "stub", "error": {"message": self._message}}
 
 
-class _InvalidJsonResponse:
-    def json(self):
-        raise ValueError("invalid json")
+class UndecodableBody:
+    """A 200 response whose body is not JSON at all."""
 
-    def raise_for_status(self):
+    def raise_for_status(self) -> None:
         return None
 
+    def json(self) -> dict[str, Any]:
+        raise ValueError("body is not JSON")
 
-class _StatusErrorResponse:
-    def __init__(self, status_code: int):
-        request = httpx.Request("POST", "http://testserver/mcp")
-        self._response = httpx.Response(status_code, request=request)
 
-    def json(self):
-        raise AssertionError("json() should not be called after an HTTP status error")
+class HttpFailure:
+    """A non-2xx response. Reading its body would be a bug, so it explodes."""
 
-    def raise_for_status(self):
+    def __init__(self, status_code: int) -> None:
+        self._request = httpx.Request("POST", "http://stub.invalid/mcp")
+        self._response = httpx.Response(status_code, request=self._request)
+
+    def raise_for_status(self) -> None:
         raise httpx.HTTPStatusError(
-            f"HTTP {self._response.status_code}",
-            request=self._response.request,
+            f"status {self._response.status_code}",
+            request=self._request,
             response=self._response,
         )
 
+    def json(self) -> dict[str, Any]:
+        raise AssertionError("the body must not be decoded after an HTTP status failure")
 
-def _seed_project_agent(project_path: Path, agent_name: str, token: str) -> None:
-    project_key = str(project_path.resolve())
-    slug = f"proj-{hashlib.sha256(project_key.encode('utf-8')).hexdigest()[:12]}"
 
-    async def _seed() -> None:
+@dataclass
+class ToolCall:
+    name: str
+    arguments: dict[str, Any]
+
+
+class StubEndpoint:
+    """In-process stand-in for the Agent Mail JSON-RPC endpoint.
+
+    Records every ``tools/call`` and answers with a default success unless a
+    per-tool reaction has been registered. A reaction may return a response
+    object or raise -- raising ``httpx.ConnectError`` is how a mid-run
+    transport failure is expressed.
+    """
+
+    def __init__(self, execution_id: str = SERVER_EXECUTION_ID) -> None:
+        self.calls: list[ToolCall] = []
+        self.execution_id = execution_id
+        self._reactions: dict[str, Callable[[dict[str, Any]], Any]] = {}
+
+    def react(self, tool: str, reaction: Callable[[dict[str, Any]], Any]) -> StubEndpoint:
+        self._reactions[tool] = reaction
+        return self
+
+    def answer(self, tool: str, response: Any) -> StubEndpoint:
+        return self.react(tool, lambda _arguments: response)
+
+    def fail(self, tool: str, exception: BaseException) -> StubEndpoint:
+        def _raise(_arguments: dict[str, Any]) -> Any:
+            raise exception
+
+        return self.react(tool, _raise)
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> StubEndpoint:
+        endpoint = self
+
+        def post(_client: Any, _url: str, json: dict[str, Any] | None = None, headers: Any = None) -> Any:
+            return endpoint._dispatch(json or {})
+
+        monkeypatch.setattr("httpx.Client.post", post)
+        return self
+
+    # -- inspection -------------------------------------------------------
+
+    @property
+    def tool_names(self) -> list[str]:
+        return [call.name for call in self.calls]
+
+    def called(self, tool: str) -> bool:
+        return tool in self.tool_names
+
+    def arguments_for(self, tool: str) -> dict[str, Any]:
+        matches = [call.arguments for call in self.calls if call.name == tool]
+        assert matches, f"{tool} was never called; saw {self.tool_names}"
+        return matches[-1]
+
+    def every_argument(self, tool: str, key: str) -> list[Any]:
+        return [call.arguments.get(key) for call in self.calls if call.name == tool]
+
+    # -- internals --------------------------------------------------------
+
+    def _dispatch(self, request: dict[str, Any]) -> Any:
+        params = request.get("params") or {}
+        name = str(params.get("name") or "")
+        arguments = dict(params.get("arguments") or {})
+        self.calls.append(ToolCall(name=name, arguments=arguments))
+        reaction = self._reactions.get(name)
+        if reaction is not None:
+            answered = reaction(arguments)
+            if answered is not None:
+                return answered
+        return RpcResult(self._default_payload(name))
+
+    def _default_payload(self, name: str) -> dict[str, Any]:
+        if name == "start_agent_execution":
+            return {"id": self.execution_id, "status": "active"}
+        if name == "end_agent_execution":
+            return {"already_ended": False}
+        return {}
+
+
+def unreachable_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every HTTP attempt fail the way a stopped server does."""
+
+    def post(*_args: Any, **_kwargs: Any) -> Any:
+        raise httpx.ConnectError("nothing is listening")
+
+    monkeypatch.setattr("httpx.Client.post", post)
+
+
+# --------------------------------------------------------------------------
+# Stub child process
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class ChildRun:
+    argv: list[str]
+    env: dict[str, str]
+
+
+class ChildStub:
+    """Replaces ``subprocess.run`` and remembers how the child was invoked."""
+
+    def __init__(
+        self,
+        *,
+        returncode: int = 0,
+        while_running: Callable[[ChildRun], None] | None = None,
+    ) -> None:
+        self.runs: list[ChildRun] = []
+        self.returncode = returncode
+        self._while_running = while_running
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> ChildStub:
+        def run(cmd: Any, env: Any = None, check: bool = False, **_kwargs: Any) -> Any:
+            record = ChildRun(argv=[str(item) for item in cmd], env=dict(env or {}))
+            self.runs.append(record)
+            if self._while_running is not None:
+                self._while_running(record)
+            return SimpleNamespace(returncode=self.returncode)
+
+        monkeypatch.setattr("subprocess.run", run)
+        return self
+
+    @property
+    def started(self) -> bool:
+        return bool(self.runs)
+
+    @property
+    def env(self) -> dict[str, str]:
+        assert self.runs, "the child never started"
+        return self.runs[-1].env
+
+
+def forbid_child(monkeypatch: pytest.MonkeyPatch, reason: str) -> None:
+    """Install a child that fails the test if it is ever started."""
+
+    def run(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError(reason)
+
+    monkeypatch.setattr("subprocess.run", run)
+
+
+# --------------------------------------------------------------------------
+# Environment fixture
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class BuildSetup:
+    """The directories and paths one ``am-run`` invocation will touch."""
+
+    workdir: Path
+    _storage: Path
+
+    @property
+    def storage_root(self) -> Path:
+        return Path(get_settings().storage.root).expanduser().resolve()
+
+    @property
+    def project_key(self) -> str:
+        """The human key ``am-run`` will resolve this working directory to."""
+        return str(_resolve_repo_worktree_root(_canonical_project_path(self.workdir)))
+
+    def archive_root(self, slug: str | None = None) -> Path:
+        resolved = slug or _resolve_project_identity(self.project_key)["slug"]
+        return self.storage_root / "projects" / resolved
+
+    def leases(self, slot: str | None = None) -> list[Path]:
+        pattern = f"projects/*/build_slots/{slot or '*'}/*.json"
+        return sorted(self.storage_root.glob(pattern))
+
+    def every_lease(self) -> list[Path]:
+        return sorted(self.storage_root.glob("projects/*/build_slots/**/*.json"))
+
+
+@pytest.fixture
+def build_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Callable[..., BuildSetup]:
+    """Configure ``am-run``'s environment and hand back the paths it will use."""
+
+    def configure(
+        *,
+        worktrees: bool = True,
+        guard_mode: str = "block",
+        agent_name: str = "Builder",
+        workdir: Path | None = None,
+    ) -> BuildSetup:
+        storage = tmp_path / "am-store"
+        monkeypatch.setenv("STORAGE_ROOT", str(storage))
+        monkeypatch.setenv("WORKTREES_ENABLED", "1" if worktrees else "0")
+        monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", guard_mode)
+        monkeypatch.setenv("AGENT_NAME", agent_name)
+        # An ambient capability would short-circuit the database lookup these
+        # tests are about, and the developer running them may well have one.
+        monkeypatch.delenv("AGENT_MAIL_REGISTRATION_TOKEN", raising=False)
+        get_settings.cache_clear()
+        target = workdir if workdir is not None else tmp_path / "workdir"
+        target.mkdir(parents=True, exist_ok=True)
+        return BuildSetup(workdir=target, _storage=storage)
+
+    return configure
+
+
+def register_local_agent(setup: BuildSetup, *, name: str, token: str) -> None:
+    """Give the CLI a locally registered agent whose token it can resolve."""
+    human_key = setup.project_key
+    slug = "p" + hashlib.blake2s(human_key.encode("utf-8"), digest_size=8).hexdigest()
+
+    async def _write() -> None:
         await ensure_schema()
         async with get_session() as session:
-            existing = await session.execute(select(Project).where(cast(Any, Project.human_key == project_key)))
-            project = existing.scalars().first()
+            found = await session.execute(select(Project).where(cast(Any, Project.human_key == human_key)))
+            project = found.scalars().first()
             if project is None:
-                project = Project(slug=slug, human_key=project_key)
+                project = Project(slug=slug, human_key=human_key)
                 session.add(project)
                 await session.commit()
                 await session.refresh(project)
-            assert project.id is not None
-            existing_agent = await session.execute(
-                select(Agent).where(
-                    cast(Any, Agent.project_id == project.id),
-                    cast(Any, Agent.name == agent_name),
+            session.add(
+                Agent(
+                    project_id=cast(int, project.id),
+                    name=name,
+                    program="pytest",
+                    model="stub",
+                    task_description="",
+                    registration_token=token,
                 )
             )
-            agent = existing_agent.scalars().first()
-            if agent is None:
-                session.add(
-                    Agent(
-                        project_id=project.id,
-                        name=agent_name,
-                        program="x",
-                        model="y",
-                        task_description="",
-                        registration_token=token,
-                    )
-                )
-            else:
-                agent.registration_token = token
             await session.commit()
 
-    asyncio.run(_seed())
+    asyncio.run(_write())
 
 
-def test_am_run_blocks_on_structured_content_conflicts(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
-    monkeypatch.setenv("WORKTREES_ENABLED", "1")
-    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "block")
-    monkeypatch.setenv("AGENT_NAME", "TestAgent")
-    get_settings.cache_clear()
-
-    proj = tmp_path / "proj"
-    proj.mkdir(parents=True, exist_ok=True)
-    _seed_project_agent(proj, "TestAgent", "secret-token")
-
-    def fake_post(self, url, json=None, headers=None):
-        tool_name = ((json or {}).get("params") or {}).get("name")
-        lifecycle = _am_run_lifecycle_response(tool_name)
-        if lifecycle is not None:
-            return lifecycle
-        if tool_name == "acquire_build_slot":
-            return _StaticJsonResponse(
-                {
-                    "jsonrpc": "2.0",
-                    "id": "am-run-acquire",
-                    "result": {
-                        "structuredContent": {
-                            "conflicts": [
-                                {
-                                    "slot": "unittest-slot",
-                                    "agent": "OtherAgent",
-                                    "branch": "main",
-                                    "expires_ts": "2026-04-10T03:00:00Z",
-                                }
-                            ]
-                        }
-                    },
-                }
-            )
-        return _StaticJsonResponse({"jsonrpc": "2.0", "id": "ok", "result": {"structuredContent": {}}})
-
-    def unexpected_run(*args, **kwargs):
-        raise AssertionError("subprocess.run should not execute when server reports a build-slot conflict")
-
-    monkeypatch.setattr("httpx.Client.post", fake_post)
-    monkeypatch.setattr("subprocess.run", unexpected_run)
-
-    with pytest.raises(typer.Exit) as excinfo:
-        am_run(
-            slot="unittest-slot",
-            cmd=[sys.executable, "-c", "import sys; sys.exit(0)"],
-            project_path=proj,
-            agent="TestAgent",
-            ttl_seconds=120,
-            shared=False,
-            block_on_conflicts=True,
-        )
-
-    assert excinfo.value.exit_code == 1
-    archive_root = Path(get_settings().storage.root).expanduser().resolve()
-    active_leases = list(archive_root.glob("projects/*/build_slots/unittest-slot/*.json"))
-    assert active_leases == []
+def write_lease(path: Path, **fields: Any) -> None:
+    """Plant a lease file the way a previous run would have left it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(fields, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def test_am_run_blocks_on_existing_exclusive_conflicts_even_for_shared_request(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
-    monkeypatch.setenv("WORKTREES_ENABLED", "1")
-    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "block")
-    monkeypatch.setenv("AGENT_NAME", "TestAgent")
-    get_settings.cache_clear()
-
-    proj = tmp_path / "proj"
-    proj.mkdir(parents=True, exist_ok=True)
-    _seed_project_agent(proj, "TestAgent", "secret-token")
-
-    def fake_post(self, url, json=None, headers=None):
-        tool_name = ((json or {}).get("params") or {}).get("name")
-        lifecycle = _am_run_lifecycle_response(tool_name)
-        if lifecycle is not None:
-            return lifecycle
-        if tool_name == "acquire_build_slot":
-            return _StaticJsonResponse(
-                {
-                    "jsonrpc": "2.0",
-                    "id": "am-run-acquire",
-                    "result": {
-                        "structuredContent": {
-                            "conflicts": [
-                                {
-                                    "slot": "unittest-slot",
-                                    "agent": "OtherAgent",
-                                    "branch": "main",
-                                    "exclusive": True,
-                                    "expires_ts": "2026-04-10T03:00:00Z",
-                                }
-                            ]
-                        }
-                    },
-                }
-            )
-        return _StaticJsonResponse({"jsonrpc": "2.0", "id": "ok", "result": {"structuredContent": {}}})
-
-    def unexpected_run(*args, **kwargs):
-        raise AssertionError("subprocess.run should not execute when an existing exclusive holder conflicts")
-
-    monkeypatch.setattr("httpx.Client.post", fake_post)
-    monkeypatch.setattr("subprocess.run", unexpected_run)
-
-    with pytest.raises(typer.Exit) as excinfo:
-        am_run(
-            slot="unittest-slot",
-            cmd=[sys.executable, "-c", "import sys; sys.exit(0)"],
-            project_path=proj,
-            agent="TestAgent",
-            ttl_seconds=120,
-            shared=True,
-            block_on_conflicts=True,
-        )
-
-    assert excinfo.value.exit_code == 1
-
-
-def test_am_run_surfaces_server_error_without_local_fallback(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
-    monkeypatch.setenv("WORKTREES_ENABLED", "1")
-    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "block")
-    monkeypatch.setenv("AGENT_NAME", "TestAgent")
-    get_settings.cache_clear()
-
-    proj = tmp_path / "proj"
-    proj.mkdir(parents=True, exist_ok=True)
-    _seed_project_agent(proj, "TestAgent", "secret-token")
-    seen_tools: list[str] = []
-
-    def fake_post(self, url, json=None, headers=None):
-        tool_name = ((json or {}).get("params") or {}).get("name")
-        seen_tools.append(str(tool_name))
-        lifecycle = _am_run_lifecycle_response(tool_name)
-        if lifecycle is not None:
-            return lifecycle
-        if tool_name == "acquire_build_slot":
-            return _StaticJsonResponse(
-                {
-                    "jsonrpc": "2.0",
-                    "id": "am-run-acquire",
-                    "error": {"message": "server denied build slot"},
-                }
-            )
-        return _StaticJsonResponse({"jsonrpc": "2.0", "id": "ok", "result": {"structuredContent": {}}})
-
-    def unexpected_run(*args, **kwargs):
-        raise AssertionError("subprocess.run should not execute when server rejects build-slot acquisition")
-
-    monkeypatch.setattr("httpx.Client.post", fake_post)
-    monkeypatch.setattr("subprocess.run", unexpected_run)
-
-    with pytest.raises(click.ClickException) as excinfo:
-        am_run(
-            slot="unittest-slot",
-            cmd=[sys.executable, "-c", "import sys; sys.exit(0)"],
-            project_path=proj,
-            agent="TestAgent",
-            ttl_seconds=120,
-            shared=False,
-            block_on_conflicts=True,
-        )
-
-    assert "server denied build slot" in str(excinfo.value)
-    assert "release_build_slot" not in seen_tools
-
-
-def test_am_run_includes_registration_token_in_server_requests(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
-    monkeypatch.setenv("WORKTREES_ENABLED", "1")
-    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "block")
-    monkeypatch.setenv("AGENT_NAME", "TestAgent")
-    get_settings.cache_clear()
-
-    proj = tmp_path / "proj"
-    proj.mkdir(parents=True, exist_ok=True)
-    _seed_project_agent(proj, "TestAgent", "secret-token")
-
-    seen_tokens: list[tuple[str, str | None]] = []
-
-    def fake_post(self, url, json=None, headers=None):
-        tool_name = ((json or {}).get("params") or {}).get("name")
-        arguments = ((json or {}).get("params") or {}).get("arguments") or {}
-        lifecycle = _am_run_lifecycle_response(tool_name)
-        if lifecycle is not None:
-            return lifecycle
-        if tool_name in {"acquire_build_slot", "release_build_slot"}:
-            seen_tokens.append((tool_name, arguments.get("registration_token")))
-        return _StaticJsonResponse({"jsonrpc": "2.0", "id": "ok", "result": {"structuredContent": {}}})
-
-    class _CompletedProcess:
-        returncode = 0
-
-    monkeypatch.setattr("httpx.Client.post", fake_post)
-    monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: _CompletedProcess())
-
-    am_run(
-        slot="unittest-slot",
-        cmd=[sys.executable, "-c", "import sys; sys.exit(0)"],
-        project_path=proj,
-        agent="TestAgent",
-        ttl_seconds=120,
-        shared=False,
+def make_git_repo(path: Path) -> Path:
+    """Create a real (empty) repository so identity resolution finds a root."""
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init"], cwd=str(path), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "builder@example.invalid"],
+        cwd=str(path),
+        check=True,
+        capture_output=True,
     )
+    subprocess.run(
+        ["git", "config", "user.name", "Builder"],
+        cwd=str(path),
+        check=True,
+        capture_output=True,
+    )
+    return path
 
-    assert ("acquire_build_slot", "secret-token") in seen_tokens
-    assert ("release_build_slot", "secret-token") in seen_tokens
+
+TRIVIAL_CHILD = [sys.executable, "-c", "raise SystemExit(0)"]
 
 
-def test_am_run_owns_server_slot_with_one_ephemeral_execution(
-    tmp_path: Path,
-    monkeypatch,
+def run_build(
+    setup: BuildSetup,
+    *,
+    project_path: Path | None = None,
+    slot: str = "unittest-slot",
+    cmd: list[str] | None = None,
+    agent: str = "Builder",
+    ttl: int = 120,
+    shared: bool = False,
+    block: bool = False,
 ) -> None:
-    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
-    monkeypatch.setenv("WORKTREES_ENABLED", "1")
-    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "block")
-    monkeypatch.setenv("AGENT_NAME", "TestAgent")
-    get_settings.cache_clear()
+    """Invoke ``am-run`` with the defaults every test in this file shares.
 
-    project = tmp_path / "project"
-    project.mkdir(parents=True)
-    _seed_project_agent(project, "TestAgent", "secret-token")
-    calls: list[tuple[str, dict[str, Any]]] = []
-    child_env: dict[str, str] = {}
-
-    def fake_post(self, url, json=None, headers=None):
-        tool_name = str(((json or {}).get("params") or {}).get("name") or "")
-        arguments = dict(((json or {}).get("params") or {}).get("arguments") or {})
-        calls.append((tool_name, arguments))
-        lifecycle = _am_run_lifecycle_response(tool_name)
-        if lifecycle is not None:
-            return lifecycle
-        return _StaticJsonResponse(
-            {"jsonrpc": "2.0", "id": "ok", "result": {"structuredContent": {}}}
-        )
-
-    class _CompletedProcess:
-        returncode = 0
-
-    def fake_run(cmd, env=None, check=False, **kwargs):
-        child_env.update(cast(dict[str, str], env or {}))
-        return _CompletedProcess()
-
-    monkeypatch.setattr("httpx.Client.post", fake_post)
-    monkeypatch.setattr("subprocess.run", fake_run)
-
+    A call site then spells out only what its own test is about; repeating the
+    other five arguments everywhere would bury that one difference.
+    """
     am_run(
-        slot="frontend-build",
-        cmd=[sys.executable, "-c", "raise SystemExit(0)"],
-        project_path=project,
-        agent="TestAgent",
-        ttl_seconds=120,
-        shared=False,
+        slot=slot,
+        cmd=TRIVIAL_CHILD if cmd is None else cmd,
+        project_path=setup.workdir if project_path is None else project_path,
+        agent=agent,
+        ttl_seconds=ttl,
+        shared=shared,
+        block_on_conflicts=block,
     )
 
-    tool_names = [name for name, _ in calls]
-    assert tool_names == [
+
+# ==========================================================================
+# Path components: the archive must survive hostile slot/agent/branch names
+# ==========================================================================
+
+
+@pytest.mark.parametrize("device", ["CON", "CON.txt", "NUL.txt", "LPT1.log", "COM3", "PRN", "aux"])
+def test_windows_device_names_never_survive_as_a_bare_component(device: str) -> None:
+    component = _safe_build_path_component(device)
+
+    stem = component.partition(".")[0].upper()
+    assert stem not in {"CON", "PRN", "AUX", "NUL", "COM3", "LPT1"}
+    assert component != device
+    assert len(component.encode("utf-8")) <= 80
+    assert _safe_build_path_component(device) == component
+    # Defusing "CON" to something fixed would fuse it with every other name
+    # that defuses the same way, so the digest of the original comes along.
+    assert component.endswith(hashlib.sha256(device.encode("utf-8")).hexdigest()[:32])
+
+
+@pytest.mark.parametrize("value", ["x" * 400, "ż" * 100, "a" * 79 + "bc"])
+def test_overlong_names_are_cut_to_the_portable_byte_budget(value: str) -> None:
+    component = _safe_build_path_component(value)
+
+    assert len(component.encode("utf-8")) <= 80
+    # Truncation alone would fuse distinct long names; the digest is what
+    # keeps them apart, so it has to be present and it has to be of the
+    # *original* value rather than of the truncated prefix.
+    assert component.endswith(hashlib.sha256(value.encode("utf-8")).hexdigest()[:32])
+
+
+def test_a_component_that_is_already_portable_is_passed_through_verbatim() -> None:
+    # This is what makes the disambiguation below observable: an untouched
+    # name carries no digest, so a digest means "this name was rewritten".
+    for value in ("feature_foo", "Builder", "frontend-build", "v1.2.3"):
+        assert _safe_build_path_component(value) == value
+
+
+def test_rewriting_two_different_names_never_produces_one_directory() -> None:
+    collision_bait = ["a/b", "a_b", "a b", ".", "..", "", "   ", "ż" * 100, "ż" * 101]
+
+    components = [_safe_build_path_component(value) for value in collision_bait]
+
+    assert len(set(components)) == len(collision_bait)
+    assert not set(components) & {"", ".", ".."}
+    assert all(len(component.encode("utf-8")) <= 80 for component in components)
+
+
+def test_a_real_child_process_receives_the_prepared_environment(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Every other test here replaces subprocess.run, which means none of them
+    # would notice if the env mapping stopped being a usable environment or
+    # the argv list stopped being passed through. This one spawns for real.
+    setup = build_setup(guard_mode="warn")
+    unreachable_endpoint(monkeypatch)
+    reported = tmp_path / "child-env.json"
+    program = (
+        "import json, os, pathlib; "
+        f"pathlib.Path({str(reported)!r}).write_text(json.dumps("
+        "{key: os.environ.get(key) for key in ('AM_SLOT', 'AGENT', 'SLUG', 'ARTIFACT_DIR')}))"
+    )
+
+    run_build(setup, slot="real-child", cmd=[sys.executable, "-c", program])
+
+    seen = json.loads(reported.read_text(encoding="utf-8"))
+    assert seen["AM_SLOT"] == "real-child"
+    assert seen["AGENT"] == "Builder"
+    assert seen["SLUG"] == _resolve_project_identity(setup.project_key)["slug"]
+    assert Path(seen["ARTIFACT_DIR"]).is_relative_to(setup.storage_root)
+
+
+# ==========================================================================
+# Offline: the local lease file is the authority
+# ==========================================================================
+
+
+def test_offline_run_leaves_exactly_one_local_lease_for_the_slot(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = build_setup(guard_mode="warn")
+    unreachable_endpoint(monkeypatch)
+    child = ChildStub().install(monkeypatch)
+
+    run_build(setup)
+
+    leases = setup.leases("unittest-slot")
+    assert len(leases) == 1
+    payload = json.loads(leases[0].read_text(encoding="utf-8"))
+    assert payload["slot"] == "unittest-slot"
+    assert payload["agent"] == "Builder"
+    assert payload["exclusive"] is True
+    # A reader has to be able to tell a fallback lease from a server one.
+    assert payload["authority"] == "local"
+    assert child.started
+
+
+def test_a_dotdot_slot_name_cannot_place_its_lease_outside_build_slots(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = build_setup(guard_mode="warn")
+    unreachable_endpoint(monkeypatch)
+    ChildStub().install(monkeypatch)
+
+    run_build(setup, slot="..")
+
+    archive = setup.archive_root()
+    build_slots_root = (archive / "build_slots").resolve()
+    leases = sorted(build_slots_root.rglob("*.json"))
+    assert len(leases) == 1
+    assert leases[0].resolve().is_relative_to(build_slots_root)
+    # ".." is not merely rejected, it is renamed to something inert.
+    assert leases[0].parent.name.startswith("unknown-")
+    assert sorted(archive.glob("*.json")) == []
+
+
+def test_traversal_in_agent_and_branch_keeps_the_child_writing_inside_the_archive(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    setup = build_setup(guard_mode="warn")
+    unreachable_endpoint(monkeypatch)
+    monkeypatch.setattr(
+        "mcp_agent_mail.app._resolve_project_identity",
+        lambda _path: {
+            "slug": "hostile-branch-project",
+            "project_uid": "uid-hostile",
+            "branch": "../../outside-branch\\..\\escaped",
+        },
+    )
+
+    def write_a_marker(record: ChildRun) -> None:
+        artifact_dir = Path(record.env["ARTIFACT_DIR"])
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        (artifact_dir / "child-wrote-this.txt").write_text("ok", encoding="utf-8")
+
+    child = ChildStub(while_running=write_a_marker).install(monkeypatch)
+
+    run_build(setup, slot="safe-slot", cmd=["unused"], agent="../outside-agent\\..\\escaped")
+
+    archive = setup.archive_root("hostile-branch-project").resolve()
+    artifacts_root = (archive / "artifacts").resolve()
+    artifact_dir = Path(child.env["ARTIFACT_DIR"]).resolve()
+    assert artifact_dir.is_relative_to(artifacts_root)
+
+    markers = sorted(tmp_path.rglob("child-wrote-this.txt"))
+    assert markers == [artifact_dir / "child-wrote-this.txt"]
+    assert markers[0].resolve().is_relative_to(archive)
+
+    leases = sorted((archive / "build_slots").resolve().rglob("*.json"))
+    assert len(leases) == 1
+    assert leases[0].resolve().is_relative_to((archive / "build_slots").resolve())
+
+
+def test_a_sanitised_branch_never_shares_an_artifact_directory_with_a_literal_one(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = build_setup(guard_mode="warn")
+    unreachable_endpoint(monkeypatch)
+    current_branch = {"value": "feature/foo"}
+    monkeypatch.setattr(
+        "mcp_agent_mail.app._resolve_project_identity",
+        lambda _path: {
+            "slug": "disambiguation-project",
+            "project_uid": "uid-disambiguation",
+            "branch": current_branch["value"],
+        },
+    )
+    child = ChildStub().install(monkeypatch)
+
+    for branch in ("feature/foo", "feature_foo"):
+        current_branch["value"] = branch
+        run_build(setup, slot="safe-slot", cmd=["unused"])
+
+    slashed, underscored = (Path(run.env["ARTIFACT_DIR"]) for run in child.runs)
+    assert slashed != underscored
+    # "feature_foo" was writable as-is, so it is used unchanged; "feature/foo"
+    # had to be rewritten, so it carries a digest and cannot land on top of it.
+    assert underscored.name == "feature_foo"
+    assert slashed.name == _safe_build_path_component("feature/foo")
+    archive = setup.archive_root("disambiguation-project").resolve()
+    assert all(path.resolve().is_relative_to(archive) for path in (slashed, underscored))
+
+    # Two independent executions, two lease files, neither overwriting the other.
+    leases = sorted((archive / "build_slots" / "safe-slot").glob("*.json"))
+    assert len(leases) == 2
+    assert len({path.name for path in leases}) == 2
+
+
+def test_a_ttl_below_the_server_floor_is_raised_before_the_child_starts(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = build_setup(guard_mode="warn")
+    unreachable_endpoint(monkeypatch)
+    observed: list[float] = []
+
+    def inspect_lease(_record: ChildRun) -> None:
+        # Read it from inside the child: after the run the lease is released,
+        # so a check afterwards could not tell a floored TTL from a released one.
+        leases = setup.leases("unittest-slot")
+        assert len(leases) == 1
+        payload = json.loads(leases[0].read_text(encoding="utf-8"))
+        acquired = datetime.fromisoformat(payload["acquired_ts"])
+        expires = datetime.fromisoformat(payload["expires_ts"])
+        observed.append((expires - acquired).total_seconds())
+
+    ChildStub(while_running=inspect_lease).install(monkeypatch)
+
+    run_build(setup, ttl=30)
+
+    assert observed == [pytest.approx(60, abs=5)]
+
+
+def test_reacquiring_our_own_lease_never_moves_its_expiry_backwards(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = build_setup(guard_mode="warn")
+    unreachable_endpoint(monkeypatch)
+    # Pin the execution id so the lease this run writes is the file planted
+    # below -- that is the only way to exercise the same-holder branch.
+    pinned = "0f0e0d0c-0b0a-4908-8706-050403020100"
+    monkeypatch.setattr(uuid, "uuid4", lambda: uuid.UUID(pinned))
+
+    lease_path = setup.archive_root() / "build_slots" / "unittest-slot" / f"{pinned}.json"
+    write_lease(
+        lease_path,
+        slot="unittest-slot",
+        agent="Builder",
+        branch="unknown",
+        exclusive=True,
+        execution_id=pinned,
+        acquired_ts=LONG_PAST,
+        expires_ts=FAR_FUTURE,
+    )
+    seen: list[dict[str, Any]] = []
+
+    def read_lease(_record: ChildRun) -> None:
+        seen.append(json.loads(lease_path.read_text(encoding="utf-8")))
+
+    ChildStub(while_running=read_lease).install(monkeypatch)
+
+    run_build(setup, ttl=30)
+
+    assert len(seen) == 1
+    assert seen[0]["acquired_ts"] == LONG_PAST
+    assert datetime.fromisoformat(seen[0]["expires_ts"]) >= datetime.fromisoformat(FAR_FUTURE)
+
+
+def test_another_holders_active_lease_is_left_byte_for_byte_alone(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = build_setup(guard_mode="warn")
+    unreachable_endpoint(monkeypatch)
+    foreign = setup.archive_root() / "build_slots" / "unittest-slot" / "someone-else.json"
+    write_lease(
+        foreign,
+        slot="unittest-slot",
+        agent="OtherBuilder",
+        branch="main",
+        exclusive=True,
+        execution_id="not-ours",
+        acquired_ts=LONG_PAST,
+        expires_ts=FAR_FUTURE,
+    )
+    before = foreign.read_bytes()
+    ChildStub().install(monkeypatch)
+
+    run_build(setup)
+
+    # Neither the acquire nor the release path may touch a lease it does not own.
+    assert foreign.read_bytes() == before
+
+
+def test_every_lease_file_touch_happens_under_the_archive_write_lock(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = build_setup(guard_mode="warn")
+    unreachable_endpoint(monkeypatch)
+
+    # The counter has to be process-wide, not per-thread: the code holds the
+    # lock on one thread and then performs the file IO on `asyncio.to_thread`
+    # workers, so a thread-local count reads zero for every real access.
+    # A process-wide count is only unambiguous while at most one lock section
+    # can be open, so the renewer is deliberately left dormant here -- the
+    # default interval for a 120s TTL is 60s and the child returns at once,
+    # which makes the main thread the only actor for the whole measurement.
+    depth = 0
+    observed_depths: list[int] = []
+    path_type = type(setup.workdir)
+    originals = {name: getattr(path_type, name) for name in ("glob", "read_text", "write_text", "mkdir")}
+    original_lock = cli_module.archive_write_lock
+
+    def note(path: Path) -> None:
+        if "build_slots" in path.parts:
+            observed_depths.append(depth)
+
+    def wrap(name: str) -> Callable[..., Any]:
+        original = originals[name]
+
+        def wrapper(self: Path, *args: Any, **kwargs: Any) -> Any:
+            note(self)
+            return original(self, *args, **kwargs)
+
+        return wrapper
+
+    @contextlib.asynccontextmanager
+    async def counting_lock(*args: Any, **kwargs: Any) -> Any:
+        nonlocal depth
+        async with original_lock(*args, **kwargs):
+            depth += 1
+            try:
+                yield
+            finally:
+                depth -= 1
+
+    for name in originals:
+        monkeypatch.setattr(path_type, name, wrap(name))
+    monkeypatch.setattr(cli_module, "archive_write_lock", counting_lock)
+    child = ChildStub().install(monkeypatch)
+
+    run_build(setup)
+
+    assert child.started
+    assert observed_depths, "no build_slots file access was observed at all"
+    # Sections never nest or overlap, so "depth > 0" really does mean
+    # "inside the one section that is open".
+    assert set(observed_depths) == {1}
+
+
+def test_asking_for_a_shared_lease_does_not_buy_past_a_local_exclusive_holder(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = build_setup(guard_mode="block")
+    unreachable_endpoint(monkeypatch)
+    write_lease(
+        setup.archive_root() / "build_slots" / "unittest-slot" / "someone-else.json",
+        slot="unittest-slot",
+        agent="OtherBuilder",
+        branch="main",
+        exclusive=True,
+        acquired_ts=LONG_PAST,
+        expires_ts=FAR_FUTURE,
+    )
+    forbid_child(monkeypatch, "the child must not start while an exclusive holder is live")
+
+    with pytest.raises(typer.Exit) as raised:
+        run_build(setup, shared=True, block=True)
+
+    assert raised.value.exit_code == 1
+
+
+def test_a_shared_local_holder_does_not_block_another_shared_request(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The complement of the test above: without this one, blanket refusal
+    # would pass just as well as reading the `exclusive` flag.
+    setup = build_setup(guard_mode="block")
+    unreachable_endpoint(monkeypatch)
+    write_lease(
+        setup.archive_root() / "build_slots" / "unittest-slot" / "someone-else.json",
+        slot="unittest-slot",
+        agent="OtherBuilder",
+        branch="main",
+        exclusive=False,
+        acquired_ts=LONG_PAST,
+        expires_ts=FAR_FUTURE,
+    )
+    child = ChildStub().install(monkeypatch)
+
+    run_build(setup, shared=True, block=True)
+
+    assert child.started
+
+
+# ==========================================================================
+# Server authority: lifecycle, tokens, and every way it can go wrong
+# ==========================================================================
+
+
+def test_a_server_run_opens_one_execution_and_threads_it_through_every_call(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = build_setup()
+    register_local_agent(setup, name="Builder", token="secret-token")
+    endpoint = StubEndpoint().install(monkeypatch)
+    child = ChildStub().install(monkeypatch)
+
+    run_build(setup, slot="frontend-build")
+
+    assert endpoint.tool_names == [
         "ensure_project",
         "start_agent_execution",
         "acquire_build_slot",
         "release_build_slot",
         "end_agent_execution",
     ]
-    by_name = dict(calls)
-    start = by_name["start_agent_execution"]
+
+    start = endpoint.arguments_for("start_agent_execution")
     assert start["kind"] == "session"
     assert start["client_name"] == "am-run"
-    assert start["lifecycle_protocol_version"] == 1
-    assert re.fullmatch(r"[0-9a-f]{64}", start["execution_token"])
+    assert start["lifecycle_protocol_version"] == PROTOCOL_VERSION
     assert start["registration_token"] == "secret-token"
-    for tool_name in ("acquire_build_slot", "release_build_slot"):
-        assert by_name[tool_name]["execution_id"] == _TEST_AM_RUN_EXECUTION_ID
-        assert by_name[tool_name]["execution_token"] == start["execution_token"]
-        assert by_name[tool_name]["lifecycle_protocol_version"] == 1
-    end = by_name["end_agent_execution"]
-    assert end["execution_id"] == _TEST_AM_RUN_EXECUTION_ID
-    assert end["execution_token"] == start["execution_token"]
-    assert end["status"] == "completed"
-    assert child_env["AGENT_EXECUTION_ID"] == _TEST_AM_RUN_EXECUTION_ID
+    # The capability the server will check on every later call: 32 random bytes.
+    assert re.fullmatch(r"[0-9a-f]{64}", start["execution_token"])
+
+    for tool in ("acquire_build_slot", "release_build_slot", "end_agent_execution"):
+        arguments = endpoint.arguments_for(tool)
+        # The server's id, not the uuid4 am-run minted for the offline case.
+        assert arguments["execution_id"] == SERVER_EXECUTION_ID
+        assert arguments["execution_token"] == start["execution_token"]
+        assert arguments["lifecycle_protocol_version"] == PROTOCOL_VERSION
+
+    assert endpoint.arguments_for("end_agent_execution")["status"] == "completed"
+    assert child.env["AGENT_EXECUTION_ID"] == SERVER_EXECUTION_ID
 
 
-def test_am_run_resolves_registration_token_case_insensitively(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
-    monkeypatch.setenv("WORKTREES_ENABLED", "1")
-    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "block")
-    monkeypatch.setenv("AGENT_NAME", "testagent")
-    get_settings.cache_clear()
-
-    proj = tmp_path / "proj"
-    proj.mkdir(parents=True, exist_ok=True)
-    _seed_project_agent(proj, "TestAgent", "secret-token")
-
-    seen_tokens: list[tuple[str, str | None]] = []
-
-    def fake_post(self, url, json=None, headers=None):
-        tool_name = ((json or {}).get("params") or {}).get("name")
-        arguments = ((json or {}).get("params") or {}).get("arguments") or {}
-        lifecycle = _am_run_lifecycle_response(tool_name)
-        if lifecycle is not None:
-            return lifecycle
-        if tool_name in {"acquire_build_slot", "release_build_slot"}:
-            seen_tokens.append((tool_name, arguments.get("registration_token")))
-        return _StaticJsonResponse({"jsonrpc": "2.0", "id": "ok", "result": {"structuredContent": {}}})
-
-    class _CompletedProcess:
-        returncode = 0
-
-    monkeypatch.setattr("httpx.Client.post", fake_post)
-    monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: _CompletedProcess())
-
-    am_run(
-        slot="unittest-slot",
-        cmd=[sys.executable, "-c", "import sys; sys.exit(0)"],
-        project_path=proj,
-        agent="testagent",
-        ttl_seconds=120,
-        shared=False,
-    )
-
-    assert ("acquire_build_slot", "secret-token") in seen_tokens
-    assert ("release_build_slot", "secret-token") in seen_tokens
-
-
-def test_am_run_surfaces_invalid_json_without_local_fallback(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
-    monkeypatch.setenv("WORKTREES_ENABLED", "1")
-    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "block")
-    monkeypatch.setenv("AGENT_NAME", "TestAgent")
-    get_settings.cache_clear()
-
-    proj = tmp_path / "proj"
-    proj.mkdir(parents=True, exist_ok=True)
-    _seed_project_agent(proj, "TestAgent", "secret-token")
-
-    def fake_post(self, url, json=None, headers=None):
-        return _InvalidJsonResponse()
-
-    def unexpected_run(*args, **kwargs):
-        raise AssertionError("subprocess.run should not execute when server returns invalid JSON")
-
-    monkeypatch.setattr("httpx.Client.post", fake_post)
-    monkeypatch.setattr("subprocess.run", unexpected_run)
-
-    with pytest.raises(click.ClickException) as excinfo:
-        am_run(
-            slot="unittest-slot",
-            cmd=[sys.executable, "-c", "import sys; sys.exit(0)"],
-            project_path=proj,
-            agent="TestAgent",
-            ttl_seconds=120,
-            shared=False,
-            block_on_conflicts=True,
-        )
-
-    assert "invalid JSON response from server" in str(excinfo.value)
-
-
-def test_am_run_surfaces_http_status_without_local_fallback(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
-    monkeypatch.setenv("WORKTREES_ENABLED", "1")
-    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "block")
-    monkeypatch.setenv("AGENT_NAME", "TestAgent")
-    get_settings.cache_clear()
-
-    proj = tmp_path / "proj"
-    proj.mkdir(parents=True, exist_ok=True)
-    _seed_project_agent(proj, "TestAgent", "secret-token")
-
-    def fake_post(self, url, json=None, headers=None):
-        return _StatusErrorResponse(401)
-
-    def unexpected_run(*args, **kwargs):
-        raise AssertionError("subprocess.run should not execute when server returns an HTTP status error")
-
-    monkeypatch.setattr("httpx.Client.post", fake_post)
-    monkeypatch.setattr("subprocess.run", unexpected_run)
-
-    with pytest.raises(click.ClickException) as excinfo:
-        am_run(
-            slot="unittest-slot",
-            cmd=[sys.executable, "-c", "import sys; sys.exit(0)"],
-            project_path=proj,
-            agent="TestAgent",
-            ttl_seconds=120,
-            shared=False,
-            block_on_conflicts=True,
-        )
-
-    assert "HTTP 401 from server" in str(excinfo.value)
-
-
-def test_am_run_uses_repo_root_identity_for_subdirectory_path(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
-    monkeypatch.setenv("WORKTREES_ENABLED", "0")
-    monkeypatch.setenv("AGENT_NAME", "TestAgent")
-    get_settings.cache_clear()
-
-    repo = tmp_path / "repo"
-    subdir = repo / "nested" / "work"
-    subdir.mkdir(parents=True, exist_ok=True)
-
-    import subprocess as stdlib_subprocess
-
-    stdlib_subprocess.run(["git", "init"], cwd=str(repo), check=True, capture_output=True)
-    stdlib_subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True)
-    stdlib_subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo), check=True)
-
-    root_ident = _resolve_project_identity(str(repo))
-    subdir_ident = _resolve_project_identity(str(subdir))
-    assert root_ident["slug"] != subdir_ident["slug"]
-
-    captured: dict[str, Any] = {}
-
-    class _CompletedProcess:
-        returncode = 0
-
-    def fake_run(cmd, env=None, check=False, **kwargs):
-        captured["cmd"] = list(cmd)
-        captured["env"] = dict(env or {})
-        return _CompletedProcess()
-
-    monkeypatch.setattr("subprocess.run", fake_run)
-
-    am_run(
-        slot="subdir-slot",
-        cmd=[sys.executable, "-c", "import sys; sys.exit(0)"],
-        project_path=subdir,
-        agent="TestAgent",
-        ttl_seconds=120,
-        shared=False,
-    )
-
-    assert captured["env"]["SLUG"] == root_ident["slug"]
-    assert captured["env"]["PROJECT_UID"] == root_ident["project_uid"]
-    assert "AGENT_EXECUTION_ID" not in captured["env"]
-    expected_artifact_dir = (
-        Path(get_settings().storage.root).expanduser().resolve()
-        / "projects"
-        / root_ident["slug"]
-        / "artifacts"
-        / "TestAgent"
-        / captured["env"]["BRANCH"]
-    )
-    assert captured["env"]["ARTIFACT_DIR"] == str(expected_artifact_dir)
-
-
-def test_am_run_lifecycle_is_independent_of_worktree_gate_and_redacts_argv(
-    tmp_path: Path,
-    monkeypatch,
-    capsys,
+def test_a_failing_child_ends_the_execution_as_failed_and_propagates_its_code(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
-    monkeypatch.setenv("WORKTREES_ENABLED", "0")
-    monkeypatch.setenv("AGENT_NAME", "TestAgent")
-    get_settings.cache_clear()
+    setup = build_setup()
+    register_local_agent(setup, name="Builder", token="secret-token")
+    endpoint = StubEndpoint().install(monkeypatch)
+    ChildStub(returncode=42).install(monkeypatch)
 
-    project = tmp_path / "project"
-    project.mkdir(parents=True)
-    _seed_project_agent(project, "TestAgent", "secret-token")
-    calls: list[tuple[str, dict[str, Any]]] = []
-    child_env: dict[str, str] = {}
+    with pytest.raises(typer.Exit) as raised:
+        run_build(setup)
 
-    def fake_post(self, url, json=None, headers=None):
-        tool_name = str(((json or {}).get("params") or {}).get("name") or "")
-        arguments = dict(((json or {}).get("params") or {}).get("arguments") or {})
-        calls.append((tool_name, arguments))
-        lifecycle = _am_run_lifecycle_response(tool_name)
-        if lifecycle is not None:
-            return lifecycle
-        return _StaticJsonResponse(
-            {"jsonrpc": "2.0", "id": "ok", "result": {"structuredContent": {}}}
-        )
-
-    class _CompletedProcess:
-        returncode = 0
-
-    def fake_run(cmd, env=None, check=False, **kwargs):
-        child_env.update(cast(dict[str, str], env or {}))
-        return _CompletedProcess()
-
-    monkeypatch.setattr("httpx.Client.post", fake_post)
-    monkeypatch.setattr("subprocess.run", fake_run)
-
-    am_run(
-        slot="no-slot-gate",
-        cmd=[sys.executable, "--token", "TOP_SECRET_ARG"],
-        project_path=project,
-        agent="TestAgent",
-        ttl_seconds=120,
-        shared=False,
-    )
-
-    assert [name for name, _arguments in calls] == [
-        "ensure_project",
-        "start_agent_execution",
-        "end_agent_execution",
-    ]
-    start_arguments = dict(calls)["start_agent_execution"]
-    assert start_arguments["task_description"] == "am-run build slot: no-slot-gate"
-    assert "TOP_SECRET_ARG" not in json.dumps(start_arguments)
-    assert child_env["AGENT_EXECUTION_ID"] == _TEST_AM_RUN_EXECUTION_ID
-    assert "TOP_SECRET_ARG" not in capsys.readouterr().out
+    assert raised.value.exit_code == 42
+    assert endpoint.arguments_for("end_agent_execution")["status"] == "failed"
+    # A failed build still owes the server its slot back.
+    assert endpoint.called("release_build_slot")
 
 
-def test_am_run_local_fallback_normalizes_short_ttl_before_running_child(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
-    monkeypatch.setenv("WORKTREES_ENABLED", "1")
-    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "warn")
-    monkeypatch.setenv("AGENT_NAME", "TestAgent")
-    get_settings.cache_clear()
-    monkeypatch.setattr(
-        "httpx.Client.post",
-        lambda *args, **kwargs: (_ for _ in ()).throw(httpx.ConnectError("server unavailable")),
-    )
+def test_the_registration_token_accompanies_every_build_slot_call(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = build_setup()
+    register_local_agent(setup, name="Builder", token="secret-token")
+    endpoint = StubEndpoint().install(monkeypatch)
+    monkeypatch.setattr("mcp_agent_mail.cli._build_slot_renew_interval_seconds", lambda _ttl: 0.01)
+    ChildStub(while_running=lambda _record: time.sleep(0.05)).install(monkeypatch)
 
-    proj = tmp_path / "proj"
-    proj.mkdir(parents=True, exist_ok=True)
+    run_build(setup)
 
-    class _CompletedProcess:
-        returncode = 0
-
-    def fake_run(cmd, env=None, check=False, **kwargs):
-        lease_files = list(
-            Path(get_settings().storage.root).expanduser().resolve().glob(
-                "projects/*/build_slots/unittest-slot/*.json"
-            )
-        )
-        assert len(lease_files) == 1
-        payload = json.loads(lease_files[0].read_text(encoding="utf-8"))
-        acquired = datetime.fromisoformat(payload["acquired_ts"])
-        expires = datetime.fromisoformat(payload["expires_ts"])
-        assert (expires - acquired).total_seconds() >= 60
-        return _CompletedProcess()
-
-    monkeypatch.setattr("subprocess.run", fake_run)
-
-    am_run(
-        slot="unittest-slot",
-        cmd=[sys.executable, "-c", "import sys; sys.exit(0)"],
-        project_path=proj,
-        agent="TestAgent",
-        ttl_seconds=30,
-        shared=False,
-    )
+    for tool in SLOT_TOOLS:
+        tokens = endpoint.every_argument(tool, "registration_token")
+        assert tokens, f"{tool} was never called; saw {endpoint.tool_names}"
+        assert set(tokens) == {"secret-token"}
 
 
-def test_am_run_local_fallback_does_not_shorten_active_same_holder_lease(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
-    monkeypatch.setenv("WORKTREES_ENABLED", "1")
-    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "warn")
-    monkeypatch.setenv("AGENT_NAME", "TestAgent")
-    get_settings.cache_clear()
-    monkeypatch.setattr(
-        "httpx.Client.post",
-        lambda *args, **kwargs: (_ for _ in ()).throw(httpx.ConnectError("server unavailable")),
-    )
+def test_the_registration_token_is_found_whatever_the_case_of_the_agent_name(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = build_setup(agent_name="builder")
+    register_local_agent(setup, name="Builder", token="secret-token")
+    endpoint = StubEndpoint().install(monkeypatch)
+    ChildStub().install(monkeypatch)
 
-    proj = tmp_path / "proj"
-    proj.mkdir(parents=True, exist_ok=True)
-    ident = _resolve_project_identity(str(proj))
-    lease_path = (
-        Path(get_settings().storage.root).expanduser().resolve()
-        / "projects"
-        / ident["slug"]
-        / "build_slots"
-        / "unittest-slot"
-        / "TestAgent__unknown.json"
-    )
-    lease_path.parent.mkdir(parents=True, exist_ok=True)
-    original_acquired = "2026-04-10T01:00:00+00:00"
-    original_exp = "2099-04-10T02:00:00+00:00"
-    lease_path.write_text(
-        json.dumps(
+    run_build(setup, agent="builder")
+
+    assert endpoint.arguments_for("acquire_build_slot")["registration_token"] == "secret-token"
+    assert endpoint.arguments_for("release_build_slot")["registration_token"] == "secret-token"
+
+
+def test_a_reachable_server_and_no_registration_token_refuses_the_run(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = build_setup()  # deliberately no registered agent
+    endpoint = StubEndpoint().install(monkeypatch)
+    forbid_child(monkeypatch, "the child must not start without a slot")
+
+    with pytest.raises(click.ClickException) as raised:
+        run_build(setup)
+
+    assert "registration token" in str(raised.value)
+    # It fails before opening an execution, so there is nothing to clean up.
+    assert not endpoint.called("start_agent_execution")
+    assert not endpoint.called("acquire_build_slot")
+
+
+def test_server_reported_conflicts_stop_the_build_and_write_no_local_lease(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = build_setup()
+    register_local_agent(setup, name="Builder", token="secret-token")
+    endpoint = StubEndpoint().install(monkeypatch)
+    endpoint.answer(
+        "acquire_build_slot",
+        RpcResult(
             {
-                "slot": "unittest-slot",
-                "agent": "TestAgent",
-                "branch": "unknown",
-                "exclusive": True,
-                "acquired_ts": original_acquired,
-                "expires_ts": original_exp,
-            },
-            indent=2,
+                "conflicts": [
+                    {
+                        "slot": "unittest-slot",
+                        "agent": "OtherBuilder",
+                        "branch": "main",
+                        "expires_ts": "2026-04-10T03:00:00Z",
+                    }
+                ]
+            }
         ),
-        encoding="utf-8",
     )
+    forbid_child(monkeypatch, "the child must not start when the server reports a conflict")
 
-    class _CompletedProcess:
-        returncode = 0
+    with pytest.raises(typer.Exit) as raised:
+        run_build(setup, block=True)
 
-    def fake_run(cmd, env=None, check=False, **kwargs):
-        payload = json.loads(lease_path.read_text(encoding="utf-8"))
-        assert payload["acquired_ts"] == original_acquired
-        assert datetime.fromisoformat(payload["expires_ts"]) >= datetime.fromisoformat(original_exp)
-        return _CompletedProcess()
-
-    monkeypatch.setattr("subprocess.run", fake_run)
-
-    am_run(
-        slot="unittest-slot",
-        cmd=[sys.executable, "-c", "import sys; sys.exit(0)"],
-        project_path=proj,
-        agent="TestAgent",
-        ttl_seconds=30,
-        shared=False,
-    )
+    assert raised.value.exit_code == 1
+    # Falling back locally here would hand the slot to two builders at once.
+    assert setup.every_lease() == []
 
 
-def test_am_run_local_fallback_slot_io_holds_archive_lock(tmp_path: Path, monkeypatch) -> None:
-    import mcp_agent_mail.cli as cli_module
-
-    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
-    monkeypatch.setenv("WORKTREES_ENABLED", "1")
-    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "warn")
-    monkeypatch.setenv("AGENT_NAME", "TestAgent")
-    get_settings.cache_clear()
-    monkeypatch.setattr(
-        "httpx.Client.post",
-        lambda *args, **kwargs: (_ for _ in ()).throw(httpx.ConnectError("server unavailable")),
-    )
-    monkeypatch.setattr("mcp_agent_mail.cli._build_slot_renew_interval_seconds", lambda _: 0.01)
-
-    proj = tmp_path / "proj"
-    proj.mkdir(parents=True, exist_ok=True)
-    path_type = type(Path("/"))
-    original_glob = path_type.glob
-    original_read_text = path_type.read_text
-    original_write_text = path_type.write_text
-    original_mkdir = path_type.mkdir
-    original_archive_write_lock = cli_module.archive_write_lock
-    lock_depth = 0
-    slot_io_depths: list[int] = []
-
-    def _record_slot_io(path: Path) -> None:
-        if "build_slots" in path.parts:
-            slot_io_depths.append(lock_depth)
-
-    def checked_glob(self: Path, pattern: str, *args, **kwargs):
-        _record_slot_io(self)
-        return original_glob(self, pattern, *args, **kwargs)
-
-    def checked_read_text(self: Path, *args, **kwargs) -> str:
-        _record_slot_io(self)
-        return original_read_text(self, *args, **kwargs)
-
-    def checked_write_text(self: Path, *args, **kwargs) -> int:
-        _record_slot_io(self)
-        return original_write_text(self, *args, **kwargs)
-
-    def checked_mkdir(self: Path, *args, **kwargs):
-        _record_slot_io(self)
-        return original_mkdir(self, *args, **kwargs)
-
-    @contextlib.asynccontextmanager
-    async def tracking_archive_write_lock(*args: Any, **kwargs: Any):
-        nonlocal lock_depth
-        lock_depth += 1
-        try:
-            async with original_archive_write_lock(*args, **kwargs):
-                yield
-        finally:
-            lock_depth -= 1
-
-    class _CompletedProcess:
-        returncode = 0
-
-    def fake_run(*args, **kwargs):
-        time.sleep(0.05)
-        return _CompletedProcess()
-
-    monkeypatch.setattr(path_type, "glob", checked_glob)
-    monkeypatch.setattr(path_type, "read_text", checked_read_text)
-    monkeypatch.setattr(path_type, "write_text", checked_write_text)
-    monkeypatch.setattr(path_type, "mkdir", checked_mkdir)
-    monkeypatch.setattr(cli_module, "archive_write_lock", tracking_archive_write_lock)
-    monkeypatch.setattr("subprocess.run", fake_run)
-
-    am_run(
-        slot="unittest-slot",
-        cmd=[sys.executable, "-c", "import sys; sys.exit(0)"],
-        project_path=proj,
-        agent="TestAgent",
-        ttl_seconds=120,
-        shared=False,
-    )
-
-    assert slot_io_depths
-    assert all(depth > 0 for depth in slot_io_depths)
-
-
-def test_am_run_local_fallback_blocks_on_existing_exclusive_conflicts_even_for_shared_request(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
-    monkeypatch.setenv("WORKTREES_ENABLED", "1")
-    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "block")
-    monkeypatch.setenv("AGENT_NAME", "TestAgent")
-    get_settings.cache_clear()
-    monkeypatch.setattr(
-        "httpx.Client.post",
-        lambda *args, **kwargs: (_ for _ in ()).throw(httpx.ConnectError("server unavailable")),
-    )
-
-    proj = tmp_path / "proj"
-    proj.mkdir(parents=True, exist_ok=True)
-    ident = _resolve_project_identity(str(proj))
-    slot_dir = (
-        Path(get_settings().storage.root).expanduser().resolve()
-        / "projects"
-        / ident["slug"]
-        / "build_slots"
-        / "unittest-slot"
-    )
-    slot_dir.mkdir(parents=True, exist_ok=True)
-    (slot_dir / "OtherAgent__main.json").write_text(
-        json.dumps(
+def test_asking_for_a_shared_lease_does_not_buy_past_a_server_side_exclusive_holder(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = build_setup()
+    register_local_agent(setup, name="Builder", token="secret-token")
+    endpoint = StubEndpoint().install(monkeypatch)
+    endpoint.answer(
+        "acquire_build_slot",
+        RpcResult(
             {
-                "slot": "unittest-slot",
-                "agent": "OtherAgent",
-                "branch": "main",
-                "exclusive": True,
-                "acquired_ts": "2026-04-10T01:00:00+00:00",
-                "expires_ts": "2099-04-10T02:00:00+00:00",
-            },
-            indent=2,
+                "conflicts": [
+                    {
+                        "slot": "unittest-slot",
+                        "agent": "OtherBuilder",
+                        "branch": "main",
+                        "exclusive": True,
+                        "expires_ts": "2026-04-10T03:00:00Z",
+                    }
+                ]
+            }
         ),
-        encoding="utf-8",
     )
+    forbid_child(monkeypatch, "a shared request must not run past an exclusive holder")
 
-    def unexpected_run(*args, **kwargs):
-        raise AssertionError("subprocess.run should not execute when a local exclusive holder conflicts")
+    with pytest.raises(typer.Exit) as raised:
+        run_build(setup, shared=True, block=True)
 
-    monkeypatch.setattr("subprocess.run", unexpected_run)
-
-    with pytest.raises(typer.Exit) as excinfo:
-        am_run(
-            slot="unittest-slot",
-            cmd=[sys.executable, "-c", "import sys; sys.exit(0)"],
-            project_path=proj,
-            agent="TestAgent",
-            ttl_seconds=120,
-            shared=True,
-            block_on_conflicts=True,
-        )
-
-    assert excinfo.value.exit_code == 1
+    assert raised.value.exit_code == 1
 
 
-def test_build_slot_renew_timing_uses_half_life_of_effective_ttl() -> None:
-    assert _effective_build_slot_ttl_seconds(30) == 60
-    assert _build_slot_renew_interval_seconds(30) == 30
-    assert _build_slot_renew_interval_seconds(120) == 60
-
-
-def test_am_run_server_uses_effective_ttl_for_build_slot_requests(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
-    monkeypatch.setenv("WORKTREES_ENABLED", "1")
-    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "block")
-    monkeypatch.setenv("AGENT_NAME", "TestAgent")
-    get_settings.cache_clear()
-
-    proj = tmp_path / "proj"
-    proj.mkdir(parents=True, exist_ok=True)
-    _seed_project_agent(proj, "TestAgent", "secret-token")
-
-    acquire_ttls: list[int] = []
-
-    def fake_post(self, url, json=None, headers=None):
-        tool_name = ((json or {}).get("params") or {}).get("name")
-        arguments = ((json or {}).get("params") or {}).get("arguments") or {}
-        lifecycle = _am_run_lifecycle_response(tool_name)
-        if lifecycle is not None:
-            return lifecycle
-        if tool_name == "acquire_build_slot":
-            acquire_ttls.append(int(arguments["ttl_seconds"]))
-        return _StaticJsonResponse({"jsonrpc": "2.0", "id": "ok", "result": {"structuredContent": {}}})
-
-    class _CompletedProcess:
-        returncode = 0
-
-    monkeypatch.setattr("httpx.Client.post", fake_post)
-    monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: _CompletedProcess())
-
-    am_run(
-        slot="unittest-slot",
-        cmd=[sys.executable, "-c", "import sys; sys.exit(0)"],
-        project_path=proj,
-        agent="TestAgent",
-        ttl_seconds=30,
-        shared=False,
-    )
-
-    assert acquire_ttls == [60]
-
-
-def test_am_run_stops_server_renewer_before_release(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
-    monkeypatch.setenv("WORKTREES_ENABLED", "1")
-    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "block")
-    monkeypatch.setenv("AGENT_NAME", "TestAgent")
-    get_settings.cache_clear()
-
-    proj = tmp_path / "proj"
-    proj.mkdir(parents=True, exist_ok=True)
-    _seed_project_agent(proj, "TestAgent", "secret-token")
-
-    release_started = threading.Event()
-    renewed_during_release = threading.Event()
-
-    def fake_post(self, url, json=None, headers=None):
-        tool_name = ((json or {}).get("params") or {}).get("name")
-        lifecycle = _am_run_lifecycle_response(tool_name)
-        if lifecycle is not None:
-            return lifecycle
-        if tool_name == "release_build_slot":
-            release_started.set()
-            time.sleep(0.05)
-        elif tool_name == "renew_build_slot" and release_started.is_set():
-            renewed_during_release.set()
-        return _StaticJsonResponse({"jsonrpc": "2.0", "id": "ok", "result": {"structuredContent": {}}})
-
-    class _CompletedProcess:
-        returncode = 0
-
-    monkeypatch.setattr("httpx.Client.post", fake_post)
-    monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: _CompletedProcess())
-    monkeypatch.setattr("mcp_agent_mail.cli._build_slot_renew_interval_seconds", lambda _: 0.01)
-
-    am_run(
-        slot="unittest-slot",
-        cmd=[sys.executable, "-c", "import sys; sys.exit(0)"],
-        project_path=proj,
-        agent="TestAgent",
-        ttl_seconds=120,
-        shared=False,
-    )
-
-    assert release_started.is_set()
-    assert not renewed_during_release.is_set()
-
-
-def test_am_run_server_renew_failure_never_creates_local_lease(
-    tmp_path: Path,
-    monkeypatch,
+def test_a_rejected_acquire_is_reported_verbatim_and_releases_nothing(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
-    monkeypatch.setenv("WORKTREES_ENABLED", "1")
-    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "block")
-    monkeypatch.setenv("AGENT_NAME", "TestAgent")
-    get_settings.cache_clear()
+    setup = build_setup()
+    register_local_agent(setup, name="Builder", token="secret-token")
+    endpoint = StubEndpoint().install(monkeypatch)
+    endpoint.answer("acquire_build_slot", RpcError("server denied build slot"))
+    forbid_child(monkeypatch, "the child must not start when acquisition was denied")
 
-    project = tmp_path / "project"
-    project.mkdir(parents=True)
-    _seed_project_agent(project, "TestAgent", "secret-token")
-    renew_attempted = threading.Event()
+    with pytest.raises(click.ClickException) as raised:
+        run_build(setup, block=True)
 
-    def fake_post(self, url, json=None, headers=None):
-        tool_name = ((json or {}).get("params") or {}).get("name")
-        lifecycle = _am_run_lifecycle_response(tool_name)
-        if lifecycle is not None:
-            return lifecycle
-        if tool_name == "renew_build_slot":
-            renew_attempted.set()
-            raise httpx.ConnectError("renew unavailable")
-        return _StaticJsonResponse(
-            {"jsonrpc": "2.0", "id": "ok", "result": {"structuredContent": {}}}
-        )
-
-    class _CompletedProcess:
-        returncode = 0
-
-    def fake_run(*args, **kwargs):
-        assert renew_attempted.wait(timeout=1)
-        return _CompletedProcess()
-
-    monkeypatch.setattr("httpx.Client.post", fake_post)
-    monkeypatch.setattr("subprocess.run", fake_run)
-    monkeypatch.setattr(
-        "mcp_agent_mail.cli._build_slot_renew_interval_seconds", lambda _: 0.01
-    )
-
-    am_run(
-        slot="unittest-slot",
-        cmd=[sys.executable, "-c", "raise SystemExit(0)"],
-        project_path=project,
-        agent="TestAgent",
-        ttl_seconds=120,
-        shared=False,
-    )
-
-    assert renew_attempted.is_set()
-    storage_root = Path(get_settings().storage.root).expanduser().resolve()
-    assert list(storage_root.glob("projects/*/build_slots/**/*.json")) == []
+    assert "server denied build slot" in str(raised.value)
+    # Releasing a slot we never held could evict whoever does hold it.
+    assert not endpoint.called("release_build_slot")
+    assert setup.every_lease() == []
 
 
-def test_am_run_ambiguous_server_acquire_fails_closed_without_local_lease(
-    tmp_path: Path,
-    monkeypatch,
+def test_an_undecodable_body_is_named_as_such_rather_than_treated_as_success(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
-    monkeypatch.setenv("WORKTREES_ENABLED", "1")
-    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "block")
-    monkeypatch.setenv("AGENT_NAME", "TestAgent")
-    get_settings.cache_clear()
+    setup = build_setup()
+    register_local_agent(setup, name="Builder", token="secret-token")
+    StubEndpoint().install(monkeypatch).answer("ensure_project", UndecodableBody())
+    forbid_child(monkeypatch, "the child must not start on an undecodable server reply")
 
-    project = tmp_path / "project"
-    project.mkdir(parents=True)
-    _seed_project_agent(project, "TestAgent", "secret-token")
-    seen_tools: list[str] = []
+    with pytest.raises(click.ClickException) as raised:
+        run_build(setup, block=True)
 
-    def fake_post(self, url, json=None, headers=None):
-        tool_name = str(((json or {}).get("params") or {}).get("name") or "")
-        seen_tools.append(tool_name)
-        lifecycle = _am_run_lifecycle_response(tool_name)
-        if lifecycle is not None:
-            return lifecycle
-        if tool_name == "acquire_build_slot":
-            raise httpx.ConnectError("ambiguous acquire")
-        return _StaticJsonResponse(
-            {"jsonrpc": "2.0", "id": "ok", "result": {"structuredContent": {}}}
-        )
+    assert "invalid JSON response from server" in str(raised.value)
+    assert setup.every_lease() == []
 
-    def unexpected_run(*args, **kwargs):
-        raise AssertionError("child must not run after an ambiguous server acquire")
 
-    monkeypatch.setattr("httpx.Client.post", fake_post)
-    monkeypatch.setattr("subprocess.run", unexpected_run)
+def test_an_http_status_failure_is_reported_with_its_code(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = build_setup()
+    register_local_agent(setup, name="Builder", token="secret-token")
+    # HttpFailure.json() raises if it is ever read, so this also pins that
+    # the status is checked before the body.
+    StubEndpoint().install(monkeypatch).answer("ensure_project", HttpFailure(401))
+    forbid_child(monkeypatch, "the child must not start after an HTTP failure")
+
+    with pytest.raises(click.ClickException) as raised:
+        run_build(setup, block=True)
+
+    assert "HTTP 401 from server" in str(raised.value)
+    assert setup.every_lease() == []
+
+
+def test_an_acquire_that_never_answered_fails_closed_and_still_ends_the_execution(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = build_setup()
+    register_local_agent(setup, name="Builder", token="secret-token")
+    endpoint = StubEndpoint().install(monkeypatch)
+    endpoint.fail("acquire_build_slot", httpx.ConnectError("connection dropped mid-acquire"))
+    forbid_child(monkeypatch, "the child must not start on an ambiguous acquire")
 
     with pytest.raises(click.ClickException, match="remote acquisition result is ambiguous"):
-        am_run(
-            slot="unittest-slot",
-            cmd=[sys.executable, "-c", "raise SystemExit(0)"],
-            project_path=project,
-            agent="TestAgent",
-            ttl_seconds=120,
-            shared=False,
-        )
+        run_build(setup)
 
-    assert seen_tools == [
+    # The server may or may not have taken the slot, so a local lease would be
+    # a guess. The execution is still closed rather than left dangling.
+    assert endpoint.tool_names == [
         "ensure_project",
         "start_agent_execution",
         "acquire_build_slot",
         "end_agent_execution",
     ]
-    storage_root = Path(get_settings().storage.root).expanduser().resolve()
-    assert list(storage_root.glob("projects/*/build_slots/**/*.json")) == []
+    assert setup.every_lease() == []
 
 
-def test_am_run_server_requests_include_stable_branch(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
-    monkeypatch.setenv("WORKTREES_ENABLED", "1")
-    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "block")
-    monkeypatch.setenv("AGENT_NAME", "TestAgent")
-    get_settings.cache_clear()
+def test_a_failing_renewal_keeps_server_authority_and_writes_no_local_lease(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = build_setup()
+    register_local_agent(setup, name="Builder", token="secret-token")
+    endpoint = StubEndpoint().install(monkeypatch)
+    renew_attempted = threading.Event()
 
-    proj = tmp_path / "proj"
-    proj.mkdir(parents=True, exist_ok=True)
-    _seed_project_agent(proj, "TestAgent", "secret-token")
+    def drop_renewals(_arguments: dict[str, Any]) -> Any:
+        renew_attempted.set()
+        raise httpx.ConnectError("renew unavailable")
 
-    seen_branches: list[tuple[str, str | None]] = []
-    seen_protocols: list[tuple[str, int | None]] = []
+    endpoint.react("renew_build_slot", drop_renewals)
+    monkeypatch.setattr("mcp_agent_mail.cli._build_slot_renew_interval_seconds", lambda _ttl: 0.01)
+    def _await_renewal(_record: ChildRun) -> None:
+        # A lambda here returns Event.wait()'s bool, and the callback contract
+        # says None. Harmless at runtime, and a real disagreement about what the
+        # hook is for: it exists to pause, not to report.
+        renew_attempted.wait(timeout=2)
 
-    def fake_post(self, url, json=None, headers=None):
-        tool_name = ((json or {}).get("params") or {}).get("name")
-        arguments = ((json or {}).get("params") or {}).get("arguments") or {}
-        lifecycle = _am_run_lifecycle_response(tool_name)
-        if lifecycle is not None:
-            return lifecycle
-        if tool_name in {"acquire_build_slot", "renew_build_slot", "release_build_slot"}:
-            seen_branches.append((str(tool_name), arguments.get("branch")))
-            seen_protocols.append(
-                (str(tool_name), arguments.get("lifecycle_protocol_version"))
-            )
-        return _StaticJsonResponse({"jsonrpc": "2.0", "id": "ok", "result": {"structuredContent": {}}})
+    child = ChildStub(while_running=_await_renewal).install(monkeypatch)
 
-    class _CompletedProcess:
-        returncode = 0
+    run_build(setup)
 
-    def fake_run(*args, **kwargs):
+    assert renew_attempted.is_set()
+    # A lost renewal is a reason to retry, not a reason to change authority,
+    # and certainly not a reason to kill a running build.
+    assert child.started
+    assert setup.every_lease() == []
+
+
+def test_the_renewer_is_stopped_before_the_slot_is_handed_back(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = build_setup()
+    register_local_agent(setup, name="Builder", token="secret-token")
+    endpoint = StubEndpoint().install(monkeypatch)
+    release_in_flight = threading.Event()
+    renewed_during_release = threading.Event()
+
+    def slow_release(_arguments: dict[str, Any]) -> Any:
+        release_in_flight.set()
         time.sleep(0.05)
-        return _CompletedProcess()
+        return None
 
-    monkeypatch.setattr("httpx.Client.post", fake_post)
-    monkeypatch.setattr("subprocess.run", fake_run)
-    monkeypatch.setattr("mcp_agent_mail.cli._build_slot_renew_interval_seconds", lambda _: 0.01)
+    def note_late_renewal(_arguments: dict[str, Any]) -> Any:
+        if release_in_flight.is_set():
+            renewed_during_release.set()
+        return None
 
-    am_run(
-        slot="unittest-slot",
-        cmd=[sys.executable, "-c", "import sys; sys.exit(0)"],
-        project_path=proj,
-        agent="TestAgent",
-        ttl_seconds=120,
-        shared=False,
-    )
+    endpoint.react("release_build_slot", slow_release)
+    endpoint.react("renew_build_slot", note_late_renewal)
+    monkeypatch.setattr("mcp_agent_mail.cli._build_slot_renew_interval_seconds", lambda _ttl: 0.01)
+    ChildStub().install(monkeypatch)
 
-    assert ("acquire_build_slot", "unknown") in seen_branches
-    assert ("release_build_slot", "unknown") in seen_branches
-    assert any(tool_name == "renew_build_slot" and branch == "unknown" for tool_name, branch in seen_branches)
-    assert ("acquire_build_slot", 1) in seen_protocols
-    assert ("release_build_slot", 1) in seen_protocols
-    assert any(
-        tool_name == "renew_build_slot" and protocol == 1
-        for tool_name, protocol in seen_protocols
-    )
+    run_build(setup)
+
+    assert release_in_flight.is_set()
+    # A renewal racing the release would resurrect a slot nobody holds.
+    assert not renewed_during_release.is_set()
 
 
-def test_am_run_server_release_fallback_without_local_lease_is_noop(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
-    monkeypatch.setenv("WORKTREES_ENABLED", "1")
-    monkeypatch.setenv("AGENT_MAIL_GUARD_MODE", "block")
-    monkeypatch.setenv("AGENT_NAME", "TestAgent")
-    get_settings.cache_clear()
+def test_a_failing_release_does_not_fall_back_to_writing_a_local_lease(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = build_setup()
+    register_local_agent(setup, name="Builder", token="secret-token")
+    endpoint = StubEndpoint().install(monkeypatch)
+    endpoint.fail("release_build_slot", httpx.ConnectError("release unavailable"))
+    ChildStub().install(monkeypatch)
 
-    proj = tmp_path / "proj"
-    proj.mkdir(parents=True, exist_ok=True)
-    _seed_project_agent(proj, "TestAgent", "secret-token")
-    ident = _resolve_project_identity(str(proj))
-    slot_dir = (
-        Path(get_settings().storage.root).expanduser().resolve()
+    run_build(setup)
+
+    assert endpoint.called("acquire_build_slot")
+    assert endpoint.called("release_build_slot")
+    # Expiry on the server is the fallback, not a file this process invents.
+    assert setup.every_lease() == []
+
+
+def test_all_three_slot_calls_quote_the_same_branch_and_protocol_version(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = build_setup()
+    register_local_agent(setup, name="Builder", token="secret-token")
+    endpoint = StubEndpoint().install(monkeypatch)
+    monkeypatch.setattr("mcp_agent_mail.cli._build_slot_renew_interval_seconds", lambda _ttl: 0.01)
+    ChildStub(while_running=lambda _record: time.sleep(0.05)).install(monkeypatch)
+
+    run_build(setup)
+
+    for tool in SLOT_TOOLS:
+        branches = endpoint.every_argument(tool, "branch")
+        assert branches, f"{tool} was never called; saw {endpoint.tool_names}"
+        # A workdir outside any repository still has to name one stable branch:
+        # acquire, renew and release must agree or they address different rows.
+        assert set(branches) == {"unknown"}
+        assert set(endpoint.every_argument(tool, "lifecycle_protocol_version")) == {PROTOCOL_VERSION}
+
+
+# ==========================================================================
+# TTL arithmetic
+# ==========================================================================
+
+
+@pytest.mark.parametrize(
+    ("requested", "effective"),
+    [(0, 60), (1, 60), (30, 60), (59, 60), (60, 60), (61, 61), (3600, 3600)],
+)
+def test_the_effective_ttl_never_drops_below_the_servers_sixty_second_floor(
+    requested: int, effective: int
+) -> None:
+    assert _effective_build_slot_ttl_seconds(requested) == effective
+
+
+@pytest.mark.parametrize("requested", [0, 30, 60, 120, 3601])
+def test_renewal_happens_halfway_through_the_effective_ttl(requested: int) -> None:
+    effective = _effective_build_slot_ttl_seconds(requested)
+    interval = _build_slot_renew_interval_seconds(requested)
+
+    assert interval == effective // 2
+    # Renewing on the boundary would leave a window with no live lease.
+    assert 1 <= interval < effective
+
+
+def test_the_server_is_asked_for_the_floored_ttl_not_the_requested_one(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = build_setup()
+    register_local_agent(setup, name="Builder", token="secret-token")
+    endpoint = StubEndpoint().install(monkeypatch)
+    ChildStub().install(monkeypatch)
+
+    run_build(setup, ttl=30)
+
+    assert endpoint.every_argument("acquire_build_slot", "ttl_seconds") == [60]
+
+
+# ==========================================================================
+# The worktree gate, argv secrecy, and project identity
+# ==========================================================================
+
+
+def test_the_execution_lifecycle_runs_even_with_the_worktree_gate_closed(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup = build_setup(worktrees=False)
+    register_local_agent(setup, name="Builder", token="secret-token")
+    endpoint = StubEndpoint().install(monkeypatch)
+    child = ChildStub().install(monkeypatch)
+
+    run_build(setup, slot="no-slot-gate", cmd=[sys.executable, "--token", "TOP_SECRET_ARG"])
+
+    # The gate governs build slots only; the execution record is unconditional.
+    assert endpoint.tool_names == ["ensure_project", "start_agent_execution", "end_agent_execution"]
+    start = endpoint.arguments_for("start_agent_execution")
+    assert start["task_description"] == "am-run build slot: no-slot-gate"
+    assert child.env["AGENT_EXECUTION_ID"] == SERVER_EXECUTION_ID
+
+    # Build commands carry credentials in argv. Neither the server record nor
+    # the console echo may contain them.
+    assert "TOP_SECRET_ARG" not in json.dumps(start)
+    printed = capsys.readouterr().out
+    assert "TOP_SECRET_ARG" not in printed
+    assert "redacted" in printed
+
+
+def test_an_offline_run_hands_the_child_no_execution_id_at_all(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = build_setup(worktrees=False)  # no registered agent, no server
+    unreachable_endpoint(monkeypatch)
+    child = ChildStub().install(monkeypatch)
+
+    run_build(setup, slot="offline-slot")
+
+    # An id the server never issued would be quoted back at it later as if it
+    # were real, so an unconfirmed execution exposes nothing.
+    assert "AGENT_EXECUTION_ID" not in child.env
+
+
+def test_a_child_started_in_a_subdirectory_gets_the_repository_roots_identity(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    repo = make_git_repo(tmp_path / "repo")
+    workdir = repo / "nested" / "work"
+    workdir.mkdir(parents=True, exist_ok=True)
+    setup = build_setup(worktrees=False, workdir=workdir)
+
+    root_identity = _resolve_project_identity(str(repo))
+    subdir_identity = _resolve_project_identity(str(workdir))
+    # Control: without the walk-up these two would be indistinguishable and
+    # the assertions below would hold for the wrong reason.
+    assert root_identity["slug"] != subdir_identity["slug"]
+
+    child = ChildStub().install(monkeypatch)
+
+    run_build(setup, project_path=workdir, slot="subdir-slot")
+
+    env = child.env
+    assert env["SLUG"] == root_identity["slug"]
+    assert env["PROJECT_UID"] == root_identity["project_uid"]
+    assert env["AGENT"] == "Builder"
+    assert env["AM_SLOT"] == "subdir-slot"
+    assert env["BRANCH"]
+    assert env["CACHE_KEY"] == f"am-cache-{root_identity['project_uid']}-Builder-{env['BRANCH']}"
+    assert env["ARTIFACT_DIR"] == str(
+        setup.storage_root
         / "projects"
-        / ident["slug"]
-        / "build_slots"
-        / "unittest-slot"
-    )
-    seen_tools: list[str] = []
-
-    def fake_post(self, url, json=None, headers=None):
-        tool_name = str(((json or {}).get("params") or {}).get("name") or "")
-        if tool_name:
-            seen_tools.append(tool_name)
-        lifecycle = _am_run_lifecycle_response(tool_name)
-        if lifecycle is not None:
-            return lifecycle
-        if tool_name == "release_build_slot":
-            raise httpx.ConnectError("release unavailable")
-        return _StaticJsonResponse({"jsonrpc": "2.0", "id": "ok", "result": {"structuredContent": {}}})
-
-    class _CompletedProcess:
-        returncode = 0
-
-    monkeypatch.setattr("httpx.Client.post", fake_post)
-    monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: _CompletedProcess())
-
-    am_run(
-        slot="unittest-slot",
-        cmd=[sys.executable, "-c", "import sys; sys.exit(0)"],
-        project_path=proj,
-        agent="TestAgent",
-        ttl_seconds=120,
-        shared=False,
+        / root_identity["slug"]
+        / "artifacts"
+        / _safe_build_path_component("Builder")
+        / _safe_build_path_component(env["BRANCH"])
     )
 
-    assert "acquire_build_slot" in seen_tools
-    assert "release_build_slot" in seen_tools
-    assert list(slot_dir.glob("*.json")) == []
 
-
-def test_amctl_env_emits_shell_safe_key_value_lines_for_long_paths(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "archive"))
-    monkeypatch.setenv("WORKTREES_ENABLED", "0")
+def test_amctl_env_prints_one_unwrapped_line_per_variable(
+    build_setup: Callable[..., BuildSetup],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    repo = make_git_repo(tmp_path / "repo-with-a-deliberately-long-directory-name-for-env")
+    workdir = repo / "nested" / "path" / "for" / "env"
+    workdir.mkdir(parents=True, exist_ok=True)
+    setup = build_setup(worktrees=False, workdir=workdir)
+    # A narrow terminal is what would tempt a rich renderer into wrapping.
     monkeypatch.setenv("COLUMNS", "40")
     get_settings.cache_clear()
+    root_identity = _resolve_project_identity(str(repo))
 
-    repo = tmp_path / "repo-with-a-very-long-name-for-env-output"
-    subdir = repo / "nested" / "path" / "for" / "env"
-    subdir.mkdir(parents=True, exist_ok=True)
-
-    import subprocess as stdlib_subprocess
-
-    stdlib_subprocess.run(["git", "init"], cwd=str(repo), check=True, capture_output=True)
-    stdlib_subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True)
-    stdlib_subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo), check=True)
-
-    root_ident = _resolve_project_identity(str(repo))
-    result = runner.invoke(app, ["amctl", "env", "--path", str(subdir), "--agent", "TestAgent"])
+    result = CliRunner().invoke(app, ["amctl", "env", "--path", str(workdir), "--agent", "Builder"])
 
     assert result.exit_code == 0
-    env_lines = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
-    assert env_lines["SLUG"] == root_ident["slug"]
-    assert env_lines["PROJECT_UID"] == root_ident["project_uid"]
-    assert env_lines["AGENT"] == "TestAgent"
+    lines = [line for line in result.stdout.splitlines() if "=" in line]
+    env = dict(line.split("=", 1) for line in lines)
+
+    assert env["SLUG"] == root_identity["slug"]
+    assert env["PROJECT_UID"] == root_identity["project_uid"]
+    assert env["AGENT"] == "Builder"
+    assert env["BRANCH"]
+    assert env["CACHE_KEY"] == f"am-cache-{root_identity['project_uid']}-Builder-{env['BRANCH']}"
+
     expected_artifact_dir = (
-        Path(get_settings().storage.root).expanduser().resolve()
+        setup.storage_root
         / "projects"
-        / root_ident["slug"]
+        / root_identity["slug"]
         / "artifacts"
-        / "TestAgent"
-        / env_lines["BRANCH"]
+        / _safe_build_path_component("Builder")
+        / _safe_build_path_component(env["BRANCH"])
     )
-    assert env_lines["ARTIFACT_DIR"] == str(expected_artifact_dir)
+    assert env["ARTIFACT_DIR"] == str(expected_artifact_dir)
+    # The output is meant to be eval'd by a shell, so a value longer than the
+    # terminal must still arrive on a single line.
+    assert len(f"ARTIFACT_DIR={expected_artifact_dir}") > 40
+    assert f"ARTIFACT_DIR={expected_artifact_dir}" in lines

@@ -1,11 +1,39 @@
+"""Contact gating: who may write to whom, and what the gate must never leak.
+
+Two mechanisms share this file because they answer the same question from
+opposite ends.
+
+``contact_policy`` is the *standing* answer -- ``block_all`` refuses, ``open``
+admits, ``contacts_only`` refuses strangers but stands aside for agents already
+working together (an approved link, or overlapping file reservations).
+
+``macro_contact_handshake`` is the *negotiated* answer: request, approval and an
+optional welcome message in one call. Its failure modes are what most of these
+tests are about, because a handshake that half-succeeds is worse than one that
+refuses. Approval belongs to the target, so a requester holding only its own
+token must not be able to approve on the target's behalf; and every refusal
+below is checked twice -- once for the error, once for the target's inbox --
+because an error that still delivered the welcome would pass a single-assertion
+test.
+
+Registering an agent also authenticates the calling MCP session for it. Several
+tests therefore register through one client and then act through a second: the
+second session begins as a stranger holding only the tokens it was handed.
+"""
+
 from __future__ import annotations
 
 import contextlib
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Any
 
 import pytest
 from fastmcp import Client
+from fastmcp.client.client import CallToolResult
 from fastmcp.exceptions import ToolError
+from mcp.types import TextResourceContents
 
 from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
@@ -17,6 +45,144 @@ POLICY_AGENT_TWO = "codex-wsl-policy-2"
 POLICY_AGENT_THREE = "codex-wsl-policy-3"
 
 
+@asynccontextmanager
+async def _fresh_session() -> AsyncIterator[Client]:
+    """One client session against a newly built server.
+
+    Tests that need to prove authentication is *not* inherited build the server
+    themselves and open two sessions on it; everything else uses this.
+    """
+    async with Client(build_mcp_server()) as client:
+        yield client
+
+
+async def _handshake(
+    client: Client,
+    project_key: str,
+    requester: str,
+    target: str,
+    **options: Any,
+) -> dict[str, Any]:
+    """Run ``macro_contact_handshake`` and return its payload.
+
+    The three positional arguments are the ones every call supplies; the
+    optional halves of the negotiation -- ``auto_accept``, the welcome pair,
+    ``to_project``, tokens -- are what each test is actually varying, so they
+    stay visible at the call site.
+    """
+    result = await client.call_tool(
+        "macro_contact_handshake",
+        {"project_key": project_key, "requester": requester, "target": target, **options},
+    )
+    return result.data
+
+
+async def _request_contact(
+    client: Client,
+    project_key: str,
+    requester: str,
+    target: str,
+    **options: Any,
+) -> dict[str, Any]:
+    """Open a contact request from ``requester`` to ``target``."""
+    result = await client.call_tool(
+        "request_contact",
+        {"project_key": project_key, "from_agent": requester, "to_agent": target, **options},
+    )
+    return result.data
+
+
+async def _respond_contact(
+    client: Client,
+    project_key: str,
+    target: str,
+    requester: str,
+    accept: bool,
+    **options: Any,
+) -> dict[str, Any]:
+    """Answer a pending request as ``target``. Argument order mirrors the tool's."""
+    result = await client.call_tool(
+        "respond_contact",
+        {
+            "project_key": project_key,
+            "to_agent": target,
+            "from_agent": requester,
+            "accept": accept,
+            **options,
+        },
+    )
+    return result.data
+
+
+async def _contact_entry(
+    client: Client,
+    project_key: str,
+    agent: str,
+    token: str,
+    peer: str,
+) -> dict[str, Any]:
+    """The single contact-list row describing ``agent``'s link to ``peer``."""
+    contacts = await client.call_tool(
+        "list_contacts",
+        {"project_key": project_key, "agent_name": agent, "registration_token": token},
+    )
+    return next(item for item in _rows(contacts) if item["to"] == peer)
+
+
+async def _enrol(client: Client, project_key: str, name: str) -> str:
+    """Register ``name`` under ``project_key`` and return its registration token."""
+    registered = await client.call_tool(
+        "register_agent",
+        {"project_key": project_key, "program": "codex", "model": "gpt-5", "name": name},
+    )
+    return registered.data["registration_token"]
+
+
+def _rows(result: CallToolResult) -> list[Any]:
+    """The ``result`` list a structured tool response carries.
+
+    Asserted rather than defaulted: a tool that answered with no structured
+    content at all is a failure to report, not an empty list to iterate.
+    """
+    payload = result.structured_content
+    assert payload is not None, "expected a structured tool response"
+    return payload["result"]
+
+
+async def _resource_payload(client: Client, uri: str) -> dict[str, Any]:
+    """Decode a resource read into its JSON object, or ``{}`` when it is empty.
+
+    Binary blocks are skipped rather than coerced: every resource this suite
+    reads is JSON text, so a blob turning up would mean the wrong resource
+    answered, and an empty payload fails the caller's assertion clearly.
+    """
+    blocks = await client.read_resource(uri)
+    text = "".join(b.text for b in blocks if isinstance(b, TextResourceContents))
+    return json.loads(text or "{}")
+
+
+async def _inbox_subjects(client: Client, project_key: str, agent: str, token: str) -> set[str]:
+    """Subjects sitting in ``agent``'s inbox, read with the agent's own token."""
+    inbox = await client.call_tool(
+        "fetch_inbox",
+        {
+            "project_key": project_key,
+            "agent_name": agent,
+            "registration_token": token,
+            "include_bodies": True,
+        },
+    )
+    return {item["subject"] for item in _rows(inbox)}
+
+
+async def _visible_subjects(client: Client, project_key: str, agent: str) -> set[str]:
+    """Subjects in ``agent``'s inbox as the session-authenticated resource sees them."""
+    payload = await _resource_payload(
+        client, f"resource://inbox/{agent}?project={project_key}&limit=10"
+    )
+    return {item.get("subject") for item in payload.get("messages", [])}
+
+
 @pytest.mark.asyncio
 async def test_contact_blocked_and_contacts_only(isolated_env, monkeypatch):
     # Ensure contact enforcement is enabled (it is by default, but be explicit)
@@ -24,14 +190,10 @@ async def test_contact_blocked_and_contacts_only(isolated_env, monkeypatch):
     with contextlib.suppress(Exception):
         _config.clear_settings_cache()
 
-    server = build_mcp_server()
-    async with Client(server) as client:
+    async with _fresh_session() as client:
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         for name in (POLICY_AGENT_ONE, POLICY_AGENT_TWO):
-            await client.call_tool(
-                "register_agent",
-                {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": name},
-            )
+            await _enrol(client, "Backend", name)
 
         # Beta blocks all
         await client.call_tool(
@@ -79,17 +241,10 @@ async def test_contact_auto_allows_file_reservation_overlap(isolated_env, monkey
     with contextlib.suppress(Exception):
         _config.clear_settings_cache()
 
-    server = build_mcp_server()
-    async with Client(server) as client:
+    async with _fresh_session() as client:
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
-        await client.call_tool(
-            "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_ONE},
-        )
-        await client.call_tool(
-            "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_TWO},
-        )
+        await _enrol(client, "Backend", POLICY_AGENT_ONE)
+        await _enrol(client, "Backend", POLICY_AGENT_TWO)
         await client.call_tool(
             "set_contact_policy",
             {"project_key": "Backend", "agent_name": POLICY_AGENT_TWO, "policy": "contacts_only"},
@@ -135,36 +290,22 @@ async def test_contact_auto_allows_file_reservation_overlap(isolated_env, monkey
 
 @pytest.mark.asyncio
 async def test_cross_project_contact_and_delivery(isolated_env):
-    server = build_mcp_server()
-    async with Client(server) as client:
+    async with _fresh_session() as client:
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
         await client.call_tool("ensure_project", {"human_key": pkey("frontend")})
-        await client.call_tool(
-            "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_ONE},
-        )
-        await client.call_tool(
-            "register_agent",
-            {"project_key": "Frontend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_TWO},
-        )
+        await _enrol(client, "Backend", POLICY_AGENT_ONE)
+        await _enrol(client, "Frontend", POLICY_AGENT_TWO)
 
-        await client.call_tool(
-            "request_contact",
-            {
-                "project_key": "Backend",
-                "from_agent": POLICY_AGENT_ONE,
-                "to_agent": f"project:Frontend#{POLICY_AGENT_TWO}",
-            },
+        await _request_contact(
+            client, "Backend", POLICY_AGENT_ONE, f"project:Frontend#{POLICY_AGENT_TWO}"
         )
-        await client.call_tool(
-            "respond_contact",
-            {
-                "project_key": "Frontend",
-                "to_agent": POLICY_AGENT_TWO,
-                "from_agent": POLICY_AGENT_ONE,
-                "from_project": "Backend",
-                "accept": True,
-            },
+        await _respond_contact(
+            client,
+            "Frontend",
+            POLICY_AGENT_TWO,
+            POLICY_AGENT_ONE,
+            accept=True,
+            from_project="Backend",
         )
 
         sent = await client.call_tool(
@@ -199,388 +340,323 @@ async def test_cross_project_contact_and_delivery(isolated_env):
         )
 
         # Verify appears in Frontend inbox
-        inbox_blocks = await client.read_resource(
-            f"resource://inbox/{POLICY_AGENT_TWO}?project=Frontend&limit=10"
-        )
-        raw = inbox_blocks[0].text if inbox_blocks else "{}"
-        data = json.loads(raw)
-        assert any(item.get("subject") == "XProj" for item in data.get("messages", []))
+        assert "XProj" in await _visible_subjects(client, "Frontend", POLICY_AGENT_TWO)
 
 
 @pytest.mark.asyncio
 async def test_macro_contact_handshake_welcome(isolated_env):
-    server = build_mcp_server()
-    async with Client(server) as client:
+    async with _fresh_session() as client:
         await client.call_tool("ensure_project", {"human_key": pkey("backend")})
-        await client.call_tool(
-            "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_ONE},
-        )
-        await client.call_tool(
-            "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_TWO},
-        )
+        await _enrol(client, "Backend", POLICY_AGENT_ONE)
+        await _enrol(client, "Backend", POLICY_AGENT_TWO)
 
-        res = await client.call_tool(
-            "macro_contact_handshake",
-            {
-                "project_key": "Backend",
-                "requester": POLICY_AGENT_ONE,
-                "target": POLICY_AGENT_TWO,
-                "reason": "let's sync",
-                "auto_accept": True,
-                "welcome_subject": "Welcome",
-                "welcome_body": "nice to meet you",
-            },
+        res = await _handshake(
+            client,
+            "Backend",
+            POLICY_AGENT_ONE,
+            POLICY_AGENT_TWO,
+            reason="let's sync",
+            auto_accept=True,
+            welcome_subject="Welcome",
+            welcome_body="nice to meet you",
         )
-        assert res.data.get("request")
-        assert res.data.get("response")
-        welcome = res.data.get("welcome_message") or {}
+        assert res.get("request")
+        assert res.get("response")
+        welcome = res.get("welcome_message") or {}
         # If the welcome ran, it will have deliveries
         if welcome:
             assert welcome.get("deliveries")
 
 
 @pytest.mark.asyncio
-async def test_macro_contact_handshake_rejects_partial_welcome(isolated_env):
-    server = build_mcp_server()
-    async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
-        await client.call_tool(
-            "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_ONE},
-        )
-        await client.call_tool(
-            "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_TWO},
-        )
+@pytest.mark.parametrize(
+    ("supplied", "withheld"),
+    [("welcome_subject", "welcome_body"), ("welcome_body", "welcome_subject")],
+    ids=["subject-without-body", "body-without-subject"],
+)
+async def test_handshake_refuses_half_a_welcome(isolated_env, supplied: str, withheld: str):
+    """A welcome needs both halves, in either direction.
 
-        with pytest.raises(Exception, match="welcome_subject and welcome_body"):
-            await client.call_tool(
-                "macro_contact_handshake",
-                {
-                    "project_key": "Backend",
-                    "requester": POLICY_AGENT_ONE,
-                    "target": POLICY_AGENT_TWO,
-                    "auto_accept": True,
-                    "welcome_subject": "Welcome only",
-                },
+    Parametrised because the check is a symmetry (``one is None`` must equal
+    ``the other is None``); testing a single direction would pass against an
+    implementation that only ever noticed a missing body.
+    """
+    async with _fresh_session() as client:
+        await client.call_tool("ensure_project", {"human_key": pkey("halfwelcome")})
+        await _enrol(client, "halfwelcome", POLICY_AGENT_ONE)
+        await _enrol(client, "halfwelcome", POLICY_AGENT_TWO)
+
+        half = {supplied: f"only the {supplied}"}
+        assert withheld not in half
+
+        with pytest.raises(ToolError, match="welcome_subject and welcome_body"):
+            await _handshake(
+                client,
+                "halfwelcome",
+                POLICY_AGENT_ONE,
+                POLICY_AGENT_TWO,
+                auto_accept=True,
+                **half,
             )
 
 
 @pytest.mark.asyncio
-async def test_macro_contact_handshake_rejects_welcome_without_auto_accept(isolated_env):
-    server = build_mcp_server()
-    async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
-        await client.call_tool(
-            "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_ONE},
-        )
-        await client.call_tool(
-            "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_TWO},
-        )
+async def test_handshake_refuses_welcome_before_approval(isolated_env):
+    """Without ``auto_accept`` the macro cannot hold a welcome until approval, so it refuses.
 
-        with pytest.raises(Exception, match="require auto_accept=True"):
-            await client.call_tool(
-                "macro_contact_handshake",
-                {
-                    "project_key": "Backend",
-                    "requester": POLICY_AGENT_ONE,
-                    "target": POLICY_AGENT_TWO,
-                    "welcome_subject": "Welcome",
-                    "welcome_body": "hello before approval",
-                },
+    The inbox check is the point: a refusal that had already queued the welcome
+    would satisfy ``pytest.raises`` on its own.
+    """
+    async with _fresh_session() as client:
+        await client.call_tool("ensure_project", {"human_key": pkey("prematurewelcome")})
+        await _enrol(client, "prematurewelcome", POLICY_AGENT_ONE)
+        await _enrol(client, "prematurewelcome", POLICY_AGENT_TWO)
+
+        with pytest.raises(ToolError, match="require auto_accept=True"):
+            await _handshake(
+                client,
+                "prematurewelcome",
+                POLICY_AGENT_ONE,
+                POLICY_AGENT_TWO,
+                welcome_subject="Greetings",
+                welcome_body="sent before anyone approved it",
             )
 
-        inbox_blocks = await client.read_resource(
-            f"resource://inbox/{POLICY_AGENT_TWO}?project=Backend&limit=10"
+        assert not await _visible_subjects(client, "prematurewelcome", POLICY_AGENT_TWO), (
+            "the refused welcome must not have been delivered anyway"
         )
-        raw = inbox_blocks[0].text if inbox_blocks else "{}"
-        data = json.loads(raw)
-        assert not data.get("messages")
 
 
 @pytest.mark.asyncio
-async def test_macro_contact_handshake_rejects_same_agent_same_project(isolated_env):
-    server = build_mcp_server()
-    async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": pkey("backend")})
-        await client.call_tool(
-            "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_TWO},
-        )
+async def test_handshake_refuses_self_contact(isolated_env):
+    """An agent contacting itself in its own project is refused, and sends nothing.
 
-        with pytest.raises(Exception, match="self-contact"):
-            await client.call_tool(
-                "macro_contact_handshake",
-                {
-                    "project_key": "Backend",
-                    "requester": POLICY_AGENT_TWO,
-                    "target": POLICY_AGENT_TWO,
-                    "auto_accept": True,
-                },
+    Self-messaging already works without a contact link, so approving one here
+    would be a no-op that still writes an intro message into the mailbox.
+    """
+    async with _fresh_session() as client:
+        await client.call_tool("ensure_project", {"human_key": pkey("selfcontact")})
+        await _enrol(client, "selfcontact", POLICY_AGENT_TWO)
+
+        with pytest.raises(ToolError, match="self-contact"):
+            await _handshake(
+                client,
+                "selfcontact",
+                POLICY_AGENT_TWO,
+                POLICY_AGENT_TWO,
+                auto_accept=True,
             )
 
-        inbox_blocks = await client.read_resource(
-            f"resource://inbox/{POLICY_AGENT_TWO}?project=Backend&limit=10"
+        assert not await _visible_subjects(client, "selfcontact", POLICY_AGENT_TWO), (
+            "a refused self-handshake must leave the mailbox untouched"
         )
-        raw = inbox_blocks[0].text if inbox_blocks else "{}"
-        data = json.loads(raw)
-        assert not data.get("messages")
 
 
 @pytest.mark.asyncio
-async def test_macro_contact_handshake_cross_project_welcome(isolated_env):
-    backend = "/data/projects/backend"
-    frontend = "/data/projects/frontend"
-    server = build_mcp_server()
-    async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": backend})
-        await client.call_tool("ensure_project", {"human_key": frontend})
-        await client.call_tool(
-            "register_agent",
-            {"project_key": backend, "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_ONE},
-        )
-        await client.call_tool(
-            "register_agent",
-            {"project_key": frontend, "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_TWO},
+async def test_handshake_delivers_cross_project_welcome(isolated_env):
+    """Across projects, an auto-accepted handshake carries its welcome through.
+
+    Both agents were registered on this session, so the macro can authenticate
+    each of them without being handed a token -- which is what separates this
+    from the token test below.
+    """
+    origin = "/data/projects/backend"
+    destination = "/data/projects/frontend"
+    async with _fresh_session() as client:
+        await client.call_tool("ensure_project", {"human_key": origin})
+        await client.call_tool("ensure_project", {"human_key": destination})
+        await _enrol(client, origin, POLICY_AGENT_ONE)
+        await _enrol(client, destination, POLICY_AGENT_TWO)
+
+        outcome = await _handshake(
+            client,
+            origin,
+            POLICY_AGENT_ONE,
+            POLICY_AGENT_TWO,
+            to_project=destination,
+            auto_accept=True,
+            welcome_subject="Cross-project welcome",
+            welcome_body="hello from the origin project",
         )
 
-        res = await client.call_tool(
-            "macro_contact_handshake",
-            {
-                "project_key": backend,
-                "requester": POLICY_AGENT_ONE,
-                "target": POLICY_AGENT_TWO,
-                "to_project": frontend,
-                "auto_accept": True,
-                "welcome_subject": "Cross-project welcome",
-                "welcome_body": "hello from backend",
-            },
-        )
+        welcome = outcome.get("welcome_message") or {}
+        assert welcome.get("deliveries"), outcome.get("welcome_error")
 
-        welcome = res.data.get("welcome_message") or {}
-        assert welcome.get("deliveries"), res.data.get("welcome_error")
-
-        inbox_blocks = await client.read_resource(
-            f"resource://inbox/{POLICY_AGENT_TWO}?project=/data/projects/frontend&limit=10"
+        landed = await _visible_subjects(client, destination, POLICY_AGENT_TWO)
+        assert "Cross-project welcome" in landed, (
+            f"welcome never reached the destination inbox; saw {landed!r}"
         )
-        raw = inbox_blocks[0].text if inbox_blocks else "{}"
-        data = json.loads(raw)
-        assert any(item.get("subject") == "Cross-project welcome" for item in data.get("messages", []))
 
 
 @pytest.mark.asyncio
-async def test_macro_contact_handshake_auto_accept_requires_target_auth(isolated_env):
-    server = build_mcp_server()
-    async with Client(server) as bootstrap_client:
-        await bootstrap_client.call_tool("ensure_project", {"human_key": pkey("backend")})
-        green = await bootstrap_client.call_tool(
-            "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_ONE},
-        )
-        blue = await bootstrap_client.call_tool(
-            "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_TWO},
-        )
-        green_token = green.data["registration_token"]
-        blue_token = blue.data["registration_token"]
+async def test_auto_accept_needs_the_targets_own_credential(isolated_env):
+    """A requester cannot approve on the target's behalf using only its own token.
 
-    async with Client(server) as requester_client:
-        res = await requester_client.call_tool(
-            "macro_contact_handshake",
-            {
-                "project_key": "Backend",
-                "requester": POLICY_AGENT_ONE,
-                "target": POLICY_AGENT_TWO,
-                "auto_accept": True,
-                "welcome_subject": "Welcome",
-                "welcome_body": "this should not send yet",
-                "requester_registration_token": green_token,
-            },
+    Everything downstream of approval has to stay unbuilt: the link stays
+    ``pending``, ``list_contacts`` reports it as not yet permitting messages,
+    and -- the assertion that matters most -- the welcome is absent from the
+    target's inbox while the contact-request notice is present. Checking only
+    the error would not distinguish "refused" from "refused, then sent anyway".
+    """
+    project = "targetauth"
+    welcome_line = "Premature welcome"
+    mail_server = build_mcp_server()
+
+    async with Client(mail_server) as bootstrap:
+        await bootstrap.call_tool("ensure_project", {"human_key": pkey(project)})
+        requester_token = await _enrol(bootstrap, project, POLICY_AGENT_ONE)
+        target_token = await _enrol(bootstrap, project, POLICY_AGENT_TWO)
+
+    # A brand-new session: it holds no authentication from the registrations above.
+    async with Client(mail_server) as as_requester:
+        outcome = await _handshake(
+            as_requester,
+            project,
+            POLICY_AGENT_ONE,
+            POLICY_AGENT_TWO,
+            auto_accept=True,
+            welcome_subject=welcome_line,
+            welcome_body="this must not be delivered yet",
+            requester_registration_token=requester_token,
         )
 
-        assert res.data["request"]["status"] == "pending"
-        assert not res.data["response"]
-        response_error = res.data["response_error"]
-        assert response_error["type"] == "AUTHENTICATION_REQUIRED"
-        assert response_error["token_param"] == "target_registration_token"
-        assert not res.data["welcome_message"]
-        welcome_error = res.data["welcome_error"]
-        assert welcome_error["type"] == "CONTACT_APPROVAL_REQUIRED"
-
-        contacts = await requester_client.call_tool(
-            "list_contacts",
-            {
-                "project_key": "Backend",
-                "agent_name": POLICY_AGENT_ONE,
-                "registration_token": green_token,
-            },
+        assert outcome["request"]["status"] == "pending"
+        assert not outcome["response"]
+        refusal = outcome["response_error"]
+        assert refusal["type"] == "AUTHENTICATION_REQUIRED"
+        assert refusal["token_param"] == "target_registration_token", (
+            "the refusal must name the credential that was missing, not a generic one"
         )
-        contact_items = contacts.structured_content["result"]
-        pending = next(item for item in contact_items if item["to"] == POLICY_AGENT_TWO)
-        assert pending["status"] == "pending"
-        assert not pending["allows_messaging"]
+        assert not outcome["welcome_message"]
+        assert outcome["welcome_error"]["type"] == "CONTACT_APPROVAL_REQUIRED"
 
-    async with Client(server) as recipient_client:
-        inbox = await recipient_client.call_tool(
-            "fetch_inbox",
-            {
-                "project_key": "Backend",
-                "agent_name": POLICY_AGENT_TWO,
-                "registration_token": blue_token,
-                "include_bodies": True,
-            },
+        entry = await _contact_entry(
+            as_requester, project, POLICY_AGENT_ONE, requester_token, POLICY_AGENT_TWO
         )
-        messages = inbox.structured_content["result"]
-        subjects = {item["subject"] for item in messages}
+        assert entry["status"] == "pending"
+        assert not entry["allows_messaging"], (
+            "a pending link must not be reported as permitting messages"
+        )
+
+    async with Client(mail_server) as as_target:
+        subjects = await _inbox_subjects(as_target, project, POLICY_AGENT_TWO, target_token)
         assert f"Contact request from {POLICY_AGENT_ONE}" in subjects
-        assert "Welcome" not in subjects
+        assert welcome_line not in subjects, "the welcome must wait for a real approval"
 
 
 @pytest.mark.asyncio
-async def test_macro_contact_handshake_reuses_existing_approval_without_target_auth(isolated_env):
-    server = build_mcp_server()
-    async with Client(server) as bootstrap_client:
-        await bootstrap_client.call_tool("ensure_project", {"human_key": pkey("backend-reuse-approved")})
-        green = await bootstrap_client.call_tool(
-            "register_agent",
-            {
-                "project_key": pkey("backend-reuse-approved"),
-                "program": "codex",
-                "model": "gpt-5",
-                "name": POLICY_AGENT_ONE,
-            },
-        )
-        blue = await bootstrap_client.call_tool(
-            "register_agent",
-            {
-                "project_key": pkey("backend-reuse-approved"),
-                "program": "codex",
-                "model": "gpt-5",
-                "name": POLICY_AGENT_TWO,
-            },
-        )
-        green_token = green.data["registration_token"]
-        blue_token = blue.data["registration_token"]
+async def test_auto_accept_reuses_a_standing_approval(isolated_env):
+    """Once contact is already approved, the target's token is no longer needed.
 
-        await bootstrap_client.call_tool(
-            "request_contact",
-            {
-                "project_key": pkey("backend-reuse-approved"),
-                "from_agent": POLICY_AGENT_ONE,
-                "to_agent": POLICY_AGENT_TWO,
-                "registration_token": green_token,
-            },
+    The mirror of the test above: the same call, from a session with the same
+    single token, now succeeds -- because approval already exists rather than
+    because the check was skipped. ``response_error`` must be absent entirely,
+    not merely falsy, since a present-but-empty error would mean the macro took
+    the failure path and papered over it.
+    """
+    project = pkey("standing-approval")
+    welcome_line = "Second time around"
+    mail_server = build_mcp_server()
+
+    async with Client(mail_server) as bootstrap:
+        await bootstrap.call_tool("ensure_project", {"human_key": project})
+        requester_token = await _enrol(bootstrap, project, POLICY_AGENT_ONE)
+        target_token = await _enrol(bootstrap, project, POLICY_AGENT_TWO)
+
+        # Approval the ordinary way: each side acts under its own credential.
+        await _request_contact(
+            bootstrap,
+            project,
+            POLICY_AGENT_ONE,
+            POLICY_AGENT_TWO,
+            registration_token=requester_token,
         )
-        await bootstrap_client.call_tool(
-            "respond_contact",
-            {
-                "project_key": pkey("backend-reuse-approved"),
-                "to_agent": POLICY_AGENT_TWO,
-                "from_agent": POLICY_AGENT_ONE,
-                "accept": True,
-                "registration_token": blue_token,
-            },
+        await _respond_contact(
+            bootstrap,
+            project,
+            POLICY_AGENT_TWO,
+            POLICY_AGENT_ONE,
+            accept=True,
+            registration_token=target_token,
         )
 
-    async with Client(server) as requester_client:
-        res = await requester_client.call_tool(
-            "macro_contact_handshake",
-            {
-                "project_key": pkey("backend-reuse-approved"),
-                "requester": POLICY_AGENT_ONE,
-                "target": POLICY_AGENT_TWO,
-                "auto_accept": True,
-                "welcome_subject": "Welcome back",
-                "welcome_body": "existing approval should be enough",
-                "requester_registration_token": green_token,
-            },
+    async with Client(mail_server) as as_requester:
+        outcome = await _handshake(
+            as_requester,
+            project,
+            POLICY_AGENT_ONE,
+            POLICY_AGENT_TWO,
+            auto_accept=True,
+            welcome_subject=welcome_line,
+            welcome_body="the standing approval should carry this through",
+            requester_registration_token=requester_token,
         )
 
-        assert res.data["request"]["status"] == "approved"
-        assert res.data["response"]["status"] == "approved"
-        assert "response_error" not in res.data
-        welcome = res.data["welcome_message"] or {}
-        assert welcome.get("deliveries"), res.data.get("welcome_error")
+        assert outcome["request"]["status"] == "approved"
+        assert outcome["response"]["status"] == "approved"
+        assert "response_error" not in outcome
+        welcome = outcome["welcome_message"] or {}
+        assert welcome.get("deliveries"), outcome.get("welcome_error")
 
-    async with Client(server) as recipient_client:
-        inbox = await recipient_client.call_tool(
-            "fetch_inbox",
-            {
-                "project_key": pkey("backend-reuse-approved"),
-                "agent_name": POLICY_AGENT_TWO,
-                "registration_token": blue_token,
-                "include_bodies": True,
-            },
-        )
-        messages = inbox.structured_content["result"]
-        assert any(item["subject"] == "Welcome back" for item in messages)
+    async with Client(mail_server) as as_target:
+        subjects = await _inbox_subjects(as_target, project, POLICY_AGENT_TWO, target_token)
+        assert welcome_line in subjects
 
 
 @pytest.mark.asyncio
 async def test_macro_contact_handshake_requires_registered_target(isolated_env):
     backend = "/data/projects/backend"
     frontend = "/data/projects/frontend"
-    server = build_mcp_server()
-    async with Client(server) as client:
+    async with _fresh_session() as client:
         await client.call_tool("ensure_project", {"human_key": backend})
         await client.call_tool("ensure_project", {"human_key": frontend})
-        await client.call_tool(
-            "register_agent",
-            {"project_key": backend, "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_ONE},
-        )
+        await _enrol(client, backend, POLICY_AGENT_ONE)
 
         with pytest.raises(ToolError, match="target must self-register"):
-            await client.call_tool(
-                "macro_contact_handshake",
-                {
-                    "project_key": backend,
-                    "requester": POLICY_AGENT_ONE,
-                    "target": POLICY_AGENT_THREE,
-                    "to_project": frontend,
-                    "auto_accept": True,
-                },
+            await _handshake(
+                client,
+                backend,
+                POLICY_AGENT_ONE,
+                POLICY_AGENT_THREE,
+                to_project=frontend,
+                auto_accept=True,
             )
 
-        agents_blocks = await client.read_resource(f"resource://agents/{slugify(frontend)}")
-        raw = agents_blocks[0].text if agents_blocks else "{}"
-        data = json.loads(raw)
+        data = await _resource_payload(client, f"resource://agents/{slugify(frontend)}")
         names = {agent.get("name") for agent in data.get("agents", [])}
         assert POLICY_AGENT_THREE not in names
 
 
 @pytest.mark.asyncio
-async def test_request_contact_requires_registered_target(isolated_env):
-    backend = "/data/projects/backend"
-    frontend = "/data/projects/frontend"
-    server = build_mcp_server()
-    async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": backend})
-        await client.call_tool("ensure_project", {"human_key": frontend})
-        await client.call_tool(
-            "register_agent",
-            {"project_key": backend, "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_ONE},
-        )
+async def test_request_contact_refuses_an_unregistered_target(isolated_env):
+    """``request_contact`` will not conjure the mailbox it is asked to contact.
+
+    The roster check is the real assertion. Refusing the request but leaving a
+    placeholder row behind would hand the requester an addressable name that
+    nobody is reading -- the same silent loss the routing suite guards against
+    from the delivery side.
+    """
+    origin = "/data/projects/backend"
+    destination = "/data/projects/frontend"
+    async with _fresh_session() as client:
+        await client.call_tool("ensure_project", {"human_key": origin})
+        await client.call_tool("ensure_project", {"human_key": destination})
+        await _enrol(client, origin, POLICY_AGENT_ONE)
 
         with pytest.raises(ToolError, match="target must self-register"):
-            await client.call_tool(
-                "request_contact",
-                {
-                    "project_key": backend,
-                    "from_agent": POLICY_AGENT_ONE,
-                    "to_agent": POLICY_AGENT_THREE,
-                    "to_project": frontend,
-                },
+            await _request_contact(
+                client,
+                origin,
+                POLICY_AGENT_ONE,
+                POLICY_AGENT_THREE,
+                to_project=destination,
             )
 
-        agents_blocks = await client.read_resource(f"resource://agents/{slugify(frontend)}")
-        raw = agents_blocks[0].text if agents_blocks else "{}"
-        data = json.loads(raw)
-        names = {agent.get("name") for agent in data.get("agents", [])}
-        assert POLICY_AGENT_THREE not in names
+        roster = await _resource_payload(client, f"resource://agents/{slugify(destination)}")
+        enrolled = {agent.get("name") for agent in roster.get("agents", [])}
+        assert POLICY_AGENT_THREE not in enrolled, (
+            f"a refused contact request must not provision the target; roster={enrolled!r}"
+        )
 
 
 @pytest.mark.asyncio
@@ -588,28 +664,19 @@ async def test_send_message_supports_at_address(isolated_env):
     backend = "/data/projects/smartedgar_mcp"
     frontend = "/data/projects/smartedgar_mcp_frontend"
     frontend_slug = slugify(frontend)
-    server = build_mcp_server()
-    async with Client(server) as client:
+    async with _fresh_session() as client:
         await client.call_tool("ensure_project", {"human_key": backend})
         await client.call_tool("ensure_project", {"human_key": frontend})
-        await client.call_tool(
-            "register_agent",
-            {"project_key": backend, "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_ONE},
-        )
-        await client.call_tool(
-            "register_agent",
-            {"project_key": frontend, "program": "codex", "model": "gpt-5", "name": POLICY_AGENT_TWO},
-        )
+        await _enrol(client, backend, POLICY_AGENT_ONE)
+        await _enrol(client, frontend, POLICY_AGENT_TWO)
 
-        await client.call_tool(
-            "macro_contact_handshake",
-            {
-                "project_key": backend,
-                "requester": POLICY_AGENT_ONE,
-                "target": POLICY_AGENT_TWO,
-                "to_project": frontend,
-                "auto_accept": True,
-            },
+        await _handshake(
+            client,
+            backend,
+            POLICY_AGENT_ONE,
+            POLICY_AGENT_TWO,
+            to_project=frontend,
+            auto_accept=True,
         )
 
         response = await client.call_tool(

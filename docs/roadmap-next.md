@@ -352,6 +352,20 @@ because they asserted the vulnerable result. Both were found by accident while
 combing the branch. Worth auditing on purpose: every place where a key,
 certificate, digest or origin arrives inside the artefact being validated.
 
+**A dead route surface exists, but it is 1 676 lines and not 9 000 -- measure it
+before deleting anything.** `MailUiAuthMiddleware` (`http.py:3368`) answers 404
+for any path `_mail_ui_active_path` does not accept, and the reported conclusion
+was that the whole server-side mail UI is unreachable. Running that predicate on
+`main` says otherwise: `/mail`, `/mail/projects`, `/mail/unified-inbox`,
+`/mail/login`, `/mail/inbox`, `/mail/compose`, `/mail/attachments` and
+`/mail/overseer` are all **reachable**. What 404s is `/mail/api/locks`,
+`/mail/archive/*`, and the *nested* forms only -- `/mail/overseer/compose`,
+`/mail/projects/<key>/inbox`. So the genuinely stranded surface is the seven
+`templates/archive_*.html` files, 1 676 lines, each with exactly one render call
+behind a 404; the 5 706 lines of `mail_*.html` are live and must not be swept up
+with them. Deciding to drop the archive UI is reasonable; doing it on the
+"whole UI is dead" reading would have taken the working half with it.
+
 ## Sequencing
 
 1 is the user's stated priority and its identity dependency is now resolved by

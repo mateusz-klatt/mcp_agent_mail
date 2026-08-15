@@ -65,7 +65,7 @@ async def _seed(server) -> tuple[dict, dict]:
                 "subject": "shared",
                 "body_md": "everyone may read this one",
                 "thread_id": "OPEN",
-                "idempotency_key": "summgate-open-1",
+                "idempotency_key": "summarize-gate-open-thread",
             },
         )
         await setup.call_tool(
@@ -77,7 +77,7 @@ async def _seed(server) -> tuple[dict, dict]:
                 "subject": "private",
                 "body_md": f"mentions {CLOSED_THREAD_PHRASE} and nothing else",
                 "thread_id": "CLOSED",
-                "idempotency_key": "summgate-closed-1",
+                "idempotency_key": "summarize-gate-closed-thread",
             },
         )
     return owner, outsider

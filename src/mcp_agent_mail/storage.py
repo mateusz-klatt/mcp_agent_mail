@@ -5558,7 +5558,11 @@ def _parse_backup_manifest(data: Any) -> BackupManifest:
         raise ValueError("manifest.json must contain a JSON object")
 
     version = data.get("version")
-    if not isinstance(version, int) or version < 1:
+    # bool is a subclass of int, so `"version": true` satisfies isinstance and
+    # then compares equal to 1 -- a manifest that never named a version would
+    # restore as version 1. Reject it before the int check rather than after,
+    # because `True < 1` is false and the range test cannot catch it.
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
         raise ValueError("manifest.json must include an integer version >= 1")
 
     created_at = data.get("created_at")

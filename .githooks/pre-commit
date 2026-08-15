@@ -1,105 +1,146 @@
 #!/usr/bin/env bash
-# Pre-commit guard against accidental secret commits.
+# Refuse a commit that stages private key material.
 #
-# Activate per-clone with:
+# Enable per clone:
 #     git config core.hooksPath .githooks
 #
-# Why this exists: signing-77c6e768.key was committed in a feature commit
-# despite .gitignore having signing-*.key — someone used `git add -f`. This
-# hook is a second layer that refuses the commit at the index level so even
-# `git add -f` can't sneak a private key in.
-
+# Three layers guard this repository and they catch the mistake at different
+# moments. `.gitignore` stops a key from being staged by accident. CI runs
+# gitleaks over the full history, which is thorough but only speaks after a
+# push. This hook sits between them and is the only one that refuses before the
+# commit object exists — the distinction that matters, because a key already in
+# history is removed by rewriting history, not by a follow-up commit.
+#
+# It inspects the INDEX, not the working tree. `git add -f` defeats .gitignore
+# but still leaves the blob staged, so reading the index is what makes the hook
+# useful rather than decorative.
+#
+# `git commit --no-verify` bypasses this, by design: a hook is a guard rail for
+# an accident, not a control against someone who has decided otherwise.
 set -euo pipefail
 
-red()  { printf '\033[31m%s\033[0m\n' "$*" >&2; }
-yel()  { printf '\033[33m%s\033[0m\n' "$*" >&2; }
+# Turn off shell tracing before touching anything, and do it first. Run under
+# `bash -x`, `sh -x` or a shell that already has xtrace on, every expansion below
+# is echoed -- including the contents of a staged blob. That is not theoretical:
+# a rewrite of scripts/hooks/check_inbox.sh dropped this exact line and duly spat
+# a bearer token and a registration token into a transcript. A guard that reads
+# secrets in order to refuse them is worthless if reading them is how they escape.
+case "$-" in *x*) set +x ;; esac
 
-# Resolve the actual gitdir. In a regular checkout this is `<repo>/.git`,
-# but in a `git worktree`, `.git` is a *file* containing
-# "gitdir: <path>" — a literal `[[ -f .git/MERGE_HEAD ]]` would always
-# fail there because `.git/MERGE_HEAD` doesn't exist as a path under a
-# file. `git rev-parse --git-dir` resolves both forms.
-GIT_DIR=$(git rev-parse --git-dir 2>/dev/null || echo .git)
-
-# Skip merge commits and rebases — these don't represent "did the user
-# mean to add this" decisions; the index is being assembled by git itself.
-if [[ -f "$GIT_DIR/MERGE_HEAD" || -d "$GIT_DIR/rebase-merge" || -d "$GIT_DIR/rebase-apply" ]]; then
-    exit 0
-fi
-
-# Files staged for this commit (added/modified/copied/renamed; excludes deletions)
-mapfile -t staged < <(git diff --cached --name-only --diff-filter=ACMR)
-
-if [[ ${#staged[@]} -eq 0 ]]; then
-    exit 0
-fi
-
-violations=()
-
-# 1. Filename-based blocklist — common private-key/secret naming conventions.
-#    The patterns below are intentionally conservative: any tracked .pub file
-#    is fine, but a .key (or .priv, or signing-XYZ without an explicit .pub
-#    suffix) is rejected at commit time.
-for path in "${staged[@]}"; do
-    base=$(basename -- "$path")
-    case "$base" in
-        # Private key file extensions
-        *.key|*.priv|*.pem|*.pfx|*.p12)
-            # Allow .pub.key (some tools name pubs with .pub.key)
-            if [[ "$base" != *.pub.key ]]; then
-                violations+=("$path  (matches private-key filename pattern)")
-            fi
-            ;;
-        # SSH private keys (no extension)
-        id_rsa|id_dsa|id_ecdsa|id_ed25519)
-            violations+=("$path  (matches SSH private-key filename)")
-            ;;
-        # Project-specific signing keys — Ed25519 seeds named signing-<hex>
-        # Allow paired .pub files and revoked-signing-*.pub historical markers.
-        signing-*|revoked-signing-*)
-            if [[ "$base" != *.pub ]]; then
-                violations+=("$path  (matches signing-* private-key naming convention)")
-            fi
-            ;;
-        # Common secret bundles
-        secrets.*|*-secret|*-secret.*|*.secret|*.secret.*)
-            violations+=("$path  (matches secret-bundle filename pattern)")
-            ;;
-    esac
-done
-
-# 2. Content-based heuristics on small staged files (<=64 KB).
-#    Catches tokens that don't have suspicious filenames.
-#    Both the size check and the blob read use the *index* state so we're
-#    inspecting exactly what would be committed, not whatever the working
-#    tree happens to contain (those can diverge after `git add`).
-for path in "${staged[@]}"; do
-    size=$(git cat-file -s ":$path" 2>/dev/null || echo 0)
-    [[ "$size" -gt 0 && "$size" -le 65536 ]] || continue
-
-    blob=$(git show ":$path" 2>/dev/null || true)
-    [[ -n "$blob" ]] || continue
-
-    # Common provider token shapes (kept conservative to avoid noise)
-    if grep -E -q '\b(sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{30,}|gho_[A-Za-z0-9]{30,}|ghs_[A-Za-z0-9]{30,}|AKIA[0-9A-Z]{16}|xox[abprs]-[A-Za-z0-9-]{20,})\b' <<<"$blob"; then
-        violations+=("$path  (contains provider-token-shaped string)")
-    fi
-
-    # PEM private-key headers
-    if grep -E -q -- '-----BEGIN (RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED |)PRIVATE KEY' <<<"$blob"; then
-        violations+=("$path  (contains PEM private key header)")
-    fi
-done
-
-if [[ ${#violations[@]} -gt 0 ]]; then
-    red "✗ Pre-commit blocked: likely secret file(s) staged."
-    for v in "${violations[@]}"; do
-        red "    - $v"
-    done
-    yel "If a finding is a false positive, run:"
-    yel "    git commit --no-verify"
-    yel "But review the file first — the last leak was a real Ed25519 key."
+die() {
+    printf '\n[pre-commit] refusing this commit\n\n%s\n\n' "$1" >&2
+    printf 'Unstage it and commit again:\n    git restore --staged -- %s\n\n' "$2" >&2
+    printf 'If this really is public key material, rename it so it ends in .pub\n' >&2
     exit 1
-fi
+}
+
+# Names that are private key material by convention. `.pub` is excluded below
+# rather than here so that a file such as `signing-abc.pub.key` still passes.
+name_looks_private() {
+    case "${1##*/}" in
+        *.pub|*.pub.key|*.pub.pem) return 1 ;;
+        *.key|*.priv|*.pem|*.p12|*.pfx|*.jks|*.keystore) return 0 ;;
+        id_rsa|id_dsa|id_ecdsa|id_ed25519) return 0 ;;
+        *.asc|*.gpg) return 0 ;;
+        # A raw Ed25519 seed written as `signing-<hex>` with no extension. The
+        # name is the ONLY layer that can catch this shape: 32 random bytes carry
+        # no header for the content scan and no prefix for the token patterns,
+        # so dropping the pattern left the file shape unguarded entirely.
+        # `revoked-signing-*.pub` stays allowed through the .pub arm above.
+        #
+        # An earlier version of this comment called it "this project's own
+        # convention" and cited a specific leak. Neither claim survives checking:
+        # the commit cited is unreachable from our history, and on the
+        # mit/raider/hermes decomposition the marker file in the repo root came
+        # from upstream. The pattern is worth keeping on its own merits, which is
+        # the first paragraph; the provenance story was decoration and is gone.
+        signing-*|revoked-signing-*) return 0 ;;
+        secrets.*|*-secret|*-secret.*|*.secret|*.secret.*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# PEM and OpenSSH private blobs both announce themselves on their first line.
+# Matching the header rather than entropy keeps this free of false positives on
+# base64 that happens to be long — a noisy guard gets disabled, which is worse
+# than no guard.
+CONTENT_MARKERS='-----BEGIN [A-Z ]*PRIVATE KEY-----|-----BEGIN OPENSSH PRIVATE KEY-----|-----BEGIN PGP PRIVATE KEY BLOCK-----'
+
+# Provider tokens announce themselves the same way: a fixed prefix followed by a
+# minimum run of token characters. That makes a prefix match as precise here as
+# the PEM headers above, with none of the false positives entropy scoring brings.
+#
+# A scan like this existed before the guard was rewritten and the rewrite dropped
+# it. "Must ALSO refuse provider tokens" is a negative requirement, the class
+# that has no natural place in a specification written as a description of
+# behaviour, so it fell out silently. The guard's own suite passed 10 of 10
+# throughout, because not one of those ten cases presented a token. A server
+# bearer reached a transcript the same day the protection was missing.
+#
+# Deliberately no `\b`: BSD and macOS ERE do not implement it, and a guard that
+# quietly stops matching on one platform is worse than one that matches slightly
+# too much. Over-matching fails closed, which is the correct direction here.
+#
+# One entry per issuer rather than a single alternation, for two reasons. The
+# refusal can then name what it found -- "an AWS access key id" sends someone to
+# the right console, "a provider access token" sends them reading. And an issuer
+# can be added, tightened or dropped without editing a regex that six other
+# issuers also depend on.
+#
+# The prefixes are published facts: GitHub documents ghp_/gho_/ghs_ and the
+# fine-grained github_pat_, AWS documents AKIA for a long-term access key id,
+# Slack documents the xoxa/xoxb/xoxp/xoxr/xoxs family, and OpenAI issues sk-. The
+# minimum lengths are ours, chosen so the shortest real token of each kind is
+# still matched while a bare prefix in prose is not -- see the negative controls
+# in scripts/test_precommit_guard.sh, which stage exactly that prose.
+TOKEN_PATTERNS=(
+    "an OpenAI-style secret key|sk-[A-Za-z0-9]{20,}"
+    "a GitHub personal access token|ghp_[A-Za-z0-9]{30,}"
+    "a GitHub OAuth token|gho_[A-Za-z0-9]{30,}"
+    "a GitHub server token|ghs_[A-Za-z0-9]{30,}"
+    "a fine-grained GitHub token|github_pat_[A-Za-z0-9_]{30,}"
+    "an AWS access key id|AKIA[0-9A-Z]{16}"
+    "a Slack token|xox[abprs]-[A-Za-z0-9-]{20,}"
+)
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -n "${staged}" ] || exit 0
+
+while IFS= read -r path; do
+    [ -n "${path}" ] || continue
+
+    if name_looks_private "${path}"; then
+        die "${path} is named like a private key." "${path}"
+    fi
+
+    # Read the staged blob, not the file on disk: they differ whenever
+    # something was staged and then edited, and the commit records the blob.
+    # Match with bash's own regex and no pipeline at all. This is not style.
+    # Under `set -o pipefail`, any pipeline whose consumer exits early reports
+    # the producer's SIGPIPE (141) as the pipeline's status, and an enclosing
+    # `if` then reads "key found" as "no key found" — failing open, silently,
+    # on exactly the large files most likely to be worth catching.
+    #
+    # That bug bit twice here, one layer apart, which is why the pipeline is
+    # gone rather than patched:
+    #   git show | head -c 65536 | grep -q   -> head closes, git show dies 141
+    #   printf '%s' "$blob" | grep -q        -> grep -q exits on first match,
+    #                                           printf dies 141
+    # Measured both times on a 200 KB file whose FIRST line is an OpenSSH
+    # private key header: it committed cleanly. Small samples never reproduce
+    # it, because nothing closes the pipe early.
+    #
+    # `head` still bounds the read, and its own SIGPIPE is absorbed by `|| true`
+    # inside the substitution, where it cannot reach the decision.
+    blob="$(git show ":${path}" 2>/dev/null | head -c 65536 || true)"
+    if [[ "${blob}" =~ ${CONTENT_MARKERS} ]]; then
+        die "${path} contains a private key header." "${path}"
+    fi
+    for entry in "${TOKEN_PATTERNS[@]}"; do
+        if [[ "${blob}" =~ ${entry#*|} ]]; then
+            die "${path} contains what looks like ${entry%%|*}." "${path}"
+        fi
+    done
+done <<< "${staged}"
 
 exit 0

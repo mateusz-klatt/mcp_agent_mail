@@ -324,6 +324,34 @@ strings the tests assert on, and API signatures -- content that cannot be
 written differently without changing the product. The last few hundred lines
 are a decision to make, not a wave to run.
 
+**79 test functions exist only on the abandoned branch, and porting them is a
+helper problem, not a copy.** Every one measured so far -- 17 in
+`test_share_export.py`, 23 more across resources, archive commands and storage
+edges -- passes against current `main`, so they assert properties the code
+already has and nothing currently guards. Distribution: `test_storage_edges` 31,
+`test_share_export` 17, `test_server` 12, `test_cli_archive_commands` 6,
+`test_mcp_resources` 5, `test_contact_and_routing` 3, `test_file_reservation` 3,
+`test_xss_corpus` 2. Appending the first 17 raised 48 `F821`: they call roughly
+ten helpers the branch has and `main` does not (17 `_helper` definitions against
+main's 4), and some of those names collide with main's own. The port is worth
+doing and needs its own session for the helper layer. **Do not dismiss a
+candidate because it fails here** -- twice on 2026-08-15 "does not pass on main"
+meant "detects a live defect", which is how both security fixes below were
+found. Read the failure type: an `ImportError`, `AttributeError` or missing
+fixture is coupling to the rewrite; an `AssertionError` about behaviour is a
+finding.
+
+**One vulnerability class has produced two instances and deserves a deliberate
+search for a third.** Both trusted key material supplied by the party being
+checked. `_fetch_jwks` parsed a response body whatever the HTTP status said, so
+a 503 error page carrying a `keys` array installed itself as a trusted key set
+(`c753c0f`). `verify_bundle` fell back to the public key embedded in the bundle
+it was verifying, so a self-signed forgery reported `signature_verified: True`
+(`ffcb3be`); two tests in `tests/test_share_export.py` had to be corrected
+because they asserted the vulnerable result. Both were found by accident while
+combing the branch. Worth auditing on purpose: every place where a key,
+certificate, digest or origin arrives inside the artefact being validated.
+
 ## Sequencing
 
 1 is the user's stated priority and its identity dependency is now resolved by

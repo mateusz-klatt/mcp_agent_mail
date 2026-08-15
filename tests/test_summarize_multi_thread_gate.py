@@ -33,7 +33,7 @@ from mcp_agent_mail.app import build_mcp_server
 KEY = "/test/summarize-gate"
 OWNER = "claude-linux-summgate-owner-1"
 OUTSIDER = "codex-linux-summgate-outsider-1"
-SECRET = "the-turbine-bearing-replacement-schedule"
+CLOSED_THREAD_PHRASE = "the-turbine-bearing-replacement-schedule"
 
 
 def _data(result):
@@ -75,7 +75,7 @@ async def _seed(server) -> tuple[dict, dict]:
                 "sender_name": OWNER,
                 "to": [OWNER],
                 "subject": "private",
-                "body_md": f"mentions {SECRET} and nothing else",
+                "body_md": f"mentions {CLOSED_THREAD_PHRASE} and nothing else",
                 "thread_id": "CLOSED",
                 "idempotency_key": "summgate-closed-1",
             },

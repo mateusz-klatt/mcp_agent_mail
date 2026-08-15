@@ -1535,6 +1535,17 @@ def finalize_snapshot_for_export(snapshot_path: Path) -> None:
         # Update query planner statistics for optimal execution plans
         conn.execute("PRAGMA optimize")
 
+        # ANALYZE writes sqlite_stat4 as well, but only when the local SQLite was
+        # built with SQLITE_ENABLE_STAT4 — true of Homebrew's Python on macOS,
+        # false on the Linux builds this ran on until now. Two reasons to drop it,
+        # and the second is why allowlisting it instead would be wrong: its rows
+        # carry verbatim samples of indexed columns, message bodies among them,
+        # and this snapshot is published. sqlite_stat1 holds only aggregates and
+        # every build produces it, so keeping just that one also makes the export
+        # byte-comparable regardless of how the exporting machine's SQLite was
+        # compiled.
+        conn.execute("DROP TABLE IF EXISTS sqlite_stat4")
+
         conn.commit()
     finally:
         conn.close()

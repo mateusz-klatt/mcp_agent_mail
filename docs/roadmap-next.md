@@ -227,6 +227,51 @@ names that cannot be keys.
 
 ## Still open, server side
 
+**The secret guard has four holes and cannot fix itself.**
+`scripts/test_precommit_guard.sh` reports four of thirty cases wrong against
+`.githooks/pre-commit`: a 200 KB file whose first line is a private-key header
+passes (the size bound is checked before the header), `github_pat_` is missing
+from an alternation that already lists the classic PAT, OpenAI and AWS shapes,
+and under `bash -x` the hook echoes the staged blob to the trace *and* fails to
+refuse -- the guard leaking exactly what it exists to catch, with no rejection
+for a reviewer to notice. `case "$-" in *x*) set +x ;; esac` before the first
+read closes the last two, and this defence has been removed from the file once
+before. The obstacle is procedural: the hook's own marker list contains a
+private-key header, so with the guard installed it refuses its own source. Any
+edit to it needs either `--no-verify` with an eyes-on diff, or a self-exemption
+-- and a self-exemption creates the blind spot where a real key pasted into
+that one file would pass.
+
+**One test makes the Windows CI leg unfinishable.**
+`test_inbox_fetch_with_100_messages` needs an estimated 307-409 s on Windows
+against the 300 s per-test timeout, so the leg dies mid-run and reports nothing
+-- not a red, an absence. It does not scale with the platform factor of the
+suite: the whole suite is 7 % slower on macOS than on Linux while this one test
+is 2.5x, and on a WSL/Windows pair sharing one physical machine the suite factor
+is 13x against >23x for this test. The mechanism explains the outlier -- filling
+the inbox writes 100 messages, i.e. 100 git commits with `fsync`, exactly where
+NTFS and APFS lose hardest. Falsifiable: at a 900 s limit expect roughly
+300-420 s.
+
+**The 500 ms send-latency threshold passes on one platform of three.** Measured
+p95: Linux 178-455 ms, macOS 621-708 ms (the whole distribution above the
+threshold, so it is a level problem, not a tail), Windows 1 408-1 825 ms against
+its own 1 500 ms margin, with the median 16 ms over -- a coin flip. The margin
+already exists and did not help. Raising it again chases a number that moves;
+the useful fix is to assert the typical cost rather than the tail, or to place
+the budget where only a qualitative change can cross it.
+
+**`.test_durations` describes code that no longer exists.** 275 of its 2 206
+entries name tests that are gone and 331 of today's tests have no timing at all,
+so the Windows 8-way CI split allocates on a stale picture and the slowest chunk
+sets the wall-clock for everyone.
+
+**`test_share_export.py` hard-fails when `uv` is absent.** The same test skips
+gracefully with a named reason when the pinned UI toolchain is missing, then
+shells out to `uv build` with no equivalent guard -- so on a machine without
+`uv` an environment gap is reported as a red gate.
+
+
 `_authenticate_agent` never refreshes `last_active_ts`, so an agent that only
 files reservations looks dead after `FILE_RESERVATION_INACTIVITY_SECONDS` and
 has its holds swept. `register_agent` does not clear `retired_at` when an
@@ -262,6 +307,22 @@ upstream commits followed it and this fork contains all of them — 128 files,
 +24 471/−3 512, concentrated in `app.py`, `http.py`, `cli.py` and `storage.py`.
 That is a rebuild, not a flag. The realistic options are keeping the rider or
 asking the copyright holder for a parallel grant.
+
+**Attempted and stopped on 2026-08-15, with the cost measured.** Four agents
+spent a day rewriting against a `mit`-based anchor; rider-attributed lines went
+16 031 -> 3 909, concentrated exactly where this paragraph predicted (`src/`
+~1 800, `tests/` ~1 700, most of it `app.py`). It was abandoned as too
+expensive, `main` was restored, and development continues under the existing
+licence. Two findings are worth carrying if anyone reconsiders. The cheap
+measurement is the honest one: `git blame` against the rider anchor already
+attributes positionally, so a line unchanged since the MIT base is *already*
+credited to that base -- three attempts to "refine" the count with a textual
+exemption filter (2 624, 3 564) all lost information, because text matching
+answers a weaker question than the one blame already answered. And what
+survives a rewrite is not random: it is disproportionately SQL schema, error
+strings the tests assert on, and API signatures -- content that cannot be
+written differently without changing the product. The last few hundred lines
+are a decision to make, not a wave to run.
 
 ## Sequencing
 

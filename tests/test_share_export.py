@@ -1983,10 +1983,12 @@ def test_sign_and_verify_manifest(tmp_path: Path) -> None:
     sig_path = tmp_path / "manifest.sig.json"
     assert sig_path.exists()
 
-    # Verify the bundle (should pass)
+    # Verify the bundle. The signature is intact, so it is *checked* -- but the
+    # only key available is the one the bundle carries, which is an argument the
+    # bundle makes about itself and proves no origin. Verified stays False.
     result = share.verify_bundle(tmp_path)
     assert result["signature_checked"] is True
-    assert result["signature_verified"] is True
+    assert result["signature_verified"] is False
 
     # Verify with explicit public key (should pass)
     result = share.verify_bundle(tmp_path, public_key=signature_info["public_key"])
@@ -2553,11 +2555,13 @@ def test_verify_bundle_with_sri_and_signature_both_valid(tmp_path: Path) -> None
     signing_key_path.write_bytes(b"A" * 32)
     share.sign_manifest(manifest_path, signing_key_path, tmp_path)
 
-    # Verification should pass
+    # Verification should pass. Without a pinned key the signature is checked
+    # for internal consistency only, so `signature_verified` stays False; the
+    # pinned-key path is covered by the caller that supplies `public_key=`.
     result = share.verify_bundle(tmp_path)
     assert result["sri_checked"] is True
     assert result["signature_checked"] is True
-    assert result["signature_verified"] is True
+    assert result["signature_verified"] is False
 
 
 def test_verify_bundle_rejects_manifest_sha256_mismatch(tmp_path: Path) -> None:
@@ -2986,3 +2990,120 @@ def test_build_materialized_views_supports_legacy_fts_without_sender_id(tmp_path
         assert row["sender_address"] is None
     finally:
         conn.close()
+
+
+def test_verify_bundle_does_not_trust_a_key_the_bundle_carries(tmp_path: Path) -> None:
+    """A bundle re-signed with the attacker's own key must not be reported as verified.
+
+    ``manifest.sig.json`` carries both the signature and the public key it was made
+    with, so anyone who can rewrite the manifest can also generate a fresh keypair,
+    re-sign the rewritten bytes, and replace the key. Checking one against the other
+    proves only that the forgery is self-consistent. Origin is proven exclusively by
+    a key the caller pinned out of band, so that is the only case that may report
+    ``signature_verified``.
+    """
+    pytest.importorskip("nacl", reason="PyNaCl required for signing tests")
+    from nacl.signing import SigningKey
+
+    # The publisher signs a genuine manifest and hands out its public key.
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({"version": "1.0", "payload": "genuine"}), encoding="utf-8"
+    )
+    publisher_key_path = tmp_path / "publisher.key"
+    publisher_key_path.write_bytes(b"P" * 32)
+    publisher_signature = share.sign_manifest(manifest_path, publisher_key_path, tmp_path)
+    publisher_public_key = publisher_signature["public_key"]
+
+    # The attacker rewrites the manifest, signs it with a keypair they just made,
+    # and publishes their own public key alongside it.
+    forged_bytes = json.dumps(
+        {"version": "1.0", "payload": "ATTACKER CONTROLLED"}
+    ).encode("utf-8")
+    manifest_path.write_bytes(forged_bytes)
+    attacker_key = SigningKey(b"X" * 32)
+    attacker_public_key = base64.b64encode(attacker_key.verify_key.encode()).decode("ascii")
+    assert attacker_public_key != publisher_public_key
+    (tmp_path / "manifest.sig.json").write_text(
+        json.dumps(
+            {
+                "algorithm": "ed25519",
+                "signature": base64.b64encode(
+                    attacker_key.sign(forged_bytes).signature
+                ).decode("ascii"),
+                "manifest_sha256": hashlib.sha256(forged_bytes).hexdigest(),
+                "public_key": attacker_public_key,
+                "generated_at": publisher_signature["generated_at"],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    # The forgery is internally consistent, so it is "checked" — but nothing about
+    # it proves an origin, so it must never be reported as verified.
+    result = share.verify_bundle(tmp_path)
+    assert result["signature_checked"] is True
+    assert result["signature_verified"] is False
+
+    # Pinning the publisher's real key is what exposes the forgery.
+    with pytest.raises(ShareExportError, match="signature verification failed"):
+        share.verify_bundle(tmp_path, public_key=publisher_public_key)
+
+
+def test_verify_bundle_reports_verified_only_for_a_pinned_key(tmp_path: Path) -> None:
+    """A genuine bundle is only ``signature_verified`` when the caller pinned the key."""
+    pytest.importorskip("nacl", reason="PyNaCl required for signing tests")
+
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps({"version": "1.0"}), encoding="utf-8")
+    signing_key_path = tmp_path / "signing.key"
+    signing_key_path.write_bytes(b"A" * 32)
+    signature_info = share.sign_manifest(manifest_path, signing_key_path, tmp_path)
+
+    unpinned = share.verify_bundle(tmp_path)
+    assert unpinned["signature_checked"] is True
+    assert unpinned["signature_verified"] is False
+
+    pinned = share.verify_bundle(tmp_path, public_key=signature_info["public_key"])
+    assert pinned["signature_checked"] is True
+    assert pinned["signature_verified"] is True
+
+
+def test_cli_verify_warns_when_no_key_is_pinned(tmp_path: Path) -> None:
+    """A signed bundle checked without ``--public-key`` must say why it is not verified.
+
+    ``Signature verified: False`` on its own reads as a malfunction, so a reader
+    shrugs it off -- and that reader is precisely the one being attacked. The
+    output has to name the circularity out loud: the only key available was the
+    one travelling inside the artifact being checked. Assertions below match
+    single words, because rich wraps the console and a multi-word phrase can be
+    split across lines without anything being wrong.
+    """
+    pytest.importorskip("nacl", reason="PyNaCl required for signing tests")
+
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    manifest = bundle / "manifest.json"
+    manifest.write_text(json.dumps({"version": "1.0"}), encoding="utf-8")
+    signing_key = tmp_path / "signing.key"
+    signing_key.write_bytes(b"A" * 32)
+    signature_info = share.sign_manifest(manifest, signing_key, bundle)
+
+    runner = CliRunner()
+    unpinned = runner.invoke(cli_module.app, ["share", "verify", str(bundle)])
+    assert unpinned.exit_code == 0
+    assert "Signature checked: True" in unpinned.output
+    assert "Signature verified: False" in unpinned.output
+    assert "forgery" in unpinned.output, "the unpinned case did not explain itself"
+
+    # Positive control: pin the key and the caveat must be gone, not merely reworded.
+    pinned = runner.invoke(
+        cli_module.app,
+        ["share", "verify", str(bundle), "--public-key", signature_info["public_key"]],
+    )
+    assert pinned.exit_code == 0
+    assert "Signature verified: True" in pinned.output
+    assert "forgery" not in pinned.output

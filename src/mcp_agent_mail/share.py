@@ -2599,9 +2599,9 @@ def verify_bundle(bundle_path: Path, *, public_key: Optional[str] = None) -> dic
                 f"Unsupported signature algorithm in manifest.sig.json: {algorithm}"
             )
 
-        key_b64 = public_key or sig_payload.get("public_key")
+        embedded_key_b64 = sig_payload.get("public_key")
         signature_b64 = sig_payload.get("signature")
-        if not key_b64 or not signature_b64:
+        if not (public_key or embedded_key_b64) or not signature_b64:
             raise ShareExportError("manifest.sig.json missing public_key or signature fields.")
         try:
             from nacl.exceptions import BadSignatureError
@@ -2609,8 +2609,21 @@ def verify_bundle(bundle_path: Path, *, public_key: Optional[str] = None) -> dic
         except ImportError as exc:  # pragma: no cover - optional dependency
             raise ShareExportError("PyNaCl is required to verify manifest signatures.") from exc
 
+        # Two keys that are never interchangeable. The key the bundle carries is
+        # an argument the bundle makes about itself: checking against it proves
+        # the manifest was not edited after signing, and nothing whatever about
+        # who signed it. Only a key the CALLER pinned can establish origin, so
+        # only that one may set ``signature_verified``. Folding the two into one
+        # `public_key or sig_payload["public_key"]` -- which is what stood here --
+        # let a forger sign their own manifest, ship their own key beside it, and
+        # be reported as verified.
         try:
-            verify_key = VerifyKey(base64.b64decode(key_b64))
+            embedded_verify_key = (
+                VerifyKey(base64.b64decode(embedded_key_b64)) if embedded_key_b64 else None
+            )
+            pinned_verify_key = (
+                VerifyKey(base64.b64decode(public_key)) if public_key else None
+            )
         except (ValueError, binascii.Error) as exc:
             raise ShareExportError(f"Invalid base64 in public_key: {exc}") from exc
 
@@ -2619,12 +2632,23 @@ def verify_bundle(bundle_path: Path, *, public_key: Optional[str] = None) -> dic
         except (ValueError, binascii.Error) as exc:
             raise ShareExportError(f"Invalid base64 in signature: {exc}") from exc
 
-        try:
-            verify_key.verify(manifest_bytes, signature_bytes)
-            signature_verified = True
-        except BadSignatureError as exc:
-            raise ShareExportError("Manifest signature verification failed.") from exc
+        if embedded_verify_key is not None:
+            try:
+                embedded_verify_key.verify(manifest_bytes, signature_bytes)
+            except BadSignatureError as exc:
+                raise ShareExportError("Manifest signature verification failed.") from exc
 
+        if pinned_verify_key is not None:
+            try:
+                pinned_verify_key.verify(manifest_bytes, signature_bytes)
+            except BadSignatureError as exc:
+                # Reached when the bundle is signed by *some* key that is not the
+                # caller's -- the self-signed forgery the embedded check cannot see.
+                raise ShareExportError(
+                    "Manifest signature verification failed: the bundle is not signed "
+                    "by the pinned public key."
+                ) from exc
+            signature_verified = True
         manifest_sha256 = str(sig_payload.get("manifest_sha256") or "").strip().lower()
         if not manifest_sha256:
             raise ShareExportError("manifest.sig.json missing manifest_sha256 field.")

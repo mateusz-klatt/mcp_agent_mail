@@ -3962,6 +3962,19 @@ def share_verify(
             console.print("[yellow]  Warning: No SRI hashes found in manifest[/]")
         if not result["signature_checked"]:
             console.print("[yellow]  Warning: No signature found (manifest.sig.json)[/]")
+        elif not result["signature_verified"]:
+            # Without --public-key the only key available is the one travelling
+            # inside the artifact being checked, so the check is circular. Say so
+            # here: "Signature verified: False" on its own reads as a failure, and
+            # the reader who shrugs it off is exactly the reader being attacked.
+            console.print(
+                "[yellow]  Warning: no --public-key given, so the signature was checked only"
+                " against the key the bundle carries.[/]"
+            )
+            console.print(
+                "[yellow]  That detects corruption, not forgery: whoever can rewrite the"
+                " manifest can re-sign it with a key of their own and this still passes.[/]"
+            )
 
     except ShareExportError as exc:
         console.print(f"[red]Verification failed:[/] {exc}")

@@ -64,7 +64,15 @@ name_looks_private() {
 # Matching the header rather than entropy keeps this free of false positives on
 # base64 that happens to be long — a noisy guard gets disabled, which is worse
 # than no guard.
-CONTENT_MARKERS='-----BEGIN [A-Z ]*PRIVATE KEY-----|-----BEGIN OPENSSH PRIVATE KEY-----|-----BEGIN PGP PRIVATE KEY BLOCK-----'
+#
+# The headers are ASSEMBLED rather than written out, and that is not styling.
+# Spelled literally, this line is itself a private-key header, so every secret
+# scanner pointed at the repository reports the guard as a leak: gitleaks failed
+# `Secret scan` on `main` with exactly two findings, both of them from here. A
+# file whose job is to list forbidden markers cannot contain them; the same trick
+# is already used in scripts/test_precommit_guard.sh for the same reason.
+_dash5='-----'
+CONTENT_MARKERS="${_dash5}BEGIN [A-Z ]*PRIVATE KEY${_dash5}|${_dash5}BEGIN OPENSSH PRIVATE KEY${_dash5}|${_dash5}BEGIN PGP PRIVATE KEY BLOCK${_dash5}"
 
 # Provider tokens announce themselves the same way: a fixed prefix followed by a
 # minimum run of token characters. That makes a prefix match as precise here as

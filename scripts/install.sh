@@ -10,9 +10,13 @@ set -euo pipefail
 # Usage examples:
 #   ./scripts/install.sh --yes
 #   ./scripts/install.sh --dir "$HOME/mcp_agent_mail" --yes
-#   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail/main/scripts/install.sh | bash -s -- --yes
+#   curl -fsSL https://raw.githubusercontent.com/mateusz-klatt/mcp_agent_mail/main/scripts/install.sh | bash -s -- --yes
 
-REPO_URL="https://github.com/Dicklesworthstone/mcp_agent_mail"
+# This fork, not upstream. README points people at this script by its raw URL on
+# mateusz-klatt/mcp_agent_mail, so cloning Dicklesworthstone/mcp_agent_mail here
+# handed them pre-fork code while every instruction said otherwise — the
+# divergence was invisible because the clone succeeded.
+REPO_URL="https://github.com/mateusz-klatt/mcp_agent_mail"
 REPO_NAME="mcp_agent_mail"
 BRANCH="main"
 # Default clone location follows XDG Base Directory spec so that
@@ -58,8 +62,8 @@ Examples:
   ./scripts/install.sh --yes
   ./scripts/install.sh --port 9000 --yes
   ./scripts/install.sh --dir "\$HOME/mcp_agent_mail" --yes
-  curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail/main/scripts/install.sh | bash -s -- --yes
-  curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail/main/scripts/install.sh | bash -s -- --port 9000 --yes
+  curl -fsSL https://raw.githubusercontent.com/mateusz-klatt/mcp_agent_mail/main/scripts/install.sh | bash -s -- --yes
+  curl -fsSL https://raw.githubusercontent.com/mateusz-klatt/mcp_agent_mail/main/scripts/install.sh | bash -s -- --port 9000 --yes
 EOF
 }
 

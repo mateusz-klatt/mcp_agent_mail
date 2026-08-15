@@ -137,10 +137,28 @@ am_execution_marker_refresh_for_payload "$PROJECT" "$AGENT" claude \
 # (app.py:11264). Reading .agent at the top level yielded null and fell back to
 # "another agent" — so in the one moment a conflict is real, the message did not
 # say who to talk to, which is the only thing it exists to convey.
-conflicts="$(printf '%s' "$resp" | jq -r \
-    '[.conflicts[]? as $c | ($c.holders[]? // {}) | "\($c.path) held by \(.agent // "another agent")"] | unique | join("; ")' 2>/dev/null)"
+#
+# Partition by holder first. A claim held by this same durable Agent — a legacy
+# unscoped claim from before the migration, or a sibling execution of ours — is
+# not "someone else", and saying so contradicts reservations_warn.sh, which gets
+# this right on the PreToolUse side and names it as our own. The two hooks
+# describing one claim in opposite terms is worse than either message alone:
+# it is loudest exactly when there is no collision, which teaches the reader to
+# discount this whole class of warning before a real conflict ever arrives.
+conflicts="$(printf '%s' "$resp" | jq -r --arg self "$AGENT" \
+    '[.conflicts[]? as $c | ($c.holders[]? // {})
+      | select((.agent // "") != $self)
+      | "\($c.path) held by \(.agent // "another agent")"] | unique | join("; ")' 2>/dev/null)"
+self_conflicts="$(printf '%s' "$resp" | jq -r --arg self "$AGENT" \
+    '[.conflicts[]? as $c | ($c.holders[]? // {})
+      | select((.agent // "") == $self)
+      | $c.path] | unique | join("; ")' 2>/dev/null)"
+
 if [ -n "$conflicts" ] && [ "$conflicts" != "null" ]; then
     am_emit_context "PostToolUse" \
         "Agent Mail: you just edited a file reserved by someone else — ${conflicts}. Coordinate before continuing."
+elif [ -n "$self_conflicts" ] && [ "$self_conflicts" != "null" ]; then
+    am_emit_context "PostToolUse" \
+        "Agent Mail: ${self_conflicts} is already claimed by your own durable Agent (a legacy or sibling-execution claim), not by another agent. No coordination is needed; release it or let it expire before the server switches to enforce mode."
 fi
 exit 0

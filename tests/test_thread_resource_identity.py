@@ -98,7 +98,7 @@ async def test_the_agent_parameter_cannot_name_someone_else(isolated_env):
     malformed URI would read as the check working.
     """
     server = build_mcp_server()
-    reader, other = await _seed(server)
+    reader, _other = await _seed(server)
 
     async with Client(server) as session:
         await _bind(session, READER, reader["registration_token"])
@@ -135,7 +135,7 @@ async def test_naming_yourself_does_not_widen_what_you_may_read(isolated_env):
     so they cannot tell a viewer-gated read from an ungated one.
     """
     server = build_mcp_server()
-    reader, other = await _seed(server)
+    reader, _other = await _seed(server)
 
     async with Client(server) as session:
         await _bind(session, READER, reader["registration_token"])

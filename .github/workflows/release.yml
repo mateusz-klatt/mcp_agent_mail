@@ -298,6 +298,15 @@ jobs:
           images: |
             ghcr.io/${{ github.repository }}
             docker.io/klattm/iris
+          # metadata-action's default is `latest=auto`, under which
+          # `type=ref,event=tag` turns `latest` on for ANY tag push. That made
+          # the `enable=` guard below inert — a `v0.5.0-rc1` would still have
+          # moved `latest` onto a release candidate, the exact thing the guard
+          # exists to prevent — and emitted `:latest` twice per image besides.
+          # Pinning it false leaves `type=raw` as the only source of `latest`,
+          # which is what makes the prerelease output load-bearing.
+          flavor: |
+            latest=false
           # `type=ref,event=tag` publishes the git ref verbatim, so it yields
           # `v0.4.0`. The documented pull command is `klattm/iris:0.4.0`, which
           # is also the ordinary Docker spelling — without `type=semver` that

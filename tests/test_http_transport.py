@@ -81,6 +81,8 @@ async def test_http_jwks_validation_and_resource_rate_limit(isolated_env, monkey
     async def fake_get(self, url: str):
         class _Resp:
             status_code = 200
+            def raise_for_status(self) -> None:
+                """A 200 raises nothing; present so the double matches a real Response."""
             def json(self) -> dict[str, Any]:
                 return jwks_payload
         return _Resp()

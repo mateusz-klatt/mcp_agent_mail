@@ -730,7 +730,17 @@ async def _fetch_jwks(jwks_url: str, *, force: bool = False):
         httpx = importlib.import_module("httpx")
         AsyncClient = httpx.AsyncClient
         async with AsyncClient(timeout=5) as client:
-            jwks = (await client.get(jwks_url)).json()
+            response = await client.get(jwks_url)
+            # Only a success status makes the body an answer. Without this the
+            # document was parsed whatever the server said, so anything able to
+            # make this URL return an error page carrying a ``keys`` array -- a
+            # caching proxy, a captive portal, an origin under someone else's
+            # control -- got its own key trusted for token verification. The
+            # raise lands in the existing handler below, which is already the
+            # behaviour we want for an unusable response: keep the last good
+            # key set rather than trusting the new one.
+            response.raise_for_status()
+            jwks = response.json()
         key_set = JsonWebKey.import_key_set(jwks)
     except Exception:
         # Fall back to any cached (possibly stale) key set on fetch failure.

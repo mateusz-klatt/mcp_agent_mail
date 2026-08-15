@@ -34,6 +34,8 @@ async def test_http_jwt_bad_kid_rejected(isolated_env, monkeypatch):
     async def fake_get(self, url: str):
         class _Resp:
             status_code = 200
+            def raise_for_status(self) -> None:
+                """A 200 raises nothing; present so the double matches a real Response."""
             def json(self) -> dict[str, Any]:
                 return jwks_payload
         return _Resp()
@@ -108,3 +110,44 @@ async def test_http_jwt_malformed_token(isolated_env, monkeypatch):
         r = await client.post(settings.http.path, headers=headers, json=_rpc("tools/call", {"name": "health_check", "arguments": {}}))
         assert r.status_code == 401
 
+
+
+@pytest.mark.asyncio
+async def test_jwks_error_status_body_is_not_trusted(monkeypatch):
+    """A JWKS endpoint answering 5xx must not have its body installed as keys.
+
+    Fetching only checked that the body parsed, never that the server said the
+    body was an answer. So anything able to make that URL return an error page
+    carrying a ``keys`` array -- a caching proxy, a captive portal, an origin
+    under someone else's control -- got its own key trusted for token
+    verification. The positive control below serves the identical body under
+    200, so a failure here can only mean the status was ignored; it cannot mean
+    the document was unusable.
+    """
+    import httpx
+
+    from mcp_agent_mail import http as http_mod
+
+    attacker_jwk = JsonWebKey.generate_key("RSA", 2048, is_private=True).as_dict(is_private=False)
+    attacker_jwk["kid"] = "attacker"
+    served = {"keys": [attacker_jwk]}
+    status = {"code": 503}
+
+    async def fake_get(self, url: str):
+        # A real Response, so raise_for_status() and json() are the real ones.
+        return httpx.Response(status["code"], json=served, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get, raising=False)
+
+    http_mod.clear_jwks_cache()
+    assert await http_mod._fetch_jwks("https://jwks.local/keys") is None, (
+        "a 503 body was imported as a key set"
+    )
+
+    # Positive control: same bytes, status 200 -- this must succeed.
+    status["code"] = 200
+    http_mod.clear_jwks_cache()
+    assert await http_mod._fetch_jwks("https://jwks.local/keys") is not None, (
+        "the control failed, so the test above proves nothing about status"
+    )
+    http_mod.clear_jwks_cache()

@@ -7086,6 +7086,50 @@ printf '%s\n200' "$envelope"
     lock_holder.stdin.write("release\n")
     lock_holder.stdin.flush()
     assert lock_holder.wait(timeout=5) == 0
+    # Wait for the work, then for the process — in that order, because they are
+    # two different events and only the first one is what this test is about.
+    #
+    # Draining straight into communicate() put a stopwatch on session-end and
+    # called the result a verdict: a slow runner raised TimeoutExpired, which is
+    # an error rather than a failed assertion, so the whole Windows chunk went
+    # red without the property below ever being evaluated. It did that on
+    # 77a9fe2 and 8a9b88a and passed on bb87d9b with nothing in between changing
+    # this file, which is the signature of a timing assertion nobody meant to
+    # write. The 6.8 s figure quoted at the other session-end call is NOT the
+    # justification: it was measured on a native Windows host, not a hosted
+    # runner, and bb87d9b proves the whole path can finish inside five seconds
+    # here. The budget sits inside the runner's spread, not below its floor.
+    #
+    # So stop timing it. Every other spawn-and-wait in this file already waits
+    # on an observable first — start_entered, register_entered, the contention
+    # markers — and this was the one call site without one. The completed
+    # generation is durable state that session-end writes on its way through, so
+    # polling for it turns a slow machine into a longer wait and a genuinely
+    # hung hook into a named assertion instead of a stopwatch error.
+    def _completed_session_generations() -> dict[int, dict[str, object]]:
+        found: dict[int, dict[str, object]] = {}
+        for path in (state / "executions").glob("*.json"):
+            try:
+                item = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                # The hook is still writing this file. Not an error: the next
+                # poll re-reads it, and the deadline below bounds the waiting.
+                continue
+            if item.get("kind") == "session":
+                found[item["lifecycle_generation"]] = item
+        return found
+
+    deadline = time.monotonic() + (60 if os.name == "nt" else 20)
+    while time.monotonic() < deadline:
+        if _completed_session_generations().get(1, {}).get("status") == "completed":
+            break
+        time.sleep(0.02)
+    assert _completed_session_generations().get(1, {}).get("status") == "completed", (
+        "session-end never completed the first generation"
+    )
+
+    # Only the exit is left, so a flat budget here assumes nothing about the
+    # machine — the same reason lock_holder above keeps its five seconds.
     end_stdout, end_stderr = end_process.communicate(timeout=5)
     assert end_process.returncode == 0, end_stderr
     assert end_stdout == ""

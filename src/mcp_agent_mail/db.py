@@ -3140,6 +3140,10 @@ def _setup_fts(
     for delivery_trigger in (
         "messages_identity_collision_guard_bi",
         "messages_identity_collision_guard_bu",
+        # Recreated below with CREATE TRIGGER IF NOT EXISTS, which is a no-op
+        # against a database that already has the previous definition. Any
+        # change to its authorization clause reaches an existing deployment
+        # only because the name is dropped here first.
         "message_deliveries_guard_bi",
         "message_deliveries_snapshots_bu",
         "message_deliveries_receipt_bu",
@@ -3159,11 +3163,6 @@ def _setup_fts(
         "message_deliveries_reply_target_pending_bd",
         "message_deliveries_reply_target_pending_bu",
         "message_deliveries_reply_target_pending_bi",
-        # Recreated below with CREATE TRIGGER IF NOT EXISTS, which is a no-op
-        # against a database that already has the previous definition. Any
-        # change to its authorization clause only reaches existing deployments
-        # because the name is dropped here first.
-        "message_deliveries_guard_bi",
     ):
         connection.exec_driver_sql(f"DROP TRIGGER IF EXISTS {delivery_trigger}")
     connection.exec_driver_sql(

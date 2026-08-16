@@ -940,11 +940,38 @@ def test_ui_actor_authorization_is_enforced_by_database(isolated_env) -> None:
             (reply_id,),
         ).fetchone() == (1,)
 
+        # An operator authors new threads too, on the project the assignment
+        # names. The trigger is the last of four layers that check this; it is
+        # the only one a direct database write still has to pass.
+        compose_id = _insert_delivery(
+            connection,
+            idempotency_key="operator-compose",
+            request_sha256="6" * 64,
+            actor_kind="ui_user",
+            actor_id=20,
+            actor_name="operator",
+            actor_generation=USER_GENERATION,
+            actor_epoch=7,
+        )
+        connection.commit()
+        assert connection.execute(
+            "SELECT delivery_kind FROM message_deliveries WHERE id = ?",
+            (compose_id,),
+        ).fetchone() == ("message",)
+
+        connection.execute(
+            "UPDATE ui_project_assignments SET role = 'viewer' "
+            "WHERE user_id = 20 AND project_id = 1"
+        )
+        # The assignment row is what grants both, so downgrading it must close
+        # both. Compose is checked here as well as reply: widening the rule for
+        # operators must not have widened it for viewers.
         with pytest.raises(sqlite3.IntegrityError, match="not authorized"):
             _insert_delivery(
                 connection,
-                idempotency_key="operator-compose",
-                request_sha256="6" * 64,
+                delivery_kind="reply",
+                idempotency_key="viewer-reply",
+                request_sha256="5" * 64,
                 actor_kind="ui_user",
                 actor_id=20,
                 actor_name="operator",
@@ -960,9 +987,8 @@ def test_ui_actor_authorization_is_enforced_by_database(isolated_env) -> None:
         with pytest.raises(sqlite3.IntegrityError, match="not authorized"):
             _insert_delivery(
                 connection,
-                delivery_kind="reply",
-                idempotency_key="viewer-reply",
-                request_sha256="5" * 64,
+                idempotency_key="viewer-compose",
+                request_sha256="3" * 64,
                 actor_kind="ui_user",
                 actor_id=20,
                 actor_name="operator",

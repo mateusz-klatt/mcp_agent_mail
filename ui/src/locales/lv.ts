@@ -207,7 +207,7 @@ const translation = {
     hint: "Nosūtiet idempotentu, noturīgi arhivētu norādījumu projekta aģentiem.",
     loading: "Ielādē rakstīšanas piekļuvi…",
     loadError: "Neizdevās ielādēt rakstīšanas piekļuvi.",
-    forbidden: "Jaunu ziņojumu rakstīšanai nepieciešama administratora piekļuve.",
+    forbidden: "Jaunu ziņojumu rakstīšanai nepieciešama administratora piekļuve vai operatora loma projektā.",
     noProjects: "Nav aktīvu projektu, kuriem varētu rakstīt.",
     project: "Projekts",
     chooseProject: "Izvēlieties projektu",

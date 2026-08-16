@@ -207,7 +207,7 @@ const translation = {
     hint: "Lähetä idempotentti, pysyvästi arkistoitu ohje projektin agenteille.",
     loading: "Ladataan kirjoitusoikeuksia…",
     loadError: "Kirjoitusoikeuksia ei voitu ladata.",
-    forbidden: "Uusien viestien kirjoittaminen vaatii järjestelmänvalvojan käyttöoikeudet.",
+    forbidden: "Uusien viestien kirjoittaminen vaatii järjestelmänvalvojan käyttöoikeudet tai operaattorin roolin jossakin projektissa.",
     noProjects: "Kirjoittamista varten ei ole saatavilla aktiivisia projekteja.",
     project: "Projekti",
     chooseProject: "Valitse projekti",

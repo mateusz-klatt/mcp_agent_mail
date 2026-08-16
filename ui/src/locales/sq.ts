@@ -207,7 +207,7 @@ const translation = {
     hint: "Dërgoni agjentëve të projektit një udhëzim idempotent dhe të arkivuar në mënyrë të qëndrueshme.",
     loading: "Po ngarkohet aksesi për shkrim…",
     loadError: "Aksesi për shkrim nuk mund të ngarkohej.",
-    forbidden: "Kërkohet akses administratori për të shkruar mesazhe të reja.",
+    forbidden: "Kërkohet akses administratori ose roli i operatorit në një projekt për të shkruar mesazhe të reja.",
     noProjects: "Nuk ka projekte aktive për shkrimin e mesazheve.",
     project: "Projekti",
     chooseProject: "Zgjidhni një projekt",

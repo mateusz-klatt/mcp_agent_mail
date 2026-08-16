@@ -207,7 +207,7 @@ const translation = {
     hint: "Seol treoir idé-easpónantach atá cartlannaithe go marthanach chuig gníomhairí tionscadail.",
     loading: "Rochtain scríofa á lódáil…",
     loadError: "Níorbh fhéidir rochtain scríofa a lódáil.",
-    forbidden: "Tá rochtain riarthóra riachtanach chun teachtaireachtaí nua a scríobh.",
+    forbidden: "Tá rochtain riarthóra nó ról oibreora ar thionscadal riachtanach chun teachtaireachtaí nua a scríobh.",
     noProjects: "Níl aon tionscadal gníomhach ar fáil chun teachtaireacht a scríobh.",
     project: "Tionscadal",
     chooseProject: "Roghnaigh tionscadal",

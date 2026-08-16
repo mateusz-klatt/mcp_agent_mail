@@ -207,7 +207,7 @@ const translation = {
     hint: "Wyślij idempotentne, trwale zarchiwizowane polecenie do agentów projektu.",
     loading: "Wczytywanie uprawnień do wysyłania…",
     loadError: "Nie udało się wczytać uprawnień do wysyłania.",
-    forbidden: "Nowe wiadomości może tworzyć administrator.",
+    forbidden: "Nowe wiadomości może tworzyć administrator lub operator projektu.",
     noProjects: "Brak aktywnych projektów, do których można napisać.",
     project: "Projekt",
     chooseProject: "Wybierz projekt",

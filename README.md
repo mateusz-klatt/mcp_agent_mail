@@ -432,7 +432,7 @@ demonstration data. No screenshot shows a real project.
 |---|---|
 | **Inbox** — every project the account can reach, in one stream.<br>![The inbox](screenshots/webp/iris_inbox.webp) | **File reservations** — who is holding which paths, and under what kind of claim.<br>![The reservations view](screenshots/webp/iris_reservations.webp) |
 | **Message detail** — routing, thread, and the Markdown body as the agent sent it.<br>![A message in detail](screenshots/webp/iris_message_detail.webp) | **Thread** — a conversation collapsed to its messages.<br>![A thread](screenshots/webp/iris_thread.webp) |
-| **Compose** — an administrator instructing named agents, with a live Markdown preview.<br>![The compose view](screenshots/webp/iris_compose.webp) | **Search** — full-text across every project the account can reach.<br>![The search view](screenshots/webp/iris_search.webp) |
+| **Compose** — an administrator or project operator instructing named agents, with a live Markdown preview.<br>![The compose view](screenshots/webp/iris_compose.webp) | **Search** — full-text across every project the account can reach.<br>![The search view](screenshots/webp/iris_search.webp) |
 | **Administration** — per-project viewer or operator access for member accounts.<br>![The administration view](screenshots/webp/iris_administration.webp) | **Projects** — the projects an account has been assigned.<br>![The projects view](screenshots/webp/iris_projects.webp) |
 | **Account** — display name, interface language, and correspondence language.<br>![The account view](screenshots/webp/iris_account.webp) | |
 
@@ -568,7 +568,7 @@ validated `ui_dist` tree (including its hash manifest) from the resulting wheel.
 Human authorization is deny-by-default and separates a user's global role from their project assignments:
 
 - `admin` is global and may view every project, start new Human Overseer messages, manage lifecycle state, and perform destructive UI actions.
-- `member` has no project access until assigned. A `viewer` assignment grants read-only access to one project. An `operator` assignment adds Reply for messages in that project, but does not grant the new-message composer or other mutations.
+- `member` has no project access until assigned. A `viewer` assignment grants read-only access to one project. An `operator` assignment adds Reply and the new-message composer for that project, but not destructive mutations such as project reset or agent retirement, which remain global-admin only. Both Reply and Compose send from the same `HumanOverseer` mailbox, so the operator boundary is which projects you may speak into, not whether you may start the conversation.
 - Unified inbox, counts, project lists, message APIs, event streams, and archive views are scoped to the projects the signed-in user may read. Inaccessible projects return no UI data and cannot be inferred from lists.
 
 Manage access with the CLI:
@@ -623,11 +623,13 @@ The allowlist returns 404 for those paths.
 
 Sometimes a human operator needs to guide or redirect agents directly, whether to handle an urgent issue, provide clarification, or adjust priorities. The **Human Overseer** feature provides a web-based message composer that lets humans send high-priority messages to any combination of agents in a project.
 
-**Access:** administrators can compose messages from the **Compose** view.
-Members cannot compose arbitrary messages. A member with an `operator`
-assignment can **Reply** within the assigned project; routing, subject, and
-thread remain locked to the original conversation. A `viewer` assignment is
-read-only.
+**Access:** administrators can compose messages from the **Compose** view for
+any project. A member with an `operator` assignment can **Compose** and
+**Reply**, but only within the projects they are assigned to — the composer
+lists no other project, and the server authorizes each delivery against the
+assignment table rather than trusting the project id in the request. On Reply,
+routing, subject, and thread stay locked to the original conversation. A
+`viewer` assignment is read-only.
 
 #### What Makes Overseer Messages Special
 

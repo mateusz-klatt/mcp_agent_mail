@@ -207,7 +207,7 @@ const translation = {
     hint: "Invia agli agenti del progetto un’istruzione idempotente e archiviata in modo persistente.",
     loading: "Caricamento dell’accesso alla composizione…",
     loadError: "Impossibile caricare l’accesso alla composizione.",
-    forbidden: "Per scrivere nuovi messaggi è necessario l’accesso da amministratore.",
+    forbidden: "Per scrivere nuovi messaggi è necessario l’accesso da amministratore o il ruolo di operatore in un progetto.",
     noProjects: "Non sono disponibili progetti attivi per scrivere un messaggio.",
     project: "Progetto",
     chooseProject: "Scegli un progetto",

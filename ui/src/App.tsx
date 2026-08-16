@@ -1974,7 +1974,13 @@ export function App({
       projects.some((project) => project.role !== "viewer")
         ? (["reservations"] as const)
         : []),
-      ...(profile?.global_role === "admin" ? (["compose"] as const) : []),
+      // Same rule as reservations directly above, and for the same reason: the
+      // compose endpoint authorizes per project, so an operator assignment on
+      // any project is enough to have somewhere to send from.
+      ...(profile?.global_role === "admin" ||
+      projects.some((project) => project.role !== "viewer")
+        ? (["compose"] as const)
+        : []),
       "account",
       ...(profile?.global_role === "admin" ? (["admin"] as const) : []),
     ],
@@ -2092,7 +2098,19 @@ export function App({
 
   const renderCompose = () => {
     const profileIsAdmin = profile?.global_role === "admin";
-    const activeProjects = projects.filter((project) => project.archived_at === null);
+    // Only projects this user may actually send into reach the picker. Listing
+    // a viewer project here would offer a choice the server answers with 403.
+    const activeProjects = projects.filter(
+      (project) =>
+        project.archived_at === null &&
+        (profileIsAdmin || project.role !== "viewer"),
+    );
+    // Deliberately the same predicate as the navigation entry, over the same
+    // unfiltered list. If these two drift, the menu offers a page that then
+    // refuses the visitor, and an operator whose only project is archived
+    // would be told they lack access when they merely lack a target.
+    const canCompose =
+      profileIsAdmin || projects.some((project) => project.role !== "viewer");
     const normalizedRecipientQuery = composeRecipientQuery.trim().toLocaleLowerCase(locale);
     const filteredAgents = composeAgents.filter((agent) =>
       normalizedRecipientQuery === "" ||
@@ -2120,13 +2138,16 @@ export function App({
         {profileStatus === "loading" || projectsStatus === "loading" ? (
           <p className="state-panel" role="status">{t("compose.loading")}</p>
         ) : null}
-        {profileStatus === "ready" && !profileIsAdmin ? (
+        {/* Waits for the project list too. canCompose reads roles out of it, so
+            judging a member before it arrives would flash "no access" at an
+            operator on every load. */}
+        {profileStatus === "ready" && projectsStatus === "ready" && !canCompose ? (
           <p className="state-panel state-error" role="alert">{t("compose.forbidden")}</p>
         ) : null}
         {profileStatus === "error" || projectsStatus === "error" ? (
           <p className="state-panel state-error" role="alert">{t("compose.loadError")}</p>
         ) : null}
-        {profileStatus === "ready" && profileIsAdmin && projectsStatus === "ready" ? (
+        {profileStatus === "ready" && canCompose && projectsStatus === "ready" ? (
           activeProjects.length === 0 ? (
             <p className="state-panel">{t("compose.noProjects")}</p>
           ) : (

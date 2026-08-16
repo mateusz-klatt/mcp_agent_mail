@@ -207,7 +207,7 @@ const translation = {
     hint: "Envie uma instrução idempotente e arquivada de forma duradoura aos agentes do projeto.",
     loading: "A carregar o acesso de escrita…",
     loadError: "Não foi possível carregar o acesso de escrita.",
-    forbidden: "É necessário acesso de administrador para escrever novas mensagens.",
+    forbidden: "É necessário acesso de administrador ou uma atribuição de operador num projeto para escrever novas mensagens.",
     noProjects: "Não há projetos ativos disponíveis para escrever mensagens.",
     project: "Projeto",
     chooseProject: "Escolha um projeto",

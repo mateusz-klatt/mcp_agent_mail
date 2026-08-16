@@ -207,7 +207,7 @@ const translation = {
     hint: "向專案代理程式傳送具等冪性且持久封存的指示。",
     loading: "正在載入撰寫權限…",
     loadError: "無法載入撰寫權限。",
-    forbidden: "撰寫新訊息需要管理員存取權。",
+    forbidden: "撰寫新訊息需要管理員存取權或專案的操作員權限。",
     noProjects: "沒有可供撰寫訊息的使用中專案。",
     project: "專案",
     chooseProject: "選擇專案",

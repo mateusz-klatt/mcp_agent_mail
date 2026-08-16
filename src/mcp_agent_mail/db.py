@@ -3159,6 +3159,11 @@ def _setup_fts(
         "message_deliveries_reply_target_pending_bd",
         "message_deliveries_reply_target_pending_bu",
         "message_deliveries_reply_target_pending_bi",
+        # Recreated below with CREATE TRIGGER IF NOT EXISTS, which is a no-op
+        # against a database that already has the previous definition. Any
+        # change to its authorization clause only reaches existing deployments
+        # because the name is dropped here first.
+        "message_deliveries_guard_bi",
     ):
         connection.exec_driver_sql(f"DROP TRIGGER IF EXISTS {delivery_trigger}")
     connection.exec_driver_sql(
@@ -3328,23 +3333,18 @@ def _setup_fts(
                       FROM ui_users AS actor
                       WHERE actor.id = new.actor_id
                         AND actor.disabled = 0
+                        AND new.delivery_kind IN ('message', 'reply')
                         AND (
-                            (new.delivery_kind = 'message' AND actor.role = 'admin')
+                            actor.role = 'admin'
                             OR (
-                                new.delivery_kind = 'reply'
-                                AND (
-                                    actor.role = 'admin'
-                                    OR (
-                                        actor.role = 'member'
-                                        AND EXISTS (
-                                            SELECT 1
-                                            FROM ui_project_assignments AS assignment
-                                            WHERE assignment.user_id = actor.id
-                                              AND assignment.project_id =
-                                                  new.actor_project_id_snapshot
-                                              AND assignment.role = 'operator'
-                                        )
-                                    )
+                                actor.role = 'member'
+                                AND EXISTS (
+                                    SELECT 1
+                                    FROM ui_project_assignments AS assignment
+                                    WHERE assignment.user_id = actor.id
+                                      AND assignment.project_id =
+                                          new.actor_project_id_snapshot
+                                      AND assignment.role = 'operator'
                                 )
                             )
                         )

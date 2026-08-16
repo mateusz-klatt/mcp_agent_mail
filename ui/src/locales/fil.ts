@@ -207,7 +207,7 @@ const translation = {
     hint: "Magpadala ng idempotent at permanenteng naka-archive na tagubilin sa mga ahente ng proyekto.",
     loading: "Nilo-load ang access sa pagsulat…",
     loadError: "Hindi ma-load ang access sa pagsulat.",
-    forbidden: "Kailangan ng access ng administrator para sumulat ng mga bagong mensahe.",
+    forbidden: "Kailangan ng access ng administrator o pagtatalaga bilang operator sa isang proyekto para sumulat ng mga bagong mensahe.",
     noProjects: "Walang aktibong proyektong available na masusulatan.",
     project: "Proyekto",
     chooseProject: "Pumili ng proyekto",

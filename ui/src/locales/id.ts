@@ -207,7 +207,7 @@ const translation = {
     hint: "Kirim instruksi idempoten yang diarsipkan secara andal kepada agen proyek.",
     loading: "Memuat akses untuk menulis…",
     loadError: "Akses untuk menulis tidak dapat dimuat.",
-    forbidden: "Akses administrator diperlukan untuk menulis pesan baru.",
+    forbidden: "Akses administrator atau peran operator pada sebuah proyek diperlukan untuk menulis pesan baru.",
     noProjects: "Tidak ada proyek aktif yang tersedia untuk menulis pesan.",
     project: "Proyek",
     chooseProject: "Pilih proyek",

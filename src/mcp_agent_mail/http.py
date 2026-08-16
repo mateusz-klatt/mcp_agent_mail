@@ -3301,11 +3301,15 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
     Anything else is redirected to the login page (for navigations) or answered
     401 (for anything expecting JSON).
 
-    State-changing requests carry two extra requirements, because the UI exposes
-    genuinely destructive routes (delete-messages, retire-agent, archive-project,
-    overseer/send): the session must belong to an ``admin``, and the request must
-    be same-origin. Combined with the ``SameSite=Lax`` cookie, a cross-site POST
-    is blocked by the browser and again by the server.
+    State-changing requests must be same-origin. Combined with the
+    ``SameSite=Lax`` cookie, a cross-site POST is blocked by the browser and
+    again by the server.
+
+    They must also come from an ``admin`` session, except for an allowlist of
+    shapes that authorize per project further in: account settings, replies,
+    composed messages, and delivery retries. Everything outside that list —
+    delete-messages, retire-agent, archive-project — stays global-admin only,
+    and being on the list is permission to be asked, not permission to act.
     """
 
     def __init__(self, app: FastAPI, settings: Settings) -> None:
@@ -3493,11 +3497,18 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
                     },
                     status_code=status.HTTP_403_FORBIDDEN,
                 )
+            # This allowlist decides only whether a path is admin-only BY SHAPE.
+            # Everything listed here still has to pass per-project authorization
+            # inside the endpoint, where the assignment table is read. Compose
+            # is listed for the same reason reply is: an operator may author
+            # into the projects they hold, and the endpoint is what checks which
+            # ones those are.
             if (
                 user["role"] != webauth.ROLE_ADMIN
                 and path not in _MAIL_ACCOUNT_API_PATHS
                 and not _OVERSEER_REPLY_PATH_RE.fullmatch(path)
                 and not _MAIL_API_REPLY_SHAPE_RE.fullmatch(path)
+                and not _MAIL_API_COMPOSE_SHAPE_RE.fullmatch(path)
                 and not (
                     _MAIL_API_DELIVERY_SHAPE_RE.fullmatch(path)
                     and path.endswith("/retry")
@@ -4018,13 +4029,20 @@ def _mail_ui_access_context(
     """
     is_admin = _mail_ui_request_is_admin(settings=settings, request=request)
     can_read = is_admin or webauth.project_role_allows_view(project_role)
-    can_reply = is_admin or webauth.project_role_allows_operate(project_role)
+    can_operate = is_admin or webauth.project_role_allows_operate(project_role)
+    # An operator composes and replies within the one project this context was
+    # built for; the caller resolves that project from the assignment table, so
+    # scope is enforced here rather than trusted from the request. Compose used
+    # to be admin-only while reply was not, which drew the boundary at "may
+    # start a thread" rather than at "may speak as HumanOverseer" - both paths
+    # send from the same mailbox, so an operator already had the second.
+    # can_mutate stays admin-only: it gates project reset and agent retirement.
     return {
         "project_id": project_id,
         "project_role": project_role,
         "can_read": can_read,
-        "can_reply": can_reply,
-        "can_compose": is_admin,
+        "can_reply": can_operate,
+        "can_compose": can_operate,
         "can_mutate": is_admin,
         "is_admin": is_admin,
     }
@@ -10148,7 +10166,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 if reply_to is None and not access["can_compose"]:
                     raise HTTPException(
                         status_code=403,
-                        detail="Forbidden: new messages require the admin role",
+                        detail="Forbidden: new messages require the project operator role",
                     )
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -10215,7 +10233,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 if not reply_endpoint and not access["can_compose"]:
                     raise HTTPException(
                         status_code=403,
-                        detail="Forbidden: new messages require the admin role",
+                        detail="Forbidden: new messages require the project operator role",
                     )
 
             raise HTTPException(
@@ -10334,7 +10352,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     if not reply_endpoint and not access["can_compose"]:
                         raise HTTPException(
                             status_code=403,
-                            detail="Forbidden: new messages require the admin role",
+                            detail="Forbidden: new messages require the project operator role",
                         )
                     if reply_endpoint and reply_to is None:
                         raise HTTPException(status_code=400, detail="Reply target is required")

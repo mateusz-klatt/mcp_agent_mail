@@ -2210,12 +2210,54 @@ describe("Iris landing shell", () => {
     expect(screen.queryByRole("button", { name: "Check status" })).not.toBeInTheDocument();
     adminView.unmount();
 
+    // A member whose only projects are viewer-role. The server never pairs a
+    // member profile with a project whose role is "admin", so the roles have to
+    // be overridden here as well as the profile - otherwise this asserts a
+    // refusal against data the API cannot produce.
     server.use(
       http.get("*/mail/api/v1/me/profile", () => HttpResponse.json(memberProfile)),
+      http.get("*/mail/api/v1/projects", () =>
+        HttpResponse.json({
+          items: [{ ...projectOne, role: "viewer", can_reply: false }],
+          total: 1,
+        }),
+      ),
     );
     render(<App />);
-    expect(await screen.findByText(/Administrator access is required/)).toBeVisible();
+    expect(
+      await screen.findByText(/requires administrator access or an operator assignment/),
+    ).toBeVisible();
     expect(screen.queryByRole("button", { name: "Review message" })).not.toBeInTheDocument();
+  });
+
+  it("offers the composer to a member holding an operator assignment", async () => {
+    window.history.replaceState({}, "", "/mail/#compose");
+    server.use(
+      http.get("*/mail/api/v1/me/profile", () => HttpResponse.json(memberProfile)),
+      http.get("*/mail/api/v1/projects", () =>
+        HttpResponse.json({
+          items: [
+            { ...projectOne, role: "operator", can_reply: true },
+            { ...projectTwo, role: "viewer", can_reply: false },
+          ],
+          total: 2,
+        }),
+      ),
+    );
+    render(<App />);
+    await waitForEnglishPreferences();
+
+    expect(
+      screen.queryByText(/requires administrator access or an operator assignment/),
+    ).not.toBeInTheDocument();
+    const projectPicker = await screen.findByLabelText("Project");
+    // The viewer project must not be offered: the server would answer 403.
+    expect(
+      within(projectPicker).queryByRole("option", { name: projectTwo.human_key }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(projectPicker).getByRole("option", { name: projectOne.human_key }),
+    ).toBeInTheDocument();
   });
 
   it("loads a stored Polish UI locale while keeping correspondence independent", async () => {

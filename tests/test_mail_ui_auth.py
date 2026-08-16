@@ -5253,6 +5253,113 @@ class TestMailUiRbacSurface:
         assert reply.json() == {"detail": "Not Found"}
 
     @pytest.mark.asyncio
+    async def test_operator_composes_into_assigned_projects_and_nowhere_else(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """Compose follows the assignment table, not the global role."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        assigned_id, _assigned_message = await _seed_project(
+            "compose-scope-assigned",
+            subject="Assigned target",
+            agent_name="AssignedAgent",
+            sound="low",
+        )
+        unassigned_id, _unassigned_message = await _seed_project(
+            "compose-scope-unassigned",
+            subject="Unassigned target",
+            agent_name="UnassignedAgent",
+            sound="low",
+        )
+        operator_epoch = await _make_user(
+            "scoped-operator", role=webauth.ROLE_MEMBER
+        )
+        await _assign(
+            "scoped-operator", assigned_id, webauth.PROJECT_ROLE_OPERATOR
+        )
+        viewer_epoch = await _make_user("scoped-viewer", role=webauth.ROLE_MEMBER)
+        await _assign("scoped-viewer", assigned_id, webauth.PROJECT_ROLE_VIEWER)
+
+        assigned_generation, assigned_refs = await _compose_lifetime_refs(
+            assigned_id,
+            "AssignedAgent",
+        )
+        unassigned_generation, unassigned_refs = await _compose_lifetime_refs(
+            unassigned_id,
+            "UnassignedAgent",
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("scoped-operator", operator_epoch),
+        ) as client:
+            allowed = await client.post(
+                f"/mail/api/v1/projects/{assigned_id}/messages",
+                json={
+                    "idempotency_key": "scoped-operator-allowed",
+                    "expected_project_generation": assigned_generation,
+                    "recipients": assigned_refs,
+                    "subject": "Operator starts a thread",
+                    "body_md": "Authored by a project operator.",
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            out_of_scope = await client.post(
+                f"/mail/api/v1/projects/{unassigned_id}/messages",
+                json={
+                    "idempotency_key": "scoped-operator-out-of-scope",
+                    "expected_project_generation": unassigned_generation,
+                    "recipients": unassigned_refs,
+                    "subject": "Should never be delivered",
+                    "body_md": "Operator has no assignment on this project.",
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("scoped-viewer", viewer_epoch),
+        ) as client:
+            viewer_refused = await client.post(
+                f"/mail/api/v1/projects/{assigned_id}/messages",
+                json={
+                    "idempotency_key": "scoped-viewer-refused",
+                    "expected_project_generation": assigned_generation,
+                    "recipients": assigned_refs,
+                    "subject": "Should never be delivered",
+                    "body_md": "A viewer must not author anything.",
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+
+        assert allowed.status_code == 200, allowed.text
+        assert allowed.json()["status"] in {"published", "pending"}
+        # An unassigned project must stay indistinguishable from a missing one.
+        # Answering 403 here would confirm the project exists to someone with
+        # no access to it, which is how project ids leak.
+        assert out_of_scope.status_code == 404, out_of_scope.text
+        assert out_of_scope.json()["detail"] == {"code": "project_not_found"}
+        # The viewer CAN see this project, so 403 is correct and leaks nothing.
+        assert viewer_refused.status_code == 403, viewer_refused.text
+        assert viewer_refused.json()["detail"] == {"code": "actor_forbidden"}
+
+        # Negative control on the assertion itself: exactly one message was
+        # authored, so `allowed` really is the only send that landed.
+        async with get_session() as session:
+            authored = (
+                await session.execute(
+                    text(
+                        "SELECT COUNT(*) FROM messages "
+                        "WHERE subject = 'Should never be delivered'"
+                    )
+                )
+            ).scalar_one()
+        assert authored == 0
+
+    @pytest.mark.asyncio
     async def test_legacy_overseer_hold_precedes_database_and_archive_writes(
         self,
         isolated_env,

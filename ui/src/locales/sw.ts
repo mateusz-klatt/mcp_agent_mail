@@ -207,7 +207,7 @@ const translation = {
     hint: "Tuma agizo lisilorudiwa na lililohifadhiwa kwa kudumu kwa mawakala wa mradi.",
     loading: "Ufikiaji wa kuandika unapakiwa…",
     loadError: "Ufikiaji wa kuandika haukuweza kupakiwa.",
-    forbidden: "Ufikiaji wa msimamizi unahitajika ili kuandika ujumbe mpya.",
+    forbidden: "Ufikiaji wa msimamizi au jukumu la mwendeshaji katika mradi unahitajika ili kuandika ujumbe mpya.",
     noProjects: "Hakuna miradi inayotumika ya kuandikiwa.",
     project: "Mradi",
     chooseProject: "Chagua mradi",

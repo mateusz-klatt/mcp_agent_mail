@@ -207,7 +207,7 @@ const translation = {
     hint: "Gửi cho các tác nhân của dự án một chỉ dẫn có tính lũy đẳng và được lưu trữ bền vững.",
     loading: "Đang tải quyền soạn thư…",
     loadError: "Không thể tải quyền soạn thư.",
-    forbidden: "Cần quyền quản trị viên để soạn tin nhắn mới.",
+    forbidden: "Cần quyền quản trị viên hoặc vai trò người vận hành trong một dự án để soạn tin nhắn mới.",
     noProjects: "Không có dự án đang hoạt động để soạn thư.",
     project: "Dự án",
     chooseProject: "Chọn dự án",

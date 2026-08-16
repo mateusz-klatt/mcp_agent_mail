@@ -1321,40 +1321,69 @@ async def test_source_operator_can_send_cross_project_thread_reply(
 
 
 @pytest.mark.asyncio
-async def test_source_operator_cannot_initiate_normal_message(isolated_env: Any) -> None:
+async def test_normal_message_needs_an_operator_assignment_not_an_admin(
+    isolated_env: Any,
+) -> None:
+    """Compose follows the assignment, and a viewer on the same project fails."""
     seeded = await _seed_identities(cross_project=True)
     async with get_immediate_session() as session:
-        user = UiUser(
+        operator = UiUser(
             username="message-operator",
             password_hash="not-used-in-service-test",
             role="member",
             session_epoch=1,
         )
-        session.add(user)
+        viewer = UiUser(
+            username="message-viewer",
+            password_hash="not-used-in-service-test",
+            role="member",
+            session_epoch=1,
+        )
+        session.add_all([operator, viewer])
         await session.flush()
-        assert user.id is not None
-        session.add(
-            UiProjectAssignment(
-                user_id=user.id,
-                project_id=seeded.source.project_id,
-                role="operator",
-            )
+        assert operator.id is not None
+        assert viewer.id is not None
+        operator_id = int(operator.id)
+        viewer_id = int(viewer.id)
+        session.add_all(
+            [
+                UiProjectAssignment(
+                    user_id=operator_id,
+                    project_id=seeded.source.project_id,
+                    role="operator",
+                ),
+                UiProjectAssignment(
+                    user_id=viewer_id,
+                    project_id=seeded.source.project_id,
+                    role="viewer",
+                ),
+            ]
         )
         await session.commit()
-    actor = DeliveryActorSnapshot.ui_user(
-        user_id=user.id,
-        username=user.username,
-        generation=user.session_generation,
-        epoch=user.session_epoch,
-        source_project=seeded.source,
-    )
 
+    def _actor(user_id: int, user: UiUser) -> DeliveryActorSnapshot:
+        return DeliveryActorSnapshot.ui_user(
+            user_id=user_id,
+            username=user.username,
+            generation=user.session_generation,
+            epoch=user.session_epoch,
+            source_project=seeded.source,
+        )
+
+    accepted = await accept_message_delivery(
+        seeded.request("operator-normal-message", actor=_actor(operator_id, operator)),
+        now=BASE_TIME,
+    )
+    assert accepted.delivery_id
+
+    # Negative control on the same project: the permission comes from the
+    # assignment row, so downgrading it to viewer must refuse the same request.
     with pytest.raises(MessageDeliveryValidationError) as denied:
         await accept_message_delivery(
-            seeded.request("operator-normal-message", actor=actor),
+            seeded.request("viewer-normal-message", actor=_actor(viewer_id, viewer)),
             now=BASE_TIME,
         )
-    assert denied.value.code == "ui_actor_admin_required"
+    assert denied.value.code == "ui_actor_operator_required"
 
 
 @pytest.mark.asyncio

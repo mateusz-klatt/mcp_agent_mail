@@ -207,7 +207,7 @@ const translation = {
     hint: "Pošaljite idempotentnu, trajno arhiviranu uputu agentima projekta.",
     loading: "Učitavanje pristupa za pisanje…",
     loadError: "Nije moguće učitati pristup za pisanje.",
-    forbidden: "Za pisanje novih poruka potreban je administratorski pristup.",
+    forbidden: "Za pisanje novih poruka potreban je administratorski pristup ili uloga operatera na projektu.",
     noProjects: "Nema aktivnih projekata dostupnih za pisanje poruke.",
     project: "Projekt",
     chooseProject: "Odaberite projekt",

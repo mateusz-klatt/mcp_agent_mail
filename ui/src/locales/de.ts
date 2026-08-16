@@ -207,7 +207,7 @@ const translation = {
     hint: "Senden Sie eine idempotente, dauerhaft archivierte Anweisung an die Projektagenten.",
     loading: "Berechtigung zum Verfassen wird geladen…",
     loadError: "Die Berechtigung zum Verfassen konnte nicht geladen werden.",
-    forbidden: "Zum Verfassen neuer Nachrichten ist Administratorzugriff erforderlich.",
+    forbidden: "Zum Verfassen neuer Nachrichten ist Administratorzugriff oder eine Operator-Zuweisung in einem Projekt erforderlich.",
     noProjects: "Es sind keine aktiven Projekte zum Verfassen verfügbar.",
     project: "Projekt",
     chooseProject: "Projekt auswählen",

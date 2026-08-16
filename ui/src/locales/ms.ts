@@ -207,7 +207,7 @@ const translation = {
     hint: "Hantar arahan idempoten yang diarkibkan secara tahan lama kepada ejen projek.",
     loading: "Memuatkan akses mengarang…",
     loadError: "Akses mengarang tidak dapat dimuatkan.",
-    forbidden: "Akses pentadbir diperlukan untuk mengarang mesej baharu.",
+    forbidden: "Akses pentadbir atau peranan pengendali dalam sesuatu projek diperlukan untuk mengarang mesej baharu.",
     noProjects: "Tiada projek aktif tersedia untuk mengarang mesej.",
     project: "Projek",
     chooseProject: "Pilih projek",

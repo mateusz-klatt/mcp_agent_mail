@@ -207,7 +207,7 @@ const translation = {
     hint: "Odošlite agentom projektu idempotentný pokyn s trvalou archiváciou.",
     loading: "Prístup na písanie sa načítava…",
     loadError: "Prístup na písanie sa nepodarilo načítať.",
-    forbidden: "Na písanie nových správ je potrebný prístup správcu.",
+    forbidden: "Na písanie nových správ je potrebný prístup správcu alebo rola operátora v projekte.",
     noProjects: "Na písanie nie sú k dispozícii žiadne aktívne projekty.",
     project: "Projekt",
     chooseProject: "Vybrať projekt",

@@ -207,7 +207,7 @@ const translation = {
     hint: "Proje temsilcilerine bir kez uygulanabilir ve kalıcı olarak arşivlenen bir talimat gönderin.",
     loading: "Yazma erişimi yükleniyor…",
     loadError: "Yazma erişimi yüklenemedi.",
-    forbidden: "Yeni ileti oluşturmak için yönetici erişimi gereklidir.",
+    forbidden: "Yeni ileti oluşturmak için yönetici erişimi veya bir projede operatör rolü gereklidir.",
     noProjects: "İleti oluşturulabilecek etkin proje yok.",
     project: "Proje",
     chooseProject: "Proje seçin",

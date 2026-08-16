@@ -207,7 +207,7 @@ const translation = {
     hint: "Send en idempotent og varig arkivert instruksjon til prosjektagenter.",
     loading: "Laster skrivetilgang…",
     loadError: "Kunne ikke laste skrivetilgangen.",
-    forbidden: "Administratortilgang kreves for å skrive nye meldinger.",
+    forbidden: "Administratortilgang eller en operatørrolle på et prosjekt kreves for å skrive nye meldinger.",
     noProjects: "Det finnes ingen aktive prosjekter å skrive til.",
     project: "Prosjekt",
     chooseProject: "Velg et prosjekt",

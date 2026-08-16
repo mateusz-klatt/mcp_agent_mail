@@ -207,7 +207,7 @@ const translation = {
     hint: "Stuur een idempotente, duurzaam gearchiveerde instructie naar projectagenten.",
     loading: "Opsteltoegang wordt geladen…",
     loadError: "Opsteltoegang kon niet worden geladen.",
-    forbidden: "Beheerderstoegang is vereist om nieuwe berichten op te stellen.",
+    forbidden: "Beheerderstoegang of een operatorrol in een project is vereist om nieuwe berichten op te stellen.",
     noProjects: "Er zijn geen actieve projecten beschikbaar om een bericht voor op te stellen.",
     project: "Project",
     chooseProject: "Kies een project",

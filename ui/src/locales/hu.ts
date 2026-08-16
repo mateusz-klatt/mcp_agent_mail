@@ -207,7 +207,7 @@ const translation = {
     hint: "Idempotens, tartósan archivált utasítást küldhet a projekt ügynökeinek.",
     loading: "Írási hozzáférés betöltése…",
     loadError: "Az írási hozzáférés nem tölthető be.",
-    forbidden: "Új üzenetek írásához rendszergazdai hozzáférés szükséges.",
+    forbidden: "Új üzenetek írásához rendszergazdai hozzáférés vagy operátori jogosultság szükséges egy projekten.",
     noProjects: "Nincs aktív projekt, amelybe üzenetet írhatna.",
     project: "Projekt",
     chooseProject: "Válasszon projektet",

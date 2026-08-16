@@ -207,7 +207,7 @@ const translation = {
     hint: "向项目代理发送具备幂等性且持久归档的指令。",
     loading: "正在加载撰写权限…",
     loadError: "无法加载撰写权限。",
-    forbidden: "撰写新消息需要管理员访问权限。",
+    forbidden: "撰写新消息需要管理员访问权限或项目的操作员权限。",
     noProjects: "没有可用于撰写消息的活跃项目。",
     project: "项目",
     chooseProject: "选择项目",

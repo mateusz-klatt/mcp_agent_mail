@@ -207,7 +207,7 @@ const translation = {
     hint: "Trimite agenților proiectului o instrucțiune idempotentă, arhivată în mod durabil.",
     loading: "Se încarcă accesul de compunere…",
     loadError: "Accesul de compunere nu a putut fi încărcat.",
-    forbidden: "Este necesar accesul de administrator pentru a compune mesaje noi.",
+    forbidden: "Este necesar accesul de administrator sau rolul de operator într-un proiect pentru a compune mesaje noi.",
     noProjects: "Nu există proiecte active disponibile pentru compunerea mesajelor.",
     project: "Proiect",
     chooseProject: "Alege un proiect",

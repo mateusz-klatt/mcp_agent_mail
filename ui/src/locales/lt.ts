@@ -207,7 +207,7 @@ const translation = {
     hint: "Siųskite idempotentinį, patvariai archyvuojamą nurodymą projekto agentams.",
     loading: "Įkeliama rašymo prieiga…",
     loadError: "Nepavyko įkelti rašymo prieigos.",
-    forbidden: "Naujus pranešimus gali rašyti tik administratorius.",
+    forbidden: "Naujus pranešimus gali rašyti administratorius arba projekto operatorius.",
     noProjects: "Nėra aktyvių projektų, kuriems galima rašyti.",
     project: "Projektas",
     chooseProject: "Pasirinkite projektą",

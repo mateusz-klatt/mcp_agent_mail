@@ -207,7 +207,7 @@ const translation = {
     hint: "Sendu endurtekningarörugg og varanlega vistuð fyrirmæli til fulltrúa verkefnisins.",
     loading: "Ritaðgangur hlaðinn…",
     loadError: "Ekki tókst að hlaða ritaðgangi.",
-    forbidden: "Kerfisstjóraaðgangur er nauðsynlegur til að semja ný skilaboð.",
+    forbidden: "Kerfisstjóraaðgangur eða rekstraraðilahlutverk í verkefni er nauðsynlegt til að semja ný skilaboð.",
     noProjects: "Engin virk verkefni eru tiltæk til að semja skilaboð.",
     project: "Verkefni",
     chooseProject: "Veldu verkefni",

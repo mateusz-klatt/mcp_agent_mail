@@ -319,7 +319,7 @@ const resources = {
         hint: "Send an idempotent, durably archived instruction to project agents.",
         loading: "Loading compose access…",
         loadError: "Compose access could not be loaded.",
-        forbidden: "Administrator access is required to compose new messages.",
+        forbidden: "Composing new messages requires administrator access or an operator assignment on a project.",
         noProjects: "There are no active projects available for compose.",
         project: "Project",
         chooseProject: "Choose a project",

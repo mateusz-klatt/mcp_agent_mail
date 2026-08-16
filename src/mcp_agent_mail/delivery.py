@@ -800,12 +800,12 @@ async def _validate_request_lifetimes(
         )
         await _load_agent_snapshot(session, actor_identity, role="actor")
     elif request.actor.kind == "ui_user":
-        ui_user = await _validate_ui_actor(session, request.actor)
-        if request.purpose == "message" and ui_user.role != "admin":
-            raise MessageDeliveryValidationError(
-                "ui_actor_admin_required",
-                "Only a global administrator may initiate a non-reply message",
-            )
+        # _validate_ui_actor has already resolved the scope: an admin passes,
+        # and a member passes only with an `operator` assignment on the actor's
+        # source project, which for both compose and reply is the project the
+        # message is being delivered into. A further "message implies admin"
+        # check here would not add a boundary, it would re-decide the policy.
+        await _validate_ui_actor(session, request.actor)
 
     for recipient in request.recipients:
         recipient_agent = await _load_agent_snapshot(

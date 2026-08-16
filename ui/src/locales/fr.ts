@@ -207,7 +207,7 @@ const translation = {
     hint: "Envoyez aux agents du projet une instruction idempotente et archivée durablement.",
     loading: "Chargement de l’accès à la rédaction…",
     loadError: "Impossible de charger l’accès à la rédaction.",
-    forbidden: "Un accès administrateur est requis pour rédiger de nouveaux messages.",
+    forbidden: "Un accès administrateur ou un rôle d’opérateur sur un projet est requis pour rédiger de nouveaux messages.",
     noProjects: "Aucun projet actif n’est disponible pour la rédaction.",
     project: "Projet",
     chooseProject: "Choisir un projet",

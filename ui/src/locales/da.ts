@@ -207,7 +207,7 @@ const translation = {
     hint: "Send en idempotent, varigt arkiveret instruktion til projektets agenter.",
     loading: "Indlæser skriveadgang…",
     loadError: "Skriveadgangen kunne ikke indlæses.",
-    forbidden: "Der kræves administratoradgang for at skrive nye beskeder.",
+    forbidden: "Der kræves administratoradgang eller en operatørrolle på et projekt for at skrive nye beskeder.",
     noProjects: "Der er ingen aktive projekter, som du kan skrive til.",
     project: "Projekt",
     chooseProject: "Vælg et projekt",

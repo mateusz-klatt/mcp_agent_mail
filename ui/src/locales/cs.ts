@@ -207,7 +207,7 @@ const translation = {
     hint: "Odešlete idempotentní, trvale archivovaný pokyn agentům projektu.",
     loading: "Načítání oprávnění k psaní zpráv…",
     loadError: "Oprávnění k psaní zpráv se nepodařilo načíst.",
-    forbidden: "Vytvářet nové zprávy může pouze správce.",
+    forbidden: "Vytvářet nové zprávy může správce nebo operátor projektu.",
     noProjects: "Nejsou k dispozici žádné aktivní projekty, kterým lze psát.",
     project: "Projekt",
     chooseProject: "Vyberte projekt",

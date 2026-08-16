@@ -207,7 +207,7 @@ const translation = {
     hint: "Skicka en idempotent och beständigt arkiverad instruktion till projektets agenter.",
     loading: "Skrivåtkomst läses in…",
     loadError: "Det gick inte att läsa in skrivåtkomsten.",
-    forbidden: "Administratörsåtkomst krävs för att skriva nya meddelanden.",
+    forbidden: "Administratörsåtkomst eller en operatörsroll i ett projekt krävs för att skriva nya meddelanden.",
     noProjects: "Det finns inga aktiva projekt att skriva till.",
     project: "Projekt",
     chooseProject: "Välj ett projekt",

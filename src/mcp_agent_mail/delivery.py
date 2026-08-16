@@ -225,9 +225,13 @@ class MessageDeliveryNotFoundError(MessageDeliveryServiceError):
 
 
 class MessageDeliveryLeaseLostError(MessageDeliveryServiceError):
-    def __init__(self, delivery_id: str) -> None:
-        super().__init__(f"Message delivery {delivery_id} lease is stale or no longer owned")
+    def __init__(self, delivery_id: str, reason: str | None = None) -> None:
+        detail = f": {reason}" if reason else ""
+        super().__init__(
+            f"Message delivery {delivery_id} lease is stale or no longer owned{detail}"
+        )
         self.delivery_id = delivery_id
+        self.reason = reason
 
 
 class MessageDeliveryTerminalError(MessageDeliveryServiceError):
@@ -1159,14 +1163,37 @@ def _assert_current_lease(
     *,
     require_unexpired: bool = True,
 ) -> None:
-    if (
-        delivery.state != "pending"
-        or delivery.lease_token != lease.token
-        or delivery.lease_fence != lease.fence
-        or delivery.lease_expires_ts is None
-        or (require_unexpired and delivery.lease_expires_ts <= now)
-    ):
-        raise MessageDeliveryLeaseLostError(delivery.id)
+    # Same five conditions in the same order as the single `or` chain this
+    # replaces, so the behaviour is unchanged. What changes is that the error
+    # now names which one fired. "stale or no longer owned" covers a lease
+    # another claimant fenced out and a lease that merely ran out of clock
+    # while this worker was still holding it, and those are opposite
+    # diagnoses: the first is contention, the second is a 60s lease against a
+    # slow Git publication. Windows CI raised this under concurrency on
+    # 2026-08-16 and the message could not say which had happened, so the next
+    # occurrence is a measurement rather than another round of guessing.
+    if delivery.state != "pending":
+        raise MessageDeliveryLeaseLostError(
+            delivery.id, f"delivery state is {delivery.state!r}, not 'pending'"
+        )
+    if delivery.lease_token != lease.token:
+        raise MessageDeliveryLeaseLostError(
+            delivery.id, "another claimant replaced the lease token"
+        )
+    if delivery.lease_fence != lease.fence:
+        raise MessageDeliveryLeaseLostError(
+            delivery.id,
+            f"another claimant advanced the lease fence to {delivery.lease_fence}"
+            f" (this worker holds {lease.fence})",
+        )
+    if delivery.lease_expires_ts is None:
+        raise MessageDeliveryLeaseLostError(delivery.id, "the lease was already released")
+    if require_unexpired and delivery.lease_expires_ts <= now:
+        overrun = (now - delivery.lease_expires_ts).total_seconds()
+        raise MessageDeliveryLeaseLostError(
+            delivery.id,
+            f"still owned by this worker, but the lease expired {overrun:.1f}s ago",
+        )
 
 
 async def _quarantine_loaded_delivery(

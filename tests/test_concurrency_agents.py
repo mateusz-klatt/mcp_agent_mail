@@ -25,6 +25,7 @@ import json
 import os
 import random
 import string
+import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
@@ -843,17 +844,63 @@ class TestNoDeadlocks:
                 else:
                     operations.append(reserve_op(i))
 
-            operation_timeout_seconds = 90.0 if os.name == "nt" else 30.0
-            try:
-                results = await asyncio.wait_for(
-                    asyncio.gather(*operations, return_exceptions=True),
-                    timeout=operation_timeout_seconds,
+            # A deadlock is the absence of PROGRESS, not the passage of time.
+            # The budget this replaces asserted that 30 operations finish inside
+            # a fixed wall-clock window, which is a claim about how fast the
+            # runner is, and it could not tell "stuck" from "merely slow". It
+            # was raised 30s -> 90s once already and went red again on Windows
+            # CI on 2026-08-16 at 118.28s, still making steady progress the
+            # whole time.
+            #
+            # So wait for the next completion instead. A deadlocked batch
+            # completes nothing, however long you wait; a starved one keeps
+            # finishing operations, just slowly. That makes this both stricter
+            # (a genuine stall is caught in 60s rather than 90s, and is caught
+            # even when it starts after 29 of 30 have landed) and immune to the
+            # runner's load.
+            stall_budget_seconds = 60.0
+            # pytest runs with --timeout=300 --timeout-method=thread, and that
+            # method kills the whole process rather than the test: one overrun
+            # here previously took ~280 tests down with it and left a log with
+            # no summary. Fail cleanly well before that.
+            overall_ceiling_seconds = 240.0
+
+            started = time.monotonic()
+            pending = {asyncio.ensure_future(operation) for operation in operations}
+            results: list[Any] = []
+
+            async def _abandon(remaining: set[asyncio.Future[Any]]) -> None:
+                for task in remaining:
+                    task.cancel()
+                await asyncio.gather(*remaining, return_exceptions=True)
+
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending,
+                    timeout=stall_budget_seconds,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
-            except asyncio.TimeoutError:
-                pytest.fail(
-                    "Deadlock detected - operations exceeded "
-                    f"the {operation_timeout_seconds:.0f}s {os.name} timeout"
-                )
+                elapsed = time.monotonic() - started
+                if not done:
+                    await _abandon(pending)
+                    pytest.fail(
+                        "Deadlock detected - no operation completed within "
+                        f"{stall_budget_seconds:.0f}s. "
+                        f"{len(results)}/{num_operations} had finished after "
+                        f"{elapsed:.1f}s on {os.name}."
+                    )
+                for task in done:
+                    error = task.exception()
+                    results.append(error if error is not None else task.result())
+                if pending and elapsed > overall_ceiling_seconds:
+                    await _abandon(pending)
+                    pytest.fail(
+                        "Operations were still progressing but blew the "
+                        f"{overall_ceiling_seconds:.0f}s ceiling: "
+                        f"{len(results)}/{num_operations} done after "
+                        f"{elapsed:.1f}s on {os.name}. Not a deadlock - this "
+                        "runner is too slow for the test as written."
+                    )
 
             # Count successes - under high concurrency some operations may get
             # transient cancellation. The key test is: no deadlock (timeout) occurred

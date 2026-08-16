@@ -26,6 +26,7 @@ import os
 import random
 import string
 import time
+from collections.abc import Set as AbstractSet
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
@@ -869,7 +870,12 @@ class TestNoDeadlocks:
             pending = {asyncio.ensure_future(operation) for operation in operations}
             results: list[Any] = []
 
-            async def _abandon(remaining: set[asyncio.Future[Any]]) -> None:
+            # AbstractSet, not set: `set` is invariant in its element type, so
+            # the `set[asyncio.Task[...]]` that asyncio.wait hands back is not a
+            # `set[asyncio.Future[...]]` however clearly Task subclasses Future.
+            # This function only iterates and cancels, so the covariant read-only
+            # supertype is both what it needs and what makes the call type-check.
+            async def _abandon(remaining: AbstractSet[asyncio.Future[Any]]) -> None:
                 for task in remaining:
                     task.cancel()
                 await asyncio.gather(*remaining, return_exceptions=True)

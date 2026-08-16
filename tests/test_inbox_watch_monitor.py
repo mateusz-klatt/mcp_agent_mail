@@ -78,17 +78,10 @@ def _harness_can_actually_run_the_script(tmp_path_factory: pytest.TempPathFactor
     """
     tmp = tmp_path_factory.mktemp("harness-canary")
     env, repo, _ = _monitor_env(tmp)
-    proc = subprocess.Popen(
-        [BASH, _git_bash_path(MONITOR), "claude", "1"],
-        cwd=repo,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    proc, out_path, err_path = _spawn_monitor(env, repo, tmp, "canary")
     time.sleep(3)
     alive = proc.poll() is None
-    _stdout, stderr = _stop_and_read(proc)
+    _stdout, stderr = _stop_and_read(proc, out_path, err_path)
 
     if not alive:
         pytest.fail(
@@ -100,19 +93,57 @@ def _harness_can_actually_run_the_script(tmp_path_factory: pytest.TempPathFactor
         )
 
 
-def _stop_and_read(proc: subprocess.Popen[str], *, budget: float = 15.0) -> tuple[str, str]:
+def _spawn_monitor(
+    env: dict[str, str], repo: Path, log_dir: Path, tag: str
+) -> tuple[subprocess.Popen[bytes], Path, Path]:
+    """Start the monitor with its output going to FILES, never to pipes.
+
+    A pipe reaches EOF only once every holder of the write end is gone, and the
+    monitor is a bash script that spawns children. So `communicate()` waits on
+    the whole descendant tree, not on the monitor -- and one orphan that
+    outlives its parent (on Windows `taskkill /T` walks the tree by parent pid,
+    so a re-parented grandchild is invisible to it) is enough to hold the pipe
+    open for ever. That cost the Windows leg twice: first as a hang that took
+    chunk 5 down on the 300s per-test ceiling, then, once the wait was bounded,
+    as a red test whose message was about descriptors rather than about the
+    monitor.
+
+    Files remove the dependency instead of bounding it. Nothing has to close
+    anything for the text to be readable, a straggler still writing is
+    harmless, and what the assertions get back is what the monitor actually
+    said. Our own handles are closed as soon as `Popen` has duplicated them,
+    so the test process is never one of the holders.
+    """
+    out_path = log_dir / f"{tag}.out"
+    err_path = log_dir / f"{tag}.err"
+    with out_path.open("wb") as out, err_path.open("wb") as err:
+        proc = subprocess.Popen(
+            [BASH, _git_bash_path(MONITOR), "claude", "1"],
+            cwd=repo,
+            env=env,
+            stdout=out,
+            stderr=err,
+        )
+    return proc, out_path, err_path
+
+
+def _read_output(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def _stop_and_read(
+    proc: subprocess.Popen[bytes],
+    out_path: Path,
+    err_path: Path,
+    *,
+    budget: float = 15.0,
+) -> tuple[str, str]:
     """Stop the monitor and read what it said, without ever blocking forever.
 
-    `communicate()` returns when the pipes reach EOF, and a pipe stays open
-    while ANY holder is alive. The monitor is a bash script that spawns
-    children, and on Windows `terminate()` is TerminateProcess against the
-    direct child only -- the grandchildren keep the pipe open and the reader
-    thread waits for ever. Measured: chunk 5 of the Windows leg died on the
-    300s per-test ceiling with a `_readerthread` stack and no culprit named.
-
-    So: ask the whole tree to stop, and bound every wait. If the pipes still
-    do not close, say so instead of hanging -- a caller asserting on the text
-    then fails on its own terms rather than taking the run down with it.
+    Every wait here is on the direct child and nothing else, which is the only
+    process this helper actually knows how to stop. Reading is unconditional:
+    even if the child somehow outlives both attempts, the caller still gets the
+    real text and fails -- or passes -- on its own terms.
     """
     if os.name == "nt":
         # No process groups to signal here; taskkill walks the tree.
@@ -124,30 +155,12 @@ def _stop_and_read(proc: subprocess.Popen[str], *, budget: float = 15.0) -> tupl
     else:
         proc.terminate()
     try:
-        return proc.communicate(timeout=budget)
+        proc.wait(timeout=budget)
     except subprocess.TimeoutExpired:
         proc.kill()
-    try:
-        return proc.communicate(timeout=budget)
-    except subprocess.TimeoutExpired:
-        # Do NOT close the pipes here. On Windows `communicate()` reads through
-        # a `_readerthread` per pipe, and closing a file whose reader thread is
-        # still blocked blocks too -- so the one unbudgeted wait in a helper
-        # that promises never to block forever was the error path, the branch
-        # that only runs once things have already gone wrong. Measured: it hung
-        # exactly here, and because --timeout-method=thread ends the pytest
-        # process rather than the test, it took the whole Windows chunk (~280
-        # tests) down with it and left a log with no summary at all.
-        #
-        # The reason to skip the close is not that the tree is dead -- reaching
-        # this line proves it is not. It is that closing cannot help here and
-        # can only hang. Leaking two descriptors from a test that is failing on
-        # its own terms is bounded; losing the chunk is not.
-        raise AssertionError(
-            "the monitor's output pipes never closed after the process tree was "
-            f"killed, so something still holds them (pid {proc.pid})"
-        ) from None
-
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=budget)
+    return _read_output(out_path), _read_output(err_path)
 
 
 @pytest.mark.parametrize(
@@ -158,7 +171,6 @@ def _stop_and_read(proc: subprocess.Popen[str], *, budget: float = 15.0) -> tupl
         ["claude", "1", "extra"],
     ],
 )
-
 def test_monitor_refuses_a_wrong_number_of_arguments(
     tmp_path: Path,
     arguments: list[str],
@@ -249,21 +261,14 @@ def test_monitor_stays_alive_and_silent_without_an_identity(tmp_path: Path) -> N
     """
     env, repo, _ = _monitor_env(tmp_path)
 
-    proc = subprocess.Popen(
-        [BASH, _git_bash_path(MONITOR), "claude", "1"],
-        cwd=repo,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    proc, out_path, err_path = _spawn_monitor(env, repo, tmp_path, "alive")
     try:
         # Long enough to cross several iterations of the one-second backoff, so
         # this proves the loop continues rather than that one sleep is running.
         time.sleep(5)
         assert proc.poll() is None, "monitor exited without an identity"
     finally:
-        stdout, _stderr = _stop_and_read(proc)
+        stdout, _stderr = _stop_and_read(proc, out_path, err_path)
 
     assert stdout == "", f"monitor spoke when it had nothing to report: {stdout!r}"
 
@@ -288,27 +293,24 @@ def test_monitor_exits_promptly_on_sigterm(tmp_path: Path) -> None:
     skip_if_cpu_overloaded()
     env, repo, _ = _monitor_env(tmp_path)
 
-    proc = subprocess.Popen(
-        [BASH, _git_bash_path(MONITOR), "claude", "1"],
-        cwd=repo,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    proc, _out_path, _err_path = _spawn_monitor(env, repo, tmp_path, "sigterm")
     time.sleep(3)
     assert proc.poll() is None, "monitor exited before the signal could be sent"
 
     sent = time.monotonic()
     proc.terminate()
     try:
-        proc.communicate(timeout=15)
+        # `wait`, not `communicate`: the event under test is the monitor
+        # exiting, and pipes reaching EOF is a different event that an orphaned
+        # curl child can delay indefinitely. Waiting on the wrong one would
+        # report a surviving grandchild as "monitor ignored SIGTERM" -- the
+        # regression this test exists to catch, blamed on the wrong process.
+        proc.wait(timeout=15)
     except subprocess.TimeoutExpired:  # pragma: no cover - failure path
-        # Bounded on purpose: a test that fails must fail, not hang the run
-        # waiting on pipes a killed process's children may still hold.
+        # Bounded on purpose: a test that fails must fail, not hang the run.
         proc.kill()
         with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.communicate(timeout=15)
+            proc.wait(timeout=15)
         pytest.fail("monitor ignored SIGTERM")
 
     assert time.monotonic() - sent < 15

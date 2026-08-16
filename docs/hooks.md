@@ -79,8 +79,10 @@ not need a `version` bump.
 
 Which copy actually executes has differed between machines — on WSL both the
 skill and the monitor ran from the repository path while a stale cache copy sat
-beside them — so read the path out of `pgrep -af inbox_watch_monitor` instead
-of assuming either.
+beside them — so read the path out of `ps -ef | grep '[i]nbox_watch_monitor'`
+instead of assuming either. Not `pgrep`: Git for Windows does not ship it, and
+its `command not found` prints no matches, which reads exactly like "nothing is
+running".
 
 The bare `.sh` in the manifest needs no interpreter of its own: the host
 resolves one, including on Windows, where it starts the command through Git for

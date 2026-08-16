@@ -26,11 +26,24 @@ Confirm it actually started, then stop:
 1. Check that a monitor process is now running:
 
    ```
-   pgrep -af "inbox_watch_monitor"
+   ps -ef | grep '[i]nbox_watch_monitor'
    ```
 
    A task list does not show background monitors, so check the processes. One
    match means this session is armed — report that and STOP.
+
+   **Not `pgrep`.** Git for Windows ships no `pgrep`: it exits 127 with
+   `command not found` on stderr and matches nothing, which is what "no monitor
+   is running" also looks like if you read only the empty match list. Step 2
+   then tells you to arm one, so the missing tool turns into a duplicate
+   subscription. Measured on `claude-win-home-1` with a healthy monitor running
+   the whole time. `ps -ef` exists on Linux, macOS and Git Bash alike.
+
+   The bracket in `[i]nbox` is load-bearing — it stops the pattern matching the
+   probe's own `grep`. Keep the bare name out of the rest of the command line
+   too: measured here, a shell whose argv happened to carry it was listed as if
+   it were the monitor. That direction is the worse one. A false "armed" ends
+   the check, leaves the session with no instant delivery, and says nothing.
 
 2. If there is **no** match after a few seconds, the host did not honour the
    trigger. Arm it yourself instead, through the **Monitor tool**, persistent and
@@ -60,9 +73,16 @@ Confirm it actually started, then stop:
    off the process rather than assuming:
 
    ```
-   pgrep -af inbox_watch_monitor
-   cmp <the path in argv> <repo>/scripts/hooks/inbox_watch_monitor.sh
+   ps -ef | grep '[i]nbox_watch_monitor'
+   diff <(tr -d '\r' < "<the path in argv>") \
+        <(tr -d '\r' < <repo>/scripts/hooks/inbox_watch_monitor.sh)
    ```
+
+   Compare on normalised line endings, not with `cmp`. The installer writes the
+   cache copy CRLF while the working tree is LF, so on Windows a byte compare
+   reports a difference for every line of an identical file — measured here at
+   307 of 307 lines "changed" with the content the same after `tr -d '\r'`. A
+   check that cannot return "same" cannot tell you anything.
 
    If they differ, the plugin is running an older snapshot. Refresh it with
    **uninstall followed by install** — measured by `claude-win-home-1` to pull a

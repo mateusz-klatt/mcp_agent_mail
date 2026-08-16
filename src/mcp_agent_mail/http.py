@@ -6944,18 +6944,34 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             """Return the active, addressable agents in one active project."""
             await ensure_schema()
             async with get_session() as session:
-                await _mail_ui_revalidated_admin_user(request, session)
+                # Deliberately NOT `_mail_ui_revalidated_admin_user`: the
+                # recipient picker in Compose reads this directory, and Compose
+                # belongs to project operators too. Revalidate the human here
+                # and let visibility plus the operate check below carry the
+                # authorization, exactly as the reservations view does.
+                await _mail_ui_revalidated_profile_user(request, session)
                 visible_roles = await _mail_ui_visible_project_roles(
                     settings=settings,
                     request=request,
                     session=session,
                 )
                 project = await session.get(Project, project_id)
+                # `.get()` returns None both for the administrator and for a
+                # project that is not visible at all, so membership is checked
+                # separately before the value is read.
+                project_role = visible_roles.get(project_id)
+                may_operate = project_id in visible_roles and (
+                    project_role is None
+                    or webauth.project_role_allows_operate(project_role)
+                )
                 if (
-                    project_id not in visible_roles
+                    not may_operate
                     or project is None
                     or project.archived_at is not None
                 ):
+                    # 404 rather than 403 for a visible-but-viewer project: the
+                    # two must stay indistinguishable, as in the reservations
+                    # view and the compose endpoint.
                     raise _mail_ui_domain_http_exception(
                         code="project_not_found",
                         status_code=status.HTTP_404_NOT_FOUND,

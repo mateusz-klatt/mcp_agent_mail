@@ -5360,6 +5360,69 @@ class TestMailUiRbacSurface:
         assert authored == 0
 
     @pytest.mark.asyncio
+    async def test_operator_reads_the_agent_directory_compose_depends_on(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        """Compose is useless without recipients, so the directory follows it."""
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        assigned_id, _assigned_message = await _seed_project(
+            "directory-assigned",
+            subject="Assigned target",
+            agent_name="DirectoryAgent",
+            sound="low",
+        )
+        unassigned_id, _unassigned_message = await _seed_project(
+            "directory-unassigned",
+            subject="Unassigned target",
+            agent_name="HiddenAgent",
+            sound="low",
+        )
+        operator_epoch = await _make_user(
+            "directory-operator", role=webauth.ROLE_MEMBER
+        )
+        await _assign(
+            "directory-operator", assigned_id, webauth.PROJECT_ROLE_OPERATOR
+        )
+        viewer_epoch = await _make_user("directory-viewer", role=webauth.ROLE_MEMBER)
+        await _assign("directory-viewer", assigned_id, webauth.PROJECT_ROLE_VIEWER)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("directory-operator", operator_epoch),
+        ) as client:
+            allowed = await client.get(
+                f"/mail/api/v1/projects/{assigned_id}/agents"
+            )
+            out_of_scope = await client.get(
+                f"/mail/api/v1/projects/{unassigned_id}/agents"
+            )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("directory-viewer", viewer_epoch),
+        ) as client:
+            viewer_refused = await client.get(
+                f"/mail/api/v1/projects/{assigned_id}/agents"
+            )
+
+        assert allowed.status_code == 200, allowed.text
+        payload = allowed.json()
+        assert [item["name"] for item in payload["items"]] == ["DirectoryAgent"]
+        # The composer sends this back as expected_project_generation, so an
+        # empty or absent value here would fail the send rather than the read.
+        assert payload["project_generation"]
+
+        # A viewer may read this project's messages but not author into it, so
+        # the directory stays closed - and closed the same way an absent
+        # project looks, not with a 403 that confirms the project exists.
+        assert viewer_refused.status_code == 404, viewer_refused.text
+        assert out_of_scope.status_code == 404, out_of_scope.text
+
+    @pytest.mark.asyncio
     async def test_legacy_overseer_hold_precedes_database_and_archive_writes(
         self,
         isolated_env,
@@ -6131,8 +6194,13 @@ class TestMailUiV1ReadApi:
             "directory-member",
             role=webauth.ROLE_MEMBER,
         )
+        viewer_epoch = await _make_user(
+            "directory-viewer-only",
+            role=webauth.ROLE_MEMBER,
+        )
         admin_epoch = await _make_user("directory-admin")
         await _assign("directory-member", active_id, webauth.PROJECT_ROLE_OPERATOR)
+        await _assign("directory-viewer-only", active_id, webauth.PROJECT_ROLE_VIEWER)
         async with get_session() as session:
             await session.execute(
                 text(
@@ -6155,11 +6223,19 @@ class TestMailUiV1ReadApi:
             base_url="http://test",
             cookies=await _cookie("directory-member", member_epoch),
         ) as member:
-            assigned_but_not_admin = await member.get(
+            operator_on_assigned = await member.get(
                 f"/mail/api/v1/projects/{active_id}/agents"
             )
             invisible = await member.get(
                 f"/mail/api/v1/projects/{hidden_id}/agents"
+            )
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("directory-viewer-only", viewer_epoch),
+        ) as viewer:
+            viewer_on_assigned = await viewer.get(
+                f"/mail/api/v1/projects/{active_id}/agents"
             )
         async with AsyncClient(
             transport=ASGITransport(app=app),
@@ -6175,15 +6251,19 @@ class TestMailUiV1ReadApi:
 
         assert unauthenticated.status_code == 401
         assert unauthenticated.json() == {"detail": {"code": "actor_forbidden"}}
-        for response in (assigned_but_not_admin, invisible):
-            assert response.status_code == 403
-            assert response.json() == {"detail": {"code": "actor_forbidden"}}
-        for response in (archived, missing):
-            assert response.status_code == 404
+        # An operator reads the directory: Compose needs recipients, and the
+        # composer is theirs now. This is the one case that changed.
+        assert operator_on_assigned.status_code == 200, operator_on_assigned.text
+        # Everything without operate rights still fails, and fails as 404 so a
+        # project you may read but not author into is indistinguishable from
+        # one that does not exist.
+        for response in (viewer_on_assigned, invisible, archived, missing):
+            assert response.status_code == 404, response.text
             assert response.json() == {"detail": {"code": "project_not_found"}}
         for response in (
             unauthenticated,
-            assigned_but_not_admin,
+            operator_on_assigned,
+            viewer_on_assigned,
             invisible,
             archived,
             missing,

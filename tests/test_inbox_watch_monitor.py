@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -248,6 +249,39 @@ def _spawn_resolved_monitor(
     return proc, out_path, err_path
 
 
+def _bash_sees_its_parent() -> bool:
+    """Whether the monitor's own bash can observe the process that started it.
+
+    Spawned exactly the way the monitor is -- straight from Python -- because
+    that is the whole question. Under Git Bash the answer is no: `$PPID` comes
+    back as 1 and pid 1 is not a signallable entity there, so a probe that
+    reports "absent" is describing itself, not the CLI. Measured rather than
+    keyed off `os.name`, so a Git Bash that one day reports a real parent moves
+    these assertions back on its own.
+    """
+    return (
+        subprocess.run(
+            [BASH, "-c", "kill -0 $PPID 2>/dev/null"],
+            check=False,
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+
+
+def _force_kill(pid: int) -> None:
+    """Stop a monitor the harness cannot reach through its Popen handle."""
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            check=False,
+            capture_output=True,
+        )
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(pid, signal.SIGKILL)
+
+
 def _pid_bash_cannot_see() -> int:
     """A numeric pid that `kill -0` reports as absent, from the monitor's own bash.
 
@@ -410,8 +444,15 @@ def test_monitor_keeps_running_when_its_owner_cannot_be_observed(
         )
     finally:
         _stop_and_read(probe, probe_out, probe_err)
-    assert _wait_until(lambda: not list(watch_dir.glob("monitor-*.json")))
 
+    # Deliberately NOT waiting for the probe's record to disappear. Windows has
+    # no stop that runs the EXIT trap -- `Popen.terminate()` is TerminateProcess
+    # just as `taskkill /F` is, measured by claude-win-home-1 to leave the record
+    # behind either way -- so waiting for cleanup here would fail in the
+    # preparation of a test that is about something else entirely. The singleton
+    # below does not need the courtesy: `am_lock_acquire` recovers a lock whose
+    # recorded owner is gone, and the monitor's own pid is one this shell can
+    # observe even where the CLI's is not.
     proc, out_path, err_path = _spawn_resolved_monitor(
         env,
         repo,
@@ -716,7 +757,16 @@ def test_monitor_is_singleton_per_project_and_agent_with_diagnostic_argv(
 def test_monitor_exits_and_cleans_its_exact_record_when_cli_parent_exits(
     tmp_path: Path,
 ) -> None:
-    """A native-Windows-style orphan must not survive into the next CLI run."""
+    """An orphan must not survive into the next CLI run -- where it can be seen.
+
+    Ownership is only enforceable on a host whose shell can observe the process
+    that started it, and Git Bash cannot: it reports `PPID=1`, and pid 1 is not
+    signallable there. So this pins both halves of one contract rather than one
+    half and a skip -- the orphan dies where death is detectable, and where it is
+    not, the monitor deliberately outlives its CLI until the connection window
+    ends. Which half runs is decided by measuring the shell, not by naming the
+    platform.
+    """
     env, repo, _ = _monitor_env(tmp_path)
     watch_dir = tmp_path / "state" / "watch"
     env.update(
@@ -762,11 +812,36 @@ raise SystemExit(2)
     )
     assert helper.returncode == 0, helper.stderr
     assert helper.stdout.strip().isdigit()
-    assert _wait_until(
-        lambda: not list(watch_dir.glob("monitor-*.json"))
-        and not list(watch_dir.glob("monitor-*.pid")),
-        budget=10,
-    ), "monitor retained its ownership record after the original CLI parent exited"
+    monitor_pid = int(helper.stdout.strip())
+
+    def _record_gone() -> bool:
+        return not list(watch_dir.glob("monitor-*.json")) and not list(
+            watch_dir.glob("monitor-*.pid")
+        )
+
+    try:
+        if _bash_sees_its_parent():
+            assert _wait_until(_record_gone, budget=10), (
+                "monitor retained its ownership record after the original CLI "
+                "parent exited"
+            )
+        else:
+            # The other half of the same contract, and the reason this is a
+            # branch rather than a skip: where the owner cannot be observed the
+            # monitor deliberately stops supervising it, so surviving the parent
+            # is the specified behaviour and its cost -- the record clears when
+            # the connection window ends, not when the CLI dies. Asserting it
+            # keeps this platform covered instead of silently uncovered, and
+            # turns red the day the probe starts working, which is exactly when
+            # the branch above should take over.
+            assert not _wait_until(_record_gone, budget=5), (
+                "the monitor cleaned up after a parent it cannot observe, so "
+                "either the latch is gone or this host now reports a real "
+                "parent -- in both cases this test is measuring the wrong branch"
+            )
+    finally:
+        # Nothing else will: on such a host the monitor is, correctly, immortal.
+        _force_kill(monitor_pid)
 
 
 @pytest.mark.skipif(

@@ -142,7 +142,7 @@ async def test_missing_file_path_in_markdown_and_originals_toggle(isolated_env, 
             {
                 "project_key": "Backend",
                 "sender_name": "codex-wsl-storage-edges-1",
-                "sender_token": registration_token,
+                "registration_token": registration_token,
                 "to": ["codex-wsl-storage-edges-1"],
                 "subject": "MissingPath2",
                 "body_md": f"![x]({image_path})",

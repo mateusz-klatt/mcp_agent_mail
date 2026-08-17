@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# One-step durable mailbox onboarding and read-only local diagnosis.
+# Durable mailbox onboarding, credential rotation, and local diagnosis.
 #
 # This script is intentionally a thin client of agent_mail_common.sh.  The
 # common layer already owns canonical project/Agent identity, private state,
-# credential locking, and secret-safe HTTP transport.  Keeping those rules in
-# one place is what makes `/onboard`, lifecycle hooks, and `/doctor` agree.
+# credential locking, and secret-safe HTTP transport. Keeping those rules in
+# one place is what makes `/onboard`, `/rotate-token`, lifecycle hooks, and
+# `/doctor` agree.
 
 set -uo pipefail
 # shellcheck source=/dev/null
@@ -18,6 +19,7 @@ usage() {
 Usage:
   agent_mail_setup.sh onboard <client> <slot> [options]
   agent_mail_setup.sh doctor  <client> <slot> [options]
+  agent_mail_setup.sh rotate-token <client> <slot> [--project-key KEY]
 
 Options:
   --project-key KEY   Use this canonical project key instead of deriving origin.
@@ -221,9 +223,14 @@ while [ "$#" -gt 0 ]; do
             exit 2 ;;
     esac
 done
-case "$MODE" in onboard|doctor) ;; *) usage; exit 2 ;; esac
+case "$MODE" in onboard|doctor|rotate-token) ;; *) usage; exit 2 ;; esac
 if [ "$MODE" = "doctor" ] && [ "$LOCAL_MARKER" -eq 1 ]; then
     printf 'Agent Mail: --local-marker is an onboarding mutation, not a doctor option.\n' >&2
+    exit 2
+fi
+if [ "$MODE" = "rotate-token" ] \
+    && { [ -n "$PROGRAM" ] || [ -n "$MODEL" ] || [ "$LOCAL_MARKER" -eq 1 ]; }; then
+    printf 'Agent Mail: rotate-token accepts only --project-key; profile and marker options belong to onboarding.\n' >&2
     exit 2
 fi
 if [ "${AM_PATH_CONFIGURATION_VALID:-0}" != "1" ]; then
@@ -242,6 +249,17 @@ if migration_pair="$(am_identity_migration_pair "$PROJECT" "$CLIENT" "$SLOT")"; 
     printf '%s\n' "$(am_identity_migration_message \
         "${migration_pair%%$'\t'*}" "${migration_pair#*$'\t'}")" >&2
     exit 1
+fi
+
+if [ "$MODE" = "rotate-token" ]; then
+    if ! am_registration_token_rotate_and_persist "$PROJECT" "$AGENT"; then
+        exit 1
+    fi
+    printf 'Agent Mail registration credential rotated and verified.\n'
+    printf 'project: %s\nagent: %s\n' "$PROJECT" "$AGENT"
+    printf 'credential: stored privately at %s (value not displayed)\n' "$AM_CRED_FILE"
+    printf 'next: restart/resume the CLI so it opens a fresh MCP session with the replacement credential.\n'
+    exit 0
 fi
 
 if [ "$MODE" = "doctor" ]; then

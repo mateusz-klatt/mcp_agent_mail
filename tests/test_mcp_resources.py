@@ -665,7 +665,7 @@ async def test_thread_resource_only_returns_visible_messages(isolated_env):
             {
                 "project_key": "ThreadPrivate",
                 "sender_name": "codex-wsl-thread-private-1",
-                "sender_token": green_token,
+                "registration_token": green_token,
                 "to": ["codex-wsl-thread-private-1"],
                 "bcc": ["codex-wsl-thread-private-2"],
                 "subject": "Private thread",

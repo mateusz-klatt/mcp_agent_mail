@@ -130,8 +130,39 @@ logger = logging.getLogger(__name__)
 
 _EXECUTION_LIFECYCLE_PROTOCOL_VERSION = 1
 _EXECUTION_TOKEN_PATTERN = re.compile(r"[0-9a-f]{64}")
+_REGISTRATION_TOKEN_PATTERN = re.compile(r"[0-9a-f]{64}")
 _REDACTED_TOOL_ARGUMENT = "***"
 _SENSITIVE_TOOL_LOG_KEY_FRAGMENTS = ("token", "secret", "capability")
+
+
+@dataclass(frozen=True, slots=True)
+class _SessionAgentBinding:
+    """One credential-versioned Agent authorization held by an MCP session."""
+
+    project_id: int
+    project_generation: str
+    agent_id: int
+    agent_generation: str
+    registration_token_fingerprint: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _SessionExecutionBinding:
+    """One implicit root execution tied to the Agent credential that bound it."""
+
+    project_generation: str
+    agent_id: int
+    agent_generation: str
+    registration_token_fingerprint: str | None
+    execution_id: str
+
+
+def _registration_token_fingerprint(token: str | None) -> str | None:
+    """Return a non-secret version key for an Agent registration capability."""
+    normalized = (token or "").strip()
+    if not normalized:
+        return None
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def _redact_tool_log_value(value: Any) -> Any:
@@ -4656,7 +4687,6 @@ def _target_registration_required_error(
 async def _ensure_agent_registration_token(
     agent: Agent,
     *,
-    rotate: bool = False,
     project: Project | None = None,
 ) -> tuple[Agent, str]:
     """Atomically ensure an agent has one stable registration token.
@@ -4691,7 +4721,7 @@ async def _ensure_agent_registration_token(
                 project=project,
                 action="registration-token access",
             )
-        if rotate or not db_agent.registration_token:
+        if not db_agent.registration_token:
             db_agent.registration_token = candidate
             session.add(db_agent)
         await session.commit()
@@ -4700,6 +4730,102 @@ async def _ensure_agent_registration_token(
         if not token:
             raise RuntimeError(f"Agent id '{agent.id}' still has no registration token.")
         return db_agent, token
+
+
+async def _rotate_agent_registration_token(
+    agent: Agent,
+    *,
+    project: Project,
+    registration_token: str,
+    new_registration_token: str,
+) -> tuple[Agent, bool]:
+    """CAS one exact Agent lifetime to a caller-generated replacement token.
+
+    The caller owns the replacement so it can journal the value before the RPC.
+    Treating an already-current replacement as success makes an ambiguous lost
+    response safely retryable without ever returning a credential from the
+    server. ``BEGIN IMMEDIATE`` serializes the comparison and update on SQLite.
+    """
+    if agent.id is None:
+        raise ValueError("Agent must have an id before rotating a registration token.")
+    if not _REGISTRATION_TOKEN_PATTERN.fullmatch(new_registration_token):
+        raise ToolExecutionError(
+            "INVALID_NEW_REGISTRATION_TOKEN",
+            "new_registration_token must be exactly 64 lowercase hexadecimal characters.",
+            recoverable=True,
+            data={"field": "new_registration_token"},
+        )
+    if not registration_token:
+        raise ToolExecutionError(
+            "AUTHENTICATION_REQUIRED",
+            f"rotate_registration_token requires registration_token for agent '{agent.name}'.",
+            recoverable=True,
+            data={
+                "agent_name": agent.name,
+                "project_key": project.human_key,
+                "token_param": "registration_token",
+            },
+        )
+    if hmac.compare_digest(registration_token, new_registration_token):
+        raise ToolExecutionError(
+            "INVALID_NEW_REGISTRATION_TOKEN",
+            "new_registration_token must differ from registration_token.",
+            recoverable=True,
+            data={"field": "new_registration_token"},
+        )
+
+    async with get_immediate_session() as session:
+        await _revalidate_project_lifetime_in_session(
+            session,
+            project=project,
+            action="registration-token rotation",
+        )
+        db_agent = await session.get(Agent, agent.id)
+        if (
+            db_agent is None
+            or db_agent.project_id != agent.project_id
+            or db_agent.name != agent.name
+            or db_agent.agent_generation != agent.agent_generation
+        ):
+            raise ToolExecutionError(
+                "AGENT_IDENTITY_STALE",
+                "The exact Agent lifetime no longer exists; refusing registration-token rotation.",
+                recoverable=True,
+                data={"agent_name": agent.name},
+            )
+
+        stored_token = (db_agent.registration_token or "").strip()
+        if not stored_token:
+            raise ToolExecutionError(
+                "AUTHENTICATION_REQUIRED",
+                f"Agent '{agent.name}' does not have a registration token to rotate.",
+                recoverable=True,
+                data={
+                    "agent_name": agent.name,
+                    "project_key": project.human_key,
+                    "token_param": "registration_token",
+                },
+            )
+
+        already_current = hmac.compare_digest(stored_token, new_registration_token)
+        if not already_current:
+            if not hmac.compare_digest(stored_token, registration_token):
+                raise ToolExecutionError(
+                    "AUTHENTICATION_REQUIRED",
+                    f"Invalid registration_token for agent '{agent.name}'.",
+                    recoverable=True,
+                    data={
+                        "agent_name": agent.name,
+                        "project_key": project.human_key,
+                        "token_param": "registration_token",
+                    },
+                )
+            db_agent.registration_token = new_registration_token
+            session.add(db_agent)
+
+        await session.commit()
+        await session.refresh(db_agent)
+        return db_agent, already_current
 
 
 def _message_visible_to_agent_clause(agent_id: int) -> Any:
@@ -7073,14 +7199,15 @@ def build_mcp_server() -> FastMCP:
     session_binding_ttl_seconds: float = max(
         60.0, float(getattr(settings, "session_binding_ttl_seconds", 24 * 3600))
     )
-    # Numeric SQLite ids are recyclable after hard deletion.  Every in-memory
-    # binding therefore carries the immutable project/Agent row generations;
-    # an old authenticated session must never become authenticated as a newly
-    # inserted row that happens to reuse the same integer id.
-    session_agent_bindings: dict[str, set[tuple[int, str, int, str]]] = {}
-    session_current_agents: dict[str, dict[int, tuple[str, int, str]]] = {}
+    # Numeric SQLite ids are recyclable after hard deletion. Every in-memory
+    # binding therefore carries the immutable project/Agent row generations.
+    # It also carries a one-way fingerprint of the current registration token:
+    # a rotation in another worker changes the DB-derived key immediately, so
+    # worker-local session state cannot keep the retired credential authorized.
+    session_agent_bindings: dict[str, set[_SessionAgentBinding]] = {}
+    session_current_agents: dict[str, dict[int, _SessionAgentBinding]] = {}
     session_current_executions: dict[
-        str, dict[int, tuple[str, str, str]]
+        str, dict[int, _SessionExecutionBinding]
     ] = {}
     session_binding_last_access: dict[str, float] = {}
 
@@ -7091,17 +7218,20 @@ def build_mcp_server() -> FastMCP:
             # Context may not be available outside of a request; ignore logging
             return
 
-    def _project_agent_key(
+    def _session_agent_binding(
         project: Project,
         agent: Agent,
-    ) -> tuple[int, str, int, str]:
+    ) -> _SessionAgentBinding:
         if project.id is None or agent.id is None:
             raise ValueError("Project and agent must have ids before binding MCP sessions.")
-        return (
-            project.id,
-            project.project_generation,
-            agent.id,
-            agent.agent_generation,
+        return _SessionAgentBinding(
+            project_id=project.id,
+            project_generation=project.project_generation,
+            agent_id=agent.id,
+            agent_generation=agent.agent_generation,
+            registration_token_fingerprint=_registration_token_fingerprint(
+                agent.registration_token
+            ),
         )
 
     def _session_binding_key(ctx: Context) -> str:
@@ -7169,7 +7299,7 @@ def build_mcp_server() -> FastMCP:
 
     def _session_bindings_for(
         ctx: Context,
-    ) -> set[tuple[int, str, int, str]]:
+    ) -> set[_SessionAgentBinding]:
         key = _session_binding_key(ctx)
         _touch_session_binding(key)
         bindings = session_agent_bindings.get(key)
@@ -7180,7 +7310,7 @@ def build_mcp_server() -> FastMCP:
 
     def _session_current_agents_for(
         ctx: Context,
-    ) -> dict[int, tuple[str, int, str]]:
+    ) -> dict[int, _SessionAgentBinding]:
         key = _session_binding_key(ctx)
         _touch_session_binding(key)
         current_agents = session_current_agents.get(key)
@@ -7191,7 +7321,7 @@ def build_mcp_server() -> FastMCP:
 
     def _session_current_executions_for(
         ctx: Context,
-    ) -> dict[int, tuple[str, str, str]]:
+    ) -> dict[int, _SessionExecutionBinding]:
         key = _session_binding_key(ctx)
         _touch_session_binding(key)
         current_executions = session_current_executions.get(key)
@@ -7201,19 +7331,24 @@ def build_mcp_server() -> FastMCP:
         return current_executions
 
     def _bind_session_agent(ctx: Context, project: Project, agent: Agent) -> None:
-        project_id, project_generation, agent_id, agent_generation = (
-            _project_agent_key(project, agent)
-        )
+        binding = _session_agent_binding(project, agent)
         bindings = _session_bindings_for(ctx)
         current_agents = _session_current_agents_for(ctx)
-        bindings.add(
-            (project_id, project_generation, agent_id, agent_generation)
+        # Keep at most one credential version for an exact Agent lifetime in a
+        # session. This bounds stale entries after reauthentication following a
+        # rotation and makes the set itself describe current authority only.
+        bindings.difference_update(
+            {
+                existing
+                for existing in bindings
+                if existing.project_id == binding.project_id
+                and existing.project_generation == binding.project_generation
+                and existing.agent_id == binding.agent_id
+                and existing.agent_generation == binding.agent_generation
+            }
         )
-        current_agents[project_id] = (
-            project_generation,
-            agent_id,
-            agent_generation,
-        )
+        bindings.add(binding)
+        current_agents[binding.project_id] = binding
 
     def _bind_session_execution(
         ctx: Context,
@@ -7221,20 +7356,27 @@ def build_mcp_server() -> FastMCP:
         agent: Agent,
         execution: AgentExecution,
     ) -> None:
-        project_id, project_generation, agent_id, agent_generation = (
-            _project_agent_key(project, agent)
-        )
-        if execution.project_id != project_id or execution.agent_id != agent_id:
+        binding = _session_agent_binding(project, agent)
+        if (
+            execution.project_id != binding.project_id
+            or execution.agent_id != binding.agent_id
+        ):
             raise ValueError("Agent execution does not belong to the authenticated project and agent.")
         _bind_session_agent(ctx, project, agent)
         # One MCP session may host a root execution and explicit subagent
         # lifetimes. Only the root is eligible for implicit resolution; a
         # child must always pass execution_id and must not steal the root slot.
         if execution.kind == "session":
-            _session_current_executions_for(ctx)[project_id] = (
-                project_generation,
-                agent_generation,
-                execution.id,
+            _session_current_executions_for(ctx)[binding.project_id] = (
+                _SessionExecutionBinding(
+                    project_generation=binding.project_generation,
+                    agent_id=binding.agent_id,
+                    agent_generation=binding.agent_generation,
+                    registration_token_fingerprint=(
+                        binding.registration_token_fingerprint
+                    ),
+                    execution_id=execution.id,
+                )
             )
 
     def _session_execution_id(
@@ -7248,14 +7390,17 @@ def build_mcp_server() -> FastMCP:
         binding = current.get(project.id)
         if binding is None:
             return None
-        project_generation, agent_generation, execution_id = binding
+        expected = _session_agent_binding(project, agent)
         if (
-            project_generation != project.project_generation
-            or agent_generation != agent.agent_generation
+            binding.project_generation != expected.project_generation
+            or binding.agent_id != expected.agent_id
+            or binding.agent_generation != expected.agent_generation
+            or binding.registration_token_fingerprint
+            != expected.registration_token_fingerprint
         ):
             current.pop(project.id, None)
             return None
-        return execution_id
+        return binding.execution_id
 
     def _clear_session_execution(
         ctx: Context,
@@ -7266,7 +7411,7 @@ def build_mcp_server() -> FastMCP:
             return
         current = _session_current_executions_for(ctx)
         binding = current.get(project.id)
-        if binding is not None and binding[2] == execution_id:
+        if binding is not None and binding.execution_id == execution_id:
             current.pop(project.id, None)
 
     def _clear_execution_bindings(execution_ids: set[str]) -> None:
@@ -7274,60 +7419,89 @@ def build_mcp_server() -> FastMCP:
             return
         for current in session_current_executions.values():
             for project_id, binding in list(current.items()):
-                execution_id = binding[2]
+                execution_id = binding.execution_id
                 if execution_id in execution_ids:
                     current.pop(project_id, None)
 
-    def _invalidate_deleted_session_bindings(
+    def _invalidate_session_bindings(
         project: Project,
         agent: Agent | None = None,
     ) -> None:
-        """Drop only bindings for the exact deleted row generation."""
+        """Drop bindings for one exact project or Agent lifetime in this worker."""
         if project.id is None:
             return
-        deleted_agent_key: tuple[int, str] | None = None
+        exact_agent_key: tuple[int, str] | None = None
         if agent is not None:
             if agent.id is None:
                 return
-            deleted_agent_key = (agent.id, agent.agent_generation)
+            exact_agent_key = (agent.id, agent.agent_generation)
 
         for session_key, bindings in session_agent_bindings.items():
             removed_bindings = {
                 binding
                 for binding in bindings
-                if binding[0] == project.id
-                and binding[1] == project.project_generation
+                if binding.project_id == project.id
+                and binding.project_generation == project.project_generation
                 and (
-                    deleted_agent_key is None
-                    or (binding[2], binding[3]) == deleted_agent_key
+                    exact_agent_key is None
+                    or (binding.agent_id, binding.agent_generation)
+                    == exact_agent_key
                 )
             }
             bindings.difference_update(removed_bindings)
             current_agents = session_current_agents.get(session_key)
-            if current_agents is None:
-                continue
-            current_agent = current_agents.get(project.id)
-            if current_agent is None:
-                continue
-            current_project_generation, current_agent_id, current_agent_generation = (
-                current_agent
-            )
-            if current_project_generation != project.project_generation:
-                continue
-            if deleted_agent_key is not None and (
-                current_agent_id,
-                current_agent_generation,
-            ) != deleted_agent_key:
-                continue
-            current_agents.pop(project.id, None)
+            if current_agents is not None:
+                current_agent = current_agents.get(project.id)
+                if (
+                    current_agent is not None
+                    and current_agent.project_generation
+                    == project.project_generation
+                    and (
+                        exact_agent_key is None
+                        or (
+                            current_agent.agent_id,
+                            current_agent.agent_generation,
+                        )
+                        == exact_agent_key
+                    )
+                ):
+                    current_agents.pop(project.id, None)
             current_executions = session_current_executions.get(session_key)
             if current_executions is not None:
-                current_executions.pop(project.id, None)
+                current_execution = current_executions.get(project.id)
+                if (
+                    current_execution is not None
+                    and current_execution.project_generation
+                    == project.project_generation
+                    and (
+                        exact_agent_key is None
+                        or (
+                            current_execution.agent_id,
+                            current_execution.agent_generation,
+                        )
+                        == exact_agent_key
+                    )
+                ):
+                    current_executions.pop(project.id, None)
 
     def _session_is_bound_to_agent(ctx: Context, project: Project, agent: Agent) -> bool:
         if project.id is None or agent.id is None:
             return False
-        return _project_agent_key(project, agent) in _session_bindings_for(ctx)
+        expected = _session_agent_binding(project, agent)
+        bindings = _session_bindings_for(ctx)
+        bindings.difference_update(
+            {
+                binding
+                for binding in bindings
+                if binding.project_id == expected.project_id
+                and binding.project_generation == expected.project_generation
+                and binding.agent_id == expected.agent_id
+                and binding.agent_generation == expected.agent_generation
+                and binding.registration_token_fingerprint
+                != expected.registration_token_fingerprint
+            }
+        )
+        return expected in bindings
 
     async def _resolve_session_agent_for_project(
         ctx: Context,
@@ -7338,15 +7512,14 @@ def build_mcp_server() -> FastMCP:
         current_agents = _session_current_agents_for(ctx)
         current_agent = current_agents.get(project.id)
         if current_agent is not None:
-            project_generation, agent_id, agent_generation = current_agent
-            if project_generation == project.project_generation:
+            if current_agent.project_generation == project.project_generation:
                 try:
-                    resolved = await _get_agent_by_id(project, agent_id)
+                    resolved = await _get_agent_by_id(project, current_agent.agent_id)
                 except NoResultFound:
                     resolved = None
                 if (
                     resolved is not None
-                    and resolved.agent_generation == agent_generation
+                    and _session_agent_binding(project, resolved) == current_agent
                 ):
                     return resolved
             current_agents.pop(project.id, None)
@@ -7355,18 +7528,17 @@ def build_mcp_server() -> FastMCP:
         bindings = _session_bindings_for(ctx)
         resolved_agents: list[Agent] = []
         for binding in list(bindings):
-            bound_project_id, project_generation, agent_id, agent_generation = binding
-            if bound_project_id != project.id:
+            if binding.project_id != project.id:
                 continue
-            if project_generation != project.project_generation:
+            if binding.project_generation != project.project_generation:
                 bindings.discard(binding)
                 continue
             try:
-                resolved = await _get_agent_by_id(project, agent_id)
+                resolved = await _get_agent_by_id(project, binding.agent_id)
             except NoResultFound:
                 bindings.discard(binding)
                 continue
-            if resolved.agent_generation != agent_generation:
+            if _session_agent_binding(project, resolved) != binding:
                 bindings.discard(binding)
                 continue
             resolved_agents.append(resolved)
@@ -9624,10 +9796,11 @@ def build_mcp_server() -> FastMCP:
         project_key: str,
         agent_name: str,
         registration_token: str,
+        new_registration_token: str,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """
-        Replace this agent's registration token with a freshly minted one.
+        Replace this agent's registration token with a caller-journaled value.
 
         When to use
         -----------
@@ -9637,41 +9810,46 @@ def build_mcp_server() -> FastMCP:
 
         How it works
         ------------
-        - Authenticates with the token being replaced, so only its holder can
-          rotate it, and mints the replacement atomically.
-        - **The old token stops working the moment this returns.** There is no
-          grace period, so the caller MUST persist the new value before doing
-          anything else -- the hook library's `am_cred_put` is the supported
-          way, and `agent_mail_common.sh` already implements it with locking.
-          A caller that drops the returned value locks this identity out and
-          only a human can re-register it.
+        - The caller securely generates and journals ``new_registration_token``
+          before this RPC. The server compares the current token and writes the
+          replacement inside one SQLite ``BEGIN IMMEDIATE`` transaction.
+        - Retrying the same old/new pair after an ambiguous disconnect succeeds
+          with ``already_current=true`` when the replacement already committed.
+        - Existing MCP session and implicit-execution bindings are invalidated.
+          Other workers reject them on their next protected call because every
+          binding includes the current token's SHA-256 fingerprint.
+        - No credential is returned. Use the supported ``agent_mail_setup.sh
+          rotate-token`` flow so the private client store and remote CAS recover
+          safely across process or network interruption.
 
         Returns
         -------
         dict
-            { "agent": str, "project": str, "registration_token": str }
+            { "agent": str, "project": str, "rotated": bool,
+              "already_current": bool }
         """
         project = await _get_project_by_identifier(project_key)
-        agent = await _authenticate_agent(
-            ctx,
-            project,
-            agent_name,
-            registration_token,
-            token_param="registration_token",
-            action="rotate_registration_token",
-        )
-        _, token = await _ensure_agent_registration_token(
+        agent = await _get_agent(project, agent_name)
+        rotated_agent, already_current = await _rotate_agent_registration_token(
             agent,
-            rotate=True,
             project=project,
+            registration_token=registration_token,
+            new_registration_token=new_registration_token,
         )
+        # Purge this worker synchronously after the durable commit. A different
+        # worker has its own maps, but its next DB-loaded Agent produces a new
+        # fingerprint and therefore cannot match an old binding.
+        _invalidate_session_bindings(project, rotated_agent)
+        await _touch_agent_activity(rotated_agent)
         await ctx.info(
-            f"rotated the registration token for '{agent.name}' in '{project.human_key}'"
+            f"rotation {'recovered' if already_current else 'committed'} for "
+            f"registration token of '{rotated_agent.name}' in '{project.human_key}'"
         )
         return {
-            "agent": agent.name,
+            "agent": rotated_agent.name,
             "project": project.human_key,
-            "registration_token": token,
+            "rotated": not already_current,
+            "already_current": already_current,
         }
 
     @mcp.tool(name="create_agent_identity")
@@ -10009,7 +10187,7 @@ def build_mcp_server() -> FastMCP:
         broadcast: bool = False,
         topic: Optional[str] = None,
         auto_contact_if_blocked: Optional[bool] = None,
-        sender_token: Optional[str] = None,
+        registration_token: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """
@@ -10082,6 +10260,9 @@ def build_mcp_server() -> FastMCP:
             unless overridden). The pending-request TTL is governed by
             ``CONTACT_PENDING_TTL_SECONDS`` (default 7 days, separate from the in-session
             auto-approval TTL ``CONTACT_AUTO_TTL_SECONDS``).
+        registration_token : Optional[str]
+            Durable mailbox credential for ``sender_name``. It may be omitted when
+            this MCP session has already authenticated as that Agent.
 
         Returns
         -------
@@ -10340,8 +10521,8 @@ def build_mcp_server() -> FastMCP:
             ctx,
             project,
             sender_name,
-            sender_token,
-            token_param="sender_token",
+            registration_token,
+            token_param="registration_token",
             action="send_message",
         )
         verified_sender = True
@@ -11427,7 +11608,7 @@ def build_mcp_server() -> FastMCP:
         cc: Optional[list[str]] = None,
         bcc: Optional[list[str]] = None,
         subject_prefix: str = "Re:",
-        sender_token: Optional[str] = None,
+        registration_token: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """
@@ -11459,6 +11640,9 @@ def build_mcp_server() -> FastMCP:
             Recipients by agent name. If omitted, `to` defaults to original sender.
         subject_prefix : str
             Prefix to apply (default "Re:"). Case-insensitive idempotent.
+        registration_token : Optional[str]
+            Durable mailbox credential for ``sender_name``. It may be omitted when
+            this MCP session has already authenticated as that Agent.
 
         Do / Don't
         ----------
@@ -11483,13 +11667,13 @@ def build_mcp_server() -> FastMCP:
         --------
         Minimal reply to original sender:
         If the caller has not already authenticated as `sender_name` in this MCP session,
-        include `sender_token`.
+        include `registration_token`.
 
         ```json
         {"jsonrpc":"2.0","id":"6","method":"tools/call","params":{"name":"reply_message","arguments":{
           "project_key":"/owner/backend","message_id":1234,"sender_name":"codex-wsl-home-1",
           "body_md":"Questions about the migration plan...",
-          "idempotency_key":"reply-1234-01","sender_token":"<registration_token>"
+          "idempotency_key":"reply-1234-01","registration_token":"<registration_token>"
         }}}
         ```
 
@@ -11498,7 +11682,7 @@ def build_mcp_server() -> FastMCP:
         {"jsonrpc":"2.0","id":"6c","method":"tools/call","params":{"name":"reply_message","arguments":{
           "project_key":"/owner/backend","message_id":1234,"sender_name":"codex-wsl-home-1",
           "body_md":"Looping ops.","to":["claude-linux-ci-1"],"cc":["gemini-linux-qa-1"],"subject_prefix":"RE:",
-          "idempotency_key":"reply-1234-02","sender_token":"<registration_token>"
+          "idempotency_key":"reply-1234-02","registration_token":"<registration_token>"
         }}}
         ```
         """
@@ -11516,8 +11700,8 @@ def build_mcp_server() -> FastMCP:
             ctx,
             project,
             sender_name,
-            sender_token,
-            token_param="sender_token",
+            registration_token,
+            token_param="registration_token",
             action="reply_message",
         )
         settings_local = get_settings()
@@ -13753,7 +13937,7 @@ def build_mcp_server() -> FastMCP:
                             "body_md": welcome_body,
                             "thread_id": thread_id,
                             "idempotency_key": welcome_idempotency_key,
-                            "sender_token": requester_registration_token,
+                            "registration_token": requester_registration_token,
                             "format": "json",
                         }
                     )
@@ -15409,7 +15593,7 @@ def build_mcp_server() -> FastMCP:
                         "ctx": ctx,
                         "project_key": project_key,
                         "sender_name": agent_name,
-                        "sender_token": registration_token,
+                        "registration_token": registration_token,
                         "to": [holder.name],
                         "subject": f"[file-reservations] Released stale lock on {reservation.path_pattern}",
                         "body_md": "\n".join(body_lines),
@@ -16819,6 +17003,20 @@ def build_mcp_server() -> FastMCP:
                         "usage_examples": [{"hint": "Provision durable identity", "sample": "create_agent_identity(project_key='/owner/backend', name_hint='codex-linux-ci-1', program='codex', model='gpt5')"}],
                     },
                     {
+                        "name": "rotate_registration_token",
+                        "summary": "CAS a journaled replacement credential and revoke prior MCP session bindings.",
+                        "use_when": "A durable Agent credential may have been exposed or requires planned rotation.",
+                        "related": ["register_agent", "whois"],
+                        "expected_frequency": "Rare security maintenance; use the supported rotate-token client flow.",
+                        "required_capabilities": ["identity"],
+                        "usage_examples": [
+                            {
+                                "hint": "Use the crash-safe client",
+                                "sample": "agent_mail_setup.sh rotate-token codex 1 --project-key /owner/backend",
+                            }
+                        ],
+                    },
+                    {
                         "name": "retire_agent",
                         "summary": "Reversibly remove a durable mailbox from active routing while preserving its history.",
                         "use_when": "A durable mailbox is no longer in use and should leave the active roster.",
@@ -16867,7 +17065,7 @@ def build_mcp_server() -> FastMCP:
                         "related": ["reply_message", "request_contact"],
                         "expected_frequency": "Frequent—core write operation.",
                         "required_capabilities": ["messaging"],
-                        "usage_examples": [{"hint": "New plan", "sample": "send_message(project_key='backend', sender_name='codex-wsl-home-1', to=['claude-linux-ci-1'], subject='Plan', body_md='...', idempotency_key='plan-01')"}],
+                        "usage_examples": [{"hint": "New plan", "sample": "send_message(project_key='backend', sender_name='codex-wsl-home-1', to=['claude-linux-ci-1'], subject='Plan', body_md='...', idempotency_key='plan-01', registration_token='<registration token>')"}],
                     },
                     {
                         "name": "reply_message",
@@ -16876,7 +17074,7 @@ def build_mcp_server() -> FastMCP:
                         "related": ["send_message"],
                         "expected_frequency": "Frequent when collaborating inside a thread.",
                         "required_capabilities": ["messaging"],
-                        "usage_examples": [{"hint": "Thread reply", "sample": "reply_message(project_key='backend', message_id=42, sender_name='codex-wsl-home-1', body_md='Got it!', idempotency_key='reply-42-01', sender_token='<sender token>')"}],
+                        "usage_examples": [{"hint": "Thread reply", "sample": "reply_message(project_key='backend', message_id=42, sender_name='codex-wsl-home-1', body_md='Got it!', idempotency_key='reply-42-01', registration_token='<registration token>')"}],
                     },
                     {
                         "name": "get_message_delivery",
@@ -17136,7 +17334,7 @@ def build_mcp_server() -> FastMCP:
             "tools": {
                 "send_message": {
                     "required": ["project_key", "sender_name", "to", "subject", "body_md", "idempotency_key"],
-                    "optional": ["cc", "bcc", "attachment_paths", "convert_images", "importance", "ack_required", "thread_id", "auto_contact_if_blocked"],
+                    "optional": ["cc", "bcc", "attachment_paths", "convert_images", "importance", "ack_required", "thread_id", "auto_contact_if_blocked", "registration_token"],
                     "shapes": {
                         "to": "list[str]",
                         "cc": "list[str] | str",
@@ -17149,11 +17347,38 @@ def build_mcp_server() -> FastMCP:
                 },
                 "reply_message": {
                     "required": ["project_key", "message_id", "sender_name", "body_md", "idempotency_key"],
-                    "optional": ["to", "cc", "bcc", "subject_prefix", "sender_token"],
+                    "optional": ["to", "cc", "bcc", "subject_prefix", "registration_token"],
+                },
+                "rotate_registration_token": {
+                    "required": [
+                        "project_key",
+                        "agent_name",
+                        "registration_token",
+                        "new_registration_token",
+                    ],
+                    "constraints": [
+                        "new_registration_token must be exactly 64 lowercase hexadecimal characters",
+                        "the caller must durably journal new_registration_token before the call",
+                        "the result never contains registration_token or new_registration_token",
+                    ],
+                    "returns": {
+                        "agent": "str",
+                        "project": "str",
+                        "rotated": "bool",
+                        "already_current": "bool",
+                    },
                 },
                 "macro_contact_handshake": {
                     "required": ["project_key", "requester|agent_name", "target|to_agent"],
-                    "optional": ["reason", "ttl_seconds", "auto_accept", "welcome_subject", "welcome_body"],
+                    "optional": [
+                        "reason",
+                        "ttl_seconds",
+                        "auto_accept",
+                        "welcome_subject",
+                        "welcome_body",
+                        "requester_registration_token",
+                        "target_registration_token",
+                    ],
                     "constraints": [
                         "target must already be registered; the macro never creates a durable Agent"
                     ],

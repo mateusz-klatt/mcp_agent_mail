@@ -2202,6 +2202,7 @@ class TestMailUiPreferences:
             "/mail/api/v1/me/profile",
             "/mail/api/v1/projects",
             "/mail/api/v1/projects/{project_id}/agents",
+            "/mail/api/v1/projects/{project_id}/agents/{agent_id}/profile",
             "/mail/api/v1/reservations",
             "/mail/api/v1/search",
             "/mail/api/v1/deliveries/{delivery_id}",
@@ -2385,6 +2386,18 @@ class TestMailUiPreferences:
         agent_directory = mail_paths[
             "/mail/api/v1/projects/{project_id}/agents"
         ]["get"]
+        directory_parameters = {
+            parameter["name"]: parameter
+            for parameter in agent_directory["parameters"]
+        }
+        assert set(directory_parameters) == {"project_id", "purpose"}
+        assert directory_parameters["purpose"]["in"] == "query"
+        assert directory_parameters["purpose"]["required"] is False
+        assert directory_parameters["purpose"]["schema"]["enum"] == [
+            "addressable",
+            "profile",
+        ]
+        assert directory_parameters["purpose"]["schema"]["default"] == "addressable"
         for status_code in ("401", "403", "404", "409", "500"):
             assert agent_directory["responses"][status_code]["content"][
                 "application/json"
@@ -2417,6 +2430,39 @@ class TestMailUiPreferences:
             "display_name",
             "notify_sound",
         }
+
+        agent_profile = mail_paths[
+            "/mail/api/v1/projects/{project_id}/agents/{agent_id}/profile"
+        ]
+        assert set(agent_profile) == {"patch"}
+        assert agent_profile["patch"]["requestBody"]["content"][
+            "application/json"
+        ]["schema"] == {"$ref": "#/components/schemas/MailUiAgentProfilePatch"}
+        assert agent_profile["patch"]["responses"]["200"]["content"][
+            "application/json"
+        ]["schema"] == {
+            "$ref": "#/components/schemas/MailUiAgentProfileMutationResponse"
+        }
+        assert agent_profile["patch"]["responses"]["422"]["content"][
+            "application/json"
+        ]["schema"] == {
+            "$ref": "#/components/schemas/MailUiDomainOrValidationErrorResponse"
+        }
+        agent_profile_patch_schema = schema["components"]["schemas"][
+            "MailUiAgentProfilePatch"
+        ]
+        assert agent_profile_patch_schema["additionalProperties"] is False
+        assert set(agent_profile_patch_schema["properties"]) == {
+            "expected_project_generation",
+            "expected_agent_generation",
+            "expected_display_name",
+            "expected_notify_sound",
+            "display_name",
+            "notify_sound",
+        }
+        assert agent_profile_patch_schema["properties"]["notify_sound"][
+            "enum"
+        ] == list(http_module.NOTIFY_SOUND_NAMES)
 
         search_operation = mail_paths["/mail/api/v1/search"]["get"]
         assert {
@@ -6048,28 +6094,43 @@ class TestMailUiV1ReadApi:
                 ),
                 {"project_id": project_id},
             )
-            for name, display_name, contact_policy, retired_at in (
-                ("bravo", "Bravo Person", "open", None),
-                ("Alpha", None, "auto", None),
-                ("RetiredAgent", "Retired Person", "open", "2030-01-01 00:00:00"),
-                ("BlockedAgent", "Blocked Person", "block_all", None),
-                ("HumanOverseer", "Human mailbox", "open", None),
+            for name, display_name, contact_policy, provisioning_state, retired_at in (
+                ("bravo", "Bravo Person", "open", "active", None),
+                ("Alpha", None, "auto", "active", None),
+                (
+                    "RetiredAgent",
+                    "Retired Person",
+                    "open",
+                    "active",
+                    "2030-01-01 00:00:00",
+                ),
+                ("BlockedAgent", "Blocked Person", "block_all", "active", None),
+                (
+                    "ProvisioningAgent",
+                    "Unpublished Person",
+                    "open",
+                    "provisioning",
+                    None,
+                ),
+                ("HumanOverseer", "Human mailbox", "open", "active", None),
             ):
                 await session.execute(
                     text(
                         "INSERT INTO agents "
                         "(project_id, name, program, model, task_description, "
                         "inception_ts, last_active_ts, attachments_policy, "
-                        "contact_policy, registration_token, retired_at, display_name) "
+                        "contact_policy, provisioning_state, registration_token, "
+                        "retired_at, display_name) "
                         "VALUES (:project_id, :name, 'secret-program', 'secret-model', "
                         "'secret-task', datetime('now'), datetime('now'), 'auto', "
-                        ":contact_policy, 'secret-token', "
+                        ":contact_policy, :provisioning_state, 'secret-token', "
                         ":retired_at, :display_name)"
                     ),
                     {
                         "project_id": project_id,
                         "name": name,
                         "contact_policy": contact_policy,
+                        "provisioning_state": provisioning_state,
                         "retired_at": retired_at,
                         "display_name": display_name,
                     },
@@ -6090,6 +6151,14 @@ class TestMailUiV1ReadApi:
         ) as client:
             response = await client.get(
                 f"/mail/api/v1/projects/{project_id}/agents"
+            )
+            profile_response = await client.get(
+                f"/mail/api/v1/projects/{project_id}/agents",
+                params={"purpose": "profile"},
+            )
+            invalid_purpose = await client.get(
+                f"/mail/api/v1/projects/{project_id}/agents",
+                params={"purpose": "audio-url"},
             )
             legacy = await client.get(
                 "/mail/api/projects/api-v1-agent-directory/agents"
@@ -6147,6 +6216,18 @@ class TestMailUiV1ReadApi:
             }
             for item in response.json()["items"]
         )
+        assert profile_response.status_code == 200
+        assert [item["name"] for item in profile_response.json()["items"]] == [
+            "Alpha",
+            "BlockedAgent",
+            "bravo",
+            "zulu",
+        ]
+        blocked = profile_response.json()["items"][1]
+        assert blocked["display_name"] == "Blocked Person"
+        assert blocked["notify_sound"] is None
+        assert profile_response.json()["total"] == 4
+        assert invalid_purpose.status_code == 422
         for private_value in (
             "directory-private-human",
             "private-program",
@@ -6158,10 +6239,13 @@ class TestMailUiV1ReadApi:
             "secret-task",
             "secret-token",
             "RetiredAgent",
-            "BlockedAgent",
+            "ProvisioningAgent",
+            "Unpublished Person",
             "HumanOverseer",
         ):
             assert private_value not in response.text
+            assert private_value not in profile_response.text
+        assert "BlockedAgent" not in response.text
         assert legacy.status_code == 404
         assert legacy.json() == {"detail": "Not Found"}
 
@@ -6269,6 +6353,385 @@ class TestMailUiV1ReadApi:
             missing,
         ):
             assert response.headers["Cache-Control"] == "no-store"
+
+    @pytest.mark.asyncio
+    async def test_operator_can_cas_update_agent_presentation_profile(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        project_id, _message_id = await _seed_project(
+            "agent-profile-cas",
+            subject="Agent profile fixture",
+            agent_name="CanonicalAgent",
+            sound="low",
+        )
+        epoch = await _make_user(
+            "agent-profile-operator",
+            role=webauth.ROLE_MEMBER,
+        )
+        await _assign(
+            "agent-profile-operator",
+            project_id,
+            webauth.PROJECT_ROLE_OPERATOR,
+        )
+        async with get_session() as session:
+            await session.execute(
+                text(
+                    "UPDATE agents SET notify_sound = NULL, "
+                    "contact_policy = 'block_all' "
+                    "WHERE project_id = :project_id"
+                ),
+                {"project_id": project_id},
+            )
+            await session.execute(
+                text(
+                    "INSERT INTO agents "
+                    "(project_id, name, program, model, task_description, "
+                    "inception_ts, last_active_ts, attachments_policy, "
+                    "contact_policy, provisioning_state, registration_token) "
+                    "VALUES (:project_id, 'UnpublishedAgent', 'test', 'test', "
+                    "'provisioning fixture', datetime('now'), datetime('now'), "
+                    "'auto', 'open', 'provisioning', 'provisioning-token')"
+                ),
+                {"project_id": project_id},
+            )
+            provisioning_agent = (
+                await session.execute(
+                    text(
+                        "SELECT id, agent_generation FROM agents "
+                        "WHERE project_id = :project_id "
+                        "AND name = 'UnpublishedAgent'"
+                    ),
+                    {"project_id": project_id},
+                )
+            ).mappings().one()
+            await session.commit()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("agent-profile-operator", epoch),
+        ) as client:
+            addressable_directory = await client.get(
+                f"/mail/api/v1/projects/{project_id}/agents"
+            )
+            directory = await client.get(
+                f"/mail/api/v1/projects/{project_id}/agents",
+                params={"purpose": "profile"},
+            )
+            snapshot = directory.json()["items"][0]
+            path = (
+                f"/mail/api/v1/projects/{project_id}/agents/"
+                f"{snapshot['agent_id']}/profile"
+            )
+            payload = {
+                "expected_project_generation": directory.json()[
+                    "project_generation"
+                ],
+                "expected_agent_generation": snapshot["agent_generation"],
+                "expected_display_name": snapshot["display_name"],
+                "expected_notify_sound": snapshot["notify_sound"],
+                "display_name": "  Friendly Agent  ",
+                "notify_sound": "sparkle",
+            }
+            updated = await client.patch(
+                path,
+                json=payload,
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            reupdated_payload = {
+                **payload,
+                "expected_display_name": "Friendly Agent",
+                "expected_notify_sound": "sparkle",
+                "display_name": "Release Friend",
+                "notify_sound": "bell",
+            }
+            reupdated = await client.patch(
+                path,
+                json=reupdated_payload,
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            unchanged = await client.patch(
+                path,
+                json={
+                    **reupdated_payload,
+                    "expected_display_name": "Release Friend",
+                    "expected_notify_sound": "bell",
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            stale = await client.patch(
+                path,
+                json={**payload, "display_name": "Clobbered"},
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            refreshed = await client.get(
+                f"/mail/api/v1/projects/{project_id}/agents",
+                params={"purpose": "profile"},
+            )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("agent-profile-operator", epoch),
+        ) as client:
+            unpublished = await client.patch(
+                f"/mail/api/v1/projects/{project_id}/agents/"
+                f"{provisioning_agent['id']}/profile",
+                json={
+                    "expected_project_generation": directory.json()[
+                        "project_generation"
+                    ],
+                    "expected_agent_generation": provisioning_agent[
+                        "agent_generation"
+                    ],
+                    "expected_display_name": None,
+                    "expected_notify_sound": None,
+                    "display_name": "Must remain unpublished",
+                    "notify_sound": "high",
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            unpublished_directory = await client.get(
+                f"/mail/api/v1/projects/{project_id}/agents",
+                params={"purpose": "profile"},
+            )
+
+        assert addressable_directory.status_code == 200
+        assert addressable_directory.json()["items"] == []
+        assert updated.status_code == 200, updated.text
+        assert updated.json() == {
+            "changed": True,
+            "agent_id": snapshot["agent_id"],
+            "agent_generation": snapshot["agent_generation"],
+            "agent_name": "CanonicalAgent",
+            "display_name": "Friendly Agent",
+            "notify_sound": "sparkle",
+        }
+        assert reupdated.status_code == 200, reupdated.text
+        assert reupdated.json() == {
+            **updated.json(),
+            "display_name": "Release Friend",
+            "notify_sound": "bell",
+        }
+        assert unchanged.status_code == 200, unchanged.text
+        assert unchanged.json() == {**reupdated.json(), "changed": False}
+        assert stale.status_code == 409
+        assert stale.json() == {
+            "detail": {"code": "profile_revision_conflict"}
+        }
+        assert refreshed.json()["items"][0] == {
+            **snapshot,
+            "display_name": "Release Friend",
+            "notify_sound": "bell",
+        }
+        assert unpublished.status_code == 404
+        assert unpublished.json() == {"detail": {"code": "target_not_found"}}
+        assert unpublished_directory.status_code == 200
+        assert [
+            item["name"] for item in unpublished_directory.json()["items"]
+        ] == ["CanonicalAgent"]
+        for response in (
+            addressable_directory,
+            updated,
+            reupdated,
+            unchanged,
+            stale,
+            refreshed,
+            unpublished,
+            unpublished_directory,
+        ):
+            assert response.headers["Cache-Control"] == "no-store"
+
+    @pytest.mark.asyncio
+    async def test_agent_profile_rejects_untrusted_sound_shapes_and_alias_clashes(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        project_id, _message_id = await _seed_project(
+            "agent-profile-validation",
+            subject="Agent validation fixture",
+            agent_name="ProfileTarget",
+            sound="chime",
+        )
+        epoch = await _make_user("agent-profile-admin")
+        async with get_session() as session:
+            await session.execute(
+                text(
+                    "INSERT INTO agents "
+                    "(project_id, name, program, model, task_description, "
+                    "inception_ts, last_active_ts, attachments_policy, "
+                    "contact_policy, notify_sound) "
+                    "VALUES (:project_id, 'OtherCanonical', 'test', 'test', "
+                    "'validation', datetime('now'), datetime('now'), 'auto', "
+                    "'open', 'low')"
+                ),
+                {"project_id": project_id},
+            )
+            await session.commit()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("agent-profile-admin", epoch),
+        ) as client:
+            directory = await client.get(
+                f"/mail/api/v1/projects/{project_id}/agents"
+            )
+            snapshot = next(
+                item
+                for item in directory.json()["items"]
+                if item["name"] == "ProfileTarget"
+            )
+            path = (
+                f"/mail/api/v1/projects/{project_id}/agents/"
+                f"{snapshot['agent_id']}/profile"
+            )
+            payload = {
+                "expected_project_generation": directory.json()[
+                    "project_generation"
+                ],
+                "expected_agent_generation": snapshot["agent_generation"],
+                "expected_display_name": None,
+                "expected_notify_sound": "chime",
+                "display_name": "Profile Target",
+                "notify_sound": "bell",
+            }
+            sound_url = await client.patch(
+                path,
+                json={
+                    **payload,
+                    "notify_sound": "https://example.invalid/ping.mp3",
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            frequency = await client.patch(
+                path,
+                json={**payload, "frequency": 20_000},
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            alias_clash = await client.patch(
+                path,
+                json={**payload, "display_name": "othercanonical"},
+                headers=SAME_ORIGIN_HEADERS,
+            )
+
+        assert sound_url.status_code == 422
+        assert "example.invalid" not in sound_url.text
+        assert frequency.status_code == 422
+        assert "20000" not in frequency.text
+        assert alias_clash.status_code == 422
+        assert alias_clash.json() == {
+            "detail": {"code": "invalid_display_name"}
+        }
+
+    @pytest.mark.asyncio
+    async def test_agent_profile_mutation_is_project_operator_scoped(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        _settings, app = _build(monkeypatch, MAIL_UI_SESSION_SECRET=SECRET)
+        project_id, _message_id = await _seed_project(
+            "agent-profile-rbac",
+            subject="Agent profile RBAC fixture",
+            agent_name="ScopedAgent",
+            sound="high",
+        )
+        operator_epoch = await _make_user(
+            "agent-profile-rbac-operator",
+            role=webauth.ROLE_MEMBER,
+        )
+        viewer_epoch = await _make_user(
+            "agent-profile-rbac-viewer",
+            role=webauth.ROLE_MEMBER,
+        )
+        await _assign(
+            "agent-profile-rbac-operator",
+            project_id,
+            webauth.PROJECT_ROLE_OPERATOR,
+        )
+        await _assign(
+            "agent-profile-rbac-viewer",
+            project_id,
+            webauth.PROJECT_ROLE_VIEWER,
+        )
+        project_generation, refs = await _compose_lifetime_refs(
+            project_id,
+            "ScopedAgent",
+        )
+        agent = refs[0]
+        path = (
+            f"/mail/api/v1/projects/{project_id}/agents/"
+            f"{agent['agent_id']}/profile"
+        )
+        payload = {
+            "expected_project_generation": project_generation,
+            "expected_agent_generation": agent["expected_agent_generation"],
+            "expected_display_name": None,
+            "expected_notify_sound": "high",
+            "display_name": "Scoped label",
+            "notify_sound": "falling",
+        }
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as anonymous:
+            unauthenticated = await anonymous.patch(
+                path,
+                json=payload,
+                headers=SAME_ORIGIN_HEADERS,
+            )
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("agent-profile-rbac-viewer", viewer_epoch),
+        ) as viewer:
+            viewer_only = await viewer.patch(
+                path,
+                json=payload,
+                headers=SAME_ORIGIN_HEADERS,
+            )
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies=await _cookie("agent-profile-rbac-operator", operator_epoch),
+        ) as operator:
+            cross_origin = await operator.patch(
+                path,
+                json=payload,
+                headers={"Origin": "https://evil.example"},
+            )
+            stale_project = await operator.patch(
+                path,
+                json={
+                    **payload,
+                    "expected_project_generation": "f" * 64,
+                },
+                headers=SAME_ORIGIN_HEADERS,
+            )
+            missing_agent = await operator.patch(
+                f"/mail/api/v1/projects/{project_id}/agents/999999999/profile",
+                json=payload,
+                headers=SAME_ORIGIN_HEADERS,
+            )
+
+        assert unauthenticated.status_code == 401
+        assert viewer_only.status_code == 404
+        assert viewer_only.json() == {"detail": {"code": "project_not_found"}}
+        assert cross_origin.status_code == 403
+        assert cross_origin.json() == {"detail": {"code": "actor_forbidden"}}
+        assert stale_project.status_code == 409
+        assert stale_project.json() == {
+            "detail": {"code": "project_recreated"}
+        }
+        assert missing_agent.status_code == 404
+        assert missing_agent.json() == {"detail": {"code": "target_not_found"}}
 
     @pytest.mark.asyncio
     async def test_compose_revalidates_directory_addressability_after_selection(

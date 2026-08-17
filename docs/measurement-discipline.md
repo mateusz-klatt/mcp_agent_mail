@@ -23,9 +23,11 @@ Verifying that a token rotation succeeded, over the right transport, with
 not exist at all: `health_check` authenticates with the server bearer and does
 not care about the agent's token. The call was real, the transport was right,
 and it answered a different question — "is the server alive" rather than "did
-the rotation land". The canonical verifier is a call that needs the thing under
-test: `fetch_inbox` with `limit:1`, or simply running `session_start.sh`, which
-reads the file and authenticates with its contents.
+the rotation land". The canonical verifier is a fresh stateless call that needs
+the thing under test. The supported `agent_mail_setup.sh rotate-token` flow uses
+`whois` only after atomically persisting the replacement; `fetch_inbox` with
+`limit:1` or a later `session_start.sh` provides an independent check that the
+private store now authenticates too.
 
 **Who introduced it — is this our problem?**
 
@@ -60,12 +62,13 @@ one-line fix into a proposal that breaks every clone and fork.
 **What shape is it — can the detector see this at all?**
 
 Three independent scans searched for `[0-9a-f]{64}`, the shape of the server
-bearer, and each reported the repository clean. Agent registration tokens are
-`secrets.token_urlsafe(32)`: 43 characters of base64url. No amount of hex
-searching will ever match one. The installer script writes *both* kinds into
-one file, so the scans covered half of what they claimed to cover. A pre-push
-secret gate on one machine had the same hole, and had reported "clean" on
-thirty commits.
+bearer, and each reported the repository clean. Initially issued Agent
+registration tokens use `secrets.token_urlsafe(32)`: 43 characters of
+base64url; the supported rotation client deliberately generates a journalable
+64-character hexadecimal replacement. Searching only one shape therefore
+misses real credentials. The installer script can write both kinds into one
+file, so a pre-push secret gate on one machine had the same hole and had
+reported "clean" on thirty commits.
 
 The narrower question is also the reliable one: *"did MY secret leak"* is
 answered with `grep -F` on the literal value and needs no hypothesis about

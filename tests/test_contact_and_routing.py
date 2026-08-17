@@ -140,7 +140,7 @@ async def test_external_cross_project_routing(isolated_env):
             {
                 "project_key": "Backend",
                 "sender_name": "Alpha",
-                "sender_token": "alpha-token",
+                "registration_token": "alpha-token",
                 "to": ["project:ops#Receiver"],
                 "subject": "Cross",
                 "body_md": "hello",
@@ -229,7 +229,7 @@ async def test_bare_name_prefers_cross_project_over_local_shadow(isolated_env):
             {
                 "project_key": "Geordi",
                 "sender_name": "Geordi",
-                "sender_token": "geordi-token",
+                "registration_token": "geordi-token",
                 "to": ["Adama"],  # bare name — used to silently hit local shadow
                 "subject": "BareName",
                 "body_md": "should reach Servitor, not the local shadow",
@@ -291,7 +291,7 @@ async def test_bare_name_prefers_local_when_no_cross_project_link(isolated_env):
             {
                 "project_key": "Solo",
                 "sender_name": "Sender",
-                "sender_token": "sender-token",
+                "registration_token": "sender-token",
                 "to": ["Recipient"],
                 "subject": "Local",
                 "body_md": "stays local",

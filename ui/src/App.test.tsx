@@ -18,6 +18,7 @@ import {
   saveProjectAssignment,
 } from "./account";
 import i18n, { type SupportedLocale } from "./i18n";
+import { resetNotificationAudio } from "./notificationSound";
 import {
   composeMessage,
   inboxPageSize,
@@ -39,6 +40,7 @@ import {
   parseInboxPage,
   parseDeliveryResult,
   parseMailRoute,
+  parseAgentProfileMutation,
   parseMessageDetail,
   parseProjectAgents,
   parseProjects,
@@ -47,6 +49,7 @@ import {
   replyIdempotencyKeyFor,
   replyToMessage,
   retryDelivery,
+  saveAgentProfile,
   threadPageSize,
 } from "./mail";
 import {
@@ -192,13 +195,34 @@ describe("Durable mail client", () => {
     const requests: Array<{ method: string; path: string; body: unknown }> = [];
     server.use(
       http.get("*/mail/api/v1/projects/:projectId/agents", ({ request }) => {
+        const url = new URL(request.url);
         requests.push({
           method: request.method,
-          path: new URL(request.url).pathname,
+          path: `${url.pathname}${url.search}`,
           body: null,
         });
         return HttpResponse.json(projectAgentsResponse);
       }),
+      http.patch(
+        "*/mail/api/v1/projects/:projectId/agents/:agentId/profile",
+        async ({ request }) => {
+          const body = await request.json();
+          requests.push({
+            method: request.method,
+            path: new URL(request.url).pathname,
+            body,
+          });
+          return HttpResponse.json({
+            changed: true,
+            agent_id: projectAgentsResponse.items[1]!.agent_id,
+            agent_generation:
+              projectAgentsResponse.items[1]!.agent_generation,
+            agent_name: projectAgentsResponse.items[1]!.name,
+            display_name: "Release lead",
+            notify_sound: "bell",
+          });
+        },
+      ),
       http.post("*/mail/api/v1/projects/:projectId/messages", async ({ request }) => {
         requests.push({
           method: request.method,
@@ -240,6 +264,30 @@ describe("Durable mail client", () => {
       projectAgentsResponse,
     );
     await expect(
+      loadProjectAgents(projectOne.id, { purpose: "profile" }),
+    ).resolves.toEqual(projectAgentsResponse);
+    const agentProfileInput = {
+      expected_project_generation: projectAgentsResponse.project_generation,
+      expected_agent_generation:
+        projectAgentsResponse.items[1]!.agent_generation,
+      expected_display_name: projectAgentsResponse.items[1]!.display_name,
+      expected_notify_sound: "chime" as const,
+      display_name: "Release lead",
+      notify_sound: "bell" as const,
+    };
+    await expect(
+      saveAgentProfile(
+        projectOne.id,
+        projectAgentsResponse.items[1]!.agent_id,
+        projectAgentsResponse.items[1]!.name,
+        agentProfileInput,
+      ),
+    ).resolves.toMatchObject({
+      agent_name: "GreenDog",
+      display_name: "Release lead",
+      notify_sound: "bell",
+    });
+    await expect(
       composeMessage(projectOne.id, {
         idempotency_key: "compose-key",
         expected_project_generation: projectAgentsResponse.project_generation,
@@ -277,6 +325,16 @@ describe("Durable mail client", () => {
         method: "GET",
         path: `/mail/api/v1/projects/${projectOne.id}/agents`,
         body: null,
+      },
+      {
+        method: "GET",
+        path: `/mail/api/v1/projects/${projectOne.id}/agents?purpose=profile`,
+        body: null,
+      },
+      {
+        method: "PATCH",
+        path: `/mail/api/v1/projects/${projectOne.id}/agents/${projectAgentsResponse.items[1]!.agent_id}/profile`,
+        body: agentProfileInput,
       },
       {
         method: "POST",
@@ -334,6 +392,26 @@ describe("Durable mail client", () => {
 
   it("rejects invalid route identities before sending", async () => {
     await expect(loadProjectAgents(0)).rejects.toThrow(TypeError);
+    await expect(
+      saveAgentProfile(0, 1, "BlueLake", {
+        expected_project_generation: "d".repeat(64),
+        expected_agent_generation: "1".repeat(64),
+        expected_display_name: null,
+        expected_notify_sound: null,
+        display_name: null,
+        notify_sound: "chime",
+      }),
+    ).rejects.toThrow(TypeError);
+    await expect(
+      saveAgentProfile(projectOne.id, 0, "BlueLake", {
+        expected_project_generation: "d".repeat(64),
+        expected_agent_generation: "1".repeat(64),
+        expected_display_name: null,
+        expected_notify_sound: null,
+        display_name: null,
+        notify_sound: "chime",
+      }),
+    ).rejects.toThrow(TypeError);
     expect(() =>
       composeMessage(0, {
         idempotency_key: "key",
@@ -391,6 +469,11 @@ describe("Durable mail client", () => {
       },
       {
         ...projectAgentsResponse,
+        items: [{ ...projectAgentsResponse.items[0], notify_sound: "airhorn" }],
+        total: 1,
+      },
+      {
+        ...projectAgentsResponse,
         items: [{ ...projectAgentsResponse.items[0], human: true }],
         total: 1,
       },
@@ -407,6 +490,63 @@ describe("Durable mail client", () => {
       ),
     );
     await expect(loadProjectAgents(projectOne.id)).rejects.toThrow(TypeError);
+  });
+
+  it("validates Agent profile mutation responses and immutable identity", async () => {
+    const response = {
+      changed: true,
+      agent_id: projectAgentsResponse.items[1]!.agent_id,
+      agent_generation: projectAgentsResponse.items[1]!.agent_generation,
+      agent_name: projectAgentsResponse.items[1]!.name,
+      display_name: "Release lead",
+      notify_sound: "sparkle",
+    };
+    expect(parseAgentProfileMutation(response)).toEqual(response);
+    for (const payload of [
+      { ...response, changed: "yes" },
+      { ...response, agent_id: 0 },
+      { ...response, agent_generation: "invalid" },
+      { ...response, agent_name: 7 },
+      { ...response, display_name: 7 },
+      { ...response, notify_sound: "airhorn" },
+      { ...response, debug: true },
+    ]) {
+      expect(() => parseAgentProfileMutation(payload)).toThrow(TypeError);
+    }
+
+    let responses = 0;
+    server.use(
+      http.patch(
+        "*/mail/api/v1/projects/:projectId/agents/:agentId/profile",
+        () => {
+          responses += 1;
+          return HttpResponse.json(
+            responses === 1
+              ? { ...response, agent_id: 999 }
+              : { ...response, agent_name: "ProxyRename" },
+          );
+        },
+      ),
+    );
+    const input = {
+      expected_project_generation: projectAgentsResponse.project_generation,
+      expected_agent_generation: response.agent_generation,
+      expected_display_name: projectAgentsResponse.items[1]!.display_name,
+      expected_notify_sound: "chime" as const,
+      display_name: response.display_name,
+      notify_sound: "sparkle" as const,
+    };
+    for (const attempt of [1, 2]) {
+      await expect(
+        saveAgentProfile(
+          projectOne.id,
+          response.agent_id,
+          response.agent_name,
+          input,
+        ),
+      ).rejects.toThrow("Invalid agent profile identity.");
+      expect(responses).toBe(attempt);
+    }
   });
 
   it("keeps typed error codes without trusting an invalid proxy body", async () => {
@@ -512,6 +652,7 @@ describe("Iris landing shell", () => {
     window.history.replaceState({}, "", "/mail/");
     document.documentElement.lang = "en";
     await i18n.changeLanguage("en");
+    resetNotificationAudio();
     FakeEventSource.instances = [];
     vi.stubGlobal("EventSource", FakeEventSource);
   });
@@ -875,7 +1016,7 @@ describe("Iris landing shell", () => {
     expect(screen.getByText("Durable delivery")).toBeVisible();
     const navigation = screen.getByRole("navigation", { name: "Primary navigation" });
     const links = within(navigation).getAllByRole("link");
-    expect(links).toHaveLength(7);
+    expect(links).toHaveLength(8);
     expect(links.map((link) => link.textContent)).toEqual([
       "Projects",
       "Inbox",
@@ -884,6 +1025,7 @@ describe("Iris landing shell", () => {
       // other read views, not with the administrative ones.
       "Reservations",
       "Compose",
+      "Agents",
       "Account",
       "Administration",
     ]);
@@ -931,6 +1073,492 @@ describe("Iris landing shell", () => {
       String(projectOne.id),
     );
   });
+
+  it("updates an Agent label and previews one of twelve tones without arming global audio", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/mail/#agents");
+    let requestBody: unknown;
+    const contexts: unknown[] = [];
+    vi.stubGlobal(
+      "AudioContext",
+      vi.fn(function AudioContextStub(this: unknown) {
+        const context = {
+          createOscillator: () => ({
+            connect: vi.fn(),
+            disconnect: vi.fn(),
+            frequency: { value: 0 },
+            type: "sine" as OscillatorType,
+            start: vi.fn(),
+            stop: vi.fn(),
+            onended: null,
+          }),
+          createGain: () => ({
+            connect: vi.fn(),
+            disconnect: vi.fn(),
+            gain: {
+              setValueAtTime: vi.fn(),
+              exponentialRampToValueAtTime: vi.fn(),
+            },
+          }),
+          currentTime: 0,
+          destination: {},
+          state: "running",
+          resume: vi.fn().mockResolvedValue(undefined),
+        };
+        contexts.push(context);
+        return context;
+      }),
+    );
+    server.use(
+      http.patch(
+        "*/mail/api/v1/projects/:projectId/agents/:agentId/profile",
+        async ({ params, request }) => {
+          requestBody = await request.json();
+          return HttpResponse.json({
+            changed: true,
+            agent_id: Number(params.agentId),
+            agent_generation: projectAgentsResponse.items[1]!.agent_generation,
+            agent_name: projectAgentsResponse.items[1]!.name,
+            display_name: "Release lead",
+            notify_sound: "bell",
+          });
+        },
+      ),
+    );
+
+    render(<App />);
+    await waitForEnglishPreferences();
+
+    expect(
+      await screen.findByRole("heading", { name: "Agent settings" }),
+    ).toBeVisible();
+    await user.selectOptions(
+      screen.getByLabelText("Project"),
+      String(projectOne.id),
+    );
+    const agentPicker = await screen.findByLabelText("Agent");
+    await user.selectOptions(
+      agentPicker,
+      String(projectAgentsResponse.items[1]!.agent_id),
+    );
+    expect(screen.getByLabelText("Canonical agent_name")).toHaveValue(
+      "GreenDog",
+    );
+    expect(screen.getByLabelText("Canonical agent_name")).toHaveAttribute(
+      "readonly",
+    );
+    const soundPicker = screen.getByLabelText("Agent notification tone");
+    expect(within(soundPicker).getAllByRole("option")).toHaveLength(12);
+    await user.clear(screen.getByLabelText("Agent display name"));
+    await user.type(screen.getByLabelText("Agent display name"), "Release lead");
+    await user.selectOptions(soundPicker, "bell");
+    const globalToggle = screen.getByRole("button", {
+      name: "Notification sound off. Click to unmute.",
+    });
+    await user.click(screen.getByRole("button", { name: "Preview tone" }));
+    expect(contexts).toHaveLength(1);
+    expect(globalToggle).toHaveAttribute("aria-pressed", "false");
+    await user.click(
+      screen.getByRole("button", { name: "Save Agent settings" }),
+    );
+
+    expect(await screen.findByText("Agent settings saved.")).toBeVisible();
+    expect(requestBody).toEqual({
+      expected_project_generation: projectAgentsResponse.project_generation,
+      expected_agent_generation:
+        projectAgentsResponse.items[1]!.agent_generation,
+      expected_display_name: "Release operator",
+      expected_notify_sound: "chime",
+      display_name: "Release lead",
+      notify_sound: "bell",
+    });
+    expect(screen.getByLabelText("Canonical agent_name")).toHaveValue(
+      "GreenDog",
+    );
+  });
+
+  it("uses the profile directory so an active block_all Agent stays configurable", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/mail/#agents");
+    const purposes: Array<string | null> = [];
+    const blockedAgent = {
+      agent_id: 77,
+      agent_generation: "7".repeat(64),
+      name: "SilentAgent",
+      display_name: "Silent operator",
+      notify_sound: "low" as const,
+    };
+    server.use(
+      http.get(
+        "*/mail/api/v1/projects/:projectId/agents",
+        ({ params, request }) => {
+          const purpose = new URL(request.url).searchParams.get("purpose");
+          purposes.push(purpose);
+          return HttpResponse.json({
+            project_id: Number(params.projectId),
+            project_generation: projectAgentsResponse.project_generation,
+            // The profile-purpose backend includes active block_all Agents and
+            // omits unpublished provisioning rows. The UI intentionally sees
+            // only this minimal presentation contract, not either policy flag.
+            items: purpose === "profile" ? [blockedAgent] : [],
+            total: purpose === "profile" ? 1 : 0,
+          });
+        },
+      ),
+    );
+
+    render(<App />);
+    await waitForEnglishPreferences();
+    await user.selectOptions(
+      screen.getByLabelText("Project"),
+      String(projectOne.id),
+    );
+
+    expect(await screen.findByLabelText("Canonical agent_name")).toHaveValue(
+      "SilentAgent",
+    );
+    expect(screen.getByLabelText("Agent")).toHaveValue(String(blockedAgent.agent_id));
+    expect(purposes).toEqual(["profile"]);
+  });
+
+  it("refreshes a stale Agent profile before asking the operator to retry", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/mail/#agents");
+    let directoryReads = 0;
+    server.use(
+      http.get("*/mail/api/v1/projects/:projectId/agents", () => {
+        directoryReads += 1;
+        return HttpResponse.json(
+          directoryReads === 1
+            ? projectAgentsResponse
+            : {
+                ...projectAgentsResponse,
+                items: projectAgentsResponse.items.map((agent) =>
+                  agent.agent_id === projectAgentsResponse.items[0]!.agent_id
+                    ? {
+                        ...agent,
+                        display_name: "Changed elsewhere",
+                        notify_sound: "pulse",
+                      }
+                    : agent,
+                ),
+              },
+        );
+      }),
+      http.patch(
+        "*/mail/api/v1/projects/:projectId/agents/:agentId/profile",
+        () =>
+          HttpResponse.json(
+            { detail: { code: "profile_revision_conflict" } },
+            { status: 409 },
+          ),
+      ),
+    );
+
+    render(<App />);
+    await waitForEnglishPreferences();
+    await user.selectOptions(
+      screen.getByLabelText("Project"),
+      String(projectOne.id),
+    );
+    await user.type(
+      await screen.findByLabelText("Agent display name"),
+      "Local draft",
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Save Agent settings" }),
+    );
+
+    expect(
+      await screen.findByText(/This Agent changed elsewhere/),
+    ).toBeVisible();
+    await waitFor(() => {
+      expect(screen.getByLabelText("Agent display name")).toHaveValue(
+        "Changed elsewhere",
+      );
+      expect(screen.getByLabelText("Agent notification tone")).toHaveValue(
+        "pulse",
+      );
+      expect(directoryReads).toBe(2);
+    });
+  });
+
+  it("keeps Agent settings limited to project operators", async () => {
+    window.history.replaceState({}, "", "/mail/#agents");
+    server.use(
+      http.get("*/mail/api/v1/me/profile", () => HttpResponse.json(memberProfile)),
+      http.get("*/mail/api/v1/projects", () =>
+        HttpResponse.json({
+          items: [{ ...projectOne, role: "viewer", can_reply: false }],
+          total: 1,
+        }),
+      ),
+    );
+
+    render(<App />);
+    await waitForEnglishPreferences();
+
+    expect(
+      await screen.findByText(/Agent settings require administrator access/),
+    ).toBeVisible();
+    expect(screen.queryByRole("link", { name: "Agents" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Project")).not.toBeInTheDocument();
+  });
+
+  it("clears an Agent label and reports typed profile mutation failures", async () => {
+    const user = userEvent.setup();
+    const onUnauthorized = vi.fn();
+    window.history.replaceState({}, "", "/mail/#agents");
+    let writes = 0;
+    server.use(
+      http.patch(
+        "*/mail/api/v1/projects/:projectId/agents/:agentId/profile",
+        ({ params }) => {
+          writes += 1;
+          if (writes === 1) {
+            return HttpResponse.json({
+              changed: false,
+              agent_id: Number(params.agentId),
+              agent_generation: projectAgentsResponse.items[0]!.agent_generation,
+              agent_name: projectAgentsResponse.items[0]!.name,
+              display_name: null,
+              notify_sound: "pulse",
+            });
+          }
+          if (writes === 2) {
+            return HttpResponse.json(
+              { detail: { code: "invalid_display_name" } },
+              { status: 422 },
+            );
+          }
+          return HttpResponse.json(
+            { detail: { code: "unauthorized" } },
+            { status: 401 },
+          );
+        },
+      ),
+    );
+
+    render(<App onUnauthorized={onUnauthorized} />);
+    await waitForEnglishPreferences();
+    await user.selectOptions(
+      screen.getByLabelText("Project"),
+      String(projectOne.id),
+    );
+    const displayName = await screen.findByLabelText("Agent display name");
+    expect(displayName).toHaveValue("");
+    await user.click(
+      screen.getByRole("button", { name: "Save Agent settings" }),
+    );
+    expect(await screen.findByText("Agent settings saved.")).toBeVisible();
+    expect(displayName).toHaveValue("");
+    expect(screen.getByLabelText("Agent notification tone")).toHaveValue("pulse");
+
+    await user.type(displayName, "Colliding label");
+    await user.click(
+      screen.getByRole("button", { name: "Save Agent settings" }),
+    );
+    expect(
+      await screen.findByText("Agent settings could not be saved."),
+    ).toBeVisible();
+    expect(onUnauthorized).not.toHaveBeenCalled();
+
+    await user.clear(displayName);
+    await user.type(displayName, "Retry after login");
+    await user.click(
+      screen.getByRole("button", { name: "Save Agent settings" }),
+    );
+    await waitFor(() => expect(onUnauthorized).toHaveBeenCalledOnce());
+    expect(await screen.findByText(/Active Agents could not be loaded/)).toBeVisible();
+    expect(writes).toBe(3);
+  });
+
+  it("renders Agent project failure and no-active-project states", async () => {
+    window.history.replaceState({}, "", "/mail/#agents");
+    server.use(
+      http.get("*/mail/api/v1/projects", () =>
+        HttpResponse.json({ detail: "private failure" }, { status: 503 }),
+      ),
+    );
+    const first = render(<App />);
+    await waitForEnglishPreferences();
+    expect(
+      await screen.findByText("Agent settings access could not be loaded."),
+    ).toBeVisible();
+    expect(screen.queryByText("private failure")).not.toBeInTheDocument();
+    first.unmount();
+
+    server.use(
+      http.get("*/mail/api/v1/projects", () =>
+        HttpResponse.json({ items: [projectTwo], total: 1 }),
+      ),
+    );
+    render(<App />);
+    await waitForEnglishPreferences();
+    expect(
+      await screen.findByText("There are no active projects available for Agent settings."),
+    ).toBeVisible();
+  });
+
+  it("reports a failed or empty Agent directory without exposing server detail", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/mail/#agents");
+    let directoryMode: "error" | "empty" = "error";
+    server.use(
+      http.get("*/mail/api/v1/projects/:projectId/agents", ({ params }) =>
+        directoryMode === "error"
+          ? HttpResponse.json(
+              { detail: "private directory failure" },
+              { status: 503 },
+            )
+          : HttpResponse.json({
+              project_id: Number(params.projectId),
+              project_generation: projectAgentsResponse.project_generation,
+              items: [],
+              total: 0,
+            }),
+      ),
+    );
+
+    render(<App />);
+    await waitForEnglishPreferences();
+    const projectPicker = screen.getByLabelText("Project");
+    await user.selectOptions(projectPicker, String(projectOne.id));
+    expect(
+      await screen.findByText("Active Agents could not be loaded."),
+    ).toBeVisible();
+    expect(screen.queryByText("private directory failure")).not.toBeInTheDocument();
+
+    directoryMode = "empty";
+    await user.selectOptions(projectPicker, "");
+    await user.selectOptions(projectPicker, String(projectOne.id));
+    expect(
+      await screen.findByText("No active Agents are available in this project."),
+    ).toBeVisible();
+  });
+
+  it("ignores an aborted Agent settings directory request", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/mail/#agents");
+    let agentRequests = 0;
+    const originalFetch = globalThis.fetch.bind(globalThis);
+    vi.stubGlobal(
+      "fetch",
+      (input: RequestInfo | URL, init?: RequestInit) => {
+        const requestUrl =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url;
+        if (
+          requestUrl.endsWith(
+            `/mail/api/v1/projects/${projectOne.id}/agents?purpose=profile`,
+          )
+        ) {
+          agentRequests += 1;
+          return Promise.reject(new DOMException("aborted", "AbortError"));
+        }
+        return originalFetch(input, init);
+      },
+    );
+
+    render(<App />);
+    await waitForEnglishPreferences();
+    await user.selectOptions(
+      screen.getByLabelText("Project"),
+      String(projectOne.id),
+    );
+    await waitFor(() => expect(agentRequests).toBe(1));
+    expect(screen.getByText("Loading active Agents…")).toBeVisible();
+    expect(screen.queryByText(/Active Agents could not be loaded/)).not.toBeInTheDocument();
+  });
+
+  it.each(["resolve", "reject"] as const)(
+    "ignores a stale Agent settings directory %s after switching projects",
+    async (outcome) => {
+      const user = userEvent.setup();
+      window.history.replaceState({}, "", "/mail/#agents");
+      const activeProjectTwo = {
+        ...projectTwo,
+        archived_at: null,
+        role: "operator" as const,
+        can_reply: true,
+      };
+      let oldRequests = 0;
+      let resolveOld: (response: Response) => void = () => undefined;
+      let rejectOld: (reason: unknown) => void = () => undefined;
+      const oldDirectory = new Promise<Response>((resolve, reject) => {
+        resolveOld = resolve;
+        rejectOld = reject;
+      });
+      const originalFetch = globalThis.fetch.bind(globalThis);
+      vi.stubGlobal(
+        "fetch",
+        (input: RequestInfo | URL, init?: RequestInit) => {
+          const requestUrl =
+            typeof input === "string"
+              ? input
+              : input instanceof URL
+                ? input.href
+                : input.url;
+          if (
+            requestUrl.endsWith(
+              `/mail/api/v1/projects/${projectOne.id}/agents?purpose=profile`,
+            )
+          ) {
+            oldRequests += 1;
+            return oldDirectory;
+          }
+          return originalFetch(input, init);
+        },
+      );
+      server.use(
+        http.get("*/mail/api/v1/projects", () =>
+          HttpResponse.json({ items: [projectOne, activeProjectTwo], total: 2 }),
+        ),
+      );
+
+      render(<App />);
+      await waitForEnglishPreferences();
+      const projectPicker = screen.getByLabelText("Project");
+      await user.selectOptions(projectPicker, String(projectOne.id));
+      await waitFor(() => expect(oldRequests).toBe(1));
+      await user.selectOptions(projectPicker, String(activeProjectTwo.id));
+      expect(await screen.findByLabelText("Canonical agent_name")).toHaveValue(
+        "BlueLake",
+      );
+
+      await act(async () => {
+        if (outcome === "resolve") {
+          resolveOld(
+            new Response(
+              JSON.stringify({
+                project_id: projectOne.id,
+                project_generation: "a".repeat(64),
+                items: [
+                  {
+                    agent_id: 999,
+                    agent_generation: "b".repeat(64),
+                    name: "OldOnly",
+                    display_name: null,
+                    notify_sound: null,
+                  },
+                ],
+                total: 1,
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            ),
+          );
+        } else {
+          rejectOld(new TypeError("late old-directory failure"));
+        }
+        await Promise.resolve();
+      });
+      expect(screen.queryByDisplayValue("OldOnly")).not.toBeInTheDocument();
+      expect(screen.getByLabelText("Canonical agent_name")).toHaveValue("BlueLake");
+    },
+  );
 
   it("composes an idempotent durable message from the administrator route", async () => {
     const user = userEvent.setup();

@@ -209,7 +209,7 @@ am_norm_path() {
 # Portable, bounded state-file component.  The readable prefix helps operators
 # inspect state by hand; the digest preserves the full input so truncation and
 # separator mapping cannot make two projects/sessions share a file.
-am_sha256() {
+am_sha256_full() {
     local digest
     if command -v sha256sum >/dev/null 2>&1; then
         digest="$(sha256sum 2>/dev/null | awk '{print $1}')"
@@ -225,7 +225,13 @@ am_sha256() {
     fi
     case "$digest" in ''|*[!0-9A-Fa-f]*) return 1 ;; esac
     [ "${#digest}" -eq 64 ] || return 1
-    printf '%s' "$(printf '%s' "$digest" | tr '[:upper:]' '[:lower:]' | cut -c1-32)"
+    printf '%s' "$digest" | tr '[:upper:]' '[:lower:]'
+}
+
+am_sha256() {
+    local digest
+    digest="$(am_sha256_full)" || return 1
+    printf '%s' "$digest" | cut -c1-32
 }
 
 am_state_component() {
@@ -1301,6 +1307,230 @@ am_ensure_agent_credential() {
     printf '%s' "$got_token"
 }
 
+# One durable journal per project+Agent closes the remote-DB/local-file gap in
+# registration-token rotation. The replacement exists here before the RPC, so a
+# lost response can retry the same compare-and-swap instead of orphaning the
+# mailbox. A completed journal is rewritten to `idle` without either secret.
+am_registration_rotation_state_file() {
+    local key
+    key="$(am_state_component "${1}|${2}")" || return 1
+    printf '%s/credential-rotations/%s.json' "$AM_STATE_DIR" "$key"
+}
+
+am_registration_rotation_state_put() {
+    local state_file="$1" project="$2" agent="$3" status="$4"
+    local expected_fingerprint="${5:-}" candidate="${6:-}" next rc=1
+    case "$status" in pending|idle) ;; *) return 1 ;; esac
+    mkdir -p "$(dirname "$state_file")" 2>/dev/null || return 1
+    chmod 700 "$(dirname "$state_file")" 2>/dev/null
+    # A stable .next path is safe because the caller holds the per-identity
+    # registration lock. It also bounds crash residue without deleting files.
+    next="${state_file}.next"
+    if [ "$status" = "pending" ]; then
+        [ -n "$expected_fingerprint" ] && [ -n "$candidate" ] || return 1
+        if AGENT_MAIL_JQ_NEW_REGISTRATION_TOKEN="$candidate" jq -nc \
+            --arg project "$project" --arg agent "$agent" \
+            --arg expected "$expected_fingerprint" \
+            '{version:1,status:"pending",project:$project,agent:$agent,
+              expected_registration_token_sha256:$expected,
+              new_registration_token:env.AGENT_MAIL_JQ_NEW_REGISTRATION_TOKEN}' \
+            > "$next" 2>/dev/null; then
+            rc=0
+        fi
+    elif jq -nc --arg project "$project" --arg agent "$agent" \
+        '{version:1,status:"idle",project:$project,agent:$agent}' \
+        > "$next" 2>/dev/null; then
+        rc=0
+    fi
+    if [ "$rc" -eq 0 ]; then
+        chmod 600 "$next" 2>/dev/null || rc=1
+    fi
+    if [ "$rc" -eq 0 ]; then
+        mv -f "$next" "$state_file" 2>/dev/null || rc=1
+    fi
+    return "$rc"
+}
+
+am_registration_token_verify() {
+    local project="$1" agent="$2" token="$3" args
+    args="$(AGENT_MAIL_JQ_REGISTRATION_TOKEN="$token" jq -nc \
+        --arg project "$project" --arg agent "$agent" \
+        '{project_key:$project,agent_name:$agent,
+          registration_token:env.AGENT_MAIL_JQ_REGISTRATION_TOKEN,
+          include_recent_commits:false}')" || return 1
+    am_call whois "$args" >/dev/null
+}
+
+am_registration_token_rotate_and_persist() {
+    local project="$1" agent="$2" key lock_dir state_file state status
+    local observed_token observed_fingerprint current_token current_fingerprint
+    local expected_fingerprint candidate candidate_fingerprint args response rc
+    [ -n "$project" ] && [ -n "$agent" ] || return 1
+    observed_token="$(am_cred_get "$project" "$agent")"
+    observed_fingerprint=""
+    if [ -n "$observed_token" ]; then
+        observed_fingerprint="$(printf '%s' "$observed_token" | am_sha256_full)" \
+            || observed_fingerprint=""
+    fi
+    key="$(am_state_component "${project}|${agent}")" || return 1
+    lock_dir="${AM_STATE_DIR}/registration/${key}.lock"
+    state_file="$(am_registration_rotation_state_file "$project" "$agent")" \
+        || return 1
+    am_lock_acquire "$lock_dir" || {
+        printf 'Agent Mail: could not lock this Agent for credential rotation.\n' >&2
+        return 1
+    }
+
+    current_token="$(am_cred_get "$project" "$agent")"
+    if [ -z "$current_token" ]; then
+        printf 'Agent Mail: no private registration credential exists for this Agent; onboard it first.\n' >&2
+        am_lock_release "$lock_dir"
+        return 1
+    fi
+    current_fingerprint="$(printf '%s' "$current_token" | am_sha256_full)" || {
+        printf 'Agent Mail: could not fingerprint the private registration credential.\n' >&2
+        am_lock_release "$lock_dir"
+        return 1
+    }
+
+    state="$(cat "$state_file" 2>/dev/null)"
+    if [ -n "$state" ]; then
+        if ! printf '%s' "$state" | jq -e --arg project "$project" --arg agent "$agent" \
+            'type == "object" and .version == 1 and
+             .project == $project and .agent == $agent and
+             (.status == "pending" or .status == "idle")' \
+            >/dev/null 2>&1; then
+            printf 'Agent Mail: credential-rotation journal is invalid; refusing to overwrite it.\n' >&2
+            am_lock_release "$lock_dir"
+            return 1
+        fi
+        status="$(printf '%s' "$state" | jq -r '.status')"
+    elif [ -e "$state_file" ]; then
+        printf 'Agent Mail: credential-rotation journal is empty or unreadable; refusing to overwrite it.\n' >&2
+        am_lock_release "$lock_dir"
+        return 1
+    else
+        status="idle"
+    fi
+
+    if [ "$status" = "pending" ]; then
+        expected_fingerprint="$(printf '%s' "$state" | jq -r \
+            '.expected_registration_token_sha256 // empty')"
+        candidate="$(printf '%s' "$state" | jq -r \
+            '.new_registration_token // empty')"
+        case "$expected_fingerprint" in
+            *[!0-9a-f]*|'') expected_fingerprint="" ;;
+        esac
+        case "$candidate" in *[!0-9a-f]*|'') candidate="" ;; esac
+        if [ "${#expected_fingerprint}" -ne 64 ] || [ "${#candidate}" -ne 64 ]; then
+            printf 'Agent Mail: credential-rotation journal is incomplete; refusing to guess.\n' >&2
+            am_lock_release "$lock_dir"
+            return 1
+        fi
+        candidate_fingerprint="$(printf '%s' "$candidate" | am_sha256_full)" || {
+            am_lock_release "$lock_dir"
+            return 1
+        }
+        if [ "$current_fingerprint" = "$candidate_fingerprint" ]; then
+            if ! am_registration_token_verify "$project" "$agent" "$current_token" \
+                || ! am_registration_rotation_state_put \
+                    "$state_file" "$project" "$agent" idle; then
+                printf 'Agent Mail: rotated credential is stored but verification is incomplete; rerun rotate-token.\n' >&2
+                am_lock_release "$lock_dir"
+                return 1
+            fi
+            am_lock_release "$lock_dir"
+            return 0
+        fi
+        if [ "$current_fingerprint" != "$expected_fingerprint" ]; then
+            printf 'Agent Mail: private credential no longer matches the pending rotation; refusing to overwrite it.\n' >&2
+            am_lock_release "$lock_dir"
+            return 1
+        fi
+    else
+        # Two commands launched together both observe the old credential before
+        # the lock. The waiter sees the winner's new credential after acquiring
+        # it and treats that completed rotation as its own success, instead of
+        # rotating a second time.
+        if [ -n "$observed_fingerprint" ] \
+            && [ "$observed_fingerprint" != "$current_fingerprint" ]; then
+            if am_registration_token_verify "$project" "$agent" "$current_token"; then
+                am_lock_release "$lock_dir"
+                return 0
+            fi
+            printf 'Agent Mail: another rotation changed the local credential, but verification failed.\n' >&2
+            am_lock_release "$lock_dir"
+            return 1
+        fi
+        candidate="$(am_capability_token_generate)" || {
+            printf 'Agent Mail: secure registration-token generation failed.\n' >&2
+            am_lock_release "$lock_dir"
+            return 1
+        }
+        candidate_fingerprint="$(printf '%s' "$candidate" | am_sha256_full)" || {
+            am_lock_release "$lock_dir"
+            return 1
+        }
+        if [ "$candidate_fingerprint" = "$current_fingerprint" ]; then
+            printf 'Agent Mail: secure registration-token generation repeated the current credential; retry.\n' >&2
+            am_lock_release "$lock_dir"
+            return 1
+        fi
+        expected_fingerprint="$current_fingerprint"
+        if ! am_registration_rotation_state_put "$state_file" "$project" "$agent" \
+            pending "$expected_fingerprint" "$candidate"; then
+            printf 'Agent Mail: could not durably journal the replacement credential; no server call was made.\n' >&2
+            am_lock_release "$lock_dir"
+            return 1
+        fi
+    fi
+
+    args="$(AGENT_MAIL_JQ_REGISTRATION_TOKEN="$current_token" \
+        AGENT_MAIL_JQ_NEW_REGISTRATION_TOKEN="$candidate" jq -nc \
+        --arg project "$project" --arg agent "$agent" \
+        '{project_key:$project,agent_name:$agent,
+          registration_token:env.AGENT_MAIL_JQ_REGISTRATION_TOKEN,
+          new_registration_token:env.AGENT_MAIL_JQ_NEW_REGISTRATION_TOKEN}')" || {
+        am_lock_release "$lock_dir"
+        return 1
+    }
+    response="$(am_call rotate_registration_token "$args")"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        printf 'Agent Mail: credential rotation did not complete; rerun rotate-token to recover the journaled request.\n' >&2
+        am_lock_release "$lock_dir"
+        return 1
+    fi
+    if ! printf '%s' "$response" | jq -e --arg project "$project" --arg agent "$agent" \
+        'type == "object" and .project == $project and .agent == $agent and
+         ((.rotated == true and .already_current == false) or
+          (.rotated == false and .already_current == true)) and
+         (has("registration_token") | not) and
+         (has("new_registration_token") | not)' >/dev/null 2>&1; then
+        printf 'Agent Mail: rotation response was incomplete; rerun rotate-token to recover safely.\n' >&2
+        am_lock_release "$lock_dir"
+        return 1
+    fi
+    if ! am_cred_put "$project" "$agent" "$candidate"; then
+        printf 'Agent Mail: server rotation committed, but the private credential store was not updated; rerun rotate-token.\n' >&2
+        am_lock_release "$lock_dir"
+        return 1
+    fi
+    if ! am_registration_token_verify "$project" "$agent" "$candidate"; then
+        printf 'Agent Mail: replacement was stored, but fresh stateless verification failed; rerun rotate-token.\n' >&2
+        am_lock_release "$lock_dir"
+        return 1
+    fi
+    if ! am_registration_rotation_state_put \
+        "$state_file" "$project" "$agent" idle; then
+        printf 'Agent Mail: rotation succeeded, but journal finalization failed; rerun rotate-token.\n' >&2
+        am_lock_release "$lock_dir"
+        return 1
+    fi
+    am_lock_release "$lock_dir"
+    return 0
+}
+
 # --- execution lifecycle -----------------------------------------------------
 # Agent is the durable mailbox.  A CLI session or native subagent is an
 # AgentExecution beneath that mailbox, and reservations belong to that
@@ -2064,7 +2294,7 @@ am_execution_marker_publish_active() {
     return "$rc"
 }
 
-am_execution_token_generate() {
+am_capability_token_generate() {
     local token=""
     [ -r /dev/urandom ] || return 1
     token="$(LC_ALL=C od -An -N32 -tx1 /dev/urandom 2>/dev/null \
@@ -2149,8 +2379,8 @@ am_execution_start() {
     fi
 
     # Any persisted lifecycle state without its original capability is not
-    # recoverable by minting a replacement token: the server intentionally
-    # rejects token rotation. This includes `starting` and `end_requested`,
+    # recoverable by minting a replacement token: AgentExecution capabilities
+    # intentionally cannot be rotated. This includes `starting` and `end_requested`,
     # because either may already refer to a committed server execution whose
     # response was lost. Fail closed for guard self-suppression and require a
     # fresh provider lifecycle instead.
@@ -2199,7 +2429,7 @@ am_execution_start() {
         else
             external_id="$native_id"
         fi
-        execution_token="$(am_execution_token_generate)" || {
+        execution_token="$(am_capability_token_generate)" || {
             am_lock_release "$lock_dir"
             return 1
         }

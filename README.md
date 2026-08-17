@@ -99,11 +99,37 @@ rerun onboarding with `--local-marker`: it writes the exact server-returned
 `projects mark-identity` for onboarding: in directory identity mode it can
 derive a different path hash on every host.
 
-Authentication binding is per MCP session. After a CLI restart the first
-authenticated tool call must establish the binding; later calls in that same
-session inherit it. Lifecycle hooks and the onboarding/doctor command read the
-credential privately, while an ordinary MCP tool session remains a separate
-transport.
+Authentication binding is per MCP session. In a fresh ordinary MCP session,
+the first protected tool call must explicitly supply `registration_token`;
+later calls in that same session may omit it and inherit the binding. Lifecycle
+hooks and the onboarding/setup commands are a separate transport: their private
+credential access does not pre-authenticate the ordinary MCP session.
+
+### Rotate a mailbox credential safely
+
+Use the installed setup script, not a hand-written MCP call, so the replacement
+cannot be lost between the server commit and the local credential write:
+
+```bash
+agent_mail_setup.sh rotate-token <client> <slot> [--project-key /owner/repo]
+```
+
+For example, Codex uses `rotate-token codex ${AGENT_MAIL_CODEX_SLOT:-1}`. The
+command reads the old value with
+`am_cred_get`, generates and durably journals a replacement under the private
+`AGENT_MAIL_STATE_DIR`, calls the server, persists with `am_cred_put`, then
+verifies the new credential through a fresh stateless `whois`. It never puts a
+secret in stdout, stderr, or the curl argument list. Restart or resume the CLI
+afterward so it opens a new MCP session.
+
+The underlying clean-break MCP contract is `rotate_registration_token(project_key, agent_name, registration_token, new_registration_token)`.
+The SQLite transaction compares the old token and writes the caller-generated
+new token atomically. Its result is only
+`{agent, project, rotated, already_current}` — it never returns a credential.
+Retrying the same old/new pair after a lost response returns
+`already_current=true`; the client can then finish its local persist and
+verification. Two competing rotations have one CAS winner, and a committed
+rotation invalidates existing Agent and implicit-execution session bindings.
 
 ## Licence — read before redistributing
 
@@ -1879,11 +1905,12 @@ Messages are GitHub-Flavored Markdown with JSON frontmatter (fenced by `---json`
 1) Create an identity
 
 - `register_agent(project_key, program, model, name, task_description?)` → creates/updates a durable `client-os-host-slot` mailbox, persists its profile to Git, and commits.
+- `rotate_registration_token(project_key, agent_name, registration_token, new_registration_token)` → atomically replaces the exact current credential, returns no secret, and revokes old session bindings; use the journaled `agent_mail_setup.sh rotate-token` client flow.
 - `start_agent_execution(...)` → creates one root-session or native-subagent lifetime beneath that mailbox; heartbeat/end keep execution-owned reservations and build slots scoped to the correct lifetime.
 
 2) Send a message
 
-- `send_message(project_key, sender_name, to[], subject, body_md, idempotency_key, cc?, bcc?, importance?, ack_required?, thread_id?, auto_contact_if_blocked?)`
+- `send_message(project_key, sender_name, to[], subject, body_md, idempotency_key, cc?, bcc?, importance?, ack_required?, thread_id?, auto_contact_if_blocked?, registration_token?)`
 - Publishes an immutable delivery request and canonical Markdown message, then commits its Git artifacts atomically. Retry only with the same idempotency key and canonical payload.
 - `attachment_paths` and `convert_images` currently fail closed with `ATTACHMENTS_NOT_SUPPORTED`; do not send local paths or arbitrary attachment bytes.
 
@@ -1936,7 +1963,7 @@ sequenceDiagram
 
 - `search_messages(project_key, query, limit?)` uses FTS5 over subject and body.
 - `summarize_thread(project_key, thread_id, include_examples?)` extracts key points, actions, and participants from the thread.
-- `reply_message(project_key, message_id, sender_name, body_md, idempotency_key, ..., sender_token?)` creates a subject-prefixed idempotent reply, preserving or creating a thread.
+- `reply_message(project_key, message_id, sender_name, body_md, idempotency_key, ..., registration_token?)` creates a subject-prefixed idempotent reply, preserving or creating a thread.
 
 ### Semantics & invariants
 
@@ -2622,6 +2649,7 @@ Output format (all tools/resources):
 | `register_agent` | `register_agent(project_key: str, program: str, model: str, name: str, task_description?: str, attachments_policy?: str, display_name?: str)` | Agent profile dict | Creates/updates one durable mailbox; creation generates an English display alias and project-local default sound, and issues a token exactly once |
 | `whois` | `whois(project_key: str, agent_name: str, include_recent_commits?: bool, commit_limit?: int)` | Agent profile dict | Enriched profile for one agent (optionally includes recent commits) |
 | `create_agent_identity` | `create_agent_identity(project_key: str, program: str, model: str, name_hint: str, task_description?: str, attachments_policy?: str, display_name?: str)` | Agent profile dict | Provisions one explicitly named durable mailbox with the same display defaults and returns its one-time credential; never use this for a subagent |
+| `rotate_registration_token` | `rotate_registration_token(project_key: str, agent_name: str, registration_token: str, new_registration_token: str)` | `{agent, project, rotated, already_current}` | SQLite CAS with idempotent replay and immediate session-binding revocation; never returns either credential. Use `agent_mail_setup.sh rotate-token` for crash-safe local persistence |
 | `set_agent_display_name` | `set_agent_display_name(project_key: str, agent_name: str, display_name?: str, registration_token?: str)` | `{agent, display_name}` | Overrides or clears the human-readable alias; the canonical address never changes |
 | `set_agent_notify_sound` | `set_agent_notify_sound(project_key: str, agent_name: str, notify_sound?: str, registration_token?: str)` | `{agent, notify_sound, available}` | Overrides or clears one of the twelve closed, locally synthesized notification patterns |
 | `start_agent_execution` | `start_agent_execution(project_key, agent_name, external_id, client_name, execution_token, kind?, parent_execution_id?, parent_execution_token?, ...)` | AgentExecution dict | Starts or idempotently resumes a capability-bound root/session execution |
@@ -2633,8 +2661,8 @@ Output format (all tools/resources):
 | `sweep_stale_agents` | `sweep_stale_agents(project_key: str, agent_name: str, threshold_seconds?: int, require_no_active_reservations?: bool, registration_token?: str)` | `{project_key, requested_by, threshold_seconds, retired[], retired_agents[], count}` | Authenticated project-scoped retirement; caller is excluded and active reservations block retirement by default |
 | `archive_project` | `archive_project(project_key: str, registration_token?: str)` | `{status, project_key, slug}` | Reversibly hides a project from active listings; messages and audit history remain |
 | `unarchive_project` | `unarchive_project(project_key: str, registration_token?: str)` | `{status, project_key, slug}` | Restores an archived project after project-admin authentication |
-| `send_message` | `send_message(project_key: str, sender_name: str, to: list[str], subject: str, body_md: str, idempotency_key: str, cc?: list[str], bcc?: list[str], importance?: str, ack_required?: bool, thread_id?: str, auto_contact_if_blocked?: bool, sender_token?: str)` | `{deliveries: [{project, delivery, message?}], count: int}` | Publishes an idempotent atomic delivery; attachment inputs currently fail closed |
-| `reply_message` | `reply_message(project_key: str, message_id: int, sender_name: str, body_md: str, idempotency_key: str, to?: list[str], cc?: list[str], bcc?: list[str], subject_prefix?: str, sender_token?: str)` | `{thread_id, reply_to, deliveries: [{project, delivery, message?}], count: int}` | Publishes an idempotent reply and preserves/creates the thread |
+| `send_message` | `send_message(project_key: str, sender_name: str, to: list[str], subject: str, body_md: str, idempotency_key: str, cc?: list[str], bcc?: list[str], importance?: str, ack_required?: bool, thread_id?: str, auto_contact_if_blocked?: bool, registration_token?: str)` | `{deliveries: [{project, delivery, message?}], count: int}` | Publishes an idempotent atomic delivery; attachment inputs currently fail closed |
+| `reply_message` | `reply_message(project_key: str, message_id: int, sender_name: str, body_md: str, idempotency_key: str, to?: list[str], cc?: list[str], bcc?: list[str], subject_prefix?: str, registration_token?: str)` | `{thread_id, reply_to, deliveries: [{project, delivery, message?}], count: int}` | Publishes an idempotent reply and preserves/creates the thread |
 | `request_contact` | `request_contact(project_key: str, from_agent: str, to_agent: str, to_project?: str, reason?: str, ttl_seconds?: int, registration_token?: str)` | Contact link dict | Request permission to message another agent |
 | `respond_contact` | `respond_contact(project_key: str, to_agent: str, from_agent: str, accept: bool, from_project?: str, ttl_seconds?: int, registration_token?: str)` | Contact link dict | Approve or deny a contact request |
 | `list_contacts` | `list_contacts(project_key: str, agent_name: str, registration_token?: str)` | `list[dict]` | List outbound contact links with target-project and expiry audit metadata |

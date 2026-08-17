@@ -321,7 +321,7 @@ class TestDisasterRecoveryE2E:
                 {
                     "project_key": project_key,
                     "sender_name": agent1_name,
-                    "sender_token": agent1_token,
+                    "registration_token": agent1_token,
                     "to": [agent2_name, agent3_name],
                     "subject": "[DR-TEST] Initial planning message",
                     "body_md": "Starting the disaster recovery test scenario.",
@@ -338,7 +338,7 @@ class TestDisasterRecoveryE2E:
                     "project_key": project_key,
                     "message_id": thread_id,
                     "sender_name": agent2_name,
-                    "sender_token": agent2_token,
+                    "registration_token": agent2_token,
                     "body_md": "Acknowledged. Ready for testing.",
                     "idempotency_key": "disaster-recovery-reply",
                 },
@@ -380,7 +380,7 @@ class TestDisasterRecoveryE2E:
                     {
                         "project_key": project_key,
                         "sender_name": agent3_name,
-                        "sender_token": agent3_token,
+                        "registration_token": agent3_token,
                         "to": [agent1_name],
                         "subject": f"[DR-TEST] Progress update {i + 1}",
                         "body_md": f"Progress report #{i + 1} for disaster recovery test.",
@@ -722,7 +722,7 @@ class TestMultipleArchives:
                 {
                     "project_key": project_key,
                     "sender_name": agent_name,
-                    "sender_token": agent_token,
+                    "registration_token": agent_token,
                     "to": [agent_name],
                     "subject": "First message",
                     "body_md": "Initial state.",
@@ -734,7 +734,7 @@ class TestMultipleArchives:
                 {
                     "project_key": project_key,
                     "sender_name": agent_name,
-                    "sender_token": agent_token,
+                    "registration_token": agent_token,
                     "to": [agent_name],
                     "subject": "Second message",
                     "body_md": "Still first archive state.",
@@ -754,7 +754,7 @@ class TestMultipleArchives:
                 {
                     "project_key": project_key,
                     "sender_name": agent_name,
-                    "sender_token": agent_token,
+                    "registration_token": agent_token,
                     "to": [agent_name],
                     "subject": "Third message",
                     "body_md": "Second archive state.",

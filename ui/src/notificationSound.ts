@@ -101,6 +101,21 @@ export const tones = {
   },
 } as const satisfies Record<string, Tone>;
 
+export type NotificationSoundName = keyof typeof tones;
+
+export const notificationSoundNames = Object.freeze(
+  Object.keys(tones) as NotificationSoundName[],
+);
+
+export function isNotificationSoundName(
+  value: unknown,
+): value is NotificationSoundName {
+  return (
+    typeof value === "string" &&
+    Object.prototype.hasOwnProperty.call(tones, value)
+  );
+}
+
 // Spelled out rather than read back from `tones`: the record is indexed by
 // arbitrary strings, so a lookup is `Tone | undefined` and the default must not
 // be.
@@ -208,6 +223,21 @@ export function playNotificationTone(
   if (!soundEnabled(storage)) {
     return;
   }
+  playTone(sound);
+}
+
+/**
+ * Preview a selected Agent tone from the settings button's user gesture.
+ *
+ * This deliberately does not alter or consult the independent global inbox
+ * sound preference. Auditioning one choice must never opt the reader into
+ * future notification audio.
+ */
+export function previewNotificationTone(sound: NotificationSoundName): void {
+  playTone(sound);
+}
+
+function playTone(sound?: string | null): void {
   const ctx = acquireContext();
   if (ctx === null) {
     return;

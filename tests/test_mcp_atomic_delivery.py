@@ -358,13 +358,13 @@ async def test_send_rejects_an_unauthenticated_sender_before_accepting_intent(
         await _register_open_agent(setup_client, project_key, ATOMIC_RECIPIENT)
 
     async with Client(server) as unbound_client:
-        with pytest.raises(Exception, match="Invalid sender_token"):
+        with pytest.raises(Exception, match="Invalid registration_token"):
             await unbound_client.call_tool(
                 "send_message",
                 {
                     "project_key": project_key,
                     "sender_name": ATOMIC_SENDER,
-                    "sender_token": "definitely-wrong",
+                    "registration_token": "definitely-wrong",
                     "to": [ATOMIC_RECIPIENT],
                     "subject": "unauthorized",
                     "body_md": "must not persist",
@@ -378,7 +378,7 @@ async def test_send_rejects_an_unauthenticated_sender_before_accepting_intent(
             {
                 "project_key": project_key,
                 "sender_name": ATOMIC_SENDER,
-                "sender_token": sender["registration_token"],
+                "registration_token": sender["registration_token"],
                 "to": [ATOMIC_RECIPIENT],
                 "subject": "authorized",
                 "body_md": "persist this",

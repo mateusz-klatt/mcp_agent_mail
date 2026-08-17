@@ -46,7 +46,18 @@ that renders these failures itself; it collapsed pydantic's two-line layout and 
 `test_agent_name_validation.py` on three platforms, which `9c8c4d1` fixed by restoring the layout
 while keeping the redaction. Verified on the deployed server: the call that leaked now answers
 `input=<redacted>` for the token while still showing a non-credential value, so the errors stayed
-useful. **What is not fixed is rotation** — see "Still open".
+useful.
+
+**Registration-token rotation is now a recoverable compare-and-swap, not a
+one-shot secret response.** The supported `agent_mail_setup.sh rotate-token`
+client generates and journals the replacement privately before the request,
+then sends the old and new values through stdin-backed JSON, persists with
+`am_cred_put`, and verifies through a fresh stateless `whois`. A lost response
+or failed local persist replays the same replacement idempotently. The SQLite
+write uses `BEGIN IMMEDIATE`, so two old-token rotations have one winner, and
+credential fingerprints revoke already-bound MCP sessions in every worker on
+their next protected call. Successful responses and the completed journal
+contain no secret.
 
 **`scripts/run_server_with_token.sh` could not start a server.** Upstream rewrote it to exec a Rust
 `am` binary; this fork builds no such binary (no `Cargo.toml`, no `rust/`), so it exited 1 on every
@@ -276,15 +287,6 @@ shells out to `uv build` with no equivalent guard -- so on a machine without
 files reservations looks dead after `FILE_RESERVATION_INACTIVITY_SECONDS` and
 has its holds swept. `register_agent` does not clear `retired_at` when an
 existing agent re-registers with a valid token.
-
-**A registration token cannot be rotated, and this now outranks the leak it
-follows.** Measured 2026-08-14: no rotation command in the CLI, nothing
-reachable in `src/`; `migrate-agent-state` moves a local credential key after a
-rename and `rename-agent` is offline and never calls MCP. The only way to a new
-token is abandoning the mailbox address the fleet routes to — identity
-migration, not rotation. Three agents were told to rotate before anyone checked
-it was possible. Redaction removes the cause going forward; there is still no
-remedy for a leak that already happened, so any exposure is permanent.
 
 **The Reservations view renders `expires_ts` raw** (`2026-08-14 20:41:21.000000`)
 where every other surface formats dates for humans. Cosmetic, visible in the

@@ -1551,7 +1551,7 @@
   "tests/test_messaging_semantics.py::test_send_message_keeps_db_invisible_when_archive_publish_is_pending": 8.49,
   "tests/test_messaging_semantics.py::test_send_message_rejects_expired_cross_project_approved_contact": 20.24,
   "tests/test_messaging_semantics.py::test_send_message_rejects_expired_local_approved_contact": 20.74,
-  "tests/test_messaging_semantics.py::test_send_message_requires_sender_token_across_sessions": 17.61,
+  "tests/test_messaging_semantics.py::test_a_second_session_cannot_send_as_an_agent_without_its_token": 17.61,
   "tests/test_mistake_detection.py::TestDetectAgentNameMistake::test_detects_broadcast": 0.01,
   "tests/test_mistake_detection.py::TestDetectAgentNameMistake::test_detects_descriptive_name": 0.01,
   "tests/test_mistake_detection.py::TestDetectAgentNameMistake::test_detects_email": 0.01,

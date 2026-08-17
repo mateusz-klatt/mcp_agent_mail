@@ -55,6 +55,7 @@ import {
   replyToMessage,
   replyIdempotencyKeyFor,
   retryDelivery,
+  saveAgentProfile,
   type DeliveryResult,
   type InboxMessage,
   type MailProject,
@@ -78,9 +79,12 @@ import {
   type MailUiPreferences,
 } from "./preferences";
 import {
+  notificationSoundNames,
   playNotificationTone,
+  previewNotificationTone,
   setSoundEnabled,
   soundEnabled,
+  type NotificationSoundName,
 } from "./notificationSound";
 import "./app.css";
 
@@ -515,6 +519,7 @@ function DeliveryConfirmation({
 type ShellRoute =
   | MailRoute
   | { view: "compose" }
+  | { view: "agents" }
   | { view: "account" }
   | { view: "admin" };
 type NavigationItem =
@@ -523,6 +528,7 @@ type NavigationItem =
   | "search"
   | "reservations"
   | "compose"
+  | "agents"
   | "account"
   | "admin";
 
@@ -530,6 +536,7 @@ function parseShellRoute(hash: string): ShellRoute {
   const normalized = hash.replace(/^#/, "");
   if (
     normalized === "compose" ||
+    normalized === "agents" ||
     normalized === "account" ||
     normalized === "admin"
   ) {
@@ -539,7 +546,10 @@ function parseShellRoute(hash: string): ShellRoute {
 }
 
 function shellRouteHash(route: ShellRoute): string {
-  return route.view === "compose" || route.view === "account" || route.view === "admin"
+  return route.view === "compose" ||
+    route.view === "agents" ||
+    route.view === "account" ||
+    route.view === "admin"
     ? `#${route.view}`
     : mailRouteHash(route);
 }
@@ -816,6 +826,22 @@ export function App({
   const [composeProjectId, setComposeProjectId] = useState("");
   const [composeRecipients, setComposeRecipients] = useState<string[]>([]);
   const [composeAgents, setComposeAgents] = useState<MailRecipientAgent[]>([]);
+  const [agentSettingsProjectId, setAgentSettingsProjectId] = useState("");
+  const [agentSettingsAgents, setAgentSettingsAgents] = useState<
+    MailRecipientAgent[]
+  >([]);
+  const [agentSettingsProjectGeneration, setAgentSettingsProjectGeneration] =
+    useState<string | null>(null);
+  const [agentSettingsStatus, setAgentSettingsStatus] =
+    useState<DetailStatus>("idle");
+  const [selectedAgentId, setSelectedAgentId] = useState("");
+  const [agentDisplayName, setAgentDisplayName] = useState("");
+  const [agentNotifySound, setAgentNotifySound] =
+    useState<NotificationSoundName>("chime");
+  const [agentMutationStatus, setAgentMutationStatus] =
+    useState<MutationStatus>("idle");
+  const [agentSettingsRefreshVersion, setAgentSettingsRefreshVersion] =
+    useState(0);
   const [reservations, setReservations] = useState<ReservationClaim[]>([]);
   const [reservationsCursor, setReservationsCursor] = useState<string | null>(null);
   const [reservationsStatus, setReservationsStatus] = useState<DetailStatus>("idle");
@@ -863,6 +889,7 @@ export function App({
   const searchRequestGenerationRef = useRef(0);
   const searchPaginationControllerRef = useRef<AbortController | null>(null);
   const composeAgentsRequestGenerationRef = useRef(0);
+  const agentSettingsRequestGenerationRef = useRef(0);
   const composeDirectoryReconcileRef = useRef(false);
   const composeDirectorySnapshotRef = useRef<{
     projectGeneration: string;
@@ -875,7 +902,8 @@ export function App({
     mailNavigation.some((item) => route.view === item) ||
     route.view === "message" ||
     route.view === "thread" ||
-    route.view === "compose";
+    route.view === "compose" ||
+    route.view === "agents";
   const routeProjectId =
     route.view === "inbox" ||
     route.view === "message" ||
@@ -1307,6 +1335,69 @@ export function App({
     route.view,
   ]);
 
+  useEffect(() => {
+    const requestGeneration = ++agentSettingsRequestGenerationRef.current;
+    if (route.view !== "agents" || agentSettingsProjectId === "") {
+      setAgentSettingsAgents([]);
+      setAgentSettingsProjectGeneration(null);
+      setAgentSettingsStatus("idle");
+      setSelectedAgentId("");
+      return undefined;
+    }
+    const controller = new AbortController();
+    const projectId = Number(agentSettingsProjectId);
+    setAgentSettingsStatus("loading");
+    void loadProjectAgents(projectId, {
+      signal: controller.signal,
+      purpose: "profile",
+    })
+      .then((page) => {
+        if (
+          requestGeneration !== agentSettingsRequestGenerationRef.current
+        ) {
+          return;
+        }
+        setAgentSettingsAgents(page.items);
+        setAgentSettingsProjectGeneration(page.project_generation);
+        setSelectedAgentId((current) =>
+          page.items.some((agent) => String(agent.agent_id) === current)
+            ? current
+            : String(page.items[0]?.agent_id ?? ""),
+        );
+        setAgentSettingsStatus("ready");
+      })
+      .catch((error: unknown) => {
+        if (
+          requestGeneration !== agentSettingsRequestGenerationRef.current
+        ) {
+          return;
+        }
+        const status = dataFailureStatus(error);
+        if (status !== null) {
+          setAgentSettingsStatus(status);
+        }
+      });
+    return () => controller.abort();
+  }, [
+    agentSettingsProjectId,
+    agentSettingsRefreshVersion,
+    dataFailureStatus,
+    route.view,
+  ]);
+
+  useEffect(() => {
+    const selectedAgent = agentSettingsAgents.find(
+      (agent) => String(agent.agent_id) === selectedAgentId,
+    );
+    if (selectedAgent === undefined) {
+      setAgentDisplayName("");
+      setAgentNotifySound("chime");
+      return;
+    }
+    setAgentDisplayName(selectedAgent.display_name ?? "");
+    setAgentNotifySound(selectedAgent.notify_sound ?? "chime");
+  }, [agentSettingsAgents, selectedAgentId]);
+
   useEffect(
     () => () => {
       paginationControllerRef.current?.abort();
@@ -1491,6 +1582,59 @@ export function App({
         }
       }
       setProfileMutationStatus("error");
+    }
+  };
+
+  const handleAgentProfileSubmit = async (
+    event: FormEvent<HTMLFormElement>,
+    selectedAgent: MailRecipientAgent,
+    projectId: number,
+    projectGeneration: string,
+  ) => {
+    event.preventDefault();
+    const requestedDisplayName =
+      agentDisplayName.trim() === "" ? null : agentDisplayName;
+    setAgentMutationStatus("saving");
+    try {
+      const result = await saveAgentProfile(
+        projectId,
+        selectedAgent.agent_id,
+        selectedAgent.name,
+        {
+          expected_project_generation: projectGeneration,
+          expected_agent_generation: selectedAgent.agent_generation,
+          expected_display_name: selectedAgent.display_name,
+          expected_notify_sound: selectedAgent.notify_sound,
+          display_name: requestedDisplayName,
+          notify_sound: agentNotifySound,
+        },
+      );
+      setAgentSettingsAgents((current) =>
+        current.map((agent) =>
+          agent.agent_id === result.agent_id &&
+          agent.agent_generation === result.agent_generation
+              ? {
+                  ...agent,
+                  display_name: result.display_name,
+                  notify_sound: result.notify_sound,
+                }
+            : agent,
+        ),
+      );
+      setAgentDisplayName(result.display_name ?? "");
+      setAgentNotifySound(result.notify_sound);
+      setAgentMutationStatus("saved");
+    } catch (error) {
+      if (error instanceof MailHttpError && error.status === 409) {
+        setAgentMutationStatus("conflict");
+        setAgentSettingsRefreshVersion((version) => version + 1);
+        return;
+      }
+      const status = dataFailureStatus(error);
+      if (status === "unauthorized") {
+        setAgentSettingsStatus(status);
+      }
+      setAgentMutationStatus("error");
     }
   };
 
@@ -1981,6 +2125,12 @@ export function App({
       projects.some((project) => project.role !== "viewer")
         ? (["compose"] as const)
         : []),
+      // Presentation settings use the same project-scoped operate capability
+      // as composing into that Agent's project.
+      ...(profile?.global_role === "admin" ||
+      projects.some((project) => project.role !== "viewer")
+        ? (["agents"] as const)
+        : []),
       "account",
       ...(profile?.global_role === "admin" ? (["admin"] as const) : []),
     ],
@@ -2021,6 +2171,13 @@ export function App({
     saved: "admin.saved",
     conflict: "admin.conflict",
     error: "admin.saveError",
+  };
+  const agentMutationMessage: Record<MutationStatus, string | null> = {
+    idle: null,
+    saving: "agents.saving",
+    saved: "agents.saved",
+    conflict: "agents.conflict",
+    error: "agents.saveError",
   };
 
   const formatDate = (timestamp: string) =>
@@ -2093,6 +2250,227 @@ export function App({
           </button>
         ) : null}
       </div>
+    );
+  };
+
+  const renderAgentSettings = () => {
+    const profileIsAdmin = profile?.global_role === "admin";
+    const activeProjects = projects.filter(
+      (project) =>
+        project.archived_at === null &&
+        (profileIsAdmin || project.role !== "viewer"),
+    );
+    const canManageAgents =
+      profileIsAdmin || projects.some((project) => project.role !== "viewer");
+    const selectedAgent = agentSettingsAgents.find(
+      (agent) => String(agent.agent_id) === selectedAgentId,
+    );
+    const saving = agentMutationStatus === "saving";
+    return (
+      <section aria-labelledby="agents-heading">
+        <div className="page-heading">
+          <div>
+            <p className="eyebrow">{t("agents.eyebrow")}</p>
+            <h1 id="agents-heading">{t("agents.title")}</h1>
+            <p>{t("agents.hint")}</p>
+          </div>
+        </div>
+        {profileStatus === "loading" || projectsStatus === "loading" ? (
+          <p className="state-panel" role="status">{t("agents.loading")}</p>
+        ) : null}
+        {profileStatus === "error" || projectsStatus === "error" ? (
+          <p className="state-panel state-error" role="alert">
+            {t("agents.loadError")}
+          </p>
+        ) : null}
+        {profileStatus === "ready" &&
+        projectsStatus === "ready" &&
+        !canManageAgents ? (
+          <p className="state-panel state-error" role="alert">
+            {t("agents.forbidden")}
+          </p>
+        ) : null}
+        {profileStatus === "ready" &&
+        projectsStatus === "ready" &&
+        canManageAgents ? (
+          activeProjects.length === 0 ? (
+            <p className="state-panel">{t("agents.noProjects")}</p>
+          ) : (
+            <div className="settings-grid">
+              <section
+                className="settings-card"
+                aria-labelledby="agent-settings-heading"
+              >
+                <h2 id="agent-settings-heading">{t("agents.settingsTitle")}</h2>
+                <div className="settings-form">
+                  <label htmlFor="agent-settings-project">
+                    {t("agents.project")}
+                  </label>
+                  <select
+                    id="agent-settings-project"
+                    name="agent-settings-project"
+                    value={agentSettingsProjectId}
+                    onChange={(event) => {
+                      setAgentSettingsProjectId(event.target.value);
+                      setSelectedAgentId("");
+                      setAgentMutationStatus("idle");
+                    }}
+                    disabled={saving}
+                  >
+                    <option value="">{t("agents.chooseProject")}</option>
+                    {activeProjects.map((project) => (
+                      <option key={project.id} value={project.id}>
+                        {project.human_key}
+                      </option>
+                    ))}
+                  </select>
+                  {agentSettingsStatus === "loading" ? (
+                    <p className="form-status" role="status">
+                      {t("agents.loadingAgents")}
+                    </p>
+                  ) : null}
+                  {agentSettingsStatus === "error" ||
+                  agentSettingsStatus === "unauthorized" ? (
+                    <p className="form-status state-error" role="alert">
+                      {t("agents.agentsLoadError")}
+                    </p>
+                  ) : null}
+                  {agentSettingsStatus === "ready" &&
+                  agentSettingsAgents.length === 0 ? (
+                    <p className="form-status">{t("agents.noAgents")}</p>
+                  ) : null}
+                  {agentSettingsStatus === "ready" &&
+                  agentSettingsAgents.length > 0 ? (
+                    <>
+                      <label htmlFor="agent-settings-agent">
+                        {t("agents.agent")}
+                      </label>
+                      <select
+                        id="agent-settings-agent"
+                        name="agent-settings-agent"
+                        value={selectedAgentId}
+                        onChange={(event) => {
+                          setSelectedAgentId(event.target.value);
+                          setAgentMutationStatus("idle");
+                        }}
+                        disabled={saving}
+                      >
+                        {agentSettingsAgents.map((agent) => (
+                          <option key={recipientSelectionKey(agent)} value={agent.agent_id}>
+                            {agent.display_name === null
+                              ? agent.name
+                              : `${agent.display_name} (${agent.name})`}
+                          </option>
+                        ))}
+                      </select>
+                    </>
+                  ) : null}
+                </div>
+                {selectedAgent !== undefined &&
+                agentSettingsProjectGeneration !== null ? (
+                  <form
+                    className="settings-form"
+                    onSubmit={(event) =>
+                      void handleAgentProfileSubmit(
+                        event,
+                        selectedAgent,
+                        Number(agentSettingsProjectId),
+                        agentSettingsProjectGeneration,
+                      )
+                    }
+                  >
+                    <label htmlFor="agent-canonical-name">
+                      {t("agents.canonicalName")}
+                    </label>
+                    <input
+                      id="agent-canonical-name"
+                      name="agent-canonical-name"
+                      value={selectedAgent.name}
+                      readOnly
+                      aria-describedby="agent-canonical-name-hint"
+                    />
+                    <small id="agent-canonical-name-hint">
+                      {t("agents.canonicalNameHint")}
+                    </small>
+                    <label htmlFor="agent-display-name">
+                      {t("agents.displayName")}
+                    </label>
+                    <input
+                      id="agent-display-name"
+                      name="agent-display-name"
+                      value={agentDisplayName}
+                      maxLength={128}
+                      onChange={(event) => {
+                        setAgentDisplayName(event.target.value);
+                        setAgentMutationStatus("idle");
+                      }}
+                      aria-describedby="agent-display-name-hint agent-profile-status"
+                      disabled={saving}
+                    />
+                    <small id="agent-display-name-hint">
+                      {t("agents.displayNameHint")}
+                    </small>
+                    <label htmlFor="agent-notify-sound">
+                      {t("agents.notifySound")}
+                    </label>
+                    <select
+                      id="agent-notify-sound"
+                      name="agent-notify-sound"
+                      value={agentNotifySound}
+                      onChange={(event) => {
+                        setAgentNotifySound(
+                          event.target.value as NotificationSoundName,
+                        );
+                        setAgentMutationStatus("idle");
+                      }}
+                      aria-describedby="agent-notify-sound-hint agent-sound-preview-hint"
+                      disabled={saving}
+                    >
+                      {notificationSoundNames.map((sound) => (
+                        <option key={sound} value={sound}>
+                          {sound}
+                        </option>
+                      ))}
+                    </select>
+                    <small id="agent-notify-sound-hint">
+                      {t("agents.notifySoundHint")}
+                    </small>
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => previewNotificationTone(agentNotifySound)}
+                      disabled={saving}
+                    >
+                      {t("agents.previewSound")}
+                    </button>
+                    <small id="agent-sound-preview-hint">
+                      {t("agents.previewSoundHint")}
+                    </small>
+                    <button
+                      className="primary-button"
+                      type="submit"
+                      disabled={saving}
+                    >
+                      {t("agents.save")}
+                    </button>
+                    <p
+                      id="agent-profile-status"
+                      className="form-status"
+                      role="status"
+                      aria-live="polite"
+                      data-state={agentMutationStatus}
+                    >
+                      {agentMutationMessage[agentMutationStatus] === null
+                        ? ""
+                        : t(agentMutationMessage[agentMutationStatus])}
+                    </p>
+                  </form>
+                ) : null}
+              </section>
+            </div>
+          )
+        ) : null}
+      </section>
     );
   };
 
@@ -3548,6 +3926,7 @@ export function App({
           {route.view === "search" ? renderSearch(route) : null}
           {route.view === "reservations" ? renderReservations() : null}
           {route.view === "compose" ? renderCompose() : null}
+          {route.view === "agents" ? renderAgentSettings() : null}
           {route.view === "message"
             ? renderMessage(route.projectId, route.messageId)
             : null}

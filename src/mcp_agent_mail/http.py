@@ -42,7 +42,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from git import NULL_TREE
 from markupsafe import Markup, escape as escape_markup
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, SecretStr, field_validator
 from sqlalchemy import select, text, update
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -52,11 +52,13 @@ from starlette.types import Receive, Scope, Send
 
 from . import webauth
 from .app import (
+    NOTIFY_SOUND_NAMES,
     _agent_to_dict,
     _expire_stale_file_reservations,
     _format_cross_project_agent_address,
     _reconcile_pending_file_reservation_artifacts,
     _revalidate_agent_lifetime_in_session,
+    _sanitize_display_name_argument,
     _sender_display_name,
     _tool_metrics_snapshot,
     build_mcp_server,
@@ -1660,6 +1662,9 @@ _MAIL_API_COMPOSE_SHAPE_RE = re.compile(
 _MAIL_API_AGENT_DIRECTORY_SHAPE_RE = re.compile(
     r"^/mail/api/v1/projects/[^/]+/agents$"
 )
+_MAIL_API_AGENT_PROFILE_SHAPE_RE = re.compile(
+    r"^/mail/api/v1/projects/[^/]+/agents/[^/]+/profile$"
+)
 _MAIL_API_DELIVERY_SHAPE_RE = re.compile(
     r"^/mail/api/v1/deliveries/[^/]+(?:/retry)?$"
 )
@@ -1733,6 +1738,7 @@ MailUiProjectRole = Literal["admin", "viewer", "operator"]
 MailUiImportance = Literal["low", "normal", "high", "urgent"]
 MailUiSearchScope = Literal["all", "subject", "body"]
 MailUiSearchOrder = Literal["relevance", "newest"]
+MailUiAgentDirectoryPurpose = Literal["addressable", "profile"]
 
 
 class _MailUiLegacyBookmark(TypedDict):
@@ -1916,6 +1922,7 @@ def _mail_ui_uses_typed_domain_errors(path: str) -> bool:
         }
         or path.startswith("/mail/api/v1/admin/users/")
         or bool(_MAIL_API_AGENT_DIRECTORY_SHAPE_RE.fullmatch(path))
+        or bool(_MAIL_API_AGENT_PROFILE_SHAPE_RE.fullmatch(path))
         or bool(_MAIL_API_DELIVERY_SHAPE_RE.fullmatch(path))
         or bool(_MAIL_API_COMPOSE_SHAPE_RE.fullmatch(path))
         or bool(_MAIL_API_REPLY_SHAPE_RE.fullmatch(path))
@@ -2254,8 +2261,26 @@ class MailUiProjectsResponse(BaseModel):
     total: int
 
 
+def _mail_ui_notify_sound_word(value: str) -> str:
+    """Validate the one sound vocabulary shared with Agent provisioning."""
+    if value not in NOTIFY_SOUND_NAMES:
+        raise ValueError("unknown Agent notification sound")
+    return value
+
+
+MailUiNotifySound = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=32,
+        json_schema_extra={"enum": list(NOTIFY_SOUND_NAMES)},
+    ),
+    AfterValidator(_mail_ui_notify_sound_word),
+]
+
+
 class MailUiAgentDirectoryItem(BaseModel):
-    """One active agent identity that can receive an administrator message."""
+    """One active Agent identity selected for the requested directory purpose."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2268,12 +2293,38 @@ class MailUiAgentDirectoryItem(BaseModel):
     # tone locally. Nothing here may become a request to a host a colleague
     # chose — that was the rule when the server-rendered UI grew this, and it
     # survives the move to the React client unchanged.
-    notify_sound: str | None = None
+    notify_sound: MailUiNotifySound | None = None
 
 
 MailUiReservationScopeState = Literal[
     "execution_scoped", "legacy_unscoped", "orphaned"
 ]
+
+
+class MailUiAgentProfilePatch(BaseModel):
+    """CAS inputs for an operator-managed Agent presentation profile."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_project_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_agent_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_display_name: str | None = Field(max_length=128)
+    expected_notify_sound: MailUiNotifySound | None
+    display_name: str | None = Field(max_length=1024)
+    notify_sound: MailUiNotifySound
+
+
+class MailUiAgentProfileMutationResponse(BaseModel):
+    """The updated Agent presentation profile and canonical identity."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    changed: bool
+    agent_id: int = Field(gt=0)
+    agent_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    agent_name: str = Field(min_length=1, max_length=128)
+    display_name: str | None
+    notify_sound: MailUiNotifySound
 
 
 class MailUiReservationItem(BaseModel):
@@ -2317,7 +2368,7 @@ class MailUiReservationsResponse(BaseModel):
 
 
 class MailUiProjectAgentsResponse(BaseModel):
-    """Privacy-minimal recipient directory for one active project."""
+    """Privacy-minimal Agent directory for one active project."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -3509,6 +3560,7 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
                 and not _OVERSEER_REPLY_PATH_RE.fullmatch(path)
                 and not _MAIL_API_REPLY_SHAPE_RE.fullmatch(path)
                 and not _MAIL_API_COMPOSE_SHAPE_RE.fullmatch(path)
+                and not _MAIL_API_AGENT_PROFILE_SHAPE_RE.fullmatch(path)
                 and not (
                     _MAIL_API_DELIVERY_SHAPE_RE.fullmatch(path)
                     and path.endswith("/retry")
@@ -6940,8 +6992,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         async def mail_ui_project_agents_v1(
             project_id: Annotated[int, FastApiPath(gt=0)],
             request: Request,
+            purpose: Annotated[MailUiAgentDirectoryPurpose, Query()] = "addressable",
         ) -> MailUiProjectAgentsResponse:
-            """Return the active, addressable agents in one active project."""
+            """Return active Agents for addressing or presentation-profile editing."""
             await ensure_schema()
             async with get_session() as session:
                 # Deliberately NOT `_mail_ui_revalidated_admin_user`: the
@@ -6981,13 +7034,15 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         "SELECT id, agent_generation, name, display_name, notify_sound "
                         "FROM agents "
                         "WHERE project_id = :project_id AND retired_at IS NULL "
+                        "AND provisioning_state = 'active' "
                         "AND name <> :human_overseer "
-                        "AND contact_policy <> 'block_all' "
+                        "AND (:include_blocked = 1 OR contact_policy <> 'block_all') "
                         "ORDER BY lower(name), name, id"
                     ),
                     {
                         "project_id": project_id,
                         "human_overseer": "HumanOverseer",
+                        "include_blocked": int(purpose == "profile"),
                     },
                 )
                 items = [
@@ -7013,6 +7068,166 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 project_generation=project.project_generation,
                 items=items,
                 total=len(items),
+            )
+
+        @fastapi_app.patch(
+            "/mail/api/v1/projects/{project_id}/agents/{agent_id}/profile",
+            response_model=MailUiAgentProfileMutationResponse,
+            responses=_MAIL_UI_DOMAIN_MUTATION_ERROR_RESPONSES,
+        )
+        async def mail_ui_agent_profile_patch_v1(
+            project_id: Annotated[int, FastApiPath(gt=0)],
+            agent_id: Annotated[int, FastApiPath(gt=0)],
+            request: Request,
+            profile: MailUiAgentProfilePatch,
+        ) -> MailUiAgentProfileMutationResponse:
+            """CAS-update one active Agent's label and closed-vocabulary tone."""
+            await ensure_schema()
+            normalized_display_name = _sanitize_display_name_argument(
+                profile.display_name
+            )
+            async with get_immediate_session() as session:
+                # The project-scoped operator permission is deliberately the
+                # narrowest human capability that can author or manage an
+                # Agent. A viewer, a hidden project, and a missing project all
+                # look alike so this mutation cannot become an existence probe.
+                await _mail_ui_revalidated_profile_user(request, session)
+                visible_roles = await _mail_ui_visible_project_roles(
+                    settings=settings,
+                    request=request,
+                    session=session,
+                )
+                project = await session.get(Project, project_id)
+                project_role = visible_roles.get(project_id)
+                may_operate = project_id in visible_roles and (
+                    project_role is None
+                    or webauth.project_role_allows_operate(project_role)
+                )
+                if (
+                    not may_operate
+                    or project is None
+                    or project.archived_at is not None
+                ):
+                    raise _mail_ui_domain_http_exception(
+                        code="project_not_found",
+                        status_code=status.HTTP_404_NOT_FOUND,
+                    )
+                if project.project_generation != profile.expected_project_generation:
+                    raise _mail_ui_domain_http_exception(
+                        code="project_recreated",
+                        status_code=status.HTTP_409_CONFLICT,
+                    )
+
+                agent_result = await session.execute(
+                    select(Agent)
+                    .where(cast(Any, Agent.id == agent_id))
+                    .where(cast(Any, Agent.project_id == project_id))
+                    .execution_options(populate_existing=True)
+                )
+                agent = agent_result.scalars().first()
+                if (
+                    agent is None
+                    or agent.retired_at is not None
+                    or agent.name == "HumanOverseer"
+                    or agent.provisioning_state != "active"
+                ):
+                    raise _mail_ui_domain_http_exception(
+                        code="target_not_found",
+                        status_code=status.HTTP_404_NOT_FOUND,
+                    )
+
+                if (
+                    agent.agent_generation != profile.expected_agent_generation
+                    or agent.display_name != profile.expected_display_name
+                    or agent.notify_sound != profile.expected_notify_sound
+                ):
+                    raise _mail_ui_domain_http_exception(
+                        code="profile_revision_conflict",
+                        status_code=status.HTTP_409_CONFLICT,
+                    )
+                agent_name = agent.name
+
+                if normalized_display_name is not None:
+                    clash = (
+                        await session.execute(
+                            text(
+                                "SELECT name FROM agents WHERE project_id = :pid "
+                                "AND id != :aid AND (lower(name) = lower(:label) "
+                                "OR lower(COALESCE(display_name, '')) = lower(:label)) "
+                                "LIMIT 1"
+                            ),
+                            {
+                                "pid": project_id,
+                                "aid": agent_id,
+                                "label": normalized_display_name,
+                            },
+                        )
+                    ).fetchone()
+                    if clash is not None:
+                        raise _mail_ui_domain_http_exception(
+                            code="invalid_display_name",
+                            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                        )
+
+                changed = (
+                    agent.display_name != normalized_display_name
+                    or agent.notify_sound != profile.notify_sound
+                )
+                if changed:
+                    statement = (
+                        update(Agent)
+                        .where(cast(Any, Agent.id == agent_id))
+                        .where(cast(Any, Agent.project_id == project_id))
+                        .where(
+                            cast(
+                                Any,
+                                Agent.agent_generation
+                                == profile.expected_agent_generation,
+                            )
+                        )
+                    )
+                    if profile.expected_display_name is None:
+                        statement = statement.where(
+                            cast(Any, Agent.display_name).is_(None)
+                        )
+                    else:
+                        statement = statement.where(
+                            cast(
+                                Any,
+                                Agent.display_name == profile.expected_display_name,
+                            )
+                        )
+                    if profile.expected_notify_sound is None:
+                        statement = statement.where(
+                            cast(Any, Agent.notify_sound).is_(None)
+                        )
+                    else:
+                        statement = statement.where(
+                            cast(
+                                Any,
+                                Agent.notify_sound == profile.expected_notify_sound,
+                            )
+                        )
+                    result = await session.execute(
+                        statement.values(
+                            display_name=normalized_display_name,
+                            notify_sound=profile.notify_sound,
+                        )
+                    )
+                    if int(getattr(result, "rowcount", 0) or 0) != 1:
+                        raise _mail_ui_domain_http_exception(
+                            code="compare_and_swap_failed",
+                            status_code=status.HTTP_409_CONFLICT,
+                        )
+                await session.commit()
+
+            return MailUiAgentProfileMutationResponse(
+                changed=changed,
+                agent_id=agent_id,
+                agent_generation=profile.expected_agent_generation,
+                agent_name=agent_name,
+                display_name=normalized_display_name,
+                notify_sound=profile.notify_sound,
             )
 
         @fastapi_app.get(
@@ -11267,6 +11482,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         path = request.url.path
         redact_input = (
             path in (_MAIL_PASSWORD_API_PATH, _MAIL_SEARCH_API_PATH)
+            or bool(_MAIL_API_AGENT_PROFILE_SHAPE_RE.fullmatch(path))
             or bool(_MAIL_API_COMPOSE_SHAPE_RE.fullmatch(path))
             or bool(_MAIL_API_REPLY_SHAPE_RE.fullmatch(path))
         )

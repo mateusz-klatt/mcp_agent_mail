@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  isNotificationSoundName,
+  notificationSoundNames,
   playNotificationTone,
+  previewNotificationTone,
   resetNotificationAudio,
   setSoundEnabled,
   soundEnabled,
@@ -107,6 +110,10 @@ describe("toneFor", () => {
       "bell",
       "sparkle",
     ]);
+    expect(notificationSoundNames).toEqual(Object.keys(tones));
+    expect(isNotificationSoundName("bell")).toBe(true);
+    expect(isNotificationSoundName("airhorn")).toBe(false);
+    expect(isNotificationSoundName(880)).toBe(false);
     for (const [word, tone] of Object.entries(tones)) {
       expect(toneFor(word)).toEqual(tone);
     }
@@ -189,6 +196,16 @@ describe("playNotificationTone", () => {
     });
     expect(oscillators[0]!.type).toBe(tones.click.notes[0].wave);
     expect(oscillators[0]!.start).toHaveBeenCalledOnce();
+  });
+
+  it("previews once without changing or consulting the global preference", () => {
+    const { oscillators } = audioStub();
+    const storage = memoryStorage({ [soundPreferenceKey]: "off" });
+
+    previewNotificationTone("bell");
+
+    expect(oscillators).toHaveLength(tones.bell.notes.length);
+    expect(storage.read(soundPreferenceKey)).toBe("off");
   });
 
   it("schedules every note in a rhythmic pattern", () => {

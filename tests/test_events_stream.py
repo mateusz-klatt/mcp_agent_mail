@@ -395,7 +395,7 @@ class TestTransport:
                     {
                         "project_key": PROJECT,
                         "sender_name": EVENT_AGENT,
-                        "sender_token": token,
+                        "registration_token": token,
                         "to": [EVENT_AGENT],
                         "subject": "wake me",
                         "body_md": "body",
@@ -471,7 +471,7 @@ class TestTransport:
                     {
                         "project_key": PROJECT,
                         "sender_name": EVENT_SENDER,
-                        "sender_token": sender["registration_token"],
+                        "registration_token": sender["registration_token"],
                         "to": [EVENT_VISIBLE],
                         "bcc": [EVENT_HIDDEN],
                         "subject": "quietly",
@@ -528,7 +528,7 @@ class TestTransport:
                     {
                         "project_key": PROJECT,
                         "sender_name": EVENT_AGENT,
-                        "sender_token": token,
+                        "registration_token": token,
                         "to": [EVENT_AGENT],
                         "subject": "both",
                         "body_md": "body",

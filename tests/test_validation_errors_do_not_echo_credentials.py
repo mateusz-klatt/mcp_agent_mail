@@ -4,7 +4,7 @@ Pydantic reports the offending value, and for an unexpected keyword that
 value IS the argument -- so a typo in a token's own field name printed the
 token in full. Measured on 2026-08-14: it burned a live registration token,
 and it caught three agents in one day because these argument names are long
-and similar (`registration_token`, `sender_token`).
+and similar (`registration_token`, `requester_registration_token`).
 """
 
 from __future__ import annotations

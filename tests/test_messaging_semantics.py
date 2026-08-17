@@ -374,6 +374,26 @@ async def test_acknowledging_twice_keeps_the_first_timestamp(server):
 # ----------------------------------------------------------------------------
 
 
+async def test_message_tool_schemas_use_the_registration_token_name(server):
+    """Mailbox credentials have one public name across reads and writes."""
+    async with Client(server) as client:
+        tools = {tool.name: tool for tool in await client.list_tools()}
+        for tool_name in ("send_message", "reply_message"):
+            properties = tools[tool_name].inputSchema["properties"]
+            assert "registration_token" in properties
+            assert "sender_token" not in properties
+
+        schema_document = await _resource(client, "resource://tooling/schemas")
+        documented_tools = schema_document["tools"]
+        for tool_name in ("send_message", "reply_message"):
+            assert "registration_token" in documented_tools[tool_name]["optional"]
+            assert "sender_token" not in documented_tools[tool_name]["optional"]
+        assert {
+            "requester_registration_token",
+            "target_registration_token",
+        } <= set(documented_tools["macro_contact_handshake"]["optional"])
+
+
 async def test_a_second_session_cannot_send_as_an_agent_without_its_token(server):
     async with Client(server) as enrolment:
         space = await _workspace(enrolment, "sender-auth")
@@ -392,7 +412,7 @@ async def test_a_second_session_cannot_send_as_an_agent_without_its_token(server
             await impostor.call_tool("send_message", forged)
         # The parameter name is what the caller has to supply next, so it is the
         # part of the message that is contract.
-        assert "sender_token" in str(refusal.value)
+        assert "registration_token" in str(refusal.value)
 
     async with Client(server) as owner_session:
         accepted = await _call(
@@ -400,7 +420,7 @@ async def test_a_second_session_cannot_send_as_an_agent_without_its_token(server
             "send_message",
             project_key=space.key,
             sender_name=owner.name,
-            sender_token=owner.token,
+            registration_token=owner.token,
             to=[owner.name],
             subject="Genuine",
             body_md="written by the owner",
@@ -440,7 +460,7 @@ async def test_blocked_send_with_auto_contact_files_a_request_and_drops_the_payl
                 {
                     "project_key": space.key,
                     "sender_name": caller.name,
-                    "sender_token": caller.token,
+                    "registration_token": caller.token,
                     "to": [callee.name],
                     "subject": "Design review",
                     "body_md": "please take a look",
@@ -488,7 +508,7 @@ async def test_auto_contact_disabled_leaves_no_request_and_no_notice(server):
                 {
                     "project_key": space.key,
                     "sender_name": caller.name,
-                    "sender_token": caller.token,
+                    "registration_token": caller.token,
                     "to": [callee.name],
                     "subject": "Design review",
                     "body_md": "please take a look",
@@ -573,7 +593,7 @@ async def test_cross_project_auto_contact_files_an_external_request_and_drops_th
                 {
                     "project_key": home.key,
                     "sender_name": caller.name,
-                    "sender_token": caller.token,
+                    "registration_token": caller.token,
                     "to": [f"{callee.name}@{away.key}"],
                     "subject": "Cross-project ask",
                     "body_md": "we need a link first",
@@ -623,7 +643,7 @@ async def test_cross_project_auto_contact_disabled_leaves_no_request_and_no_noti
                 {
                     "project_key": home.key,
                     "sender_name": caller.name,
-                    "sender_token": caller.token,
+                    "registration_token": caller.token,
                     "to": [f"{callee.name}@{away.key}"],
                     "subject": "Cross-project ask",
                     "body_md": "we need a link first",
@@ -843,7 +863,7 @@ async def test_send_refuses_a_cross_project_approval_whose_ttl_has_passed(server
                 {
                     "project_key": home.key,
                     "sender_name": caller.name,
-                    "sender_token": caller.token,
+                    "registration_token": caller.token,
                     "to": [f"{remote.name}@{away.key}"],
                     "subject": "Stale external approval",
                     "body_md": "an expired link must not route mail across projects",
@@ -925,7 +945,7 @@ async def test_cross_project_delivery_credits_the_sender_to_its_own_project(serv
             "send_message",
             project_key=home.key,
             sender_name=author.name,
-            sender_token=author.token,
+            registration_token=author.token,
             to=[f"{remote.name}@{away.key}"],
             subject="Origin check",
             body_md="sent from the home project",
@@ -983,7 +1003,7 @@ async def test_a_local_namesake_neither_owns_the_message_nor_catches_the_reply(s
             "send_message",
             project_key=home.key,
             sender_name=author.name,
-            sender_token=author.token,
+            registration_token=author.token,
             to=[f"{remote.name}@{away.key}"],
             subject="Origin check",
             body_md="sent from the home project",
@@ -1010,7 +1030,7 @@ async def test_a_local_namesake_neither_owns_the_message_nor_catches_the_reply(s
                     "project_key": away.key,
                     "message_id": landed_id,
                     "sender_name": remote.name,
-                    "sender_token": remote.token,
+                    "registration_token": remote.token,
                     "to": [namesake.name],
                     "body_md": "aiming at the lookalike",
                     "idempotency_key": "namesake-lookalike-reply",
@@ -1024,7 +1044,7 @@ async def test_a_local_namesake_neither_owns_the_message_nor_catches_the_reply(s
             project_key=away.key,
             message_id=landed_id,
             sender_name=remote.name,
-            sender_token=remote.token,
+            registration_token=remote.token,
             body_md="answering the sender that actually wrote to me",
             idempotency_key="namesake-true-reply",
         )
@@ -1066,7 +1086,7 @@ async def test_a_reservation_over_legacy_inbox_paths_does_not_stall_a_send(serve
             "send_message",
             project_key=home.key,
             sender_name=author.name,
-            sender_token=author.token,
+            registration_token=author.token,
             to=[author.name, f"{remote.name}@{away.key}"],
             subject="Two projects at once",
             body_md="immutable delivery does not go through those paths",
@@ -1095,7 +1115,7 @@ async def test_a_reservation_over_legacy_inbox_paths_does_not_stall_a_reply(serv
             "send_message",
             project_key=home.key,
             sender_name=author.name,
-            sender_token=author.token,
+            registration_token=author.token,
             to=[f"{remote.name}@{away.key}"],
             subject="Opening note across projects",
             body_md="start of the thread",
@@ -1124,7 +1144,7 @@ async def test_a_reservation_over_legacy_inbox_paths_does_not_stall_a_reply(serv
             project_key=away.key,
             message_id=landed_id,
             sender_name=remote.name,
-            sender_token=remote.token,
+            registration_token=remote.token,
             body_md="the reply uses the immutable delivery document",
             idempotency_key="legacy-reply-child",
         )
@@ -1159,7 +1179,7 @@ async def _stage_private_thread(server) -> tuple[Workspace, Mailbox, Mailbox]:
             "send_message",
             project_key=space.key,
             sender_name=author.name,
-            sender_token=author.token,
+            registration_token=author.token,
             to=[author.name],
             bcc=[blind.name],
             subject="Sealed plan",

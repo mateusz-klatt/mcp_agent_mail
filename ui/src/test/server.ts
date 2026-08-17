@@ -350,6 +350,27 @@ export const server = setupServer(
       project_id: Number(params.projectId),
     }),
   ),
+  http.patch(
+    "*/mail/api/v1/projects/:projectId/agents/:agentId/profile",
+    async ({ params, request }) => {
+      const body = (await request.json()) as {
+        expected_agent_generation: string;
+        display_name: string | null;
+        notify_sound: string;
+      };
+      const agent = projectAgentsResponse.items.find(
+        (candidate) => candidate.agent_id === Number(params.agentId),
+      );
+      return HttpResponse.json({
+        changed: true,
+        agent_id: Number(params.agentId),
+        agent_generation: body.expected_agent_generation,
+        agent_name: agent?.name ?? "UnknownAgent",
+        display_name: body.display_name,
+        notify_sound: body.notify_sound,
+      });
+    },
+  ),
   http.get("*/mail/api/v1/inbox", () => HttpResponse.json(inboxResponse)),
   http.get("*/mail/api/v1/search", () => HttpResponse.json(searchResponse)),
   http.get(

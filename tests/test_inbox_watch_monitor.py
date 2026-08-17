@@ -97,6 +97,114 @@ printf '200\n'
     )
 
 
+def _install_rotation_server(fake_bin: Path) -> None:
+    """Install a stateful fake for onboard plus journaled token rotation."""
+    _install_fake_curl(
+        fake_bin,
+        r'''#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FAKE_ARGV_LOG"
+body="$(cat)"
+tool="$(printf '%s' "$body" | jq -r '.params.name')"
+printf '%s\n' "$tool" >> "$FAKE_TOOL_LOG"
+current="$(cat "$FAKE_SERVER_TOKEN_FILE" 2>/dev/null)"
+error=""
+case "$tool" in
+  ensure_project)
+    result='{"id":1,"slug":"owner-repo","human_key":"/owner/repo","project_uid":"private-project-uid"}'
+    ;;
+  register_agent)
+    name="$(printf '%s' "$body" | jq -r '.params.arguments.name')"
+    token="$(printf '%s' "$body" | jq -r '.params.arguments.registration_token // empty')"
+    if [[ -z "$token" ]]; then
+      current="one-time-secret"
+      printf '%s' "$current" > "$FAKE_SERVER_TOKEN_FILE"
+      result="$(jq -nc --arg name "$name" --arg token "$current" \
+        '{id:7,name:$name,registration_token:$token}')"
+    elif [[ "$token" == "$current" ]]; then
+      result="$(jq -nc --arg name "$name" '{id:7,name:$name}')"
+    else
+      error="authentication failed"
+    fi
+    ;;
+  fetch_inbox)
+    token="$(printf '%s' "$body" | jq -r '.params.arguments.registration_token // empty')"
+    if [[ "$token" == "$current" ]]; then result='[]'; else error="authentication failed"; fi
+    ;;
+  rotate_registration_token)
+    old="$(printf '%s' "$body" | jq -r '.params.arguments.registration_token // empty')"
+    new="$(printf '%s' "$body" | jq -r '.params.arguments.new_registration_token // empty')"
+    if [[ "${FAKE_ROTATE_REJECT:-0}" == 1 ]]; then
+      error="rotation refused"
+    elif [[ "$new" == "$current" ]]; then
+      result="$(jq -nc --arg agent "$(printf '%s' "$body" | jq -r '.params.arguments.agent_name')" \
+        '{agent:$agent,project:"/owner/repo",rotated:false,already_current:true}')"
+    elif [[ "$old" == "$current" ]]; then
+      if [[ "${FAKE_ROTATE_DELAY:-0}" != 0 ]]; then sleep "$FAKE_ROTATE_DELAY"; fi
+      printf '%s' "$new" > "$FAKE_SERVER_TOKEN_FILE"
+      count="$(cat "$FAKE_ROTATE_COUNT_FILE" 2>/dev/null)"
+      case "$count" in ''|*[!0-9]*) count=0 ;; esac
+      printf '%s' "$((count + 1))" > "$FAKE_ROTATE_COUNT_FILE"
+      if [[ "${FAKE_LOSE_ROTATION_RESPONSE_ONCE:-0}" == 1 \
+          && ! -e "$FAKE_LOST_RESPONSE_MARKER" ]]; then
+        : > "$FAKE_LOST_RESPONSE_MARKER"
+        exit 97
+      fi
+      result="$(jq -nc --arg agent "$(printf '%s' "$body" | jq -r '.params.arguments.agent_name')" \
+        '{agent:$agent,project:"/owner/repo",rotated:true,already_current:false}')"
+    else
+      error="authentication failed"
+    fi
+    ;;
+  whois)
+    token="$(printf '%s' "$body" | jq -r '.params.arguments.registration_token // empty')"
+    agent="$(printf '%s' "$body" | jq -r '.params.arguments.agent_name')"
+    if [[ "$token" == "$current" ]]; then
+      result="$(jq -nc --arg agent "$agent" '{id:7,name:$agent,recent_commits:[]}')"
+    else
+      error="authentication failed"
+    fi
+    ;;
+  *) exit 93 ;;
+esac
+if [[ -n "$error" ]]; then
+  jq -nc --arg message "$error" \
+    '{result:{content:[{type:"text",text:$message}],isError:true}}'
+else
+  jq -nc --argjson value "$result" \
+    '{result:{content:[{type:"text",text:($value|tojson)}],isError:false}}'
+fi
+printf '200\n'
+''',
+    )
+
+
+def _rotation_setup(
+    tmp_path: Path,
+) -> tuple[dict[str, str], Path, str, str]:
+    env, repo, _ = _monitor_env(tmp_path)
+    _install_rotation_server(tmp_path / "bin")
+    env["FAKE_ARGV_LOG"] = _git_bash_path(tmp_path / "argv.log")
+    env["FAKE_SERVER_TOKEN_FILE"] = _git_bash_path(tmp_path / "server-token")
+    env["FAKE_ROTATE_COUNT_FILE"] = _git_bash_path(tmp_path / "rotation-count")
+    env["FAKE_LOST_RESPONSE_MARKER"] = _git_bash_path(tmp_path / "lost-response")
+    env["FAKE_TOOL_LOG"] = _git_bash_path(tmp_path / "tool.log")
+    onboard = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "onboard", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert onboard.returncode == 0, onboard.stdout + onboard.stderr
+    credentials = json.loads(
+        (tmp_path / "state" / "credentials.json").read_text(encoding="utf-8")
+    )
+    [(agent, original)] = credentials["/owner/repo"].items()
+    return env, repo, agent, original
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _harness_can_actually_run_the_script(tmp_path_factory: pytest.TempPathFactory) -> None:
     """Fail this module outright if the script dies before it reaches its own code.
@@ -607,6 +715,254 @@ def test_onboard_persists_the_one_time_token_and_doctor_never_prints_it(
     assert "monitor: not armed for this project and Agent (optional" in doctor.stdout
     assert "result: healthy" in doctor.stdout
     assert "one-time-secret" not in doctor.stdout + doctor.stderr
+
+
+def test_rotate_token_persists_verifies_and_redacts_the_replacement(
+    tmp_path: Path,
+) -> None:
+    env, repo, agent, original = _rotation_setup(tmp_path)
+    rotated = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "rotate-token", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert rotated.returncode == 0, rotated.stdout + rotated.stderr
+    credentials = json.loads(
+        (tmp_path / "state" / "credentials.json").read_text(encoding="utf-8")
+    )
+    replacement = credentials["/owner/repo"][agent]
+    assert replacement != original
+    assert len(replacement) == 64
+    assert set(replacement) <= set("0123456789abcdef")
+    assert (tmp_path / "server-token").read_text(encoding="utf-8") == replacement
+    journals = list((tmp_path / "state" / "credential-rotations").glob("*.json"))
+    assert len(journals) == 1
+    journal = json.loads(journals[0].read_text(encoding="utf-8"))
+    assert journal == {
+        "version": 1,
+        "status": "idle",
+        "project": "/owner/repo",
+        "agent": agent,
+    }
+    exposed = rotated.stdout + rotated.stderr + (tmp_path / "argv.log").read_text(
+        encoding="utf-8"
+    )
+    assert original not in exposed
+    assert replacement not in exposed
+    assert "value not displayed" in rotated.stdout
+    assert (tmp_path / "rotation-count").read_text(encoding="utf-8") == "1"
+
+
+def test_rotate_token_recovers_a_committed_response_loss_from_its_journal(
+    tmp_path: Path,
+) -> None:
+    env, repo, agent, original = _rotation_setup(tmp_path)
+    env["FAKE_LOSE_ROTATION_RESPONSE_ONCE"] = "1"
+    interrupted = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "rotate-token", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert interrupted.returncode == 1
+    credentials_path = tmp_path / "state" / "credentials.json"
+    assert json.loads(credentials_path.read_text(encoding="utf-8"))["/owner/repo"][agent] == original
+    [journal_path] = list(
+        (tmp_path / "state" / "credential-rotations").glob("*.json")
+    )
+    pending = json.loads(journal_path.read_text(encoding="utf-8"))
+    candidate = pending["new_registration_token"]
+    assert pending["status"] == "pending"
+    assert (tmp_path / "server-token").read_text(encoding="utf-8") == candidate
+    assert original not in interrupted.stdout + interrupted.stderr
+    assert candidate not in interrupted.stdout + interrupted.stderr
+    assert candidate not in (tmp_path / "argv.log").read_text(encoding="utf-8")
+
+    recovered = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "rotate-token", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert recovered.returncode == 0, recovered.stdout + recovered.stderr
+    credentials = json.loads(credentials_path.read_text(encoding="utf-8"))
+    assert credentials["/owner/repo"][agent] == candidate
+    completed = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert completed["status"] == "idle"
+    assert "new_registration_token" not in completed
+    assert (tmp_path / "rotation-count").read_text(encoding="utf-8") == "1"
+    assert candidate not in recovered.stdout + recovered.stderr
+
+
+def test_rotate_token_recovers_when_private_persist_failed_after_server_commit(
+    tmp_path: Path,
+) -> None:
+    env, repo, agent, original = _rotation_setup(tmp_path)
+    real_mv = subprocess.run(
+        [BASH, "-lc", "command -v mv"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    env["REAL_MV"] = real_mv
+    env["FAIL_CREDENTIAL_WRITE"] = "1"
+    fake_mv = tmp_path / "bin" / "mv"
+    fake_mv.write_text(
+        """#!/usr/bin/env bash
+last="${!#}"
+if [[ "${FAIL_CREDENTIAL_WRITE:-0}" == 1 && "$last" == */credentials.json ]]; then
+  exit 71
+fi
+exec "$REAL_MV" "$@"
+""",
+        encoding="utf-8",
+    )
+    fake_mv.chmod(0o755)
+
+    interrupted = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "rotate-token", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert interrupted.returncode == 1
+    credentials_path = tmp_path / "state" / "credentials.json"
+    assert json.loads(credentials_path.read_text(encoding="utf-8"))["/owner/repo"][agent] == original
+    [journal_path] = list(
+        (tmp_path / "state" / "credential-rotations").glob("*.json")
+    )
+    pending = json.loads(journal_path.read_text(encoding="utf-8"))
+    candidate = pending["new_registration_token"]
+    assert (tmp_path / "server-token").read_text(encoding="utf-8") == candidate
+    assert candidate not in interrupted.stdout + interrupted.stderr
+
+    repaired_env = {
+        key: value for key, value in env.items() if key != "FAIL_CREDENTIAL_WRITE"
+    }
+    recovered = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "rotate-token", "claude", "1"],
+        cwd=repo,
+        env=repaired_env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert recovered.returncode == 0, recovered.stdout + recovered.stderr
+    credentials = json.loads(credentials_path.read_text(encoding="utf-8"))
+    assert credentials["/owner/repo"][agent] == candidate
+    assert json.loads(journal_path.read_text(encoding="utf-8"))["status"] == "idle"
+    assert (tmp_path / "rotation-count").read_text(encoding="utf-8") == "1"
+
+
+def test_rotate_token_preserves_old_state_on_refusal_and_fails_closed_if_stale(
+    tmp_path: Path,
+) -> None:
+    env, repo, agent, original = _rotation_setup(tmp_path)
+    env["FAKE_ROTATE_REJECT"] = "1"
+    refused = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "rotate-token", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert refused.returncode == 1
+    credentials_path = tmp_path / "state" / "credentials.json"
+    credentials = json.loads(credentials_path.read_text(encoding="utf-8"))
+    assert credentials["/owner/repo"][agent] == original
+    assert (tmp_path / "server-token").read_text(encoding="utf-8") == original
+    [journal_path] = list(
+        (tmp_path / "state" / "credential-rotations").glob("*.json")
+    )
+    pending = json.loads(journal_path.read_text(encoding="utf-8"))
+    candidate = pending["new_registration_token"]
+    assert pending["status"] == "pending"
+    assert original not in refused.stdout + refused.stderr
+    assert candidate not in refused.stdout + refused.stderr
+    assert (tmp_path / "tool.log").read_text(encoding="utf-8").splitlines().count(
+        "rotate_registration_token"
+    ) == 1
+
+    # A credential change outside this journal is not something recovery may
+    # guess through. It must stop before another rotation RPC or local overwrite.
+    unrelated = "9" * 64
+    credentials["/owner/repo"][agent] = unrelated
+    credentials_path.write_text(json.dumps(credentials), encoding="utf-8")
+    retry_env = {key: value for key, value in env.items() if key != "FAKE_ROTATE_REJECT"}
+    stale = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "rotate-token", "claude", "1"],
+        cwd=repo,
+        env=retry_env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert stale.returncode == 1
+    assert json.loads(credentials_path.read_text(encoding="utf-8"))["/owner/repo"][agent] == unrelated
+    assert json.loads(journal_path.read_text(encoding="utf-8")) == pending
+    assert (tmp_path / "server-token").read_text(encoding="utf-8") == original
+    assert (tmp_path / "tool.log").read_text(encoding="utf-8").splitlines().count(
+        "rotate_registration_token"
+    ) == 1
+    assert unrelated not in stale.stdout + stale.stderr
+    assert candidate not in stale.stdout + stale.stderr
+
+
+def test_concurrent_local_rotate_commands_coalesce_under_the_identity_lock(
+    tmp_path: Path,
+) -> None:
+    env, repo, agent, original = _rotation_setup(tmp_path)
+    env["FAKE_ROTATE_DELAY"] = "1"
+    command = [BASH, _git_bash_path(SETUP), "rotate-token", "claude", "1"]
+    first = subprocess.Popen(
+        command,
+        cwd=repo,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    second = subprocess.Popen(
+        command,
+        cwd=repo,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    first_stdout, first_stderr = first.communicate(timeout=30)
+    second_stdout, second_stderr = second.communicate(timeout=30)
+
+    assert first.returncode == 0, first_stdout + first_stderr
+    assert second.returncode == 0, second_stdout + second_stderr
+    credentials = json.loads(
+        (tmp_path / "state" / "credentials.json").read_text(encoding="utf-8")
+    )
+    replacement = credentials["/owner/repo"][agent]
+    assert replacement != original
+    assert (tmp_path / "server-token").read_text(encoding="utf-8") == replacement
+    assert (tmp_path / "rotation-count").read_text(encoding="utf-8") == "1"
+    exposed = first_stdout + first_stderr + second_stdout + second_stderr
+    assert original not in exposed
+    assert replacement not in exposed
 
 
 def test_onboard_persists_the_non_reissuable_token_before_repairable_name_marker(

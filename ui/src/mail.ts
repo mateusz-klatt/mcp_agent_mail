@@ -1,3 +1,8 @@
+import {
+  isNotificationSoundName,
+  type NotificationSoundName,
+} from "./notificationSound";
+
 export const projectsEndpoint = "/mail/api/v1/projects";
 export const inboxEndpoint = "/mail/api/v1/inbox";
 export const searchEndpoint = "/mail/api/v1/search";
@@ -155,7 +160,7 @@ export interface MailRecipientAgent {
    * browser synthesises the tone; nothing is ever fetched from a host a
    * colleague chose.
    */
-  notify_sound: string | null;
+  notify_sound: NotificationSoundName | null;
 }
 
 export interface ProjectAgentsPage {
@@ -163,6 +168,26 @@ export interface ProjectAgentsPage {
   project_generation: string;
   items: MailRecipientAgent[];
   total: number;
+}
+
+export type AgentDirectoryPurpose = "addressable" | "profile";
+
+export interface AgentProfileMutationInput {
+  expected_project_generation: string;
+  expected_agent_generation: string;
+  expected_display_name: string | null;
+  expected_notify_sound: NotificationSoundName | null;
+  display_name: string | null;
+  notify_sound: NotificationSoundName;
+}
+
+export interface AgentProfileMutation {
+  changed: boolean;
+  agent_id: number;
+  agent_generation: string;
+  agent_name: string;
+  display_name: string | null;
+  notify_sound: NotificationSoundName;
 }
 
 export interface ComposeRecipientReference {
@@ -375,6 +400,17 @@ function nullableString(value: unknown, label: string): string | null {
     throw new TypeError(`Invalid ${label}.`);
   }
   return value;
+}
+
+function nullableNotificationSound(
+  value: unknown,
+  label: string,
+): NotificationSoundName | null {
+  const sound = nullableString(value, label);
+  if (sound !== null && !isNotificationSoundName(sound)) {
+    throw new TypeError(`Invalid ${label}.`);
+  }
+  return sound;
 }
 
 function positiveInteger(value: unknown, label: string): number {
@@ -686,10 +722,43 @@ export function parseProjectAgents(payload: unknown): ProjectAgentsPage {
         ),
         name: stringValue(candidate.name, "agent name"),
         display_name: nullableString(candidate.display_name, "agent display name"),
-        notify_sound: nullableString(candidate.notify_sound, "agent notify sound"),
+        notify_sound: nullableNotificationSound(
+          candidate.notify_sound,
+          "agent notify sound",
+        ),
       };
     }),
     total: nonNegativeInteger(response.total, "project agent total"),
+  };
+}
+
+export function parseAgentProfileMutation(
+  payload: unknown,
+): AgentProfileMutation {
+  const response = exactRecord(payload, "agent profile response", [
+    "changed",
+    "agent_id",
+    "agent_generation",
+    "agent_name",
+    "display_name",
+    "notify_sound",
+  ]);
+  if (!isNotificationSoundName(response.notify_sound)) {
+    throw new TypeError("Invalid agent profile notify sound.");
+  }
+  return {
+    changed: booleanValue(response.changed, "agent profile changed"),
+    agent_id: positiveInteger(response.agent_id, "agent profile id"),
+    agent_generation: generationValue(
+      response.agent_generation,
+      "agent profile generation",
+    ),
+    agent_name: stringValue(response.agent_name, "agent profile name"),
+    display_name: nullableString(
+      response.display_name,
+      "agent profile display name",
+    ),
+    notify_sound: response.notify_sound,
   };
 }
 
@@ -871,13 +940,15 @@ export async function loadReservations(
 
 export async function loadProjectAgents(
   projectId: number,
-  options: FetchOptions = {},
+  options: FetchOptions & { purpose?: AgentDirectoryPurpose } = {},
 ): Promise<ProjectAgentsPage> {
   positiveInteger(projectId, "agent project id");
+  const { purpose = "addressable", ...fetchOptions } = options;
+  const purposeQuery = purpose === "profile" ? "?purpose=profile" : "";
   const page = await mailRequest(
-    `/mail/api/v1/projects/${projectId}/agents`,
+    `/mail/api/v1/projects/${projectId}/agents${purposeQuery}`,
     parseProjectAgents,
-    options,
+    fetchOptions,
   );
   if (page.project_id !== projectId) {
     throw new TypeError("Invalid agent project id.");
@@ -964,9 +1035,10 @@ async function mailMutationRequest<T>(
   endpoint: string,
   body: unknown,
   parser: (payload: unknown) => T,
+  method: "PATCH" | "POST" = "POST",
 ): Promise<T> {
   const response = await fetch(new URL(endpoint, window.location.origin), {
-    method: "POST",
+    method,
     cache: "no-store",
     credentials: "same-origin",
     headers: {
@@ -979,6 +1051,30 @@ async function mailMutationRequest<T>(
     throw await mailHttpError(response);
   }
   return parser(await response.json());
+}
+
+export async function saveAgentProfile(
+  projectId: number,
+  agentId: number,
+  expectedAgentName: string,
+  input: AgentProfileMutationInput,
+): Promise<AgentProfileMutation> {
+  positiveInteger(projectId, "agent profile project id");
+  positiveInteger(agentId, "agent profile agent id");
+  const result = await mailMutationRequest(
+    `/mail/api/v1/projects/${projectId}/agents/${agentId}/profile`,
+    input,
+    parseAgentProfileMutation,
+    "PATCH",
+  );
+  if (
+    result.agent_id !== agentId ||
+    result.agent_generation !== input.expected_agent_generation ||
+    result.agent_name !== expectedAgentName
+  ) {
+    throw new TypeError("Invalid agent profile identity.");
+  }
+  return result;
 }
 
 export function composeMessage(

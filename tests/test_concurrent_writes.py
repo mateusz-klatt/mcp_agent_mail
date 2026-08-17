@@ -109,7 +109,7 @@ async def test_concurrent_message_sends(isolated_env):
             {
                 "project_key": pkey("tmp/concurrent-test"),
                 "sender_name": sender,
-                "sender_token": data["tokens_by_name"][sender],
+                "registration_token": data["tokens_by_name"][sender],
                 "to": [recipient],
                 "subject": subject,
                 "body_md": f"Message from {sender} to {recipient}",
@@ -150,7 +150,7 @@ async def test_concurrent_messages_to_same_thread(isolated_env):
             {
                 "project_key": pkey("tmp/concurrent-test"),
                 "sender_name": sender,
-                "sender_token": data["tokens_by_name"][sender],
+                "registration_token": data["tokens_by_name"][sender],
                 "to": [first_agent],
                 "subject": f"Thread Message {message_num}",
                 "body_md": f"Message {message_num} from {sender}",
@@ -304,7 +304,7 @@ async def test_concurrent_inbox_fetches(isolated_env):
                 {
                     "project_key": pkey("tmp/concurrent-test"),
                     "sender_name": data["agents"][(i + 1) % 5],
-                    "sender_token": data["tokens_by_name"][data["agents"][(i + 1) % 5]],
+                    "registration_token": data["tokens_by_name"][data["agents"][(i + 1) % 5]],
                     "to": [data["agents"][0]],
                     "subject": f"Test Message {i}",
                     "body_md": f"Body {i}",
@@ -350,7 +350,7 @@ async def test_concurrent_inbox_fetch_during_message_send(isolated_env):
             {
                 "project_key": pkey("tmp/concurrent-test"),
                 "sender_name": data["agents"][1],
-                "sender_token": data["tokens_by_name"][data["agents"][1]],
+                "registration_token": data["tokens_by_name"][data["agents"][1]],
                 "to": [data["agents"][0]],
                 "subject": f"Concurrent Send {i}",
                 "body_md": f"Body {i}",

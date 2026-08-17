@@ -187,11 +187,19 @@ trap 'exit 0' INT TERM HUP
 
 source_sha256="$(am_sha256 < "$SELF_PATH" 2>/dev/null || true)"
 metadata_tmp="${METADATA}.${BASHPID:-$$}.tmp"
+# `supervise_parent` is recorded because `parent_pid` alone cannot be read
+# correctly by anyone else. A reader that finds the pid unsignalable has two
+# incompatible explanations for it -- the owner exited, or the probe never had
+# resolving power here -- and only this process knows which, because only this
+# process ran the probe while the owner was certainly alive. Publishing the
+# latch is what lets `agent_mail_setup.sh doctor` distinguish them instead of
+# assuming the first, which on Windows reports a healthy monitor as dying.
 if jq -nc --argjson pid "$$" --argjson parent_pid "$PARENT_PID" \
+        --argjson supervise_parent "$SUPERVISE_PARENT" \
         --arg project_key "$PROJECT" --arg agent_name "$AGENT" \
         --arg client "$CLIENT" --arg slot "$SLOT" --arg script "$SELF_PATH" \
         --arg source_sha256 "$source_sha256" \
-        '{pid:$pid,parent_pid:$parent_pid,project_key:$project_key,agent_name:$agent_name,client:$client,slot:$slot,script:$script,source_sha256:$source_sha256}' \
+        '{pid:$pid,parent_pid:$parent_pid,supervise_parent:$supervise_parent,project_key:$project_key,agent_name:$agent_name,client:$client,slot:$slot,script:$script,source_sha256:$source_sha256}' \
         > "$metadata_tmp" 2>/dev/null; then
     chmod 600 "$metadata_tmp" 2>/dev/null || true
     mv -f "$metadata_tmp" "$METADATA" 2>/dev/null || true

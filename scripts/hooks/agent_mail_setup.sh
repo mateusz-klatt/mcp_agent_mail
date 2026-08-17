@@ -112,7 +112,7 @@ local_marker_status() {
 }
 
 monitor_status() {
-    local project="$1" agent="$2" slug marker meta pid meta_pid parent_pid
+    local project="$1" agent="$2" slug marker meta pid meta_pid parent_pid supervise_parent
     local installed_monitor running_hash installed_hash
     slug="$(am_state_component "${project}|${agent}")" || return 1
     marker="${AM_STATE_DIR}/watch/monitor-${slug}.pid"
@@ -146,12 +146,32 @@ monitor_status() {
         printf 'monitor: metadata does not belong to this exact project and Agent\n'
         return 1
     fi
+    # `kill -0` on the owner answers a different question depending on whether
+    # the monitor is supervising at all, so read its own latch rather than
+    # re-deriving one here. The monitor probes once at birth, while the owner is
+    # certainly alive, and records the verdict; a failure it saw then means the
+    # probe has no resolving power on this host, not that anything died. Windows
+    # hits that whenever the owner is a native process outside the MSYS table --
+    # `parent_pid` comes back as 1 -- and reporting "shutting down" there called
+    # a healthy armed monitor dying, in the one check the wake skill tells
+    # operators to trust instead of `ps`.
     parent_pid="$(jq -r '.parent_pid // empty' < "$meta" 2>/dev/null)"
+    supervise_parent="$(jq -r '.supervise_parent // empty' < "$meta" 2>/dev/null)"
     case "$parent_pid" in
         ''|*[!0-9]*) printf 'monitor parent: unknown\n' ;;
         *)
             if kill -0 "$parent_pid" 2>/dev/null; then
                 printf 'monitor parent: live pid %s\n' "$parent_pid"
+            elif [ "$supervise_parent" = "0" ]; then
+                printf 'monitor parent: pid %s not observable here; the monitor disabled owner supervision at startup and will not exit for this\n' \
+                    "$parent_pid"
+            elif [ -z "$supervise_parent" ]; then
+                # Armed before the latch was published. Both explanations remain
+                # open, so say so rather than pick one: a false "issue" against a
+                # healthy monitor is the direction that costs an operator a
+                # needless re-arm, and this case disappears on the next arm.
+                printf 'monitor parent: pid %s not signalable, and this monitor predates the supervision record, so whether it is exiting cannot be told from here\n' \
+                    "$parent_pid"
             else
                 printf 'monitor parent: exited pid %s (monitor is shutting down)\n' "$parent_pid"
                 return 1

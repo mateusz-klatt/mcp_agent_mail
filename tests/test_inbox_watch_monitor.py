@@ -647,11 +647,20 @@ def test_monitor_keeps_running_when_its_owner_cannot_be_observed(
         assert proc.poll() is None, (
             "the monitor read an unobservable owner as a dead one and exited"
         )
+        # Observe the monitor while it is still running. On Git Bash, forcibly
+        # tearing down the process tree can race an in-flight MSYS fork and make
+        # the runtime itself append a transient child_copy/Win32 error 299 line
+        # to stderr. That teardown diagnostic says nothing about owner handling.
+        stdout = _read_output(out_path)
+        stderr = _read_output(err_path)
+        assert stdout == "", (
+            f"monitor spoke when it had nothing to report: {stdout!r}"
+        )
+        assert stderr == "", (
+            f"monitor complained about its own owner: {stderr!r}"
+        )
     finally:
-        stdout, stderr = _stop_and_read(proc, out_path, err_path)
-
-    assert stdout == "", f"monitor spoke when it had nothing to report: {stdout!r}"
-    assert stderr == "", f"monitor complained about its own owner: {stderr!r}"
+        _stop_and_read(proc, out_path, err_path)
 
 
 def test_onboard_persists_the_one_time_token_and_doctor_never_prints_it(

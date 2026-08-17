@@ -120,6 +120,8 @@ def _harness_can_actually_run_the_script(tmp_path_factory: pytest.TempPathFactor
     time.sleep(3)
     alive = proc.poll() is None
     _stdout, stderr = _stop_and_read(proc, out_path, err_path)
+    # This fixture builds its own directory, so the per-test sweep never sees it.
+    _sweep_monitors(tmp)
 
     if not alive:
         pytest.fail(
@@ -128,6 +130,48 @@ def _harness_can_actually_run_the_script(tmp_path_factory: pytest.TempPathFactor
             "script needs coreutils (`dirname`) from Git's usr/bin, which a "
             "native Windows shell does not put on PATH but Git Bash does. "
             f"stderr was: {stderr!r}"
+        )
+
+
+@pytest.fixture(autouse=True)
+def _no_monitor_outlives_its_test(tmp_path: Path):
+    """Kill every monitor this test started, by the pid the monitor itself wrote.
+
+    `claude-win-home-1` measured 18 live monitors left behind by a few runs of
+    this module, each holding a connection and each named after a fixture's
+    throwaway project. Two correct behaviours compose into that: where the owner
+    cannot be observed the monitor is deliberately immortal, and Windows offers
+    Python no stop that runs the EXIT trap -- `Popen.terminate()` is
+    TerminateProcess exactly as `taskkill /F` is.
+
+    So the sweep reads the record rather than the handle. `Popen.pid` is the
+    process Python started, and MSYS `exec` replaces that with another Windows
+    process while keeping the shell pid, so the handle can name something that
+    is already gone. The metadata carries `$$` from after the re-exec, which is
+    the live one -- and it is killed through the monitor's own bash, because on
+    Windows that pid means something only inside MSYS.
+
+    Scoped to this test's own state directory, so a monitor another project or
+    another agent is legitimately holding is never touched.
+    """
+    yield
+    _sweep_monitors(tmp_path)
+
+
+def _sweep_monitors(state_root: Path) -> None:
+    watch_dir = state_root / "state" / "watch"
+    pids: set[int] = set()
+    for record in watch_dir.glob("monitor-*.json"):
+        with contextlib.suppress(OSError, ValueError, KeyError):
+            pids.add(int(json.loads(record.read_text(encoding="utf-8"))["pid"]))
+    for marker in watch_dir.glob("monitor-*.pid"):
+        with contextlib.suppress(OSError, ValueError):
+            pids.add(int(marker.read_text(encoding="utf-8").strip()))
+    if pids:
+        subprocess.run(
+            [BASH, "-c", "kill -9 " + " ".join(str(pid) for pid in sorted(pids))],
+            check=False,
+            capture_output=True,
         )
 
 

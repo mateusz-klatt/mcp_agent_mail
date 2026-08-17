@@ -16,7 +16,7 @@ def _git(cwd: Path, *args: str) -> str:
     return cp.stdout.strip()
 
 
-def test_committed_marker_precedence(tmp_path: Path, monkeypatch) -> None:
+def test_local_worktree_marker_precedence(tmp_path: Path, monkeypatch) -> None:
     # Gate on worktrees so identity logic runs in modern mode
     monkeypatch.setenv("WORKTREES_ENABLED", "1")
     get_settings.cache_clear()
@@ -26,11 +26,11 @@ def test_committed_marker_precedence(tmp_path: Path, monkeypatch) -> None:
     _git(repo, "init")
     _git(repo, "config", "user.name", "Unit Test")
     _git(repo, "config", "user.email", "test@example.com")
-    # Write committed marker
-    committed_uid = "deadbeefcafefeed1234"
-    (repo / ".agent-mail-project-id").write_text(committed_uid + "\n", encoding="utf-8")
+    # The resolver cares about exact local content, not Git tracking state.
+    marker_uid = "deadbeefcafefeed1234"
+    (repo / ".agent-mail-project-id").write_text(marker_uid + "\n", encoding="utf-8")
     ident = _resolve_project_identity(str(repo))
-    assert ident["project_uid"] == committed_uid
+    assert ident["project_uid"] == marker_uid
 
 
 def test_private_marker_used_when_committed_missing(tmp_path: Path, monkeypatch) -> None:
@@ -74,7 +74,7 @@ def test_remote_fingerprint_when_no_markers(tmp_path: Path, monkeypatch) -> None
     assert ident["project_uid"] == expected_uid
 
 
-def test_projects_mark_identity_commit_only_commits_marker(
+def test_projects_mark_identity_is_local_only_and_preserves_the_index(
     isolated_env, tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.setenv("WORKTREES_ENABLED", "1")
@@ -93,18 +93,21 @@ def test_projects_mark_identity_commit_only_commits_marker(
     (repo / "unrelated.txt").write_text("pending\n", encoding="utf-8")
     _git(repo, "add", "unrelated.txt")
 
-    result = runner.invoke(app, ["projects", "mark-identity", str(repo), "--commit"])
+    before_head = _git(repo, "rev-parse", "HEAD")
+    result = runner.invoke(app, ["projects", "mark-identity", str(repo)])
 
     assert result.exit_code == 0, result.output
-
-    committed_files = {
-        line for line in _git(repo, "show", "--pretty=format:", "--name-only", "HEAD").splitlines() if line
-    }
-    assert committed_files == {".agent-mail-project-id"}
+    assert _git(repo, "rev-parse", "HEAD") == before_head
 
     staged_files = {line for line in _git(repo, "diff", "--cached", "--name-only").splitlines() if line}
     assert "unrelated.txt" in staged_files
     assert ".agent-mail-project-id" not in staged_files
+    assert _git(repo, "status", "--short", "--", ".agent-mail-project-id") == ""
+    exclude_raw = _git(repo, "rev-parse", "--git-path", "info/exclude")
+    exclude_path = Path(exclude_raw)
+    if not exclude_path.is_absolute():
+        exclude_path = repo / exclude_path
+    assert ".agent-mail-project-id" in exclude_path.read_text(encoding="utf-8")
 
 
 def test_projects_mark_identity_uses_repo_root_uid_from_subdirectory(
@@ -125,10 +128,31 @@ def test_projects_mark_identity_uses_repo_root_uid_from_subdirectory(
     subdir_uid = _resolve_project_identity(str(subdir))["project_uid"]
     assert root_uid != subdir_uid
 
-    result = runner.invoke(app, ["projects", "mark-identity", str(subdir), "--no-commit"])
+    result = runner.invoke(app, ["projects", "mark-identity", str(subdir)])
 
     assert result.exit_code == 0, result.output
     assert (repo / ".agent-mail-project-id").read_text(encoding="utf-8").strip() == root_uid
+
+
+def test_projects_mark_identity_refuses_to_replace_an_existing_uid(
+    isolated_env, tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("WORKTREES_ENABLED", "1")
+    get_settings.cache_clear()
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.name", "Unit Test")
+    _git(repo, "config", "user.email", "test@example.com")
+    marker = repo / ".agent-mail-project-id"
+    marker.write_text("\n", encoding="utf-8")
+
+    result = runner.invoke(app, ["projects", "mark-identity", str(repo)])
+
+    assert result.exit_code == 2
+    assert "Refusing to replace existing local marker" in result.output
+    assert marker.read_text(encoding="utf-8") == "\n"
 
 
 def test_projects_discovery_init_writes_yaml_at_repo_root(

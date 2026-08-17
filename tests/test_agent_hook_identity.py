@@ -1046,9 +1046,10 @@ def test_integrators_install_lf_only_hooks_from_crlf_sources(
             "session_end.sh",
             "inbox_watch.sh",
             "inbox_watch_monitor.sh",
+            "agent_mail_setup.sh",
         )
         if client == "claude"
-        else ("codex_notify.sh", "agent_mail_common.sh")
+        else ("codex_notify.sh", "agent_mail_common.sh", "agent_mail_setup.sh")
     )
     for hook_name in hook_names:
         source = ROOT / "scripts" / "hooks" / hook_name
@@ -1090,7 +1091,12 @@ def test_integrators_install_lf_only_hooks_from_crlf_sources(
     expected_installed_names = (
         set(hook_names)
         if client == "claude"
-        else {"agent_mail_common.sh", "agent_mail_hook.sh", "hook_wrapper.sh"}
+        else {
+            "agent_mail_common.sh",
+            "agent_mail_hook.sh",
+            "agent_mail_setup.sh",
+            "hook_wrapper.sh",
+        }
     )
     assert {path.name for path in installed_hooks} == expected_installed_names
     for installed_hook in installed_hooks:

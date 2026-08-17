@@ -2559,7 +2559,7 @@ def _resolve_project_identity(
         canonical_path = target_path
 
     # Compute project_uid via precedence:
-    # committed marker -> discovery yaml -> private marker -> remote fingerprint -> git-common-dir hash -> dir hash
+    # worktree marker -> discovery yaml -> private marker -> remote fingerprint -> git-common-dir hash -> dir hash
     marker_committed: Optional[Path] = Path(repo_root or "") / ".agent-mail-project-id" if repo_root else None
     marker_private: Optional[Path] = Path(git_common_dir or "") / "agent-mail" / "project-id" if git_common_dir else None
     # Normalize marker_private to absolute if git_common_dir is relative (common for non-linked worktrees)
@@ -4069,6 +4069,25 @@ async def _generate_unique_agent_name(
 
 _GENERATED_ALIAS_ATTEMPTS = 12
 
+# Ordered, closed vocabulary shared by automatic assignment and the public
+# setter. The ordinal is project-local: global Agent ids are intentionally not
+# part of a human-audible preference, because gaps created in unrelated
+# projects would make the first two colleagues in one project collide.
+NOTIFY_SOUND_NAMES: tuple[str, ...] = (
+    "chime",
+    "low",
+    "high",
+    "soft",
+    "click",
+    "double",
+    "rising",
+    "falling",
+    "knock",
+    "pulse",
+    "bell",
+    "sparkle",
+)
+
 
 async def _resolve_new_agent_display_name(
     session: AsyncSession,
@@ -4128,6 +4147,20 @@ async def _resolve_new_agent_display_name(
     return None
 
 
+async def _resolve_new_agent_notify_sound(
+    session: AsyncSession,
+    project_id: int,
+) -> str:
+    """Assign a stable default from the dense Agent order in one project."""
+    result = await session.execute(
+        select(Agent.id)
+        .where(cast(Any, Agent.project_id == project_id))
+        .order_by(cast(Any, Agent.id))
+    )
+    project_position = len(result.scalars().all())
+    return NOTIFY_SOUND_NAMES[project_position % len(NOTIFY_SOUND_NAMES)]
+
+
 def _sanitize_display_name_argument(value: str | None) -> str | None:
     """Normalize a caller-supplied display label; empty collapses to None.
 
@@ -4163,6 +4196,7 @@ async def _create_agent_record(
         alias = await _resolve_new_agent_display_name(
             session, project.id, name, display_name
         )
+        notify_sound = await _resolve_new_agent_notify_sound(session, project.id)
         agent = Agent(
             project_id=project.id,
             name=name,
@@ -4173,6 +4207,7 @@ async def _create_agent_record(
             registration_token=registration_token,
             provisioning_state="provisioning",
             display_name=alias,
+            notify_sound=notify_sound,
         )
         session.add(agent)
         await session.commit()
@@ -4315,6 +4350,9 @@ async def _get_or_create_agent(
             alias = await _resolve_new_agent_display_name(
                 session, project.id, desired_name, display_name
             )
+            notify_sound = await _resolve_new_agent_notify_sound(
+                session, project.id
+            )
             candidate = Agent(
                 project_id=project.id,
                 name=desired_name,
@@ -4325,6 +4363,7 @@ async def _get_or_create_agent(
                 registration_token=registration_token_on_create,
                 provisioning_state="provisioning",
                 display_name=alias,
+                notify_sound=notify_sound,
             )
             if (
                 expected_existing_agent_id is not None
@@ -12390,19 +12429,6 @@ def build_mcp_server() -> FastMCP:
                 })
         return out
 
-    # Closed vocabulary, and the values are what a browser needs to synthesise
-    # the tone locally: no file is fetched, so nothing here can become a request
-    # to a host somebody else chose. Frequencies stay inside the band a small
-    # laptop speaker actually reproduces and a person can tell apart — the point
-    # is distinguishing four colleagues, not composing.
-    NOTIFY_SOUNDS: dict[str, dict[str, Any]] = {
-        "chime": {"hz": 880, "wave": "sine"},
-        "low": {"hz": 440, "wave": "sine"},
-        "high": {"hz": 1320, "wave": "sine"},
-        "soft": {"hz": 660, "wave": "triangle"},
-        "click": {"hz": 220, "wave": "square"},
-    }
-
     @mcp.tool(name="set_agent_display_name")
     @_instrument_tool(
         "set_agent_display_name",
@@ -12531,8 +12557,9 @@ def build_mcp_server() -> FastMCP:
         Parameters
         ----------
         notify_sound : Optional[str]
-            One of: chime, low, high, soft, click. Pass null or an empty string
-            to clear it and fall back to the viewer's default tone.
+            One of: chime, low, high, soft, click, double, rising, falling,
+            knock, pulse, bell, sparkle. Pass null or an empty string to clear
+            it and fall back to the viewer's default tone.
 
         Returns
         -------
@@ -12552,7 +12579,7 @@ def build_mcp_server() -> FastMCP:
         )
 
         choice = (notify_sound or "").strip().lower()
-        if choice and choice not in NOTIFY_SOUNDS:
+        if choice and choice not in NOTIFY_SOUND_NAMES:
             # Named explicitly rather than silently ignored: a tone that does not
             # play is indistinguishable from a viewer with sound switched off,
             # and the agent would have no way to tell which it was looking at.
@@ -12560,7 +12587,7 @@ def build_mcp_server() -> FastMCP:
                 error_type="INVALID_NOTIFY_SOUND",
                 message=(
                     f"Unknown notify_sound {choice!r}. "
-                    f"Expected one of: {', '.join(sorted(NOTIFY_SOUNDS))}."
+                    f"Expected one of: {', '.join(NOTIFY_SOUND_NAMES)}."
                 ),
             )
 
@@ -12573,7 +12600,7 @@ def build_mcp_server() -> FastMCP:
         return {
             "agent": agent.name,
             "notify_sound": choice or None,
-            "available": sorted(NOTIFY_SOUNDS),
+            "available": list(NOTIFY_SOUND_NAMES),
         }
 
     @mcp.tool(name="set_contact_policy")

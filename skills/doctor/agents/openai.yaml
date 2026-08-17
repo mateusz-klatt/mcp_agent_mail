@@ -1,0 +1,4 @@
+interface:
+  display_name: "Diagnose Agent Mail"
+  short_description: "Check mailbox identity, credentials, and monitor health"
+  default_prompt: "Use $doctor to diagnose this project mailbox and its exact monitor without exposing credentials."

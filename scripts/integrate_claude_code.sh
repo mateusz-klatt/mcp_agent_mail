@@ -108,6 +108,10 @@ AGENT_MAIL_HOOKS=(
   # directory the agent is already told about, so arming does not depend on the
   # plugin being installed.
   inbox_watch_monitor.sh
+  # Shared deterministic command behind the bundled onboard/doctor skills.
+  # Keeping it beside the common hook means the skills and lifecycle hooks use
+  # exactly the same private-state and secret-transport implementation.
+  agent_mail_setup.sh
 )
 
 # A native Windows checkout may contain CRLF hook sources because of the

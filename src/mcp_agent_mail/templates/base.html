@@ -3145,11 +3145,41 @@
         // colleague's preference must never become a request from this browser to
         // a host that colleague chose.
         const TONES = {
-          chime: { hz: 880,  wave: 'sine' },
-          low:   { hz: 440,  wave: 'sine' },
-          high:  { hz: 1320, wave: 'sine' },
-          soft:  { hz: 660,  wave: 'triangle' },
-          click: { hz: 220,  wave: 'square' },
+          chime:  { notes: [{ hz: 880,  wave: 'sine',     start: 0,    duration: 0.36, gain: 0.25 }] },
+          low:    { notes: [{ hz: 392,  wave: 'sine',     start: 0,    duration: 0.42, gain: 0.25 }] },
+          high:   { notes: [{ hz: 1319, wave: 'sine',     start: 0,    duration: 0.30, gain: 0.20 }] },
+          soft:   { notes: [{ hz: 659,  wave: 'triangle', start: 0,    duration: 0.55, gain: 0.13 }] },
+          click:  { notes: [{ hz: 196,  wave: 'square',   start: 0,    duration: 0.07, gain: 0.11 }] },
+          double: { notes: [
+            { hz: 784, wave: 'sine', start: 0,    duration: 0.16, gain: 0.21 },
+            { hz: 784, wave: 'sine', start: 0.22, duration: 0.16, gain: 0.21 },
+          ] },
+          rising: { notes: [
+            { hz: 440, wave: 'sine', start: 0,   duration: 0.18, gain: 0.20 },
+            { hz: 880, wave: 'sine', start: 0.2, duration: 0.24, gain: 0.22 },
+          ] },
+          falling: { notes: [
+            { hz: 988, wave: 'sine', start: 0,   duration: 0.18, gain: 0.20 },
+            { hz: 494, wave: 'sine', start: 0.2, duration: 0.24, gain: 0.22 },
+          ] },
+          knock: { notes: [
+            { hz: 196, wave: 'square', start: 0,    duration: 0.08, gain: 0.12 },
+            { hz: 196, wave: 'square', start: 0.16, duration: 0.08, gain: 0.12 },
+          ] },
+          pulse: { notes: [
+            { hz: 659, wave: 'triangle', start: 0,    duration: 0.10, gain: 0.16 },
+            { hz: 659, wave: 'triangle', start: 0.14, duration: 0.10, gain: 0.16 },
+            { hz: 659, wave: 'triangle', start: 0.28, duration: 0.10, gain: 0.16 },
+          ] },
+          bell: { notes: [
+            { hz: 784,  wave: 'sine', start: 0, duration: 0.50, gain: 0.18 },
+            { hz: 1568, wave: 'sine', start: 0, duration: 0.36, gain: 0.06 },
+          ] },
+          sparkle: { notes: [
+            { hz: 1047, wave: 'sine', start: 0,    duration: 0.10, gain: 0.15 },
+            { hz: 1319, wave: 'sine', start: 0.12, duration: 0.10, gain: 0.15 },
+            { hz: 1568, wave: 'sine', start: 0.24, duration: 0.16, gain: 0.16 },
+          ] },
         };
 
         // Which agent sounds like what. Read from a JSON island the page may or
@@ -3166,7 +3196,7 @@
         // Browsers refuse audio until a gesture inside the page, and arriving
         // from the login form does not count — hence opt-in, remembered.
         //
-        // Takes the sender so four colleagues are distinguishable without
+        // Takes the sender so several colleagues are distinguishable without
         // looking. Callers that cannot know who sent it pass nothing and get the
         // default, which is exactly what every caller did before this existed.
         function ding(agentName) {
@@ -3174,13 +3204,17 @@
           const tone = TONES[AGENT_TONES[agentName]] || TONES.chime;
           try {
             const ctx = new (window.AudioContext || window.webkitAudioContext)();
-            const osc = ctx.createOscillator(), gain = ctx.createGain();
-            osc.connect(gain); gain.connect(ctx.destination);
-            osc.frequency.value = tone.hz; osc.type = tone.wave;
-            gain.gain.setValueAtTime(0.0001, ctx.currentTime);
-            gain.gain.exponentialRampToValueAtTime(0.25, ctx.currentTime + 0.01);
-            gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.35);
-            osc.start(); osc.stop(ctx.currentTime + 0.36);
+            tone.notes.forEach((note) => {
+              const osc = ctx.createOscillator(), gain = ctx.createGain();
+              const start = ctx.currentTime + note.start;
+              const end = start + note.duration;
+              osc.connect(gain); gain.connect(ctx.destination);
+              osc.frequency.value = note.hz; osc.type = note.wave;
+              gain.gain.setValueAtTime(0.0001, start);
+              gain.gain.exponentialRampToValueAtTime(note.gain, start + Math.min(0.01, note.duration / 4));
+              gain.gain.exponentialRampToValueAtTime(0.0001, end);
+              osc.start(start); osc.stop(end + 0.01);
+            });
           } catch (e) { /* no device, or blocked: silence is acceptable */ }
         }
 

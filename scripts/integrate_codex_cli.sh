@@ -104,7 +104,8 @@ for _managed_file in \
   "$USER_TOML" \
   "$HOOK_RUNTIME" \
   "$HOOK_WRAPPER" \
-  "${HOOKS_DIR}/agent_mail_common.sh"; do
+  "${HOOKS_DIR}/agent_mail_common.sh" \
+  "${HOOKS_DIR}/agent_mail_setup.sh"; do
   _validate_managed_file_target "$_managed_file" || {
     log_err "No user configuration was changed."
     exit 1
@@ -149,7 +150,8 @@ _normalized_hook_source() {
 # what makes both --dry-run and a refused merge genuinely side-effect free.
 for _source in \
   "${ROOT_DIR}/scripts/hooks/codex_notify.sh" \
-  "${ROOT_DIR}/scripts/hooks/agent_mail_common.sh"; do
+  "${ROOT_DIR}/scripts/hooks/agent_mail_common.sh" \
+  "${ROOT_DIR}/scripts/hooks/agent_mail_setup.sh"; do
   if [[ ! -f "${_source}" ]]; then
     log_err "Missing required hook script: ${_source}"
     exit 1
@@ -1201,6 +1203,9 @@ set_secure_exec "$HOOK_RUNTIME" || exit 1
 _normalized_hook_source "${ROOT_DIR}/scripts/hooks/agent_mail_common.sh" | \
   write_atomic "${HOOKS_DIR}/agent_mail_common.sh"
 set_secure_file "${HOOKS_DIR}/agent_mail_common.sh" || exit 1
+_normalized_hook_source "${ROOT_DIR}/scripts/hooks/agent_mail_setup.sh" | \
+  write_atomic "${HOOKS_DIR}/agent_mail_setup.sh"
+set_secure_exec "${HOOKS_DIR}/agent_mail_setup.sh" || exit 1
 write_atomic "$HOOK_WRAPPER" <<<"$CODEX_WRAPPER_CONTENT"
 set_secure_exec "$HOOK_WRAPPER" || exit 1
 

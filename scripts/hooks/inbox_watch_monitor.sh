@@ -46,15 +46,38 @@ set -uo pipefail
 # shellcheck source=/dev/null
 . "$(dirname "$0")/agent_mail_common.sh" 2>/dev/null || exit 0
 
-# Same two-argument contract as inbox_watch.sh, and required for the same
-# reason: this script is client-neutral, and guessing "claude" here is what made
-# the watcher unusable from Codex and Copilot before a2d5b4f made it explicit.
-if [ "$#" -ne 2 ]; then
+SELF_PATH="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)/$(basename -- "$0")" || exit 0
+
+# The public two-argument form resolves identity once, then replaces itself
+# with an internal argv that names the exact project and Agent.  This is only
+# observability -- the singleton below is the authority -- but it makes `ps`
+# useful on hosts running several CLIs in several repositories.  No credential
+# or bearer ever crosses argv.
+if [ "$#" -eq 2 ]; then
+    CLIENT="$(am_client "$1")" || exit 0
+    SLOT="$(am_slot "$2")" || exit 0
+    PARENT_PID="$PPID"
+    PROJECT="$(am_project_key)"
+    if [ -z "$PROJECT" ]; then
+        printf 'Agent Mail: inbox monitor cannot derive a project from this working directory.\n' >&2
+        exit 0
+    fi
+    export AM_PROJECT_FOR_NAME="$PROJECT"
+    AGENT="$(am_agent_name "$CLIENT" "$SLOT")" || exit 0
+    exec "$SELF_PATH" --resolved "$CLIENT" "$SLOT" "$PROJECT" "$AGENT" "$PARENT_PID"
+fi
+if [ "$#" -ne 6 ] || [ "$1" != "--resolved" ]; then
     printf 'Agent Mail: inbox_watch_monitor.sh requires an explicit client and slot.\n' >&2
     exit 0
 fi
-CLIENT="$(am_client "$1")" || exit 0
-SLOT="$(am_slot "$2")" || exit 0
+CLIENT="$(am_client "$2")" || exit 0
+SLOT="$(am_slot "$3")" || exit 0
+PROJECT="$4"
+AGENT="$5"
+PARENT_PID="$6"
+case "$PARENT_PID" in ''|*[!0-9]*) exit 0 ;; esac
+[ -n "$PROJECT" ] && [ -n "$AGENT" ] || exit 0
+export AM_PROJECT_FOR_NAME="$PROJECT"
 
 # How long ONE subscription is held before reconnecting. Kept under the server's
 # own cap (AGENT_MAIL_EVENTS_MAX_SECONDS, 3600 by default, which ends the stream
@@ -74,19 +97,52 @@ BACKOFF_MAX="${AGENT_MAIL_MONITOR_BACKOFF_MAX:-300}"
 # How long a failure streak must last before it is worth one line of context.
 FAIL_ANNOUNCE="${AGENT_MAIL_MONITOR_FAIL_SECONDS:-300}"
 
-SELF_PATH="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)/$(basename -- "$0")" || exit 0
-
 CURL_PID=""
 STREAM=""
-MARKER=""
+slug="$(am_state_component "${PROJECT}|${AGENT}")" || exit 0
+WATCH_DIR="${AM_STATE_DIR}/watch"
+MARKER="${WATCH_DIR}/monitor-${slug}.pid"
+METADATA="${WATCH_DIR}/monitor-${slug}.json"
+MONITOR_LOCK="${WATCH_DIR}/monitor-${slug}.lock"
+mkdir -p "$WATCH_DIR" 2>/dev/null || exit 0
+
+# Exactly one stream per durable mailbox in one project. Different projects
+# deliberately derive different locks even when the same client/slot runs both.
+# A repeated `/wake` waits briefly, sees the live owner, and exits without ever
+# opening a second subscription.
+if ! am_lock_acquire "$MONITOR_LOCK" 20; then
+    exit 0
+fi
+
+stop_curl() {
+    local attempt=0
+    [ -n "$CURL_PID" ] || return 0
+    kill "$CURL_PID" 2>/dev/null || true
+    while kill -0 "$CURL_PID" 2>/dev/null && [ "$attempt" -lt 10 ]; do
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    if kill -0 "$CURL_PID" 2>/dev/null; then
+        kill -KILL "$CURL_PID" 2>/dev/null || true
+    fi
+    wait "$CURL_PID" 2>/dev/null || true
+    CURL_PID=""
+}
+
 cleanup() {
-    [ -n "$CURL_PID" ] && kill "$CURL_PID" 2>/dev/null
+    stop_curl
     [ -n "$STREAM" ] && rm -f "$STREAM" 2>/dev/null
     # The marker is what tells SessionStart not to ask the agent to arm a second
     # watcher alongside this one. Removing it on the way out is what makes that
     # suppression self-healing: if this process dies, the very next SessionStart
     # goes back to advertising the manual path.
-    [ -n "$MARKER" ] && rm -f "$MARKER" 2>/dev/null
+    if [ "$(tr -cd '0-9' < "$MARKER" 2>/dev/null)" = "$$" ]; then
+        rm -f "$MARKER" 2>/dev/null
+    fi
+    if [ "$(jq -r '.pid // empty' < "$METADATA" 2>/dev/null)" = "$$" ]; then
+        rm -f "$METADATA" 2>/dev/null
+    fi
+    am_lock_release "$MONITOR_LOCK"
 }
 trap cleanup EXIT
 # The signal handlers must EXIT, not merely clean up.
@@ -102,6 +158,20 @@ trap cleanup EXIT
 # orphaned the curl because no trap runs on SIGKILL. Exiting here lets the EXIT
 # trap above do the cleaning exactly once, on every path.
 trap 'exit 0' INT TERM HUP
+
+source_sha256="$(am_sha256 < "$SELF_PATH" 2>/dev/null || true)"
+metadata_tmp="${METADATA}.${BASHPID:-$$}.tmp"
+if jq -nc --argjson pid "$$" --argjson parent_pid "$PARENT_PID" \
+        --arg project_key "$PROJECT" --arg agent_name "$AGENT" \
+        --arg client "$CLIENT" --arg slot "$SLOT" --arg script "$SELF_PATH" \
+        --arg source_sha256 "$source_sha256" \
+        '{pid:$pid,parent_pid:$parent_pid,project_key:$project_key,agent_name:$agent_name,client:$client,slot:$slot,script:$script,source_sha256:$source_sha256}' \
+        > "$metadata_tmp" 2>/dev/null; then
+    chmod 600 "$metadata_tmp" 2>/dev/null || true
+    mv -f "$metadata_tmp" "$METADATA" 2>/dev/null || true
+fi
+rm -f "$metadata_tmp" 2>/dev/null || true
+printf '%s\n' "$$" > "$MARKER" 2>/dev/null || { exit 0; }
 
 # Highest message id already announced on stdout.
 #
@@ -128,38 +198,28 @@ announce() {
     printf 'Agent Mail: new mail (id %s) for %s\n' "$1" "$2"
 }
 
-# One sleep helper so an interrupted sleep cannot be mistaken for elapsed time.
-nap() { sleep "$1" 2>/dev/null || true; }
+# Sleep in short pieces while checking the actual CLI owner. This is deliberately
+# performed by the main shell rather than by a child that signals it: native
+# Git Bash has installations where `kill -TERM <bash-pid>` reports success but
+# the target keeps running. Exiting here runs the normal EXIT cleanup and cannot
+# leave a monitor ownership record attached to a dead CLI.
+nap() {
+    local remaining="$1" step
+    case "$remaining" in ''|*[!0-9]*) remaining=1 ;; esac
+    while [ "$remaining" -gt 0 ]; do
+        kill -0 "$PARENT_PID" 2>/dev/null || exit 0
+        step=2
+        [ "$remaining" -lt "$step" ] && step="$remaining"
+        sleep "$step" 2>/dev/null || true
+        remaining=$((remaining - step))
+    done
+}
 
 while :; do
-    # ── identity, re-resolved every cycle ────────────────────────────────────
-    #
-    # Re-resolved rather than computed once, because the failure modes it covers
-    # are all recoverable: a project activated after the monitor started, a
-    # credential written by a SessionStart that had not run yet, an identity
-    # migration completed by a human. Computing this once at startup would turn
-    # every one of those into a permanently dead monitor.
-    #
-    # The cost is real and this comment used to understate it by claiming cycles
-    # are hourly. They are hourly only while the mailbox is quiet: `GET /events`
-    # is one-shot, so every message ends a cycle and the next one starts by
-    # resolving the identity again. Measured by claude-win-home-1 on Windows,
-    # where git is slowest:
-    #
-    #     am_project_key 190 ms, am_project_is_active 102 ms,
-    #     am_identity_migration 718 ms, am_agent_name 419 ms  ->  1429 ms
-    #
-    # About ten cycles in eight minutes on a busy evening, so seconds of git per
-    # burst rather than a couple of calls an hour. Kept anyway: it buys the
-    # self-healing above, and it is latency between messages, never a lost one —
-    # the catch-up query after `: ready` covers the window in which no
-    # subscription is open. Resolve once every N cycles if this ever matters,
-    # but weigh it against a monitor that cannot recover from a late
-    # registration.
-    PROJECT="$(am_project_key)"
-    if [ -z "$PROJECT" ]; then nap "$BACKOFF_MAX"; continue; fi
-    export AM_PROJECT_FOR_NAME="$PROJECT"
-
+    # ── identity and credential, credential re-read every cycle ─────────────
+    # Project and Agent are fixed by the singleton key and visible in argv.
+    # Credentials remain dynamic: a monitor armed before onboarding recovers as
+    # soon as `/onboard` writes the private token, without another `/wake`.
     if ! am_project_is_active "$PROJECT" "$CLIENT" "$SLOT" .; then
         nap "$BACKOFF_MAX"
         continue
@@ -179,7 +239,6 @@ while :; do
     fi
     migration_announced=0
 
-    AGENT="$(am_agent_name "$CLIENT" "$SLOT")"
     token="$(am_cred_get "$PROJECT" "$AGENT")"
     bearer="$(am_bearer)"
     if [ -z "$AGENT" ] || [ -z "$token" ] || [ -z "$bearer" ]; then
@@ -188,22 +247,8 @@ while :; do
         continue
     fi
 
-    # ── liveness marker, refreshed once per cycle ────────────────────────────
-    #
-    # Holds this process's pid so SessionStart can distinguish "a monitor is
-    # running" from "a monitor ran once and died", which an mtime alone cannot:
-    # this script blocks inside curl for up to CONNECT seconds, so freshness has
-    # to tolerate an hour of no writes, and an hour is long enough for a dead
-    # monitor to keep suppressing the manual hint.
-    slug="$(am_state_component "${PROJECT}|${AGENT}")" || slug=""
-    if [ -n "$slug" ]; then
-        MARKER="${AM_STATE_DIR}/watch/monitor-${slug}.pid"
-        mkdir -p "$(dirname "$MARKER")" 2>/dev/null
-        printf '%s\n' "$$" > "$MARKER" 2>/dev/null
-    fi
-
     # ── subscribe ────────────────────────────────────────────────────────────
-    STREAM="${AM_STATE_DIR}/watch/monitor-${slug:-$$}.stream"
+    STREAM="${WATCH_DIR}/monitor-${slug}-$$.stream"
     : > "$STREAM" 2>/dev/null || { nap "$backoff"; continue; }
     url="${AM_BASE_URL}/events?project=$(am_urlencode "$PROJECT")&agent=$(am_urlencode "$AGENT")"
     started="$(date +%s 2>/dev/null || echo 0)"
@@ -219,15 +264,17 @@ while :; do
     ready_deadline=$(( started + READY_WAIT ))
     while :; do
         grep -q '^: ready' "$STREAM" 2>/dev/null && { ready=1; break; }
+        if ! kill -0 "$PARENT_PID" 2>/dev/null; then
+            stop_curl
+            exit 0
+        fi
         kill -0 "$CURL_PID" 2>/dev/null || break
         [ "$(date +%s 2>/dev/null || echo 0)" -ge "$ready_deadline" ] 2>/dev/null && break
         sleep 0.2
     done
 
     if [ "$ready" -ne 1 ]; then
-        kill "$CURL_PID" 2>/dev/null
-        wait "$CURL_PID" 2>/dev/null
-        CURL_PID=""
+        stop_curl
         now="$(date +%s 2>/dev/null || echo 0)"
         [ "$fail_since" -eq 0 ] && fail_since="$now"
         if [ "$fail_announced" -eq 0 ] \
@@ -285,6 +332,13 @@ while :; do
     # subscriptions for the same agent are explicitly supported server-side
     # (both are woken, neither evicts the other), so reconnecting immediately is
     # safe even if an old connection is still winding down.
+    while kill -0 "$CURL_PID" 2>/dev/null; do
+        if ! kill -0 "$PARENT_PID" 2>/dev/null; then
+            stop_curl
+            exit 0
+        fi
+        sleep 0.5
+    done
     wait "$CURL_PID" 2>/dev/null
     CURL_PID=""
     out="$(cat "$STREAM" 2>/dev/null)"

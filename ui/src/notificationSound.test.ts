@@ -93,8 +93,38 @@ function audioStub() {
 
 describe("toneFor", () => {
   it("resolves each word in the set_agent_notify_sound vocabulary", () => {
+    expect(Object.keys(tones)).toEqual([
+      "chime",
+      "low",
+      "high",
+      "soft",
+      "click",
+      "double",
+      "rising",
+      "falling",
+      "knock",
+      "pulse",
+      "bell",
+      "sparkle",
+    ]);
     for (const [word, tone] of Object.entries(tones)) {
       expect(toneFor(word)).toEqual(tone);
+    }
+  });
+
+  it("keeps all twelve audible patterns structurally distinct", () => {
+    const signatures = Object.values(tones).map((tone) =>
+      JSON.stringify(tone.notes),
+    );
+    expect(new Set(signatures).size).toBe(signatures.length);
+    for (const tone of Object.values(tones)) {
+      expect(tone.notes.length).toBeGreaterThan(0);
+      for (const note of tone.notes) {
+        expect(note.hz).toBeGreaterThanOrEqual(196);
+        expect(note.hz).toBeLessThanOrEqual(1568);
+        expect(note.duration).toBeGreaterThan(0);
+        expect(note.duration).toBeLessThanOrEqual(0.55);
+      }
     }
   });
 
@@ -154,9 +184,28 @@ describe("playNotificationTone", () => {
     playNotificationTone("click", memoryStorage({ [soundPreferenceKey]: "on" }));
 
     expect(oscillators).toHaveLength(1);
-    expect(oscillators[0]!.frequency).toEqual({ value: tones.click.hz });
-    expect(oscillators[0]!.type).toBe(tones.click.wave);
+    expect(oscillators[0]!.frequency).toEqual({
+      value: tones.click.notes[0].hz,
+    });
+    expect(oscillators[0]!.type).toBe(tones.click.notes[0].wave);
     expect(oscillators[0]!.start).toHaveBeenCalledOnce();
+  });
+
+  it("schedules every note in a rhythmic pattern", () => {
+    const { oscillators } = audioStub();
+
+    playNotificationTone(
+      "sparkle",
+      memoryStorage({ [soundPreferenceKey]: "on" }),
+    );
+
+    expect(oscillators).toHaveLength(tones.sparkle.notes.length);
+    expect(oscillators.map((oscillator) => oscillator.frequency.value)).toEqual(
+      tones.sparkle.notes.map((note) => note.hz),
+    );
+    expect(oscillators[1]!.start).toHaveBeenCalledWith(
+      tones.sparkle.notes[1].start,
+    );
   });
 
   it("reuses one context across notifications and releases only the nodes", () => {

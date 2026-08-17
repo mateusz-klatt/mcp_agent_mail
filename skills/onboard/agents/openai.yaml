@@ -1,0 +1,4 @@
+interface:
+  display_name: "Onboard Agent Mail"
+  short_description: "Provision and verify this project mailbox safely"
+  default_prompt: "Use $onboard to provision this project mailbox and persist its one-time credential safely."

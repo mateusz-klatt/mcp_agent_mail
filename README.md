@@ -62,6 +62,49 @@ curl -fsSL "https://raw.githubusercontent.com/mateusz-klatt/mcp_agent_mail/<tag>
 
 `scripts/install.sh --help` lists the flags. Per-client integrators live in `scripts/integrate_*.sh` and are safe to re-run — each one re-derives its own managed entries, so a second run updates rather than duplicates. **Re-run the integrator after pulling**: the installed hooks are copies, not links, and nothing warns when they fall behind.
 
+## New project in three steps
+
+1. Install or refresh the user-level lifecycle hooks and, for Claude Code, the
+   bundled `mcp-agent-mail` plugin that supplies `/onboard`, `/doctor` and
+   `/wake`.
+   Re-running `scripts/integrate_claude_code.sh --yes` or
+   `scripts/integrate_codex_cli.sh --yes` updates the managed copies; uninstall
+   is not required for hooks. A cached Claude plugin at the same version is the
+   exception: refresh that cache with plugin uninstall/install when doctor says
+   its running script snapshot is stale.
+2. In the new repository, Claude runs `/mcp-agent-mail:onboard`. Codex runs
+   `${CODEX_HOME:-${HOME}/.codex}/hooks/mcp-agent-mail/agent_mail_setup.sh onboard codex ${AGENT_MAIL_CODEX_SLOT:-1}`.
+   The command performs one secret-safe operation: it ensures the canonical remote-derived project,
+   registers the durable `client-os-host-slot` mailbox, captures the token that
+   is returned only once, atomically persists it under the granted Agent name,
+   then writes the repairable granted-name marker and verifies an authenticated
+   inbox read. It never prints the token.
+3. Claude runs `/mcp-agent-mail:doctor`; Codex uses the same installed script
+   with `doctor codex ${AGENT_MAIL_CODEX_SLOT:-1}`. It checks the exact project
+   and Agent rather than counting processes. Use `/mcp-agent-mail:wake` only
+   when leaving a Claude session unattended; repeated wake for the same mailbox
+   is idempotent, while monitors for different projects on the same machine
+   remain independent.
+
+On first creation the server also generates an English adjective+noun display
+alias (for example `BlueCastle`) and assigns one of twelve recognisably distinct
+notification patterns by the Agent's dense position inside that project. The
+canonical address does not change, and both display name and sound remain
+manually overridable preferences.
+
+Local state is sufficient; do not commit `.agent-mail-project-id` and do not add
+it to `.gitignore`. If an operator explicitly wants a checkout-local marker,
+rerun onboarding with `--local-marker`: it writes the exact server-returned
+`project_uid` and hides only the filename in `.git/info/exclude`. Do not use
+`projects mark-identity` for onboarding: in directory identity mode it can
+derive a different path hash on every host.
+
+Authentication binding is per MCP session. After a CLI restart the first
+authenticated tool call must establish the binding; later calls in that same
+session inherit it. Lifecycle hooks and the onboarding/doctor command read the
+credential privately, while an ordinary MCP tool session remains a separate
+transport.
+
 ## Licence — read before redistributing
 
 This project is **not** plain MIT. `LICENSE` is "MIT License (with OpenAI/Anthropic Rider)": the rider withholds all rights from OpenAI, Anthropic and their affiliates, terminates permission automatically on breach, and must be redistributed unmodified. Because it discriminates against named parties it is not an OSI-approved open-source licence, which is why package metadata declares `License :: Other/Proprietary License` and GitHub resolves the repository to `NOASSERTION`. The rider comes from upstream and is preserved here unchanged.
@@ -832,9 +875,10 @@ The UI shares the same parsing as the API's `_parse_fts_query`:
 ### Prerequisites to see data
 
 The UI reads from the same SQLite + Git artifacts as the MCP tools. To populate content:
-1) Ensure a project exists (via tool call or CLI):
-   - Ensure/create project: `ensure_project(human_key)`
-2) Register one or more durable mailboxes: `register_agent(project_key, program, model, name)`, where `name` follows `client-os-host-slot`
+1) For a client mailbox, run `/mcp-agent-mail:onboard`; an operator or other
+   trusted bootstrapper may instead use the granular `ensure_project` and
+   `register_agent` tools while providing an out-of-band credential handoff.
+2) Verify the exact mailbox with `/mcp-agent-mail:doctor`.
 3) Send messages: `send_message(..., idempotency_key="<stable-operation-key>")`.
    The current atomic-delivery contract is Markdown-body only; attachment inputs
    fail closed until canonical inline normalization is available.
@@ -2034,7 +2078,8 @@ sequenceDiagram
   - CLI (diagnostics): `mcp-agent-mail mail status /abs/path`
 
 - Precedence (when gate is on):
-  1) Committed marker `.agent-mail-project-id` (recommended)
+  1) Worktree marker `.agent-mail-project-id` (local-only in this fork; hide it
+     through `.git/info/exclude`, never commit it)
   2) Discovery YAML `.agent-mail.yaml` with `project_uid:`
   3) Private marker under Git common dir `.git/agent-mail/project-id`
   4) Remote fingerprint: normalized `origin` URL + default branch
@@ -2058,9 +2103,9 @@ for the marker precedence above. Local markers are an explicit opt-in and
 identity source for path-based CLI/MCP calls and repositories without a shared
 remote; use `mail status` to verify which path is active.
 
-- Migration helpers:
-  - Write committed marker: `mcp-agent-mail projects mark-identity . --commit`
-  - Scaffold discovery file: `mcp-agent-mail projects discovery-init . --product <product_uid>`
+- Identity utilities remain available for controlled migrations, but the
+  onboarding path deliberately does not call `projects mark-identity`: it uses
+  the canonical project key and exact `project_uid` returned by the server.
 
 Example identity payload (resource):
 
@@ -2574,9 +2619,11 @@ Output format (all tools/resources):
 | :-- | :-- | :-- | :-- |
 | `health_check` | `health_check()` | `{status, environment, http_host, http_port, http_path}` | Lightweight readiness probe; never exposes connection URLs |
 | `ensure_project` | `ensure_project(human_key: str, identity_mode?: str)` | `{id, project_uid, slug, human_key, project_generation, created_at}` | Idempotently resolves the durable Git/project identity and ensures its archive |
-| `register_agent` | `register_agent(project_key: str, program: str, model: str, name: str, task_description?: str, attachments_policy?: str)` | Agent profile dict | Creates/updates one durable mailbox; a token is issued exactly once on creation and never echoed on resume |
+| `register_agent` | `register_agent(project_key: str, program: str, model: str, name: str, task_description?: str, attachments_policy?: str, display_name?: str)` | Agent profile dict | Creates/updates one durable mailbox; creation generates an English display alias and project-local default sound, and issues a token exactly once |
 | `whois` | `whois(project_key: str, agent_name: str, include_recent_commits?: bool, commit_limit?: int)` | Agent profile dict | Enriched profile for one agent (optionally includes recent commits) |
-| `create_agent_identity` | `create_agent_identity(project_key: str, program: str, model: str, name_hint: str, task_description?: str, attachments_policy?: str)` | Agent profile dict | Provisions one explicitly named durable mailbox and returns its one-time credential; never use this for a subagent |
+| `create_agent_identity` | `create_agent_identity(project_key: str, program: str, model: str, name_hint: str, task_description?: str, attachments_policy?: str, display_name?: str)` | Agent profile dict | Provisions one explicitly named durable mailbox with the same display defaults and returns its one-time credential; never use this for a subagent |
+| `set_agent_display_name` | `set_agent_display_name(project_key: str, agent_name: str, display_name?: str, registration_token?: str)` | `{agent, display_name}` | Overrides or clears the human-readable alias; the canonical address never changes |
+| `set_agent_notify_sound` | `set_agent_notify_sound(project_key: str, agent_name: str, notify_sound?: str, registration_token?: str)` | `{agent, notify_sound, available}` | Overrides or clears one of the twelve closed, locally synthesized notification patterns |
 | `start_agent_execution` | `start_agent_execution(project_key, agent_name, external_id, client_name, execution_token, kind?, parent_execution_id?, parent_execution_token?, ...)` | AgentExecution dict | Starts or idempotently resumes a capability-bound root/session execution |
 | `heartbeat_agent_execution` | `heartbeat_agent_execution(project_key, agent_name, execution_id?, execution_token?, ...)` | AgentExecution dict | Refreshes one active execution and its observed Git/worktree metadata |
 | `end_agent_execution` | `end_agent_execution(project_key, agent_name, status?, execution_id?, execution_token?, ...)` | `{execution, descendants_ended, released_reservations, released_build_slots}` | Terminalizes an execution tree and releases only its automatic claims |
@@ -2892,8 +2939,11 @@ client opened a repository. Before any network request, they require either
 existing local credentials/granted-name state for the exact project or an
 explicit repository opt-in: a non-empty `.agent-mail-project-id`, or an
 `.agent-mail.yaml` containing `project_uid:`. This keeps unrelated checkouts out
-of the server. Per-project/per-agent registration tokens are stored in the
-private Agent Mail `credentials.json`, not in the shared environment file.
+of the server. Use `/mcp-agent-mail:onboard` to create that private state before
+the first lifecycle start; a marker alone cannot recover a token from an Agent
+already provisioned through an ordinary MCP call. Per-project/per-agent
+registration tokens are stored in the private Agent Mail `credentials.json`,
+not in the shared environment file.
 
 Before enabling the new `<client>-<os>-<host>-<slot>` name for an existing
 installation, migrate a legacy `<host>-<os>-<slot>` identity without

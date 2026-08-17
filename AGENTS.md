@@ -175,14 +175,15 @@ Macros vs granular tools
 ### Git-based identity: precedence and migration
 
 - Precedence (when gate is on):
-  1) Committed marker `.agent-mail-project-id`
+  1) Worktree marker `.agent-mail-project-id` (local-only; hide it through
+     `.git/info/exclude`, never commit it)
   2) Discovery YAML `.agent-mail.yaml` with `project_uid:`
   3) Private marker `.git/agent-mail/project-id`
   4) Remote fingerprint: normalized `origin` + default branch
   5) `git-common-dir` or path hash
-- Migration helpers (CLI):
-  - Write committed marker: `mcp-agent-mail projects mark-identity . --commit`
-  - Scaffold discovery YAML: `mcp-agent-mail projects discovery-init . --product <product_uid>`
+- Identity migration utilities exist for controlled operator work, but normal
+  onboarding must use `/mcp-agent-mail:onboard` and must not call
+  `projects mark-identity`; directory-mode derivation can be host-local.
 
 ### Guard usage quickstart
 

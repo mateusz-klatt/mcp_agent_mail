@@ -17,7 +17,7 @@ import pytest
 from fastmcp import Client
 
 from mcp_agent_mail import config as _config
-from mcp_agent_mail.app import build_mcp_server
+from mcp_agent_mail.app import NOTIFY_SOUND_NAMES, build_mcp_server
 
 KEY = "/test/sound"
 AGENT_NAME = "codex-linux-sound-1"
@@ -43,6 +43,78 @@ async def _register(client, name: str = AGENT_NAME):
         )
     )
     return me["registration_token"]
+
+
+async def _register_payload(client, project_key: str, name: str):
+    await client.call_tool("ensure_project", {"human_key": project_key})
+    return _data(
+        await client.call_tool(
+            "register_agent",
+            {
+                "project_key": project_key,
+                "name": name,
+                "program": "probe",
+                "model": "probe",
+            },
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_new_agents_get_dense_project_local_sounds(server):
+    """Global sparse ids must not make colleagues collide in a fresh project."""
+    other_key = "/test/sound-other"
+    async with Client(server) as client:
+        first = await _register_payload(client, KEY, "codex-linux-sound-1")
+        for slot in range(1, 6):
+            await _register_payload(
+                client,
+                other_key,
+                f"claude-linux-other-{slot}",
+            )
+        sounds = [first["notify_sound"]]
+        for slot in range(2, 14):
+            created = await _register_payload(
+                client,
+                KEY,
+                f"codex-linux-sound-{slot}",
+            )
+            sounds.append(created["notify_sound"])
+
+    assert sounds == [*NOTIFY_SOUND_NAMES, NOTIFY_SOUND_NAMES[0]]
+    assert len(set(sounds[:12])) == 12
+
+
+@pytest.mark.asyncio
+async def test_create_agent_identity_uses_the_same_sound_assignment(server):
+    project_key = "/test/sound-create"
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": project_key})
+        first = _data(
+            await client.call_tool(
+                "create_agent_identity",
+                {
+                    "project_key": project_key,
+                    "name_hint": "codex-linux-create-1",
+                    "program": "probe",
+                    "model": "probe",
+                },
+            )
+        )
+        second = _data(
+            await client.call_tool(
+                "create_agent_identity",
+                {
+                    "project_key": project_key,
+                    "name_hint": "codex-linux-create-2",
+                    "program": "probe",
+                    "model": "probe",
+                },
+            )
+        )
+
+    assert first["notify_sound"] == NOTIFY_SOUND_NAMES[0]
+    assert second["notify_sound"] == NOTIFY_SOUND_NAMES[1]
 
 
 @pytest.mark.asyncio

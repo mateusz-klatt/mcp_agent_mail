@@ -552,7 +552,7 @@ am_project_activation_message() {
         return 0
     fi
     printf '%s' \
-        "Agent Mail is not activated for ${project}. No Agent Mail network request was made and no Agent was registered. Explicitly onboard this repository first, or add a non-empty .agent-mail-project-id (or .agent-mail.yaml with project_uid) at its Git root. The global hook will not create projects or identities merely because a client opened a repository."
+        "Agent Mail is not activated for ${project}. No Agent Mail network request was made and no Agent was registered. Run the deterministic onboarding command first (Claude: /mcp-agent-mail:onboard; other clients: the installed agent_mail_setup.sh onboard <client> <slot>). A local project marker opens only the activation gate; it neither provisions nor recovers the private credential. The global hook will not create projects or identities merely because a client opened a repository."
 }
 
 # Print "old<TAB>new" and return 0 when registering the client-scoped name could
@@ -1119,8 +1119,9 @@ am_lock_atomic_claim() {
 
 am_lock_acquire() {
     local lock_dir="$1" self_owner observed_owner current_owner
-    local tries=0 empty_tries=0
+    local max_tries="${2:-200}" tries=0 empty_tries=0
     local recovery_dir="${1}.recovery" claim_file
+    case "$max_tries" in ''|0|*[!0-9]*) max_tries=200 ;; esac
     self_owner="${BASHPID:-$$}"
     claim_file="${lock_dir}.claim.${self_owner}"
     mkdir -p "$(dirname "$lock_dir")" 2>/dev/null || return 1
@@ -1189,7 +1190,7 @@ am_lock_acquire() {
             continue
         fi
         tries=$((tries + 1))
-        [ "$tries" -lt 200 ] || return 1
+        [ "$tries" -lt "$max_tries" ] || return 1
         sleep 0.05
     done
 }
@@ -1286,9 +1287,13 @@ am_ensure_agent_credential() {
     got_token="$(printf '%s' "$response" | jq -r \
         '.registration_token // empty' 2>/dev/null)"
     retired="$(printf '%s' "$response" | jq -r '.retired_at // empty' 2>/dev/null)"
+    # Persist the non-reissuable capability first. The granted-name marker is
+    # repairable; the credential is not. If the second atomic rename is
+    # interrupted, the next onboarding run authenticates from credentials.json
+    # and repairs the marker instead of orphaning the Agent.
     if [ "$got_name" != "$agent" ] || [ -z "$got_token" ] || [ -n "$retired" ] \
-        || ! am_granted_name_put "$project" "$got_name" "$client" "$slot" \
-        || ! am_cred_put "$project" "$got_name" "$got_token"; then
+        || ! am_cred_put "$project" "$got_name" "$got_token" \
+        || ! am_granted_name_put "$project" "$got_name" "$client" "$slot"; then
         am_lock_release "$lock_dir"
         return 1
     fi

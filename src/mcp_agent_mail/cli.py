@@ -5933,10 +5933,14 @@ def am_run(
 @projects_app.command("mark-identity")
 def projects_mark_identity(
     project_path: Annotated[Path, typer.Argument(..., help="Path to repo/worktree ('.' for current)")],
-    commit: Annotated[bool, typer.Option("--commit/--no-commit", help="Write committed marker .agent-mail-project-id")] = True,
 ) -> None:
     """
-    Write the current project_uid into a marker file (.agent-mail-project-id).
+    Write a checkout-local project_uid marker and hide it in .git/info/exclude.
+
+    This low-level migration utility derives identity from the checkout. Normal
+    mailbox provisioning should use /mcp-agent-mail:onboard, which writes the
+    exact project_uid returned by the server when a marker is explicitly
+    requested. The marker and its ignore rule are never committed.
     """
     p = _canonical_project_path(project_path)
     root = _resolve_repo_worktree_root(p)
@@ -5946,19 +5950,37 @@ def projects_mark_identity(
     if not uid:
         raise typer.BadParameter("Unable to resolve project_uid for this path.")
     marker_path = root / ".agent-mail-project-id"
-    marker_rel = marker_path.relative_to(root).as_posix()
-    marker_path.write_text(uid + "\n", encoding="utf-8")
-    console.print(f"[green]Wrote[/] {marker_path} with project_uid={uid}")
-    if commit:
-        try:
-            subprocess.run(["git", "-C", str(root), "add", "--", marker_rel], check=True)
-            subprocess.run(
-                ["git", "-C", str(root), "commit", "-m", "chore: add .agent-mail-project-id", "--", marker_rel],
-                check=True,
+    if marker_path.exists():
+        existing_uid = marker_path.read_text(encoding="utf-8").strip()
+        if existing_uid != uid:
+            raise typer.BadParameter(
+                f"Refusing to replace existing local marker {marker_path} "
+                f"({existing_uid!r}) with {uid!r}."
             )
-            console.print("[green]Committed marker file.[/]")
-        except Exception:
-            console.print("[yellow]Unable to commit marker automatically. Please commit manually.[/]")
+    exclude_raw = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--git-path", "info/exclude"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    exclude_path = Path(exclude_raw)
+    if not exclude_path.is_absolute():
+        exclude_path = root / exclude_path
+    exclude_path.parent.mkdir(parents=True, exist_ok=True)
+    excluded = (
+        exclude_path.read_text(encoding="utf-8").splitlines()
+        if exclude_path.exists()
+        else []
+    )
+    if ".agent-mail-project-id" not in excluded:
+        with exclude_path.open("a", encoding="utf-8") as handle:
+            handle.write(".agent-mail-project-id\n")
+    if not marker_path.exists():
+        marker_path.write_text(uid + "\n", encoding="utf-8")
+    console.print(
+        f"[green]Wrote local marker[/] {marker_path} with project_uid={uid}; "
+        "hidden only through .git/info/exclude."
+    )
 
 
 @projects_app.command("discovery-init")

@@ -19,8 +19,10 @@ twelve existing assertions about inbox_watch.sh keep a file to themselves.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -38,6 +40,7 @@ from tests.test_agent_hook_identity import (
 )
 
 MONITOR = ROOT / "scripts" / "hooks" / "inbox_watch_monitor.sh"
+SETUP = ROOT / "scripts" / "hooks" / "agent_mail_setup.sh"
 
 
 def _monitor_env(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
@@ -57,6 +60,40 @@ def _monitor_env(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
     env["AGENT_MAIL_MONITOR_BACKOFF_MAX"] = "1"
     env["AGENT_MAIL_MONITOR_BACKOFF_MIN"] = "1"
     return env, repo, tmp_path / "curl.log"
+
+
+def _install_setup_server(fake_bin: Path) -> None:
+    _install_fake_curl(
+        fake_bin,
+        r'''#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FAKE_ARGV_LOG"
+body="$(cat)"
+tool="$(printf '%s' "$body" | jq -r '.params.name')"
+case "$tool" in
+  ensure_project)
+    result='{"id":1,"slug":"owner-repo","human_key":"/owner/repo","project_uid":"private-project-uid"}'
+    ;;
+  register_agent)
+    name="$(printf '%s' "$body" | jq -r '.params.arguments.name')"
+    token="$(printf '%s' "$body" | jq -r '.params.arguments.registration_token // empty')"
+    if [[ -z "$token" ]]; then
+      result="$(jq -nc --arg name "$name" '{id:7,name:$name,display_name:"BlueCastle",notify_sound:"chime",registration_token:"one-time-secret"}')"
+    else
+      [[ "$token" == "one-time-secret" ]] || exit 91
+      result="$(jq -nc --arg name "$name" '{id:7,name:$name,display_name:"BlueCastle",notify_sound:"chime"}')"
+    fi
+    ;;
+  fetch_inbox)
+    token="$(printf '%s' "$body" | jq -r '.params.arguments.registration_token // empty')"
+    [[ "$token" == "one-time-secret" ]] || exit 92
+    result='[]'
+    ;;
+  *) exit 93 ;;
+esac
+jq -nc --argjson value "$result" '{result:{content:[{type:"text",text:($value|tojson)}],isError:false}}'
+printf '200\n'
+''',
+    )
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -129,6 +166,15 @@ def _spawn_monitor(
 
 def _read_output(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
+
+
+def _wait_until(predicate, *, budget: float = 10.0) -> bool:
+    deadline = time.monotonic() + budget
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return bool(predicate())
 
 
 def _stop_and_read(
@@ -271,6 +317,342 @@ def test_monitor_stays_alive_and_silent_without_an_identity(tmp_path: Path) -> N
         stdout, _stderr = _stop_and_read(proc, out_path, err_path)
 
     assert stdout == "", f"monitor spoke when it had nothing to report: {stdout!r}"
+
+
+def test_onboard_persists_the_one_time_token_and_doctor_never_prints_it(
+    tmp_path: Path,
+) -> None:
+    env, repo, _ = _monitor_env(tmp_path)
+    fake_bin = tmp_path / "bin"
+    _install_setup_server(fake_bin)
+    argv_log = tmp_path / "argv.log"
+    env["FAKE_ARGV_LOG"] = _git_bash_path(argv_log)
+
+    first = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "onboard", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert first.returncode == 0, first.stderr
+    assert "Agent Mail onboarding complete" in first.stdout
+    assert "display name: BlueCastle" in first.stdout
+    assert "notification sound: chime" in first.stdout
+    assert "one-time-secret" not in first.stdout + first.stderr
+    assert "one-time-secret" not in argv_log.read_text(encoding="utf-8")
+    assert not (repo / ".agent-mail-project-id").exists()
+
+    credentials = json.loads(
+        (tmp_path / "state" / "credentials.json").read_text(encoding="utf-8")
+    )
+    [(agent_name, stored_token)] = credentials["/owner/repo"].items()
+    assert agent_name.startswith("claude-") and agent_name.endswith("-1")
+    assert stored_token == "one-time-secret"
+    assert list((tmp_path / "state" / "granted").iterdir())
+
+    again = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "onboard", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert again.returncode == 0, again.stderr
+    assert "one-time-secret" not in again.stdout + again.stderr
+
+    doctor = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "doctor", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert doctor.returncode == 0, "an optional night monitor is not mailbox damage"
+    assert "server authentication: valid" in doctor.stdout
+    assert "local marker: absent (optional" in doctor.stdout
+    assert "monitor: not armed for this project and Agent (optional" in doctor.stdout
+    assert "result: healthy" in doctor.stdout
+    assert "one-time-secret" not in doctor.stdout + doctor.stderr
+
+
+def test_onboard_persists_the_non_reissuable_token_before_repairable_name_marker(
+    tmp_path: Path,
+) -> None:
+    env, repo, _ = _monitor_env(tmp_path)
+    fake_bin = tmp_path / "bin"
+    _install_setup_server(fake_bin)
+    env["FAKE_ARGV_LOG"] = _git_bash_path(tmp_path / "argv.log")
+    real_mv = subprocess.run(
+        [BASH, "-lc", "command -v mv"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    env["REAL_MV"] = real_mv
+    env["FAIL_GRANTED_WRITE"] = "1"
+    fake_mv = fake_bin / "mv"
+    fake_mv.write_text(
+        """#!/usr/bin/env bash
+if [[ "${FAIL_GRANTED_WRITE:-}" == 1 ]]; then
+  for argument in "$@"; do
+    [[ "$argument" == */granted/* ]] && exit 71
+  done
+fi
+exec "$REAL_MV" "$@"
+""",
+        encoding="utf-8",
+    )
+    fake_mv.chmod(0o755)
+
+    interrupted = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "onboard", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert interrupted.returncode == 1
+    credentials = json.loads(
+        (tmp_path / "state" / "credentials.json").read_text(encoding="utf-8")
+    )
+    assert list(credentials["/owner/repo"].values()) == ["one-time-secret"]
+    assert "one-time-secret" not in interrupted.stdout + interrupted.stderr
+
+    repaired_env = {key: value for key, value in env.items() if key != "FAIL_GRANTED_WRITE"}
+    repaired = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "onboard", "claude", "1"],
+        cwd=repo,
+        env=repaired_env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert repaired.returncode == 0, repaired.stderr
+    assert list((tmp_path / "state" / "granted").iterdir())
+    assert "one-time-secret" not in repaired.stdout + repaired.stderr
+
+
+def test_onboard_local_marker_is_explicit_and_hidden_only_locally(
+    tmp_path: Path,
+) -> None:
+    env, repo, _ = _monitor_env(tmp_path)
+    _install_setup_server(tmp_path / "bin")
+    env["FAKE_ARGV_LOG"] = _git_bash_path(tmp_path / "argv.log")
+
+    result = subprocess.run(
+        [
+            BASH,
+            _git_bash_path(SETUP),
+            "onboard",
+            "claude",
+            "1",
+            "--local-marker",
+        ],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (repo / ".agent-mail-project-id").read_text(encoding="utf-8") == (
+        "private-project-uid\n"
+    )
+    exclude = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--git-path", "info/exclude"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    exclude_path = Path(exclude)
+    if not exclude_path.is_absolute():
+        exclude_path = repo / exclude_path
+    assert ".agent-mail-project-id" in exclude_path.read_text(encoding="utf-8")
+    status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--short"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status.stdout == ""
+
+    doctor = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "doctor", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert doctor.returncode == 0, doctor.stdout + doctor.stderr
+    assert "local marker: present and hidden only in .git/info/exclude" in doctor.stdout
+
+    (repo / ".gitignore").write_text(
+        ".agent-mail-project-id\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "-f", ".agent-mail-project-id"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    unsafe = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "doctor", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert unsafe.returncode == 1
+    assert "invalid public .gitignore entry" in unsafe.stdout
+    assert "invalid tracked .agent-mail-project-id" in unsafe.stdout
+
+
+def test_monitor_is_singleton_per_project_and_agent_with_diagnostic_argv(
+    tmp_path: Path,
+) -> None:
+    """Repeated `/wake` is free; another project remains independently valid."""
+    env, repo, _ = _monitor_env(tmp_path)
+    first, first_out, first_err = _spawn_monitor(env, repo, tmp_path, "first")
+    duplicate: subprocess.Popen[bytes] | None = None
+    other: subprocess.Popen[bytes] | None = None
+    duplicate_out = duplicate_err = other_out = other_err = tmp_path / "unused"
+    try:
+        watch_dir = tmp_path / "state" / "watch"
+        assert _wait_until(lambda: len(list(watch_dir.glob("monitor-*.json"))) == 1)
+        duplicate, duplicate_out, duplicate_err = _spawn_monitor(
+            env,
+            repo,
+            tmp_path,
+            "duplicate",
+        )
+        assert _wait_until(lambda: duplicate.poll() is not None)
+        assert first.poll() is None
+        assert len(list(watch_dir.glob("monitor-*.json"))) == 1
+
+        other_repo = tmp_path / "other-repo"
+        _init_git_repo(other_repo)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(other_repo),
+                "remote",
+                "set-url",
+                "origin",
+                "git@github.com:owner/other.git",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        other, other_out, other_err = _spawn_monitor(
+            env,
+            other_repo,
+            tmp_path,
+            "other",
+        )
+        assert _wait_until(lambda: len(list(watch_dir.glob("monitor-*.json"))) == 2)
+        assert first.poll() is None and other.poll() is None
+
+        metadata = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in watch_dir.glob("monitor-*.json")
+        ]
+        assert {item["project_key"] for item in metadata} == {
+            "/owner/repo",
+            "/owner/other",
+        }
+        agent_names = {item["agent_name"] for item in metadata}
+        assert len(agent_names) == 1
+        resolved_agent = agent_names.pop()
+        assert resolved_agent.startswith("claude-")
+        assert resolved_agent.endswith("-1")
+        if Path(f"/proc/{first.pid}/cmdline").is_file():
+            argv = Path(f"/proc/{first.pid}/cmdline").read_bytes().replace(
+                b"\0", b" "
+            )
+            assert b"--resolved" in argv
+            assert b"/owner/repo" in argv
+            assert resolved_agent.encode() in argv
+    finally:
+        if duplicate is not None:
+            _stop_and_read(duplicate, duplicate_out, duplicate_err)
+        if other is not None:
+            _stop_and_read(other, other_out, other_err)
+        _stop_and_read(first, first_out, first_err)
+
+
+def test_monitor_exits_and_cleans_its_exact_record_when_cli_parent_exits(
+    tmp_path: Path,
+) -> None:
+    """A native-Windows-style orphan must not survive into the next CLI run."""
+    env, repo, _ = _monitor_env(tmp_path)
+    watch_dir = tmp_path / "state" / "watch"
+    env.update(
+        {
+            "TEST_BASH": BASH,
+            "TEST_MONITOR": _git_bash_path(MONITOR),
+            "TEST_REPO": str(repo),
+            "TEST_WATCH_DIR": str(watch_dir),
+        }
+    )
+    helper = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import glob
+import os
+import subprocess
+import time
+
+child = subprocess.Popen(
+    [os.environ["TEST_BASH"], os.environ["TEST_MONITOR"], "claude", "1"],
+    cwd=os.environ["TEST_REPO"],
+    env=os.environ.copy(),
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    start_new_session=True,
+)
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline:
+    if glob.glob(os.path.join(os.environ["TEST_WATCH_DIR"], "monitor-*.json")):
+        print(child.pid, flush=True)
+        raise SystemExit(0)
+    time.sleep(0.05)
+raise SystemExit(2)
+""",
+        ],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert helper.returncode == 0, helper.stderr
+    assert helper.stdout.strip().isdigit()
+    assert _wait_until(
+        lambda: not list(watch_dir.glob("monitor-*.json"))
+        and not list(watch_dir.glob("monitor-*.pid")),
+        budget=10,
+    ), "monitor retained its ownership record after the original CLI parent exited"
 
 
 @pytest.mark.skipif(

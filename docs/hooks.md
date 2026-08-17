@@ -20,6 +20,7 @@ agent about to edit a file somebody else is already in.
 | `session_end.sh` | SubagentStop, SessionEnd | never |
 | `inbox_watch.sh` | not a hook — a Claude background task | it exits, which is the Claude wake |
 | `inbox_watch_monitor.sh` | not a hook — a Claude plugin monitor | one line per message; silence otherwise |
+| `agent_mail_setup.sh` | manual `/onboard` and `/doctor` backend | safe summary only; credentials never print |
 
 `inbox_watch.sh <client> <slot>` binds the subscription to the identity
 established by that client's SessionStart; it never guesses between multiple
@@ -79,10 +80,11 @@ not need a `version` bump.
 
 Which copy actually executes has differed between machines — on WSL both the
 skill and the monitor ran from the repository path while a stale cache copy sat
-beside them — so read the path out of `ps -ef | grep '[i]nbox_watch_monitor'`
-instead of assuming either. Not `pgrep`: Git for Windows does not ship it, and
-its `command not found` prints no matches, which reads exactly like "nothing is
-running".
+beside them. Diagnose it with `/mcp-agent-mail:doctor`: the monitor publishes
+its non-secret project, Agent, parent pid, script path and source hash in an
+exact private record. Do not infer health from `ps`, `pgrep`, or a global
+process count; several repositories on one machine may correctly have separate
+monitors, and wrappers can make one monitor look like two processes.
 
 The bare `.sh` in the manifest needs no interpreter of its own: the host
 resolves one, including on Windows, where it starts the command through Git for
@@ -105,7 +107,9 @@ nothing. Re-arm after pulling.
 A monitor that exits is never restarted for the life of the CLI process, and it
 is not restored when a session resumes. If the CLI restarts overnight, instant
 delivery stays off until someone runs `/wake` again — the lifecycle hooks still
-deliver on the next turn, so mail is delayed rather than lost.
+deliver on the next turn, so mail is delayed rather than lost. Repeating
+`/wake` while the exact project+Agent monitor is alive is idempotent; another
+project receives its own independent monitor.
 
 ## Installing
 
@@ -284,11 +288,14 @@ server-launch helper is created.
 
 `SessionStart` derives the repository and the Claude client slot, then applies a
 local activation gate before any server request. Existing credentials or a
-current/legacy granted-name file activate a known project. A new project must
-carry a non-empty `.agent-mail-project-id` or an `.agent-mail.yaml` declaring
-`project_uid:`. Only then does the hook register the agent and store its
-per-agent registration token in the private `credentials.json` state store. The
-registration token is never copied into `~/.agent-mail.env`.
+current/legacy granted-name file activate a known project. Bootstrap a new
+mailbox with `/mcp-agent-mail:onboard`, which captures the one-time token before
+the lifecycle hook can encounter the existing server identity without it. A
+non-empty local `.agent-mail-project-id` or an `.agent-mail.yaml` declaring
+`project_uid:` may also open the activation gate, but neither replaces the
+private credential. Keep the marker checkout-local through `.git/info/exclude`;
+do not commit it or add its rule to `.gitignore`. The registration token is never copied into
+`~/.agent-mail.env`.
 
 When an origin exists, the global hook derives and sends its canonical
 synthetic `/owner/repo` key; it does not pass a checkout path through the local

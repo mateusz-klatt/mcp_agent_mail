@@ -15,7 +15,7 @@ Without coordination, multiple agents:
 - Require humans to relay messages between tools
 
 Agent Mail solves this with:
-- Memorable identities (adjective+noun names like "GreenCastle")
+- Durable `client-os-host-slot` addresses plus generated adjective+noun display aliases
 - Advisory file reservations to signal editing intent
 - Threaded messaging with importance levels and acknowledgments
 - Pre-commit guard to enforce reservations at commit time
@@ -41,7 +41,11 @@ Web UI for humans: `http://127.0.0.1:8765/mail`
 Each working directory (absolute path) is a project. Agents in the same directory share a project namespace. Use the same `project_key` for agents that need to coordinate.
 
 ### Agent Identity
-Agents register with adjective+noun names (GreenCastle, BlueLake). Names are unique per project, memorable, and appear in inboxes, commit logs, and the web UI.
+Agents register one durable `client-os-host-slot` address, such as
+`codex-wsl-home-1`. New mailboxes receive a generated English adjective+noun
+display alias such as `GreenCastle`; the alias is never an address or
+credential. Sessions and native subagents are `AgentExecution` rows beneath the
+same mailbox, not new Agent identities.
 
 ### File Reservations (Leases)
 Advisory locks on file paths or globs. Before editing files, reserve them to signal intent. Other agents see the reservation and can choose different work. The optional pre-commit guard blocks commits that conflict with others' exclusive reservations.
@@ -237,9 +241,9 @@ Bypass in emergencies: `AGENT_MAIL_BYPASS=1 git commit ...`
 | Tool | Purpose |
 |------|---------|
 | `ensure_project(human_key)` | Create/ensure project exists |
-| `register_agent(project_key, program, model, name?, task_description?)` | Register identity |
+| `register_agent(project_key, program, model, name, task_description?)` | Register or authenticate one durable identity |
 | `whois(project_key, agent_name)` | Get agent profile with recent commits |
-| `create_agent_identity(project_key, program, model)` | Always create new unique agent |
+| `create_agent_identity(project_key, program, model, name_hint)` | Provision one new explicit durable identity |
 
 ### Messaging
 
@@ -358,6 +362,15 @@ uv run python -m mcp_agent_mail.cli archive restore <file>.zip --force
 
 ## Mailbox Health (Doctor)
 
+For one client's project-local identity and credential, Claude invokes
+`/mcp-agent-mail:doctor`; Codex runs its installed
+`hooks/mcp-agent-mail/agent_mail_setup.sh doctor codex <slot>`. The diagnostic
+is read-only and checks the exact project+Agent; do not count all monitor
+processes on a machine. Use the corresponding onboard command for a new
+repository or host.
+
+The CLI commands below diagnose server storage rather than one client mailbox:
+
 ```bash
 # Run diagnostics
 uv run python -m mcp_agent_mail.cli doctor check
@@ -375,7 +388,7 @@ Checks: stale locks, database integrity, orphaned records, FTS sync, expired res
 
 | Error | Fix |
 |-------|-----|
-| "sender_name not registered" | Call `register_agent` or `macro_start_session` first |
+| "sender_name not registered" | Run the client onboarding command as the durable parent; never create a subagent identity |
 | "FILE_RESERVATION_CONFLICT" | Wait for expiry, coordinate, or use non-exclusive |
 | "CONTACT_BLOCKED" | Use `request_contact` and wait for approval |
 | Empty inbox | Check `since_ts`, `urgent_only`, verify agent name matches exactly |

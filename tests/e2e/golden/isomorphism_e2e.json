@@ -350,6 +350,7 @@
           "last_active_ts": "2025-01-01T00:02:01+00:00",
           "model": "gpt-5",
           "name": "codex-wsl-isomorphism-alpha-1",
+          "notify_sound": "chime",
           "program": "codex",
           "project_id": 1,
           "task_description": ""
@@ -362,6 +363,7 @@
           "last_active_ts": "2025-01-01T00:02:02+00:00",
           "model": "gpt-5",
           "name": "codex-wsl-isomorphism-alpha-2",
+          "notify_sound": "low",
           "program": "codex",
           "project_id": 1,
           "task_description": ""
@@ -374,6 +376,7 @@
           "last_active_ts": "2025-01-01T00:02:03+00:00",
           "model": "gpt-5",
           "name": "codex-wsl-isomorphism-alpha-3",
+          "notify_sound": "high",
           "program": "codex",
           "project_id": 1,
           "task_description": ""
@@ -386,6 +389,7 @@
           "last_active_ts": "2025-01-01T00:02:04+00:00",
           "model": "gpt-5",
           "name": "codex-wsl-isomorphism-alpha-4",
+          "notify_sound": "soft",
           "program": "codex",
           "project_id": 1,
           "task_description": ""
@@ -407,6 +411,7 @@
           "last_active_ts": "2025-01-01T00:02:07+00:00",
           "model": "gpt-5",
           "name": "codex-wsl-isomorphism-alpha-1",
+          "notify_sound": "high",
           "program": "codex",
           "project_id": 2,
           "task_description": ""
@@ -419,6 +424,7 @@
           "last_active_ts": "2025-01-01T00:02:05+00:00",
           "model": "gpt-5",
           "name": "codex-wsl-isomorphism-beta-5",
+          "notify_sound": "chime",
           "program": "codex",
           "project_id": 2,
           "task_description": ""
@@ -431,6 +437,7 @@
           "last_active_ts": "2025-01-01T00:02:06+00:00",
           "model": "gpt-5",
           "name": "codex-wsl-isomorphism-beta-6",
+          "notify_sound": "low",
           "program": "codex",
           "project_id": 2,
           "task_description": ""
@@ -450,6 +457,7 @@
       "last_active_ts": "2025-01-01T00:02:01+00:00",
       "model": "gpt-5",
       "name": "codex-wsl-isomorphism-alpha-1",
+      "notify_sound": "chime",
       "program": "codex",
       "project_id": 1,
       "recent_commits": [],

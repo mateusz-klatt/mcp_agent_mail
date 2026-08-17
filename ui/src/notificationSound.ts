@@ -18,9 +18,16 @@
 
 export const soundPreferenceKey = "agentMailSound";
 
-interface Tone {
+interface ToneNote {
   hz: number;
   wave: OscillatorType;
+  start: number;
+  duration: number;
+  gain: number;
+}
+
+interface Tone {
+  notes: readonly ToneNote[];
 }
 
 /**
@@ -31,17 +38,73 @@ interface Tone {
  * string go through {@link toneFor}, which supplies the fallback.
  */
 export const tones = {
-  chime: { hz: 880, wave: "sine" },
-  low: { hz: 440, wave: "sine" },
-  high: { hz: 1320, wave: "sine" },
-  soft: { hz: 660, wave: "triangle" },
-  click: { hz: 220, wave: "square" },
+  chime: {
+    notes: [{ hz: 880, wave: "sine", start: 0, duration: 0.36, gain: 0.25 }],
+  },
+  low: {
+    notes: [{ hz: 392, wave: "sine", start: 0, duration: 0.42, gain: 0.25 }],
+  },
+  high: {
+    notes: [{ hz: 1319, wave: "sine", start: 0, duration: 0.3, gain: 0.2 }],
+  },
+  soft: {
+    notes: [
+      { hz: 659, wave: "triangle", start: 0, duration: 0.55, gain: 0.13 },
+    ],
+  },
+  click: {
+    notes: [{ hz: 196, wave: "square", start: 0, duration: 0.07, gain: 0.11 }],
+  },
+  double: {
+    notes: [
+      { hz: 784, wave: "sine", start: 0, duration: 0.16, gain: 0.21 },
+      { hz: 784, wave: "sine", start: 0.22, duration: 0.16, gain: 0.21 },
+    ],
+  },
+  rising: {
+    notes: [
+      { hz: 440, wave: "sine", start: 0, duration: 0.18, gain: 0.2 },
+      { hz: 880, wave: "sine", start: 0.2, duration: 0.24, gain: 0.22 },
+    ],
+  },
+  falling: {
+    notes: [
+      { hz: 988, wave: "sine", start: 0, duration: 0.18, gain: 0.2 },
+      { hz: 494, wave: "sine", start: 0.2, duration: 0.24, gain: 0.22 },
+    ],
+  },
+  knock: {
+    notes: [
+      { hz: 196, wave: "square", start: 0, duration: 0.08, gain: 0.12 },
+      { hz: 196, wave: "square", start: 0.16, duration: 0.08, gain: 0.12 },
+    ],
+  },
+  pulse: {
+    notes: [
+      { hz: 659, wave: "triangle", start: 0, duration: 0.1, gain: 0.16 },
+      { hz: 659, wave: "triangle", start: 0.14, duration: 0.1, gain: 0.16 },
+      { hz: 659, wave: "triangle", start: 0.28, duration: 0.1, gain: 0.16 },
+    ],
+  },
+  bell: {
+    notes: [
+      { hz: 784, wave: "sine", start: 0, duration: 0.5, gain: 0.18 },
+      { hz: 1568, wave: "sine", start: 0, duration: 0.36, gain: 0.06 },
+    ],
+  },
+  sparkle: {
+    notes: [
+      { hz: 1047, wave: "sine", start: 0, duration: 0.1, gain: 0.15 },
+      { hz: 1319, wave: "sine", start: 0.12, duration: 0.1, gain: 0.15 },
+      { hz: 1568, wave: "sine", start: 0.24, duration: 0.16, gain: 0.16 },
+    ],
+  },
 } as const satisfies Record<string, Tone>;
 
 // Spelled out rather than read back from `tones`: the record is indexed by
 // arbitrary strings, so a lookup is `Tone | undefined` and the default must not
 // be.
-const defaultTone: Tone = { hz: 880, wave: "sine" };
+const defaultTone: Tone = tones.chime;
 
 export function soundEnabled(
   // Read off `globalThis` rather than the bare identifier: in a non-DOM
@@ -157,25 +220,31 @@ export function playNotificationTone(
     if (ctx.state === "suspended") {
       void ctx.resume().catch(() => undefined);
     }
-    const oscillator = ctx.createOscillator();
-    const gain = ctx.createGain();
-    oscillator.connect(gain);
-    gain.connect(ctx.destination);
-    oscillator.frequency.value = tone.hz;
-    oscillator.type = tone.wave;
-    // Ramp rather than switch: an instant edge on a square wave clicks audibly
-    // on some devices, which reads as a defect rather than a notification.
-    gain.gain.setValueAtTime(0.0001, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.25, ctx.currentTime + 0.01);
-    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.35);
-    oscillator.start();
-    oscillator.stop(ctx.currentTime + 0.36);
-    // Only the nodes are disposable; the context is not. Releasing the nodes
-    // keeps a long-lived context from accumulating them.
-    oscillator.onended = () => {
-      oscillator.disconnect();
-      gain.disconnect();
-    };
+    for (const note of tone.notes) {
+      const oscillator = ctx.createOscillator();
+      const gain = ctx.createGain();
+      const start = ctx.currentTime + note.start;
+      const end = start + note.duration;
+      oscillator.connect(gain);
+      gain.connect(ctx.destination);
+      oscillator.frequency.value = note.hz;
+      oscillator.type = note.wave;
+      // Ramp rather than switch: an instant edge on a square wave clicks
+      // audibly on some devices. Short patterns keep a shorter attack so their
+      // rhythm remains crisp without producing an uncontrolled edge.
+      const attack = Math.min(0.01, note.duration / 4);
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.exponentialRampToValueAtTime(note.gain, start + attack);
+      gain.gain.exponentialRampToValueAtTime(0.0001, end);
+      oscillator.start(start);
+      oscillator.stop(end + 0.01);
+      // Only the nodes are disposable; the context is not. Releasing the nodes
+      // keeps a long-lived context from accumulating them.
+      oscillator.onended = () => {
+        oscillator.disconnect();
+        gain.disconnect();
+      };
+    }
   } catch {
     /* no device, or autoplay blocked: silence is acceptable */
   }

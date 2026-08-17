@@ -222,6 +222,25 @@ def _wait_until(predicate, *, budget: float = 10.0) -> bool:
     return bool(predicate())
 
 
+def _bash_can_observe_pid(pid: int) -> bool:
+    """Ask the monitor's own process namespace whether ``pid`` is still live."""
+    return (
+        subprocess.run(
+            [BASH, "-c", f"kill -0 {pid} 2>/dev/null"],
+            check=False,
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+
+
+def _recorded_monitor_pid(path: Path) -> int | None:
+    """Read a monitor pid across the brief remove/replace window."""
+    with contextlib.suppress(OSError, ValueError, KeyError):
+        return int(json.loads(path.read_text(encoding="utf-8"))["pid"])
+    return None
+
+
 def _stop_and_read(
     proc: subprocess.Popen[bytes],
     out_path: Path,
@@ -483,20 +502,25 @@ def test_monitor_keeps_running_when_its_owner_cannot_be_observed(
     probe, probe_out, probe_err = _spawn_monitor(env, repo, tmp_path, "resolve")
     try:
         assert _wait_until(lambda: bool(list(watch_dir.glob("monitor-*.json"))))
+        record_path = next(iter(watch_dir.glob("monitor-*.json")))
         record = json.loads(
-            next(iter(watch_dir.glob("monitor-*.json"))).read_text(encoding="utf-8")
+            record_path.read_text(encoding="utf-8")
         )
     finally:
         _stop_and_read(probe, probe_out, probe_err)
+        # On Windows the Popen handle can name the bootstrap process that MSYS
+        # replaced, while the live monitor recorded its own different pid. Stop
+        # that process too or it keeps the project+Agent singleton and makes the
+        # real subject below exit successfully as a duplicate.
+        _sweep_monitors(tmp_path)
 
-    # Deliberately NOT waiting for the probe's record to disappear. Windows has
-    # no stop that runs the EXIT trap -- `Popen.terminate()` is TerminateProcess
-    # just as `taskkill /F` is, measured by claude-win-home-1 to leave the record
-    # behind either way -- so waiting for cleanup here would fail in the
-    # preparation of a test that is about something else entirely. The singleton
-    # below does not need the courtesy: `am_lock_acquire` recovers a lock whose
-    # recorded owner is gone, and the monitor's own pid is one this shell can
-    # observe even where the CLI's is not.
+    probe_pid = int(record["pid"])
+    # SIGKILL cannot run the EXIT trap, so the files remain. The singleton is
+    # recoverable once its recorded owner is no longer observable; this is the
+    # exact predicate `am_lock_acquire` uses before reclaiming the stale lock.
+    assert _wait_until(lambda: not _bash_can_observe_pid(probe_pid)), (
+        f"identity probe monitor {probe_pid} survived its metadata-directed stop"
+    )
     proc, out_path, err_path = _spawn_resolved_monitor(
         env,
         repo,
@@ -507,6 +531,10 @@ def test_monitor_keeps_running_when_its_owner_cannot_be_observed(
         parent_pid=_pid_bash_cannot_see(),
     )
     try:
+        assert _wait_until(
+            lambda: (subject_pid := _recorded_monitor_pid(record_path)) is not None
+            and subject_pid != probe_pid
+        ), "the subject monitor never acquired the singleton"
         time.sleep(5)
         assert proc.poll() is None, (
             "the monitor read an unobservable owner as a dead one and exited"

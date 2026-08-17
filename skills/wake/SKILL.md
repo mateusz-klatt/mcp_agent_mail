@@ -61,8 +61,15 @@ happened.
 
 Repeated `/wake` for the same project and Agent is idempotent: the later monitor
 exits before subscribing. Monitors for different projects are independent and
-valid. The process watches its original CLI parent and exits with it, preventing
-a native-Windows orphan from surviving into the next CLI run.
+valid. The process watches its original CLI parent **where that parent is
+observable** and exits with it, which is what keeps an orphan from surviving into
+the next CLI run. Where the probe has no resolving power — a native Windows
+parent is not in the MSYS process table, so `kill -0` answers "absent" about a
+healthy CLI — the monitor deliberately outlives its session rather than believe
+that answer, and stopping it is then a manual act. Both cases occur on one
+machine: arming through the plugin host gives an observable shell parent, while
+`subprocess.Popen` does not. Do not infer which one you have — `doctor` reads
+the verdict the monitor recorded at birth and names it.
 
 The monitor is **not** restored when a session resumes, and a monitor that exits
 is never restarted for the life of the CLI process. If the CLI restarts

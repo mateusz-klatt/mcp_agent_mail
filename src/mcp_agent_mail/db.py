@@ -33,7 +33,6 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Final, TypeVar, cast
 
-import anyio
 from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
 from alembic.runtime.migration import MigrationContext
@@ -640,11 +639,11 @@ async def await_database_cleanup_task(task: asyncio.Task[T]) -> T:
     current_task = asyncio.current_task()
     while not task.done():
         try:
-            if cancellation is None:
-                await asyncio.shield(task)
-            else:
-                with anyio.CancelScope(shield=True):
-                    await asyncio.shield(task)
+            # asyncio.wait does not cancel its member task when this waiter is
+            # cancelled, and it does not surface the member's own exception.
+            # That lets cleanup finish without Python 3.14's cancelled-shield
+            # wrapper reporting "exception in shielded future".
+            await asyncio.wait((task,))
         except asyncio.CancelledError as exc:
             if current_task is None or current_task.cancelling() == 0:
                 raise
@@ -652,10 +651,14 @@ async def await_database_cleanup_task(task: asyncio.Task[T]) -> T:
                 cancellation = exc
             while current_task.cancelling():
                 current_task.uncancel()
-    result = task.result()
     if cancellation is not None:
+        # Observe any cleanup failure, but caller cancellation is authoritative.
+        # Otherwise task.result() can raise first and silently consume the
+        # cancellation that this helper deliberately drained and preserved.
+        with suppress(BaseException):
+            task.result()
         raise cancellation
-    return result
+    return task.result()
 
 
 async def _close_session(session: AsyncSession) -> None:

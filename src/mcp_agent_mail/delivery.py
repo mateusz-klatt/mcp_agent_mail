@@ -15,8 +15,8 @@ import hashlib
 import json
 import re
 import uuid
-from collections.abc import Mapping, Sequence
-from contextlib import suppress
+from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, cast
@@ -68,6 +68,8 @@ DeliveryProcessingStatus = Literal[
 _TOPIC_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _MAX_ERROR_LENGTH = 4096
+_DEFAULT_MESSAGE_DELIVERY_LEASE_SECONDS = 180
+_LEASE_RENEWAL_MAX_DELAY_SECONDS = 20.0
 
 
 def _utcnow_naive() -> datetime:
@@ -187,6 +189,7 @@ class MessageDeliveryLease:
     fence: int
     expires_ts: datetime
     attempt_count: int
+    lease_seconds: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1168,10 +1171,11 @@ def _assert_current_lease(
     # now names which one fired. "stale or no longer owned" covers a lease
     # another claimant fenced out and a lease that merely ran out of clock
     # while this worker was still holding it, and those are opposite
-    # diagnoses: the first is contention, the second is a 60s lease against a
-    # slow Git publication. Windows CI raised this under concurrency on
-    # 2026-08-16 and the message could not say which had happened, so the next
-    # occurrence is a measurement rather than another round of guessing.
+    # diagnoses: the first is contention, the second was the original 60s
+    # lease against a slow Git publication. Windows CI raised this under
+    # concurrency on 2026-08-16; the instrumented recurrence on 2026-08-17
+    # proved the second case: the same worker was 0.9s past expiry. The
+    # processing path now refreshes that lease through Git and DB finalization.
     if delivery.state != "pending":
         raise MessageDeliveryLeaseLostError(
             delivery.id, f"delivery state is {delivery.state!r}, not 'pending'"
@@ -1216,7 +1220,7 @@ async def _quarantine_loaded_delivery(
 async def claim_message_delivery(
     delivery_id: str,
     *,
-    lease_seconds: int = 60,
+    lease_seconds: int = _DEFAULT_MESSAGE_DELIVERY_LEASE_SECONDS,
     now: datetime | None = None,
 ) -> MessageDeliveryLease | None:
     """Acquire a due pending intent with a monotonically increasing fence."""
@@ -1263,17 +1267,18 @@ async def claim_message_delivery(
             fence=delivery.lease_fence,
             expires_ts=delivery.lease_expires_ts,
             attempt_count=delivery.attempt_count,
+            lease_seconds=lease_seconds,
         )
 
 
 async def renew_message_delivery_lease(
     lease: MessageDeliveryLease,
     *,
-    extend_seconds: int = 60,
+    extend_seconds: float = 60,
     now: datetime | None = None,
 ) -> MessageDeliveryLease:
     """Extend a currently owned lease without changing its fencing token."""
-    if extend_seconds < 1:
+    if extend_seconds <= 0:
         raise ValueError("extend_seconds must be positive")
     renewed_at = now or _utcnow_naive()
     if renewed_at.tzinfo is not None:
@@ -1295,7 +1300,95 @@ async def renew_message_delivery_lease(
             fence=lease.fence,
             expires_ts=delivery.lease_expires_ts,
             attempt_count=delivery.attempt_count,
+            lease_seconds=lease.lease_seconds,
         )
+
+
+async def _refresh_message_delivery_lease(
+    lease: MessageDeliveryLease,
+) -> MessageDeliveryLease | None:
+    """Refresh one active lease horizon, or stop after a terminal transition."""
+    async with get_immediate_session() as session:
+        # The serialized timestamp must be sampled only after BEGIN IMMEDIATE.
+        # A pre-lock timestamp could accept and revive a lease that expired
+        # while this transaction waited behind another SQLite writer.
+        refreshed_at = _utcnow_naive()
+        delivery = await session.get(MessageDelivery, lease.delivery_id)
+        if delivery is None:
+            raise MessageDeliveryNotFoundError(lease.delivery_id)
+        if delivery.state in {"published", "quarantined"}:
+            return None
+        _assert_current_lease(delivery, lease, refreshed_at)
+        current_expiry = cast(datetime, delivery.lease_expires_ts)
+        minimum_expiry = refreshed_at + timedelta(seconds=lease.lease_seconds)
+        delivery.lease_expires_ts = max(current_expiry, minimum_expiry)
+        session.add(delivery)
+        await _commit_preserving_cancellation(session)
+        return MessageDeliveryLease(
+            delivery_id=lease.delivery_id,
+            token=lease.token,
+            fence=lease.fence,
+            expires_ts=delivery.lease_expires_ts,
+            attempt_count=delivery.attempt_count,
+            lease_seconds=lease.lease_seconds,
+        )
+
+
+async def _refresh_message_delivery_lease_until_stopped(
+    lease: MessageDeliveryLease,
+    stopped: asyncio.Event,
+) -> None:
+    """Keep one owned lease alive through publication and DB finalization."""
+    current = lease
+    horizon_seconds = float(lease.lease_seconds)
+    while not stopped.is_set():
+        remaining_seconds = (current.expires_ts - _utcnow_naive()).total_seconds()
+        delay_seconds = max(
+            0.0,
+            min(
+                _LEASE_RENEWAL_MAX_DELAY_SECONDS,
+                horizon_seconds / 3,
+                remaining_seconds / 3,
+            ),
+        )
+        if delay_seconds > 0:
+            try:
+                await asyncio.wait_for(stopped.wait(), timeout=delay_seconds)
+            except TimeoutError:
+                pass
+            else:
+                return
+        if stopped.is_set():
+            return
+        refreshed = await _refresh_message_delivery_lease(current)
+        if refreshed is None:
+            return
+        current = refreshed
+
+
+@asynccontextmanager
+async def _maintain_message_delivery_lease(
+    lease: MessageDeliveryLease,
+    *,
+    enabled: bool,
+) -> AsyncIterator[None]:
+    """Renew an owned lease until pre-checkpoint processing leaves the scope."""
+    if not enabled:
+        yield
+        return
+    stopped = asyncio.Event()
+    heartbeat = asyncio.create_task(
+        _refresh_message_delivery_lease_until_stopped(lease, stopped)
+    )
+    try:
+        yield
+    except BaseException:
+        stopped.set()
+        with suppress(Exception):
+            await await_database_cleanup_task(heartbeat)
+        raise
+    stopped.set()
+    await await_database_cleanup_task(heartbeat)
 
 
 async def _checkpoint_publication(
@@ -1678,32 +1771,49 @@ async def process_claimed_message_delivery(
         return processed_at if now is not None else _utcnow_naive()
 
     try:
-        async with get_immediate_session() as load_session:
-            delivery = await load_session.get(MessageDelivery, lease.delivery_id)
-            if delivery is None:
-                raise MessageDeliveryNotFoundError(lease.delivery_id)
-            if delivery.state == "published":
-                return _processing_result_from_delivery(delivery, now=_operation_time())
-            if delivery.state == "quarantined":
-                return _processing_result_from_delivery(delivery, now=_operation_time())
-            _assert_current_lease(delivery, lease, _operation_time())
-            recipients = await _load_delivery_recipients(load_session, delivery.id)
-            request = _request_from_delivery(delivery, recipients)
-            await _validate_request_lifetimes(load_session, request, _operation_time())
-            project_slug = delivery.project_slug_snapshot
-            document_bytes = delivery.archive_document.encode()
-            document_sha256 = delivery.document_sha256
+        # Explicit time freezes service tests and deterministic recovery
+        # simulations; no wall-clock lease heartbeat belongs in that mode.
+        async with _maintain_message_delivery_lease(lease, enabled=now is None):
+            async with get_immediate_session() as load_session:
+                delivery = await load_session.get(MessageDelivery, lease.delivery_id)
+                if delivery is None:
+                    raise MessageDeliveryNotFoundError(lease.delivery_id)
+                if delivery.state == "published":
+                    return _processing_result_from_delivery(
+                        delivery,
+                        now=_operation_time(),
+                    )
+                if delivery.state == "quarantined":
+                    return _processing_result_from_delivery(
+                        delivery,
+                        now=_operation_time(),
+                    )
+                _assert_current_lease(delivery, lease, _operation_time())
+                recipients = await _load_delivery_recipients(load_session, delivery.id)
+                request = _request_from_delivery(delivery, recipients)
+                await _validate_request_lifetimes(
+                    load_session,
+                    request,
+                    _operation_time(),
+                )
+                project_slug = delivery.project_slug_snapshot
+                document_bytes = delivery.archive_document.encode()
+                document_sha256 = delivery.document_sha256
 
-        archive = await ensure_archive(resolved_settings, project_slug)
-        publication = await publish_message_delivery(
-            archive,
-            lease.delivery_id,
-            document_bytes,
-            document_sha256,
-            lease_fence=lease.fence,
-        )
-        await _checkpoint_publication(lease, publication, _operation_time())
-        return await _finalize_message_delivery(lease, publication, _operation_time())
+            archive = await ensure_archive(resolved_settings, project_slug)
+            publication = await publish_message_delivery(
+                archive,
+                lease.delivery_id,
+                document_bytes,
+                document_sha256,
+                lease_fence=lease.fence,
+            )
+            await _checkpoint_publication(lease, publication, _operation_time())
+            return await _finalize_message_delivery(
+                lease,
+                publication,
+                _operation_time(),
+            )
     except asyncio.CancelledError:
         # The storage primitive waits for its shielded Git thread before this
         # propagates. Leaving the lease intact lets a later fenced claimant
@@ -1758,7 +1868,7 @@ async def process_message_delivery(
     delivery_id: str,
     *,
     settings: Settings | None = None,
-    lease_seconds: int = 60,
+    lease_seconds: int = _DEFAULT_MESSAGE_DELIVERY_LEASE_SECONDS,
     max_attempts: int = 8,
 ) -> MessageDeliveryProcessingResult:
     """Claim one due delivery, or report why no worker action was taken."""

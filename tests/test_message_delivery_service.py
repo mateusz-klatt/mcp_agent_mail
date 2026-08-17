@@ -8,7 +8,7 @@ import json
 import sqlite3
 import uuid
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +52,7 @@ from mcp_agent_mail.models import (
 )
 from mcp_agent_mail.storage import (
     MessageDeliveryPendingError,
+    MessageDeliveryPublication,
     MessageDeliveryQuarantinedError,
 )
 
@@ -394,6 +395,280 @@ async def test_stale_fence_cannot_renew_after_takeover(isolated_env: Any) -> Non
 
 
 @pytest.mark.asyncio
+async def test_slow_publication_renews_its_owned_lease(
+    isolated_env: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seeded = await _seed_identities()
+    accepted = await accept_message_delivery(seeded.request("slow-publication"))
+    lease = await claim_message_delivery(accepted.delivery_id, lease_seconds=1)
+    assert lease is not None
+
+    from mcp_agent_mail import delivery as delivery_module
+
+    publication_started = asyncio.Event()
+    release_publication = asyncio.Event()
+    lease_renewed = asyncio.Event()
+    original_refresh = delivery_module._refresh_message_delivery_lease
+
+    async def observed_refresh(
+        current: MessageDeliveryLease,
+    ) -> MessageDeliveryLease | None:
+        refreshed = await original_refresh(current)
+        delivery_module._LEASE_RENEWAL_MAX_DELAY_SECONDS = 20.0
+        lease_renewed.set()
+        return refreshed
+
+    async def blocked_publication(
+        archive: Any,
+        delivery_id: str,
+        document_bytes: bytes,
+        expected_sha256: str,
+        *,
+        lease_fence: int,
+    ) -> MessageDeliveryPublication:
+        del archive, document_bytes, lease_fence
+        publication_started.set()
+        await release_publication.wait()
+        return MessageDeliveryPublication(
+            relative_path=f"projects/delivery-source/message_deliveries/{delivery_id}.md",
+            document_sha256=expected_sha256,
+            blob_sha="a" * 40,
+            commit_sha="b" * 40,
+            recovered=False,
+        )
+
+    monkeypatch.setattr(
+        delivery_module,
+        "_LEASE_RENEWAL_MAX_DELAY_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(
+        delivery_module,
+        "_refresh_message_delivery_lease",
+        observed_refresh,
+    )
+    monkeypatch.setattr(
+        delivery_module,
+        "publish_message_delivery",
+        blocked_publication,
+    )
+
+    async with asyncio.TaskGroup() as tasks:
+        processing = tasks.create_task(
+            process_claimed_message_delivery(lease, settings=get_settings())
+        )
+        await asyncio.wait_for(publication_started.wait(), timeout=1.0)
+        await asyncio.wait_for(lease_renewed.wait(), timeout=1.0)
+        async with get_immediate_session() as session:
+            delivery = await session.get(MessageDelivery, accepted.delivery_id)
+            assert delivery is not None
+            assert delivery.lease_token == lease.token
+            assert delivery.lease_fence == lease.fence
+            assert delivery.lease_expires_ts is not None
+            assert delivery.lease_expires_ts > lease.expires_ts
+        remaining_original_seconds = (
+            lease.expires_ts
+            - datetime.now(timezone.utc).replace(tzinfo=None)
+        ).total_seconds()
+        await asyncio.sleep(max(0.0, remaining_original_seconds) + 0.05)
+        assert await claim_message_delivery(accepted.delivery_id) is None
+        release_publication.set()
+
+    result = processing.result()
+    assert result.status == "published"
+    assert result.published_now is True
+    assert await _row_count(Message) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_publication_stops_its_lease_heartbeat(
+    isolated_env: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seeded = await _seed_identities()
+    accepted = await accept_message_delivery(seeded.request("cancelled-heartbeat"))
+    lease = await claim_message_delivery(accepted.delivery_id, lease_seconds=1)
+    assert lease is not None
+
+    from mcp_agent_mail import delivery as delivery_module
+
+    publication_started = asyncio.Event()
+    first_renewal = asyncio.Event()
+    renewal_during_cancellation_cleanup = asyncio.Event()
+    publication_cancelled = asyncio.Event()
+    release_cancellation_cleanup = asyncio.Event()
+    never_complete = asyncio.Event()
+    original_refresh = delivery_module._refresh_message_delivery_lease
+    renewal_count = 0
+
+    async def observed_refresh(
+        current: MessageDeliveryLease,
+    ) -> MessageDeliveryLease | None:
+        nonlocal renewal_count
+        refreshed = await original_refresh(current)
+        renewal_count += 1
+        if renewal_count == 1:
+            first_renewal.set()
+        elif renewal_count == 2:
+            renewal_during_cancellation_cleanup.set()
+        return refreshed
+
+    async def blocked_publication(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        publication_started.set()
+        try:
+            await never_complete.wait()
+        except asyncio.CancelledError:
+            publication_cancelled.set()
+            await release_cancellation_cleanup.wait()
+            raise
+
+    monkeypatch.setattr(
+        delivery_module,
+        "_LEASE_RENEWAL_MAX_DELAY_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(
+        delivery_module,
+        "_refresh_message_delivery_lease",
+        observed_refresh,
+    )
+    monkeypatch.setattr(
+        delivery_module,
+        "publish_message_delivery",
+        blocked_publication,
+    )
+
+    async with asyncio.TaskGroup() as tasks:
+        processing = tasks.create_task(
+            process_claimed_message_delivery(lease, settings=get_settings())
+        )
+        try:
+            await asyncio.wait_for(publication_started.wait(), timeout=1.0)
+            await asyncio.wait_for(first_renewal.wait(), timeout=1.0)
+            processing.cancel()
+            await asyncio.wait_for(publication_cancelled.wait(), timeout=1.0)
+            await asyncio.wait_for(
+                renewal_during_cancellation_cleanup.wait(),
+                timeout=1.0,
+            )
+        finally:
+            release_cancellation_cleanup.set()
+    assert processing.cancelled()
+
+    async with get_immediate_session() as session:
+        delivery = await session.get(MessageDelivery, accepted.delivery_id)
+        assert delivery is not None
+        expiry_after_cancellation = delivery.lease_expires_ts
+        assert expiry_after_cancellation is not None
+        assert delivery.lease_token == lease.token
+        assert delivery.lease_fence == lease.fence
+    await asyncio.sleep(0.05)
+    async with get_immediate_session() as session:
+        delivery = await session.get(MessageDelivery, accepted.delivery_id)
+        assert delivery is not None
+        assert delivery.lease_expires_ts == expiry_after_cancellation
+    assert await _row_count(Message) == 0
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_cleanup_preserves_late_caller_cancellation(
+    isolated_env: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seeded = await _seed_identities()
+    accepted = await accept_message_delivery(seeded.request("cleanup-cancellation"))
+    lease = await claim_message_delivery(accepted.delivery_id)
+    assert lease is not None
+
+    from mcp_agent_mail import delivery as delivery_module
+
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    async def blocked_heartbeat(
+        current: MessageDeliveryLease,
+        stopped: asyncio.Event,
+    ) -> None:
+        assert current == lease
+        await stopped.wait()
+        cleanup_started.set()
+        await release_cleanup.wait()
+        raise RuntimeError("heartbeat cleanup also failed")
+
+    monkeypatch.setattr(
+        delivery_module,
+        "_refresh_message_delivery_lease_until_stopped",
+        blocked_heartbeat,
+    )
+
+    async def fail_inside_heartbeat_scope() -> None:
+        async with delivery_module._maintain_message_delivery_lease(
+            lease,
+            enabled=True,
+        ):
+            raise ValueError("body failed before caller cancellation")
+
+    loop = asyncio.get_running_loop()
+    previous_exception_handler = loop.get_exception_handler()
+    loop_errors: list[dict[str, Any]] = []
+    loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+    try:
+        processing = asyncio.create_task(fail_inside_heartbeat_scope())
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1.0)
+        processing.cancel()
+        release_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await processing
+    finally:
+        loop.set_exception_handler(previous_exception_handler)
+    assert processing.cancelled()
+    assert loop_errors == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_processing_time_does_not_start_a_wall_clock_heartbeat(
+    isolated_env: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seeded = await _seed_identities()
+    accepted = await accept_message_delivery(
+        seeded.request("fixed-processing-time"),
+        now=BASE_TIME,
+    )
+    lease = await claim_message_delivery(accepted.delivery_id, now=BASE_TIME)
+    assert lease is not None
+
+    from mcp_agent_mail import delivery as delivery_module
+
+    heartbeat_started = False
+
+    async def observed_heartbeat_start(
+        current: MessageDeliveryLease,
+        stopped: asyncio.Event,
+    ) -> None:
+        nonlocal heartbeat_started
+        assert current == lease
+        heartbeat_started = True
+        await stopped.wait()
+
+    monkeypatch.setattr(
+        delivery_module,
+        "_refresh_message_delivery_lease_until_stopped",
+        observed_heartbeat_start,
+    )
+    result = await process_claimed_message_delivery(
+        lease,
+        settings=get_settings(),
+        now=BASE_TIME,
+    )
+    assert result.status == "published"
+    assert result.published_now is True
+    assert heartbeat_started is False
+
+
+@pytest.mark.asyncio
 async def test_only_winning_lease_reports_the_publication_transition(
     isolated_env: Any,
 ) -> None:
@@ -421,9 +696,12 @@ async def test_only_winning_lease_reports_the_publication_transition(
         now=BASE_TIME + timedelta(seconds=2),
     )
     stale_observation = await process_claimed_message_delivery(
-        expired,
+        replace(
+            expired,
+            expires_ts=datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(seconds=1),
+        ),
         settings=get_settings(),
-        now=BASE_TIME + timedelta(seconds=3),
     )
 
     assert published.status == stale_observation.status == "published"
@@ -1137,6 +1415,7 @@ async def test_hostile_trigger_valid_archive_divergence_quarantines_before_git(
             fence=1,
             expires_ts=BASE_TIME + timedelta(minutes=1),
             attempt_count=1,
+            lease_seconds=60,
         ),
         settings=get_settings(),
         now=BASE_TIME,

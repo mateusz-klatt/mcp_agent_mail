@@ -79,6 +79,32 @@ case "$PARENT_PID" in ''|*[!0-9]*) exit 0 ;; esac
 [ -n "$PROJECT" ] && [ -n "$AGENT" ] || exit 0
 export AM_PROJECT_FOR_NAME="$PROJECT"
 
+# Whether `kill -0 $PARENT_PID` is capable of answering the question at all,
+# decided ONCE while the owner is known to be alive -- it is what spawned us
+# moments ago, so a failure here cannot mean "the CLI died".
+#
+# It means the probe has no resolving power on this host. Git Bash gives the
+# monitor a native Windows parent (node.exe, python.exe), whose pid is not in
+# the MSYS process table, so `kill -0` reports failure for a perfectly healthy
+# CLI. Every wait in this script starts with that check, so believing it turned
+# `/wake` on Windows into a monitor that exited within milliseconds -- silently,
+# because a healthy monitor prints nothing either.
+#
+# So the probe is latched, not repeated: unobservable at birth means unusable
+# for the rest of the run. The cost is that on such a host the monitor outlives
+# a dead CLI until the connection window ends; the alternative was not having a
+# monitor at all. Same rule as everywhere else here -- absence of a signal is
+# not a signal saying "no".
+SUPERVISE_PARENT=1
+kill -0 "$PARENT_PID" 2>/dev/null || SUPERVISE_PARENT=0
+
+# True only when the owner is BOTH observable and gone.
+owner_gone() {
+    [ "$SUPERVISE_PARENT" -eq 1 ] || return 1
+    kill -0 "$PARENT_PID" 2>/dev/null && return 1
+    return 0
+}
+
 # How long ONE subscription is held before reconnecting. Kept under the server's
 # own cap (AGENT_MAIL_EVENTS_MAX_SECONDS, 3600 by default, which ends the stream
 # with `: bye`) so the client decides when to cycle rather than discovering it
@@ -207,7 +233,7 @@ nap() {
     local remaining="$1" step
     case "$remaining" in ''|*[!0-9]*) remaining=1 ;; esac
     while [ "$remaining" -gt 0 ]; do
-        kill -0 "$PARENT_PID" 2>/dev/null || exit 0
+        owner_gone && exit 0
         step=2
         [ "$remaining" -lt "$step" ] && step="$remaining"
         sleep "$step" 2>/dev/null || true
@@ -264,7 +290,7 @@ while :; do
     ready_deadline=$(( started + READY_WAIT ))
     while :; do
         grep -q '^: ready' "$STREAM" 2>/dev/null && { ready=1; break; }
-        if ! kill -0 "$PARENT_PID" 2>/dev/null; then
+        if owner_gone; then
             stop_curl
             exit 0
         fi
@@ -333,7 +359,7 @@ while :; do
     # (both are woken, neither evicts the other), so reconnecting immediately is
     # safe even if an old connection is still winding down.
     while kill -0 "$CURL_PID" 2>/dev/null; do
-        if ! kill -0 "$PARENT_PID" 2>/dev/null; then
+        if owner_gone; then
             stop_curl
             exit 0
         fi

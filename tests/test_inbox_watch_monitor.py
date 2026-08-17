@@ -209,6 +209,66 @@ def _stop_and_read(
     return _read_output(out_path), _read_output(err_path)
 
 
+def _spawn_resolved_monitor(
+    env: dict[str, str],
+    repo: Path,
+    log_dir: Path,
+    tag: str,
+    *,
+    project_key: str,
+    agent_name: str,
+    parent_pid: int,
+) -> tuple[subprocess.Popen[bytes], Path, Path]:
+    """Start the monitor at its internal argv, which is where the owner pid enters.
+
+    The public two-argument form reads the owner from `$PPID`, so it can only
+    ever be handed a pid the harness cannot choose. Naming it explicitly is what
+    makes the "owner cannot be observed" condition reproducible anywhere rather
+    than only on the host that happens to produce it.
+    """
+    out_path = log_dir / f"{tag}.out"
+    err_path = log_dir / f"{tag}.err"
+    with out_path.open("wb") as out, err_path.open("wb") as err:
+        proc = subprocess.Popen(
+            [
+                BASH,
+                _git_bash_path(MONITOR),
+                "--resolved",
+                "claude",
+                "1",
+                project_key,
+                agent_name,
+                str(parent_pid),
+            ],
+            cwd=repo,
+            env=env,
+            stdout=out,
+            stderr=err,
+        )
+    return proc, out_path, err_path
+
+
+def _pid_bash_cannot_see() -> int:
+    """A numeric pid that `kill -0` reports as absent, from the monitor's own bash.
+
+    Asked of that bash rather than of Python on purpose: the whole point is what
+    the script's own probe answers, and the two do not have to agree -- under
+    Git Bash they demonstrably do not for a native parent.
+    """
+    reaped = subprocess.Popen([sys.executable, "-c", ""])
+    reaped.wait(timeout=60)
+    probe = subprocess.run(
+        [BASH, "-c", f"kill -0 {reaped.pid} 2>/dev/null"],
+        check=False,
+        capture_output=True,
+    )
+    assert probe.returncode != 0, (
+        f"pid {reaped.pid} was reused between reaping and probing, so this test "
+        "would have proved nothing"
+    )
+    return reaped.pid
+
+
 @pytest.mark.parametrize(
     "arguments",
     [
@@ -317,6 +377,60 @@ def test_monitor_stays_alive_and_silent_without_an_identity(tmp_path: Path) -> N
         stdout, _stderr = _stop_and_read(proc, out_path, err_path)
 
     assert stdout == "", f"monitor spoke when it had nothing to report: {stdout!r}"
+
+
+def test_monitor_keeps_running_when_its_owner_cannot_be_observed(
+    tmp_path: Path,
+) -> None:
+    """An owner the probe cannot see is not an owner that died.
+
+    Every wait in the monitor begins by asking `kill -0 $PARENT_PID` whether the
+    CLI is still there, and a negative answer ends the run. That is right when
+    the answer means "gone" and catastrophic when it means "this probe cannot
+    tell": a monitor is never restarted for the life of the CLI, so one wrong
+    reading costs the whole session its instant delivery -- silently, since a
+    healthy monitor prints nothing either.
+
+    The condition is reproduced by naming an owner pid that the monitor's own
+    bash reports as absent, which is exactly what a Git Bash monitor gets when
+    its parent is a native Windows process outside the MSYS process table.
+    Reproducing it through argv rather than through a host keeps the property
+    testable on every platform instead of only on the one that exhibits it.
+    """
+    env, repo, _ = _monitor_env(tmp_path)
+    watch_dir = tmp_path / "state" / "watch"
+
+    # Identity comes from a real run rather than from a literal, so this test
+    # cannot drift away from whatever the resolver actually produces here.
+    probe, probe_out, probe_err = _spawn_monitor(env, repo, tmp_path, "resolve")
+    try:
+        assert _wait_until(lambda: bool(list(watch_dir.glob("monitor-*.json"))))
+        record = json.loads(
+            next(iter(watch_dir.glob("monitor-*.json"))).read_text(encoding="utf-8")
+        )
+    finally:
+        _stop_and_read(probe, probe_out, probe_err)
+    assert _wait_until(lambda: not list(watch_dir.glob("monitor-*.json")))
+
+    proc, out_path, err_path = _spawn_resolved_monitor(
+        env,
+        repo,
+        tmp_path,
+        "unobservable",
+        project_key=record["project_key"],
+        agent_name=record["agent_name"],
+        parent_pid=_pid_bash_cannot_see(),
+    )
+    try:
+        time.sleep(5)
+        assert proc.poll() is None, (
+            "the monitor read an unobservable owner as a dead one and exited"
+        )
+    finally:
+        stdout, stderr = _stop_and_read(proc, out_path, err_path)
+
+    assert stdout == "", f"monitor spoke when it had nothing to report: {stdout!r}"
+    assert stderr == "", f"monitor complained about its own owner: {stderr!r}"
 
 
 def test_onboard_persists_the_one_time_token_and_doctor_never_prints_it(

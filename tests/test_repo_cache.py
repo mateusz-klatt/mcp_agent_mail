@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import gc
 import threading
 import time
 from pathlib import Path
@@ -381,6 +382,113 @@ class TestModuleLevelFunctions:
         finally:
             release_constructor.set()
             clear_repo_cache()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_repo_waiter_consumes_late_shared_failure(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A cancelled waiter must not leak a later shared-flight exception."""
+        repo_root = tmp_path / "cancelled-waiter"
+        flight: concurrent.futures.Future[Repo] = concurrent.futures.Future()
+        both_waiting = asyncio.Event()
+        waiter_count = 0
+
+        def shared_flight(
+            root: Path,
+            settings: Any,
+            cache_key: str,
+        ) -> concurrent.futures.Future[Repo]:
+            nonlocal waiter_count
+            del root, settings, cache_key
+            waiter_count += 1
+            if waiter_count == 2:
+                both_waiting.set()
+            return flight
+
+        monkeypatch.setattr(
+            storage_module,
+            "_get_or_start_repo_single_flight",
+            shared_flight,
+        )
+        loop = asyncio.get_running_loop()
+        previous_exception_handler = loop.get_exception_handler()
+        loop_errors: list[dict[str, Any]] = []
+
+        def capture_loop_error(
+            _loop: asyncio.AbstractEventLoop,
+            context: dict[str, Any],
+        ) -> None:
+            loop_errors.append(context)
+
+        loop.set_exception_handler(capture_loop_error)
+        settings = get_settings()
+        first = asyncio.create_task(_ensure_repo(repo_root, settings))
+        second = asyncio.create_task(_ensure_repo(repo_root, settings))
+        try:
+            await asyncio.wait_for(both_waiting.wait(), timeout=5.0)
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+
+            shared_error = RuntimeError(
+                f"Repository initialization was cancelled for {repo_root.resolve()}"
+            )
+            flight.set_exception(shared_error)
+            with pytest.raises(RuntimeError, match="Repository initialization was cancelled") as exc:
+                await second
+            assert exc.value is shared_error
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert loop_errors == []
+        finally:
+            for waiter in (first, second):
+                if not waiter.done():
+                    waiter.cancel()
+            if not flight.done():
+                flight.cancel()
+            await asyncio.gather(first, second, return_exceptions=True)
+            await asyncio.sleep(0)
+            loop.set_exception_handler(previous_exception_handler)
+
+    def test_cancelled_repo_waiter_consumes_done_failure_before_loop_close(self) -> None:
+        """A same-tick failure must be observed before its loop can close."""
+        flight: concurrent.futures.Future[Repo] = concurrent.futures.Future()
+        shared_error = RuntimeError("late shared repository failure")
+        loop = asyncio.new_event_loop()
+        loop_errors: list[dict[str, Any]] = []
+
+        def capture_loop_error(
+            _loop: asyncio.AbstractEventLoop,
+            context: dict[str, Any],
+        ) -> None:
+            loop_errors.append(context)
+
+        async def cancel_after_shared_failure(
+            shared_flight: concurrent.futures.Future[Repo],
+        ) -> None:
+            current = asyncio.current_task()
+            assert current is not None
+            loop.call_soon(shared_flight.set_exception, shared_error)
+            loop.call_soon(current.cancel)
+            try:
+                await storage_module._await_repo_single_flight(shared_flight)
+            except asyncio.CancelledError:
+                loop.stop()
+                raise
+
+        loop.set_exception_handler(capture_loop_error)
+        waiter = loop.create_task(cancel_after_shared_failure(flight))
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                loop.run_until_complete(waiter)
+        finally:
+            loop.close()
+        del waiter
+        del flight
+        gc.collect()
+        assert loop_errors == []
 
     def test_global_capacity_limiter_spans_event_loops(self) -> None:
         """Capacity one must serialize holders running on different loops."""

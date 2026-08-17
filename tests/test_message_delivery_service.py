@@ -406,17 +406,34 @@ async def test_slow_publication_renews_its_owned_lease(
 
     from mcp_agent_mail import delivery as delivery_module
 
+    archive_started = asyncio.Event()
+    release_archive = asyncio.Event()
+    renewal_during_archive = asyncio.Event()
     publication_started = asyncio.Event()
     release_publication = asyncio.Event()
-    lease_renewed = asyncio.Event()
+    renewal_during_publication = asyncio.Event()
+    prepared_archive = object()
     original_refresh = delivery_module._refresh_message_delivery_lease
+
+    async def ready_archive(settings: Any, project_slug: str) -> object:
+        del settings, project_slug
+        archive_started.set()
+        await release_archive.wait()
+        return prepared_archive
 
     async def observed_refresh(
         current: MessageDeliveryLease,
     ) -> MessageDeliveryLease | None:
+        archive_is_blocked = archive_started.is_set() and not release_archive.is_set()
+        publication_is_blocked = (
+            publication_started.is_set() and not release_publication.is_set()
+        )
         refreshed = await original_refresh(current)
-        delivery_module._LEASE_RENEWAL_MAX_DELAY_SECONDS = 20.0
-        lease_renewed.set()
+        if refreshed is not None and archive_is_blocked:
+            renewal_during_archive.set()
+        if refreshed is not None and publication_is_blocked:
+            delivery_module._LEASE_RENEWAL_MAX_DELAY_SECONDS = 20.0
+            renewal_during_publication.set()
         return refreshed
 
     async def blocked_publication(
@@ -427,7 +444,8 @@ async def test_slow_publication_renews_its_owned_lease(
         *,
         lease_fence: int,
     ) -> MessageDeliveryPublication:
-        del archive, document_bytes, lease_fence
+        assert archive is prepared_archive
+        del document_bytes, lease_fence
         publication_started.set()
         await release_publication.wait()
         return MessageDeliveryPublication(
@@ -448,6 +466,7 @@ async def test_slow_publication_renews_its_owned_lease(
         "_refresh_message_delivery_lease",
         observed_refresh,
     )
+    monkeypatch.setattr(delivery_module, "ensure_archive", ready_archive)
     monkeypatch.setattr(
         delivery_module,
         "publish_message_delivery",
@@ -458,8 +477,11 @@ async def test_slow_publication_renews_its_owned_lease(
         processing = tasks.create_task(
             process_claimed_message_delivery(lease, settings=get_settings())
         )
-        await asyncio.wait_for(publication_started.wait(), timeout=1.0)
-        await asyncio.wait_for(lease_renewed.wait(), timeout=1.0)
+        await asyncio.wait_for(archive_started.wait(), timeout=5.0)
+        await asyncio.wait_for(renewal_during_archive.wait(), timeout=5.0)
+        release_archive.set()
+        await asyncio.wait_for(publication_started.wait(), timeout=5.0)
+        await asyncio.wait_for(renewal_during_publication.wait(), timeout=5.0)
         async with get_immediate_session() as session:
             delivery = await session.get(MessageDelivery, accepted.delivery_id)
             assert delivery is not None
@@ -499,23 +521,30 @@ async def test_cancelled_publication_stops_its_lease_heartbeat(
     publication_cancelled = asyncio.Event()
     release_cancellation_cleanup = asyncio.Event()
     never_complete = asyncio.Event()
+    prepared_archive = object()
     original_refresh = delivery_module._refresh_message_delivery_lease
-    renewal_count = 0
+
+    async def ready_archive(settings: Any, project_slug: str) -> object:
+        del settings, project_slug
+        return prepared_archive
 
     async def observed_refresh(
         current: MessageDeliveryLease,
     ) -> MessageDeliveryLease | None:
-        nonlocal renewal_count
+        cancellation_cleanup_is_blocked = (
+            publication_cancelled.is_set()
+            and not release_cancellation_cleanup.is_set()
+        )
         refreshed = await original_refresh(current)
-        renewal_count += 1
-        if renewal_count == 1:
-            first_renewal.set()
-        elif renewal_count == 2:
+        if refreshed is not None and cancellation_cleanup_is_blocked:
             renewal_during_cancellation_cleanup.set()
+        elif refreshed is not None:
+            first_renewal.set()
         return refreshed
 
     async def blocked_publication(*args: Any, **kwargs: Any) -> Any:
-        del args, kwargs
+        assert args[0] is prepared_archive
+        del kwargs
         publication_started.set()
         try:
             await never_complete.wait()
@@ -534,6 +563,7 @@ async def test_cancelled_publication_stops_its_lease_heartbeat(
         "_refresh_message_delivery_lease",
         observed_refresh,
     )
+    monkeypatch.setattr(delivery_module, "ensure_archive", ready_archive)
     monkeypatch.setattr(
         delivery_module,
         "publish_message_delivery",
@@ -545,13 +575,13 @@ async def test_cancelled_publication_stops_its_lease_heartbeat(
             process_claimed_message_delivery(lease, settings=get_settings())
         )
         try:
-            await asyncio.wait_for(publication_started.wait(), timeout=1.0)
-            await asyncio.wait_for(first_renewal.wait(), timeout=1.0)
+            await asyncio.wait_for(publication_started.wait(), timeout=5.0)
+            await asyncio.wait_for(first_renewal.wait(), timeout=5.0)
             processing.cancel()
-            await asyncio.wait_for(publication_cancelled.wait(), timeout=1.0)
+            await asyncio.wait_for(publication_cancelled.wait(), timeout=5.0)
             await asyncio.wait_for(
                 renewal_during_cancellation_cleanup.wait(),
-                timeout=1.0,
+                timeout=5.0,
             )
         finally:
             release_cancellation_cleanup.set()

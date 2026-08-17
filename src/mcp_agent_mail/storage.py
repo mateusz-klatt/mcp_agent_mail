@@ -2179,6 +2179,26 @@ def _get_or_start_repo_single_flight(
         return flight
 
 
+def _consume_abandoned_repo_waiter(waiter: asyncio.Future[Repo]) -> None:
+    """Observe a per-loop wrapper after its caller was cancelled."""
+    with contextlib.suppress(BaseException):
+        waiter.result()
+
+
+async def _await_repo_single_flight(flight: ConcurrentFuture[Repo]) -> Repo:
+    """Await shared repo creation without cancelling or leaking its result."""
+    waiter = asyncio.wrap_future(flight)
+    try:
+        await asyncio.wait((waiter,))
+    except asyncio.CancelledError:
+        if waiter.done():
+            _consume_abandoned_repo_waiter(waiter)
+        else:
+            waiter.add_done_callback(_consume_abandoned_repo_waiter)
+        raise
+    return waiter.result()
+
+
 async def _ensure_repo(root: Path, settings: Settings) -> Repo:
     """Get or create a Repo for the given root, with caching to prevent file handle leaks.
 
@@ -2198,7 +2218,7 @@ async def _ensure_repo(root: Path, settings: Settings) -> Repo:
         return cached
 
     flight = _get_or_start_repo_single_flight(root, settings, cache_key)
-    return await asyncio.shield(asyncio.wrap_future(flight))
+    return await _await_repo_single_flight(flight)
 
 
 def _read_identity_rename_document_sync(project_root: Path) -> dict[str, object]:

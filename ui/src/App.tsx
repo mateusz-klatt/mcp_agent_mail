@@ -884,6 +884,16 @@ export function App({
   const paginationControllerRef = useRef<AbortController | null>(null);
   const inboxRequestGenerationRef = useRef(0);
   const detailRequestGenerationRef = useRef(0);
+  // Remembers the route identity the inbox/projects load last ran for, so a
+  // refresh-only tick (a new-mail server-sent event bumping `refreshVersion`
+  // while the same project stays open) can be told apart from a real
+  // navigation. See the data-loading effect below for why the distinction
+  // matters: a refresh must not tear the visible list down to "loading",
+  // because that unmounts the reply composer and drops focus on every ding.
+  const lastInboxRouteRef = useRef<{
+    active: boolean;
+    projectId: number | null;
+  } | null>(null);
   const threadRequestGenerationRef = useRef(0);
   const threadPaginationControllerRef = useRef<AbortController | null>(null);
   const searchRequestGenerationRef = useRef(0);
@@ -1083,18 +1093,35 @@ export function App({
   }, [route, refreshVersion, dataFailureStatus]);
 
   useEffect(() => {
-    const detailRequestGeneration = ++detailRequestGenerationRef.current;
     ++inboxRequestGenerationRef.current;
     paginationControllerRef.current?.abort();
     paginationControllerRef.current = null;
+    const inboxRouteKey = mailRouteActive ? routeProjectId : null;
+    const inboxRouteChanged =
+      lastInboxRouteRef.current === null ||
+      lastInboxRouteRef.current.active !== mailRouteActive ||
+      lastInboxRouteRef.current.projectId !== inboxRouteKey;
+    lastInboxRouteRef.current = {
+      active: mailRouteActive,
+      projectId: inboxRouteKey,
+    };
     if (!mailRouteActive) {
       return undefined;
     }
     const controller = new AbortController();
     const projectId = routeProjectId ?? undefined;
-    setProjectsStatus("loading");
-    setInboxStatus("loading");
     setPaginationStatus("idle");
+    // A navigation between routes or projects shows a loading state; a
+    // refresh-only tick — a new-mail server-sent event bumping
+    // `refreshVersion` while the same project stays open — refetches
+    // silently so the visible list and the open reply composer stay mounted
+    // and keep focus. Tearing down to "loading" on every ding unmounts the
+    // reply textarea, and the remount lands without focus; the inbox list
+    // flickered for the same reason.
+    if (inboxRouteChanged) {
+      setProjectsStatus("loading");
+      setInboxStatus("loading");
+    }
 
     void loadProjects({ signal: controller.signal })
       .then((page) => {
@@ -1123,49 +1150,61 @@ export function App({
         }
       });
 
-    if (routeMessageId !== null && routeProjectId !== null) {
-      setDetail(null);
-      setDetailStatus("loading");
-      void loadMessage(routeProjectId, routeMessageId, {
-        signal: controller.signal,
-      })
-        .then((message) => {
-          if (detailRequestGeneration !== detailRequestGenerationRef.current) {
-            return;
-          }
-          if (
-            message.project_id !== routeProjectId ||
-            message.id !== routeMessageId
-          ) {
-            setDetail(null);
-            setDetailStatus("error");
-            return;
-          }
-          setDetail(message);
-          setDetailStatus("ready");
-        })
-        .catch((error: unknown) => {
-          if (detailRequestGeneration !== detailRequestGenerationRef.current) {
-            return;
-          }
-          const status = dataFailureStatus(error);
-          if (status !== null) {
-            setDetailStatus(status);
-          }
-        });
-    } else {
+    return () => controller.abort();
+  }, [dataFailureStatus, mailRouteActive, refreshVersion, routeProjectId]);
+
+  // The open message detail loads on navigation only, never on a refresh tick.
+  // `refreshVersion` is deliberately absent from the dependency array: a
+  // new-mail server-sent event must not reload the message the operator is
+  // already reading, because that tears the detail panel down to "loading",
+  // unmounts the reply composer, and drops focus — the ding and the focus
+  // loss were perfectly correlated because they shared one refresh tick. The
+  // open message does not change its own body when a different message
+  // arrives, so a silent skip is correct. The detail has its own
+  // AbortController so an in-flight navigation load is not aborted by a
+  // refresh tick either.
+  useEffect(() => {
+    if (!mailRouteActive) {
+      return undefined;
+    }
+    if (routeMessageId === null || routeProjectId === null) {
       setDetail(null);
       setDetailStatus("idle");
+      return undefined;
     }
-
+    const detailRequestGeneration = ++detailRequestGenerationRef.current;
+    const controller = new AbortController();
+    setDetail(null);
+    setDetailStatus("loading");
+    void loadMessage(routeProjectId, routeMessageId, {
+      signal: controller.signal,
+    })
+      .then((message) => {
+        if (detailRequestGeneration !== detailRequestGenerationRef.current) {
+          return;
+        }
+        if (
+          message.project_id !== routeProjectId ||
+          message.id !== routeMessageId
+        ) {
+          setDetail(null);
+          setDetailStatus("error");
+          return;
+        }
+        setDetail(message);
+        setDetailStatus("ready");
+      })
+      .catch((error: unknown) => {
+        if (detailRequestGeneration !== detailRequestGenerationRef.current) {
+          return;
+        }
+        const status = dataFailureStatus(error);
+        if (status !== null) {
+          setDetailStatus(status);
+        }
+      });
     return () => controller.abort();
-  }, [
-    dataFailureStatus,
-    mailRouteActive,
-    refreshVersion,
-    routeMessageId,
-    routeProjectId,
-  ]);
+  }, [dataFailureStatus, mailRouteActive, routeMessageId, routeProjectId]);
 
   useEffect(() => {
     const requestGeneration = ++threadRequestGenerationRef.current;

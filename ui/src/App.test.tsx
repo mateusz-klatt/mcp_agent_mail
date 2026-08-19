@@ -4652,6 +4652,61 @@ describe("Iris landing shell", () => {
     expect(inboxReads).toBe(2);
   });
 
+  it("keeps reply-composer focus through an SSE refresh tick without tearing the detail down to loading", async () => {
+    // Regression guard: an SSE new-mail event bumps refreshVersion, which used
+    // to re-run the shared data-loading effect with refreshVersion in its dep
+    // array. That effect synchronously tore the open message detail down to
+    // "loading" (setDetail(null) + setDetailStatus("loading")) and refetched,
+    // unmounting the <article> that holds the reply textarea. When the fetch
+    // resolved the article remounted with a fresh, unfocused textarea — so
+    // every notification sound correlated with the reply box losing focus.
+    // The fix splits detail loading into its own effect that never depends on
+    // refreshVersion (the open message does not change when a different one
+    // arrives), so a refresh-only tick silently refetches the inbox while the
+    // composer stays mounted and focused.
+    let inboxReads = 0;
+    const source = new FakeEventSource("/mail/events");
+    const factory = vi.fn(() => source);
+    server.use(
+      http.get("*/mail/api/v1/inbox", () => {
+        inboxReads += 1;
+        return HttpResponse.json(inboxResponse);
+      }),
+    );
+    window.history.replaceState(
+      {},
+      "",
+      `/mail/#message/${projectOne.id}/${messageOne.id}`,
+    );
+    render(<App createEventSource={factory} />);
+
+    const composer = await screen.findByLabelText("Reply in Markdown");
+    await waitFor(() => expect(inboxReads).toBe(1));
+    act(() => source.emitOpen());
+
+    act(() => composer.focus());
+    expect(document.activeElement).toBe(composer);
+    const composerNode = composer;
+
+    // Simulate the new-mail ding: one SSE message, debounced 250 ms into a
+    // refreshVersion bump that re-runs the inbox/projects effect.
+    vi.useFakeTimers();
+    act(() => {
+      source.emitMessage();
+      vi.advanceTimersByTime(250);
+    });
+    vi.useRealTimers();
+    await waitFor(() => expect(inboxReads).toBe(2));
+
+    // The detail must not have passed through "loading" — the loading state
+    // panel would have unmounted the article and dropped focus. Asserting the
+    // same DOM node is still the active element covers both "no unmount" and
+    // "focus retained" in one check.
+    expect(screen.queryByText("Loading message…")).not.toBeInTheDocument();
+    expect(document.activeElement).toBe(composerNode);
+    expect(composerNode).toBeInTheDocument();
+  });
+
   it("redirects exactly once when viewer data loses authorization", async () => {
     const onUnauthorized = vi.fn();
     window.history.replaceState(

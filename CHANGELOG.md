@@ -35,6 +35,10 @@ Format: entries are organized by version in reverse chronological order. Each ve
 - Moved schema management under Alembic, strengthened verified backup and
   snapshot publication, kept delivery leases alive through finalization and
   tightened JWKS, validation-redaction and reservation-guard failure handling.
+- Added RFC 8414/RFC 9728 discovery, dynamic client registration and
+  Authorization Code + PKCE through an allowlisted GitHub OAuth broker, so
+  VS Code can connect from only the Iris MCP URL while existing static-bearer
+  and JWT clients continue to work unchanged.
 - Expanded the measured Windows CI matrix and lifecycle, backup, concurrency,
   authorization and release regression coverage.
 

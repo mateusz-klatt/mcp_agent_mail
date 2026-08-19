@@ -38,7 +38,8 @@ services:
     ports:
       - "127.0.0.1:8765:8765"
 
-    # Secrets (HTTP_BEARER_TOKEN, MAIL_UI_SESSION_SECRET) — gitignored, mode 0600.
+    # Secrets (bearer, UI session, and optional OAuth credentials/signing key)
+    # live in this gitignored mode-0600 file.
     env_file:
       - .env
 
@@ -61,6 +62,9 @@ services:
       HTTP_PATH: "/api/"
 
       STORAGE_ROOT: "/data/mailbox"
+      # DCR registrations, authorization transactions, and upstream tokens are
+      # encrypted before they reach this persistent directory.
+      HTTP_OAUTH_STORAGE_PATH: "/data/oauth"
 
       # ---------------------------------------------------------------------
       # THE most important line in this file.

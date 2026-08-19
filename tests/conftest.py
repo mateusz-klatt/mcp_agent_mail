@@ -105,6 +105,7 @@ def isolated_env(tmp_path, monkeypatch):
     monkeypatch.setenv("HTTP_HOST", "127.0.0.1")
     monkeypatch.setenv("HTTP_PORT", "8765")
     monkeypatch.setenv("HTTP_PATH", "/mcp/")
+    monkeypatch.setenv("HTTP_OAUTH_ENABLED", "false")
     monkeypatch.setenv("APP_ENVIRONMENT", "test")
     storage_root = tmp_path / "storage"
     monkeypatch.setenv("STORAGE_ROOT", str(storage_root))

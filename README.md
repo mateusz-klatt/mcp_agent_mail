@@ -548,6 +548,7 @@ Either way, `/mail` opens on a sign-in page rather than on your correspondence:
 Auth notes:
 - Human access uses the `/mail/login` session cookie. Set a long random `MAIL_UI_SESSION_SECRET`, keep `MAIL_UI_AUTH_ENABLED=true`, and create the first admin explicitly with `mcp-agent-mail ui-users add <name> --role admin`.
 - `HTTP_BEARER_TOKEN` authenticates MCP and narrow service traffic; it does not log a human into `/mail`. With UI auth enabled, the only `/mail` bearer exception is `GET /mail/api/file-reservations?project=...`, which installed hooks use as a read-only service endpoint.
+- Optional GitHub-backed OAuth lets browser clients discover and authenticate to MCP without receiving the shared service bearer. It is independent of the `/mail` human session; see [Browser OAuth for VS Code](#browser-oauth-for-vs-code).
 - `MAIL_UI_AUTH_ENABLED=false` is an open test/development mode with no human project boundary. Do not use it as a production reverse-proxy handoff.
 - Health endpoints remain open at `/health/*`.
 
@@ -2415,6 +2416,16 @@ Common variables you may set:
 | `HTTP_CORS_ALLOW_METHODS` | `*` | CSV of allowed methods or `*` |
 | `HTTP_CORS_ALLOW_HEADERS` | `*` | CSV of allowed headers or `*` |
 | `HTTP_BEARER_TOKEN` |  | Static MCP/service bearer; not a human `/mail` login |
+| `HTTP_OAUTH_ENABLED` | `false` | Enable RFC 8414/RFC 9728 discovery, DCR, and GitHub-backed Authorization Code + PKCE for interactive MCP clients |
+| `HTTP_OAUTH_BASE_URL` |  | Public HTTPS origin only, without `/mcp` (for example `https://mail.example.com`) |
+| `HTTP_OAUTH_GITHUB_CLIENT_ID` |  | Client ID of the server's GitHub OAuth App |
+| `HTTP_OAUTH_GITHUB_CLIENT_SECRET` |  | Client secret of the server's GitHub OAuth App |
+| `HTTP_OAUTH_GITHUB_ALLOWED_IDENTITIES` |  | CSV allowlist of `id:<numeric-id>` and/or `login:<login>` entries; immutable IDs are preferred |
+| `HTTP_OAUTH_JWT_SIGNING_KEY` |  | Stable secret of at least 32 characters for local access tokens and encrypted OAuth state |
+| `HTTP_OAUTH_STORAGE_PATH` | `~/.mcp_agent_mail_oauth` | Persistent encrypted DCR and token state; must be absolute in production |
+| `HTTP_OAUTH_ACCESS_TOKEN_TTL_SECONDS` | `2592000` | Lifetime of locally issued access tokens when GitHub returns a non-expiring token (300 seconds to 1 year) |
+| `HTTP_OAUTH_ALLOWED_CLIENT_REDIRECT_URIS` | `http://127.0.0.1:*,https://vscode.dev/redirect` | CSV of exact HTTPS redirects and explicit HTTP loopback port patterns for dynamically registered public clients; other wildcards are rejected |
+| `HTTP_OAUTH_RBAC_ROLE` | `writer` | Existing configured RBAC role assigned to an allowlisted OAuth identity |
 | `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED` | `true` in development; forced `false` in production | Allow local MCP transport requests without auth; production startup rejects an attempted opt-in and human UI sessions are never bypassed |
 | `MAIL_UI_AUTH_ENABLED` | `true` | Require human session authentication and project-scoped UI authorization; disable only for isolated test/development use |
 | `MAIL_UI_SESSION_SECRET` |  | Required secret used to sign human viewer sessions when UI auth is enabled |
@@ -2959,6 +2970,58 @@ For manual integration or customization, dedicated scripts are available:
 | GitHub Copilot CLI + VS Code | `scripts/integrate_github_copilot.sh` | `${COPILOT_HOME:-~/.copilot}/mcp-config.json`, user hook JSON/runtime, and VS Code's user `mcp.json` |
 | Gemini CLI | `scripts/integrate_gemini_cli.sh` | `~/.gemini/settings.json`, MCP server, hooks |
 | Factory Droid | `scripts/integrate_factory_droid.sh` | `~/.factory/settings.json`, MCP server, hooks |
+
+### Browser OAuth for VS Code
+
+Iris can expose standards-based OAuth discovery and Dynamic Client
+Registration (DCR), allowing VS Code/Copilot to connect with only the MCP URL.
+The browser flow uses Authorization Code + PKCE; Iris forwards identity
+authentication to GitHub, accepts only explicitly allowlisted GitHub users, and
+never gives VS Code the shared `HTTP_BEARER_TOKEN`. Static bearer and JWT
+authentication remain available in parallel for Copilot CLI, lifecycle hooks,
+and other headless agents.
+
+The server operator performs one GitHub setup step:
+
+1. Create a GitHub **OAuth App** with the public Iris origin as its homepage and
+   exactly `<public-origin>/auth/callback` as its authorization callback URL.
+   For `https://mail.example.com`, the callback is
+   `https://mail.example.com/auth/callback`.
+2. Add the following values to the existing private `.env` without replacing
+   that file. Obtain the immutable account ID with `gh api user --jq .id`.
+
+```dotenv
+HTTP_OAUTH_ENABLED=true
+HTTP_OAUTH_BASE_URL=https://mail.example.com
+HTTP_OAUTH_GITHUB_CLIENT_ID=<github-oauth-app-client-id>
+HTTP_OAUTH_GITHUB_CLIENT_SECRET=<github-oauth-app-client-secret>
+HTTP_OAUTH_GITHUB_ALLOWED_IDENTITIES=id:<numeric-github-user-id>
+HTTP_OAUTH_JWT_SIGNING_KEY=<output-of-openssl-rand-hex-32>
+HTTP_OAUTH_STORAGE_PATH=/data/oauth
+```
+
+Keep the signing key stable: it signs local access tokens and encrypts
+persistent OAuth registrations and upstream tokens. The default client redirect
+allowlist already covers VS Code's loopback callback on a dynamic port and
+`https://vscode.dev/redirect`; do not broaden it unless another trusted client
+requires a specific redirect.
+
+After restarting Iris, VS Code needs no manually provisioned `client_id`:
+
+```json
+{
+  "servers": {
+    "iris": {
+      "type": "http",
+      "url": "https://mail.example.com/mcp/"
+    }
+  }
+}
+```
+
+VS Code discovers `/.well-known/oauth-protected-resource/mcp`, registers a
+public client without a secret, and opens GitHub sign-in. Iris rejects the flow
+before persisting tokens unless the GitHub identity is on the allowlist.
 
 On native Windows, the Copilot installer resolves the Git Bash executable that
 is running it, so per-user and custom Git for Windows installations are valid.

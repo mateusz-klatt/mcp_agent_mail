@@ -1202,6 +1202,88 @@ def test_production_disallows_unauthenticated_localhost_writer(
         get_settings()
 
 
+def test_oauth_configuration_fails_closed_in_production(
+    isolated_env,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("APP_ENVIRONMENT", "production")
+    monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "false")
+    monkeypatch.setenv("HTTP_OAUTH_ENABLED", "true")
+    clear_settings_cache()
+    with pytest.raises(
+        ConfigError,
+        match="HTTP_OAUTH_ENABLED requires non-empty values",
+    ):
+        get_settings()
+
+    monkeypatch.setenv("HTTP_OAUTH_BASE_URL", "http://iris.example")
+    monkeypatch.setenv("HTTP_OAUTH_GITHUB_CLIENT_ID", "github-client")
+    monkeypatch.setenv(
+        "HTTP_OAUTH_GITHUB_CLIENT_SECRET",
+        "test-client-secret-" + ("s" * 32),
+    )
+    monkeypatch.setenv(
+        "HTTP_OAUTH_GITHUB_ALLOWED_IDENTITIES",
+        "login:allowed-user",
+    )
+    monkeypatch.setenv(
+        "HTTP_OAUTH_JWT_SIGNING_KEY",
+        "test-signing-key-" + ("k" * 32),
+    )
+    monkeypatch.setenv("HTTP_OAUTH_STORAGE_PATH", "relative/oauth")
+    clear_settings_cache()
+    with pytest.raises(ConfigError, match="must use https"):
+        get_settings()
+
+    monkeypatch.setenv("HTTP_OAUTH_BASE_URL", "https://iris.example")
+    clear_settings_cache()
+    with pytest.raises(ConfigError, match="must be absolute"):
+        get_settings()
+
+    monkeypatch.setenv("HTTP_OAUTH_STORAGE_PATH", str(tmp_path / "oauth"))
+    monkeypatch.setenv(
+        "HTTP_OAUTH_GITHUB_ALLOWED_IDENTITIES",
+        "id:not-a-number",
+    )
+    clear_settings_cache()
+    with pytest.raises(ConfigError, match="id: entries"):
+        get_settings()
+
+    monkeypatch.setenv(
+        "HTTP_OAUTH_GITHUB_ALLOWED_IDENTITIES",
+        "id:12345",
+    )
+    monkeypatch.setenv("HTTP_OAUTH_ACCESS_TOKEN_TTL_SECONDS", "60")
+    clear_settings_cache()
+    with pytest.raises(ConfigError, match="must be between 300"):
+        get_settings()
+
+    monkeypatch.setenv("HTTP_OAUTH_ACCESS_TOKEN_TTL_SECONDS", "2592000")
+    monkeypatch.setenv(
+        "HTTP_OAUTH_ALLOWED_CLIENT_REDIRECT_URIS",
+        "https://*.example.com/*",
+    )
+    clear_settings_cache()
+    with pytest.raises(ConfigError, match="wildcards only"):
+        get_settings()
+
+    monkeypatch.setenv(
+        "HTTP_OAUTH_ALLOWED_CLIENT_REDIRECT_URIS",
+        "http://127.0.0.1:*,https://vscode.dev/redirect",
+    )
+    monkeypatch.setenv("HTTP_OAUTH_RBAC_ROLE", "unknown-role")
+    clear_settings_cache()
+    with pytest.raises(ConfigError, match="HTTP_OAUTH_RBAC_ROLE"):
+        get_settings()
+
+    monkeypatch.setenv("HTTP_OAUTH_RBAC_ROLE", "writer")
+    clear_settings_cache()
+    settings = get_settings()
+    assert settings.http.oauth_enabled is True
+    assert settings.http.oauth_base_url == "https://iris.example"
+
+
 def test_execution_reaper_default_tolerates_long_event_driven_tools(
     isolated_env,
     monkeypatch,

@@ -19,8 +19,9 @@ import logging
 import math
 import re
 import threading
+import time
 import unicodedata
-from collections.abc import Callable, MutableMapping
+from collections.abc import Callable, Collection, MutableMapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal, NamedTuple, Protocol, TypedDict, cast
@@ -40,14 +41,30 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastmcp.server.auth import AccessToken as FastMCPAccessToken, OAuthProxy, TokenVerifier
+from fastmcp.server.auth.providers.github import GitHubTokenVerifier
 from git import NULL_TREE
+from key_value.aio.stores.disk import DiskStore
+from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
 from markupsafe import Markup, escape as escape_markup
+from mcp.server.auth.handlers.metadata import MetadataHandler
+from mcp.server.auth.provider import (
+    AuthorizationCode,
+    AuthorizationParams,
+    AuthorizeError,
+    RegistrationError,
+    TokenError,
+)
+from mcp.server.auth.routes import build_metadata, cors_middleware
+from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOptions
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, SecretStr, field_validator
 from sqlalchemy import select, text, update
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import col
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
 from . import webauth
@@ -67,7 +84,7 @@ from .app import (
     sweep_stale_agents,
     update_project_sibling_status,
 )
-from .config import Settings, get_settings
+from .config import OAUTH_LOOPBACK_REDIRECT_PORT_PATTERNS, Settings, get_settings
 from .db import ensure_schema, get_immediate_session, get_session
 from .delivery import (
     DeliveryActorSnapshot,
@@ -882,9 +899,304 @@ class Utf8BodyGuardMiddleware:
         await self._app(scope, replay, send)
 
 
+class _AllowlistedGitHubTokenVerifier(TokenVerifier):
+    """Validate a GitHub token and require an explicitly allowed identity."""
+
+    def __init__(self, allowed_identities: Collection[str]) -> None:
+        super().__init__(required_scopes=[])
+        self._delegate = GitHubTokenVerifier(required_scopes=[])
+        allowed_ids: set[str] = set()
+        allowed_logins: set[str] = set()
+        for raw_identity in allowed_identities:
+            identity = raw_identity.strip()
+            if not identity:
+                continue
+            prefix, separator, value = identity.partition(":")
+            if separator and prefix.casefold() == "id":
+                allowed_ids.add(value.strip())
+            elif separator and prefix.casefold() == "login":
+                allowed_logins.add(value.strip().casefold())
+            elif identity.isdecimal():
+                allowed_ids.add(identity)
+            else:
+                allowed_logins.add(identity.casefold())
+        self._allowed_ids = frozenset(allowed_ids)
+        self._allowed_logins = frozenset(allowed_logins)
+
+    async def verify_token(self, token: str) -> FastMCPAccessToken | None:
+        validated = await self._delegate.verify_token(token)
+        if validated is None:
+            return None
+
+        github_id = str(validated.claims.get("sub") or "").strip()
+        github_login = str(validated.claims.get("login") or "").strip()
+        if (
+            github_id in self._allowed_ids
+            or github_login.casefold() in self._allowed_logins
+        ):
+            return validated
+
+        structlog.get_logger("oauth").warning(
+            "github_identity_rejected",
+            github_user_id=github_id or None,
+            github_login=github_login or None,
+        )
+        return None
+
+
+class _AllowlistedGitHubOAuthProxy(OAuthProxy):
+    """Reject non-allowlisted GitHub users before persisting proxy tokens."""
+
+    def __init__(
+        self,
+        *,
+        access_token_ttl_seconds: int,
+        resource_url: str,
+        **kwargs: Any,
+    ) -> None:
+        self._access_token_ttl_seconds = access_token_ttl_seconds
+        self._oauth_resource_url = resource_url
+        self._authorization_code_exchange_lock = asyncio.Lock()
+        super().__init__(**kwargs)
+
+    def get_routes(self, mcp_path: str | None = None) -> list[Route]:
+        """Advertise the public-client token method accepted by the SDK."""
+
+        routes = super().get_routes(mcp_path)
+        client_registration_options = (
+            self.client_registration_options or ClientRegistrationOptions()
+        )
+        revocation_options = self.revocation_options or RevocationOptions()
+        metadata = build_metadata(
+            self.issuer_url,
+            self.service_documentation_url,
+            client_registration_options,
+            revocation_options,
+        )
+        metadata.token_endpoint_auth_methods_supported = ["none"]
+        metadata_route = Route(
+            "/.well-known/oauth-authorization-server",
+            endpoint=cors_middleware(
+                MetadataHandler(metadata).handle,
+                ["GET", "OPTIONS"],
+            ),
+            methods=["GET", "OPTIONS"],
+        )
+        return [
+            metadata_route
+            if route.path == "/.well-known/oauth-authorization-server"
+            else route
+            for route in routes
+        ]
+
+    async def register_client(
+        self,
+        client_info: OAuthClientInformationFull,
+    ) -> None:
+        for redirect_uri in client_info.redirect_uris or []:
+            if not _oauth_redirect_uri_allowed(
+                redirect_uri,
+                self._allowed_client_redirect_uris or (),
+            ):
+                raise RegistrationError(
+                    "invalid_redirect_uri",
+                    "The requested redirect URI is not allowed by this server.",
+                )
+        client_info.token_endpoint_auth_method = "none"
+        client_info.client_secret = None
+        client_info.client_secret_expires_at = None
+        await super().register_client(client_info)
+
+    async def authorize(
+        self,
+        client: OAuthClientInformationFull,
+        params: AuthorizationParams,
+    ) -> str:
+        if params.resource and not _oauth_resource_uris_match(
+            params.resource,
+            self._oauth_resource_url,
+        ):
+            raise AuthorizeError(
+                "invalid_request",
+                "The requested resource does not match this MCP server.",
+            )
+        return await super().authorize(client, params)
+
+    def _build_upstream_authorize_url(
+        self,
+        txn_id: str,
+        transaction: dict[str, Any],
+    ) -> str:
+        github_transaction = {**transaction, "resource": None}
+        return super()._build_upstream_authorize_url(
+            txn_id,
+            github_transaction,
+        )
+
+    async def exchange_authorization_code(
+        self,
+        client: OAuthClientInformationFull,
+        authorization_code: AuthorizationCode,
+    ) -> OAuthToken:
+        async with self._authorization_code_exchange_lock:
+            code_model = await self._code_store.get(key=authorization_code.code)
+            if code_model is not None:
+                upstream_access_token = str(
+                    code_model.idp_tokens.get("access_token") or ""
+                )
+                validated = (
+                    await self._token_validator.verify_token(upstream_access_token)
+                    if upstream_access_token
+                    else None
+                )
+                if validated is None:
+                    await self._code_store.delete(key=authorization_code.code)
+                    raise TokenError(
+                        "invalid_grant",
+                        "The authenticated GitHub identity is not authorized for this server.",
+                    )
+                if not code_model.idp_tokens.get("expires_in"):
+                    code_model.idp_tokens["expires_in"] = (
+                        self._access_token_ttl_seconds
+                    )
+                    await self._code_store.put(
+                        key=authorization_code.code,
+                        value=code_model,
+                        ttl=max(1, int(code_model.expires_at - time.time())),
+                    )
+            return await super().exchange_authorization_code(
+                client,
+                authorization_code,
+            )
+
+
+def _oauth_redirect_uri_allowed(
+    redirect_uri: object,
+    allowed_patterns: Collection[str],
+) -> bool:
+    """Match exact HTTPS redirects or a strictly parsed loopback port pattern."""
+
+    redirect_text = str(redirect_uri)
+    try:
+        parsed_redirect = urlsplit(redirect_text)
+        redirect_hostname = parsed_redirect.hostname
+        redirect_port = parsed_redirect.port
+    except ValueError:
+        return False
+    if (
+        not parsed_redirect.netloc
+        or parsed_redirect.username is not None
+        or parsed_redirect.password is not None
+        or parsed_redirect.fragment
+    ):
+        return False
+
+    for pattern in allowed_patterns:
+        if pattern in OAUTH_LOOPBACK_REDIRECT_PORT_PATTERNS:
+            parsed_pattern = urlsplit(pattern[:-1] + "1")
+            if (
+                parsed_redirect.scheme == "http"
+                and redirect_hostname == parsed_pattern.hostname
+                and redirect_port is not None
+            ):
+                return True
+        elif hmac.compare_digest(redirect_text, pattern):
+            return True
+    return False
+
+
+def _oauth_resource_uris_match(requested: str, expected: str) -> bool:
+    """Compare canonical resource origins and paths, tolerating a trailing slash."""
+
+    def _parts(value: str) -> tuple[str, str, int, str] | None:
+        try:
+            parsed = urlsplit(value)
+            hostname = parsed.hostname
+            port = parsed.port
+        except ValueError:
+            return None
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+        ):
+            return None
+        effective_port = port
+        if effective_port is None:
+            effective_port = 443 if parsed.scheme == "https" else 80
+        return (
+            parsed.scheme.casefold(),
+            hostname.casefold(),
+            effective_port,
+            parsed.path.rstrip("/"),
+        )
+
+    return _parts(requested) == _parts(expected)
+
+
+def _build_oauth_provider(settings: Settings) -> OAuthProxy | None:
+    """Build the optional GitHub-backed OAuth broker with encrypted storage."""
+
+    if not settings.http.oauth_enabled:
+        return None
+
+    client_id = settings.http.oauth_github_client_id
+    client_secret = settings.http.oauth_github_client_secret
+    signing_key = settings.http.oauth_jwt_signing_key
+    if client_id is None or client_secret is None or signing_key is None:
+        raise RuntimeError("OAuth configuration was not validated before app startup.")
+
+    storage = FernetEncryptionWrapper(
+        DiskStore(
+            directory=Path(settings.http.oauth_storage_path).expanduser(),
+            max_size=256 * 1024 * 1024,
+        ),
+        source_material=signing_key,
+        salt="mcp-agent-mail-oauth-storage-v1",
+    )
+    token_verifier = _AllowlistedGitHubTokenVerifier(
+        settings.http.oauth_github_allowed_identities
+    )
+    return _AllowlistedGitHubOAuthProxy(
+        upstream_authorization_endpoint="https://github.com/login/oauth/authorize",
+        upstream_token_endpoint="https://github.com/login/oauth/access_token",
+        upstream_client_id=client_id,
+        upstream_client_secret=client_secret,
+        token_verifier=token_verifier,
+        access_token_ttl_seconds=settings.http.oauth_access_token_ttl_seconds,
+        resource_url=f"{settings.http.oauth_base_url}/mcp",
+        base_url=settings.http.oauth_base_url,
+        issuer_url=settings.http.oauth_base_url,
+        allowed_client_redirect_uris=settings.http.oauth_allowed_client_redirect_uris,
+        valid_scopes=[],
+        forward_pkce=True,
+        client_storage=storage,
+        jwt_signing_key=signing_key,
+        require_authorization_consent=True,
+    )
+
+
+def _oauth_path_is_public(
+    path: str,
+    oauth_public_paths: Collection[str],
+) -> bool:
+    """Return whether an OAuth protocol endpoint must be anonymously reachable."""
+
+    return path in oauth_public_paths or "/.well-known/oauth-" in path
+
+
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     def __init__(
-        self, app: FastAPI, token: str, allow_localhost: bool = False, jwt_enabled: bool = False
+        self,
+        app: FastAPI,
+        token: str | None,
+        allow_localhost: bool = False,
+        jwt_enabled: bool = False,
+        oauth_provider: OAuthProxy | None = None,
+        oauth_public_paths: Collection[str] = (),
+        oauth_resource_metadata_url: str | None = None,
     ) -> None:
         super().__init__(app)
         self._token = token
@@ -894,6 +1206,9 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         # chance to validate a JWT (#210). In that case we accept any Bearer
         # token here and let the JWT path render the final auth decision.
         self._jwt_enabled = jwt_enabled
+        self._oauth_provider = oauth_provider
+        self._oauth_public_paths = frozenset(oauth_public_paths)
+        self._oauth_resource_metadata_url = oauth_resource_metadata_url
 
     @staticmethod
     def _is_localhost(host: str) -> bool:
@@ -920,6 +1235,11 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         if request.url.path.startswith("/health/") or request.url.path == "/api/health":
             return await call_next(request)
+        if _oauth_path_is_public(
+            request.url.path,
+            self._oauth_public_paths,
+        ):
+            return await call_next(request)
         # MailUiAuthMiddleware sits OUTSIDE this one and has already rendered a
         # verdict for /mail: either it authenticated a browser session (and set
         # this flag) or it redirected to the login page. Re-checking the bearer
@@ -933,16 +1253,33 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         ):
             return await call_next(request)
         auth_header = request.headers.get("Authorization", "")
-        expected_header = f"Bearer {self._token}"
-        # Use constant-time comparison to prevent timing attacks
-        if hmac.compare_digest(auth_header, expected_header):
+        expected_header = f"Bearer {self._token}" if self._token else ""
+        # Use constant-time comparison to prevent timing attacks.
+        if expected_header and hmac.compare_digest(auth_header, expected_header):
             return await call_next(request)
+        if self._oauth_provider is not None and auth_header.startswith("Bearer "):
+            oauth_token = auth_header.split(" ", 1)[1].strip()
+            if oauth_token:
+                validated = await self._oauth_provider.verify_token(oauth_token)
+                if validated is not None:
+                    request.state.oauth_access_token = validated
+                    return await call_next(request)
         # Static bearer did not match. If JWT auth is enabled, defer to the inner
         # JWT-validating middleware instead of rejecting here, so EITHER a valid
         # static bearer OR a valid JWT is accepted (#210).
         if self._jwt_enabled and auth_header.startswith("Bearer "):
             return await call_next(request)
-        return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
+        headers = {}
+        if self._oauth_resource_metadata_url:
+            headers["WWW-Authenticate"] = (
+                'Bearer resource_metadata="'
+                f'{self._oauth_resource_metadata_url}"'
+            )
+        return JSONResponse(
+            {"detail": "Unauthorized"},
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            headers=headers,
+        )
 
 
 def _localhost_bypass_allowed(request: Request, *, allow_localhost: bool) -> bool:
@@ -4708,9 +5045,15 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
     - Applies per-endpoint token-bucket limits (tools vs resources) with in-memory or Redis backend.
     """
 
-    def __init__(self, app: FastAPI, settings: Settings):
+    def __init__(
+        self,
+        app: FastAPI,
+        settings: Settings,
+        oauth_public_paths: Collection[str] = (),
+    ):
         super().__init__(app)
         self.settings = settings
+        self._oauth_public_paths = frozenset(oauth_public_paths)
         self._jwt_enabled = bool(getattr(settings.http, "jwt_enabled", False))
         self._rbac_enabled = bool(getattr(settings.http, "rbac_enabled", True))
         self._reader_roles = set(getattr(settings.http, "rbac_reader_roles", []) or [])
@@ -4930,8 +5273,15 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
         kind, tool_name = self._classify_request(request.url.path, request.method, body_bytes)
 
         # JWT auth (if enabled)
-        if getattr(request.state, "mail_ui_authenticated", False):
+        if _oauth_path_is_public(
+            request.url.path,
+            self._oauth_public_paths,
+        ):
+            roles: set[str] = set()
+        elif getattr(request.state, "mail_ui_authenticated", False):
             roles = {self._default_role}
+        elif getattr(request.state, "oauth_access_token", None) is not None:
+            roles = {self.settings.http.oauth_rbac_role}
         elif self._jwt_enabled:
             auth_header = request.headers.get("Authorization", "")
             # #210: when JWT is enabled, a valid *static* bearer is still accepted
@@ -5047,6 +5397,23 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     _configure_logging(settings)
     if server is None:
         server = build_mcp_server()
+
+    oauth_provider = _build_oauth_provider(settings)
+    oauth_routes = (
+        oauth_provider.get_routes(mcp_path="/mcp")
+        if oauth_provider is not None
+        else []
+    )
+    oauth_public_paths = frozenset(
+        str(route.path)
+        for route in oauth_routes
+        if getattr(route, "path", None)
+    )
+    oauth_resource_metadata_url = (
+        f"{settings.http.oauth_base_url}/.well-known/oauth-protected-resource/mcp"
+        if oauth_provider is not None
+        else None
+    )
 
     # Build MCP HTTP sub-app with stateless mode for ASGI test transports
     mcp_http_app = cast(_FastMCPHttpApp, server).http_app(
@@ -5509,9 +5876,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         or getattr(settings.http, "rbac_enabled", True)
     ):
         app_any = cast(Any, fastapi_app)
-        app_any.add_middleware(SecurityAndRateLimitMiddleware, settings=settings)
+        app_any.add_middleware(
+            SecurityAndRateLimitMiddleware,
+            settings=settings,
+            oauth_public_paths=oauth_public_paths,
+        )
     # Bearer auth for non-localhost only; allow localhost unauth optionally for seamless local dev
-    if settings.http.bearer_token:
+    if settings.http.bearer_token or oauth_provider is not None:
         from typing import Any as _Any, cast as _cast  # local type-only import
         app_any = _cast(_Any, fastapi_app)
         app_any.add_middleware(
@@ -5519,6 +5890,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             token=settings.http.bearer_token,
             allow_localhost=bool(getattr(settings.http, "allow_localhost_unauthenticated", False)),
             jwt_enabled=bool(getattr(settings.http, "jwt_enabled", False)),
+            oauth_provider=oauth_provider,
+            oauth_public_paths=oauth_public_paths,
+            oauth_resource_metadata_url=oauth_resource_metadata_url,
         )
 
     # Registered AFTER BearerAuthMiddleware, which with Starlette's add_middleware
@@ -5850,6 +6224,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
     _add_oauth_metadata_path("/.well-known/oauth-authorization-server")
     _add_oauth_metadata_path("/.well-known/oauth-authorization-server/mcp")
+    _add_oauth_metadata_path("/.well-known/oauth-protected-resource")
+    _add_oauth_metadata_path("/.well-known/oauth-protected-resource/mcp")
     for mount_path in mount_paths:
         normalized = mount_path.rstrip("/") or "/"
         if normalized == "/":
@@ -5857,8 +6233,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         _add_oauth_metadata_path(f"{normalized}/.well-known/oauth-authorization-server")
         _add_oauth_metadata_path(f"{normalized}/.well-known/oauth-authorization-server/mcp")
         _add_oauth_metadata_path(f"/.well-known/oauth-authorization-server{normalized}")
-    for path in sorted(oauth_metadata_paths):
-        _register_oauth_metadata_disabled(path)
+    if oauth_provider is not None:
+        fastapi_app.router.routes.extend(oauth_routes)
+        fastapi_app.state.oauth_provider = oauth_provider
+    else:
+        for path in sorted(oauth_metadata_paths):
+            _register_oauth_metadata_disabled(path)
 
     for mount_path in mount_paths:
         with contextlib.suppress(Exception):

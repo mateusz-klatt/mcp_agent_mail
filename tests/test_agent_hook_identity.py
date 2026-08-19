@@ -508,6 +508,7 @@ def test_state_digest_fails_without_a_sha256_provider() -> None:
 @pytest.mark.parametrize(
     ("uname_value", "extra_setup", "client", "slot", "expected"),
     [
+        ("Linux", "grep() { return 1; }", "agy", "1", "agy-linux-labbox-1"),
         ("Linux", "grep() { return 1; }", "claude", "1", "claude-linux-labbox-1"),
         (
             "Linux",
@@ -529,6 +530,8 @@ def test_state_digest_fails_without_a_sha256_provider() -> None:
         ("Linux", "grep() { return 1; }", "cline", "1", "cline-linux-labbox-1"),
         ("Linux", "grep() { return 1; }", "windsurf", "1", "windsurf-linux-labbox-1"),
         ("Linux", "grep() { return 1; }", "opencode", "4", "opencode-linux-labbox-4"),
+        ("Linux", "grep() { return 1; }", "grok", "1", "grok-linux-labbox-1"),
+        ("Linux", "grep() { return 1; }", "kimi", "1", "kimi-linux-labbox-1"),
     ],
 )
 def test_integration_agent_name_is_cross_platform_and_client_scoped(
@@ -6076,6 +6079,29 @@ def test_hook_remembers_granted_names_per_client_and_slot(tmp_path: Path) -> Non
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == ["server-claude", "server-codex", "server-codex-slot-2"]
+
+
+@pytest.mark.parametrize("client", ["agy", "grok", "kimi"])
+def test_hook_accepts_claude_delegator_client_families(
+    tmp_path: Path,
+    client: str,
+) -> None:
+    result = _bash(
+        f"""
+        export AGENT_MAIL_STATE_DIR={shlex.quote(_git_bash_path(tmp_path))}
+        export AGENT_MAIL_ENV_FILE=/dev/null
+        export AGENT_MAIL_PROJECT_KEY=/owner/repo
+        source {shlex.quote(_git_bash_path(HOOK_COMMON))}
+        uname() {{ printf Linux; }}
+        hostname() {{ printf 'Lab-Box'; }}
+        grep() {{ return 1; }}
+        am_agent_name '{client}' 1
+        """,
+        env={"AGENT_MAIL_AGENT": "", "WSL_DISTRO_NAME": ""},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"{client}-linux-lab-box-1"
 
 
 @pytest.mark.parametrize(

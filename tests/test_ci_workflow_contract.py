@@ -222,6 +222,15 @@ def test_release_reuses_exact_sha_gates_before_publication() -> None:
     assert "        run: uv sync --dev --frozen" in validation
     assert any("git rev-parse HEAD" in line for line in validation)
     assert any("pyproject.toml version" in line for line in validation)
+    assert any("Ensure the Docker Hub repository is public" in line for line in validation)
+    assert any("https://hub.docker.com/v2/auth/token" in line for line in validation)
+    assert any(
+        "https://hub.docker.com/v2/namespaces/klattm/repositories/iris" in line
+        for line in validation
+    )
+    assert sum('--oauth2-bearer "$hub_token"' in line for line in validation) == 2
+    assert any('"$status" == "404"' in line for line in validation)
+    assert any("is_private: false" in line for line in validation)
 
     assert "    needs: validate-release" in candidates
     assert "      packages: write" in candidates
@@ -264,6 +273,11 @@ def test_release_reuses_exact_sha_gates_before_publication() -> None:
     assert any(".manifests | length" in line for line in publish)
     assert any('"$tag_digest" != "$manifest_digest"' in line for line in publish)
     assert any("steps.promote.outputs.digest" in line for line in publish)
+    assert any("Verify release tags are anonymously pullable" in line for line in publish)
+    assert any('printf \'{"auths":{}}\\n\'' in line for line in publish)
+    assert any('DOCKER_CONFIG="$anonymous_docker_config"' in line for line in publish)
+    assert any("New GHCR packages are private by default" in line for line in publish)
+    assert any('"$tag_digest" != "$PROMOTED_DIGEST"' in line for line in publish)
     assert not any("docker/build-push-action@" in line for line in publish)
 
     all_release_builds = [

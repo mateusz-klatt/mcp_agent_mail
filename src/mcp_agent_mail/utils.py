@@ -167,8 +167,25 @@ NOUNS: Iterable[str] = (
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _AGENT_NAME_RE = re.compile(r"[^A-Za-z0-9]+")
 _THREAD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+CANONICAL_AGENT_CLIENTS: tuple[str, ...] = (
+    "agy",
+    "claude",
+    "cline",
+    "codex",
+    "copilot",
+    "cursor",
+    "factory",
+    "gemini",
+    "grok",
+    "kimi",
+    "opencode",
+    "windsurf",
+)
+_CANONICAL_AGENT_CLIENT_PATTERN = "|".join(
+    re.escape(client) for client in CANONICAL_AGENT_CLIENTS
+)
 _CLIENT_PLATFORM_HOST_AGENT_ID_RE = re.compile(
-    r"^(?:claude|codex|copilot|gemini|factory|cursor|cline|windsurf|opencode)"
+    rf"^(?:{_CANONICAL_AGENT_CLIENT_PATTERN})"
     r"-(?:linux|wsl|win|mac|other)"
     r"-[A-Za-z0-9][A-Za-z0-9._-]{0,95}"
     r"-[1-9][0-9]*$",

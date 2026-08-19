@@ -336,10 +336,13 @@ am_platform() {
 am_client() {
     local client="${1:-}"
     case "$client" in
+        agy) printf 'agy' ;;
         claude) printf 'claude' ;;
         codex) printf 'codex' ;;
         copilot) printf 'copilot' ;;
         gemini) printf 'gemini' ;;
+        grok) printf 'grok' ;;
+        kimi) printf 'kimi' ;;
         *)
             printf 'Unsupported Agent Mail client: %s\n' "$client" >&2
             return 1 ;;

@@ -71,6 +71,58 @@ jobs:
             exit 1
           fi
 
+      - name: Ensure the Docker Hub repository is public
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          auth_response="$(
+            jq -n \
+              --arg identifier "$DOCKERHUB_USERNAME" \
+              --arg secret "$DOCKERHUB_TOKEN" \
+              '{identifier: $identifier, secret: $secret}' \
+              | curl --fail-with-body --silent --show-error \
+                  --request POST \
+                  --header "Content-Type: application/json" \
+                  --data-binary @- \
+                  https://hub.docker.com/v2/auth/token
+          )"
+          hub_token="$(jq -er '.access_token' <<<"$auth_response")"
+          status="$(
+            curl --silent --show-error \
+              --output "$RUNNER_TEMP/dockerhub-repository.json" \
+              --write-out "%{http_code}" \
+              --oauth2-bearer "$hub_token" \
+              "https://hub.docker.com/v2/namespaces/klattm/repositories/iris"
+          )"
+          if [[ "$status" == "404" ]]; then
+            jq -n \
+              --arg name "iris" \
+              --arg namespace "klattm" \
+              --arg description "MCP Agent Mail (Iris) server" \
+              '{
+                name: $name,
+                namespace: $namespace,
+                description: $description,
+                registry: "docker.io",
+                is_private: false
+              }' \
+              | curl --fail-with-body --silent --show-error \
+                  --request POST \
+                  --oauth2-bearer "$hub_token" \
+                  --header "Content-Type: application/json" \
+                  --data-binary @- \
+                  "https://hub.docker.com/v2/namespaces/klattm/repositories" \
+                  > "$RUNNER_TEMP/dockerhub-repository.json"
+          elif [[ "$status" != "200" ]]; then
+            cat "$RUNNER_TEMP/dockerhub-repository.json"
+            exit 1
+          fi
+          jq -e \
+            '.namespace == "klattm" and .name == "iris" and .is_private == false' \
+            "$RUNNER_TEMP/dockerhub-repository.json" >/dev/null
+
       - name: Verify exact tag, checkout, and project version
         id: version
         shell: bash
@@ -308,7 +360,7 @@ jobs:
           flavor: |
             latest=false
           # `type=ref,event=tag` publishes the git ref verbatim, so it yields
-          # `v0.4.0`. The documented pull command is `klattm/iris:0.4.0`, which
+          # `v0.5.0`. The documented pull command is `klattm/iris:0.5.0`, which
           # is also the ordinary Docker spelling — without `type=semver` that
           # command would 404 against a release that had otherwise succeeded,
           # and nothing in this workflow would notice. Publish both spellings so
@@ -394,6 +446,34 @@ jobs:
             fi
           done <<< "$RELEASE_TAGS"
           echo "digest=$manifest_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Verify release tags are anonymously pullable
+        env:
+          PROMOTED_DIGEST: ${{ steps.promote.outputs.digest }}
+        run: |
+          set -euo pipefail
+          anonymous_docker_config="$RUNNER_TEMP/anonymous-docker"
+          mkdir -p "$anonymous_docker_config"
+          printf '{"auths":{}}\n' > "$anonymous_docker_config/config.json"
+          for tag in \
+            "ghcr.io/${{ github.repository }}:${{ github.ref_name }}" \
+            "docker.io/klattm/iris:${{ github.ref_name }}"; do
+            if ! manifest_json="$(
+              DOCKER_CONFIG="$anonymous_docker_config" \
+                docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}'
+            )"; then
+              echo "::error::$tag is not anonymously pullable."
+              if [[ "$tag" == ghcr.io/* ]]; then
+                echo "::error::New GHCR packages are private by default. Change the package visibility to Public, then rerun this failed job."
+              fi
+              exit 1
+            fi
+            tag_digest="$(jq -er '.digest' <<<"$manifest_json")"
+            if [[ "$tag_digest" != "$PROMOTED_DIGEST" ]]; then
+              echo "::error::$tag anonymously resolves to $tag_digest instead of $PROMOTED_DIGEST"
+              exit 1
+            fi
+          done
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2

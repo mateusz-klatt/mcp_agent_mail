@@ -6,6 +6,50 @@ Format: entries are organized by version in reverse chronological order. Each ve
 
 ---
 
+## v0.5.0 - 2026-08-19
+
+### Durable agents and executions
+
+- Added the four-level Agent and AgentExecution lifecycle model, including
+  parent/child execution chains, authenticated lifecycle capabilities,
+  execution-scoped automatic reservations, durable explicit reservations and
+  advisory build slots.
+- Hardened lifecycle enrollment and teardown across Claude Code, Codex,
+  Copilot, Gemini, Cursor and other supported clients on Linux, native Windows,
+  WSL and macOS, including cross-project sessions and restart races.
+- Added secret-safe registration-token rotation with a durable local recovery
+  journal, stronger profile validation and deterministic canonical identities,
+  including the `agy`, `grok` and `kimi` provider families used by
+  claude-delegator 1.9.2.
+
+### Iris operator experience
+
+- Exposed the live agent directory and file reservations to the operator
+  console, restored operator compose and thread conversations, and improved
+  notification tones, UTC expiry rendering and reply-composer focus.
+- Streamlined onboarding, diagnostics and wake monitoring while making monitor
+  ownership limits explicit on native Windows.
+
+### Reliability and security
+
+- Moved schema management under Alembic, strengthened verified backup and
+  snapshot publication, kept delivery leases alive through finalization and
+  tightened JWKS, validation-redaction and reservation-guard failure handling.
+- Expanded the measured Windows CI matrix and lifecycle, backup, concurrency,
+  authorization and release regression coverage.
+
+### Distribution
+
+- Published the Claude Code plugin as 0.5.0 so installations refresh the
+  post-0.4.0 lifecycle and credential-management scripts instead of reusing a
+  stale same-version cache.
+- Added the first public Iris container release pipeline. The same smoked
+  `linux/amd64` and `linux/arm64` manifest is promoted to Docker Hub
+  (`klattm/iris`) and GHCR (`ghcr.io/mateusz-klatt/mcp_agent_mail`) under
+  version, Git tag, commit and `latest` tags, with automatic public Docker Hub
+  repository creation and anonymous-access verification before the GitHub
+  Release is created.
+
 ## v0.4.0 - 2026-08-13
 
 ### Iris human interface

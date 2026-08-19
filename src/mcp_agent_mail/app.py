@@ -3213,9 +3213,10 @@ async def _get_project_by_id(project_id: int) -> Project:
 
 # Known program names that agents might mistakenly use as agent names
 _KNOWN_PROGRAM_NAMES: frozenset[str] = frozenset({
-    "claude-code", "claude", "codex-cli", "codex", "cursor", "windsurf",
-    "cline", "aider", "copilot", "github-copilot", "gemini-cli", "gemini",
-    "opencode", "vscode", "neovim", "vim", "emacs", "zed", "continue",
+    "agy", "claude-code", "claude", "codex-cli", "codex", "cursor", "grok",
+    "windsurf", "cline", "aider", "copilot", "github-copilot", "gemini-cli",
+    "gemini", "kimi", "opencode", "vscode", "neovim", "vim", "emacs", "zed",
+    "continue",
 })
 
 # Known model name patterns that agents might mistakenly use as agent names

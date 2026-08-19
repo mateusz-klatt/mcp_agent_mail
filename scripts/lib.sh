@@ -1225,6 +1225,7 @@ integration_platform() {
 integration_client() {
   local client="$1"
   case "$client" in
+    agy) printf 'agy' ;;
     claude) printf 'claude' ;;
     codex) printf 'codex' ;;
     copilot) printf 'copilot' ;;
@@ -1234,6 +1235,8 @@ integration_client() {
     cline) printf 'cline' ;;
     windsurf) printf 'windsurf' ;;
     opencode) printf 'opencode' ;;
+    grok) printf 'grok' ;;
+    kimi) printf 'kimi' ;;
     *)
       log_err "Unsupported agent client token: ${client}"
       return 1 ;;

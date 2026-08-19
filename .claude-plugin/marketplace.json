@@ -6,13 +6,13 @@
   },
   "metadata": {
     "description": "MCP Agent Mail — coordinated multi-agent messaging with secret-safe onboarding, exact diagnostics and an on-demand night monitor.",
-    "version": "0.4.0"
+    "version": "0.5.0"
   },
   "plugins": [
     {
       "name": "mcp-agent-mail",
       "source": "./",
-      "version": "0.4.0",
+      "version": "0.5.0",
       "description": "Agent Mail bootstrap, diagnostics and night-time delivery for Claude Code. Bundled skills provision and verify durable mailboxes, while the on-demand monitor streams mail hints for an unattended session. Lifecycle execution and turn-boundary delivery remain in scripts/integrate_claude_code.sh.",
       "author": {
         "name": "Mateusz Klatt",

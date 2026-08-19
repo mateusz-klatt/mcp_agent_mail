@@ -21,6 +21,7 @@ from mcp_agent_mail.db import get_session
 from mcp_agent_mail.models import Agent
 from mcp_agent_mail.utils import (
     ADJECTIVES,
+    CANONICAL_AGENT_CLIENTS,
     NOUNS,
     generate_agent_name,
     parse_client_platform_host_agent_id,
@@ -128,16 +129,28 @@ class TestValidateClientPlatformHostAgentId:
     @pytest.mark.parametrize(
         "name",
         [
+            "agy-linux-home-1",
             "claude-wsl-home-1",
+            "cline-linux-home-1",
             "codex-wsl-home-1",
-            "cursor-wsl-home-1",
             "copilot-win-home-1",
+            "cursor-wsl-home-1",
+            "factory-linux-home-1",
             "gemini-linux-build-box-7-12",
+            "grok-linux-home-1",
+            "kimi-linux-home-1",
+            "opencode-linux-home-1",
+            "windsurf-linux-home-1",
             "claude-mac-MacBook-Pro.mac-2",
         ],
     )
     def test_accepts_supported_client_identities(self, name: str) -> None:
         assert validate_client_platform_host_agent_id(name)
+
+    def test_client_vocabulary_covers_claude_delegator_providers(self) -> None:
+        assert {"agy", "claude", "codex", "copilot", "cursor", "grok", "kimi"} <= set(
+            CANONICAL_AGENT_CLIENTS
+        )
 
     @pytest.mark.parametrize(
         "name",
@@ -312,6 +325,39 @@ async def test_register_agent_with_explicit_durable_name(isolated_env):
         )
 
         assert result.data["name"] == "codex-wsl-names-1"
+        assert result.data["registration_token"]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "agy-linux-delegator-1",
+        "grok-linux-delegator-1",
+        "kimi-linux-delegator-1",
+    ],
+)
+@pytest.mark.asyncio
+async def test_register_agent_accepts_claude_delegator_provider_identity(
+    isolated_env,
+    name: str,
+):
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool(
+            "ensure_project",
+            {"human_key": pkey("test/delegator-provider-names")},
+        )
+        result = await client.call_tool(
+            "register_agent",
+            {
+                "project_key": pkey("test/delegator-provider-names"),
+                "program": name.partition("-")[0],
+                "model": "test-model",
+                "name": name,
+            },
+        )
+
+        assert result.data["name"] == name
         assert result.data["registration_token"]
 
 

@@ -54,10 +54,11 @@ cd mcp_agent_mail
 bash scripts/install.sh --yes
 ```
 
-Once the first tagged release exists, prefer pinning to it rather than tracking `main`:
+For reproducible installs, pin to the current release rather than tracking
+`main`:
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/mateusz-klatt/mcp_agent_mail/<tag>/scripts/install.sh" | bash -s -- --yes
+curl -fsSL "https://raw.githubusercontent.com/mateusz-klatt/mcp_agent_mail/v0.5.0/scripts/install.sh" | bash -s -- --yes
 ```
 
 `scripts/install.sh --help` lists the flags. Per-client integrators live in `scripts/integrate_*.sh` and are safe to re-run — each one re-derives its own managed entries, so a second run updates rather than duplicates. **Re-run the integrator after pulling**: the installed hooks are copies, not links, and nothing warns when they fall behind.
@@ -157,6 +158,11 @@ This project provides a lightweight, interoperable layer so agents can:
 - Search, summarize, and thread conversations
 - Declare advisory file reservations (leases) on files/globs to signal intent
 - Inspect a directory of active agents, programs/models, and activity
+
+The canonical client vocabulary includes the provider families used by
+claude-delegator (`agy`, `grok` and `kimi`) even where Iris does not ship a
+dedicated installer, so delegated CLIs can register and report under their own
+identity instead of impersonating the caller.
 
 It's designed for: FastMCP clients and CLI tools (Claude Code, Codex, Gemini CLI, Factory Droid, etc.) coordinating across one or more codebases.
 
@@ -2249,7 +2255,7 @@ run.
 Pin the version for anything you depend on:
 
 ```bash
-docker run -p 8765:8765 -v iris-data:/data klattm/iris:0.4.0
+docker run -p 8765:8765 -v iris-data:/data klattm/iris:0.5.0
 ```
 
 Building it yourself is still supported, and is what you want when changing the
@@ -2784,7 +2790,14 @@ Operations teams can follow `docs/operations_alignment_checklist.md`, which link
 ### CI/CD
 
 - Lint and Typecheck CI: GitHub Actions workflow runs Ruff and Ty on pushes/PRs to main/develop.
-- Release: Pushing a tag like `v0.1.0` builds and pushes a multi-arch Docker image to GHCR under `ghcr.io/<owner>/<repo>` with `latest` and version tags.
+- Release: Pushing a tag like `v0.5.0` builds and smokes the exact amd64 and
+  arm64 candidates, then promotes one multi-arch manifest to Docker Hub
+  (`klattm/iris`) and GHCR (`ghcr.io/mateusz-klatt/mcp_agent_mail`) with
+  `latest`, version, Git tag and commit tags. The workflow creates the Docker
+  Hub repository as public when needed and refuses to create the GitHub Release
+  until both registry tags are anonymously pullable. GitHub makes a new
+  personal GHCR package private, so on its first publication change the
+  package visibility to **Public** and rerun the failed publish job.
 - Nightly: A scheduled workflow runs migrations and lists projects daily for lightweight maintenance visibility.
 
 ### Log rotation (optional)

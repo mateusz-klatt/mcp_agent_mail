@@ -21,19 +21,23 @@ import stat
 import subprocess
 import time
 from collections import defaultdict, deque
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from functools import wraps
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, AsyncContextManager, Callable, Optional, Protocol, Union, cast
+from typing import Any, AsyncContextManager, Callable, Optional, Union, cast
 from urllib.parse import parse_qsl
 import uuid
 
 from fastmcp import Context, FastMCP
-from fastmcp.exceptions import ToolError as _FastMCPToolError
+from fastmcp.exceptions import (
+    ToolError as _FastMCPToolError,
+    ValidationError as _FastMCPValidationError,
+)
+from fastmcp.resources import ResourceContent, ResourceResult
 from fastmcp.server.middleware import Middleware
 from pydantic import ValidationError
 from git import Repo
@@ -47,7 +51,6 @@ from . import rich_logger
 from .config import Settings, get_settings
 from .db import (
     await_database_cleanup_task,
-    dispose_engine_blocking,
     ensure_schema,
     get_engine,
     get_immediate_session,
@@ -132,7 +135,14 @@ _EXECUTION_LIFECYCLE_PROTOCOL_VERSION = 1
 _EXECUTION_TOKEN_PATTERN = re.compile(r"[0-9a-f]{64}")
 _REGISTRATION_TOKEN_PATTERN = re.compile(r"[0-9a-f]{64}")
 _REDACTED_TOOL_ARGUMENT = "***"
-_SENSITIVE_TOOL_LOG_KEY_FRAGMENTS = ("token", "secret", "capability")
+_SENSITIVE_TOOL_LOG_KEY_FRAGMENTS = (
+    "bearer",
+    "capability",
+    "credential",
+    "password",
+    "secret",
+    "token",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,27 +177,133 @@ def _registration_token_fingerprint(token: str | None) -> str | None:
 
 def _redact_tool_log_value(value: Any) -> Any:
     """Return a recursively redacted copy suitable only for diagnostic logs."""
-    if isinstance(value, dict):
-        return {
-            key: (
-                _REDACTED_TOOL_ARGUMENT
-                if any(
-                    fragment in str(key).casefold()
-                    for fragment in _SENSITIVE_TOOL_LOG_KEY_FRAGMENTS
+    sensitive_values: set[str] = set()
+
+    def _is_sensitive_key(key: Any) -> bool:
+        return any(
+            fragment in str(key).casefold()
+            for fragment in _SENSITIVE_TOOL_LOG_KEY_FRAGMENTS
+        )
+
+    def _collect(item: Any, *, sensitive_context: bool = False) -> None:
+        if isinstance(item, Mapping):
+            for key, nested in item.items():
+                _collect(
+                    nested,
+                    sensitive_context=(
+                        sensitive_context or _is_sensitive_key(key)
+                    ),
                 )
-                else _redact_tool_log_value(item)
-            )
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [_redact_tool_log_value(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_redact_tool_log_value(item) for item in value)
-    model_dump = getattr(value, "model_dump", None)
-    if callable(model_dump):
-        with suppress(Exception):
-            return _redact_tool_log_value(model_dump())
-    return value
+            return
+        if isinstance(item, (list, tuple, set, frozenset)):
+            for nested in item:
+                _collect(nested, sensitive_context=sensitive_context)
+            return
+        model_dump = getattr(item, "model_dump", None)
+        if callable(model_dump):
+            with suppress(Exception):
+                _collect(
+                    model_dump(),
+                    sensitive_context=sensitive_context,
+                )
+            return
+        if sensitive_context and isinstance(item, str) and item:
+            sensitive_values.add(item)
+
+    def _redact(item: Any) -> Any:
+        if isinstance(item, Mapping):
+            redacted_mapping: dict[Any, Any] = {}
+            for key, nested in item.items():
+                safe_key = (
+                    _REDACTED_TOOL_ARGUMENT
+                    if isinstance(key, str)
+                    and any(secret in key for secret in sensitive_values)
+                    else key
+                )
+                redacted_mapping[safe_key] = (
+                    _REDACTED_TOOL_ARGUMENT
+                    if _is_sensitive_key(key)
+                    else _redact(nested)
+                )
+            return redacted_mapping
+        if isinstance(item, list):
+            return [_redact(nested) for nested in item]
+        if isinstance(item, tuple):
+            return tuple(_redact(nested) for nested in item)
+        if isinstance(item, (set, frozenset)):
+            return [_redact(nested) for nested in item]
+        model_dump = getattr(item, "model_dump", None)
+        if callable(model_dump):
+            with suppress(Exception):
+                return _redact(model_dump())
+        if isinstance(item, str) and any(
+            secret in item for secret in sensitive_values
+        ):
+            return _REDACTED_TOOL_ARGUMENT
+        return item
+
+    _collect(value)
+    return _redact(value)
+
+
+class _FastMCPSensitiveLogFilter(logging.Filter):
+    """Keep FastMCP internals from logging raw MCP tool arguments.
+
+    FastMCP 3 logs the complete argument mapping at DEBUG and includes
+    Pydantic's offending input in its validation WARNING before application
+    middleware gets a chance to sanitize the client-facing error.  Both paths
+    can contain registration or execution capabilities, so sanitize the
+    records at their source logger for every transport.
+    """
+
+    _mcp_agent_mail_sensitive_log_filter = True
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name == "fastmcp.server.auth.oauth_proxy.proxy":
+            # OAuth transactions, authorization codes, upstream errors, and
+            # callback state are all capabilities or untrusted IdP input. Keep
+            # the severity signal while discarding every dynamic detail so a
+            # future FastMCP message template cannot reopen the leak.
+            record.msg = "FastMCP OAuth proxy event (details redacted)"
+            record.args = ()
+            record.exc_info = None
+            record.exc_text = None
+            return True
+        message_template = record.msg
+        if not isinstance(message_template, str):
+            return True
+        if message_template.endswith(
+            "Handler called: call_tool %s with %s"
+        ):
+            record.msg = "FastMCP tool call received (arguments redacted)"
+            record.args = ()
+            return True
+        if message_template == "Invalid arguments for tool %r: %s":
+            record_args = record.args
+            if isinstance(record_args, tuple) and record_args:
+                record.msg = "Invalid arguments for tool %r (details redacted)"
+                record.args = (record_args[0],)
+            else:
+                record.msg = "Invalid tool arguments (details redacted)"
+                record.args = ()
+        return True
+
+
+def _install_fastmcp_sensitive_log_filter() -> None:
+    """Install the credential filter once on both FastMCP tool loggers."""
+
+    for logger_name in (
+        "fastmcp.server.auth.oauth_proxy.proxy",
+        "fastmcp.server.mixins.mcp_operations",
+        "fastmcp.server.server",
+    ):
+        fastmcp_logger = logging.getLogger(logger_name)
+        if any(
+            getattr(existing, "_mcp_agent_mail_sensitive_log_filter", False)
+            for existing in fastmcp_logger.filters
+        ):
+            continue
+        fastmcp_logger.addFilter(_FastMCPSensitiveLogFilter())
 
 
 def _absolute_project_key_path(value: str) -> PurePosixPath | PureWindowsPath | None:
@@ -211,17 +327,6 @@ def _is_absolute_project_key(value: str) -> bool:
     """Return whether ``value`` is an absolute, traversal-free project key."""
     return _absolute_project_key_path(value) is not None
 
-
-class _FastMCPToolGetter(Protocol):
-    async def get_tool(self, name: str) -> Any: ...
-
-
-class _ToolRegistryLike(Protocol):
-    _tools: dict[str, Any]
-
-
-class _FastMCPToolManagerLike(Protocol):
-    _tool_manager: _ToolRegistryLike
 
 # ty currently struggles to type SQLModel-mapped SQLAlchemy expressions.
 # Provide lightweight wrappers to keep type checking focused on our code.
@@ -302,6 +407,7 @@ RECENT_TOOL_USAGE: deque[tuple[datetime, str, Optional[str], Optional[str]]] = d
 # requested format: a caller asking for TOON gets TOON, a caller asking for nothing
 # still gets a list, and both satisfy the declared schema.
 ToonableList = Union[list[dict[str, Any]], dict[str, Any]]
+JsonArrayResource = Union[ResourceResult, dict[str, Any]]
 
 # Tools that are safe to auto-retry after transient OS-level FD exhaustion (EMFILE).
 # Keep this list conservative: do NOT include tools like send_message that can create
@@ -375,10 +481,6 @@ TOOL_FILTER_PROFILES: dict[str, dict[str, list[str] | set[str]]] = {
     },
 }
 
-# Track filtered tools for logging/debugging
-_FILTERED_TOOLS: set[str] = set()
-
-
 def _should_expose_tool(tool_name: str, cluster: str, settings: Settings) -> bool:
     """Determine if a tool should be exposed based on filter settings.
 
@@ -430,28 +532,12 @@ def _should_expose_tool(tool_name: str, cluster: str, settings: Settings) -> boo
     return not (profile_clusters or profile_tools)
 
 
-def _filtered_tool_decorator(
-    mcp: FastMCP,
-    tool_name: str,
-    cluster: str,
-    settings: Settings,
-    **kwargs: Any,
-) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """Conditional tool registration based on filter settings.
-
-    Returns either the real @mcp.tool decorator or a no-op decorator that
-    doesn't register the tool.
-    """
-    if _should_expose_tool(tool_name, cluster, settings):
-        return mcp.tool(name=tool_name, **kwargs)
-    else:
-        _FILTERED_TOOLS.add(tool_name)
-
-        # Return a no-op decorator that preserves the function but doesn't register it
-        def noop_decorator(func: Callable[..., Any]) -> Callable[..., Any]:
-            return func
-
-        return noop_decorator
+def _tool_visible_for_settings(tool_name: str, settings: Settings) -> bool:
+    return _should_expose_tool(
+        tool_name,
+        TOOL_CLUSTER_MAP.get(tool_name, "unclassified"),
+        settings,
+    )
 
 
 class ToolExecutionError(Exception):
@@ -596,6 +682,27 @@ def _instrument_tool(
             bound = _bind_arguments(signature, args, kwargs)
             ctx = bound.arguments.get("ctx")
             format_value = bound.arguments.get("format")
+            raw_log_arguments = {
+                key: value
+                for key, value in bound.arguments.items()
+                if key != "ctx"
+            }
+            safe_log_context = cast(
+                dict[str, Any],
+                _redact_tool_log_value(
+                    {
+                        "arguments": raw_log_arguments,
+                        "project": _extract_argument(bound, project_arg),
+                        "agent": _extract_argument(bound, agent_arg),
+                    }
+                ),
+            )
+            clean_kwargs = cast(
+                dict[str, Any],
+                safe_log_context["arguments"],
+            )
+            project_value = cast(Optional[str], safe_log_context["project"])
+            agent_value = cast(Optional[str], safe_log_context["agent"])
             # Pre-validate the output `format` BEFORE running the wrapped tool
             # (issue #177). Previously an invalid format was only caught while
             # encoding the result, so the tool's side effects (e.g. sending a
@@ -606,9 +713,13 @@ def _instrument_tool(
                     metrics["errors"] += 1
                     _fmt_exc = ToolExecutionError(
                         "INVALID_ARGUMENT",
-                        f"Invalid format '{format_value}'. Expected 'json' or 'toon'.",
+                        "Invalid format value. Expected 'json' or 'toon'.",
                         recoverable=True,
-                        data={"tool": tool_name, "argument": "format", "provided": format_value},
+                        data={
+                            "tool": tool_name,
+                            "argument": "format",
+                            "provided": clean_kwargs.get("format"),
+                        },
                     )
                     # This validation runs before the try/finally, so emit the
                     # structured error log here rather than silently skipping the
@@ -618,8 +729,6 @@ def _instrument_tool(
             if isinstance(ctx, Context) and meta["capabilities"]:
                 required_caps = set(cast(list[str], meta["capabilities"]))
                 _enforce_capabilities(ctx, required_caps, tool_name)
-            project_value = _extract_argument(bound, project_arg)
-            agent_value = _extract_argument(bound, agent_arg)
 
             # Rich logging: Log tool call start if enabled
             settings = get_settings()
@@ -635,13 +744,6 @@ def _instrument_tool(
 
             if log_enabled:
                 try:
-                    clean_kwargs = _redact_tool_log_value(
-                        {
-                            key: value
-                            for key, value in bound.arguments.items()
-                            if key != "ctx"
-                        }
-                    )
                     log_ctx = rich_logger.ToolCallContext(
                         tool_name=tool_name,
                         args=[],
@@ -657,6 +759,7 @@ def _instrument_tool(
 
             result = None
             error = None
+            pending_validation_error: _FastMCPToolError | None = None
             try:
                 try:
                     result = await func(*args, **kwargs)
@@ -700,6 +803,30 @@ def _instrument_tool(
                 )
                 error = wrapped_exc
                 raise wrapped_exc from exc
+            except ValidationError as exc:
+                # Pydantic validation raised inside a tool body is a ValueError,
+                # so it must be handled before the generic ValueError branch.
+                # Do not log or re-raise while the raw exception is active. A
+                # broken logging handler calls logging.handleError(), which
+                # prints the active exception context to stderr and would expose
+                # Pydantic's credential-bearing input even when the LogRecord is
+                # sanitized. Defer the safe error until after this except block
+                # and the instrumentation finally block have completed.
+                metrics["errors"] += 1
+                safe_arguments = {
+                    key: value
+                    for key, value in bound.arguments.items()
+                    if key != "ctx"
+                }
+                safe_exc = _FastMCPToolError(
+                    _redacted_validation_message(
+                        tool_name,
+                        exc,
+                        safe_arguments,
+                    )
+                )
+                error = safe_exc
+                pending_validation_error = safe_exc
             except ValueError as exc:
                 # Invalid argument value
                 metrics["errors"] += 1
@@ -893,6 +1020,10 @@ def _instrument_tool(
                 if tracker_token is not None:
                     stop_query_tracking(tracker_token)
 
+            if pending_validation_error is not None:
+                _record_tool_error(tool_name, pending_validation_error)
+                raise pending_validation_error from None
+
             return result
 
         # Preserve annotations so FastMCP can infer output schema
@@ -991,7 +1122,7 @@ def _lifespan_factory(settings: Settings) -> Callable[[FastMCP], AsyncContextMan
                 with suppress(Exception):
                     engine = get_engine()
                     dispose_task = asyncio.create_task(
-                        asyncio.to_thread(dispose_engine_blocking, engine)
+                        engine.dispose()
                     )
                     await await_database_cleanup_task(dispose_task)
             finally:
@@ -1453,6 +1584,15 @@ def _apply_resource_output_format(
 ) -> Any:
     decision = _resolve_output_format(format_value, settings)
     if decision.resolved != "toon":
+        # FastMCP 3 treats a bare list returned by a resource template as a
+        # list of separate ResourceContent items. Our list-shaped resources are
+        # one JSON document, so make that wire contract explicit.
+        if isinstance(payload, list):
+            return ResourceResult(
+                contents=[
+                    ResourceContent(payload, mime_type="application/json")
+                ]
+            )
         return payload
     return _encode_payload_to_toon_sync(
         payload,
@@ -7125,18 +7265,60 @@ def _redacted_validation_message(
     only when neither its own name nor any credential-named argument's value
     could be hiding in it.
     """
-    secrets_in_call = {
-        str(value)
-        for key, value in arguments.items()
-        if _CREDENTIAL_ARGUMENT_PATTERN.search(str(key)) and isinstance(value, str) and value
-    }
+    secrets_in_call: set[str] = set()
+
+    def _collect_credential_values(
+        value: Any,
+        *,
+        credential_context: bool = False,
+    ) -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                _collect_credential_values(
+                    item,
+                    credential_context=(
+                        credential_context
+                        or bool(
+                            _CREDENTIAL_ARGUMENT_PATTERN.search(str(key))
+                        )
+                    ),
+                )
+            return
+        if isinstance(value, (list, tuple, set, frozenset)):
+            for item in value:
+                _collect_credential_values(
+                    item,
+                    credential_context=credential_context,
+                )
+            return
+        if credential_context and isinstance(value, str) and value:
+            secrets_in_call.add(value)
+
+    _collect_credential_values(arguments)
 
     def _safe_input(location: tuple[Any, ...], value: Any) -> str:
         if any(_CREDENTIAL_ARGUMENT_PATTERN.search(str(part)) for part in location):
             return "<redacted>"
-        rendered = repr(value)
+        rendered = repr(_redact_tool_log_value(value))
         if any(secret in rendered for secret in secrets_in_call):
             return "<redacted>"
+        return rendered if len(rendered) <= 120 else f"{rendered[:117]}..."
+
+    def _safe_message(location: tuple[Any, ...], value: Any) -> str:
+        if any(
+            _CREDENTIAL_ARGUMENT_PATTERN.search(str(part))
+            for part in location
+        ):
+            return "Invalid credential value"
+        rendered = str(value or "invalid")
+        for secret in sorted(secrets_in_call, key=len, reverse=True):
+            rendered = rendered.replace(secret, "<redacted>")
+        return rendered
+
+    def _safe_location_part(value: Any) -> str:
+        rendered = str(value)
+        for secret in sorted(secrets_in_call, key=len, reverse=True):
+            rendered = rendered.replace(secret, "<redacted>")
         return rendered if len(rendered) <= 120 else f"{rendered[:117]}..."
 
     # Pydantic's own layout is kept -- location on its own line, message
@@ -7145,9 +7327,12 @@ def _redacted_validation_message(
     lines = [f"{len(error.errors())} validation error(s) for {tool_name}"]
     for entry in error.errors():
         location = tuple(entry.get("loc", ()))
-        lines.append(".".join(str(part) for part in location) or "<call>")
         lines.append(
-            f"  {entry.get('msg', 'invalid')} "
+            ".".join(_safe_location_part(part) for part in location)
+            or "<call>"
+        )
+        lines.append(
+            f"  {_safe_message(location, entry.get('msg'))} "
             f"[type={entry.get('type', 'unknown')}, input={_safe_input(location, entry.get('input'))}]"
         )
     return "\n".join(lines)
@@ -7159,17 +7344,32 @@ class _CredentialSafeValidationErrors(Middleware):
     async def on_call_tool(self, context: Any, call_next: Any) -> Any:
         try:
             return await call_next(context)
+        except _FastMCPValidationError as exc:
+            arguments = getattr(context.message, "arguments", None) or {}
+            validation_cause = exc.__cause__
+            if not isinstance(validation_cause, ValidationError):
+                raise _FastMCPToolError("Invalid tool arguments.") from None
+            raise _FastMCPToolError(
+                _redacted_validation_message(
+                    getattr(context.message, "name", "<tool>"),
+                    validation_cause,
+                    arguments,
+                )
+            ) from None
         except ValidationError as exc:
             arguments = getattr(context.message, "arguments", None) or {}
             raise _FastMCPToolError(
                 _redacted_validation_message(
-                    getattr(context.message, "name", "<tool>"), exc, arguments
+                    getattr(context.message, "name", "<tool>"),
+                    exc,
+                    arguments,
                 )
             ) from None
 
 
 def build_mcp_server() -> FastMCP:
     """Create and configure the FastMCP server instance."""
+    _install_fastmcp_sensitive_log_filter()
     settings: Settings = get_settings()
     lifespan = _lifespan_factory(settings)
 
@@ -7182,6 +7382,9 @@ def build_mcp_server() -> FastMCP:
 
     mcp = FastMCP(name="mcp-agent-mail", instructions=instructions, lifespan=lifespan)
     mcp.add_middleware(_CredentialSafeValidationErrors())
+    file_reservation_paths_direct: (
+        Callable[..., Awaitable[dict[str, Any]]] | None
+    ) = None
 
     # Session bindings are keyed by `ctx.session_id` (the FastMCP-assigned
     # ID derived from the `mcp-session-id` header for HTTP transport, or a
@@ -10749,43 +10952,35 @@ def build_mcp_server() -> FastMCP:
                 )
                 if effective_auto_contact:
                     try:
-                        from fastmcp.tools.tool import FunctionTool
-
-                        handshake = cast(FunctionTool, cast(Any, macro_contact_handshake))
-                        request_tool = cast(FunctionTool, cast(Any, request_contact))
                         for nm in list(dict.fromkeys(blocked_recipients)):
                             rec = recipient_agents.get(nm)
                             if rec is None:
                                 continue
                             try:
                                 if _session_is_bound_to_agent(ctx, project, rec):
-                                    await handshake.run(
-                                        {
-                                            "ctx": ctx,
-                                            "project_key": project.human_key,
-                                            "requester": sender.name,
-                                            "target": nm,
-                                            "reason": "in-session auto-approval by send_message",
-                                            "auto_accept": True,
-                                            "ttl_seconds": int(settings_local.contact_auto_ttl_seconds),
-                                            "format": "json",
-                                        }
+                                    await macro_contact_handshake(
+                                        ctx=ctx,
+                                        project_key=project.human_key,
+                                        requester=sender.name,
+                                        target=nm,
+                                        reason="in-session auto-approval by send_message",
+                                        auto_accept=True,
+                                        ttl_seconds=int(settings_local.contact_auto_ttl_seconds),
+                                        format="json",
                                     )
                                     auto_approved.append(nm)
                                 else:
                                     # Pending fallback path — async human may take days to approve,
                                     # so use the longer pending TTL (default 7 days) rather than
                                     # the in-session auto-approval TTL (default 24h).
-                                    await request_tool.run(
-                                        {
-                                            "ctx": ctx,
-                                            "project_key": project.human_key,
-                                            "from_agent": sender.name,
-                                            "to_agent": nm,
-                                            "reason": "auto contact request created by send_message",
-                                            "ttl_seconds": int(settings_local.contact_pending_ttl_seconds),
-                                            "format": "json",
-                                        }
+                                    await request_contact(
+                                        ctx=ctx,
+                                        project_key=project.human_key,
+                                        from_agent=sender.name,
+                                        to_agent=nm,
+                                        reason="auto contact request created by send_message",
+                                        ttl_seconds=int(settings_local.contact_pending_ttl_seconds),
+                                        format="json",
                                     )
                                     auto_requested.append(nm)
                             except Exception:
@@ -11165,9 +11360,6 @@ def build_mcp_server() -> FastMCP:
                         else auto_contact_if_blocked
                     )
                     if effective_auto_contact and unknown_external:
-                        from fastmcp.tools.tool import FunctionTool
-                        handshake = cast(FunctionTool, cast(Any, macro_contact_handshake))
-                        request_tool = cast(FunctionTool, cast(Any, request_contact))
                         # Iterate over a copy since we may mutate/resolve entries
                         for label, pending_names in list(unknown_external.items()):
                             try:
@@ -11181,18 +11373,16 @@ def build_mcp_server() -> FastMCP:
                                 try:
                                     target_agent = await _find_agent_optional(target_proj, nm)
                                     if target_agent is not None and _session_is_bound_to_agent(ctx, target_proj, target_agent):
-                                        await handshake.run(
-                                            {
-                                                "ctx": ctx,
-                                                "project_key": project.human_key,
-                                                "requester": sender.name,
-                                                "target": nm,
-                                                "to_project": target_proj.human_key or target_proj.slug,
-                                                "reason": "in-session auto-approval by send_message",
-                                                "auto_accept": True,
-                                                "ttl_seconds": int(settings_local.contact_auto_ttl_seconds),
-                                                "format": "json",
-                                            }
+                                        await macro_contact_handshake(
+                                            ctx=ctx,
+                                            project_key=project.human_key,
+                                            requester=sender.name,
+                                            target=nm,
+                                            to_project=target_proj.human_key or target_proj.slug,
+                                            reason="in-session auto-approval by send_message",
+                                            auto_accept=True,
+                                            ttl_seconds=int(settings_local.contact_auto_ttl_seconds),
+                                            format="json",
                                         )
                                         attempted_external.append(display_target)
                                         for route_kind in sorted(route_kinds):
@@ -11201,17 +11391,15 @@ def build_mcp_server() -> FastMCP:
                                         # Pending fallback path — async human may take days to approve,
                                         # so use the longer pending TTL (default 7 days) rather than
                                         # the in-session auto-approval TTL (default 24h).
-                                        await request_tool.run(
-                                            {
-                                                "ctx": ctx,
-                                                "project_key": project.human_key,
-                                                "from_agent": sender.name,
-                                                "to_agent": nm,
-                                                "to_project": target_proj.human_key or target_proj.slug,
-                                                "reason": "auto contact request created by send_message",
-                                                "ttl_seconds": int(settings_local.contact_pending_ttl_seconds),
-                                                "format": "json",
-                                            }
+                                        await request_contact(
+                                            ctx=ctx,
+                                            project_key=project.human_key,
+                                            from_agent=sender.name,
+                                            to_agent=nm,
+                                            to_project=target_proj.human_key or target_proj.slug,
+                                            reason="auto contact request created by send_message",
+                                            ttl_seconds=int(settings_local.contact_pending_ttl_seconds),
+                                            format="json",
                                         )
                                         requested_external.append(display_target)
                                 except Exception:
@@ -13320,48 +13508,35 @@ def build_mcp_server() -> FastMCP:
         )
         _bind_session_agent(ctx, project, agent)
 
-        from fastmcp.tools.tool import FunctionTool
-
-        mcp_with_tools = cast(_FastMCPToolGetter, mcp)
-        start_tool = cast(
-            FunctionTool, await mcp_with_tools.get_tool("start_agent_execution")
-        )
-        start_result = await start_tool.run(
-            {
-                "ctx": ctx,
-                "project_key": project.human_key,
-                "agent_name": agent.name,
-                "external_id": external_id,
-                "client_name": client_name,
-                "execution_token": execution_token,
-                "lifecycle_protocol_version": _EXECUTION_LIFECYCLE_PROTOCOL_VERSION,
-                "kind": "session",
-                "task_description": task_description,
-                "format": "json",
-            }
-        )
-        execution_result = cast(
-            dict[str, Any], start_result.structured_content or {}
+        execution_result = await start_agent_execution(
+            ctx=ctx,
+            project_key=project.human_key,
+            agent_name=agent.name,
+            external_id=external_id,
+            client_name=client_name,
+            execution_token=execution_token,
+            lifecycle_protocol_version=_EXECUTION_LIFECYCLE_PROTOCOL_VERSION,
+            kind="session",
+            task_description=task_description,
+            format="json",
         )
 
         file_reservations_result: Optional[dict[str, Any]] = None
         if file_reservation_paths is not None:
-            # Use MCP tool registry to avoid param shadowing (file_reservation_paths param shadows file_reservation_paths function)
-            _file_reservation_tool = cast(FunctionTool, await mcp_with_tools.get_tool("file_reservation_paths"))
-            _file_reservation_run = await _file_reservation_tool.run(
-                {
-                    "ctx": ctx,
-                    "project_key": project.human_key,
-                    "agent_name": agent.name,
-                    "paths": file_reservation_paths,
-                    "ttl_seconds": file_reservation_ttl_seconds,
-                    "exclusive": True,
-                    "reason": file_reservation_reason,
-                    "lifecycle_protocol_version": _EXECUTION_LIFECYCLE_PROTOCOL_VERSION,
-                    "format": "json",
-                }
+            reservation_function = file_reservation_paths_direct
+            if reservation_function is None:
+                raise RuntimeError("file_reservation_paths tool is not registered")
+            file_reservations_result = await reservation_function(
+                ctx=ctx,
+                project_key=project.human_key,
+                agent_name=agent.name,
+                paths=file_reservation_paths,
+                ttl_seconds=file_reservation_ttl_seconds,
+                exclusive=True,
+                reason=file_reservation_reason,
+                lifecycle_protocol_version=_EXECUTION_LIFECYCLE_PROTOCOL_VERSION,
+                format="json",
             )
-            file_reservations_result = cast(dict[str, Any], _file_reservation_run.structured_content or {})
 
         inbox_items = await _list_inbox(
             project,
@@ -13441,28 +13616,17 @@ def build_mcp_server() -> FastMCP:
         )
         _bind_session_agent(ctx, project, agent)
 
-        from fastmcp.tools.tool import FunctionTool
-
-        mcp_with_tools = cast(_FastMCPToolGetter, mcp)
-        start_tool = cast(
-            FunctionTool, await mcp_with_tools.get_tool("start_agent_execution")
-        )
-        start_result = await start_tool.run(
-            {
-                "ctx": ctx,
-                "project_key": project.human_key,
-                "agent_name": agent.name,
-                "external_id": external_id,
-                "client_name": client_name,
-                "execution_token": execution_token,
-                "lifecycle_protocol_version": _EXECUTION_LIFECYCLE_PROTOCOL_VERSION,
-                "kind": "session",
-                "task_description": task_description,
-                "format": "json",
-            }
-        )
-        execution_result = cast(
-            dict[str, Any], start_result.structured_content or {}
+        execution_result = await start_agent_execution(
+            ctx=ctx,
+            project_key=project.human_key,
+            agent_name=agent.name,
+            external_id=external_id,
+            client_name=client_name,
+            execution_token=execution_token,
+            lifecycle_protocol_version=_EXECUTION_LIFECYCLE_PROTOCOL_VERSION,
+            kind="session",
+            task_description=task_description,
+            format="json",
         )
 
         inbox_items = await _list_inbox(
@@ -13517,27 +13681,20 @@ def build_mcp_server() -> FastMCP:
     ) -> dict[str, Any]:
         """Reserve a set of file paths and optionally release them at the end of the workflow."""
 
-        # Call underlying FunctionTool directly so we don't treat the wrapper as a plain coroutine
-        from fastmcp.tools.tool import FunctionTool
-
-        file_reservations_tool = cast(FunctionTool, cast(Any, file_reservation_paths))
-        file_reservations_tool_result = await file_reservations_tool.run(
-            {
-                "ctx": ctx,
-                "project_key": project_key,
-                "agent_name": agent_name,
-                "paths": paths,
-                "ttl_seconds": ttl_seconds,
-                "exclusive": exclusive,
-                "reason": reason,
-                "execution_id": execution_id,
-                "execution_token": execution_token,
-                "lifecycle_protocol_version": _EXECUTION_LIFECYCLE_PROTOCOL_VERSION,
-                "registration_token": registration_token,
-                "format": "json",
-            }
+        file_reservations_result = await file_reservation_paths(
+            ctx=ctx,
+            project_key=project_key,
+            agent_name=agent_name,
+            paths=paths,
+            ttl_seconds=ttl_seconds,
+            exclusive=exclusive,
+            reason=reason,
+            execution_id=execution_id,
+            execution_token=execution_token,
+            lifecycle_protocol_version=_EXECUTION_LIFECYCLE_PROTOCOL_VERSION,
+            registration_token=registration_token,
+            format="json",
         )
-        file_reservations_result = cast(dict[str, Any], file_reservations_tool_result.structured_content or {})
 
         release_result = None
         if auto_release:
@@ -13551,21 +13708,17 @@ def build_mcp_server() -> FastMCP:
                 if entry.get("id") is not None and not entry.get("reused", False)
             ]
             if newly_granted_ids:
-                release_tool = cast(FunctionTool, cast(Any, release_file_reservations_tool))
-                release_tool_result = await release_tool.run(
-                    {
-                        "ctx": ctx,
-                        "project_key": project_key,
-                        "agent_name": agent_name,
-                        "file_reservation_ids": newly_granted_ids,
-                        "execution_id": execution_id,
-                        "execution_token": execution_token,
-                        "lifecycle_protocol_version": _EXECUTION_LIFECYCLE_PROTOCOL_VERSION,
-                        "registration_token": registration_token,
-                        "format": "json",
-                    }
+                release_result = await release_file_reservations_tool(
+                    ctx=ctx,
+                    project_key=project_key,
+                    agent_name=agent_name,
+                    file_reservation_ids=newly_granted_ids,
+                    execution_id=execution_id,
+                    execution_token=execution_token,
+                    lifecycle_protocol_version=_EXECUTION_LIFECYCLE_PROTOCOL_VERSION,
+                    registration_token=registration_token,
+                    format="json",
                 )
-                release_result = cast(dict[str, Any], release_tool_result.structured_content or {})
             else:
                 # Nothing new to release (all reservations pre-existed); skip the call.
                 release_result = {"released": [], "skipped": "no_newly_granted_reservations"}
@@ -13843,24 +13996,17 @@ def build_mcp_server() -> FastMCP:
             }
             return {"request": approved_payload, "response": approved_payload, "welcome_message": None}
 
-        from fastmcp.tools.tool import FunctionTool
-
-        request_tool = cast(FunctionTool, cast(Any, request_contact))
-        request_payload: dict[str, Any] = {
-            "ctx": ctx,
-            "project_key": project_key,
-            "from_agent": real_requester,
-            "to_agent": real_target,
-            "reason": reason,
-            "ttl_seconds": ttl_seconds,
-            "format": "json",
-        }
-        if requester_registration_token:
-            request_payload["registration_token"] = requester_registration_token
-        if target_project_key:
-            request_payload["to_project"] = target_project_key
-        request_tool_result = await request_tool.run(request_payload)
-        request_result = cast(dict[str, Any], request_tool_result.structured_content or {})
+        request_result = await request_contact(
+            ctx=ctx,
+            project_key=project_key,
+            from_agent=real_requester,
+            to_agent=real_target,
+            to_project=target_project_key,
+            reason=reason,
+            ttl_seconds=ttl_seconds,
+            registration_token=requester_registration_token,
+            format="json",
+        )
         request_status = str(request_result.get("status") or "").lower()
 
         response_result = None
@@ -13884,22 +14030,17 @@ def build_mcp_server() -> FastMCP:
                         "token_param": "target_registration_token",
                     }
                 else:
-                    respond_tool = cast(FunctionTool, cast(Any, respond_contact))
-                    respond_payload: dict[str, Any] = {
-                        "ctx": ctx,
-                        "project_key": target_project_key or project_key,
-                        "to_agent": real_target,
-                        "from_agent": real_requester,
-                        "accept": True,
-                        "ttl_seconds": ttl_seconds,
-                        "format": "json",
-                    }
-                    if target_auth_token:
-                        respond_payload["registration_token"] = target_auth_token
-                    if target_project_key:
-                        respond_payload["from_project"] = project_key
-                    respond_tool_result = await respond_tool.run(respond_payload)
-                    response_result = cast(dict[str, Any], respond_tool_result.structured_content or {})
+                    response_result = await respond_contact(
+                        ctx=ctx,
+                        project_key=target_project_key or project_key,
+                        to_agent=real_target,
+                        from_agent=real_requester,
+                        accept=True,
+                        ttl_seconds=ttl_seconds,
+                        from_project=project_key if target_project_key else None,
+                        registration_token=target_auth_token,
+                        format="json",
+                    )
 
         welcome_message = None
         welcome_error: dict[str, Any] | None = None
@@ -13915,7 +14056,6 @@ def build_mcp_server() -> FastMCP:
             else:
                 try:
                     welcome_recipients = [real_target] if not target_project_key else [f"{real_target}@{target_project_key}"]
-                    send_tool = cast(FunctionTool, cast(Any, send_message))
                     welcome_idempotency_key = _internal_delivery_idempotency_key(
                         "contact-welcome",
                         {
@@ -13928,21 +14068,18 @@ def build_mcp_server() -> FastMCP:
                             "thread_id": thread_id,
                         },
                     )
-                    send_tool_result = await send_tool.run(
-                        {
-                            "ctx": ctx,
-                            "project_key": project_key,
-                            "sender_name": real_requester,
-                            "to": welcome_recipients,
-                            "subject": welcome_subject,
-                            "body_md": welcome_body,
-                            "thread_id": thread_id,
-                            "idempotency_key": welcome_idempotency_key,
-                            "registration_token": requester_registration_token,
-                            "format": "json",
-                        }
+                    welcome_payload = await send_message(
+                        ctx=ctx,
+                        project_key=project_key,
+                        sender_name=real_requester,
+                        to=welcome_recipients,
+                        subject=welcome_subject,
+                        body_md=welcome_body,
+                        thread_id=thread_id,
+                        idempotency_key=welcome_idempotency_key,
+                        registration_token=requester_registration_token,
+                        format="json",
                     )
-                    welcome_payload = cast(dict[str, Any], send_tool_result.structured_content or {})
                     error_payload = _extract_delivery_error_payload(welcome_payload)
                     if error_payload is not None:
                         welcome_error = _with_delivery_project(error_payload, welcome_project)
@@ -14051,7 +14188,7 @@ def build_mcp_server() -> FastMCP:
         if sanitized_query is None:
             await ctx.info(f"Search query '{query}' is not searchable, returning empty results.")
             try:
-                from fastmcp.tools.tool import ToolResult
+                from fastmcp.tools import ToolResult
                 return ToolResult(structured_content={"result": []})
             except Exception:
                 return []
@@ -14175,7 +14312,7 @@ def build_mcp_server() -> FastMCP:
             )
             items.append(item)
         try:
-            from fastmcp.tools.tool import ToolResult
+            from fastmcp.tools import ToolResult
             return ToolResult(structured_content={"result": items})
         except Exception:
             return items
@@ -15159,6 +15296,11 @@ def build_mcp_server() -> FastMCP:
             "legacy_unscoped": execution is None,
         }
 
+    # FastMCP 3 decorators return the original function for safe composition.
+    # Keep a non-shadowed reference so the macro continues to work even when
+    # the public helper is hidden by an instance-scoped tool filter.
+    file_reservation_paths_direct = file_reservation_paths
+
     @mcp.tool(name="release_file_reservations")
     @_instrument_tool("release_file_reservations", cluster=CLUSTER_FILE_RESERVATIONS, capabilities={"file_reservations"}, project_arg="project_key", agent_arg="agent_name")
     async def release_file_reservations_tool(
@@ -15576,9 +15718,6 @@ def build_mcp_server() -> FastMCP:
                 ]
             )
             try:
-                from fastmcp.tools.tool import FunctionTool
-
-                send_tool = cast(FunctionTool, cast(Any, send_message))
                 release_idempotency_key = _internal_delivery_idempotency_key(
                     "file-reservation-release",
                     {
@@ -15589,20 +15728,17 @@ def build_mcp_server() -> FastMCP:
                         "holder": holder.name,
                     },
                 )
-                send_tool_result = await send_tool.run(
-                    {
-                        "ctx": ctx,
-                        "project_key": project_key,
-                        "sender_name": agent_name,
-                        "registration_token": registration_token,
-                        "to": [holder.name],
-                        "subject": f"[file-reservations] Released stale lock on {reservation.path_pattern}",
-                        "body_md": "\n".join(body_lines),
-                        "idempotency_key": release_idempotency_key,
-                        "format": "json",
-                    }
+                notification_payload = await send_message(
+                    ctx=ctx,
+                    project_key=project_key,
+                    sender_name=agent_name,
+                    registration_token=registration_token,
+                    to=[holder.name],
+                    subject=f"[file-reservations] Released stale lock on {reservation.path_pattern}",
+                    body_md="\n".join(body_lines),
+                    idempotency_key=release_idempotency_key,
+                    format="json",
                 )
-                notification_payload = cast(dict[str, Any], send_tool_result.structured_content or {})
                 error_payload = _extract_delivery_error_payload(notification_payload)
                 if error_payload is not None:
                     notification_error = _with_delivery_project(error_payload, project)
@@ -16533,7 +16669,7 @@ def build_mcp_server() -> FastMCP:
             if sanitized_query is None:
                 await ctx.info(f"Search query '{query}' is not searchable, returning empty results.")
                 try:
-                    from fastmcp.tools.tool import ToolResult
+                    from fastmcp.tools import ToolResult
                     return ToolResult(structured_content={"result": []})
                 except Exception:
                     return []
@@ -16651,7 +16787,7 @@ def build_mcp_server() -> FastMCP:
                 )
                 items.append(item)
             try:
-                from fastmcp.tools.tool import ToolResult
+                from fastmcp.tools import ToolResult
                 return ToolResult(structured_content={"result": items})
             except Exception:
                 return items
@@ -17252,16 +17388,34 @@ def build_mcp_server() -> FastMCP:
             },
         ]
 
+        visible_clusters: list[dict[str, Any]] = []
         for cluster in clusters:
+            visible_tools: list[dict[str, Any]] = []
             for tool_entry in cluster["tools"]:
                 tool_dict = cast(dict[str, Any], tool_entry)
-                meta = TOOL_METADATA.get(str(tool_dict.get("name", "")))
+                tool_name = str(tool_dict.get("name", ""))
+                if not _tool_visible_for_settings(tool_name, settings):
+                    continue
+                related = tool_dict.get("related")
+                if isinstance(related, list):
+                    tool_dict["related"] = [
+                        related_name
+                        for related_name in related
+                        if _tool_visible_for_settings(str(related_name), settings)
+                    ]
+                meta = TOOL_METADATA.get(tool_name)
                 if not meta:
+                    visible_tools.append(tool_dict)
                     continue
                 tool_dict["capabilities"] = meta["capabilities"]
                 tool_dict.setdefault("complexity", meta["complexity"])
                 if "required_capabilities" in tool_dict:
                     tool_dict["required_capabilities"] = meta["capabilities"]
+                visible_tools.append(tool_dict)
+            if visible_tools:
+                cluster["tools"] = visible_tools
+                visible_clusters.append(cluster)
+        clusters = visible_clusters
 
         playbooks = [
             {
@@ -17284,6 +17438,14 @@ def build_mcp_server() -> FastMCP:
                 "workflow": "Manage contact approvals",
                 "sequence": ["set_contact_policy", "request_contact", "respond_contact", "send_message"],
             },
+        ]
+        playbooks = [
+            playbook
+            for playbook in playbooks
+            if all(
+                _tool_visible_for_settings(str(tool_name), settings)
+                for tool_name in playbook["sequence"]
+            )
         ]
 
         default_format = settings.output_format_default or settings.toon_default_format or "json"
@@ -17390,6 +17552,13 @@ def build_mcp_server() -> FastMCP:
                 },
             },
         }
+        tool_schemas = payload.get("tools")
+        if isinstance(tool_schemas, dict):
+            payload["tools"] = {
+                tool_name: schema
+                for tool_name, schema in tool_schemas.items()
+                if _tool_visible_for_settings(str(tool_name), settings)
+            }
         return _apply_resource_output_format(
             payload,
             settings=settings,
@@ -17534,7 +17703,9 @@ def build_mcp_server() -> FastMCP:
             format_value=format_value,
         )
 
-    async def _read_projects_resource(format: Optional[str] = None) -> list[dict[str, Any]]:
+    async def _read_projects_resource(
+        format: Optional[str] = None,
+    ) -> JsonArrayResource:
         """
         List all projects known to the server in creation order.
 
@@ -17574,11 +17745,13 @@ def build_mcp_server() -> FastMCP:
             )
 
     @mcp.resource("resource://tooling/projects", mime_type="application/json")
-    async def projects_resource_exact() -> list[dict[str, Any]]:
+    async def projects_resource_exact() -> JsonArrayResource:
         return await _read_projects_resource()
 
     @mcp.resource("resource://tooling/projects{?format}", mime_type="application/json")
-    async def projects_resource(format: Optional[str] = None) -> list[dict[str, Any]]:
+    async def projects_resource(
+        format: Optional[str] = None,
+    ) -> JsonArrayResource:
         return await _read_projects_resource(format)
 
     @mcp.resource("resource://project/{slug}{?format}", mime_type="application/json")
@@ -17742,7 +17915,7 @@ def build_mcp_server() -> FastMCP:
         slug: str,
         active_only: bool = True,
         format: Optional[str] = None,
-    ) -> ToonableList:
+    ) -> JsonArrayResource:
         """
         List file_reservations for a project, optionally filtering to active-only.
 
@@ -18725,42 +18898,21 @@ def build_mcp_server() -> FastMCP:
 
 
 def _apply_tool_filter(mcp: FastMCP, settings: Settings) -> None:
-    """Remove filtered tools from the MCP server's tool registry.
+    """Disable filtered tools through FastMCP's public visibility API.
 
-    This is a post-registration step that removes tools that shouldn't be exposed
-    based on the tool filter settings. This approach is cleaner than conditional
-    registration because it doesn't require modifying every @mcp.tool decorator.
+    The transform belongs to this server instance, so building a filtered server
+    cannot mutate global metadata or hide tools from a later unfiltered server.
     """
-    # FastMCP stores tools in _tool_manager._tools (dict keyed by tool name)
-    tool_manager = getattr(cast(_FastMCPToolManagerLike, mcp), "_tool_manager", None)
-    if tool_manager is None:
-        logger.warning("Tool filtering enabled but FastMCP tool manager not found")
-        return
+    to_disable: set[str] = set()
+    for tool_name in TOOL_CLUSTER_MAP:
+        if not _tool_visible_for_settings(tool_name, settings):
+            to_disable.add(tool_name)
 
-    tools_registry_raw = getattr(cast(_ToolRegistryLike, tool_manager), "_tools", None)
-    if tools_registry_raw is None or not isinstance(tools_registry_raw, dict):
-        logger.warning("Tool filtering enabled but tool registry not accessible")
-        return
-    tools_registry = cast(dict[str, Any], tools_registry_raw)
-
-    # Identify tools to remove
-    to_remove: list[str] = []
-    for tool_name in list(tools_registry.keys()):
-        cluster = TOOL_CLUSTER_MAP.get(tool_name, "unclassified")
-        if not _should_expose_tool(tool_name, cluster, settings):
-            to_remove.append(tool_name)
-            _FILTERED_TOOLS.add(tool_name)
-
-    # Remove filtered tools
-    for tool_name in to_remove:
-        del tools_registry[tool_name]
-        # Also remove from metadata registries
-        TOOL_CLUSTER_MAP.pop(tool_name, None)
-        TOOL_METADATA.pop(tool_name, None)
-
-    if to_remove:
+    if to_disable:
+        mcp.disable(names=to_disable, components={"tool"})
         profile = settings.tool_filter.profile
         logger.info(
-            f"Tool filtering active (profile={profile}): removed {len(to_remove)} tools, "
-            f"{len(tools_registry)} tools exposed"
+            "Tool filtering active (profile=%s): disabled %d tools",
+            profile,
+            len(to_disable),
         )

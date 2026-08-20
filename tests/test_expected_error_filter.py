@@ -83,7 +83,7 @@ def create_log_record(
 ) -> logging.LogRecord:
     """Create a log record for testing."""
     record = logging.LogRecord(
-        name="fastmcp.tools.tool_manager",
+        name="fastmcp.server.server",
         level=level,
         pathname="test.py",
         lineno=1,
@@ -433,6 +433,6 @@ class TestHttpModuleIntegration:
         settings = get_settings()
         http._configure_logging(settings)
 
-        fastmcp_logger = logging.getLogger("fastmcp.tools.tool_manager")
+        fastmcp_logger = logging.getLogger("fastmcp.server.server")
         filter_names = [f.__class__.__name__ for f in fastmcp_logger.filters]
         assert "ExpectedErrorFilter" in filter_names

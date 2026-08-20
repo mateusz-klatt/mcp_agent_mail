@@ -123,6 +123,62 @@ class TestToolFilter:
         assert _should_expose_tool("file_reservation_paths", "file_reservations", settings) is False
         assert _should_expose_tool("acquire_build_slot", "build_slots", settings) is False
 
+    @pytest.mark.asyncio
+    async def test_minimal_filter_changes_only_that_server_surface(
+        self,
+        isolated_env,
+        monkeypatch,
+    ) -> None:
+        from fastmcp import Client
+
+        from mcp_agent_mail.app import build_mcp_server
+        from mcp_agent_mail.config import clear_settings_cache
+
+        monkeypatch.setenv("TOOLS_FILTER_ENABLED", "true")
+        monkeypatch.setenv("TOOLS_FILTER_PROFILE", "minimal")
+        clear_settings_cache()
+        filtered_server = build_mcp_server()
+        filtered_names = {
+            tool.name for tool in await filtered_server.list_tools()
+        }
+        assert "health_check" in filtered_names
+        assert "send_message" in filtered_names
+        assert "search_messages" not in filtered_names
+        assert "file_reservation_paths" not in filtered_names
+
+        async with Client(filtered_server) as client:
+            directory_blocks = await client.read_resource(
+                "resource://tooling/directory"
+            )
+            schemas_blocks = await client.read_resource(
+                "resource://tooling/schemas"
+            )
+        directory_payload = json.loads(directory_blocks[0].text or "{}")
+        directory_names = {
+            tool["name"]
+            for cluster in directory_payload["clusters"]
+            for tool in cluster["tools"]
+        }
+        assert "health_check" in directory_names
+        assert "search_messages" not in directory_names
+        assert directory_names <= filtered_names
+        assert all(
+            set(playbook["sequence"]) <= filtered_names
+            for playbook in directory_payload["playbooks"]
+        )
+
+        schemas_payload = json.loads(schemas_blocks[0].text or "{}")
+        assert "send_message" in schemas_payload["tools"]
+        assert "macro_contact_handshake" not in schemas_payload["tools"]
+        assert set(schemas_payload["tools"]) <= filtered_names
+
+        monkeypatch.setenv("TOOLS_FILTER_ENABLED", "false")
+        clear_settings_cache()
+        full_server = build_mcp_server()
+        full_names = {tool.name for tool in await full_server.list_tools()}
+        assert "search_messages" in full_names
+        assert "file_reservation_paths" in full_names
+
 
 class TestNotifications:
     """Tests for NOTIFICATIONS_ENABLED feature."""

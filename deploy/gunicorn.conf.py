@@ -34,7 +34,7 @@ bind = "0.0.0.0:8765"
 # that ships. Scale by putting more instances behind the proxy, each with its own
 # store — not by adding workers to one.
 workers = 1
-worker_class = "uvicorn.workers.UvicornWorker"
+worker_class = "uvicorn_worker.UvicornWorker"
 
 # Graceful timeouts to match long running tasks.
 keepalive = 5
@@ -44,7 +44,10 @@ timeout = 120
 # Location for PID/log files (customize as desired).
 pidfile = str(Path("/var/run/mcp-agent-mail/gunicorn.pid"))
 errorlog = "-"  # stderr
-accesslog = "-"  # stdout
+# The default Gunicorn request line includes the full query string. OAuth
+# callbacks carry a short-lived authorization code and state there, so rely on
+# the application's redacted request logger instead.
+accesslog = None
 loglevel = "info"
 
 # Optional: forward standard proxy headers.

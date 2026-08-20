@@ -13,6 +13,14 @@
 #      configures a remote and never pushes (there is no push/remote/origin
 #      anywhere in storage.py), so mirroring it off-box is an external job.
 #
+# The encrypted /data/oauth directory is intentionally NOT copied. It is
+# recoverable session state (DCR clients, JTI mappings, and upstream tokens),
+# and restoring a stale snapshot can resurrect old credentials. Losing it
+# forces clients to register and sign in again without losing mail. Operators
+# who require session continuity must use a separately encrypted, short-lived
+# stopped-service/volume snapshot and retain the matching signing key outside
+# this job.
+#
 # Both destinations live OUTSIDE the mcp_agent_mail working tree on purpose.
 # ./data is gitignored-and-untracked, which is precisely what `git clean -xdf`
 # removes — an off-tree copy is what makes that mistake survivable.

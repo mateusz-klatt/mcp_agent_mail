@@ -19,7 +19,6 @@ import logging
 import math
 import re
 import threading
-import time
 import unicodedata
 from collections.abc import Callable, Collection, MutableMapping
 from datetime import datetime, timedelta, timezone
@@ -34,25 +33,34 @@ from urllib.parse import (
     urlunsplit,
 )
 
+import httpx
 import structlog
 import uvicorn
 from fastapi import FastAPI, HTTPException, Path as FastApiPath, Query, Request, status
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from fastmcp.server.auth import AccessToken as FastMCPAccessToken, OAuthProxy, TokenVerifier
+from fastmcp.server.auth.auth import ClientAuthenticator, TokenHandler
 from fastmcp.server.auth.providers.github import GitHubTokenVerifier
 from git import NULL_TREE
 from key_value.aio.stores.disk import DiskStore
 from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
+from key_value.aio.wrappers.routing import CollectionRoutingWrapper
 from markupsafe import Markup, escape as escape_markup
 from mcp.server.auth.handlers.metadata import MetadataHandler
 from mcp.server.auth.provider import (
     AuthorizationCode,
     AuthorizationParams,
     AuthorizeError,
-    RegistrationError,
     TokenError,
 )
 from mcp.server.auth.routes import build_metadata, cors_middleware
@@ -73,6 +81,7 @@ from .app import (
     _agent_to_dict,
     _expire_stale_file_reservations,
     _format_cross_project_agent_address,
+    _install_fastmcp_sensitive_log_filter,
     _reconcile_pending_file_reservation_artifacts,
     _revalidate_agent_lifetime_in_session,
     _sanitize_display_name_argument,
@@ -84,7 +93,7 @@ from .app import (
     sweep_stale_agents,
     update_project_sibling_status,
 )
-from .config import OAUTH_LOOPBACK_REDIRECT_PORT_PATTERNS, Settings, get_settings
+from .config import Settings, get_settings
 from .db import ensure_schema, get_immediate_session, get_session
 from .delivery import (
     DeliveryActorSnapshot,
@@ -597,6 +606,7 @@ def _like_escape(term: str) -> str:
 
 def _configure_logging(settings: Settings) -> None:
     """Initialize structlog and stdlib logging formatting."""
+    _install_fastmcp_sensitive_log_filter()
     # Idempotent setup
     global _LOGGING_CONFIGURED
     if _LOGGING_CONFIGURED:
@@ -636,7 +646,7 @@ def _configure_logging(settings: Settings) -> None:
     logging.getLogger("sse_starlette.sse").setLevel(logging.INFO)
 
     # Add filter to suppress verbose tracebacks for expected/recoverable errors
-    # FastMCP's tool_manager uses logger.exception() which prints full tracebacks
+    # FastMCP's server logger reports tool failures and may include tracebacks
     # even for expected errors like "agent not found" or "git lock contention".
     # This filter intercepts those and removes the traceback for cleaner logs.
     class ExpectedErrorFilter(logging.Filter):
@@ -665,7 +675,7 @@ def _configure_logging(settings: Settings) -> None:
         )
 
         def filter(self, record: logging.LogRecord) -> bool:
-            # Only process records from FastMCP tool_manager with exception info
+            # Only process FastMCP tool-failure records with exception info
             if not record.exc_info or record.exc_info[1] is None:
                 return True
 
@@ -699,8 +709,8 @@ def _configure_logging(settings: Settings) -> None:
 
             return bool(super().filter(record))
 
-    # Apply filter to FastMCP's tool_manager logger
-    fastmcp_logger = logging.getLogger("fastmcp.tools.tool_manager")
+    # FastMCP 3 emits tool execution errors from this server logger.
+    fastmcp_logger = logging.getLogger("fastmcp.server.server")
     fastmcp_logger.addFilter(ExpectedErrorFilter())
 
     # mark configured
@@ -710,6 +720,9 @@ def _configure_logging(settings: Settings) -> None:
 # In-process JWKS cache: avoid refetching the JWKS document on every request
 # (#212). Keyed by JWKS URL; entries expire after _JWKS_CACHE_TTL_SECONDS.
 _JWKS_CACHE_TTL_SECONDS = 300.0
+_OAUTH_DCR_COLLECTION = "mcp-oauth-proxy-clients"
+_OAUTH_PROTECTED_STORAGE_MAX_BYTES = 256 * 1024 * 1024
+_OAUTH_DCR_STORAGE_MAX_BYTES = 8 * 1024 * 1024
 _jwks_cache: dict[str, tuple[float, Any]] = {}
 _jwks_cache_lock = threading.Lock()
 
@@ -832,15 +845,20 @@ class Utf8BodyGuardMiddleware:
 
     Written as plain ASGI rather than BaseHTTPMiddleware because it has to touch
     the request body, and buffering through BaseHTTPMiddleware is exactly where
-    that class misbehaves. Only POSTs with a declared, modest Content-Length are
-    inspected: a streamed or oversized body is passed through untouched rather
-    than buffered, and non-POST traffic — including the long-lived SSE GET — is
-    never intercepted at all.
+    that class misbehaves. Ordinary POSTs are inspected only when they declare a
+    modest Content-Length. Public OAuth POST endpoints are stricter: declared
+    and streamed bodies are capped before form/JSON parsing so anonymous clients
+    cannot turn them into memory or persistent-storage amplifiers.
+    Non-POST traffic — including the long-lived SSE GET — is never intercepted.
     """
 
     # Comfortably above any JSON-RPC call this server serves; attachments travel
     # as paths, not bytes.
     MAX_INSPECT_BYTES = 4 * 1024 * 1024
+    OAUTH_DCR_MAX_BODY_BYTES = 8 * 1024
+    OAUTH_BOUNDED_POST_PATHS = frozenset(
+        {"/authorize", "/consent", "/register", "/token"}
+    )
 
     def __init__(self, app: Any) -> None:
         self._app = app
@@ -859,17 +877,49 @@ class Utf8BodyGuardMiddleware:
             await self._app(scope, receive, send)
             return
         length = self._declared_length(scope)
-        if length is None or length <= 0 or length > self.MAX_INSPECT_BYTES:
+        path = str(scope.get("path") or "").rstrip("/") or "/"
+        is_bounded_oauth_request = path in self.OAUTH_BOUNDED_POST_PATHS
+        if (
+            is_bounded_oauth_request
+            and length is not None
+            and length > self.OAUTH_DCR_MAX_BODY_BYTES
+        ):
+            response = JSONResponse(
+                {"detail": "OAuth request body exceeds 8 KiB."},
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+            )
+            await response(scope, receive, send)
+            return
+        if not is_bounded_oauth_request and (
+            length is None or length <= 0 or length > self.MAX_INSPECT_BYTES
+        ):
             await self._app(scope, receive, send)
             return
-
         chunks: list[bytes] = []
+        body_size = 0
         while True:
             message = await receive()
             if message.get("type") == "http.disconnect":
                 await self._app(scope, receive, send)
                 return
-            chunks.append(message.get("body", b"") or b"")
+            chunk = message.get("body", b"") or b""
+            body_size += len(chunk)
+            if (
+                is_bounded_oauth_request
+                and body_size > self.OAUTH_DCR_MAX_BODY_BYTES
+            ):
+                response = JSONResponse(
+                    {"detail": "OAuth request body exceeds 8 KiB."},
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                    headers={
+                        "Cache-Control": "no-store",
+                        "Pragma": "no-cache",
+                    },
+                )
+                await response(scope, receive, send)
+                return
+            chunks.append(chunk)
             if not message.get("more_body", False):
                 break
         body = b"".join(chunks)
@@ -883,7 +933,15 @@ class Utf8BodyGuardMiddleware:
                 "legacy codepage will fail here. Either send UTF-8, or escape "
                 "non-ASCII characters as \\uXXXX, which cannot be mis-encoded."
             )
-            response = JSONResponse({"detail": detail}, status_code=status.HTTP_400_BAD_REQUEST)
+            response = JSONResponse(
+                {"detail": detail},
+                status_code=status.HTTP_400_BAD_REQUEST,
+                headers=(
+                    {"Cache-Control": "no-store", "Pragma": "no-cache"}
+                    if is_bounded_oauth_request
+                    else None
+                ),
+            )
             await response(scope, receive, send)
             return
 
@@ -902,9 +960,20 @@ class Utf8BodyGuardMiddleware:
 class _AllowlistedGitHubTokenVerifier(TokenVerifier):
     """Validate a GitHub token and require an explicitly allowed identity."""
 
-    def __init__(self, allowed_identities: Collection[str]) -> None:
+    def __init__(
+        self,
+        allowed_identities: Collection[str],
+        *,
+        cache_ttl_seconds: int = 60,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> None:
         super().__init__(required_scopes=[])
-        self._delegate = GitHubTokenVerifier(required_scopes=[])
+        self._delegate = GitHubTokenVerifier(
+            required_scopes=[],
+            cache_ttl_seconds=(cache_ttl_seconds if cache_ttl_seconds > 0 else None),
+            max_cache_size=1024,
+            http_client=http_client,
+        )
         allowed_ids: set[str] = set()
         allowed_logins: set[str] = set()
         for raw_identity in allowed_identities:
@@ -945,24 +1014,115 @@ class _AllowlistedGitHubTokenVerifier(TokenVerifier):
 
 
 class _AllowlistedGitHubOAuthProxy(OAuthProxy):
-    """Reject non-allowlisted GitHub users before persisting proxy tokens."""
+    """Bind OAuth tokens to this resource and allowlisted GitHub identities."""
 
     def __init__(
         self,
         *,
-        access_token_ttl_seconds: int,
+        disk_stores: tuple[DiskStore, ...],
+        github_http_client: httpx.AsyncClient,
         resource_url: str,
         **kwargs: Any,
     ) -> None:
-        self._access_token_ttl_seconds = access_token_ttl_seconds
+        self._oauth_disk_stores = disk_stores
+        self._github_http_client = github_http_client
         self._oauth_resource_url = resource_url
         self._authorization_code_exchange_lock = asyncio.Lock()
         super().__init__(**kwargs)
 
+    async def astart(self) -> None:
+        """Initialize every owned disk store before serving OAuth requests."""
+
+        for disk_store in self._oauth_disk_stores:
+            await disk_store.setup()
+
+    async def aclose(self) -> None:
+        """Close OAuth-owned HTTP and disk resources during app shutdown."""
+
+        first_error: BaseException | None = None
+        closeables = (self._github_http_client, *self._oauth_disk_stores)
+        for closeable in closeables:
+            try:
+                if isinstance(closeable, httpx.AsyncClient):
+                    await closeable.aclose()
+                else:
+                    await closeable.close()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+    async def _handle_idp_callback(
+        self,
+        request: Request,
+    ) -> HTMLResponse | RedirectResponse:
+        """Remove untrusted IdP detail from browser-visible callback errors."""
+
+        response = await super()._handle_idp_callback(request)
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+
+        location = response.headers.get("location")
+        if location:
+            parsed_location = urlsplit(location)
+            query_pairs = parse_qsl(
+                parsed_location.query,
+                keep_blank_values=True,
+            )
+            has_client_code = any(key == "code" for key, _value in query_pairs)
+            has_oauth_error = any(
+                key == "error" for key, _value in query_pairs
+            )
+            if has_oauth_error and not has_client_code:
+                standard_errors = {
+                    "access_denied",
+                    "invalid_request",
+                    "invalid_scope",
+                    "server_error",
+                    "temporarily_unavailable",
+                    "unauthorized_client",
+                    "unsupported_response_type",
+                }
+                safe_pairs: list[tuple[str, str]] = []
+                for key, value in query_pairs:
+                    if key == "error_description":
+                        continue
+                    if key == "error" and value not in standard_errors:
+                        value = "server_error"
+                    safe_pairs.append((key, value))
+                response.headers["location"] = urlunsplit(
+                    (
+                        parsed_location.scheme,
+                        parsed_location.netloc,
+                        parsed_location.path,
+                        urlencode(safe_pairs),
+                        parsed_location.fragment,
+                    )
+                )
+            return response
+
+        if response.status_code >= status.HTTP_400_BAD_REQUEST:
+            return HTMLResponse(
+                content=(
+                    "<!doctype html><html><head><title>OAuth error</title>"
+                    "</head><body><h1>OAuth request failed</h1>"
+                    "<p>Please restart the sign-in flow.</p></body></html>"
+                ),
+                status_code=response.status_code,
+                headers={
+                    "Cache-Control": "no-store",
+                    "Pragma": "no-cache",
+                },
+            )
+        return response
+
     def get_routes(self, mcp_path: str | None = None) -> list[Route]:
-        """Advertise the public-client token method accepted by the SDK."""
+        """Advertise public-client auth and require RFC 8707 token binding."""
 
         routes = super().get_routes(mcp_path)
+        if self.issuer_url is None:
+            raise RuntimeError("OAuth issuer_url must be configured.")
         client_registration_options = (
             self.client_registration_options or ClientRegistrationOptions()
         )
@@ -982,26 +1142,95 @@ class _AllowlistedGitHubOAuthProxy(OAuthProxy):
             ),
             methods=["GET", "OPTIONS"],
         )
-        return [
-            metadata_route
-            if route.path == "/.well-known/oauth-authorization-server"
-            else route
-            for route in routes
-        ]
+
+        token_handler = TokenHandler(
+            provider=self,
+            client_authenticator=ClientAuthenticator(self),
+        )
+
+        def _token_error_response(
+            error: str,
+            description: str,
+        ) -> JSONResponse:
+            return JSONResponse(
+                {"error": error, "error_description": description},
+                status_code=status.HTTP_400_BAD_REQUEST,
+                headers={
+                    "Cache-Control": "no-store",
+                    "Pragma": "no-cache",
+                },
+            )
+
+        async def resource_bound_token_endpoint(request: Request) -> Response:
+            content_type = (
+                request.headers.get("content-type", "")
+                .partition(";")[0]
+                .strip()
+                .casefold()
+            )
+            if content_type != "application/x-www-form-urlencoded":
+                return _token_error_response(
+                    "invalid_request",
+                    "The token request must use application/x-www-form-urlencoded.",
+                )
+            try:
+                form_data = await request.form()
+            except Exception:
+                return _token_error_response(
+                    "invalid_request",
+                    "The token request form could not be parsed.",
+                )
+            duplicate_parameters = sorted(
+                str(parameter)
+                for parameter in form_data
+                if len(form_data.getlist(parameter)) != 1
+            )
+            if duplicate_parameters:
+                return _token_error_response(
+                    "invalid_request",
+                    "Token request parameters must not be repeated: "
+                    + ", ".join(duplicate_parameters),
+                )
+            resource_values = form_data.getlist("resource")
+            if (
+                len(resource_values) != 1
+                or not isinstance(resource_values[0], str)
+                or not _oauth_resource_uris_match(
+                    resource_values[0],
+                    self._oauth_resource_url,
+                )
+            ):
+                return _token_error_response(
+                    "invalid_target",
+                    "The resource parameter must identify this MCP server.",
+                )
+            return await token_handler.handle(request)
+
+        token_route = Route(
+            "/token",
+            endpoint=cors_middleware(
+                resource_bound_token_endpoint,
+                ["POST", "OPTIONS"],
+            ),
+            methods=["POST", "OPTIONS"],
+        )
+
+        replaced_routes: list[Route] = []
+        for route in routes:
+            if route.path == "/.well-known/oauth-authorization-server":
+                replaced_routes.append(metadata_route)
+            elif route.path == "/token":
+                replaced_routes.append(token_route)
+            else:
+                replaced_routes.append(route)
+        return replaced_routes
 
     async def register_client(
         self,
         client_info: OAuthClientInformationFull,
     ) -> None:
-        for redirect_uri in client_info.redirect_uris or []:
-            if not _oauth_redirect_uri_allowed(
-                redirect_uri,
-                self._allowed_client_redirect_uris or (),
-            ):
-                raise RegistrationError(
-                    "invalid_redirect_uri",
-                    "The requested redirect URI is not allowed by this server.",
-                )
+        """Force every dynamically registered MCP client to remain public."""
+
         client_info.token_endpoint_auth_method = "none"
         client_info.client_secret = None
         client_info.client_secret_expires_at = None
@@ -1012,26 +1241,14 @@ class _AllowlistedGitHubOAuthProxy(OAuthProxy):
         client: OAuthClientInformationFull,
         params: AuthorizationParams,
     ) -> str:
-        if params.resource and not _oauth_resource_uris_match(
-            params.resource,
-            self._oauth_resource_url,
+        if not params.resource or not _oauth_resource_uris_match(
+            params.resource, self._oauth_resource_url
         ):
             raise AuthorizeError(
                 "invalid_request",
-                "The requested resource does not match this MCP server.",
+                "The resource parameter must identify this MCP server.",
             )
         return await super().authorize(client, params)
-
-    def _build_upstream_authorize_url(
-        self,
-        txn_id: str,
-        transaction: dict[str, Any],
-    ) -> str:
-        github_transaction = {**transaction, "resource": None}
-        return super()._build_upstream_authorize_url(
-            txn_id,
-            github_transaction,
-        )
 
     async def exchange_authorization_code(
         self,
@@ -1055,60 +1272,16 @@ class _AllowlistedGitHubOAuthProxy(OAuthProxy):
                         "invalid_grant",
                         "The authenticated GitHub identity is not authorized for this server.",
                     )
-                if not code_model.idp_tokens.get("expires_in"):
-                    code_model.idp_tokens["expires_in"] = (
-                        self._access_token_ttl_seconds
-                    )
-                    await self._code_store.put(
-                        key=authorization_code.code,
-                        value=code_model,
-                        ttl=max(1, int(code_model.expires_at - time.time())),
-                    )
             return await super().exchange_authorization_code(
                 client,
                 authorization_code,
             )
 
 
-def _oauth_redirect_uri_allowed(
-    redirect_uri: object,
-    allowed_patterns: Collection[str],
-) -> bool:
-    """Match exact HTTPS redirects or a strictly parsed loopback port pattern."""
-
-    redirect_text = str(redirect_uri)
-    try:
-        parsed_redirect = urlsplit(redirect_text)
-        redirect_hostname = parsed_redirect.hostname
-        redirect_port = parsed_redirect.port
-    except ValueError:
-        return False
-    if (
-        not parsed_redirect.netloc
-        or parsed_redirect.username is not None
-        or parsed_redirect.password is not None
-        or parsed_redirect.fragment
-    ):
-        return False
-
-    for pattern in allowed_patterns:
-        if pattern in OAUTH_LOOPBACK_REDIRECT_PORT_PATTERNS:
-            parsed_pattern = urlsplit(pattern[:-1] + "1")
-            if (
-                parsed_redirect.scheme == "http"
-                and redirect_hostname == parsed_pattern.hostname
-                and redirect_port is not None
-            ):
-                return True
-        elif hmac.compare_digest(redirect_text, pattern):
-            return True
-    return False
-
-
 def _oauth_resource_uris_match(requested: str, expected: str) -> bool:
     """Compare canonical resource origins and paths, tolerating a trailing slash."""
 
-    def _parts(value: str) -> tuple[str, str, int, str] | None:
+    def _parts(value: str) -> tuple[str, str, int, str, str] | None:
         try:
             parsed = urlsplit(value)
             hostname = parsed.hostname
@@ -1131,12 +1304,15 @@ def _oauth_resource_uris_match(requested: str, expected: str) -> bool:
             hostname.casefold(),
             effective_port,
             parsed.path.rstrip("/"),
+            parsed.query,
         )
 
     return _parts(requested) == _parts(expected)
 
 
-def _build_oauth_provider(settings: Settings) -> OAuthProxy | None:
+def _build_oauth_provider(
+    settings: Settings,
+) -> _AllowlistedGitHubOAuthProxy | None:
     """Build the optional GitHub-backed OAuth broker with encrypted storage."""
 
     if not settings.http.oauth_enabled:
@@ -1148,16 +1324,38 @@ def _build_oauth_provider(settings: Settings) -> OAuthProxy | None:
     if client_id is None or client_secret is None or signing_key is None:
         raise RuntimeError("OAuth configuration was not validated before app startup.")
 
+    storage_path = Path(settings.http.oauth_storage_path).expanduser()
+    storage_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    storage_path.chmod(0o700)
+    protected_storage_path = storage_path / "protected"
+    dcr_storage_path = storage_path / "registrations"
+    for owned_path in (protected_storage_path, dcr_storage_path):
+        owned_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        owned_path.chmod(0o700)
+    protected_disk_store = DiskStore(
+        directory=protected_storage_path,
+        max_size=_OAUTH_PROTECTED_STORAGE_MAX_BYTES,
+    )
+    dcr_disk_store = DiskStore(
+        directory=dcr_storage_path,
+        max_size=_OAUTH_DCR_STORAGE_MAX_BYTES,
+    )
+    routed_disk_storage = CollectionRoutingWrapper(
+        collection_map={_OAUTH_DCR_COLLECTION: dcr_disk_store},
+        default_store=protected_disk_store,
+    )
     storage = FernetEncryptionWrapper(
-        DiskStore(
-            directory=Path(settings.http.oauth_storage_path).expanduser(),
-            max_size=256 * 1024 * 1024,
-        ),
+        routed_disk_storage,
         source_material=signing_key,
         salt="mcp-agent-mail-oauth-storage-v1",
     )
+    github_http_client = httpx.AsyncClient(timeout=10)
     token_verifier = _AllowlistedGitHubTokenVerifier(
-        settings.http.oauth_github_allowed_identities
+        settings.http.oauth_github_allowed_identities,
+        cache_ttl_seconds=(
+            settings.http.oauth_github_token_cache_ttl_seconds
+        ),
+        http_client=github_http_client,
     )
     return _AllowlistedGitHubOAuthProxy(
         upstream_authorization_endpoint="https://github.com/login/oauth/authorize",
@@ -1165,16 +1363,22 @@ def _build_oauth_provider(settings: Settings) -> OAuthProxy | None:
         upstream_client_id=client_id,
         upstream_client_secret=client_secret,
         token_verifier=token_verifier,
-        access_token_ttl_seconds=settings.http.oauth_access_token_ttl_seconds,
+        disk_stores=(protected_disk_store, dcr_disk_store),
+        github_http_client=github_http_client,
         resource_url=f"{settings.http.oauth_base_url}/mcp",
         base_url=settings.http.oauth_base_url,
         issuer_url=settings.http.oauth_base_url,
         allowed_client_redirect_uris=settings.http.oauth_allowed_client_redirect_uris,
         valid_scopes=[],
         forward_pkce=True,
+        forward_resource=False,
         client_storage=storage,
         jwt_signing_key=signing_key,
         require_authorization_consent=True,
+        fallback_access_token_expiry_seconds=(
+            settings.http.oauth_access_token_ttl_seconds
+        ),
+        enable_cimd=False,
     )
 
 
@@ -1184,7 +1388,36 @@ def _oauth_path_is_public(
 ) -> bool:
     """Return whether an OAuth protocol endpoint must be anonymously reachable."""
 
-    return path in oauth_public_paths or "/.well-known/oauth-" in path
+    return path in oauth_public_paths
+
+
+def _oauth_metadata_alias_paths(configured_mcp_path: str) -> frozenset[str]:
+    """Enumerate every metadata probe path without broad substring matching."""
+
+    paths: set[str] = set()
+
+    def _add(path: str) -> None:
+        normalized = path.rstrip("/") or "/"
+        paths.add(normalized)
+        if normalized != "/":
+            paths.add(f"{normalized}/")
+
+    _add("/.well-known/oauth-authorization-server")
+    _add("/.well-known/oauth-authorization-server/mcp")
+    _add("/.well-known/oauth-protected-resource")
+    _add("/.well-known/oauth-protected-resource/mcp")
+    mount_paths = {
+        _normalized_http_base_path(configured_mcp_path),
+        "/api",
+        "/mcp",
+    }
+    for mount_path in mount_paths:
+        if mount_path == "/":
+            continue
+        _add(f"{mount_path}/.well-known/oauth-authorization-server")
+        _add(f"{mount_path}/.well-known/oauth-authorization-server/mcp")
+        _add(f"/.well-known/oauth-authorization-server{mount_path}")
+    return frozenset(paths)
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -5142,7 +5375,10 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
 
     @staticmethod
     def _classify_request(path: str, method: str, body_bytes: bytes) -> tuple[str, str | None]:
-        """Return (kind, tool_name) where kind is 'tools'|'resources'|'other'."""
+        """Return the rate-limit class and optional MCP tool name."""
+
+        if method.upper() == "POST" and path.rstrip("/") == "/register":
+            return "oauth_register", None
         if method.upper() != "POST":
             return "other", None
         if not body_bytes:
@@ -5186,6 +5422,16 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
         elif kind == "resources":
             rpm = self._coerce_rpm(getattr(self.settings.http, "rate_limit_resources_per_minute", 120), 120)
             burst = int(getattr(self.settings.http, "rate_limit_resources_burst", 0) or 0)
+        elif kind == "oauth_register":
+            rpm = self._coerce_rpm(
+                getattr(
+                    self.settings.http,
+                    "oauth_dcr_rate_limit_per_minute",
+                    10,
+                ),
+                10,
+            )
+            burst = min(3, rpm) if rpm > 0 else 0
         else:
             rpm = self._coerce_rpm(getattr(self.settings.http, "rate_limit_per_minute", 60), 60)
             burst = 0
@@ -5342,8 +5588,13 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
                         if not is_writer:
                             return JSONResponse({"detail": "Forbidden"}, status_code=status.HTTP_403_FORBIDDEN)
 
-        # Rate limiting
-        if self.settings.http.rate_limit_enabled:
+        # DCR remains bounded even in local/development configurations where
+        # the general limiter is disabled. It is an anonymous persistent write,
+        # unlike ordinary development traffic.
+        rate_limit_applies = self.settings.http.rate_limit_enabled or (
+            self.settings.http.oauth_enabled and kind == "oauth_register"
+        )
+        if rate_limit_applies:
             rpm, burst = self._rate_limits_for(kind)
             identity = request.client.host if request.client else "ip-unknown"
             # Prefer stable subject from JWT if present
@@ -5357,7 +5608,18 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
             key = f"{kind}:{endpoint}:{identity}"
             allowed = await self._consume_bucket(key, rpm, burst)
             if not allowed:
-                return JSONResponse({"detail": "Rate limit exceeded"}, status_code=status.HTTP_429_TOO_MANY_REQUESTS)
+                return JSONResponse(
+                    {"detail": "Rate limit exceeded"},
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    headers=(
+                        {"Cache-Control": "no-store", "Pragma": "no-cache"}
+                        if _oauth_path_is_public(
+                            request.url.path,
+                            self._oauth_public_paths,
+                        )
+                        else None
+                    ),
+                )
 
         return await call_next(request)
 
@@ -5404,10 +5666,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         if oauth_provider is not None
         else []
     )
+    oauth_metadata_paths = _oauth_metadata_alias_paths(settings.http.path)
     oauth_public_paths = frozenset(
-        str(route.path)
-        for route in oauth_routes
-        if getattr(route, "path", None)
+        {
+            str(route.path)
+            for route in oauth_routes
+            if getattr(route, "path", None)
+        }
+        | set(oauth_metadata_paths)
     )
     oauth_resource_metadata_url = (
         f"{settings.http.oauth_base_url}/.well-known/oauth-protected-resource/mcp"
@@ -5446,6 +5712,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
         async def _worker_cleanup() -> None:
             while True:
+                # Ordinary reservation operations already expire stale rows.
+                # Delay the periodic full scan so startup/shutdown does not race
+                # a redundant database connection, and deployments avoid an
+                # immediate maintenance stampede after a rolling restart.
+                await asyncio.sleep(
+                    settings.file_reservations_cleanup_interval_seconds
+                )
                 try:
                     await ensure_schema()
                     async with get_session() as session:
@@ -5478,7 +5751,6 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         )
                 except Exception:
                     pass
-                await asyncio.sleep(settings.file_reservations_cleanup_interval_seconds)
 
         async def _worker_ack_ttl() -> None:
             import datetime as _dt
@@ -5765,15 +6037,24 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         # (each http_app() call owns an independent StreamableHTTPSessionManager).
         mcp_lifespan_app = cast(_FastAPILifespan, mcp_http_app)
         mcp_stateful_lifespan_app = cast(_FastAPILifespan, mcp_stateful_http_app)
-        async with (
-            mcp_lifespan_app.lifespan(mcp_http_app),
-            mcp_stateful_lifespan_app.lifespan(mcp_stateful_http_app),
-        ):
-            await _startup()
-            try:
-                yield
-            finally:
-                await _shutdown()
+        startup_succeeded = False
+        try:
+            if oauth_provider is not None:
+                await oauth_provider.astart()
+            async with (
+                mcp_lifespan_app.lifespan(mcp_http_app),
+                mcp_stateful_lifespan_app.lifespan(mcp_stateful_http_app),
+            ):
+                await _startup()
+                startup_succeeded = True
+                try:
+                    yield
+                finally:
+                    if startup_succeeded:
+                        await _shutdown()
+        finally:
+            if oauth_provider is not None:
+                await oauth_provider.aclose()
 
     # Now construct FastAPI with the composed lifespan so ASGI transports run it.
     # Give the app a real title/version so the auto-generated /openapi.json has a
@@ -5872,6 +6153,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     # Unified JWT/RBAC and robust rate limiter middleware
     if (
         settings.http.rate_limit_enabled
+        or settings.http.oauth_enabled
         or getattr(settings.http, "jwt_enabled", False)
         or getattr(settings.http, "rbac_enabled", True)
     ):
@@ -6113,14 +6395,27 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     # ASGITransport) no lifespan events are sent, so the wrapper lazily enters
     # the MCP app's lifespan on first request to avoid "Task group not
     # initialized" errors.
+    lazy_lifespan_lock: asyncio.Lock | None = None
+
+    def _shared_lazy_lifespan_lock() -> asyncio.Lock:
+        nonlocal lazy_lifespan_lock
+        if lazy_lifespan_lock is None:
+            lazy_lifespan_lock = asyncio.Lock()
+        return lazy_lifespan_lock
+
     class _HeaderFixupMCPApp:
         """Normalize headers then delegate to the native MCP HTTP app."""
 
-        def __init__(self, native_app: FastAPI) -> None:
+        def __init__(
+            self,
+            native_app: FastAPI,
+            *,
+            allow_lazy_lifespan: bool,
+        ) -> None:
             self._app = native_app
+            self._allow_lazy_lifespan = allow_lazy_lifespan
             self._lifespan_entered = False
             self._lifespan_cm: Any = None
-            self._lifespan_lock: asyncio.Lock | None = None
 
         async def _ensure_lifespan(self) -> None:
             """Lazily enter the MCP app's lifespan if not already running.
@@ -6136,11 +6431,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             """
             if self._lifespan_entered:
                 return
-            # Lazily create the lock (must be in async context for the
-            # correct event loop).
-            if self._lifespan_lock is None:
-                self._lifespan_lock = asyncio.Lock()
-            async with self._lifespan_lock:
+            async with _shared_lazy_lifespan_lock():
                 if self._lifespan_entered:
                     return
                 # Check if the session manager is already running (production path)
@@ -6156,6 +6447,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 if session_mgr is not None and getattr(session_mgr, "_task_group", None) is not None:
                     self._lifespan_entered = True
                     return
+                if not self._allow_lazy_lifespan:
+                    raise RuntimeError(
+                        "The parent ASGI lifespan was not started before an MCP request."
+                    )
                 # Enter the MCP app's lifespan (test path)
                 mcp_lifespan_app = cast(_FastAPILifespan, self._app)
                 self._lifespan_cm = mcp_lifespan_app.lifespan(self._app)
@@ -6190,8 +6485,15 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     # Also mount compatibility aliases for both '/api' and '/mcp' regardless of configured base.
     base_no_slash = _normalized_http_base_path(settings.http.path)
     base_with_slash = base_no_slash if base_no_slash == "/" else base_no_slash + "/"
-    stateless_app = _HeaderFixupMCPApp(mcp_http_app)
-    stateful_app = _HeaderFixupMCPApp(mcp_stateful_http_app)
+    allow_test_lifespan_fallback = settings.environment.casefold() == "test"
+    stateless_app = _HeaderFixupMCPApp(
+        mcp_http_app,
+        allow_lazy_lifespan=allow_test_lifespan_fallback,
+    )
+    stateful_app = _HeaderFixupMCPApp(
+        mcp_stateful_http_app,
+        allow_lazy_lifespan=allow_test_lifespan_fallback,
+    )
 
     # Path -> app mapping (issue #250): the '/mcp' compat alias is the
     # stateful, Mcp-Session-Id-issuing endpoint; '/api' and the configured
@@ -6214,25 +6516,6 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         if compat_with_slash not in mount_paths:
             mount_paths.append(compat_with_slash)
 
-    oauth_metadata_paths: set[str] = set()
-
-    def _add_oauth_metadata_path(path: str) -> None:
-        normalized = path.rstrip("/") or "/"
-        oauth_metadata_paths.add(normalized)
-        if normalized != "/":
-            oauth_metadata_paths.add(f"{normalized}/")
-
-    _add_oauth_metadata_path("/.well-known/oauth-authorization-server")
-    _add_oauth_metadata_path("/.well-known/oauth-authorization-server/mcp")
-    _add_oauth_metadata_path("/.well-known/oauth-protected-resource")
-    _add_oauth_metadata_path("/.well-known/oauth-protected-resource/mcp")
-    for mount_path in mount_paths:
-        normalized = mount_path.rstrip("/") or "/"
-        if normalized == "/":
-            continue
-        _add_oauth_metadata_path(f"{normalized}/.well-known/oauth-authorization-server")
-        _add_oauth_metadata_path(f"{normalized}/.well-known/oauth-authorization-server/mcp")
-        _add_oauth_metadata_path(f"/.well-known/oauth-authorization-server{normalized}")
     if oauth_provider is not None:
         fastapi_app.router.routes.extend(oauth_routes)
         fastapi_app.state.oauth_provider = oauth_provider
@@ -11965,7 +12248,14 @@ def main() -> None:
     import inspect as _inspect
 
     _sig = _inspect.signature(uvicorn.run)
-    _kwargs: dict[str, Any] = {"host": host, "port": port, "log_level": args.log_level}
+    # Uvicorn's access logger includes OAuth callback query parameters. The
+    # application logger can redact them, so disable the unsafe duplicate.
+    _kwargs: dict[str, Any] = {
+        "host": host,
+        "port": port,
+        "log_level": args.log_level,
+        "access_log": False,
+    }
     if "ws" in _sig.parameters:
         _kwargs["ws"] = "none"
     if "forwarded_allow_ips" in _sig.parameters:

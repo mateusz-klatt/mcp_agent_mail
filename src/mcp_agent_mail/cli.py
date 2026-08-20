@@ -1974,7 +1974,15 @@ def serve_http(
         # monkeypatch uvicorn.run without the 'ws' parameter.
         import inspect as _inspect
         _sig = _inspect.signature(uvicorn.run)
-        _kwargs: dict[str, Any] = {"host": resolved_host, "port": resolved_port, "log_level": "info"}
+        # Uvicorn's access logger includes the raw query string. OAuth callbacks
+        # carry short-lived codes and state in that query, so rely on the app's
+        # query-redacting request logger instead of emitting an unsafe duplicate.
+        _kwargs: dict[str, Any] = {
+            "host": resolved_host,
+            "port": resolved_port,
+            "log_level": "info",
+            "access_log": False,
+        }
         if "ws" in _sig.parameters:
             _kwargs["ws"] = "none"
         if "forwarded_allow_ips" in _sig.parameters:
@@ -2004,12 +2012,16 @@ def serve_stdio() -> None:
     os.environ["LOG_RICH_ENABLED"] = "false"
     clear_settings_cache()
 
+    root_logger = logging.getLogger()
+    previous_handlers = tuple(root_logger.handlers)
+    previous_level = root_logger.level
+
     # Enforce single-server ownership of the storage root (issue #123)
     server_lock = _acquire_server_lock()
     try:
         # Redirect all logging to stderr to avoid corrupting stdio transport
-        for handler in logging.root.handlers[:]:
-            logging.root.removeHandler(handler)
+        for handler in tuple(root_logger.handlers):
+            root_logger.removeHandler(handler)
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -2022,6 +2034,17 @@ def serve_stdio() -> None:
         server = build_mcp_server()
         server.run(transport="stdio")
     finally:
+        # `serve-stdio` normally owns the process for its whole lifetime, but
+        # embedded callers and test runners can return from `server.run()`.
+        # Restore their logging graph instead of leaving a StreamHandler bound
+        # to a capture stream that may already be closed.
+        for handler in tuple(root_logger.handlers):
+            root_logger.removeHandler(handler)
+            if handler not in previous_handlers:
+                handler.close()
+        for handler in previous_handlers:
+            root_logger.addHandler(handler)
+        root_logger.setLevel(previous_level)
         server_lock.release()
 
 

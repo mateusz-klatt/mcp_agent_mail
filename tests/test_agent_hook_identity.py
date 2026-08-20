@@ -2731,7 +2731,9 @@ def test_codex_and_copilot_integrators_write_only_temp_user_config(
     assert "AGENT_MAIL_PROJECT" not in copilot_wrapper_text
     assert "AGENT_MAIL_REGISTRATION_TOKEN" not in copilot_wrapper_text
 
-    # Reinstalling replaces exactly the three managed hook entries.
+    # Reinstalling replaces exactly the three managed hook entries. Switching
+    # VS Code to OAuth also removes the previously managed bearer header while
+    # Copilot CLI and lifecycle hooks keep their headless bearer credential.
     copilot_rerun = subprocess.run(
         [
             BASH,
@@ -2741,7 +2743,7 @@ def test_codex_and_copilot_integrators_write_only_temp_user_config(
             _git_bash_path(project),
         ],
         cwd=ROOT,
-        env=env,
+        env={**env, "AGENT_MAIL_VSCODE_AUTH_MODE": "oauth"},
         check=False,
         capture_output=True,
         text=True,
@@ -2755,6 +2757,15 @@ def test_codex_and_copilot_integrators_write_only_temp_user_config(
     ]
     assert sum("mcp-agent-mail" in handler.get("bash", "") for handler in rerun_handlers) == 3
     assert sum(handler.get("bash") == "echo keep-copilot-foreign" for handler in rerun_handlers) == 1
+    oauth_vscode_config = json.loads(vscode_config_path.read_text(encoding="utf-8"))
+    assert oauth_vscode_config["servers"]["mcp-agent-mail"] == {
+        "type": "http",
+        "url": "https://hermes.example/mcp/",
+    }
+    rerun_copilot_config = json.loads(copilot_mcp.read_text(encoding="utf-8"))
+    assert rerun_copilot_config["mcpServers"]["mcp-agent-mail"]["headers"] == {
+        "Authorization": "Bearer test-bearer"
+    }
 
     generated_files = {home / ".agent-mail.env", vscode_config_path}
     for generated_root in (codex_dir, copilot_dir):

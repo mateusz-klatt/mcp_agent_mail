@@ -58,6 +58,8 @@ class HttpSettings:
     oauth_github_client_id: str | None
     oauth_github_client_secret: str | None
     oauth_github_allowed_identities: list[str]
+    oauth_github_token_cache_ttl_seconds: int
+    oauth_dcr_rate_limit_per_minute: int
     oauth_jwt_signing_key: str | None
     oauth_storage_path: str
     oauth_access_token_ttl_seconds: int
@@ -449,6 +451,14 @@ def _build_settings() -> Settings:
         "HTTP_OAUTH_GITHUB_ALLOWED_IDENTITIES",
         default="",
     )
+    oauth_github_token_cache_ttl_seconds = _i(
+        "HTTP_OAUTH_GITHUB_TOKEN_CACHE_TTL_SECONDS",
+        default=60,
+    )
+    oauth_dcr_rate_limit_per_minute = _i(
+        "HTTP_OAUTH_DCR_RATE_LIMIT_PER_MINUTE",
+        default=10,
+    )
     oauth_jwt_signing_key = (
         decouple_config("HTTP_OAUTH_JWT_SIGNING_KEY", default="").strip() or None
     )
@@ -465,7 +475,10 @@ def _build_settings() -> Settings:
     )
     oauth_allowed_client_redirect_uris = _csv(
         "HTTP_OAUTH_ALLOWED_CLIENT_REDIRECT_URIS",
-        default="http://127.0.0.1:*,https://vscode.dev/redirect",
+        default=(
+            "http://127.0.0.1:*,http://127.0.0.1/,"
+            "https://vscode.dev/redirect,https://insiders.vscode.dev/redirect"
+        ),
     )
     oauth_rbac_role = (
         decouple_config("HTTP_OAUTH_RBAC_ROLE", default="writer").strip()
@@ -476,6 +489,8 @@ def _build_settings() -> Settings:
         "HTTP_RBAC_WRITER_ROLES",
         default="writer,write,tools,rw",
     )
+    rate_limit_enabled = _b("HTTP_RATE_LIMIT_ENABLED", default=False)
+    rate_limit_per_minute = _i("HTTP_RATE_LIMIT_PER_MINUTE", default=60)
 
     if oauth_enabled:
         missing = [
@@ -546,6 +561,15 @@ def _build_settings() -> Settings:
                 "HTTP_OAUTH_ACCESS_TOKEN_TTL_SECONDS must be between 300 and "
                 "31536000 seconds."
             )
+        if not 0 <= oauth_github_token_cache_ttl_seconds <= 300:
+            raise ConfigError(
+                "HTTP_OAUTH_GITHUB_TOKEN_CACHE_TTL_SECONDS must be between 0 "
+                "and 300 seconds."
+            )
+        if not 1 <= oauth_dcr_rate_limit_per_minute <= 60:
+            raise ConfigError(
+                "HTTP_OAUTH_DCR_RATE_LIMIT_PER_MINUTE must be between 1 and 60."
+            )
         for redirect_pattern in oauth_allowed_client_redirect_uris:
             if "*" in redirect_pattern:
                 if redirect_pattern not in OAUTH_LOOPBACK_REDIRECT_PORT_PATTERNS:
@@ -610,6 +634,13 @@ def _build_settings() -> Settings:
                 "HTTP_OAUTH_RBAC_ROLE must be present in HTTP_RBAC_READER_ROLES "
                 "or HTTP_RBAC_WRITER_ROLES."
             )
+        if production_environment and (
+            not rate_limit_enabled or rate_limit_per_minute <= 0
+        ):
+            raise ConfigError(
+                "Production OAuth requires HTTP_RATE_LIMIT_ENABLED=true and a "
+                "positive HTTP_RATE_LIMIT_PER_MINUTE to protect public OAuth endpoints."
+            )
 
     http_settings = HttpSettings(
         host=decouple_config("HTTP_HOST", default="127.0.0.1"),
@@ -625,13 +656,17 @@ def _build_settings() -> Settings:
         oauth_github_client_id=oauth_github_client_id,
         oauth_github_client_secret=oauth_github_client_secret,
         oauth_github_allowed_identities=oauth_github_allowed_identities,
+        oauth_github_token_cache_ttl_seconds=(
+            oauth_github_token_cache_ttl_seconds
+        ),
+        oauth_dcr_rate_limit_per_minute=oauth_dcr_rate_limit_per_minute,
         oauth_jwt_signing_key=oauth_jwt_signing_key,
         oauth_storage_path=oauth_storage_path,
         oauth_access_token_ttl_seconds=oauth_access_token_ttl_seconds,
         oauth_allowed_client_redirect_uris=oauth_allowed_client_redirect_uris,
         oauth_rbac_role=oauth_rbac_role,
-        rate_limit_enabled=_b("HTTP_RATE_LIMIT_ENABLED", default=False),
-        rate_limit_per_minute=_i("HTTP_RATE_LIMIT_PER_MINUTE", default=60),
+        rate_limit_enabled=rate_limit_enabled,
+        rate_limit_per_minute=rate_limit_per_minute,
         rate_limit_backend=_enum(
             decouple_config("HTTP_RATE_LIMIT_BACKEND", default=""),
             default="memory",

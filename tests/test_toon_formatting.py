@@ -65,6 +65,21 @@ async def test_resource_format_toon_envelope(isolated_env, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_resource_format_json_array_is_one_content_document(isolated_env):
+    clear_settings_cache()
+    server = build_mcp_server()
+
+    async with Client(server) as client:
+        blocks = await client.read_resource(
+            "resource://tooling/projects?format=json"
+        )
+
+    assert len(blocks) == 1
+    assert blocks[0].text is not None
+    assert isinstance(json.loads(blocks[0].text), list)
+
+
+@pytest.mark.asyncio
 async def test_resource_format_query_param_fastmcp(isolated_env, monkeypatch):
     monkeypatch.setattr(app_module, "_looks_like_toon_rust_encoder", lambda _exe: True)
     clear_settings_cache()

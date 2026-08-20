@@ -65,6 +65,11 @@ services:
       # DCR registrations, authorization transactions, and upstream tokens are
       # encrypted before they reach this persistent directory.
       HTTP_OAUTH_STORAGE_PATH: "/data/oauth"
+      # OAuth's DCR/browser endpoints are public by design. config.py refuses
+      # production OAuth unless the limiter is enabled with a positive budget.
+      HTTP_RATE_LIMIT_ENABLED: "${HTTP_RATE_LIMIT_ENABLED:-true}"
+      HTTP_RATE_LIMIT_PER_MINUTE: "${HTTP_RATE_LIMIT_PER_MINUTE:-60}"
+      HTTP_OAUTH_DCR_RATE_LIMIT_PER_MINUTE: "${HTTP_OAUTH_DCR_RATE_LIMIT_PER_MINUTE:-10}"
 
       # ---------------------------------------------------------------------
       # THE most important line in this file.
@@ -122,8 +127,9 @@ services:
 
     volumes:
       # Everything durable lives here: storage.sqlite3 (+ -wal/-shm), the git archive,
-      # attachments, and the server lock. Host dir must be owned by uid/gid 10001 —
-      # the Dockerfile's chown happens at build time and is shadowed by this mount.
+      # attachments, OAuth session state, and the server lock. Host dir must be
+      # owned by uid/gid 10001 — the Dockerfile's chown happens at build time
+      # and is shadowed by this mount.
       - type: bind
         source: ./data
         target: /data

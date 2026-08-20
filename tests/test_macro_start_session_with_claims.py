@@ -10,9 +10,11 @@ from tests.keys import pkey
 CLAIMS_SESSION_AGENT = "claude-wsl-claims-session-1"
 NO_CLAIMS_SESSION_AGENT = "codex-wsl-claims-session-2"
 EMPTY_CLAIMS_SESSION_AGENT = "codex-wsl-claims-session-3"
+FILTERED_CLAIMS_SESSION_AGENT = "codex-wsl-claims-session-4"
 CLAIMS_SESSION_TOKEN = "a" * 64
 NO_CLAIMS_SESSION_TOKEN = "b" * 64
 EMPTY_CLAIMS_SESSION_TOKEN = "c" * 64
+FILTERED_CLAIMS_SESSION_TOKEN = "d" * 64
 
 
 async def _provision_agent(
@@ -43,12 +45,12 @@ async def test_macro_start_session_with_file_reservation_paths(isolated_env):
     Test macro_start_session WITH file_reservation_paths parameter.
 
     This test specifically exercises the code path that was broken by the
-    globals().get("file_reservation_paths") bug (now fixed to use mcp.get_tool("file_reservation_paths")).
+    parameter shadowing the decorated function.
 
     The bug was: macro_start_session has a parameter named 'file_reservation_paths' which
-    shadowed the file_reservation_paths function. Using mcp.get_tool("file_reservation_paths") avoids global lookups.
+    shadowed the file_reservation_paths function.
 
-    The fix: Use mcp.get_tool("file_reservation_paths") to get the tool from the registry.
+    The fix: Keep a non-shadowed reference to FastMCP 3's composable function.
     """
     server = build_mcp_server()
     async with Client(server) as client:
@@ -192,3 +194,53 @@ async def test_macro_start_session_rejects_explicit_empty_file_reservation_paths
                     "file_reservation_paths": [],
                 },
             )
+
+
+@pytest.mark.asyncio
+async def test_macro_start_session_uses_hidden_reservation_helper(
+    isolated_env,
+    monkeypatch,
+):
+    """Instance visibility must not break an internal macro dependency."""
+    project_key = pkey("test/project-filtered-claims")
+    provisioning_server = build_mcp_server()
+    async with Client(provisioning_server) as client:
+        registration_token = await _provision_agent(
+            client,
+            project_key=project_key,
+            agent_name=FILTERED_CLAIMS_SESSION_AGENT,
+            program="codex",
+            model="gpt-5",
+        )
+
+    monkeypatch.setenv("TOOLS_FILTER_ENABLED", "true")
+    monkeypatch.setenv("TOOLS_FILTER_PROFILE", "custom")
+    monkeypatch.setenv("TOOLS_FILTER_MODE", "include")
+    monkeypatch.setenv("TOOLS_FILTER_CLUSTERS", "workflow_macros")
+    from mcp_agent_mail.config import clear_settings_cache
+
+    clear_settings_cache()
+    filtered_server = build_mcp_server()
+    visible_tools = {tool.name for tool in await filtered_server.list_tools()}
+    assert "macro_start_session" in visible_tools
+    assert "file_reservation_paths" not in visible_tools
+
+    async with Client(filtered_server) as client:
+        result = await client.call_tool(
+            "macro_start_session",
+            {
+                "human_key": project_key,
+                "program": "codex",
+                "model": "gpt-5",
+                "agent_name": FILTERED_CLAIMS_SESSION_AGENT,
+                "external_id": "claims-session-filtered",
+                "client_name": "codex",
+                "execution_token": FILTERED_CLAIMS_SESSION_TOKEN,
+                "registration_token": registration_token,
+                "file_reservation_paths": ["src/filtered.py"],
+            },
+        )
+    assert [
+        reservation["path_pattern"]
+        for reservation in result.data["file_reservations"]["granted"]
+    ] == ["src/filtered.py"]

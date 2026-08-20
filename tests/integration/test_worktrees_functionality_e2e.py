@@ -3,7 +3,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import pytest
 from fastmcp import Client
@@ -32,33 +32,38 @@ async def _read_json_resource(server: Any, uri: str) -> dict[str, Any]:
 
 
 def _print_tools_and_resources(console: Console, mcp: Any) -> tuple[list[str], list[str]]:
-    # Use FastMCP async getters
+    # FastMCP 3 exposes static resources and URI templates separately.
     import asyncio as _asyncio
+
+    async def _load_surface() -> tuple[Any, Any, Any]:
+        return (
+            await mcp.list_tools(),
+            await mcp.list_resources(),
+            await mcp.list_resource_templates(),
+        )
+
     try:
-        tools = _asyncio.run(mcp.get_tools())
+        tools, resources, resource_templates = _asyncio.run(_load_surface())
     except RuntimeError:
         # in-case nested loop; run a temporary loop
         import queue
         import threading
-        q: "queue.Queue[Iterable[Any]]" = queue.Queue()
+
+        q: "queue.Queue[tuple[Any, Any, Any]]" = queue.Queue()
+
         def _runner():
-            q.put(_asyncio.run(mcp.get_tools()))
+            q.put(_asyncio.run(_load_surface()))
+
         t = threading.Thread(target=_runner, daemon=True)
         t.start()
-        tools = q.get()
-    try:
-        resources = _asyncio.run(mcp.get_resources())
-    except RuntimeError:
-        import queue
-        import threading
-        q2: "queue.Queue[Iterable[Any]]" = queue.Queue()
-        def _runner2():
-            q2.put(_asyncio.run(mcp.get_resources()))
-        t2 = threading.Thread(target=_runner2, daemon=True)
-        t2.start()
-        resources = q2.get()
+        tools, resources, resource_templates = q.get()
+
     tool_names = [getattr(t, "name", "") for t in tools if getattr(t, "name", "")]
-    resource_names = [getattr(r, "name", "") for r in resources if getattr(r, "name", "")]
+    resource_names = [str(resource.uri).split("{?", 1)[0] for resource in resources]
+    resource_names.extend(
+        str(template.uri_template).split("{?", 1)[0]
+        for template in resource_templates
+    )
 
     table = Table(title="MCP Surface (tools/resources)")
     table.add_column("Tools", style="cyan")
@@ -142,6 +147,10 @@ def test_worktrees_functionality_e2e(
     tools_on, resources_on = _print_tools_and_resources(console, mcp_on)
 
     console.print(Panel.fit(f"Tools (count): {len(tools_on)} • Resources (count): {len(resources_on)}", title="Surface (Gate ON)"))
+    assert "ensure_product" in tools_on
+    assert "products_link" in tools_on
+    assert "resource://product/{key}" in resources_on
+    assert "resource://identity/{project}" in resources_on
 
     # Ensure a project exists for the repo so guard install can resolve it
     project_payload = __import__("asyncio").run(_call_tool(_build_server(), "ensure_project", {"human_key": str(repo.resolve())}))

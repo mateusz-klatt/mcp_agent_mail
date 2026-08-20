@@ -17,10 +17,18 @@ def test_http_main_invokes_uvicorn(monkeypatch):
         _config.clear_settings_cache()
     calls: dict[str, object] = {}
 
-    def fake_run(app, host, port, log_level="info", forwarded_allow_ips="127.0.0.1"):
+    def fake_run(
+        app,
+        host,
+        port,
+        log_level="info",
+        access_log=True,
+        forwarded_allow_ips="127.0.0.1",
+    ):
         calls["host"] = host
         calls["port"] = port
         calls["lv"] = log_level
+        calls["access_log"] = access_log
         calls["forwarded_allow_ips"] = forwarded_allow_ips
 
     monkeypatch.setenv("HTTP_HOST", "127.0.0.1")
@@ -33,6 +41,7 @@ def test_http_main_invokes_uvicorn(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["mcp-http"])
     http_main()
     assert calls.get("host") == "127.0.0.1"
+    assert calls.get("access_log") is False
     assert calls.get("forwarded_allow_ips") == "127.0.0.1"
 
 

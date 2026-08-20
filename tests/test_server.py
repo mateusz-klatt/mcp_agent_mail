@@ -1260,6 +1260,18 @@ def test_oauth_configuration_fails_closed_in_production(
         get_settings()
 
     monkeypatch.setenv("HTTP_OAUTH_ACCESS_TOKEN_TTL_SECONDS", "2592000")
+    monkeypatch.setenv("HTTP_OAUTH_GITHUB_TOKEN_CACHE_TTL_SECONDS", "301")
+    clear_settings_cache()
+    with pytest.raises(ConfigError, match="TOKEN_CACHE_TTL_SECONDS"):
+        get_settings()
+
+    monkeypatch.setenv("HTTP_OAUTH_GITHUB_TOKEN_CACHE_TTL_SECONDS", "60")
+    monkeypatch.setenv("HTTP_OAUTH_DCR_RATE_LIMIT_PER_MINUTE", "0")
+    clear_settings_cache()
+    with pytest.raises(ConfigError, match="DCR_RATE_LIMIT_PER_MINUTE"):
+        get_settings()
+
+    monkeypatch.setenv("HTTP_OAUTH_DCR_RATE_LIMIT_PER_MINUTE", "10")
     monkeypatch.setenv(
         "HTTP_OAUTH_ALLOWED_CLIENT_REDIRECT_URIS",
         "https://*.example.com/*",
@@ -1279,9 +1291,16 @@ def test_oauth_configuration_fails_closed_in_production(
 
     monkeypatch.setenv("HTTP_OAUTH_RBAC_ROLE", "writer")
     clear_settings_cache()
+    with pytest.raises(ConfigError, match="Production OAuth requires"):
+        get_settings()
+
+    monkeypatch.setenv("HTTP_RATE_LIMIT_ENABLED", "true")
+    clear_settings_cache()
     settings = get_settings()
     assert settings.http.oauth_enabled is True
     assert settings.http.oauth_base_url == "https://iris.example"
+    assert settings.http.oauth_github_token_cache_ttl_seconds == 60
+    assert settings.http.oauth_dcr_rate_limit_per_minute == 10
 
 
 def test_execution_reaper_default_tolerates_long_event_driven_tools(

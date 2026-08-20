@@ -94,11 +94,20 @@ _URL="$(resolve_integration_mcp_url)" || {
   log_err "Missing MCP endpoint. Set INTEGRATION_MCP_URL or AGENT_MAIL_URL (for example https://hermes.example/mcp/)."
   exit 1
 }
+_VSCODE_AUTH_MODE="${AGENT_MAIL_VSCODE_AUTH_MODE:-bearer}"
+case "$_VSCODE_AUTH_MODE" in
+  bearer|oauth) ;;
+  *)
+    log_err "AGENT_MAIL_VSCODE_AUTH_MODE must be 'bearer' or 'oauth'."
+    exit 1
+    ;;
+esac
 _TOKEN="$(resolve_global_integration_bearer_token)" || {
   log_err "Missing bearer token. Set INTEGRATION_BEARER_TOKEN or HTTP_BEARER_TOKEN."
   exit 1
 }
 log_ok "Using MCP endpoint: ${_URL}"
+log_ok "VS Code authentication mode: ${_VSCODE_AUTH_MODE}"
 log_ok "Copilot identity ${_IDENTITY_DESCRIPTION}"
 
 # Resolve every target and validate every existing JSON document before the
@@ -209,13 +218,22 @@ MERGED_COPILOT_MCP="$(
 MERGED_VSCODE_MCP="$(
   AGENT_MAIL_INSTALL_URL="${_URL}" \
   AGENT_MAIL_INSTALL_AUTHORIZATION="Bearer ${_TOKEN}" \
+  AGENT_MAIL_INSTALL_VSCODE_AUTH_MODE="${_VSCODE_AUTH_MODE}" \
   jq '
     .servers = (.servers // {}) |
-    .servers["mcp-agent-mail"] = {
-      type: "http",
-      url: env.AGENT_MAIL_INSTALL_URL,
-      headers: {Authorization: env.AGENT_MAIL_INSTALL_AUTHORIZATION}
-    }
+    .servers["mcp-agent-mail"] =
+      if env.AGENT_MAIL_INSTALL_VSCODE_AUTH_MODE == "oauth" then
+        {
+          type: "http",
+          url: env.AGENT_MAIL_INSTALL_URL
+        }
+      else
+        {
+          type: "http",
+          url: env.AGENT_MAIL_INSTALL_URL,
+          headers: {Authorization: env.AGENT_MAIL_INSTALL_AUTHORIZATION}
+        }
+      end
   ' <<<"$EXISTING_VSCODE_MCP"
 )" || {
   log_err "Could not merge ${VSCODE_MCP_JSON}; existing configuration was left unchanged."
@@ -478,7 +496,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
   _print "[dry-run] install Copilot CLI runtime under ${HOOKS_DIR}"
   _print "[dry-run] merge Copilot CLI MCP into ${COPILOT_MCP_JSON}"
   _print "[dry-run] merge Copilot CLI hooks into ${COPILOT_HOOKS_JSON}"
-  _print "[dry-run] merge VS Code MCP into ${VSCODE_MCP_JSON}"
+  _print "[dry-run] merge VS Code MCP (${_VSCODE_AUTH_MODE}) into ${VSCODE_MCP_JSON}"
   _print "[dry-run] no files or directories were changed"
   exit 0
 fi
@@ -524,6 +542,7 @@ _print "Copilot CLI MCP config: ${COPILOT_MCP_JSON}"
 _print "Copilot CLI hook config: ${COPILOT_HOOKS_JSON}"
 _print "VS Code user MCP config: ${VSCODE_MCP_JSON}"
 _print "Authenticated server: ${_URL}"
+_print "VS Code authentication: ${_VSCODE_AUTH_MODE}"
 _print "Copilot identity ${_IDENTITY_DESCRIPTION}"
 _print "Restart Copilot CLI: user hook files are loaded only when the CLI starts."
 _print "Documentation: https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/use-hooks"

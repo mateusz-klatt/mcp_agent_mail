@@ -29,8 +29,11 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "fastmcp>=2.10.5",
+  "fastmcp>=3.4.7,<3.5",
+  "mcp>=1.25.0,<1.26",
   "uvicorn[standard]>=0.32.0",
+  "gunicorn>=26.0.0,<27; sys_platform != 'win32'",
+  "uvicorn-worker>=0.4.0,<0.5; sys_platform != 'win32'",
   "fastapi>=0.110.0",
   "PyYAML>=6.0.2",
   "pathspec>=0.12.1",
@@ -55,13 +58,13 @@ dependencies = [
   "pillow>=10.4.0",
   "GitPython>=3.1.43",
   "filelock>=3.16.0",
-  "authlib>=1.5.2,<1.6",
+  "authlib>=1.6.11,<2",
   "litellm>=1.40.0,<2",
   "ruff>=0.14.1,<0.15",
   "pynacl>=1.6.0",
   "psutil>=6.1.1",
   "alembic>=1.19.1",
-  "py-key-value-aio[disk,wrappers-encryption]>=0.2.8,<0.3",
+  "py-key-value-aio[disk,wrappers-encryption]>=0.4.4,<0.5",
 ]
 
 [project.optional-dependencies]
@@ -180,6 +183,7 @@ dev = [
     "playwright==1.62.0",
     "pytest-asyncio>=1.2.0",
     "pytest-cov>=7.0.0",
+    "respx>=0.23.1,<0.24",
     # Splits the Windows leg across parallel runners.  That leg needs ~4.5 h for
     # the full suite while Ubuntu needs 19 min, so it was being killed by the
     # 180-minute ceiling at ~59% having printed nothing at all — failures in the

@@ -247,11 +247,12 @@ def test_cli_list_projects_and_serve_http_overrides(isolated_env, monkeypatch):
     # serve-http should honor host/port/path overrides and not crash (monkeypatch uvicorn)
     calls: dict[str, object] = {}
 
-    def fake_uvicorn_run(app, host, port, log_level="info"):
+    def fake_uvicorn_run(app, host, port, log_level="info", access_log=True):
         calls["app"] = app
         calls["host"] = host
         calls["port"] = port
         calls["log_level"] = log_level
+        calls["access_log"] = access_log
 
     def fake_build_http_app(settings, server):
         calls["path"] = settings.http.path
@@ -265,6 +266,7 @@ def test_cli_list_projects_and_serve_http_overrides(isolated_env, monkeypatch):
     assert calls.get("path") == "/m"
     assert calls.get("host") == "0.0.0.0"
     assert calls.get("port") == 9999
+    assert calls.get("access_log") is False
 
 
 def test_cli_products_search_disambiguates_cross_project_sender(isolated_env, monkeypatch):

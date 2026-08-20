@@ -47,13 +47,15 @@ async def test_empty_inbox_and_pagination(isolated_env):
         )
         items = list(first.data)
         assert len(items) == 10
-        # Fetch next 10 using since_ts of last message in first page
+        # Incremental polling is exclusive: using the oldest item in this
+        # newest-first page returns the nine entries strictly newer than it.
         def _get(field: str, obj):
             if isinstance(obj, dict):
                 return obj.get(field)
             return getattr(obj, field, None)
+
         last_created = _get("created_ts", items[-1])
-        next_page = await client.call_tool(
+        incremental = await client.call_tool(
             "fetch_inbox",
             {
                 "project_key": "Backend",
@@ -62,7 +64,10 @@ async def test_empty_inbox_and_pagination(isolated_env):
                 "since_ts": last_created,
             },
         )
-        assert len(list(next_page.data)) >= 10
+        incremental_items = list(incremental.data)
+        assert [_get("id", item) for item in incremental_items] == [
+            _get("id", item) for item in items[:-1]
+        ]
 
         # Thread resource with multiple messages
         # Use the last message id as thread seed and ensure at least 2

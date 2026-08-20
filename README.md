@@ -538,7 +538,7 @@ Advanced (manual commands):
 ```bash
 uv run python -m mcp_agent_mail.http --host 127.0.0.1 --port 8765
 # or:
-uv run uvicorn mcp_agent_mail.http:create_app --factory --host 127.0.0.1 --port 8765
+uv run uvicorn mcp_agent_mail.http:create_app --factory --no-access-log --host 127.0.0.1 --port 8765
 ```
 
 Either way, `/mail` opens on a sign-in page rather than on your correspondence:
@@ -2390,7 +2390,7 @@ Common variables you may set:
 | `HTTP_RBAC_WRITER_ROLES` | `writer,write,tools,rw` | CSV of writer roles |
 | `HTTP_RBAC_DEFAULT_ROLE` | `reader` | Role used when none present |
 | `HTTP_RBAC_READONLY_TOOLS` | `health_check,fetch_inbox,whois,search_messages,summarize_thread` | CSV of read-only tool names |
-| `HTTP_RATE_LIMIT_ENABLED` | `false` | Enable token-bucket limiter |
+| `HTTP_RATE_LIMIT_ENABLED` | `false` | Enable token-bucket limiter; production startup requires this when OAuth is enabled |
 | `HTTP_RATE_LIMIT_BACKEND` | `memory` | `memory` or `redis` |
 | `HTTP_RATE_LIMIT_PER_MINUTE` | `60` | Legacy per-IP limit (fallback) |
 | `HTTP_RATE_LIMIT_TOOLS_PER_MINUTE` | `60` | Per-minute for tools/call |
@@ -2421,10 +2421,12 @@ Common variables you may set:
 | `HTTP_OAUTH_GITHUB_CLIENT_ID` |  | Client ID of the server's GitHub OAuth App |
 | `HTTP_OAUTH_GITHUB_CLIENT_SECRET` |  | Client secret of the server's GitHub OAuth App |
 | `HTTP_OAUTH_GITHUB_ALLOWED_IDENTITIES` |  | CSV allowlist of `id:<numeric-id>` and/or `login:<login>` entries; immutable IDs are preferred |
+| `HTTP_OAUTH_GITHUB_TOKEN_CACHE_TTL_SECONDS` | `60` | Cache successful GitHub identity checks for 0–300 seconds; revocation may take at most this long to propagate, and `0` disables the cache |
+| `HTTP_OAUTH_DCR_RATE_LIMIT_PER_MINUTE` | `10` | Dedicated per-IP limit for anonymous dynamic client registration (1–60/minute, burst capped at 3) |
 | `HTTP_OAUTH_JWT_SIGNING_KEY` |  | Stable secret of at least 32 characters for local access tokens and encrypted OAuth state |
 | `HTTP_OAUTH_STORAGE_PATH` | `~/.mcp_agent_mail_oauth` | Persistent encrypted DCR and token state; must be absolute in production |
 | `HTTP_OAUTH_ACCESS_TOKEN_TTL_SECONDS` | `2592000` | Lifetime of locally issued access tokens when GitHub returns a non-expiring token (300 seconds to 1 year) |
-| `HTTP_OAUTH_ALLOWED_CLIENT_REDIRECT_URIS` | `http://127.0.0.1:*,https://vscode.dev/redirect` | CSV of exact HTTPS redirects and explicit HTTP loopback port patterns for dynamically registered public clients; other wildcards are rejected |
+| `HTTP_OAUTH_ALLOWED_CLIENT_REDIRECT_URIS` | `http://127.0.0.1:*,http://127.0.0.1/,https://vscode.dev/redirect,https://insiders.vscode.dev/redirect` | CSV of exact HTTPS redirects and explicit HTTP loopback port patterns for dynamically registered public clients; the default is the current stable + Insiders VS Code payload and other wildcards are rejected |
 | `HTTP_OAUTH_RBAC_ROLE` | `writer` | Existing configured RBAC role assigned to an allowlisted OAuth identity |
 | `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED` | `true` in development; forced `false` in production | Allow local MCP transport requests without auth; production startup rejects an attempted opt-in and human UI sessions are never bypassed |
 | `MAIL_UI_AUTH_ENABLED` | `true` | Require human session authentication and project-scoped UI authorization; disable only for isolated test/development use |
@@ -2793,9 +2795,9 @@ Operations teams can follow `docs/operations_alignment_checklist.md`, which link
 > `-w`/`--workers` to any command below breaks this. Scale by running more
 > instances behind the proxy, each with its own store.
 
-- **Direct uvicorn**: `uvicorn mcp_agent_mail.http:create_app --factory --host 0.0.0.0 --port 8765`. This lower-level entrypoint reads Uvicorn's `FORWARDED_ALLOW_IPS`, so set it to the same trusted proxy list as `HTTP_FORWARDED_ALLOW_IPS` when running behind TLS termination.
+- **Direct uvicorn**: `uvicorn mcp_agent_mail.http:create_app --factory --no-access-log --host 0.0.0.0 --port 8765`. This lower-level entrypoint reads Uvicorn's `FORWARDED_ALLOW_IPS`, so set it to the same trusted proxy list as `HTTP_FORWARDED_ALLOW_IPS` when running behind TLS termination. Keep raw access logging disabled because OAuth callbacks carry authorization codes and state in their query string.
 - **Python module**: `python -m mcp_agent_mail.http --host 0.0.0.0 --port 8765`
-- **Gunicorn**: `gunicorn -c deploy/gunicorn.conf.py mcp_agent_mail.http:create_app --factory` — the config pins `workers = 1`; do not override it
+- **Gunicorn**: `gunicorn -c deploy/gunicorn.conf.py 'mcp_agent_mail.http:create_app()'` — the config pins `workers = 1`, uses the maintained `uvicorn-worker` package, and disables raw request-line access logs; do not override those settings
 - **Docker**: `docker compose up --build`
 
 ### CI/CD
@@ -2996,15 +2998,25 @@ HTTP_OAUTH_BASE_URL=https://mail.example.com
 HTTP_OAUTH_GITHUB_CLIENT_ID=<github-oauth-app-client-id>
 HTTP_OAUTH_GITHUB_CLIENT_SECRET=<github-oauth-app-client-secret>
 HTTP_OAUTH_GITHUB_ALLOWED_IDENTITIES=id:<numeric-github-user-id>
+HTTP_OAUTH_GITHUB_TOKEN_CACHE_TTL_SECONDS=60
+HTTP_OAUTH_DCR_RATE_LIMIT_PER_MINUTE=10
 HTTP_OAUTH_JWT_SIGNING_KEY=<output-of-openssl-rand-hex-32>
 HTTP_OAUTH_STORAGE_PATH=/data/oauth
+HTTP_RATE_LIMIT_ENABLED=true
+HTTP_RATE_LIMIT_PER_MINUTE=60
 ```
 
 Keep the signing key stable: it signs local access tokens and encrypts
 persistent OAuth registrations and upstream tokens. The default client redirect
-allowlist already covers VS Code's loopback callback on a dynamic port and
-`https://vscode.dev/redirect`; do not broaden it unless another trusted client
-requires a specific redirect.
+allowlist covers the complete current VS Code registration payload: stable and
+Insiders web redirects, the portless loopback URI, and a dynamic loopback port.
+Do not broaden it unless another trusted client requires a specific redirect.
+Production startup fails closed unless the general request limiter is enabled;
+when a CDN is in front, enforce the limit at the edge or configure a trusted
+real-client-IP chain so all users do not share one backend bucket.
+Anonymous DCR additionally has an 8 KiB request cap, its own low-rate bucket,
+and a separate bounded encrypted store, so registration churn cannot evict
+active JTI mappings or upstream tokens.
 
 After restarting Iris, VS Code needs no manually provisioned `client_id`:
 
@@ -3020,8 +3032,44 @@ After restarting Iris, VS Code needs no manually provisioned `client_id`:
 ```
 
 VS Code discovers `/.well-known/oauth-protected-resource/mcp`, registers a
-public client without a secret, and opens GitHub sign-in. Iris rejects the flow
-before persisting tokens unless the GitHub identity is on the allowlist.
+public client without a secret, requires the Iris MCP resource at both the
+authorization and token exchanges, and opens GitHub sign-in. The callback keeps
+the upstream GitHub token only in encrypted, five-minute authorization-code
+state; Iris validates the GitHub identity before issuing a local JWT or
+persisting the long-lived token mapping. Rejected identities have that temporary
+code removed and receive `invalid_grant`.
+
+The standard GitHub OAuth App flow does not return a refresh token. The local
+access token therefore lasts `HTTP_OAUTH_ACCESS_TOKEN_TTL_SECONDS` (30 days by
+default), after which VS Code must run the browser flow again. Revocation is
+performed in GitHub **Settings → Applications → Authorized OAuth Apps**; Iris
+revalidates the GitHub token on use, with at most the configured 60-second cache
+delay. If VS Code retains a stale dynamic provider after revocation or expiry,
+run **Authentication: Remove Dynamic Authentication Providers** and reconnect.
+
+`/data/oauth` is recoverable session state, not part of
+`deploy/agent-mail-backup.sh`: losing it forces DCR and sign-in again without
+losing mail. If session continuity requires backing it up, snapshot the stopped
+service or its volume, encrypt the backup separately, retain it no longer than
+the access-token TTL, and restore it only with the same signing key.
+
+The combined Copilot installer keeps bearer authentication for Copilot CLI and
+lifecycle hooks. To write a URL-only VS Code entry (and remove a previously
+managed Authorization header), run it with
+`AGENT_MAIL_VSCODE_AUTH_MODE=oauth`; the default remains `bearer`.
+
+Automated coverage exercises the complete in-process browser flow — VS Code DCR,
+client and proxy PKCE, consent CSRF/binding cookies, mocked GitHub callback and
+identity lookup, strict resource validation, one-time code exchange, token
+cache, and a stateful MCP initialize/tool call:
+
+```bash
+uv run pytest tests/test_http_transport.py -k oauth
+```
+
+Before production enablement, also test both VS Code stable and Insiders against
+a staging GitHub OAuth App: successful writer call, denied account, restart,
+GitHub revocation, and reauthentication after a short test TTL.
 
 On native Windows, the Copilot installer resolves the Git Bash executable that
 is running it, so per-user and custom Git for Windows installations are valid.

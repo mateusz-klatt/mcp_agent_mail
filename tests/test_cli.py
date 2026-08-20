@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -1020,12 +1021,14 @@ def test_cli_serve_http_uses_settings(isolated_env, monkeypatch):
         host,
         port,
         log_level="info",
+        access_log=True,
         forwarded_allow_ips="127.0.0.1",
     ):
         call_args["app"] = app
         call_args["host"] = host
         call_args["port"] = port
         call_args["log_level"] = log_level
+        call_args["access_log"] = access_log
         call_args["forwarded_allow_ips"] = forwarded_allow_ips
 
     monkeypatch.setenv("HTTP_FORWARDED_ALLOW_IPS", "172.19.0.1")
@@ -1035,6 +1038,7 @@ def test_cli_serve_http_uses_settings(isolated_env, monkeypatch):
     assert result.exit_code == 0
     assert call_args["host"] == "127.0.0.1"
     assert call_args["port"] == 8765
+    assert call_args["access_log"] is False
     assert call_args["forwarded_allow_ips"] == "172.19.0.1"
 
 
@@ -1078,6 +1082,9 @@ def test_cli_serve_stdio(isolated_env, monkeypatch):
     """Test that serve-stdio invokes FastMCP.run with stdio transport."""
     runner = CliRunner()
     call_args: dict[str, Any] = {}
+    root_logger = logging.getLogger()
+    previous_handlers = tuple(root_logger.handlers)
+    previous_level = root_logger.level
 
     def fake_run(self, transport="stdio", **kwargs):
         call_args["transport"] = transport
@@ -1090,6 +1097,8 @@ def test_cli_serve_stdio(isolated_env, monkeypatch):
     result = runner.invoke(app, ["serve-stdio"])
     assert result.exit_code == 0
     assert call_args["transport"] == "stdio"
+    assert tuple(root_logger.handlers) == previous_handlers
+    assert root_logger.level == previous_level
 
 
 def test_cli_migrate(monkeypatch):

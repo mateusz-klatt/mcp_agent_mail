@@ -102,6 +102,20 @@ case "$_VSCODE_AUTH_MODE" in
     exit 1
     ;;
 esac
+_VSCODE_URL="$_URL"
+if [[ "$_VSCODE_AUTH_MODE" == "oauth" ]]; then
+  # RFC 9728 requires the protected-resource metadata identifier to match the
+  # configured MCP target exactly. Iris advertises the canonical /mcp
+  # resource, while VS Code treats /mcp/ as a different identifier and
+  # then falls back to an OAuth flow without RFC 8707's resource parameter.
+  case "$_URL" in
+    */mcp|*/mcp/) _VSCODE_URL="${_URL%/}" ;;
+    *)
+      log_err "VS Code OAuth requires an MCP endpoint ending in /mcp or /mcp/."
+      exit 1
+      ;;
+  esac
+fi
 _TOKEN="$(resolve_global_integration_bearer_token)" || {
   log_err "Missing bearer token. Set INTEGRATION_BEARER_TOKEN or HTTP_BEARER_TOKEN."
   exit 1
@@ -216,7 +230,7 @@ MERGED_COPILOT_MCP="$(
   exit 1
 }
 MERGED_VSCODE_MCP="$(
-  AGENT_MAIL_INSTALL_URL="${_URL}" \
+  AGENT_MAIL_INSTALL_URL="${_VSCODE_URL}" \
   AGENT_MAIL_INSTALL_AUTHORIZATION="Bearer ${_TOKEN}" \
   AGENT_MAIL_INSTALL_VSCODE_AUTH_MODE="${_VSCODE_AUTH_MODE}" \
   jq '

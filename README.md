@@ -3025,19 +3025,22 @@ After restarting Iris, VS Code needs no manually provisioned `client_id`:
   "servers": {
     "iris": {
       "type": "http",
-      "url": "https://mail.example.com/mcp/"
+      "url": "https://mail.example.com/mcp"
     }
   }
 }
 ```
 
-VS Code discovers `/.well-known/oauth-protected-resource/mcp`, registers a
-public client without a secret, requires the Iris MCP resource at both the
-authorization and token exchanges, and opens GitHub sign-in. The callback keeps
-the upstream GitHub token only in encrypted, five-minute authorization-code
-state; Iris validates the GitHub identity before issuing a local JWT or
-persisting the long-lived token mapping. Rejected identities have that temporary
-code removed and receive `invalid_grant`.
+Keep this OAuth URL in its canonical no-trailing-slash form. RFC 9728 requires
+the protected-resource metadata identifier to match the configured MCP target
+exactly, and VS Code correctly treats `/mcp` and `/mcp/` as different resource
+identifiers. VS Code discovers `/.well-known/oauth-protected-resource/mcp`,
+registers a public client without a secret, requires the Iris MCP resource at
+both the authorization and token exchanges, and opens GitHub sign-in. The
+callback keeps the upstream GitHub token only in encrypted, five-minute
+authorization-code state; Iris validates the GitHub identity before issuing a
+local JWT or persisting the long-lived token mapping. Rejected identities have
+that temporary code removed and receive `invalid_grant`.
 
 The standard GitHub OAuth App flow does not return a refresh token. The local
 access token therefore lasts `HTTP_OAUTH_ACCESS_TOKEN_TTL_SECONDS` (30 days by

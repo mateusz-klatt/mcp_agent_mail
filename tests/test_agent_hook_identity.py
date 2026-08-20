@@ -2760,12 +2760,43 @@ def test_codex_and_copilot_integrators_write_only_temp_user_config(
     oauth_vscode_config = json.loads(vscode_config_path.read_text(encoding="utf-8"))
     assert oauth_vscode_config["servers"]["mcp-agent-mail"] == {
         "type": "http",
-        "url": "https://hermes.example/mcp/",
+        "url": "https://hermes.example/mcp",
     }
     rerun_copilot_config = json.loads(copilot_mcp.read_text(encoding="utf-8"))
     assert rerun_copilot_config["mcpServers"]["mcp-agent-mail"]["headers"] == {
         "Authorization": "Bearer test-bearer"
     }
+
+    # OAuth resource metadata is fixed to the canonical /mcp resource. An
+    # explicit alternate endpoint must fail before changing any user config,
+    # rather than creating a provider that silently drops RFC 8707 resource.
+    vscode_before_invalid_oauth = vscode_config_path.read_text(encoding="utf-8")
+    invalid_oauth_endpoint = subprocess.run(
+        [
+            BASH,
+            _git_bash_path(INTEGRATORS["copilot"]),
+            "--yes",
+            "--project-dir",
+            _git_bash_path(project),
+        ],
+        cwd=ROOT,
+        env={
+            **env,
+            "AGENT_MAIL_VSCODE_AUTH_MODE": "oauth",
+            "INTEGRATION_MCP_URL": "https://hermes.example/api/",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert invalid_oauth_endpoint.returncode != 0
+    assert "OAuth requires an MCP endpoint ending in /mcp" in (
+        invalid_oauth_endpoint.stdout + invalid_oauth_endpoint.stderr
+    )
+    assert (
+        vscode_config_path.read_text(encoding="utf-8")
+        == vscode_before_invalid_oauth
+    )
 
     generated_files = {home / ".agent-mail.env", vscode_config_path}
     for generated_root in (codex_dir, copilot_dir):

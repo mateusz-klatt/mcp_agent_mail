@@ -142,12 +142,13 @@ async def test_http_oauth_discovery_and_challenge_are_public(
         assert metadata["token_endpoint_auth_methods_supported"] == ["none"]
         assert "client_id_metadata_document_supported" not in metadata
 
-        unauthorized = await client.post("/mcp/", json={})
-        assert unauthorized.status_code == 401
-        assert unauthorized.headers["www-authenticate"] == (
-            'Bearer resource_metadata="'
-            'https://iris.example/.well-known/oauth-protected-resource/mcp"'
-        )
+        for resource_path in ("/mcp", "/mcp/"):
+            unauthorized = await client.post(resource_path, json={})
+            assert unauthorized.status_code == 401
+            assert unauthorized.headers["www-authenticate"] == (
+                'Bearer resource_metadata="'
+                'https://iris.example/.well-known/oauth-protected-resource/mcp"'
+            )
     assert provider._github_http_client.is_closed is True
     assert (tmp_path / "oauth").stat().st_mode & 0o777 == 0o700
     assert (tmp_path / "oauth" / "protected").stat().st_mode & 0o777 == 0o700

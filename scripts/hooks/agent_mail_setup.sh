@@ -262,14 +262,55 @@ claude_inventory_path() {
     am_normalize_runtime_user_path "$raw"
 }
 
+claude_profile_root() {
+    local raw normalized
+    if [ "${CLAUDE_CONFIG_DIR+x}" = x ]; then
+        [ -n "$CLAUDE_CONFIG_DIR" ] || return 1
+        raw="$CLAUDE_CONFIG_DIR"
+    else
+        raw="${HOME}/.claude"
+    fi
+    normalized="$(claude_inventory_path "$raw")" || return 1
+    case "$normalized" in
+        /*|[A-Za-z]:/*) printf '%s\n' "$normalized" ;;
+        *) return 1 ;;
+    esac
+}
+
 claude_inventory_command() (
-    # Plugin inventory has no reason to inherit any Agent Mail credential.
-    # Apart from being unnecessary, forwarding one to a third-party CLI makes a
-    # read-only freshness check a new secret-bearing subprocess. Use a subshell
-    # so the diagnostic's own authenticated server probe keeps its environment.
-    unset INTEGRATION_BEARER_TOKEN HTTP_BEARER_TOKEN MCP_AGENT_MAIL_TOKEN
-    unset AGENT_MAIL_TOKEN AGENT_MAIL_REGISTRATION_TOKEN _TOKEN
-    command claude "$@"
+    # A denylist cannot enumerate future provider keys, database URLs, or helper
+    # tokens. Inventory needs only a small platform/runtime environment, so run
+    # the third-party CLI from the same allowlist as the Claude integrator.
+    local env_name
+    local safe_env=()
+    for env_name in \
+        HOME PATH USER LOGNAME USERNAME SHELL \
+        TMPDIR TMP TEMP CLAUDE_CODE_TMPDIR \
+        USERPROFILE APPDATA LOCALAPPDATA PROGRAMDATA SystemRoot SYSTEMROOT WINDIR \
+        COMSPEC ComSpec PATHEXT HOMEDRIVE HOMEPATH SystemDrive SYSTEMDRIVE \
+        XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_RUNTIME_DIR \
+        CLAUDE_CONFIG_DIR CLAUDE_CODE_PLUGIN_CACHE_DIR \
+        CLAUDE_CODE_PLUGIN_GIT_TIMEOUT_MS CLAUDE_CODE_PLUGIN_PREFER_HTTPS \
+        CLAUDE_CODE_CERT_STORE \
+        LANG LANGUAGE LC_ALL LC_COLLATE LC_CTYPE LC_MESSAGES LC_MONETARY LC_NUMERIC \
+        LC_TIME LC_ADDRESS LC_IDENTIFICATION LC_MEASUREMENT LC_NAME LC_PAPER \
+        LC_RESPONSE LC_TELEPHONE TERM COLORTERM NO_COLOR FORCE_COLOR TZ \
+        HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY FTP_PROXY \
+        http_proxy https_proxy all_proxy no_proxy ftp_proxy \
+        SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE CURL_CA_BUNDLE \
+        NODE_EXTRA_CA_CERTS GIT_SSL_CAINFO NIX_SSL_CERT_FILE \
+        MSYSTEM MSYS CYGWIN CHERE_INVOKING WSL_DISTRO_NAME WSL_INTEROP WSLENV \
+        DISABLE_TELEMETRY DISABLE_ERROR_REPORTING DO_NOT_TRACK \
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+    do
+        if [[ -n "${!env_name+x}" ]]; then
+            if [[ "$env_name" == CLAUDE_CONFIG_DIR && -z "${!env_name}" ]]; then
+                continue
+            fi
+            safe_env+=("${env_name}=${!env_name}")
+        fi
+    done
+    command env -i ${safe_env[@]+"${safe_env[@]}"} claude "$@"
 )
 
 is_full_lower_git_sha() {
@@ -281,14 +322,22 @@ is_full_lower_git_sha() {
 claude_freshness_status() {
     local plugins_json="" marketplaces_json="" plugin_count="" marketplace_count=""
     local installed_version="" installed_root_raw="" installed_root="" installed_enabled=""
+    local installed_errors_state=""
     local marketplace_root_raw="" marketplace_root="" marketplace_source=""
     local source_version="" source_mode="" catalog_source=""
     local manifest_version="" catalog_version="" source_git_sha=""
     local installed_manifest_version="" installed_manifest_valid=0
     local source_ready=0 installed_ready=0
     local versions_match=1 rel source_hash installed_hash plugin_drift=0 hook_drift=0
-    local installed_hooks_root="${HOME}/.claude/hooks/mcp-agent-mail"
+    local claude_root="" installed_hooks_root=""
     CLAUDE_FRESHNESS_PROBLEMS=0
+
+    if claude_root="$(claude_profile_root)"; then
+        installed_hooks_root="${claude_root}/hooks/mcp-agent-mail"
+    else
+        printf 'Claude profile: CLAUDE_CONFIG_DIR must resolve to a non-empty absolute path\n'
+        CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+    fi
 
     if ! command -v claude >/dev/null 2>&1; then
         printf 'Claude plugin inventory: unavailable; claude CLI is not on PATH\n'
@@ -325,7 +374,18 @@ claude_freshness_status() {
                 --arg id "$CLAUDE_AGENT_MAIL_PLUGIN_ID" '
                     if type == "array" then . else .plugins end
                     | [.[] | select(.id == $id)][0].enabled
-                    | if . == false then "false" else "true" end
+                    | if . == true then "true"
+                      elif . == false then "false"
+                      else "invalid" end
+                ' 2>/dev/null)"
+            installed_errors_state="$(printf '%s' "$plugins_json" | jq -r \
+                --arg id "$CLAUDE_AGENT_MAIL_PLUGIN_ID" '
+                    if type == "array" then . else .plugins end
+                    | [.[] | select(.id == $id)][0]
+                    | if ((has("errors") | not) or .errors == null or .errors == [])
+                      then "clear"
+                      elif (.errors | type) == "array" then "reported"
+                      else "invalid" end
                 ' 2>/dev/null)"
             if [ -n "$installed_version" ] \
                 && installed_root="$(claude_inventory_path "$installed_root_raw")" \
@@ -334,6 +394,16 @@ claude_freshness_status() {
                 if [ "$installed_enabled" = "false" ]; then
                     printf 'Claude plugin: installed at version %s but disabled\n' \
                         "$installed_version"
+                    CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+                elif [ "$installed_enabled" != "true" ]; then
+                    printf 'Claude plugin inventory: enabled state is missing or invalid\n'
+                    CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+                fi
+                if [ "$installed_errors_state" = "reported" ]; then
+                    printf 'Claude plugin inventory: Agent Mail entry reports plugin errors\n'
+                    CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+                elif [ "$installed_errors_state" != "clear" ]; then
+                    printf 'Claude plugin inventory: errors state is missing or invalid\n'
                     CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
                 fi
             else
@@ -586,7 +656,7 @@ claude_freshness_status() {
         fi
     fi
 
-    if [ "$source_ready" -eq 1 ]; then
+    if [ "$source_ready" -eq 1 ] && [ -n "$installed_hooks_root" ]; then
         for rel in "${CLAUDE_AGENT_MAIL_HOOKS[@]}"; do
             if ! source_hash="$(normalized_file_sha256 "${marketplace_root}/scripts/hooks/${rel}")"; then
                 printf 'Claude hook: source missing or unreadable: %s\n' "$rel"

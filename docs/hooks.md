@@ -6,8 +6,10 @@ makes the mailbox reach an agent that is busy, and the reservations reach an
 agent about to edit a file somebody else is already in.
 
 `scripts/integrate_claude_code.sh` installs this set once under
-`~/.claude/hooks/mcp-agent-mail` and merges the hook entries into the user-level
-`~/.claude/settings.json`. It does not create a project's `.claude` directory.
+`${CLAUDE_CONFIG_DIR-${HOME}/.claude}/hooks/mcp-agent-mail` and merges the hook
+entries into that selected profile's `settings.json`. It does not create a
+project's `.claude` directory. An explicitly empty `CLAUDE_CONFIG_DIR` is
+invalid; only an unset variable selects the default profile.
 
 ## What each one does
 
@@ -70,7 +72,8 @@ registers `mateusz-klatt/mcp_agent_mail` as a GitHub marketplace with sparse
 paths `.claude-plugin`, `skills`, and `scripts/hooks`. Claude therefore clones
 tracked content from those cones and their Git cone-mode ancestor directories
 before copying the plugin under
-`~/.claude/plugins/cache/<marketplace>/<plugin>/<git-sha>/`; `.env`, virtual
+`${CLAUDE_CONFIG_DIR-${HOME}/.claude}/plugins/cache/<marketplace>/<plugin>/<git-sha>/`;
+`.env`, virtual
 environments, SQLite/WAL files, `node_modules`, coverage artifacts, and other
 ignored working-tree state cannot enter that snapshot. Both plugin manifests
 deliberately omit `version`, so Claude uses the source commit SHA and
@@ -150,7 +153,8 @@ they must run without importing the server, Python environment, or `.env`.
 Server configuration remains exclusively owned by `python-decouple`; these
 guard-only runtime signals are the explicit exception.
 
-User scope, once per machine, in `~/.claude/settings.json`:
+User scope, once per selected Claude profile, in
+`${CLAUDE_CONFIG_DIR-${HOME}/.claude}/settings.json`:
 
 ```json
 {"hooks": {
@@ -290,10 +294,12 @@ should not treat it as an error.
 
 The integrator is user-scope only:
 
-- hook scripts: `~/.claude/hooks/mcp-agent-mail`
-- hook definitions: `~/.claude/settings.json`
-- authenticated MCP server: Claude user scope in `~/.claude.json`, preferably
-  written through `claude mcp add --scope user`
+- hook scripts: `${CLAUDE_CONFIG_DIR-${HOME}/.claude}/hooks/mcp-agent-mail`
+- hook definitions: `${CLAUDE_CONFIG_DIR-${HOME}/.claude}/settings.json`
+- authenticated MCP server: Claude user scope in `~/.claude.json` when
+  `CLAUDE_CONFIG_DIR` is unset, otherwise in
+  `${CLAUDE_CONFIG_DIR}/.claude.json`, preferably written through
+  `claude mcp add --scope user`
 
 Re-running it migrates old managed commands that point into a project's
 `.claude/hooks` directory, then installs one canonical global set. It filters

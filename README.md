@@ -2105,7 +2105,7 @@ sequenceDiagram
     - A Python chain-runner is written to `.git/hooks/pre-commit` and `.git/hooks/pre-push`.
     - It executes `hooks.d/<hook>/*` in lexical order, then `<hook>.orig` if present (existing hooks are preserved, not overwritten).
     - Agent Mail installs its guard as `hooks.d/pre-commit/50-agent-mail.py` and `hooks.d/pre-push/50-agent-mail.py`.
-    - Windows shims (`pre-commit.cmd/.ps1`, `pre-push.cmd/.ps1`) are written to invoke the Python chain-runner.
+    - Git invokes the extensionless Python chain-runner on Windows as well. A sibling `.ps1` is written for explicit PowerShell use; new `.cmd` wrappers are never created because `%*` cannot preserve arbitrary hook arguments safely. Reinstalling retires only an exact historical Agent Mail `.cmd` in place with a fail-closed marker and leaves foreign files untouched.
   - Matching and safety details:
     - Renames/moves are handled: both the old and new names are checked (`git diff --cached --name-status -M -z`).
     - NUL-safe end-to-end: paths are collected and forwarded as NUL-delimited to avoid ambiguity.
@@ -2447,6 +2447,7 @@ Common variables you may set:
 | `OTEL_SERVICE_NAME` | `mcp-agent-mail` | Service name for telemetry |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` |  | OTLP exporter endpoint URL |
 | `APP_ENVIRONMENT` | `development` | Environment name (development/production) |
+| `MCP_AGENT_MAIL_BUILD_COMMIT` |  | Optional immutable full Git SHA supplied by the build/deploy; authenticated health reports it as `commit` and `build.git_sha` only when recorded |
 | `DATABASE_URL` | `sqlite+aiosqlite:///./storage.sqlite3` | SQLAlchemy async database URL |
 | `DATABASE_ECHO` | `false` | Echo SQL statements for debugging |
 | `DATABASE_POOL_SIZE` | `50 (sqlite) / 25 (other)` | Base SQLAlchemy pool size (optional override) |
@@ -2672,7 +2673,7 @@ Output format (all tools/resources):
 
 | Name | Signature | Returns | Notes |
 | :-- | :-- | :-- | :-- |
-| `health_check` | `health_check()` | `{status, environment, http_host, http_port, http_path}` | Lightweight readiness probe; never exposes connection URLs |
+| `health_check` | `health_check()` | `{status, version, commit?, build:{application_version, fastmcp_version, git_sha}, environment, http_host, http_port, http_path}` | Authenticated readiness and immutable build probe; `commit` is present only when the build recorded one, and connection URLs are never exposed |
 | `ensure_project` | `ensure_project(human_key: str, identity_mode?: str)` | `{id, project_uid, slug, human_key, project_generation, created_at}` | Idempotently resolves the durable Git/project identity and ensures its archive |
 | `register_agent` | `register_agent(project_key: str, program: str, model: str, name: str, task_description?: str, attachments_policy?: str, display_name?: str)` | Agent profile dict | Creates/updates one durable mailbox; creation generates an English display alias and project-local default sound, and issues a token exactly once |
 | `whois` | `whois(project_key: str, agent_name: str, include_recent_commits?: bool, commit_limit?: int)` | Agent profile dict | Enriched profile for one agent (optionally includes recent commits) |
@@ -2976,7 +2977,7 @@ For manual integration or customization, dedicated scripts are available:
 
 | Tool | Script | What it configures |
 |------|--------|-------------------|
-| Claude Code | `scripts/integrate_claude_code.sh` | `~/.claude/settings.json`, `~/.claude/hooks/mcp-agent-mail`, user MCP in `~/.claude.json`, tracked-files-only GitHub marketplace and plugin |
+| Claude Code | `scripts/integrate_claude_code.sh` | Selected Claude profile (`CLAUDE_CONFIG_DIR` or `~/.claude`): `settings.json`, `hooks/mcp-agent-mail`, and tracked-files-only GitHub plugin; user MCP stays in `~/.claude.json` by default and moves to `<CLAUDE_CONFIG_DIR>/.claude.json` for a custom profile |
 | Codex CLI | `scripts/integrate_codex_cli.sh` | `${CODEX_HOME:-~/.codex}/config.toml`, `${CODEX_HOME:-~/.codex}/hooks.json`, global lifecycle scripts |
 | GitHub Copilot CLI + VS Code | `scripts/integrate_github_copilot.sh` | `${COPILOT_HOME:-~/.copilot}/mcp-config.json`, user hook JSON/runtime, and VS Code's user `mcp.json` |
 | Gemini CLI | `scripts/integrate_gemini_cli.sh` | `~/.gemini/settings.json`, MCP server, hooks |

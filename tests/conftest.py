@@ -111,7 +111,6 @@ def isolated_env(tmp_path, monkeypatch):
     # its compile-time default regardless of the machine running the suite.
     for variable in (
         "HTTP_OAUTH_ACCESS_TOKEN_TTL_SECONDS",
-        "HTTP_OAUTH_ALLOWED_CLIENT_REDIRECT_URIS",
         "HTTP_OAUTH_BASE_URL",
         "HTTP_OAUTH_DCR_RATE_LIMIT_PER_MINUTE",
         "HTTP_OAUTH_GITHUB_ALLOWED_IDENTITIES",
@@ -131,6 +130,14 @@ def isolated_env(tmp_path, monkeypatch):
         "HTTP_RATE_LIMIT_TOOLS_PER_MINUTE",
     ):
         monkeypatch.setenv(variable, "")
+    # CSV configuration intentionally distinguishes explicit empty from unset.
+    # Pin the compile-time redirect default instead of exposing a real .env or
+    # accidentally turning the safe default into an empty allowlist.
+    monkeypatch.setenv(
+        "HTTP_OAUTH_ALLOWED_CLIENT_REDIRECT_URIS",
+        "http://127.0.0.1:*,http://127.0.0.1/,"
+        "https://vscode.dev/redirect,https://insiders.vscode.dev/redirect",
+    )
     monkeypatch.setenv("HTTP_OAUTH_ENABLED", "false")
     monkeypatch.setenv("APP_ENVIRONMENT", "test")
     # An empty process value deliberately shadows any deploy provenance in the

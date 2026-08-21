@@ -8,7 +8,7 @@ description: Diagnose this repository's exact Agent Mail identity, private state
 Run the read-only deterministic diagnostic from the project being checked:
 
 ```bash
-"${HOME}/.claude/hooks/mcp-agent-mail/agent_mail_setup.sh" \
+"${CLAUDE_CONFIG_DIR-${HOME}/.claude}/hooks/mcp-agent-mail/agent_mail_setup.sh" \
   doctor claude "${AGENT_MAIL_CLAUDE_SLOT:-1}"
 ```
 

@@ -142,11 +142,13 @@ def _install_doctor_freshness_fixture(
     catalog_version: str | None = None,
     marketplace_inventory_source: str | None = None,
     source_git_backed: bool = True,
+    claude_config_dir: Path | None = None,
 ) -> tuple[Path, Path, Path]:
     """Install a hermetic Claude inventory and its two managed file surfaces."""
     source = tmp_path / "plugin-source"
     installed = tmp_path / "plugin-cache"
-    installed_hooks = tmp_path / "home" / ".claude" / "hooks" / "mcp-agent-mail"
+    claude_root = claude_config_dir or (tmp_path / "home" / ".claude")
+    installed_hooks = claude_root / "hooks" / "mcp-agent-mail"
 
     source_manifest_data = {"name": "mcp-agent-mail"}
     marketplace_plugin = {
@@ -239,38 +241,58 @@ def _install_doctor_freshness_fixture(
         json.dumps(installed_manifest_data, sort_keys=True) + "\n",
     )
 
-    env["FAKE_CLAUDE_PLUGIN_VERSION"] = installed_version
-    env["FAKE_CLAUDE_PLUGIN_PATH"] = _git_bash_path(installed)
-    env["FAKE_CLAUDE_MARKETPLACE_PATH"] = _git_bash_path(source)
-    env["FAKE_CLAUDE_MARKETPLACE_SOURCE"] = (
-        marketplace_inventory_source or "github"
+    fake_bin = tmp_path / "bin"
+    (fake_bin / "claude-plugin-inventory.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": CLAUDE_PLUGIN_ID,
+                    "version": installed_version,
+                    "installPath": _git_bash_path(installed),
+                    "scope": "user",
+                    "enabled": True,
+                    "errors": [],
+                }
+            ],
+            sort_keys=True,
+        ),
+        encoding="utf-8",
     )
-    fake_claude = tmp_path / "bin" / "claude"
+    (fake_bin / "claude-marketplace-inventory.json").write_text(
+        json.dumps(
+            [
+                {
+                    "name": CLAUDE_MARKETPLACE,
+                    "source": marketplace_inventory_source or "github",
+                    "installLocation": _git_bash_path(source),
+                }
+            ],
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    fake_claude = fake_bin / "claude"
     fake_claude.write_text(
         r'''#!/usr/bin/env bash
+fixture_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+if [[ -n ${CLAUDE_CONFIG_DIR+x} ]]; then
+  printf 'set\n' >> "${fixture_dir}/claude-config-dir-presence.log"
+fi
 for secret_name in \
   INTEGRATION_BEARER_TOKEN HTTP_BEARER_TOKEN MCP_AGENT_MAIL_TOKEN \
-  AGENT_MAIL_TOKEN AGENT_MAIL_REGISTRATION_TOKEN _TOKEN; do
+  AGENT_MAIL_TOKEN AGENT_MAIL_REGISTRATION_TOKEN _TOKEN GROQ_API_KEY \
+  REDIS_URL REDIS_TLS_URL AGENT_MAIL_JQ_TOKEN AGENT_MAIL_JQ_ACCESS_TOKEN \
+  CLAUDE_CODE_OAUTH_TOKEN NODE_OPTIONS BASH_ENV PASSWORD; do
   secret_value="$(eval "printf '%s' \"\${${secret_name}:-}\"")"
   if [[ -n "$secret_value" ]]; then
-    if [[ -n "${FAKE_CLAUDE_SECRET_LOG:-}" ]]; then
-      printf '%s\n' "$secret_name" >> "$FAKE_CLAUDE_SECRET_LOG"
-    fi
+    printf '%s\n' "$secret_name" >> "${fixture_dir}/claude-secret-env.log"
     exit 95
   fi
 done
 if [[ "$1" == plugin && "$2" == list && "$3" == --json ]]; then
-  jq -nc \
-    --arg id "mcp-agent-mail@mateusz-klatt-mcp-agent-mail" \
-    --arg version "$FAKE_CLAUDE_PLUGIN_VERSION" \
-    --arg path "$FAKE_CLAUDE_PLUGIN_PATH" \
-    '[{id:$id,version:$version,installPath:$path,scope:"user",enabled:true}]'
+  cat "${fixture_dir}/claude-plugin-inventory.json"
 elif [[ "$1" == plugin && "$2" == marketplace && "$3" == list && "$4" == --json ]]; then
-  jq -nc \
-    --arg name "mateusz-klatt-mcp-agent-mail" \
-    --arg path "$FAKE_CLAUDE_MARKETPLACE_PATH" \
-    --arg source "$FAKE_CLAUDE_MARKETPLACE_SOURCE" \
-    '[{name:$name,source:$source,installLocation:$path}]'
+  cat "${fixture_dir}/claude-marketplace-inventory.json"
 else
   exit 94
 fi
@@ -1507,8 +1529,7 @@ def test_doctor_does_not_forward_agent_mail_secrets_to_claude_cli(
     )
     assert onboard.returncode == 0, onboard.stdout + onboard.stderr
 
-    secret_log = tmp_path / "claude-secret-env.log"
-    env["FAKE_CLAUDE_SECRET_LOG"] = _git_bash_path(secret_log)
+    secret_log = tmp_path / "bin" / "claude-secret-env.log"
     secret_values: list[str] = []
     for index, name in enumerate(
         (
@@ -1518,6 +1539,14 @@ def test_doctor_does_not_forward_agent_mail_secrets_to_claude_cli(
             "AGENT_MAIL_TOKEN",
             "AGENT_MAIL_REGISTRATION_TOKEN",
             "_TOKEN",
+            "GROQ_API_KEY",
+            "REDIS_URL",
+            "REDIS_TLS_URL",
+            "AGENT_MAIL_JQ_TOKEN",
+            "AGENT_MAIL_JQ_ACCESS_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "NODE_OPTIONS",
+            "PASSWORD",
         )
     ):
         value = f"subprocess-secret-{index}"
@@ -1539,6 +1568,145 @@ def test_doctor_does_not_forward_agent_mail_secrets_to_claude_cli(
     exposed = doctor.stdout + doctor.stderr
     for secret in secret_values:
         assert secret not in exposed
+
+
+@pytest.mark.parametrize(
+    ("inventory_mode", "expected_returncode", "expected_message"),
+    (
+        ("disabled", 1, "but disabled"),
+        ("missing-enabled", 1, "enabled state is missing or invalid"),
+        ("string-enabled", 1, "enabled state is missing or invalid"),
+        ("reported-errors", 1, "reports plugin errors"),
+        ("invalid-errors", 1, "errors state is missing or invalid"),
+        ("missing-errors", 0, None),
+    ),
+)
+def test_doctor_requires_enabled_error_free_claude_plugin_inventory(
+    tmp_path: Path,
+    inventory_mode: str,
+    expected_returncode: int,
+    expected_message: str | None,
+) -> None:
+    env, repo, _ = _monitor_env(tmp_path)
+    _install_setup_server(tmp_path / "bin")
+    _install_doctor_freshness_fixture(tmp_path, env)
+    inventory_path = tmp_path / "bin" / "claude-plugin-inventory.json"
+    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+    entry = inventory[0]
+    if inventory_mode == "disabled":
+        entry["enabled"] = False
+    elif inventory_mode == "missing-enabled":
+        entry.pop("enabled")
+    elif inventory_mode == "string-enabled":
+        entry["enabled"] = "true"
+    elif inventory_mode == "reported-errors":
+        entry["errors"] = ["private-plugin-error-detail"]
+    elif inventory_mode == "invalid-errors":
+        entry["errors"] = "private-plugin-error-detail"
+    elif inventory_mode == "missing-errors":
+        entry.pop("errors")
+    inventory_path.write_text(json.dumps(inventory), encoding="utf-8")
+
+    env["FAKE_ARGV_LOG"] = _git_bash_path(tmp_path / "argv.log")
+    onboard = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "onboard", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert onboard.returncode == 0, onboard.stdout + onboard.stderr
+
+    doctor = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "doctor", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert doctor.returncode == expected_returncode, doctor.stdout + doctor.stderr
+    if expected_message is not None:
+        assert expected_message in doctor.stdout
+    assert "private-plugin-error-detail" not in doctor.stdout + doctor.stderr
+
+
+def test_doctor_uses_custom_claude_config_dir_for_installed_hooks(
+    tmp_path: Path,
+) -> None:
+    env, repo, _ = _monitor_env(tmp_path)
+    _install_setup_server(tmp_path / "bin")
+    custom_claude_root = tmp_path / "custom claude profile"
+    env["CLAUDE_CONFIG_DIR"] = _git_bash_path(custom_claude_root)
+    _install_doctor_freshness_fixture(
+        tmp_path,
+        env,
+        claude_config_dir=custom_claude_root,
+    )
+    env["FAKE_ARGV_LOG"] = _git_bash_path(tmp_path / "argv.log")
+    onboard = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "onboard", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert onboard.returncode == 0, onboard.stdout + onboard.stderr
+
+    doctor = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "doctor", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert doctor.returncode == 0, doctor.stdout + doctor.stderr
+    assert "Claude hooks: current" in doctor.stdout
+
+
+def test_doctor_rejects_empty_claude_config_dir_without_forwarding_it(
+    tmp_path: Path,
+) -> None:
+    env, repo, _ = _monitor_env(tmp_path)
+    _install_setup_server(tmp_path / "bin")
+    _install_doctor_freshness_fixture(tmp_path, env)
+    env["FAKE_ARGV_LOG"] = _git_bash_path(tmp_path / "argv.log")
+    onboard = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "onboard", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert onboard.returncode == 0, onboard.stdout + onboard.stderr
+
+    presence_log = tmp_path / "bin" / "claude-config-dir-presence.log"
+    assert not presence_log.exists()
+    env["CLAUDE_CONFIG_DIR"] = ""
+    doctor = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "doctor", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert doctor.returncode == 1, doctor.stdout + doctor.stderr
+    assert "CLAUDE_CONFIG_DIR must resolve to a non-empty absolute path" in doctor.stdout
+    assert not presence_log.exists()
 
 
 def test_doctor_detects_same_version_plugin_file_drift(tmp_path: Path) -> None:
@@ -1633,13 +1801,26 @@ def test_doctor_hook_inventory_matches_the_claude_integrator_contract() -> None:
 
 
 def test_claude_skills_use_integrator_managed_diagnostic_paths() -> None:
-    expected_setup = '"${HOME}/.claude/hooks/mcp-agent-mail/agent_mail_setup.sh"'
+    expected_setup = (
+        '"${CLAUDE_CONFIG_DIR-${HOME}/.claude}/hooks/'
+        'mcp-agent-mail/agent_mail_setup.sh"'
+    )
     for skill in ("doctor", "onboard", "wake"):
         text = (ROOT / "skills" / skill / "SKILL.md").read_text(encoding="utf-8")
         assert expected_setup in text
         assert "${CLAUDE_PLUGIN_ROOT}/scripts/hooks/agent_mail_setup.sh" not in text
     wake = (ROOT / "skills" / "wake" / "SKILL.md").read_text(encoding="utf-8")
-    assert "${HOME}/.claude/hooks/mcp-agent-mail/inbox_watch_monitor.sh" in wake
+    assert (
+        '"${CLAUDE_CONFIG_DIR-${HOME}/.claude}/hooks/'
+        'mcp-agent-mail/inbox_watch_monitor.sh"'
+        in wake
+    )
+    plugin = json.loads(
+        (ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
+    )
+    monitor_command = plugin["experimental"]["monitors"][0]["command"]
+    assert monitor_command.startswith('"${CLAUDE_PLUGIN_ROOT}/scripts/hooks/')
+    assert 'inbox_watch_monitor.sh" claude ' in monitor_command
 
 
 def test_rotate_token_persists_verifies_and_redacts_the_replacement(

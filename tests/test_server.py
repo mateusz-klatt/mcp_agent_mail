@@ -3357,7 +3357,8 @@ async def test_health_check_reports_our_version_not_the_frameworks(isolated_env,
     """
     from mcp_agent_mail.utils import package_version
 
-    monkeypatch.delenv("MCP_AGENT_MAIL_BUILD_COMMIT", raising=False)
+    monkeypatch.setenv("MCP_AGENT_MAIL_BUILD_COMMIT", "")
+    clear_settings_cache()
     server = build_mcp_server()
     async with Client(server) as client:
         health = await client.call_tool("health_check", {})
@@ -3376,7 +3377,7 @@ async def test_health_check_reports_our_version_not_the_frameworks(isolated_env,
 async def test_health_check_surfaces_build_commit_only_when_the_build_recorded_one(
     isolated_env, monkeypatch
 ):
-    monkeypatch.delenv("MCP_AGENT_MAIL_BUILD_COMMIT", raising=False)
+    monkeypatch.setenv("MCP_AGENT_MAIL_BUILD_COMMIT", "")
     clear_settings_cache()
     server = build_mcp_server()
     async with Client(server) as client:

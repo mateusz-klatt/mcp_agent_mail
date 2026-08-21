@@ -64,12 +64,46 @@ case "$SHARED_ENV_FILE" in
 esac
 AGENT_MAIL_ENV_FILE="$SHARED_ENV_FILE"
 
+CLAUDE_CONFIG_DIR_IS_SET=0
+if [[ -n "${CLAUDE_CONFIG_DIR+x}" ]]; then
+  if [[ -z "$CLAUDE_CONFIG_DIR" ]]; then
+    log_err "CLAUDE_CONFIG_DIR is set but empty; refusing to guess the Claude profile."
+    exit 1
+  fi
+  CLAUDE_CONFIG_DIR_IS_SET=1
+  _CLAUDE_DIR_INPUT="$CLAUDE_CONFIG_DIR"
+else
+  _CLAUDE_DIR_INPUT="${HOME}/.claude"
+fi
+CLAUDE_DIR="$(_normalize_claude_path "$_CLAUDE_DIR_INPUT")" || exit 1
+case "$CLAUDE_DIR" in
+  ''|*$'\n'*|*$'\r'*)
+    log_err "Claude profile path must be a non-empty single-line absolute path."
+    exit 1 ;;
+  /*) ;;
+  *)
+    log_err "Claude profile path must be absolute: ${CLAUDE_DIR}"
+    exit 1 ;;
+esac
+if [[ "$CLAUDE_CONFIG_DIR_IS_SET" == "1" ]]; then
+  CLAUDE_CONFIG_DIR="$CLAUDE_DIR"
+  export CLAUDE_CONFIG_DIR
+fi
+SETTINGS_PATH="${CLAUDE_DIR}/settings.json"
+if [[ "$CLAUDE_CONFIG_DIR_IS_SET" == "1" ]]; then
+  CLAUDE_USER_JSON="${CLAUDE_DIR}/.claude.json"
+else
+  # Preserve Claude's historical default when no custom profile was selected.
+  CLAUDE_USER_JSON="${HOME}/.claude.json"
+fi
+HOOKS_DIR="${CLAUDE_DIR}/hooks/mcp-agent-mail"
+
 log_step "Claude Code Integration (user scope)"
 echo
 echo "This installs MCP Agent Mail once for the current user:"
-echo "  - hooks: ~/.claude/hooks/mcp-agent-mail"
-echo "  - hook settings: ~/.claude/settings.json"
-echo "  - MCP server: Claude user scope (~/.claude.json)"
+echo "  - hooks: ${HOOKS_DIR}"
+echo "  - hook settings: ${SETTINGS_PATH}"
+echo "  - MCP server: Claude user scope (${CLAUDE_USER_JSON})"
 echo "No repository configuration or server credential is created."
 echo
 if ! confirm "Proceed?"; then log_warn "Aborted."; exit 1; fi
@@ -85,28 +119,45 @@ _TOKEN="$(resolve_global_integration_bearer_token)" || {
 log_ok "Using MCP endpoint: ${_URL}"
 
 log_step "Preparing user-level Claude settings"
-CLAUDE_DIR="${HOME}/.claude"
-SETTINGS_PATH="${CLAUDE_DIR}/settings.json"
-CLAUDE_USER_JSON="${HOME}/.claude.json"
-HOOKS_DIR="${CLAUDE_DIR}/hooks/mcp-agent-mail"
 CLAUDE_PLUGIN_MARKETPLACE="mateusz-klatt-mcp-agent-mail"
 CLAUDE_PLUGIN_REPOSITORY="mateusz-klatt/mcp_agent_mail"
 CLAUDE_PLUGIN_ID="mcp-agent-mail@${CLAUDE_PLUGIN_MARKETPLACE}"
 CLAUDE_PLUGIN_READY=0
 
-# Keep Agent Mail server/mailbox credentials and unrelated provider credentials
-# out of Claude's plugin subprocess. The public GitHub marketplace needs none of
-# them, and an inherited production .env must not become subprocess authority.
+# Start Claude's plugin subprocess from an allowlisted environment. A denylist
+# cannot cover future provider keys, database URLs, or helper-specific tokens;
+# the public GitHub marketplace needs only platform/runtime settings.
 _claude_plugin_cli() (
-  unset INTEGRATION_BEARER_TOKEN HTTP_BEARER_TOKEN MCP_AGENT_MAIL_TOKEN
-  unset AGENT_MAIL_TOKEN AGENT_MAIL_REGISTRATION_TOKEN _TOKEN
-  unset HTTP_OAUTH_GITHUB_CLIENT_SECRET HTTP_OAUTH_JWT_SIGNING_KEY
-  unset HTTP_JWT_SECRET MAIL_UI_SESSION_SECRET DATABASE_URL PGPASSWORD
-  unset CLAUDE_CODE_PLUGIN_KEEP_MARKETPLACE_ON_FAILURE
-  unset ANTHROPIC_API_KEY DEEPSEEK_API_KEY GEMINI_API_KEY GITHUB_TOKEN GH_TOKEN
-  unset GOOGLE_API_KEY GROK_API_KEY MORPH_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY
-  unset XAI_API_KEY
-  command claude plugin "$@"
+  local _env_name
+  local _safe_env=()
+  for _env_name in \
+    HOME PATH USER LOGNAME USERNAME SHELL \
+    TMPDIR TMP TEMP CLAUDE_CODE_TMPDIR \
+    USERPROFILE APPDATA LOCALAPPDATA PROGRAMDATA SystemRoot SYSTEMROOT WINDIR \
+    COMSPEC ComSpec PATHEXT HOMEDRIVE HOMEPATH SystemDrive SYSTEMDRIVE \
+    XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_RUNTIME_DIR \
+    CLAUDE_CONFIG_DIR CLAUDE_CODE_PLUGIN_CACHE_DIR \
+    CLAUDE_CODE_PLUGIN_GIT_TIMEOUT_MS CLAUDE_CODE_PLUGIN_PREFER_HTTPS \
+    CLAUDE_CODE_CERT_STORE \
+    LANG LANGUAGE LC_ALL LC_COLLATE LC_CTYPE LC_MESSAGES LC_MONETARY LC_NUMERIC \
+    LC_TIME LC_ADDRESS LC_IDENTIFICATION LC_MEASUREMENT LC_NAME LC_PAPER \
+    LC_RESPONSE LC_TELEPHONE TERM COLORTERM NO_COLOR FORCE_COLOR TZ \
+    HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY FTP_PROXY \
+    http_proxy https_proxy all_proxy no_proxy ftp_proxy \
+    SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE CURL_CA_BUNDLE \
+    NODE_EXTRA_CA_CERTS GIT_SSL_CAINFO NIX_SSL_CERT_FILE \
+    MSYSTEM MSYS CYGWIN CHERE_INVOKING WSL_DISTRO_NAME WSL_INTEROP WSLENV \
+    DISABLE_TELEMETRY DISABLE_ERROR_REPORTING DO_NOT_TRACK \
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+  do
+    if [[ -n "${!_env_name+x}" ]]; then
+      if [[ "$_env_name" == CLAUDE_CONFIG_DIR && -z "${!_env_name}" ]]; then
+        continue
+      fi
+      _safe_env+=("${_env_name}=${!_env_name}")
+    fi
+  done
+  command env -i ${_safe_env[@]+"${_safe_env[@]}"} claude plugin "$@"
 )
 
 _install_or_update_claude_plugin() {
@@ -163,6 +214,21 @@ _install_or_update_claude_plugin() {
       log_warn "Refusing to mutate a project/local declaration whose scope is absent from marketplace list JSON."
       return 0
     fi
+    if ! printf '%s' "$user_marketplace_entry" | jq -e '
+      try (
+        type == "object" and
+        (.source | type) == "object" and
+        (.source.source | type) == "string" and
+        (.source.source | length) > 0 and
+        (.source | (.repo == null or (.repo | type) == "string")) and
+        (.source | (.ref == null or (.ref | type) == "string")) and
+        (.source | (.path == null or (.path | type) == "string"))
+      ) catch false
+    ' >/dev/null 2>&1; then
+      log_warn "Claude marketplace ${CLAUDE_PLUGIN_MARKETPLACE} has a malformed user-scoped source declaration."
+      log_warn "Refusing to guess or mutate plugin state."
+      return 0
+    fi
     source="$(printf '%s' "$user_marketplace_entry" | jq -r '.source.source // empty')"
     repo="$(printf '%s' "$user_marketplace_entry" | jq -r '.source.repo // empty')"
     ref="$(printf '%s' "$user_marketplace_entry" | jq -r '.source.ref // empty')"
@@ -195,6 +261,7 @@ _install_or_update_claude_plugin() {
     if ! printf '%s' "$user_marketplace_entry" | jq -e '
       (.source | type) == "object" and (
         ((.source | has("path")) | not) or
+        .source.path == null or
         .source.path == ".claude-plugin/marketplace.json"
       )
     ' >/dev/null 2>&1; then

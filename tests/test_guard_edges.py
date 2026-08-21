@@ -9,7 +9,12 @@ from pathlib import Path
 import pytest
 
 from mcp_agent_mail.config import get_settings
-from mcp_agent_mail.guard import install_guard, install_prepush_guard, render_precommit_script, uninstall_guard
+from mcp_agent_mail.guard import (
+    install_guard,
+    install_prepush_guard,
+    render_precommit_script,
+    uninstall_guard,
+)
 from mcp_agent_mail.storage import ensure_archive
 
 
@@ -30,6 +35,27 @@ def _bash_executable() -> str:
 
 
 BASH = _bash_executable()
+
+
+def _legacy_cmd_fixture(hook_name: str, line_ending: bytes) -> bytes:
+    body = (
+        "@echo off\n"
+        "setlocal\n"
+        'set "DIR=%~dp0"\n'
+        f'python "%DIR%{hook_name}" %*\n'
+        "exit /b %ERRORLEVEL%\n"
+    ).encode()
+    return body.replace(b"\n", line_ending)
+
+
+def _retired_cmd_fixture(line_ending: bytes) -> bytes:
+    body = (
+        "@echo off\n"
+        "REM mcp-agent-mail disabled legacy cmd shim v1\n"
+        "1>&2 echo [mcp-agent-mail] Legacy .cmd shim is disabled; use Git or the sibling PowerShell shim.\n"
+        "exit /b 126\n"
+    ).encode()
+    return body.replace(b"\n", line_ending)
 
 
 def _git_bash_path(path: Path) -> str:
@@ -114,9 +140,9 @@ async def test_uninstall_guard_removes_agent_mail_windows_shims(isolated_env, tm
     await install_prepush_guard(settings, "backend", repo_dir)
 
     hooks_dir = repo_dir / ".git" / "hooks"
-    assert (hooks_dir / "pre-commit.cmd").exists()
+    assert not (hooks_dir / "pre-commit.cmd").exists()
     assert (hooks_dir / "pre-commit.ps1").exists()
-    assert (hooks_dir / "pre-push.cmd").exists()
+    assert not (hooks_dir / "pre-push.cmd").exists()
     assert (hooks_dir / "pre-push.ps1").exists()
 
     removed = await uninstall_guard(repo_dir)
@@ -128,3 +154,130 @@ async def test_uninstall_guard_removes_agent_mail_windows_shims(isolated_env, tm
     assert not (hooks_dir / "pre-push").exists()
     assert not (hooks_dir / "pre-push.cmd").exists()
     assert not (hooks_dir / "pre-push.ps1").exists()
+
+
+@pytest.mark.parametrize(
+    ("hook_name", "installer"),
+    (("pre-commit", install_guard), ("pre-push", install_prepush_guard)),
+)
+@pytest.mark.parametrize("line_ending", (b"\n", b"\r\n", b"\r\r\n"))
+@pytest.mark.asyncio
+async def test_guard_retires_only_exact_legacy_cmd_shims_in_place(
+    isolated_env,
+    tmp_path: Path,
+    hook_name: str,
+    installer,
+    line_ending: bytes,
+):
+    settings = get_settings()
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    proc_init = await asyncio.create_subprocess_exec("git", "init", cwd=str(repo_dir))
+    assert (await proc_init.wait()) == 0
+
+    cmd_path = repo_dir / ".git" / "hooks" / f"{hook_name}.cmd"
+    cmd_path.write_bytes(_legacy_cmd_fixture(hook_name, line_ending))
+
+    await installer(settings, "backend", repo_dir)
+
+    retired = _retired_cmd_fixture(b"\r\n")
+    assert cmd_path.read_bytes() == retired
+    assert b"%*" not in retired
+    assert b"python" not in retired.lower()
+
+    await installer(settings, "backend", repo_dir)
+    assert cmd_path.read_bytes() == retired
+
+
+@pytest.mark.parametrize(
+    ("hook_name", "installer"),
+    (("pre-commit", install_guard), ("pre-push", install_prepush_guard)),
+)
+@pytest.mark.parametrize(
+    "foreign_body",
+    (
+        b"@echo off\r\necho foreign hook\r\n",
+        b"x" * 10_000,
+        _legacy_cmd_fixture("pre-commit", b"\r\n") + b"echo foreign\r\n",
+        _retired_cmd_fixture(b"\r\n") + b"echo foreign\r\n",
+    ),
+)
+@pytest.mark.asyncio
+async def test_guard_preserves_foreign_cmd_shims_byte_for_byte(
+    isolated_env,
+    tmp_path: Path,
+    hook_name: str,
+    installer,
+    foreign_body: bytes,
+):
+    settings = get_settings()
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    proc_init = await asyncio.create_subprocess_exec("git", "init", cwd=str(repo_dir))
+    assert (await proc_init.wait()) == 0
+
+    cmd_path = repo_dir / ".git" / "hooks" / f"{hook_name}.cmd"
+    cmd_path.write_bytes(foreign_body)
+    await installer(settings, "backend", repo_dir)
+    assert cmd_path.read_bytes() == foreign_body
+
+    assert await uninstall_guard(repo_dir) is True
+    assert cmd_path.read_bytes() == foreign_body
+
+
+@pytest.mark.parametrize("hook_name", ("pre-commit", "pre-push"))
+@pytest.mark.parametrize("line_ending", (b"\n", b"\r\n", b"\r\r\n"))
+@pytest.mark.parametrize("body_kind", ("legacy", "retired"))
+@pytest.mark.asyncio
+async def test_uninstall_guard_removes_only_exact_owned_cmd_variants(
+    isolated_env,
+    tmp_path: Path,
+    hook_name: str,
+    line_ending: bytes,
+    body_kind: str,
+):
+    settings = get_settings()
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    proc_init = await asyncio.create_subprocess_exec("git", "init", cwd=str(repo_dir))
+    assert (await proc_init.wait()) == 0
+
+    installer = install_guard if hook_name == "pre-commit" else install_prepush_guard
+    await installer(settings, "backend", repo_dir)
+    cmd_path = repo_dir / ".git" / "hooks" / f"{hook_name}.cmd"
+    body = _legacy_cmd_fixture(hook_name, line_ending) if body_kind == "legacy" else _retired_cmd_fixture(line_ending)
+    cmd_path.write_bytes(body)
+
+    assert await uninstall_guard(repo_dir) is True
+    assert not cmd_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("hook_name", "installer"),
+    (("pre-commit", install_guard), ("pre-push", install_prepush_guard)),
+)
+@pytest.mark.asyncio
+async def test_uninstall_guard_preserves_modified_powershell_shim(
+    isolated_env,
+    tmp_path: Path,
+    hook_name: str,
+    installer,
+):
+    settings = get_settings()
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    proc_init = await asyncio.create_subprocess_exec("git", "init", cwd=str(repo_dir))
+    assert (await proc_init.wait()) == 0
+
+    ps1_path = repo_dir / ".git" / "hooks" / f"{hook_name}.ps1"
+    foreign_body = (
+        "$ErrorActionPreference = 'Stop'\n"
+        f"$hook = Join-Path $PSScriptRoot '{hook_name}'\n"
+        "python $hook @args\n"
+        "exit $LASTEXITCODE\n"
+        "Write-Output 'foreign'\n"
+    ).encode()
+    ps1_path.write_bytes(foreign_body)
+    await installer(settings, "backend", repo_dir)
+    assert await uninstall_guard(repo_dir) is True
+    assert ps1_path.read_bytes() == foreign_body

@@ -908,6 +908,72 @@ def render_prepush_script(archive: ProjectArchive) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _legacy_cmd_body(hook_name: str) -> bytes:
+    """Return the exact historical Agent Mail cmd shim body with LF endings."""
+    return (
+        "@echo off\n"
+        "setlocal\n"
+        'set "DIR=%~dp0"\n'
+        f'python "%DIR%{hook_name}" %*\n'
+        "exit /b %ERRORLEVEL%\n"
+    ).encode()
+
+
+def _retired_cmd_body() -> bytes:
+    """Return the inert marker used to retire an exact-owned legacy cmd shim."""
+    return (
+        "@echo off\n"
+        "REM mcp-agent-mail disabled legacy cmd shim v1\n"
+        "1>&2 echo [mcp-agent-mail] Legacy .cmd shim is disabled; use Git or the sibling PowerShell shim.\n"
+        "exit /b 126\n"
+    ).encode()
+
+
+def _powershell_body(hook_name: str) -> bytes:
+    """Return the owned PowerShell shim body with canonical LF endings."""
+    return (
+        "$ErrorActionPreference = 'Stop'\n"
+        f"$hook = Join-Path $PSScriptRoot '{hook_name}'\n"
+        "python $hook @args\n"
+        "exit $LASTEXITCODE\n"
+    ).encode()
+
+
+def _line_ending_variants(body: bytes, *, include_doubled_cr: bool = False) -> frozenset[bytes]:
+    """Return exact whole-file variants produced by historical text writes."""
+    variants = {body, body.replace(b"\n", b"\r\n")}
+    if include_doubled_cr:
+        variants.add(body.replace(b"\n", b"\r\r\n"))
+    return frozenset(variants)
+
+
+def _matches_exact_owned(path: Path, bodies: frozenset[bytes]) -> bool:
+    """Return whether a regular, non-symlink file exactly matches an owned body."""
+    if not bodies or path.is_symlink() or not path.is_file():
+        return False
+    owned_sizes = {len(body) for body in bodies}
+    max_owned_size = max(owned_sizes)
+    try:
+        if path.stat().st_size not in owned_sizes:
+            return False
+        with path.open("rb") as handle:
+            content = handle.read(max_owned_size + 1)
+        return content in bodies
+    except OSError:
+        return False
+
+
+def _retire_legacy_cmd(path: Path, hook_name: str) -> None:
+    """Overwrite only an exact historical cmd shim with an inert marker."""
+    legacy_bodies = _line_ending_variants(
+        _legacy_cmd_body(hook_name),
+        include_doubled_cr=True,
+    )
+    if _matches_exact_owned(path, legacy_bodies):
+        retired_crlf = _retired_cmd_body().replace(b"\n", b"\r\n")
+        path.write_bytes(retired_crlf)
+
+
 async def install_guard(settings: Settings, project_slug: str, repo_path: Path) -> Path:
     """Install the pre-commit chain-runner and Agent Mail guard plugin."""
 
@@ -933,26 +999,14 @@ async def install_guard(settings: Settings, project_slug: str, repo_path: Path) 
     await asyncio.to_thread(chain_path.write_text, chain_script, "utf-8")
     await asyncio.to_thread(os.chmod, chain_path, 0o755)
 
-    # Windows shims (.cmd / .ps1) to invoke the Python chain-runner
+    # Git invokes the extensionless chain-runner directly. Historical .cmd
+    # wrappers expanded %* through cmd.exe and cannot preserve arbitrary Git
+    # hook arguments safely, so exact-owned copies are retired in place.
     cmd_path = hooks_dir / "pre-commit.cmd"
-    if not cmd_path.exists():
-        cmd_body = (
-            "@echo off\r\n"
-            "setlocal\r\n"
-            "set \"DIR=%~dp0\"\r\n"
-            "python \"%DIR%pre-commit\" %*\r\n"
-            "exit /b %ERRORLEVEL%\r\n"
-        )
-        await asyncio.to_thread(cmd_path.write_text, cmd_body, "utf-8")
+    await asyncio.to_thread(_retire_legacy_cmd, cmd_path, "pre-commit")
     ps1_path = hooks_dir / "pre-commit.ps1"
     if not ps1_path.exists():
-        ps1_body = (
-            "$ErrorActionPreference = 'Stop'\n"
-            "$hook = Join-Path $PSScriptRoot 'pre-commit'\n"
-            "python $hook @args\n"
-            "exit $LASTEXITCODE\n"
-        )
-        await asyncio.to_thread(ps1_path.write_text, ps1_body, "utf-8")
+        await asyncio.to_thread(ps1_path.write_bytes, _powershell_body("pre-commit"))
 
     # Write our guard plugin
     plugin_path = run_dir / "50-agent-mail.py"
@@ -981,26 +1035,13 @@ async def install_prepush_guard(settings: Settings, project_slug: str, repo_path
     await asyncio.to_thread(chain_path.write_text, chain_script, "utf-8")
     await asyncio.to_thread(os.chmod, chain_path, 0o755)
 
-    # Windows shims (.cmd / .ps1) to invoke the Python chain-runner
+    # See install_guard: never create a new cmd wrapper, and retire only the
+    # exact historical Agent Mail template without touching foreign files.
     cmd_path = hooks_dir / "pre-push.cmd"
-    if not cmd_path.exists():
-        cmd_body = (
-            "@echo off\r\n"
-            "setlocal\r\n"
-            "set \"DIR=%~dp0\"\r\n"
-            "python \"%DIR%pre-push\" %*\r\n"
-            "exit /b %ERRORLEVEL%\r\n"
-        )
-        await asyncio.to_thread(cmd_path.write_text, cmd_body, "utf-8")
+    await asyncio.to_thread(_retire_legacy_cmd, cmd_path, "pre-push")
     ps1_path = hooks_dir / "pre-push.ps1"
     if not ps1_path.exists():
-        ps1_body = (
-            "$ErrorActionPreference = 'Stop'\n"
-            "$hook = Join-Path $PSScriptRoot 'pre-push'\n"
-            "python $hook @args\n"
-            "exit $LASTEXITCODE\n"
-        )
-        await asyncio.to_thread(ps1_path.write_text, ps1_body, "utf-8")
+        await asyncio.to_thread(ps1_path.write_bytes, _powershell_body("pre-push"))
 
     plugin_path = run_dir / "50-agent-mail.py"
     plugin_script = render_prepush_script(archive)
@@ -1028,17 +1069,21 @@ async def uninstall_guard(repo_path: Path) -> bool:
         return any(item.is_file() and item.name != "50-agent-mail.py" for item in run_dir.iterdir())
 
     def _agent_mail_shims(hook_name: str) -> list[Path]:
-        shim_signatures = {
-            hooks_dir / f"{hook_name}.cmd": f'python "%DIR%{hook_name}" %*',
-            hooks_dir / f"{hook_name}.ps1": f"Join-Path $PSScriptRoot '{hook_name}'",
+        cmd_bodies = _line_ending_variants(
+            _legacy_cmd_body(hook_name),
+            include_doubled_cr=True,
+        ) | _line_ending_variants(
+            _retired_cmd_body(),
+            include_doubled_cr=True,
+        )
+        ps1_bodies = _line_ending_variants(_powershell_body(hook_name))
+        shim_bodies = {
+            hooks_dir / f"{hook_name}.cmd": cmd_bodies,
+            hooks_dir / f"{hook_name}.ps1": ps1_bodies,
         }
         matches: list[Path] = []
-        for shim_path, signature in shim_signatures.items():
-            try:
-                content = shim_path.read_text("utf-8")
-            except Exception:
-                continue
-            if signature in content:
+        for shim_path, owned_bodies in shim_bodies.items():
+            if _matches_exact_owned(shim_path, owned_bodies):
                 matches.append(shim_path)
         return matches
 

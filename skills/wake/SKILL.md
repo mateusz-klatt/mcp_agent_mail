@@ -24,7 +24,7 @@ arming is a deliberate act by whoever is leaving.
 Confirm it actually started with the exact-mailbox diagnostic, then stop:
 
 ```bash
-"${HOME}/.claude/hooks/mcp-agent-mail/agent_mail_setup.sh" \
+"${CLAUDE_CONFIG_DIR-${HOME}/.claude}/hooks/mcp-agent-mail/agent_mail_setup.sh" \
   doctor claude "${AGENT_MAIL_CLAUDE_SLOT:-1}"
 ```
 
@@ -39,7 +39,8 @@ the integrator-managed script through the **Monitor tool**, persistent and with 
 timeout — not a backgrounded shell command:
 
 ```bash
-${HOME}/.claude/hooks/mcp-agent-mail/inbox_watch_monitor.sh claude 1
+"${CLAUDE_CONFIG_DIR-${HOME}/.claude}/hooks/mcp-agent-mail/inbox_watch_monitor.sh" \
+  claude "${AGENT_MAIL_CLAUDE_SLOT:-1}"
 ```
 
 Pass the actual slot when it is not 1, then run doctor again. A healthy monitor

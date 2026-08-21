@@ -875,8 +875,17 @@ def test_the_registration_token_accompanies_every_build_slot_call(
     setup = build_setup()
     register_local_agent(setup, name="Builder", token="secret-token")
     endpoint = StubEndpoint().install(monkeypatch)
+    renew_attempted = threading.Event()
+
+    def note_renewal(_arguments: dict[str, Any]) -> None:
+        renew_attempted.set()
+
+    def await_renewal(_record: ChildRun) -> None:
+        assert renew_attempted.wait(timeout=2), "the renewer never called renew_build_slot"
+
+    endpoint.react("renew_build_slot", note_renewal)
     monkeypatch.setattr("mcp_agent_mail.cli._build_slot_renew_interval_seconds", lambda _ttl: 0.01)
-    ChildStub(while_running=lambda _record: time.sleep(0.05)).install(monkeypatch)
+    ChildStub(while_running=await_renewal).install(monkeypatch)
 
     run_build(setup)
 
@@ -1147,8 +1156,17 @@ def test_all_three_slot_calls_quote_the_same_branch_and_protocol_version(
     setup = build_setup()
     register_local_agent(setup, name="Builder", token="secret-token")
     endpoint = StubEndpoint().install(monkeypatch)
+    renew_attempted = threading.Event()
+
+    def note_renewal(_arguments: dict[str, Any]) -> None:
+        renew_attempted.set()
+
+    def await_renewal(_record: ChildRun) -> None:
+        assert renew_attempted.wait(timeout=2), "the renewer never called renew_build_slot"
+
+    endpoint.react("renew_build_slot", note_renewal)
     monkeypatch.setattr("mcp_agent_mail.cli._build_slot_renew_interval_seconds", lambda _ttl: 0.01)
-    ChildStub(while_running=lambda _record: time.sleep(0.05)).install(monkeypatch)
+    ChildStub(while_running=await_renewal).install(monkeypatch)
 
     run_build(setup)
 

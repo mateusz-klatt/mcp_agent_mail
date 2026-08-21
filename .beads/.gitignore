@@ -13,6 +13,10 @@ bd.sock
 sync-state.json
 last-touched
 
+# beads_rust transactional writer locks (host-local runtime state)
+.write.lock
+.br-*-write-*.lock
+
 # Local version tracking (prevents upgrade notification spam after git ops)
 .local_version
 

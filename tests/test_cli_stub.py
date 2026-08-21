@@ -1,17 +1,21 @@
-"""Tests for the CLI stub that helps confused agents.
-
-The CLI stub is a shell script installed by install.sh that prints a helpful
-message when agents mistakenly try to run 'mcp-agent-mail' as a CLI command
-instead of using the MCP tools.
-"""
+"""Packaging and installer contract for the real ``mcp-agent-mail`` CLI."""
 from __future__ import annotations
 
+import importlib.metadata
 import os
+import shlex
 import shutil
 import subprocess
+import sysconfig
+import tomllib
 from pathlib import Path
 
 import pytest
+
+from mcp_agent_mail.__main__ import main
+
+ROOT = Path(__file__).resolve().parents[1]
+INSTALLER = ROOT / "scripts" / "install.sh"
 
 
 def _bash_executable() -> str:
@@ -43,9 +47,11 @@ def _git_bash_path(path: Path) -> str:
     return normalized
 
 
-def _run_stub(script: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _bash(script: str, *, cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [BASH, _git_bash_path(script), *args],
+        [BASH, "-c", script],
+        cwd=cwd,
+        env=env,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -53,99 +59,200 @@ def _run_stub(script: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-@pytest.fixture
-def cli_stub_script(tmp_path: Path) -> Path:
-    """Create a test copy of the CLI stub script."""
-    stub_content = '''#!/usr/bin/env bash
-# MCP Agent Mail — Helpful Stub for Confused Agents
-cat <<'MSG'
-MCP Agent Mail is NOT a CLI tool!
-
-It's an MCP (Model Context Protocol) server that provides tools to your
-AI coding agent. You should already have access to these tools as part
-of your available MCP tools.
-
-CORRECT USAGE:
-   Use the MCP tools directly, for example:
-     • mcp__mcp-agent-mail__register_agent
-     • mcp__mcp-agent-mail__send_message
-     • mcp__mcp-agent-mail__fetch_inbox
-MSG
-exit 1
-'''
-    stub_path = tmp_path / "mcp-agent-mail"
-    stub_path.write_text(stub_content, encoding="utf-8", newline="\n")
-    stub_path.chmod(0o755)
-    return stub_path
+def _install_fake_uv(fake_bin: Path) -> Path:
+    fake_bin.mkdir(parents=True, exist_ok=True)
+    executable = fake_bin / "uv"
+    executable.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -eu\n"
+        "printf '%s|%s\\n' \"$PWD\" \"$*\" >> \"$UV_CALL_LOG\"\n"
+        "if [[ -n ${UV_FAIL_ON:-} && $* == *\"$UV_FAIL_ON\"* ]]; then\n"
+        "  exit 42\n"
+        "fi\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    executable.chmod(0o700)
+    return executable
 
 
-def test_cli_stub_prints_not_cli_message(cli_stub_script: Path):
-    """Test that the CLI stub prints a message explaining it's not a CLI tool."""
-    result = _run_stub(cli_stub_script)
+def _installer_env(tmp_path: Path, *, fail_on: str = "") -> tuple[dict[str, str], Path, Path]:
+    home = tmp_path / "home"
+    fake_bin = tmp_path / "bin"
+    call_log = tmp_path / "uv-calls.log"
+    home.mkdir()
+    _install_fake_uv(fake_bin)
+    path_entries = [
+        _git_bash_path(fake_bin),
+        *(
+            _git_bash_path(Path(entry))
+            for entry in os.environ.get("PATH", "").split(os.pathsep)
+            if entry
+        ),
+    ]
+    env = {
+        **os.environ,
+        "BASH_ENV": "",
+        "HOME": _git_bash_path(home),
+        "PATH": ":".join(path_entries),
+        "UV_CALL_LOG": _git_bash_path(call_log),
+        "UV_FAIL_ON": fail_on,
+    }
+    return env, home, call_log
 
-    assert result.returncode == 1, "CLI stub should exit with code 1"
-    output = result.stdout
 
-    # Check for key messages in the output
-    assert "NOT a CLI" in output or "not a CLI" in output.lower()
-    assert "MCP" in output
-    assert "mcp__mcp-agent-mail__" in output
-
-
-def test_cli_stub_mentions_correct_tools(cli_stub_script: Path):
-    """Test that the CLI stub mentions the correct MCP tool names."""
-    result = _run_stub(cli_stub_script)
-
-    output = result.stdout
-
-    # Should mention some of the key tools
-    assert "register_agent" in output
-    assert "send_message" in output
-    assert "fetch_inbox" in output
+def _install_cli_script(*, uname_value: str | None = None) -> str:
+    simulated_uname = ""
+    if uname_value is not None:
+        simulated_uname = f"uname() {{ printf '%s\\n' {shlex.quote(uname_value)}; }}\n"
+    return (
+        simulated_uname
+        + f"source {shlex.quote(_git_bash_path(INSTALLER))}\n"
+        + f"REPO_DIR={shlex.quote(_git_bash_path(ROOT))}\n"
+        + "install_cli\n"
+    )
 
 
-def test_cli_stub_ignores_arguments(cli_stub_script: Path):
-    """Test that the CLI stub ignores any arguments passed to it."""
-    # Try various argument patterns that a confused agent might try
-    test_cases = [
-        ["--help"],
-        ["send", "--to", "BlueLake", "--message", "Hello"],
-        ["register", "--name", "MyAgent"],
-        ["-v"],
+def _run_install_cli(
+    tmp_path: Path,
+    *,
+    fail_on: str = "",
+    uname_value: str | None = None,
+) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+    env, home, call_log = _installer_env(tmp_path, fail_on=fail_on)
+    script = _install_cli_script(uname_value=uname_value)
+    return _bash(script, cwd=ROOT, env=env), home, call_log
+
+
+def test_project_defines_one_canonical_cli_entrypoint() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+
+    assert project["scripts"] == {"mcp-agent-mail": "mcp_agent_mail.__main__:main"}
+
+
+def test_editable_distribution_exposes_the_canonical_cli_entrypoint() -> None:
+    distribution = importlib.metadata.distribution("mcp-agent-mail")
+    console_scripts = [
+        entry_point
+        for entry_point in distribution.entry_points
+        if entry_point.group == "console_scripts"
     ]
 
-    for args in test_cases:
-        result = _run_stub(cli_stub_script, *args)
-
-        # Should always exit 1 regardless of arguments
-        assert result.returncode == 1
-        # Should always print the help message
-        assert "MCP" in result.stdout
+    assert [(entry.name, entry.value) for entry in console_scripts] == [
+        ("mcp-agent-mail", "mcp_agent_mail.__main__:main")
+    ]
+    assert console_scripts[0].load() is main
 
 
-class TestInstallScriptCliStub:
-    """Tests for the install_cli_stub function in install.sh."""
+def test_native_cli_launcher_runs_real_typer_help() -> None:
+    executable_name = "mcp-agent-mail.exe" if os.name == "nt" else "mcp-agent-mail"
+    launcher = Path(sysconfig.get_path("scripts")) / executable_name
 
-    def test_install_function_exists(self):
-        """Verify the install_cli_stub function exists in install.sh."""
-        install_script = Path(__file__).parent.parent / "scripts" / "install.sh"
-        content = install_script.read_text(encoding="utf-8")
+    assert launcher.is_file(), f"uv sync did not install {launcher}"
+    result = subprocess.run(
+        [launcher, "--help"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
 
-        assert "install_cli_stub()" in content, "install_cli_stub function should exist"
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "Developer utilities for Iris" in output
+    assert "doctor" in output
 
-    def test_install_creates_variants(self):
-        """Verify install script creates variant symlinks."""
-        install_script = Path(__file__).parent.parent / "scripts" / "install.sh"
-        content = install_script.read_text(encoding="utf-8")
 
-        # Should create symlinks for common variants
-        expected_variants = ["mcp_agent_mail", "mcpagentmail", "agentmail", "agent-mail"]
-        for variant in expected_variants:
-            assert variant in content, f"Should create symlink for '{variant}'"
+def test_installer_delegates_global_cli_installation_and_path_setup_to_uv(tmp_path: Path) -> None:
+    result, _home, call_log = _run_install_cli(tmp_path)
 
-    def test_stub_mentions_github_repo(self):
-        """Verify the stub script mentions the GitHub repo for documentation."""
-        install_script = Path(__file__).parent.parent / "scripts" / "install.sh"
-        content = install_script.read_text(encoding="utf-8")
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert calls == [
+        f"{_git_bash_path(ROOT)}|tool install --editable --python 3.14 .",
+        f"{_git_bash_path(ROOT)}|tool update-shell",
+        f"{_git_bash_path(ROOT)}|tool run --offline mcp-agent-mail --help",
+    ]
+    assert "Installed the mcp-agent-mail CLI" in result.stdout
 
-        assert "github.com" in content.lower() and "mcp_agent_mail" in content
+
+@pytest.mark.parametrize(
+    ("fail_on", "message"),
+    [
+        ("tool install", "Failed to install the mcp-agent-mail CLI with uv"),
+        ("tool update-shell", "could not add its executable directory to PATH"),
+        ("tool run", "did not pass its help smoke test"),
+    ],
+)
+def test_installer_propagates_uv_cli_failures(
+    tmp_path: Path,
+    fail_on: str,
+    message: str,
+) -> None:
+    result, _home, _call_log = _run_install_cli(tmp_path, fail_on=fail_on)
+
+    assert result.returncode != 0
+    assert message in result.stdout + result.stderr
+
+
+def test_installer_refuses_to_overwrite_its_legacy_rejecting_stub(tmp_path: Path) -> None:
+    env, home, call_log = _installer_env(tmp_path)
+    legacy_stub = home / ".local" / "bin" / "mcp-agent-mail"
+    legacy_stub.parent.mkdir(parents=True)
+    original = "#!/usr/bin/env bash\nMCP Agent Mail is NOT a CLI tool\nsentinel\n"
+    legacy_stub.write_text(original, encoding="utf-8", newline="\n")
+    result = _bash(_install_cli_script(), cwd=ROOT, env=env)
+
+    assert result.returncode != 0
+    assert _git_bash_path(legacy_stub) in result.stdout + result.stderr
+    assert "explicit review" in result.stdout + result.stderr
+    assert legacy_stub.read_text(encoding="utf-8") == original
+    assert not call_log.exists()
+
+
+@pytest.mark.parametrize("shadow_kind", ["file", "broken_symlink"])
+def test_installer_refuses_any_extensionless_windows_shadow(
+    tmp_path: Path,
+    shadow_kind: str,
+) -> None:
+    env, home, call_log = _installer_env(tmp_path)
+    shadow = home / ".local" / "bin" / "mcp-agent-mail"
+    shadow.parent.mkdir(parents=True)
+    if shadow_kind == "file":
+        original = "custom command that must remain untouched\n"
+        shadow.write_text(original, encoding="utf-8", newline="\n")
+    else:
+        original = "missing-cli-target"
+        try:
+            shadow.symlink_to(original)
+        except OSError as exc:
+            pytest.skip(f"symlinks unavailable on this platform: {exc}")
+
+    result = _bash(
+        _install_cli_script(uname_value="MINGW64_NT-10.0"),
+        cwd=ROOT,
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert _git_bash_path(shadow) in result.stdout + result.stderr
+    assert "shadows the Windows CLI" in result.stdout + result.stderr
+    if shadow_kind == "file":
+        assert shadow.read_text(encoding="utf-8") == original
+    else:
+        assert shadow.is_symlink()
+        assert str(shadow.readlink()) == original
+    assert not call_log.exists()
+
+
+def test_installer_has_no_cli_stub_or_alias_shims_and_respects_start_only() -> None:
+    content = INSTALLER.read_text(encoding="utf-8")
+    start_only = content[content.index('if [[ "${START_ONLY}" -eq 1 ]]'):]
+    start_only = start_only[: start_only.index("  ensure_uv")]
+    normal_setup = content[content.index("  ensure_uv"):]
+
+    assert "install_cli_stub" not in content
+    assert 'for variant in "mcp_agent_mail"' not in content
+    assert "install_cli" not in start_only
+    assert normal_setup.index("  ensure_repo") < normal_setup.index("  sync_deps")
+    assert normal_setup.index("  sync_deps") < normal_setup.index("  install_cli")

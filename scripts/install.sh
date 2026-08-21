@@ -858,61 +858,54 @@ ensure_beads() {
   exit 1
 }
 
-install_cli_stub() {
-  # Install a helpful "mcp-agent-mail" command that explains this is NOT a CLI tool
-  # This catches agents that mistakenly try to run it as a shell command
-  local stub_dir="${HOME}/.local/bin"
-  local stub_path="${stub_dir}/mcp-agent-mail"
+install_cli() {
+  info "Installing the mcp-agent-mail CLI with uv"
 
-  mkdir -p "${stub_dir}" 2>/dev/null || true
-
-  cat > "${stub_path}" <<'STUB_EOF'
-#!/usr/bin/env bash
-# MCP Agent Mail — Helpful Stub for Confused Agents
-#
-# If you're seeing this, you (or an AI agent) tried to run "mcp-agent-mail"
-# as a CLI command. That's a common mistake!
-
-cat <<'MSG'
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                                                                              ║
-║   🚫  MCP Agent Mail is NOT a CLI tool!                                      ║
-║                                                                              ║
-║   It's an MCP (Model Context Protocol) server that provides tools to your   ║
-║   AI coding agent. You should already have access to these tools as part    ║
-║   of your available MCP tools.                                              ║
-║                                                                              ║
-║   ✅ CORRECT USAGE:                                                          ║
-║      Use the MCP tools directly, for example:                               ║
-║        • mcp__mcp-agent-mail__register_agent                                ║
-║        • mcp__mcp-agent-mail__send_message                                  ║
-║        • mcp__mcp-agent-mail__fetch_inbox                                   ║
-║                                                                              ║
-║   ❌ INCORRECT USAGE:                                                        ║
-║      Running shell commands like:                                           ║
-║        • mcp-agent-mail send --to codex-wsl-home-1 ...                      ║
-║        • mcp-agent-mail --help                                              ║
-║                                                                              ║
-║   📚 For documentation, see:                                                 ║
-║      https://github.com/Dicklesworthstone/mcp_agent_mail                    ║
-║                                                                              ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-MSG
-exit 1
-STUB_EOF
-
-  chmod +x "${stub_path}" 2>/dev/null || true
-
-  # Also create common aliases/variants agents might try
-  for variant in "mcp_agent_mail" "mcpagentmail" "agentmail" "agent-mail"; do
-    local variant_path="${stub_dir}/${variant}"
-    if [[ ! -f "${variant_path}" ]]; then
-      ln -sf "${stub_path}" "${variant_path}" 2>/dev/null || true
+  # Until bd-305h.2, this installer wrote an extensionless rejecting stub at
+  # this exact path.  On Git Bash it can continue to shadow uv's native
+  # mcp-agent-mail.exe even after a successful tool install.  Removing or
+  # overwriting a user file is an operator decision, so detect our marker and
+  # stop with the exact path instead of using uv's destructive --force option.
+  local legacy_stub="${HOME}/.local/bin/mcp-agent-mail"
+  local legacy_marker=0
+  local windows_shadow=0
+  if [[ -f "${legacy_stub}" ]] && grep -Fq "MCP Agent Mail is NOT a CLI tool" "${legacy_stub}"; then
+    legacy_marker=1
+  fi
+  case "$(uname -s 2>/dev/null || true)" in
+    MINGW*|MSYS*|CYGWIN*)
+      if [[ -e "${legacy_stub}" || -L "${legacy_stub}" ]]; then
+        windows_shadow=1
+      fi
+      ;;
+  esac
+  if [[ "${legacy_marker}" -eq 1 || "${windows_shadow}" -eq 1 ]]; then
+    if [[ "${legacy_marker}" -eq 1 ]]; then
+      err "Legacy MCP Agent Mail CLI stub found at ${legacy_stub}"
+    else
+      err "Extensionless command path shadows the Windows CLI at ${legacy_stub}"
     fi
-  done
+    err "Move or remove that exact file after explicit review, then rerun the installer."
+    record_summary "CLI: blocked by extensionless path at ${legacy_stub}"
+    return 1
+  fi
 
-  ok "Installed helpful CLI stub at ${stub_path}"
-  record_summary "CLI stub: installed (catches mistaken CLI usage)"
+  if ! (cd "${REPO_DIR}" && uv tool install --editable --python 3.14 .); then
+    err "Failed to install the mcp-agent-mail CLI with uv"
+    return 1
+  fi
+  if ! uv tool update-shell; then
+    err "The CLI was installed, but uv could not add its executable directory to PATH"
+    return 1
+  fi
+  if ! uv tool run --offline mcp-agent-mail --help >/dev/null; then
+    err "The installed mcp-agent-mail CLI did not pass its help smoke test"
+    return 1
+  fi
+
+  hash -r 2>/dev/null || true
+  ok "Installed the mcp-agent-mail CLI"
+  record_summary "CLI: mcp-agent-mail installed"
 }
 
 ensure_bv() {
@@ -1000,7 +993,6 @@ main() {
     record_summary "Repo: existing at ${REPO_DIR} (--start-only)"
     ensure_beads
     ensure_bv
-    install_cli_stub
     install_am_alias "${REPO_DIR}"
     configure_port
     if ! run_integration_and_start; then
@@ -1017,10 +1009,10 @@ main() {
   ensure_jq
   ensure_beads
   ensure_bv
-  install_cli_stub
   ensure_repo
   ensure_python_and_venv
   sync_deps
+  install_cli
   install_am_alias "${REPO_DIR}"
   configure_port
   if ! run_integration_and_start; then
@@ -1035,6 +1027,7 @@ main() {
   ok "All set!"
   echo "Next runs (open a new terminal or run 'source ~/.zshrc' / 'source ~/.bashrc'):"
   echo "  am                                    # quick alias to start the server"
+  echo "  mcp-agent-mail --help                 # full management CLI"
   echo "  # or manually (uv auto-detects .venv, no activate needed):"
   echo "  cd \"${REPO_DIR}\""
   echo "  uv run python -m mcp_agent_mail.cli"

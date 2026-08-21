@@ -1598,6 +1598,36 @@ def test_doctor_repair_touches_only_the_named_project(
     assert _released_reservation_paths() == {RESERVED_PATH.format(slug="backend")}
     assert not backend_lock.exists()
     assert frontend_lock.exists()
+    assert "Healed 1 stale lock(s)" in result.stdout
+    assert "No stale locks to heal" not in result.stdout
+
+
+def test_doctor_repair_reports_lock_and_metadata_counts(
+    isolated_env,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """The CLI must report both collections returned by the lock healer."""
+
+    async def _snapshot(*_args: Any, **_kwargs: Any) -> Path:
+        return tmp_path / "diagnostic-snapshot"
+
+    async def _healed(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "locks_scanned": 2,
+            "locks_removed": ["stale.lock"],
+            "metadata_removed": ["orphan.lock.owner.json"],
+        }
+
+    monkeypatch.setattr(storage_module, "create_diagnostic_backup", _snapshot)
+    monkeypatch.setattr(storage_module, "heal_archive_locks", _healed)
+
+    result = _run_cli("doctor", "repair", "--yes")
+
+    assert result.exit_code == 0, result.output
+    assert "Healed 1 stale lock(s)" in result.stdout
+    assert "Removed 1 orphaned lock metadata file(s)" in result.stdout
+    assert "No stale locks to heal" not in result.stdout
 
 
 def test_doctor_repair_changes_nothing_when_the_backup_cannot_be_taken(

@@ -113,7 +113,6 @@ from .storage import (
     write_file_reservation_records,
 )
 from .utils import (
-    build_commit,
     generate_agent_name,
     package_version,
     safe_build_path_component,
@@ -2320,7 +2319,7 @@ def _public_runtime_descriptor(settings: Settings) -> dict[str, Any]:
         "http_port": settings.http.port,
         "http_path": settings.http.path,
     }
-    commit = build_commit()
+    commit = settings.build_commit
     if commit:
         descriptor["commit"] = commit
     return descriptor

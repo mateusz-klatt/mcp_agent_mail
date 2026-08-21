@@ -223,6 +223,8 @@ class Settings:
     """Top-level application settings."""
 
     environment: str
+    # Immutable source revision recorded by the image build, when available.
+    build_commit: str | None
     # Global gate for worktree-friendly behavior (opt-in; default False)
     worktrees_enabled: bool
     # Identity preferences (phase 1: read-only; behavior remains 'dir' unless features enabled)
@@ -804,6 +806,9 @@ def _build_settings() -> Settings:
 
     return Settings(
         environment=environment,
+        build_commit=(
+            decouple_config("MCP_AGENT_MAIL_BUILD_COMMIT", default="").strip() or None
+        ),
         # Gate: allow either legacy WORKTREES_ENABLED or new GIT_IDENTITY_ENABLED to enable features
         worktrees_enabled=(
             _b("WORKTREES_ENABLED", default=False)

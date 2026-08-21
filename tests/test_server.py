@@ -3373,20 +3373,24 @@ async def test_health_check_reports_our_version_not_the_frameworks(isolated_env,
 async def test_health_check_surfaces_build_commit_only_when_the_build_recorded_one(
     isolated_env, monkeypatch
 ):
-    server = build_mcp_server()
-
     monkeypatch.delenv("MCP_AGENT_MAIL_BUILD_COMMIT", raising=False)
+    clear_settings_cache()
+    server = build_mcp_server()
     async with Client(server) as client:
         without = await client.call_tool("health_check", {})
     assert "commit" not in without.data
 
     monkeypatch.setenv("MCP_AGENT_MAIL_BUILD_COMMIT", "d6a78286f9c3a399c2ed7d723fe62e9b2d83f8b8")
+    clear_settings_cache()
+    server = build_mcp_server()
     async with Client(server) as client:
         with_commit = await client.call_tool("health_check", {})
     assert with_commit.data["commit"] == "d6a78286f9c3a399c2ed7d723fe62e9b2d83f8b8"
 
     # Whitespace-only must read as absent, not as a commit named " ".
     monkeypatch.setenv("MCP_AGENT_MAIL_BUILD_COMMIT", "   ")
+    clear_settings_cache()
+    server = build_mcp_server()
     async with Client(server) as client:
         blank = await client.call_tool("health_check", {})
     assert "commit" not in blank.data

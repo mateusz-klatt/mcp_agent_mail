@@ -1075,7 +1075,7 @@ async def test_archive_write_lock_releases_on_body_exception(tmp_path: Path, mon
 
 
 @pytest.mark.asyncio
-async def test_doctor_never_steals_aged_lock_from_live_owner(tmp_path: Path, monkeypatch) -> None:
+async def test_doctor_never_steals_aged_lock_from_live_owner(isolated_env) -> None:
     """A long-running live archive writer remains authoritative regardless of age."""
     settings = get_settings()
     root = Path(settings.storage.root).expanduser().resolve()

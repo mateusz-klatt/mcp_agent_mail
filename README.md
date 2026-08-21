@@ -67,12 +67,20 @@ curl -fsSL "https://raw.githubusercontent.com/mateusz-klatt/mcp_agent_mail/v0.5.
 
 1. Install or refresh the user-level lifecycle hooks and, for Claude Code, the
    bundled `mcp-agent-mail` plugin that supplies `/onboard`, `/doctor` and
-   `/wake`.
+   `/wake`. The Claude integrator registers the GitHub marketplace with a
+   sparse Git checkout containing only `.claude-plugin`, `skills`, and
+   `scripts/hooks`; ignored files such as `.env`, `.venv`, and SQLite databases
+   therefore cannot enter the plugin cache. Plugin releases use the Git commit
+   SHA as their cache version, so every new commit is updateable without a
+   manual version bump.
    Re-running `scripts/integrate_claude_code.sh --yes` or
    `scripts/integrate_codex_cli.sh --yes` updates the managed copies; uninstall
-   is not required for hooks. A cached Claude plugin at the same version is the
-   exception: refresh that cache with plugin uninstall/install when doctor says
-   its running script snapshot is stale.
+   is not required for hooks or for a GitHub-installed Claude plugin. A legacy
+   Claude marketplace that points directly at a working checkout is detected
+   but never removed automatically, because removing a marketplace uninstalls
+   its plugins; the integrator prints the explicit migration commands instead.
+   Restart Claude Code after the integrator installs or updates the plugin so
+   the new snapshot becomes active.
 2. In the new repository, Claude runs `/mcp-agent-mail:onboard`. Codex runs
    `${CODEX_HOME:-${HOME}/.codex}/hooks/mcp-agent-mail/agent_mail_setup.sh onboard codex ${AGENT_MAIL_CODEX_SLOT:-1}`.
    The command performs one secret-safe operation: it ensures the canonical remote-derived project,
@@ -2967,7 +2975,7 @@ For manual integration or customization, dedicated scripts are available:
 
 | Tool | Script | What it configures |
 |------|--------|-------------------|
-| Claude Code | `scripts/integrate_claude_code.sh` | `~/.claude/settings.json`, `~/.claude/hooks/mcp-agent-mail`, user MCP in `~/.claude.json` |
+| Claude Code | `scripts/integrate_claude_code.sh` | `~/.claude/settings.json`, `~/.claude/hooks/mcp-agent-mail`, user MCP in `~/.claude.json`, tracked-files-only GitHub marketplace and plugin |
 | Codex CLI | `scripts/integrate_codex_cli.sh` | `${CODEX_HOME:-~/.codex}/config.toml`, `${CODEX_HOME:-~/.codex}/hooks.json`, global lifecycle scripts |
 | GitHub Copilot CLI + VS Code | `scripts/integrate_github_copilot.sh` | `${COPILOT_HOME:-~/.copilot}/mcp-config.json`, user hook JSON/runtime, and VS Code's user `mcp.json` |
 | Gemini CLI | `scripts/integrate_gemini_cli.sh` | `~/.gemini/settings.json`, MCP server, hooks |

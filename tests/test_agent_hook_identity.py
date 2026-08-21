@@ -424,6 +424,19 @@ def test_project_claude_template_is_an_inert_installer_pointer() -> None:
     assert "YOUR_BEARER_TOKEN" not in template_text
 
 
+def test_claude_plugin_uses_git_sha_versioning_from_a_relative_source() -> None:
+    """Every tracked commit must be updateable without a manual version bump."""
+    plugin = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    marketplace = json.loads(
+        (ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8")
+    )
+    entry = next(item for item in marketplace["plugins"] if item["name"] == "mcp-agent-mail")
+
+    assert "version" not in plugin
+    assert "version" not in entry
+    assert entry["source"] == "./"
+
+
 def test_mac_bash_32_case_labels_inside_command_substitutions_are_balanced() -> None:
     """Keep case labels parseable by the Bash 3.2 shipped with macOS."""
     shared_lib = LIB.read_text(encoding="utf-8")
@@ -999,6 +1012,10 @@ def _integration_env(home: Path, fake_bin: Path) -> dict[str, str]:
         "LOCALAPPDATA": _git_bash_path(home / "localappdata"),
         "INTEGRATION_MCP_URL": "https://hermes.example/mcp/",
         "INTEGRATION_BEARER_TOKEN": "test-bearer",
+        # Most integration tests exercise hooks/config only. Dedicated plugin
+        # tests opt back in with a fake Claude CLI so no test reaches the real
+        # user profile or network merely because `claude` is on the host PATH.
+        "AGENT_MAIL_MANAGE_CLAUDE_PLUGIN": "0",
         "PATH": ":".join(
             [
                 _git_bash_path(fake_bin),
@@ -1013,6 +1030,170 @@ def _integration_env(home: Path, fake_bin: Path) -> dict[str, str]:
         "TEMP": bash_tmp,
         "TMP": bash_tmp,
     }
+
+
+def _install_fake_claude_plugin_cli(fake_bin: Path) -> Path:
+    """Install a deterministic Claude plugin CLI that records no secret values."""
+    fake = fake_bin / "claude"
+    fake.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -eu\n"
+        "printf '%s\\n' \"$*\" >> \"$FAKE_CLAUDE_PLUGIN_LOG\"\n"
+        "if [[ -n ${INTEGRATION_BEARER_TOKEN:-}${HTTP_BEARER_TOKEN:-}"
+        "${MCP_AGENT_MAIL_TOKEN:-}${AGENT_MAIL_TOKEN:-}"
+        "${AGENT_MAIL_REGISTRATION_TOKEN:-} ]]; then\n"
+        "  printf 'secret-env-present\\n' >> \"$FAKE_CLAUDE_PLUGIN_LOG\"\n"
+        "fi\n"
+        "case \"$*\" in\n"
+        "  'plugin marketplace list --json') printf '%s\\n' \"${FAKE_CLAUDE_MARKETPLACES_JSON:-[]}\" ;;\n"
+        "  'plugin list --json') printf '%s\\n' \"${FAKE_CLAUDE_PLUGINS_JSON:-[]}\" ;;\n"
+        "  *) exit \"${FAKE_CLAUDE_MUTATION_RC:-0}\" ;;\n"
+        "esac\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    fake.chmod(0o700)
+    return fake
+
+
+@pytest.mark.parametrize(
+    ("marketplaces", "plugins", "expected_calls", "forbidden_calls", "message"),
+    [
+        pytest.param(
+            [],
+            [],
+            (
+                "plugin marketplace add mateusz-klatt/mcp_agent_mail --scope user "
+                "--sparse .claude-plugin skills scripts/hooks",
+                "plugin install mcp-agent-mail@mateusz-klatt-mcp-agent-mail --scope user",
+            ),
+            ("plugin marketplace update", "plugin update"),
+            "Installed Claude plugin",
+            id="fresh-install",
+        ),
+        pytest.param(
+            [
+                {
+                    "name": "mateusz-klatt-mcp-agent-mail",
+                    "source": "github",
+                    "repo": "mateusz-klatt/mcp_agent_mail",
+                }
+            ],
+            [
+                {
+                    "id": "mcp-agent-mail@mateusz-klatt-mcp-agent-mail",
+                    "scope": "user",
+                }
+            ],
+            (
+                "plugin marketplace update mateusz-klatt-mcp-agent-mail",
+                "plugin update mcp-agent-mail@mateusz-klatt-mcp-agent-mail --scope user",
+            ),
+            ("plugin marketplace add", "plugin install"),
+            "Updated Claude plugin",
+            id="tracked-github-update",
+        ),
+        pytest.param(
+            [
+                {
+                    "name": "mateusz-klatt-mcp-agent-mail",
+                    "source": "directory",
+                    "path": "/private/checkout-with-dotenv",
+                }
+            ],
+            [],
+            ("plugin marketplace list --json",),
+            (
+                "plugin marketplace remove",
+                "plugin marketplace add",
+                "plugin uninstall",
+                "plugin install",
+            ),
+            "still points at a local directory",
+            id="legacy-directory-is-not-deleted",
+        ),
+    ],
+)
+def test_claude_integrator_uses_tracked_github_plugin_source(
+    tmp_path: Path,
+    marketplaces: list[dict[str, str]],
+    plugins: list[dict[str, str]],
+    expected_calls: tuple[str, ...],
+    forbidden_calls: tuple[str, ...],
+    message: str,
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    fake_bin = tmp_path / "bin"
+    home.mkdir()
+    project.mkdir()
+    fake_bin.mkdir()
+    _install_fake_claude_plugin_cli(fake_bin)
+    call_log = tmp_path / "claude-plugin-calls.log"
+    env = {
+        **os.environ,
+        **_integration_env(home, fake_bin),
+        "AGENT_MAIL_MANAGE_CLAUDE_PLUGIN": "1",
+        "FAKE_CLAUDE_PLUGIN_LOG": _git_bash_path(call_log),
+        "FAKE_CLAUDE_MARKETPLACES_JSON": json.dumps(marketplaces),
+        "FAKE_CLAUDE_PLUGINS_JSON": json.dumps(plugins),
+    }
+
+    result = subprocess.run(
+        [BASH, _git_bash_path(INTEGRATORS["claude"]), "--yes"],
+        cwd=ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert calls[0] == "plugin marketplace list --json"
+    for expected in expected_calls:
+        assert expected in calls
+    for forbidden in forbidden_calls:
+        assert not any(call.startswith(forbidden) for call in calls)
+    assert "secret-env-present" not in calls
+    assert "test-bearer" not in result.stdout + result.stderr + "\n".join(calls)
+    assert message in result.stdout
+    if message.startswith(("Installed", "Updated")):
+        assert "Restart Claude Code" in result.stdout
+        assert not any("--yes" in call for call in calls)
+    else:
+        assert "marketplace remove mateusz-klatt-mcp-agent-mail --scope user" in result.stdout
+
+
+def test_claude_plugin_management_dry_run_never_calls_cli(tmp_path: Path) -> None:
+    """A dry run reports plugin intent without even asking Claude for state."""
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    fake_bin = tmp_path / "bin"
+    home.mkdir()
+    project.mkdir()
+    fake_bin.mkdir()
+    _install_fake_claude_plugin_cli(fake_bin)
+    call_log = tmp_path / "claude-plugin-calls.log"
+    env = {
+        **os.environ,
+        **_integration_env(home, fake_bin),
+        "AGENT_MAIL_MANAGE_CLAUDE_PLUGIN": "1",
+        "FAKE_CLAUDE_PLUGIN_LOG": _git_bash_path(call_log),
+    }
+
+    result = subprocess.run(
+        [BASH, _git_bash_path(INTEGRATORS["claude"]), "--yes", "--dry-run"],
+        cwd=ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "install/update Claude plugin from tracked Git files" in result.stdout
+    assert not call_log.exists()
 
 
 @pytest.mark.parametrize("client", ["claude", "codex"])

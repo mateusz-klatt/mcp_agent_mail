@@ -65,18 +65,23 @@ between connections without risk of eviction. `session_start.sh` suppresses the
 manual watcher invitation while a monitor's pid file shows a live process, so the
 two are not armed at once.
 
-**The plugin runs a copy, not your working tree.** Installing from a local
-directory leaves a full snapshot under
-`~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/` — a real directory
-with no `.git`, measured on macOS and WSL alike. The commit that added
-`.claude-plugin/marketplace.json` claims a local install "points at the working
-tree itself"; that is wrong, and the drift it says has nowhere to happen simply
-moved: `integrate_claude_code.sh --yes` refreshes the copies under
-`~/.claude/hooks/`; the plugin cache needs `plugin uninstall` followed by
-`plugin install`. `plugin update` will not do it — at an unchanged `version` it
-answers "already at the latest version" and leaves the snapshot pinned to the
-commit it was installed from, measured on Windows and WSL. Reinstalling does
-not need a `version` bump.
+**The plugin runs a copy, not your working tree.** The supported integrator
+registers `mateusz-klatt/mcp_agent_mail` as a GitHub marketplace with sparse
+paths `.claude-plugin`, `skills`, and `scripts/hooks`. Claude therefore clones
+only tracked plugin files before copying them under
+`~/.claude/plugins/cache/<marketplace>/<plugin>/<git-sha>/`; `.env`, virtual
+environments, SQLite/WAL files, `node_modules`, coverage artifacts, and other
+ignored working-tree state cannot enter that snapshot. Both plugin manifests
+deliberately omit `version`, so Claude uses the source commit SHA and
+`marketplace update` plus `plugin update` sees every new commit.
+
+A legacy marketplace registered from a local checkout is unsafe for exactly the
+opposite reason: Claude copies the whole directory and does not apply
+`.gitignore`. `integrate_claude_code.sh --yes` detects that source and prints a
+one-time migration sequence, but it does not run `plugin uninstall` or
+`marketplace remove`; both delete cached state and require explicit operator
+approval. This keeps an ordinary hook refresh non-destructive while making the
+remaining exposure loud.
 
 Which copy actually executes has differed between machines — on WSL both the
 skill and the monitor ran from the repository path while a stale cache copy sat
@@ -123,9 +128,11 @@ and `jq --version` in that same shell before installing. The generated Codex
 Both lifecycle integrators are idempotent upgrades. After a Git pull, rerun
 `scripts/integrate_claude_code.sh --yes` and
 `scripts/integrate_codex_cli.sh --yes`; do not uninstall their user-level hook
-definitions first. The separate `plugin uninstall` followed by `plugin install`
-sequence described above applies only when refreshing Claude's copied plugin
-snapshot (the `/wake` skill and monitor), not these lifecycle hook copies.
+definitions first. A GitHub-installed Claude plugin updates through the same
+Claude integrator; restart Claude Code after an install or update to activate
+the new plugin snapshot. Uninstall/remove/install is needed only for the
+explicitly approved one-time migration away from a legacy local-directory
+marketplace, not for normal upgrades.
 
 Installed Git guards are deliberately standalone programs. They read the
 short-lived process signals `AGENT_NAME`, `AGENT_EXECUTION_ID`,

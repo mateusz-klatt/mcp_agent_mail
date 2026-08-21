@@ -6,10 +6,16 @@ git configurations including worktrees, custom hooksPath, and hook preservation.
 
 from __future__ import annotations
 
+import asyncio
+import builtins
+import io
 import os
+import shutil
 import subprocess
 import sys
+import types
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -198,6 +204,131 @@ async def test_guard_install_relative_hookspath(isolated_env, tmp_path: Path):
 
     # Hook should be resolved relative to repo root
     assert hook_path.exists()
+
+
+# =============================================================================
+# Husky v9 hooksPath Tests
+# =============================================================================
+
+
+def _write_husky_v9_layout(
+    repo: Path,
+    hook_name: str,
+    tracked_body: str,
+) -> tuple[Path, Path]:
+    """Create the essential Husky v9 runtime stub, resolver, and tracked hook."""
+    husky_dir = repo / ".husky"
+    runtime_dir = husky_dir / "_"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+
+    resolver = runtime_dir / "h"
+    resolver.write_text(
+        "#!/usr/bin/env sh\n"
+        'hook_name="${0##*/}"\n'
+        'tracked="${0%/*/*}/$hook_name"\n'
+        '[ ! -f "$tracked" ] && exit 0\n'
+        'sh -e "$tracked" "$@"\n'
+        "exit $?\n",
+        encoding="utf-8",
+    )
+    resolver.chmod(0o755)
+
+    stub = runtime_dir / hook_name
+    stub.write_text('#!/usr/bin/env sh\n. "$(dirname "$0")/h"\n', encoding="utf-8")
+    stub.chmod(0o755)
+
+    tracked = husky_dir / hook_name
+    tracked.write_text(tracked_body, encoding="utf-8")
+    tracked.chmod(0o755)
+    return runtime_dir, tracked
+
+
+@pytest.mark.asyncio
+async def test_guard_install_husky_v9_runs_tracked_hook(isolated_env, tmp_path: Path):
+    """Renaming the Husky stub to .orig must not change its logical hook name."""
+    settings = get_settings()
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    _init_git_repo(repo)
+    runtime_dir, _tracked = _write_husky_v9_layout(
+        repo,
+        "pre-commit",
+        "#!/usr/bin/env sh\necho HUSKY_TRACKED_RAN\n",
+    )
+    _git_config(repo, "core.hooksPath", ".husky/_")
+
+    hook_path = await install_guard(settings, "husky-v9-test", repo)
+
+    assert (runtime_dir / "pre-commit.orig").exists()
+    result = _run_hook(
+        hook_path,
+        repo,
+        {"WORKTREES_ENABLED": "0", "GIT_IDENTITY_ENABLED": "0"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert "HUSKY_TRACKED_RAN" in result.stdout
+
+
+@pytest.mark.asyncio
+async def test_guard_install_husky_v9_propagates_failure(isolated_env, tmp_path: Path):
+    """A failing tracked Husky hook must fail the Agent Mail chain-runner."""
+    settings = get_settings()
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    _init_git_repo(repo)
+    _write_husky_v9_layout(
+        repo,
+        "pre-commit",
+        "#!/usr/bin/env sh\necho HUSKY_TRACKED_FAILED\nexit 23\n",
+    )
+    _git_config(repo, "core.hooksPath", ".husky/_")
+
+    hook_path = await install_guard(settings, "husky-v9-failure-test", repo)
+    result = _run_hook(
+        hook_path,
+        repo,
+        {"WORKTREES_ENABLED": "0", "GIT_IDENTITY_ENABLED": "0"},
+    )
+
+    assert "HUSKY_TRACKED_FAILED" in result.stdout
+    assert result.returncode == 23
+
+
+@pytest.mark.asyncio
+async def test_prepush_guard_husky_v9_forwards_argv_and_stdin(isolated_env, tmp_path: Path):
+    """Husky pre-push receives Git's arguments and a fresh copy of its stdin."""
+    settings = get_settings()
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    _init_git_repo(repo)
+    _write_husky_v9_layout(
+        repo,
+        "pre-push",
+        "#!/usr/bin/env sh\n"
+        'printf "HUSKY_ARGS=%s|%s\\n" "$1" "$2"\n'
+        "cat\n",
+    )
+    _git_config(repo, "core.hooksPath", ".husky/_")
+    hook_path = await install_prepush_guard(settings, "husky-v9-prepush-test", repo)
+    payload = "refs/heads/main 111 refs/heads/main 000\n"
+    env = os.environ.copy()
+    env.update({"WORKTREES_ENABLED": "0", "GIT_IDENTITY_ENABLED": "0"})
+
+    result = await asyncio.to_thread(
+        subprocess.run,
+        [sys.executable, str(hook_path), "origin", "ssh://example.invalid/repo.git"],
+        cwd=repo,
+        env=env,
+        input=payload,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert isinstance(result.stdout, str)
+    assert "HUSKY_ARGS=origin|ssh://example.invalid/repo.git" in result.stdout
+    assert payload in result.stdout
 
 
 # =============================================================================
@@ -594,3 +725,173 @@ async def test_chain_runner_executes_plugins(isolated_env, tmp_path: Path):
     # Plugin should have run
     assert marker_file.exists()
     assert marker_file.read_text(encoding="utf-8") == "ran"
+
+
+# =============================================================================
+# Windows chain-runner dispatch
+# =============================================================================
+
+
+class _RecordingRun:
+    """Record subprocess argv and input instead of spawning a Windows child."""
+
+    def __init__(self, git_exec_path: str = "") -> None:
+        self.calls: list[tuple[list[str], dict[str, Any]]] = []
+        self._git_exec_path = git_exec_path
+
+    def __call__(self, argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        normalized = [str(value) for value in argv]
+        if normalized[:2] == ["git", "--exec-path"]:
+            return subprocess.CompletedProcess(
+                normalized,
+                0,
+                stdout=self._git_exec_path,
+                stderr="",
+            )
+        self.calls.append((normalized, kwargs))
+        return subprocess.CompletedProcess(normalized, 0, stdout="", stderr="")
+
+
+def _exec_chain_runner(hook_path: Path, script_text: str, *, os_name: str) -> None:
+    """Execute a rendered runner with only its imported os.name simulated."""
+    exec_globals: dict[str, Any] = {"__file__": str(hook_path), "__name__": "__main__"}
+    os_shim = types.SimpleNamespace(name=os_name)
+    real_import = builtins.__import__
+
+    def _import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "os":
+            return os_shim
+        return real_import(name, *args, **kwargs)
+
+    exec_globals["__builtins__"] = {**vars(builtins), "__import__": _import}
+    with pytest.raises(SystemExit) as exc_info:
+        exec(compile(script_text, str(hook_path), "exec"), exec_globals)
+    assert exc_info.value.code in (0, None)
+
+
+def _write_windows_dispatch_layout(tmp_path: Path) -> Path:
+    """Create Windows runner children covering Python and shell dispatch."""
+    hooks = tmp_path / "hooks"
+    run_dir = hooks / "hooks.d" / "pre-commit"
+    run_dir.mkdir(parents=True)
+    (run_dir / "10-plugin.py").write_text("print('python')\n", encoding="utf-8")
+    (run_dir / "20-python-script").write_text(
+        "#!/usr/bin/env python3\nprint('python shebang')\n",
+        encoding="utf-8",
+    )
+    (run_dir / "30-native.cmd").write_text("@echo off\r\nexit /b 0\r\n", encoding="utf-8")
+    (hooks / "pre-commit.orig").write_text(
+        "#!/usr/bin/env sh\necho original\n",
+        encoding="utf-8",
+    )
+    return hooks
+
+
+def test_chain_runner_windows_dispatches_shebang_children(monkeypatch, tmp_path: Path):
+    """Windows must not pass shell or Python shebang scripts bare to CreateProcess."""
+    from mcp_agent_mail.guard import _render_chain_runner_script
+
+    hooks = _write_windows_dispatch_layout(tmp_path)
+    hook_path = hooks / "pre-commit"
+    recorder = _RecordingRun()
+    monkeypatch.setattr(subprocess, "run", recorder)
+    monkeypatch.setattr(shutil, "which", lambda _command: "C:/Git/usr/bin/sh.exe")
+    monkeypatch.setattr(sys, "argv", [str(hook_path), "hook-arg"])
+
+    _exec_chain_runner(hook_path, _render_chain_runner_script("pre-commit"), os_name="nt")
+
+    calls = [argv for argv, _kwargs in recorder.calls]
+    python_file = next(argv for argv in calls if "10-plugin.py" in argv[1])
+    python_shebang = next(argv for argv in calls if "20-python-script" in argv[1])
+    native_cmd = next(argv for argv in calls if "30-native.cmd" in argv[0])
+    shell_orig = next(
+        argv for argv in calls if any(value.endswith("pre-commit.orig") for value in argv)
+    )
+    assert python_file == [sys.executable, str(hooks / "hooks.d/pre-commit/10-plugin.py"), "hook-arg"]
+    assert python_shebang == [
+        sys.executable,
+        str(hooks / "hooks.d/pre-commit/20-python-script"),
+        "hook-arg",
+    ]
+    assert native_cmd == [str(hooks / "hooks.d/pre-commit/30-native.cmd"), "hook-arg"]
+    assert shell_orig == ["C:/Git/usr/bin/sh.exe", str(hooks / "pre-commit.orig"), "hook-arg"]
+
+
+def test_chain_runner_windows_resolves_git_bundled_sh(monkeypatch, tmp_path: Path):
+    """The runner finds Git for Windows' sh.exe when PATH has no shell."""
+    from mcp_agent_mail.guard import _render_chain_runner_script
+
+    hooks = _write_windows_dispatch_layout(tmp_path)
+    hook_path = hooks / "pre-commit"
+    git_root = tmp_path / "Git"
+    exec_path = git_root / "mingw64/libexec/git-core"
+    exec_path.mkdir(parents=True)
+    bundled_sh = git_root / "usr/bin/sh.exe"
+    bundled_sh.parent.mkdir(parents=True)
+    bundled_sh.write_text("", encoding="utf-8")
+    recorder = _RecordingRun(git_exec_path=str(exec_path))
+    monkeypatch.setattr(subprocess, "run", recorder)
+    monkeypatch.setattr(shutil, "which", lambda _command: None)
+    monkeypatch.setattr(sys, "argv", [str(hook_path)])
+
+    _exec_chain_runner(hook_path, _render_chain_runner_script("pre-commit"), os_name="nt")
+
+    orig_call = next(
+        argv
+        for argv, _kwargs in recorder.calls
+        if any(value.endswith("pre-commit.orig") for value in argv)
+    )
+    assert orig_call[0] == str(bundled_sh)
+
+
+@pytest.mark.parametrize(
+    ("hook_name", "hook_args", "stdin_bytes"),
+    [
+        ("pre-commit", ["commit-arg"], None),
+        ("pre-push", ["origin", "ssh://example.invalid/repo.git"], b"ref tuple\n"),
+    ],
+)
+def test_chain_runner_windows_husky_uses_real_hook_name(
+    monkeypatch,
+    tmp_path: Path,
+    hook_name: str,
+    hook_args: list[str],
+    stdin_bytes: bytes | None,
+):
+    """Windows Husky uses Git sh, a slash-safe argv0, and preserves hook I/O."""
+    from mcp_agent_mail.guard import _render_chain_runner_script
+
+    # A literal backslash in this POSIX test component stands in for the one
+    # WindowsPath would put after a drive prefix. Only sh-bound paths normalize it.
+    hooks = tmp_path / "C:\\repo" / ".husky/_"
+    hooks.mkdir(parents=True)
+    (hooks / "h").write_text("#!/usr/bin/env sh\n", encoding="utf-8")
+    (hooks / f"{hook_name}.orig").write_text(
+        '#!/usr/bin/env sh\n. "$(dirname "$0")/h"\n',
+        encoding="utf-8",
+    )
+    hook_path = hooks / hook_name
+    recorder = _RecordingRun()
+    monkeypatch.setattr(subprocess, "run", recorder)
+    monkeypatch.setattr(shutil, "which", lambda _command: "C:/Git/usr/bin/sh.exe")
+    monkeypatch.setattr(sys, "argv", [str(hook_path), *hook_args])
+    if stdin_bytes is not None:
+        monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(buffer=io.BytesIO(stdin_bytes)))
+
+    script = _render_chain_runner_script(hook_name)
+    _exec_chain_runner(hook_path, script, os_name="nt")
+
+    assert len(recorder.calls) == 1
+    argv, kwargs = recorder.calls[0]
+    assert argv[:3] == [
+        "C:/Git/usr/bin/sh.exe",
+        "-c",
+        'husky_h="$1"; shift; . "$husky_h"',
+    ]
+    assert argv[3].endswith(f"/{hook_name}")
+    assert not argv[3].endswith(".orig")
+    assert argv[4].endswith("/h")
+    assert "\\" not in argv[3]
+    assert "\\" not in argv[4]
+    assert argv[5:] == hook_args
+    assert kwargs["input"] == stdin_bytes

@@ -62,12 +62,13 @@ INSTALLED_HOOK_SOURCES = (
 
 
 def _posix_tool_dirs() -> tuple[str, ...]:
-    """Return PATH entries that keep git and curl visible to a raw Git Bash.
+    """Return PATH entries that keep Git Bash and its tools self-contained.
 
     A native Windows process commonly resolves ``git`` through
     ``Git/cmd/git.exe`` or ``Git/bin/git.exe`` while Git's ``curl.exe`` lives in
     ``Git/mingw64/bin``. Prefer a verified Git runtime containing both tools,
-    then retain the directories of the individually discovered executables.
+    then its ``usr/bin`` before ambient executable directories such as
+    ``System32``, which may contain the incompatible WSL ``bash.exe`` launcher.
     """
     resolved_tools: dict[str, Path] = {}
     for command in ("git", "curl"):
@@ -87,6 +88,9 @@ def _posix_tool_dirs() -> tuple[str, ...]:
                     for tool in ("git", "curl")
                 ):
                     candidates.append(runtime)
+                    raw_shell_tools = root / "usr" / "bin"
+                    if raw_shell_tools.is_dir():
+                        candidates.append(raw_shell_tools)
                     runtime_found = True
                     break
             if runtime_found:
@@ -110,8 +114,10 @@ def test_posix_tool_dirs_include_windows_runtime_for_git_cmd_shim(
     runtime = git_root / "mingw64" / "bin"
     runtime_git = runtime / "git.exe"
     runtime_curl = runtime / "curl.exe"
+    raw_shell_tools = git_root / "usr" / "bin"
+    raw_bash = raw_shell_tools / "bash.exe"
     system_curl = tmp_path / "Windows" / "System32" / "curl.exe"
-    for executable in (cmd_git, runtime_git, runtime_curl, system_curl):
+    for executable in (cmd_git, runtime_git, runtime_curl, raw_bash, system_curl):
         executable.parent.mkdir(parents=True, exist_ok=True)
         executable.write_bytes(b"")
 
@@ -126,6 +132,7 @@ def test_posix_tool_dirs_include_windows_runtime_for_git_cmd_shim(
     entries = _posix_tool_dirs()
 
     assert entries[0] == _git_bash_path(runtime)
+    assert entries[1] == _git_bash_path(raw_shell_tools)
     assert _git_bash_path(cmd_git.parent) in entries
     assert _git_bash_path(system_curl.parent) in entries
 
@@ -175,6 +182,34 @@ def _bash_executable() -> str:
 
 
 BASH = _bash_executable()
+RAW_GIT_BASH_MISSING_TMP_WARNING = "bash.exe: warning: could not find /tmp, please create!\n"
+
+
+def _without_raw_git_bash_tmp_warning(stderr: str) -> str:
+    """Remove only the pre-script warning from Git Bash's shared MSYS mount."""
+    if os.name != "nt":
+        return stderr
+    return stderr.replace(RAW_GIT_BASH_MISSING_TMP_WARNING, "")
+
+
+@pytest.fixture(autouse=True)
+def _make_raw_git_bash_self_contained(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give the raw Windows shell its own tools without outranking test shims."""
+    if os.name != "nt":
+        return
+
+    raw_bash_dir = str(Path(BASH).parent)
+    current_entries = [entry for entry in os.environ.get("PATH", "").split(os.pathsep) if entry]
+    normalized_raw_bash_dir = os.path.normcase(os.path.normpath(raw_bash_dir))
+    ambient_entries = [
+        entry
+        for entry in current_entries
+        if os.path.normcase(os.path.normpath(entry)) != normalized_raw_bash_dir
+    ]
+    # The raw shell does not seed /usr/bin, and an ambient WSL bash.exe may
+    # otherwise win `#!/usr/bin/env bash`. Fixture shims are prepended later by
+    # each test, so this only takes precedence over the inherited host PATH.
+    monkeypatch.setenv("PATH", os.pathsep.join((raw_bash_dir, *ambient_entries)))
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows Git layout")
@@ -4494,7 +4529,7 @@ def test_copilot_wsl_windows_profile_embeds_only_target_git_bash_tools(
     )
 
     assert execution.returncode == 0, execution.stderr
-    assert execution.stderr == ""
+    assert _without_raw_git_bash_tmp_warning(execution.stderr) == ""
     assert not poison_log.exists()
     output = json.loads(execution.stdout)
     assert "Agent Mail is not activated for /owner/repo" in output["additionalContext"]
@@ -4699,7 +4734,7 @@ printf '%s\n200' "$envelope"
     )
 
     assert execution.returncode == 0, execution.stderr
-    assert execution.stderr == ""
+    assert _without_raw_git_bash_tmp_warning(execution.stderr) == ""
     assert not poison_log.exists()
     registered_agent = agent_log.read_text(encoding="utf-8").strip()
     assert re.fullmatch(

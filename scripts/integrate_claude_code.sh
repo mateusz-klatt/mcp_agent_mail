@@ -26,27 +26,27 @@ require_cmd curl
 require_cmd jq  # Required for safe JSON merging (avoids quote injection vulnerabilities)
 require_cmd git
 
-_normalize_claude_shared_path() {
+_normalize_claude_path() {
   local target="$1"
   case "$target" in
     [a-zA-Z]:\\*|[a-zA-Z]:/*)
       case "$(uname -s 2>/dev/null || printf unknown)" in
         MINGW*|MSYS*|CYGWIN*)
           command -v cygpath >/dev/null 2>&1 || {
-            log_err "cygpath is required to normalize the Windows shared env path: ${target}" >&2
+            log_err "cygpath is required to normalize the Windows Claude path: ${target}" >&2
             return 1
           }
           cygpath -u "$target" 2>/dev/null || {
-            log_err "Could not normalize the Windows shared env path: ${target}" >&2
+            log_err "Could not normalize the Windows Claude path: ${target}" >&2
             return 1
           } ;;
         *)
           command -v wslpath >/dev/null 2>&1 || {
-            log_err "wslpath is required to normalize the Windows shared env path: ${target}" >&2
+            log_err "wslpath is required to normalize the Windows Claude path: ${target}" >&2
             return 1
           }
           wslpath -u "$target" 2>/dev/null || {
-            log_err "Could not normalize the Windows shared env path: ${target}" >&2
+            log_err "Could not normalize the Windows Claude path: ${target}" >&2
             return 1
           } ;;
       esac ;;
@@ -54,7 +54,7 @@ _normalize_claude_shared_path() {
   esac
 }
 
-SHARED_ENV_FILE="$(_normalize_claude_shared_path \
+SHARED_ENV_FILE="$(_normalize_claude_path \
   "${AGENT_MAIL_ENV_FILE:-${HOME}/.agent-mail.env}")" || exit 1
 case "$SHARED_ENV_FILE" in
   /*) ;;
@@ -64,12 +64,46 @@ case "$SHARED_ENV_FILE" in
 esac
 AGENT_MAIL_ENV_FILE="$SHARED_ENV_FILE"
 
+CLAUDE_CONFIG_DIR_IS_SET=0
+if [[ -n "${CLAUDE_CONFIG_DIR+x}" ]]; then
+  if [[ -z "$CLAUDE_CONFIG_DIR" ]]; then
+    log_err "CLAUDE_CONFIG_DIR is set but empty; refusing to guess the Claude profile."
+    exit 1
+  fi
+  CLAUDE_CONFIG_DIR_IS_SET=1
+  _CLAUDE_DIR_INPUT="$CLAUDE_CONFIG_DIR"
+else
+  _CLAUDE_DIR_INPUT="${HOME}/.claude"
+fi
+CLAUDE_DIR="$(_normalize_claude_path "$_CLAUDE_DIR_INPUT")" || exit 1
+case "$CLAUDE_DIR" in
+  ''|*$'\n'*|*$'\r'*)
+    log_err "Claude profile path must be a non-empty single-line absolute path."
+    exit 1 ;;
+  /*) ;;
+  *)
+    log_err "Claude profile path must be absolute: ${CLAUDE_DIR}"
+    exit 1 ;;
+esac
+if [[ "$CLAUDE_CONFIG_DIR_IS_SET" == "1" ]]; then
+  CLAUDE_CONFIG_DIR="$CLAUDE_DIR"
+  export CLAUDE_CONFIG_DIR
+fi
+SETTINGS_PATH="${CLAUDE_DIR}/settings.json"
+if [[ "$CLAUDE_CONFIG_DIR_IS_SET" == "1" ]]; then
+  CLAUDE_USER_JSON="${CLAUDE_DIR}/.claude.json"
+else
+  # Preserve Claude's historical default when no custom profile was selected.
+  CLAUDE_USER_JSON="${HOME}/.claude.json"
+fi
+HOOKS_DIR="${CLAUDE_DIR}/hooks/mcp-agent-mail"
+
 log_step "Claude Code Integration (user scope)"
 echo
 echo "This installs MCP Agent Mail once for the current user:"
-echo "  - hooks: ~/.claude/hooks/mcp-agent-mail"
-echo "  - hook settings: ~/.claude/settings.json"
-echo "  - MCP server: Claude user scope (~/.claude.json)"
+echo "  - hooks: ${HOOKS_DIR}"
+echo "  - hook settings: ${SETTINGS_PATH}"
+echo "  - MCP server: Claude user scope (${CLAUDE_USER_JSON})"
 echo "No repository configuration or server credential is created."
 echo
 if ! confirm "Proceed?"; then log_warn "Aborted."; exit 1; fi
@@ -85,24 +119,53 @@ _TOKEN="$(resolve_global_integration_bearer_token)" || {
 log_ok "Using MCP endpoint: ${_URL}"
 
 log_step "Preparing user-level Claude settings"
-CLAUDE_DIR="${HOME}/.claude"
-SETTINGS_PATH="${CLAUDE_DIR}/settings.json"
-CLAUDE_USER_JSON="${HOME}/.claude.json"
-HOOKS_DIR="${CLAUDE_DIR}/hooks/mcp-agent-mail"
 CLAUDE_PLUGIN_MARKETPLACE="mateusz-klatt-mcp-agent-mail"
 CLAUDE_PLUGIN_REPOSITORY="mateusz-klatt/mcp_agent_mail"
 CLAUDE_PLUGIN_ID="mcp-agent-mail@${CLAUDE_PLUGIN_MARKETPLACE}"
+CLAUDE_PLUGIN_READY=0
 
-# Keep every server and mailbox credential out of Claude's plugin subprocess.
-# The plugin manager needs Git/network access but no Agent Mail authority.
+# Start Claude's plugin subprocess from an allowlisted environment. A denylist
+# cannot cover future provider keys, database URLs, or helper-specific tokens;
+# the public GitHub marketplace needs only platform/runtime settings.
 _claude_plugin_cli() (
-  unset INTEGRATION_BEARER_TOKEN HTTP_BEARER_TOKEN MCP_AGENT_MAIL_TOKEN
-  unset AGENT_MAIL_TOKEN AGENT_MAIL_REGISTRATION_TOKEN _TOKEN
-  command claude plugin "$@"
+  local _env_name
+  local _safe_env=()
+  for _env_name in \
+    HOME PATH USER LOGNAME USERNAME SHELL \
+    TMPDIR TMP TEMP CLAUDE_CODE_TMPDIR \
+    USERPROFILE APPDATA LOCALAPPDATA PROGRAMDATA SystemRoot SYSTEMROOT WINDIR \
+    COMSPEC ComSpec PATHEXT HOMEDRIVE HOMEPATH SystemDrive SYSTEMDRIVE \
+    XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_RUNTIME_DIR \
+    CLAUDE_CONFIG_DIR CLAUDE_CODE_PLUGIN_CACHE_DIR \
+    CLAUDE_CODE_PLUGIN_GIT_TIMEOUT_MS CLAUDE_CODE_PLUGIN_PREFER_HTTPS \
+    CLAUDE_CODE_CERT_STORE \
+    LANG LANGUAGE LC_ALL LC_COLLATE LC_CTYPE LC_MESSAGES LC_MONETARY LC_NUMERIC \
+    LC_TIME LC_ADDRESS LC_IDENTIFICATION LC_MEASUREMENT LC_NAME LC_PAPER \
+    LC_RESPONSE LC_TELEPHONE TERM COLORTERM NO_COLOR FORCE_COLOR TZ \
+    HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY FTP_PROXY \
+    http_proxy https_proxy all_proxy no_proxy ftp_proxy \
+    SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE CURL_CA_BUNDLE \
+    NODE_EXTRA_CA_CERTS GIT_SSL_CAINFO NIX_SSL_CERT_FILE \
+    MSYSTEM MSYS CYGWIN CHERE_INVOKING WSL_DISTRO_NAME WSL_INTEROP WSLENV \
+    DISABLE_TELEMETRY DISABLE_ERROR_REPORTING DO_NOT_TRACK \
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+  do
+    if [[ -n "${!_env_name+x}" ]]; then
+      if [[ "$_env_name" == CLAUDE_CONFIG_DIR && -z "${!_env_name}" ]]; then
+        continue
+      fi
+      _safe_env+=("${_env_name}=${!_env_name}")
+    fi
+  done
+  command env -i ${_safe_env[@]+"${_safe_env[@]}"} claude plugin "$@"
 )
 
 _install_or_update_claude_plugin() {
-  local marketplaces marketplace_entry source repo plugins installed
+  local marketplaces marketplace_entry user_marketplace_entry
+  local source repo ref listed_source listed_repo listed_ref
+  local post_marketplaces post_marketplace_entry install_location expected_sha
+  local plugins plugin_entry enabled post_plugins post_plugin_entry action action_lower
+  local plugin_version plugin_install_path plugin_cache_root expected_install_path
   case "${AGENT_MAIL_MANAGE_CLAUDE_PLUGIN:-1}" in
     0|false|False|FALSE|no|No|NO)
       log_warn "Claude plugin management was disabled with AGENT_MAIL_MANAGE_CLAUDE_PLUGIN=0."
@@ -129,19 +192,58 @@ _install_or_update_claude_plugin() {
       return 0
     }
 
+  user_marketplace_entry="$(jq -c --arg name "$CLAUDE_PLUGIN_MARKETPLACE" \
+    '.extraKnownMarketplaces[$name] // null' "$SETTINGS_PATH" 2>/dev/null)" || {
+      log_warn "Could not inspect the user-scoped Claude marketplace declaration; refusing to mutate plugin state."
+      return 0
+    }
+
   if [[ "$marketplace_entry" == "null" ]]; then
+    if [[ "$user_marketplace_entry" != "null" ]]; then
+      log_warn "Claude's marketplace inventory disagrees with its user settings; refusing to add a duplicate."
+      return 0
+    fi
     if ! _claude_plugin_cli marketplace add "$CLAUDE_PLUGIN_REPOSITORY" \
       --scope user --sparse .claude-plugin skills scripts/hooks; then
       log_warn "Could not add the tracked-files-only Claude marketplace; hooks and MCP remain installed."
       return 0
     fi
   else
-    source="$(printf '%s' "$marketplace_entry" | jq -r '.source // empty')"
-    repo="$(printf '%s' "$marketplace_entry" | jq -r '.repo // empty')"
+    if [[ "$user_marketplace_entry" == "null" ]]; then
+      log_warn "Claude marketplace ${CLAUDE_PLUGIN_MARKETPLACE} is not declared at user scope."
+      log_warn "Refusing to mutate a project/local declaration whose scope is absent from marketplace list JSON."
+      return 0
+    fi
+    if ! printf '%s' "$user_marketplace_entry" | jq -e '
+      try (
+        type == "object" and
+        (.source | type) == "object" and
+        (.source.source | type) == "string" and
+        (.source.source | length) > 0 and
+        (.source | (.repo == null or (.repo | type) == "string")) and
+        (.source | (.ref == null or (.ref | type) == "string")) and
+        (.source | (.path == null or (.path | type) == "string"))
+      ) catch false
+    ' >/dev/null 2>&1; then
+      log_warn "Claude marketplace ${CLAUDE_PLUGIN_MARKETPLACE} has a malformed user-scoped source declaration."
+      log_warn "Refusing to guess or mutate plugin state."
+      return 0
+    fi
+    source="$(printf '%s' "$user_marketplace_entry" | jq -r '.source.source // empty')"
+    repo="$(printf '%s' "$user_marketplace_entry" | jq -r '.source.repo // empty')"
+    ref="$(printf '%s' "$user_marketplace_entry" | jq -r '.source.ref // empty')"
+    listed_source="$(printf '%s' "$marketplace_entry" | jq -r '.source // empty')"
+    listed_repo="$(printf '%s' "$marketplace_entry" | jq -r '.repo // empty')"
+    listed_ref="$(printf '%s' "$marketplace_entry" | jq -r '.ref // empty')"
+    if [[ "$source" != "$listed_source" || "$repo" != "$listed_repo" || "$ref" != "$listed_ref" ]]; then
+      log_warn "Claude's marketplace inventory disagrees with its user-scoped declaration; refusing to mutate it."
+      return 0
+    fi
     if [[ "$source" == "directory" ]]; then
       log_warn "Claude marketplace ${CLAUDE_PLUGIN_MARKETPLACE} still points at a local directory."
       log_warn "That source can copy .env, virtualenvs, databases, and other ignored files into Claude's cache."
-      log_warn "No uninstall/remove was run because both delete cached plugin state. After explicit approval, migrate with:"
+      log_warn "No uninstall/remove was run because marketplace removal uninstalls its plugins and changes cached install state."
+      log_warn "After explicit approval, migrate this verified user-scoped declaration with:"
       _print "  claude plugin uninstall ${CLAUDE_PLUGIN_ID} --scope user --keep-data"
       _print "  claude plugin marketplace remove ${CLAUDE_PLUGIN_MARKETPLACE} --scope user"
       _print "  claude plugin marketplace add ${CLAUDE_PLUGIN_REPOSITORY} --scope user --sparse .claude-plugin skills scripts/hooks"
@@ -152,10 +254,65 @@ _install_or_update_claude_plugin() {
       log_warn "Claude marketplace ${CLAUDE_PLUGIN_MARKETPLACE} has an unexpected source; refusing to replace it."
       return 0
     fi
+    if [[ -n "$ref" ]]; then
+      log_warn "Claude marketplace ${CLAUDE_PLUGIN_MARKETPLACE} is pinned to ref ${ref}; refusing to claim every-commit updates."
+      return 0
+    fi
+    if ! printf '%s' "$user_marketplace_entry" | jq -e '
+      (.source | type) == "object" and (
+        ((.source | has("path")) | not) or
+        .source.path == null or
+        .source.path == ".claude-plugin/marketplace.json"
+      )
+    ' >/dev/null 2>&1; then
+      log_warn "Claude marketplace ${CLAUDE_PLUGIN_MARKETPLACE} uses an unexpected manifest path; refusing to mutate it."
+      return 0
+    fi
+    if ! printf '%s' "$user_marketplace_entry" | jq -e '
+      (.source | type) == "object" and (
+        ((.source | has("sparsePaths")) | not) or
+        (
+          (.source.sparsePaths | type) == "array" and
+          (.source.sparsePaths | sort) == [".claude-plugin", "scripts/hooks", "skills"]
+        )
+      )
+    ' >/dev/null 2>&1; then
+      log_warn "Claude marketplace ${CLAUDE_PLUGIN_MARKETPLACE} uses unexpected sparse checkout paths; refusing to mutate it."
+      return 0
+    fi
     if ! _claude_plugin_cli marketplace update "$CLAUDE_PLUGIN_MARKETPLACE"; then
       log_warn "Could not update the Claude marketplace; hooks and MCP remain installed."
       return 0
     fi
+  fi
+
+  post_marketplaces="$(_claude_plugin_cli marketplace list --json 2>/dev/null)" || {
+    log_warn "Marketplace mutation completed, but its resulting state could not be inspected."
+    return 0
+  }
+  post_marketplace_entry="$(printf '%s' "$post_marketplaces" | jq -c \
+    --arg name "$CLAUDE_PLUGIN_MARKETPLACE" \
+    --arg repo "$CLAUDE_PLUGIN_REPOSITORY" '
+    [.[] | select(
+      .name == $name and .source == "github" and .repo == $repo and
+      ((.ref // "") == "") and ((.installLocation // "") != "")
+    )] | if length == 1 then .[0] else null end
+  ' 2>/dev/null)" || post_marketplace_entry="null"
+  if [[ "$post_marketplace_entry" == "null" ]]; then
+    log_warn "Claude marketplace ${CLAUDE_PLUGIN_MARKETPLACE} is not an unpinned GitHub checkout after mutation."
+    return 0
+  fi
+  install_location="$(printf '%s' "$post_marketplace_entry" | jq -r '.installLocation')"
+  install_location="$(_normalize_claude_path "$install_location")" || return 0
+  expected_sha="$(git -C "$install_location" rev-parse --verify HEAD 2>/dev/null)" || {
+    log_warn "Could not read the exact Git HEAD from Claude marketplace checkout ${install_location}; refusing to claim freshness."
+    return 0
+  }
+  if ! printf '%s' "$expected_sha" | jq -R -e '
+    test("^[0-9a-f]{40}([0-9a-f]{24})?$")
+  ' >/dev/null 2>&1; then
+    log_warn "Claude marketplace returned an invalid full Git commit identity; refusing to claim freshness."
+    return 0
   fi
 
   plugins="$(_claude_plugin_cli list --json 2>/dev/null)" || {
@@ -166,21 +323,64 @@ _install_or_update_claude_plugin() {
     log_warn "Claude returned invalid plugin JSON; refusing to guess or mutate plugin state."
     return 0
   fi
-  installed="$(printf '%s' "$plugins" | jq -r --arg id "$CLAUDE_PLUGIN_ID" \
-    'any(.[]; .id == $id and .scope == "user")')"
-  if [[ "$installed" == "true" ]]; then
-    if _claude_plugin_cli update "$CLAUDE_PLUGIN_ID" --scope user; then
-      log_ok "Updated Claude plugin ${CLAUDE_PLUGIN_ID} from tracked Git files."
-      log_warn "Restart Claude Code to activate the updated plugin snapshot."
-    else
+  plugin_entry="$(printf '%s' "$plugins" | jq -c --arg id "$CLAUDE_PLUGIN_ID" \
+    '[.[] | select(.id == $id and .scope == "user")] | if length == 0 then null elif length == 1 then .[0] else error("duplicate plugin") end' \
+    2>/dev/null)" || {
+      log_warn "Claude reported duplicate user-scoped plugin entries; refusing to mutate plugin state."
+      return 0
+    }
+  if [[ "$plugin_entry" != "null" ]]; then
+    enabled="$(printf '%s' "$plugin_entry" | jq -r '.enabled // false')"
+    if ! _claude_plugin_cli update "$CLAUDE_PLUGIN_ID" --scope user; then
       log_warn "Could not update Claude plugin ${CLAUDE_PLUGIN_ID}; hooks and MCP remain installed."
+      return 0
     fi
+    if [[ "$enabled" != "true" ]] && ! _claude_plugin_cli enable "$CLAUDE_PLUGIN_ID" --scope user; then
+      log_warn "Updated Claude plugin ${CLAUDE_PLUGIN_ID}, but could not enable it."
+      return 0
+    fi
+    action="Updated"
+    action_lower="updated"
   elif _claude_plugin_cli install "$CLAUDE_PLUGIN_ID" --scope user; then
-    log_ok "Installed Claude plugin ${CLAUDE_PLUGIN_ID} from tracked Git files."
-    log_warn "Restart Claude Code to activate the installed plugin snapshot."
+    action="Installed"
+    action_lower="installed"
   else
     log_warn "Could not install Claude plugin ${CLAUDE_PLUGIN_ID}; hooks and MCP remain installed."
+    return 0
   fi
+
+  post_plugins="$(_claude_plugin_cli list --json 2>/dev/null)" || {
+    log_warn "Plugin mutation completed, but its resulting state could not be inspected."
+    return 0
+  }
+  post_plugin_entry="$(printf '%s' "$post_plugins" | jq -c --arg id "$CLAUDE_PLUGIN_ID" '
+    [.[] | select(.id == $id and .scope == "user")] |
+    if length == 1 and (.[0].enabled == true) and ((.[0].errors // []) == [])
+    then .[0] else null end
+  ' 2>/dev/null)" || post_plugin_entry="null"
+  if [[ "$post_plugin_entry" == "null" ]]; then
+    log_warn "Claude plugin ${CLAUDE_PLUGIN_ID} is not enabled and error-free after mutation."
+    return 0
+  fi
+  plugin_version="$(printf '%s' "$post_plugin_entry" | jq -r '.version // empty')"
+  plugin_install_path="$(printf '%s' "$post_plugin_entry" | jq -r '.installPath // empty')"
+  plugin_install_path="$(_normalize_claude_path "$plugin_install_path")" || return 0
+  plugin_cache_root="${CLAUDE_CODE_PLUGIN_CACHE_DIR:-${CLAUDE_DIR}/plugins}"
+  plugin_cache_root="$(_normalize_claude_path "$plugin_cache_root")" || return 0
+  expected_install_path="$(_normalize_claude_path \
+    "${plugin_cache_root}/cache/${CLAUDE_PLUGIN_MARKETPLACE}/mcp-agent-mail/${expected_sha}")" || return 0
+  if [[ "$plugin_version" != "$expected_sha" ]]; then
+    log_warn "Claude plugin ${CLAUDE_PLUGIN_ID} reports version ${plugin_version:-<missing>} instead of marketplace Git HEAD ${expected_sha}."
+    return 0
+  fi
+  if [[ "$plugin_install_path" != "$expected_install_path" ]]; then
+    log_warn "Claude plugin ${CLAUDE_PLUGIN_ID} is not installed from its exact Git-SHA cache path."
+    return 0
+  fi
+
+  CLAUDE_PLUGIN_READY=1
+  log_ok "${action} Claude plugin ${CLAUDE_PLUGIN_ID} from tracked Git files."
+  log_warn "Restart Claude Code to activate the ${action_lower} plugin snapshot."
 }
 
 # Preflight every input before creating a directory, backup, or partial hook
@@ -719,7 +919,11 @@ set_secure_file "$CLAUDE_USER_JSON" || true
 log_step "Installing/updating the Claude plugin"
 _install_or_update_claude_plugin
 
-log_ok "==> Claude Code user integration complete."
+if [[ "$CLAUDE_PLUGIN_READY" == "1" ]]; then
+  log_ok "==> Claude Code user integration complete; plugin state verified."
+else
+  log_warn "==> Claude hooks and MCP integration complete; plugin state still requires operator attention."
+fi
 _print "Hook settings: ${SETTINGS_PATH}"
 _print "Hook scripts: ${HOOKS_DIR}"
 _print "MCP server: user scope in ${CLAUDE_USER_JSON}"

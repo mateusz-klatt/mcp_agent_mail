@@ -27,6 +27,9 @@ from mcp_agent_mail import config as config_module, db as db_module, utils as ut
 # exception that quotes it turns a configuration mistake into a credential in
 # the terminal scrollback and in whatever ships the logs.
 URL_SECRET = "hunter2-never-print-me"
+BUILD_COMMIT_VARIABLE = "MCP_AGENT_MAIL_BUILD_COMMIT"
+BUILD_SHA_1 = "a" * 40
+BUILD_SHA_256 = "b" * 64
 
 
 def _settings_from(monkeypatch, **environment: str):
@@ -98,6 +101,47 @@ def test_an_absent_variable_takes_the_compiled_default(monkeypatch):
     monkeypatch.delenv("DATABASE_POOL_SIZE", raising=False)
     config_module.clear_settings_cache()
     assert config_module.get_settings().database.pool_size == 50
+
+
+@mark.parametrize("git_sha", (BUILD_SHA_1, BUILD_SHA_256))
+def test_build_commit_accepts_only_full_lowercase_object_ids(monkeypatch, git_sha):
+    settings = _settings_from(monkeypatch, **{BUILD_COMMIT_VARIABLE: git_sha})
+    assert settings.build_commit == git_sha
+
+
+def test_blank_build_commit_means_provenance_is_unavailable(monkeypatch):
+    settings = _settings_from(monkeypatch, **{BUILD_COMMIT_VARIABLE: "   "})
+    assert settings.build_commit is None
+
+
+def test_absent_build_commit_means_provenance_is_unavailable(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(BUILD_COMMIT_VARIABLE, raising=False)
+    config_module.clear_settings_cache()
+    assert config_module.get_settings().build_commit is None
+
+
+@mark.parametrize(
+    "written",
+    (
+        "a" * 39,
+        "a" * 41,
+        "b" * 63,
+        "b" * 65,
+        "A" * 40,
+        "g" * 40,
+        "refs/heads/main",
+        "build-secret-must-not-be-echoed",
+    ),
+)
+def test_invalid_build_commit_stops_startup_without_echoing_input(
+    monkeypatch,
+    written,
+):
+    message = _refusal_for(monkeypatch, BUILD_COMMIT_VARIABLE, written)
+    assert BUILD_COMMIT_VARIABLE in message
+    assert "40- or 64-character" in message
+    assert written not in message
 
 
 # (variable, what the operator typed, anything else the message must carry)

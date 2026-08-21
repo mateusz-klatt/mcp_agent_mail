@@ -115,7 +115,7 @@ local_marker_status() {
 
 monitor_status() {
     local project="$1" agent="$2" slug marker meta pid meta_pid parent_pid supervise_parent
-    local installed_monitor running_hash installed_hash
+    local installed_monitor running_hash installed_hash stream delivery_status="unconfirmed"
     slug="$(am_state_component "${project}|${agent}")" || return 1
     marker="${AM_STATE_DIR}/watch/monitor-${slug}.pid"
     meta="${AM_STATE_DIR}/watch/monitor-${slug}.json"
@@ -182,12 +182,503 @@ monitor_status() {
     installed_monitor="$(dirname "$0")/inbox_watch_monitor.sh"
     running_hash="$(jq -r '.source_sha256 // empty' < "$meta" 2>/dev/null)"
     installed_hash="$(am_sha256 < "$installed_monitor" 2>/dev/null || true)"
+    stream="${AM_STATE_DIR}/watch/monitor-${slug}-${pid}.stream"
+    # The owner and source checks prove that the intended monitor process is
+    # running, but not that its long-lived delivery request is authenticated.
+    # Inspect only the exact stream owned by the validated pid. Never echo its
+    # contents: an error response can contain operational details that do not
+    # belong in a diagnostic transcript.
+    if [ -r "$stream" ] && grep -Fq 'Unauthorized' "$stream" 2>/dev/null; then
+        delivery_status="unauthorized"
+        printf 'monitor delivery: unauthorized; the running monitor may hold a stale bearer\n'
+    elif [ -r "$stream" ] && grep -q '^: ready' "$stream" 2>/dev/null; then
+        delivery_status="authenticated"
+        printf 'monitor delivery: authenticated (: ready observed)\n'
+    elif [ ! -s "$stream" ]; then
+        printf 'monitor delivery: unconfirmed; stream is empty or between reconnects\n'
+    else
+        printf 'monitor delivery: unconfirmed; stream response is transient or not recognized\n'
+    fi
     if [ -n "$running_hash" ] && [ "$running_hash" = "$installed_hash" ]; then
+        if [ "$delivery_status" = "unauthorized" ]; then
+            printf 'monitor: running pid %s; source is current, but delivery authentication failed\n' \
+                "$pid"
+            return 1
+        fi
         printf 'monitor: healthy pid %s; source is current\n' "$pid"
         return 0
     fi
     printf 'monitor: running pid %s from a different script snapshot; re-arm it\n' "$pid"
     return 1
+}
+
+# Claude's plugin cache and its user-scoped lifecycle hooks are two independent
+# installations. A cached `/doctor` used to inspect files relative to
+# CLAUDE_PLUGIN_ROOT, which made an old cache compare itself with itself and
+# report "current" while the marketplace source and the hooks actually in use
+# had moved on. Keep this inventory explicit: it is the same runtime surface
+# declared by the plugin plus the exact nine scripts copied by
+# integrate_claude_code.sh.
+CLAUDE_AGENT_MAIL_PLUGIN_ID="mcp-agent-mail@mateusz-klatt-mcp-agent-mail"
+CLAUDE_AGENT_MAIL_MARKETPLACE="mateusz-klatt-mcp-agent-mail"
+CLAUDE_AGENT_MAIL_PLUGIN_FILES=(
+    .claude-plugin/plugin.json
+    skills/doctor/SKILL.md
+    skills/onboard/SKILL.md
+    skills/wake/SKILL.md
+    scripts/hooks/inbox_watch_monitor.sh
+    scripts/hooks/agent_mail_common.sh
+    scripts/hooks/agent_mail_setup.sh
+)
+CLAUDE_AGENT_MAIL_HOOKS=(
+    agent_mail_common.sh
+    session_start.sh
+    inbox_check.sh
+    reservations_warn.sh
+    autoreserve.sh
+    session_end.sh
+    inbox_watch.sh
+    inbox_watch_monitor.sh
+    agent_mail_setup.sh
+)
+
+normalized_file_sha256() {
+    local path="$1" line
+    [ -r "$path" ] || return 1
+    # The Claude integrator deliberately writes LF copies even when a native
+    # Windows checkout has CRLF. Hash the same canonical stream so line-ending
+    # policy is not mistaken for stale code. No file contents or digest is ever
+    # printed by the diagnostic.
+    while IFS= read -r line || [ -n "$line" ]; do
+        printf '%s\n' "${line%$'\r'}"
+    done < "$path" | am_sha256_full
+}
+
+claude_inventory_path() {
+    local raw="$1"
+    case "$raw" in
+        ''|*$'\n'*|*$'\r'*) return 1 ;;
+    esac
+    am_normalize_runtime_user_path "$raw"
+}
+
+claude_profile_root() {
+    local raw normalized
+    if [ "${CLAUDE_CONFIG_DIR+x}" = x ]; then
+        [ -n "$CLAUDE_CONFIG_DIR" ] || return 1
+        raw="$CLAUDE_CONFIG_DIR"
+    else
+        raw="${HOME}/.claude"
+    fi
+    normalized="$(claude_inventory_path "$raw")" || return 1
+    case "$normalized" in
+        /*|[A-Za-z]:/*) printf '%s\n' "$normalized" ;;
+        *) return 1 ;;
+    esac
+}
+
+claude_inventory_command() (
+    # A denylist cannot enumerate future provider keys, database URLs, or helper
+    # tokens. Inventory needs only a small platform/runtime environment, so run
+    # the third-party CLI from the same allowlist as the Claude integrator.
+    local env_name
+    local safe_env=()
+    for env_name in \
+        HOME PATH USER LOGNAME USERNAME SHELL \
+        TMPDIR TMP TEMP CLAUDE_CODE_TMPDIR \
+        USERPROFILE APPDATA LOCALAPPDATA PROGRAMDATA SystemRoot SYSTEMROOT WINDIR \
+        COMSPEC ComSpec PATHEXT HOMEDRIVE HOMEPATH SystemDrive SYSTEMDRIVE \
+        XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_RUNTIME_DIR \
+        CLAUDE_CONFIG_DIR CLAUDE_CODE_PLUGIN_CACHE_DIR \
+        CLAUDE_CODE_PLUGIN_GIT_TIMEOUT_MS CLAUDE_CODE_PLUGIN_PREFER_HTTPS \
+        CLAUDE_CODE_CERT_STORE \
+        LANG LANGUAGE LC_ALL LC_COLLATE LC_CTYPE LC_MESSAGES LC_MONETARY LC_NUMERIC \
+        LC_TIME LC_ADDRESS LC_IDENTIFICATION LC_MEASUREMENT LC_NAME LC_PAPER \
+        LC_RESPONSE LC_TELEPHONE TERM COLORTERM NO_COLOR FORCE_COLOR TZ \
+        HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY FTP_PROXY \
+        http_proxy https_proxy all_proxy no_proxy ftp_proxy \
+        SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE CURL_CA_BUNDLE \
+        NODE_EXTRA_CA_CERTS GIT_SSL_CAINFO NIX_SSL_CERT_FILE \
+        MSYSTEM MSYS CYGWIN CHERE_INVOKING WSL_DISTRO_NAME WSL_INTEROP WSLENV \
+        DISABLE_TELEMETRY DISABLE_ERROR_REPORTING DO_NOT_TRACK \
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+    do
+        if [[ -n "${!env_name+x}" ]]; then
+            if [[ "$env_name" == CLAUDE_CONFIG_DIR && -z "${!env_name}" ]]; then
+                continue
+            fi
+            safe_env+=("${env_name}=${!env_name}")
+        fi
+    done
+    command env -i ${safe_env[@]+"${safe_env[@]}"} claude "$@"
+)
+
+is_full_lower_git_sha() {
+    local value="$1"
+    case "$value" in ''|*[!0-9a-f]*) return 1 ;; esac
+    [ "${#value}" -eq 40 ] || [ "${#value}" -eq 64 ]
+}
+
+claude_freshness_status() {
+    local plugins_json="" marketplaces_json="" plugin_count="" marketplace_count=""
+    local installed_version="" installed_root_raw="" installed_root="" installed_enabled=""
+    local installed_errors_state=""
+    local marketplace_root_raw="" marketplace_root="" marketplace_source=""
+    local source_version="" source_mode="" catalog_source=""
+    local manifest_version="" catalog_version="" source_git_sha=""
+    local installed_manifest_version="" installed_manifest_valid=0
+    local source_ready=0 installed_ready=0
+    local versions_match=1 rel source_hash installed_hash plugin_drift=0 hook_drift=0
+    local claude_root="" installed_hooks_root=""
+    CLAUDE_FRESHNESS_PROBLEMS=0
+
+    if claude_root="$(claude_profile_root)"; then
+        installed_hooks_root="${claude_root}/hooks/mcp-agent-mail"
+    else
+        printf 'Claude profile: CLAUDE_CONFIG_DIR must resolve to a non-empty absolute path\n'
+        CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+    fi
+
+    if ! command -v claude >/dev/null 2>&1; then
+        printf 'Claude plugin inventory: unavailable; claude CLI is not on PATH\n'
+        CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+        return
+    fi
+
+    if plugins_json="$(claude_inventory_command plugin list --json 2>/dev/null)" \
+        && printf '%s' "$plugins_json" | jq -e '
+            if type == "array" then .
+            elif type == "object" and (.plugins | type == "array") then .plugins
+            else error("unsupported plugin inventory") end
+            | all(.[]; type == "object")
+        ' >/dev/null 2>&1; then
+        plugin_count="$(printf '%s' "$plugins_json" | jq -r \
+            --arg id "$CLAUDE_AGENT_MAIL_PLUGIN_ID" '
+                if type == "array" then . else .plugins end
+                | [.[] | select(.id == $id)] | length
+            ')"
+        if [ "$plugin_count" = "1" ]; then
+            installed_version="$(printf '%s' "$plugins_json" | jq -r \
+                --arg id "$CLAUDE_AGENT_MAIL_PLUGIN_ID" '
+                    if type == "array" then . else .plugins end
+                    | [.[] | select(.id == $id)][0].version
+                    | strings | select(length > 0)
+                ' 2>/dev/null)"
+            installed_root_raw="$(printf '%s' "$plugins_json" | jq -r \
+                --arg id "$CLAUDE_AGENT_MAIL_PLUGIN_ID" '
+                    if type == "array" then . else .plugins end
+                    | [.[] | select(.id == $id)][0].installPath
+                    | strings | select(length > 0)
+                ' 2>/dev/null)"
+            installed_enabled="$(printf '%s' "$plugins_json" | jq -r \
+                --arg id "$CLAUDE_AGENT_MAIL_PLUGIN_ID" '
+                    if type == "array" then . else .plugins end
+                    | [.[] | select(.id == $id)][0].enabled
+                    | if . == true then "true"
+                      elif . == false then "false"
+                      else "invalid" end
+                ' 2>/dev/null)"
+            installed_errors_state="$(printf '%s' "$plugins_json" | jq -r \
+                --arg id "$CLAUDE_AGENT_MAIL_PLUGIN_ID" '
+                    if type == "array" then . else .plugins end
+                    | [.[] | select(.id == $id)][0]
+                    | if ((has("errors") | not) or .errors == null or .errors == [])
+                      then "clear"
+                      elif (.errors | type) == "array" then "reported"
+                      else "invalid" end
+                ' 2>/dev/null)"
+            if [ -n "$installed_version" ] \
+                && installed_root="$(claude_inventory_path "$installed_root_raw")" \
+                && [ -n "$installed_root" ]; then
+                installed_ready=1
+                if [ "$installed_enabled" = "false" ]; then
+                    printf 'Claude plugin: installed at version %s but disabled\n' \
+                        "$installed_version"
+                    CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+                elif [ "$installed_enabled" != "true" ]; then
+                    printf 'Claude plugin inventory: enabled state is missing or invalid\n'
+                    CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+                fi
+                if [ "$installed_errors_state" = "reported" ]; then
+                    printf 'Claude plugin inventory: Agent Mail entry reports plugin errors\n'
+                    CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+                elif [ "$installed_errors_state" != "clear" ]; then
+                    printf 'Claude plugin inventory: errors state is missing or invalid\n'
+                    CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+                fi
+            else
+                printf 'Claude plugin inventory: Agent Mail entry has invalid version or installPath\n'
+                CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+            fi
+        elif [ "$plugin_count" = "0" ]; then
+            printf 'Claude plugin: mcp-agent-mail is not installed\n'
+            CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+        else
+            printf 'Claude plugin inventory: %s Agent Mail entries are ambiguous\n' \
+                "$plugin_count"
+            CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+        fi
+    else
+        printf 'Claude plugin inventory: claude plugin list --json failed or returned an unsupported shape\n'
+        CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+    fi
+
+    if marketplaces_json="$(claude_inventory_command plugin marketplace list --json 2>/dev/null)" \
+        && printf '%s' "$marketplaces_json" | jq -e '
+            if type == "array" then .
+            elif type == "object" and (.marketplaces | type == "array") then .marketplaces
+            else error("unsupported marketplace inventory") end
+            | all(.[]; type == "object")
+        ' >/dev/null 2>&1; then
+        marketplace_count="$(printf '%s' "$marketplaces_json" | jq -r \
+            --arg name "$CLAUDE_AGENT_MAIL_MARKETPLACE" '
+                if type == "array" then . else .marketplaces end
+                | [.[] | select(.name == $name)] | length
+            ')"
+        if [ "$marketplace_count" = "1" ]; then
+            marketplace_root_raw="$(printf '%s' "$marketplaces_json" | jq -r \
+                --arg name "$CLAUDE_AGENT_MAIL_MARKETPLACE" '
+                    if type == "array" then . else .marketplaces end
+                    | [.[] | select(.name == $name)][0].installLocation
+                    | strings | select(length > 0)
+                ' 2>/dev/null)"
+            marketplace_source="$(printf '%s' "$marketplaces_json" | jq -r \
+                --arg name "$CLAUDE_AGENT_MAIL_MARKETPLACE" '
+                    if type == "array" then . else .marketplaces end
+                    | [.[] | select(.name == $name)][0].source
+                    | strings | select(length > 0)
+                ' 2>/dev/null)"
+            if marketplace_root="$(claude_inventory_path "$marketplace_root_raw")" \
+                && [ -n "$marketplace_root" ] && [ -n "$marketplace_source" ]; then
+                if ! jq -e '
+                        type == "object" and .name == "mcp-agent-mail" and
+                        ((has("version") | not) or
+                         (.version | type == "string" and length > 0))
+                    ' "${marketplace_root}/.claude-plugin/plugin.json" \
+                        >/dev/null 2>&1; then
+                    printf 'Claude plugin source: plugin manifest is invalid or missing\n'
+                    CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+                elif ! jq -e '
+                        type == "object" and (.plugins | type == "array") and
+                        ([.plugins[] | select(.name == "mcp-agent-mail")] | length) == 1 and
+                        ([.plugins[] | select(.name == "mcp-agent-mail")][0] |
+                         ((has("version") | not) or
+                          (.version | type == "string" and length > 0)))
+                    ' "${marketplace_root}/.claude-plugin/marketplace.json" \
+                        >/dev/null 2>&1; then
+                    printf 'Claude plugin source: marketplace manifest is invalid or ambiguous\n'
+                    CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+                else
+                    manifest_version="$(jq -r '.version // empty' \
+                        "${marketplace_root}/.claude-plugin/plugin.json" 2>/dev/null)"
+                    catalog_version="$(jq -r '
+                        [.plugins[] | select(.name == "mcp-agent-mail")][0].version // empty
+                    ' "${marketplace_root}/.claude-plugin/marketplace.json" 2>/dev/null)"
+                    catalog_source="$(jq -r '
+                        [.plugins[] | select(.name == "mcp-agent-mail")][0].source
+                        | strings | select(. == "./")
+                    ' "${marketplace_root}/.claude-plugin/marketplace.json" 2>/dev/null)"
+                    if [ -n "$manifest_version" ]; then
+                        source_version="$manifest_version"
+                        source_mode="explicit"
+                    elif [ -n "$catalog_version" ]; then
+                        source_version="$catalog_version"
+                        source_mode="explicit"
+                    else
+                        case "$marketplace_source" in
+                            github|git|url|directory)
+                                if [ -z "$catalog_source" ]; then
+                                    printf 'Claude plugin source: Git-SHA mode requires the root-relative ./ plugin in the Git-backed marketplace\n'
+                                    CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+                                else
+                                    source_git_sha="$(am_git "$marketplace_root" rev-parse HEAD)"
+                                    if is_full_lower_git_sha "$source_git_sha"; then
+                                        source_version="$source_git_sha"
+                                        if [ "$marketplace_source" = "directory" ]; then
+                                            source_mode="directory"
+                                        else
+                                            source_mode="git"
+                                        fi
+                                    elif [ "$marketplace_source" = "directory" ] \
+                                        && [ "$(am_git "$marketplace_root" rev-parse --is-inside-work-tree)" = "true" ]; then
+                                        printf 'Claude plugin source: live marketplace directory is a Git worktree, but its exact HEAD is unavailable or invalid\n'
+                                        CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+                                        source_version="live-directory"
+                                        source_mode="directory"
+                                    else
+                                        printf 'Claude plugin source: marketplace %s cannot be verified as a Git worktree with an exact HEAD\n' \
+                                            "$marketplace_source"
+                                        CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+                                        if [ "$marketplace_source" = "directory" ]; then
+                                            source_version="live-directory"
+                                            source_mode="directory"
+                                        fi
+                                    fi
+                                fi ;;
+                            *)
+                                printf 'Claude plugin source: version fields are absent but marketplace source %s is not Git-backed\n' \
+                                    "$marketplace_source"
+                                CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1)) ;;
+                        esac
+                    fi
+                    if [ -n "$manifest_version" ] && [ -n "$catalog_version" ] \
+                        && [ "$manifest_version" != "$catalog_version" ]; then
+                        printf 'Claude plugin source: manifest version %s differs from marketplace version %s\n' \
+                            "$manifest_version" "$catalog_version"
+                        CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+                        versions_match=0
+                    fi
+                    if [ -n "$source_version" ]; then
+                        if [ "$versions_match" -eq 1 ] \
+                            || [ "$marketplace_source" = "directory" ]; then
+                            source_ready=1
+                        fi
+                    fi
+                    if [ "$source_ready" -eq 1 ] \
+                        && [ "$marketplace_source" = "directory" ]; then
+                        source_mode="directory"
+                        if [ -z "$source_git_sha" ]; then
+                            source_git_sha="$(am_git "$marketplace_root" rev-parse HEAD)"
+                        fi
+                        if is_full_lower_git_sha "$source_git_sha"; then
+                            printf 'Claude plugin source: live Git-backed directory at %s\n' \
+                                "$source_git_sha"
+                        else
+                            printf 'Claude plugin source: live directory has no verifiable exact Git HEAD\n'
+                        fi
+                        printf 'Claude plugin source: legacy directory mode is not an immutable tracked-file snapshot\n'
+                        CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+                    fi
+                fi
+            else
+                printf 'Claude marketplace inventory: Agent Mail source or installLocation is invalid\n'
+                CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+            fi
+        elif [ "$marketplace_count" = "0" ]; then
+            printf 'Claude marketplace: %s is not configured\n' \
+                "$CLAUDE_AGENT_MAIL_MARKETPLACE"
+            CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+        else
+            printf 'Claude marketplace inventory: %s Agent Mail entries are ambiguous\n' \
+                "$marketplace_count"
+            CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+        fi
+    else
+        printf 'Claude marketplace inventory: claude plugin marketplace list --json failed or returned an unsupported shape\n'
+        CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+    fi
+
+    if [ "$installed_ready" -eq 1 ] && [ "$source_mode" != "directory" ]; then
+        if ! jq -e '
+                type == "object" and .name == "mcp-agent-mail" and
+                ((has("version") | not) or
+                 (.version | type == "string" and length > 0))
+            ' "${installed_root}/.claude-plugin/plugin.json" \
+                >/dev/null 2>&1; then
+            printf 'Claude plugin cache: installed manifest is invalid or missing\n'
+            CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+            versions_match=0
+        else
+            installed_manifest_valid=1
+            installed_manifest_version="$(jq -r '.version // empty' \
+                "${installed_root}/.claude-plugin/plugin.json" 2>/dev/null)"
+        fi
+        if [ "$installed_manifest_valid" -eq 1 ]; then
+            if [ -n "$installed_manifest_version" ] \
+                && [ "$installed_manifest_version" != "$installed_version" ]; then
+                printf 'Claude plugin cache: inventory version %s differs from cached manifest version %s\n' \
+                    "$installed_version" "$installed_manifest_version"
+                CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+                versions_match=0
+            elif [ -z "$installed_manifest_version" ] && [ "$source_mode" = "explicit" ]; then
+                printf 'Claude plugin cache: explicit-version source has no cached manifest version\n'
+                CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+                versions_match=0
+            elif [ -z "$installed_manifest_version" ] \
+                && ! is_full_lower_git_sha "$installed_version"; then
+                printf 'Claude plugin cache: versionless manifest requires a full lowercase Git SHA inventory version\n'
+                CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+                versions_match=0
+            fi
+        fi
+    fi
+
+    if [ "$source_ready" -eq 1 ] && [ "$installed_ready" -eq 1 ]; then
+        if [ "$source_mode" = "directory" ]; then
+            printf 'Claude plugin version: cached inventory %s is not a freshness signal for a live directory source\n' \
+                "$installed_version"
+            printf 'Claude plugin files: live from marketplace directory; cache comparison is not applicable\n'
+        elif [ "$installed_version" != "$source_version" ]; then
+            # Exact identity is intentional. Ordering version strings would
+            # misclassify 0.10 versus 0.9 and still would not answer whether
+            # the selected cache is the source snapshot Claude will execute.
+            if [ "$source_mode" = "git" ]; then
+                printf 'Claude plugin version: installed %s differs from source Git HEAD %s\n' \
+                    "$installed_version" "$source_version"
+            else
+                printf 'Claude plugin version: installed %s differs from source %s\n' \
+                    "$installed_version" "$source_version"
+            fi
+            CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+            versions_match=0
+        elif [ "$versions_match" -eq 1 ]; then
+            if [ "$source_mode" = "git" ]; then
+                printf 'Claude plugin version: current (%s exact Git SHA match)\n' \
+                    "$source_version"
+            else
+                printf 'Claude plugin version: current (%s exact match)\n' "$source_version"
+            fi
+        fi
+
+        if [ "$source_mode" != "directory" ] && [ "$versions_match" -eq 1 ]; then
+            for rel in "${CLAUDE_AGENT_MAIL_PLUGIN_FILES[@]}"; do
+                if ! source_hash="$(normalized_file_sha256 "${marketplace_root}/${rel}")"; then
+                    printf 'Claude plugin file: source missing or unreadable: %s\n' "$rel"
+                    CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+                    plugin_drift=$((plugin_drift + 1))
+                elif ! installed_hash="$(normalized_file_sha256 "${installed_root}/${rel}")"; then
+                    printf 'Claude plugin file: installed copy missing or unreadable: %s\n' "$rel"
+                    CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+                    plugin_drift=$((plugin_drift + 1))
+                elif [ "$source_hash" != "$installed_hash" ]; then
+                    printf 'Claude plugin file: same-version drift: %s\n' "$rel"
+                    CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+                    plugin_drift=$((plugin_drift + 1))
+                fi
+            done
+            if [ "$plugin_drift" -eq 0 ]; then
+                printf 'Claude plugin files: current (%s/%s normalized hashes match)\n' \
+                    "${#CLAUDE_AGENT_MAIL_PLUGIN_FILES[@]}" \
+                    "${#CLAUDE_AGENT_MAIL_PLUGIN_FILES[@]}"
+            fi
+        elif [ "$source_mode" != "directory" ]; then
+            printf 'Claude plugin files: hash comparison deferred until version metadata agrees\n'
+        fi
+    fi
+
+    if [ "$source_ready" -eq 1 ] && [ -n "$installed_hooks_root" ]; then
+        for rel in "${CLAUDE_AGENT_MAIL_HOOKS[@]}"; do
+            if ! source_hash="$(normalized_file_sha256 "${marketplace_root}/scripts/hooks/${rel}")"; then
+                printf 'Claude hook: source missing or unreadable: %s\n' "$rel"
+                CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+                hook_drift=$((hook_drift + 1))
+            elif ! installed_hash="$(normalized_file_sha256 "${installed_hooks_root}/${rel}")"; then
+                printf 'Claude hook: installed copy missing or unreadable: %s\n' "$rel"
+                CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+                hook_drift=$((hook_drift + 1))
+            elif [ "$source_hash" != "$installed_hash" ]; then
+                printf 'Claude hook: installed copy drift: %s\n' "$rel"
+                CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+                hook_drift=$((hook_drift + 1))
+            fi
+        done
+        if [ "$hook_drift" -eq 0 ]; then
+            printf 'Claude hooks: current (%s/%s normalized hashes match)\n' \
+                "${#CLAUDE_AGENT_MAIL_HOOKS[@]}" \
+                "${#CLAUDE_AGENT_MAIL_HOOKS[@]}"
+        fi
+    fi
+    return 0
 }
 
 [ "$#" -ge 3 ] || { usage; exit 2; }
@@ -294,6 +785,10 @@ if [ "$MODE" = "doctor" ]; then
     monitor_rc=$?
     if [ "$monitor_rc" -eq 1 ]; then
         problems=$((problems + 1))
+    fi
+    if [ "$CLIENT" = "claude" ]; then
+        claude_freshness_status
+        problems=$((problems + CLAUDE_FRESHNESS_PROBLEMS))
     fi
     if [ "$problems" -eq 0 ]; then
         printf 'result: healthy\n'

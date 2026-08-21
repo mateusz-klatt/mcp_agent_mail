@@ -20,7 +20,7 @@
       {
         "name": "inbox-watch",
         "description": "Agent Mail instant delivery (night monitor)",
-        "command": "${CLAUDE_PLUGIN_ROOT}/scripts/hooks/inbox_watch_monitor.sh claude ${AGENT_MAIL_CLAUDE_SLOT:-1}",
+        "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/hooks/inbox_watch_monitor.sh\" claude ${AGENT_MAIL_CLAUDE_SLOT:-1}",
         "when": "on-skill-invoke:mcp-agent-mail:wake"
       }
     ]

@@ -32,6 +32,7 @@ from typing import Any, AsyncContextManager, Callable, Optional, Union, cast
 from urllib.parse import parse_qsl
 import uuid
 
+import fastmcp
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import (
     ToolError as _FastMCPToolError,
@@ -2323,6 +2324,15 @@ def _public_runtime_descriptor(settings: Settings) -> dict[str, Any]:
     if commit:
         descriptor["commit"] = commit
     return descriptor
+
+
+def _authenticated_build_descriptor(settings: Settings) -> dict[str, str | None]:
+    """Return immutable build identity for authenticated diagnostics."""
+    return {
+        "application_version": package_version(),
+        "fastmcp_version": fastmcp.__version__,
+        "git_sha": settings.build_commit,
+    }
 
 
 def _format_cross_project_agent_address(project_slug: str, agent_name: str) -> str:
@@ -8636,7 +8646,12 @@ def build_mcp_server() -> FastMCP:
         -------
         dict
             {
-              "status": "ok" | "degraded" | "error",
+              "status": "ok" | "degraded",
+              "build": {
+                "application_version": str,
+                "fastmcp_version": str,
+                "git_sha": str | null
+              },
               "environment": str,
               "http_host": str,
               "http_port": int,
@@ -8667,11 +8682,13 @@ def build_mcp_server() -> FastMCP:
         if database_status is None:
             return {
                 "status": "ok",
+                "build": _authenticated_build_descriptor(settings),
                 **_public_runtime_descriptor(settings),
             }
         return {
             "status": "degraded",
             "database": f"unreadable ({database_status})",
+            "build": _authenticated_build_descriptor(settings),
             **_public_runtime_descriptor(settings),
         }
 

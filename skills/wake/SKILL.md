@@ -24,7 +24,7 @@ arming is a deliberate act by whoever is leaving.
 Confirm it actually started with the exact-mailbox diagnostic, then stop:
 
 ```bash
-"${CLAUDE_PLUGIN_ROOT}/scripts/hooks/agent_mail_setup.sh" \
+"${CLAUDE_CONFIG_DIR-${HOME}/.claude}/hooks/mcp-agent-mail/agent_mail_setup.sh" \
   doctor claude "${AGENT_MAIL_CLAUDE_SLOT:-1}"
 ```
 
@@ -35,11 +35,12 @@ non-secret labels in its argv and private metadata; doctor checks that exact
 record, its parent process, and its source checksum.
 
 If doctor says the monitor is absent, the host did not honour the trigger. Arm
-the repository script through the **Monitor tool**, persistent and with no
+the integrator-managed script through the **Monitor tool**, persistent and with no
 timeout — not a backgrounded shell command:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/hooks/inbox_watch_monitor.sh claude 1
+"${CLAUDE_CONFIG_DIR-${HOME}/.claude}/hooks/mcp-agent-mail/inbox_watch_monitor.sh" \
+  claude "${AGENT_MAIL_CLAUDE_SLOT:-1}"
 ```
 
 Pass the actual slot when it is not 1, then run doctor again. A healthy monitor
@@ -47,10 +48,13 @@ prints nothing. If credentials are not present yet, leave the existing monitor
 alone: it re-reads private state and starts delivering automatically after
 `/mcp-agent-mail:onboard` succeeds.
 
-If doctor reports a different script snapshot after a pull, stop/re-arm it. A
-cached plugin copy does not track the repository; when that copy is stale,
-refresh the plugin with uninstall followed by install. `plugin update` at an
-unchanged version does not refresh the cache.
+If doctor reports a different running script snapshot, stop/re-arm it from the
+integrator-managed path above. If it reports user-hook drift, rerun
+`scripts/integrate_claude_code.sh`. A cached plugin copy does not track the
+marketplace source. For Git-SHA versioning, update the marketplace and then the
+plugin. For same-explicit-version file drift, refresh with uninstall followed by
+install; `plugin update` at an unchanged explicit version does not refresh the
+cache.
 
 Once armed, each new message wakes this session with a single line naming the
 message id. The hooks deliver the content as usual; the monitor only ends the

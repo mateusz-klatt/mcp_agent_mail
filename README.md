@@ -68,11 +68,12 @@ curl -fsSL "https://raw.githubusercontent.com/mateusz-klatt/mcp_agent_mail/v0.5.
 1. Install or refresh the user-level lifecycle hooks and, for Claude Code, the
    bundled `mcp-agent-mail` plugin that supplies `/onboard`, `/doctor` and
    `/wake`. The Claude integrator registers the GitHub marketplace with a
-   sparse Git checkout containing only `.claude-plugin`, `skills`, and
-   `scripts/hooks`; ignored files such as `.env`, `.venv`, and SQLite databases
-   therefore cannot enter the plugin cache. Plugin releases use the Git commit
-   SHA as their cache version, so every new commit is updateable without a
-   manual version bump.
+   sparse Git checkout for the `.claude-plugin`, `skills`, and `scripts/hooks`
+   cones (plus Git cone-mode ancestor files). Every copied file is tracked;
+   ignored files such as `.env`, `.venv`, and SQLite databases therefore cannot
+   enter the plugin cache. Plugin releases use the Git commit
+   SHA as their cache version, so every pushed commit on the source branch is
+   updateable without a manual version bump.
    Re-running `scripts/integrate_claude_code.sh --yes` or
    `scripts/integrate_codex_cli.sh --yes` updates the managed copies; uninstall
    is not required for hooks or for a GitHub-installed Claude plugin. A legacy

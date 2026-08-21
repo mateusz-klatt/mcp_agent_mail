@@ -40,6 +40,8 @@ def _render_chain_runner_script(hook_name: str) -> str:
         "#!/usr/bin/env python3",
         f"# mcp-agent-mail chain-runner ({hook_name})",
         "import os",
+        "import shlex",
+        "import shutil",
         "import sys",
         "import stat",
         "import subprocess",
@@ -62,7 +64,8 @@ def _render_chain_runner_script(hook_name: str) -> str:
         "    if not RUN_DIR.exists() or not RUN_DIR.is_dir():",
         "        return []",
         "    items = sorted([p for p in RUN_DIR.iterdir() if p.is_file()], key=lambda p: p.name)",
-        "    # On POSIX, honor exec bit; on Windows, include all files (we'll dispatch .py via python).",
+        "    # POSIX has a meaningful executable bit. Windows entries are",
+        "    # validated by _windows_argv before anything is launched.",
         "    if os.name == 'posix':",
         "        try:",
         "            items = [p for p in items if _is_exec(p)]",
@@ -76,7 +79,6 @@ def _render_chain_runner_script(hook_name: str) -> str:
         "def _win_sh() -> str:",
         "    # A hook can be launched outside Git's own shell environment, so",
         "    # resolve sh explicitly and then inspect Git for Windows as fallback.",
-        "    import shutil",
         "    found = shutil.which('sh')",
         "    if found:",
         "        return found",
@@ -111,20 +113,65 @@ def _render_chain_runner_script(hook_name: str) -> str:
         "    value = str(path)",
         "    return value.replace('\\\\', '/') if os.name != 'posix' else value",
         "",
+        "def _windows_argv(path: Path):",
+        "    # CreateProcess cannot honor shebangs, and Python may implicitly",
+        "    # hand .bat/.cmd files to cmd.exe without safely quoting Git's",
+        "    # remote arguments. Resolve an explicit interpreter or fail closed.",
+        "    suffix = path.suffix.lower()",
+        "    if suffix == '.py':",
+        "        return [sys.executable, str(path), *ARGV]",
+        "    if suffix in ('.exe', '.com'):",
+        "        return [str(path), *ARGV]",
+        "    if suffix in ('.bat', '.cmd'):",
+        "        return None",
+        "    if suffix == '.ps1':",
+        "        powershell = shutil.which('pwsh') or shutil.which('powershell')",
+        "        if not powershell:",
+        "            return None",
+        "        return [powershell, '-NoProfile', '-NonInteractive', '-File', str(path), *ARGV]",
+        "    shebang = _read_shebang(path)",
+        "    if not shebang:",
+        "        if suffix == '.sh':",
+        "            return [_win_sh(), _shell_path(path), *ARGV]",
+        "        return None",
+        "    try:",
+        "        parts = shlex.split(shebang, posix=True)",
+        "    except ValueError:",
+        "        return None",
+        "    if not parts:",
+        "        return None",
+        "    command = Path(parts[0].replace('\\\\', '/')).name.lower()",
+        "    interpreter_args = parts[1:]",
+        "    if command in ('env', 'env.exe'):",
+        "        if interpreter_args[:1] == ['-S']:",
+        "            interpreter_args = interpreter_args[1:]",
+        "        if not interpreter_args or interpreter_args[0].startswith('-'):",
+        "            return None",
+        "        command = Path(interpreter_args[0].replace('\\\\', '/')).name.lower()",
+        "        interpreter_args = interpreter_args[1:]",
+        "    if command in ('python', 'python3', 'python.exe', 'python3.exe'):",
+        "        return [sys.executable, *interpreter_args, str(path), *ARGV]",
+        "    if command in ('sh', 'sh.exe'):",
+        "        return [_win_sh(), *interpreter_args, _shell_path(path), *ARGV]",
+        "    if command in ('bash', 'bash.exe', 'dash', 'dash.exe'):",
+        "        interpreter = shutil.which(command)",
+        "        if not interpreter:",
+        "            return None",
+        "        return [interpreter, *interpreter_args, _shell_path(path), *ARGV]",
+        "    if command in ('cmd', 'cmd.exe'):",
+        "        return None",
+        "    interpreter = shutil.which(command)",
+        "    if not interpreter:",
+        "        return None",
+        "    return [interpreter, *interpreter_args, str(path), *ARGV]",
+        "",
         "def _run_child(path: Path, *, stdin_bytes=None):",
         "    argv = [str(path), *ARGV]",
         "    if os.name != 'posix':",
-        "        # CreateProcess cannot interpret shebangs. Dispatch scripts",
-        "        # explicitly while leaving PE files and PATHEXT commands native.",
-        "        suffix = path.suffix.lower()",
-        "        if suffix == '.py':",
-        "            argv = [sys.executable, str(path), *ARGV]",
-        "        elif suffix not in ('.exe', '.com', '.bat', '.cmd'):",
-        "            shebang = _read_shebang(path).lower()",
-        "            if 'python' in shebang:",
-        "                argv = [sys.executable, str(path), *ARGV]",
-        "            else:",
-        "                argv = [_win_sh(), _shell_path(path), *ARGV]",
+        "        argv = _windows_argv(path)",
+        "        if argv is None:",
+        "            sys.stderr.write(f'Unsupported Windows hook child: {path}\\n')",
+        "            return 126",
         "    return subprocess.run(argv, input=stdin_bytes, check=False).returncode",
         "",
         "def _is_husky_stub(path: Path) -> bool:",
@@ -138,17 +185,19 @@ def _render_chain_runner_script(hook_name: str) -> str:
         "    except Exception:",
         "        return False",
         "    normalized = text.replace('\\\\', '/')",
-        "    return '$0' in text and ('/h\"' in normalized or \"/h'\" in normalized)",
+        "    body = [line.strip() for line in normalized.splitlines()",
+        "            if line.strip() and not line.lstrip().startswith('#')]",
+        "    return body.count('. \"$(dirname \"$0\")/h\"') == 1",
         "",
         "def _run_orig(*, stdin_bytes=None):",
         "    if _is_husky_stub(ORIG):",
-        "        # Source h in one shell while presenting the original hook name",
-        "        # as $0. After shifting h itself, $@ remains Git's hook argv.",
+        "        # Source the preserved stub under the original hook name so all",
+        "        # of its commands run and Husky's h resolver sees the right $0.",
         "        shell = '/bin/sh' if os.name == 'posix' else _win_sh()",
         "        argv0 = _shell_path(HOOK_DIR / HOOK_NAME)",
-        "        snippet = 'husky_h=\"$1\"; shift; . \"$husky_h\"'",
+        "        snippet = 'orig=\"$1\"; shift; . \"$orig\"'",
         "        return subprocess.run(",
-        "            [shell, '-c', snippet, argv0, _shell_path(HUSKY_H), *ARGV],",
+        "            [shell, '-c', snippet, argv0, _shell_path(ORIG), *ARGV],",
         "            input=stdin_bytes,",
         "            check=False,",
         "        ).returncode",
@@ -186,6 +235,33 @@ def _render_chain_runner_script(hook_name: str) -> str:
             "sys.exit(0)",
         ]
     return "\n".join(lines) + "\n"
+
+
+async def _preserve_foreign_hook(chain_path: Path, marker: str) -> None:
+    """Preserve a foreign hook without overwriting a different saved original."""
+
+    if not chain_path.exists():
+        return
+    try:
+        content = await asyncio.to_thread(chain_path.read_text, "utf-8")
+    except Exception:
+        content = ""
+    if marker in content:
+        return
+
+    orig_path = chain_path.with_name(f"{chain_path.name}.orig")
+    if orig_path.exists():
+        current_bytes, original_bytes = await asyncio.gather(
+            asyncio.to_thread(chain_path.read_bytes),
+            asyncio.to_thread(orig_path.read_bytes),
+        )
+        if current_bytes != original_bytes:
+            raise FileExistsError(
+                "Refusing to replace a foreign Git hook because a different "
+                f"saved hook already exists: {chain_path} and {orig_path}"
+            )
+        return
+    await asyncio.to_thread(chain_path.replace, orig_path)
 
 
 def _git(cwd: Path, *args: str) -> str | None:
@@ -846,16 +922,12 @@ async def install_guard(settings: Settings, project_slug: str, repo_path: Path) 
     await asyncio.to_thread(run_dir.mkdir, parents=True, exist_ok=True)
 
     chain_path = hooks_dir / "pre-commit"
-    # Preserve existing non-chain hook as .orig
-    if chain_path.exists():
-        try:
-            content = (await asyncio.to_thread(chain_path.read_text, "utf-8")).strip()
-        except Exception:
-            content = ""
-        if "mcp-agent-mail chain-runner (pre-commit)" not in content:
-            orig = hooks_dir / "pre-commit.orig"
-            if not orig.exists():
-                await asyncio.to_thread(chain_path.replace, orig)
+    # Preserve an existing non-chain hook, but never overwrite a different
+    # original left by an earlier installation.
+    await _preserve_foreign_hook(
+        chain_path,
+        "mcp-agent-mail chain-runner (pre-commit)",
+    )
     # Write/overwrite chain-runner
     chain_script = _render_chain_runner_script("pre-commit")
     await asyncio.to_thread(chain_path.write_text, chain_script, "utf-8")
@@ -901,15 +973,10 @@ async def install_prepush_guard(settings: Settings, project_slug: str, repo_path
     await asyncio.to_thread(run_dir.mkdir, parents=True, exist_ok=True)
 
     chain_path = hooks_dir / "pre-push"
-    if chain_path.exists():
-        try:
-            content = (await asyncio.to_thread(chain_path.read_text, "utf-8")).strip()
-        except Exception:
-            content = ""
-        if "mcp-agent-mail chain-runner (pre-push)" not in content:
-            orig = hooks_dir / "pre-push.orig"
-            if not orig.exists():
-                await asyncio.to_thread(chain_path.replace, orig)
+    await _preserve_foreign_hook(
+        chain_path,
+        "mcp-agent-mail chain-runner (pre-push)",
+    )
     chain_script = _render_chain_runner_script("pre-push")
     await asyncio.to_thread(chain_path.write_text, chain_script, "utf-8")
     await asyncio.to_thread(os.chmod, chain_path, 0o755)

@@ -7,12 +7,17 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import time
 import tomllib
+from collections.abc import Callable, Iterator
+from contextlib import suppress
 from pathlib import Path, PureWindowsPath
+from typing import Any
 
+import psutil
 import pytest
 
 from mcp_agent_mail.cli import _agent_state_component
@@ -59,6 +64,90 @@ INSTALLED_HOOK_SOURCES = (
     ROOT / "scripts" / "hooks" / "inbox_watch.sh",
     ROOT / "scripts" / "hooks" / "codex_notify.sh",
 )
+
+type PopenFactory = Callable[..., subprocess.Popen[str]]
+
+
+def _terminate_tracked_popen(process: subprocess.Popen[str]) -> None:
+    """Stop one exact test process tree and close every pipe it owns."""
+
+    was_running = process.poll() is None
+    if process.stdin is not None and not process.stdin.closed:
+        with suppress(OSError):
+            process.stdin.close()
+
+    if was_running and os.name == "posix":
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+    elif was_running:
+        descendants: list[psutil.Process] = []
+        with suppress(psutil.Error):
+            descendants = psutil.Process(process.pid).children(recursive=True)
+        taskkill_succeeded = False
+        try:
+            taskkill = subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            taskkill_succeeded = taskkill.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            taskkill_succeeded = False
+        if not taskkill_succeeded:
+            with suppress(psutil.Error):
+                descendants.extend(
+                    child
+                    for child in psutil.Process(process.pid).children(recursive=True)
+                    if child not in descendants
+                )
+            for child in reversed(descendants):
+                with suppress(psutil.Error):
+                    child.kill()
+            if process.poll() is None:
+                process.kill()
+        _gone, alive = psutil.wait_procs(descendants, timeout=5)
+        for child in alive:
+            with suppress(psutil.Error):
+                child.kill()
+        psutil.wait_procs(alive, timeout=5)
+
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        if os.name == "posix":
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
+        with suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=5)
+    finally:
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None and not stream.closed:
+                with suppress(OSError):
+                    stream.close()
+
+
+@pytest.fixture
+def tracked_popen(tmp_path: Path) -> Iterator[PopenFactory]:
+    """Track Popen trees so assertion failures cannot outlive tmp_path."""
+
+    _ = tmp_path
+    processes: list[subprocess.Popen[str]] = []
+
+    def spawn(args: list[str], **kwargs: Any) -> subprocess.Popen[str]:
+        if os.name == "posix":
+            kwargs.setdefault("start_new_session", True)
+        process = subprocess.Popen(args, **kwargs)
+        processes.append(process)
+        return process
+
+    yield spawn
+
+    for process in reversed(processes):
+        _terminate_tracked_popen(process)
 
 
 def _posix_tool_dirs() -> tuple[str, ...]:
@@ -1025,6 +1114,107 @@ def _install_bash_env(home: Path, fake_bin: Path) -> tuple[str, str]:
     return _git_bash_path(bash_env), str(bash_tmp)
 
 
+def test_bash_env_keeps_nested_shells_in_the_per_test_temp_dir(tmp_path: Path) -> None:
+    """Nested Git Bash processes retain the isolated TMP dialect."""
+    home = tmp_path / "home"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    bash_env, bash_tmp = _install_bash_env(home, fake_bin)
+    expected = _git_bash_path(Path(bash_tmp))
+    env = {
+        **os.environ,
+        "HOME": _git_bash_path(home),
+        "BASH_ENV": bash_env,
+        "TMPDIR": bash_tmp,
+        "TEMP": bash_tmp,
+        "TMP": bash_tmp,
+        "TEST_NESTED_BASH": _git_bash_path(Path(BASH)),
+    }
+
+    result = subprocess.run(
+        [
+            BASH,
+            "-c",
+            '"$TEST_NESTED_BASH" --noprofile --norc -c '
+            "'printf \"%s\\n\" \"$TMPDIR\" \"$TEMP\" \"$TMP\"'",
+        ],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [expected, expected, expected]
+    assert expected != "/tmp"
+
+
+def test_tracked_popen_cleanup_stops_a_nested_long_lived_child(tmp_path: Path) -> None:
+    """Teardown kills descendants before their inherited temp path disappears."""
+    home = tmp_path / "home"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    bash_env, bash_tmp = _install_bash_env(home, fake_bin)
+    expected_tmp = _git_bash_path(Path(bash_tmp))
+    env = {
+        **os.environ,
+        "HOME": _git_bash_path(home),
+        "BASH_ENV": bash_env,
+        "TMPDIR": bash_tmp,
+        "TEMP": bash_tmp,
+        "TMP": bash_tmp,
+    }
+    kwargs: dict[str, Any] = {
+        "env": env,
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+    }
+    if os.name == "posix":
+        kwargs["start_new_session"] = True
+    process = subprocess.Popen(
+        [
+            BASH,
+            "--noprofile",
+            "--norc",
+            "-c",
+            "while :; do sleep 60; done & child=$!; "
+            "printf '%s|%s|%s|%s\\n' \"$child\" \"$TMPDIR\" \"$TEMP\" \"$TMP\"; "
+            "wait \"$child\"",
+        ],
+        **kwargs,
+    )
+    try:
+        assert process.stdout is not None
+        child_pid, *temp_values = process.stdout.readline().strip().split("|")
+        assert child_pid.isdigit()
+        assert temp_values == [expected_tmp, expected_tmp, expected_tmp]
+        _terminate_tracked_popen(process)
+        deadline = time.monotonic() + 10
+        child_is_alive = True
+        while child_is_alive and time.monotonic() < deadline:
+            probe = subprocess.run(
+                [
+                    BASH,
+                    "--noprofile",
+                    "--norc",
+                    "-c",
+                    f"kill -0 {child_pid} 2>/dev/null",
+                ],
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            child_is_alive = probe.returncode == 0
+            if child_is_alive:
+                time.sleep(0.05)
+        assert not child_is_alive
+    finally:
+        _terminate_tracked_popen(process)
+
+
 def _integration_env(home: Path, fake_bin: Path) -> dict[str, str]:
     _install_forbidden_client_toolchain_guards(fake_bin)
     bash_env, bash_tmp = _install_bash_env(home, fake_bin)
@@ -1076,12 +1266,32 @@ def _install_fake_claude_plugin_cli(fake_bin: Path) -> Path:
         "printf '%s\\n' \"$*\" >> \"$FAKE_CLAUDE_PLUGIN_LOG\"\n"
         "if [[ -n ${INTEGRATION_BEARER_TOKEN:-}${HTTP_BEARER_TOKEN:-}"
         "${MCP_AGENT_MAIL_TOKEN:-}${AGENT_MAIL_TOKEN:-}"
-        "${AGENT_MAIL_REGISTRATION_TOKEN:-} ]]; then\n"
+        "${AGENT_MAIL_REGISTRATION_TOKEN:-}${HTTP_OAUTH_GITHUB_CLIENT_SECRET:-}"
+        "${HTTP_OAUTH_JWT_SIGNING_KEY:-}${HTTP_JWT_SECRET:-}"
+        "${MAIL_UI_SESSION_SECRET:-}${DATABASE_URL:-}${PGPASSWORD:-}"
+        "${ANTHROPIC_API_KEY:-}${DEEPSEEK_API_KEY:-}${GEMINI_API_KEY:-}"
+        "${GITHUB_TOKEN:-}${GH_TOKEN:-}${GOOGLE_API_KEY:-}${GROK_API_KEY:-}"
+        "${MORPH_API_KEY:-}${OPENAI_API_KEY:-}${OPENROUTER_API_KEY:-}"
+        "${XAI_API_KEY:-} ]]; then\n"
         "  printf 'secret-env-present\\n' >> \"$FAKE_CLAUDE_PLUGIN_LOG\"\n"
         "fi\n"
+        "if [[ $* == 'plugin marketplace update '* && "
+        "${CLAUDE_CODE_PLUGIN_KEEP_MARKETPLACE_ON_FAILURE:-} == 1 ]]; then\n"
+        "  printf 'stale-marketplace-retention-enabled\\n' >> \"$FAKE_CLAUDE_PLUGIN_LOG\"\n"
+        "fi\n"
         "case \"$*\" in\n"
-        "  'plugin marketplace list --json') printf '%s\\n' \"${FAKE_CLAUDE_MARKETPLACES_JSON:-[]}\" ;;\n"
-        "  'plugin list --json') printf '%s\\n' \"${FAKE_CLAUDE_PLUGINS_JSON:-[]}\" ;;\n"
+        "  'plugin marketplace list --json')\n"
+        "    if grep -Eq '^plugin marketplace (add|update) ' \"$FAKE_CLAUDE_PLUGIN_LOG\"; then\n"
+        "      printf '%s\\n' \"${FAKE_CLAUDE_MARKETPLACES_AFTER_JSON:-${FAKE_CLAUDE_MARKETPLACES_JSON:-[]}}\"\n"
+        "    else\n"
+        "      printf '%s\\n' \"${FAKE_CLAUDE_MARKETPLACES_JSON:-[]}\"\n"
+        "    fi ;;\n"
+       "  'plugin list --json')\n"
+        "    if grep -Eq '^plugin (install|update|enable) ' \"$FAKE_CLAUDE_PLUGIN_LOG\"; then\n"
+        "      printf '%s\\n' \"${FAKE_CLAUDE_PLUGINS_AFTER_JSON:-${FAKE_CLAUDE_PLUGINS_JSON:-[]}}\"\n"
+        "    else\n"
+        "      printf '%s\\n' \"${FAKE_CLAUDE_PLUGINS_JSON:-[]}\"\n"
+        "    fi ;;\n"
         "  *) exit \"${FAKE_CLAUDE_MUTATION_RC:-0}\" ;;\n"
         "esac\n",
         encoding="utf-8",
@@ -1092,7 +1302,15 @@ def _install_fake_claude_plugin_cli(fake_bin: Path) -> Path:
 
 
 @pytest.mark.parametrize(
-    ("marketplaces", "plugins", "expected_calls", "forbidden_calls", "message"),
+    (
+        "marketplaces",
+        "plugins",
+        "expected_calls",
+        "forbidden_calls",
+        "message",
+        "declare_user",
+        "post_state",
+    ),
     [
         pytest.param(
             [],
@@ -1104,7 +1322,40 @@ def _install_fake_claude_plugin_cli(fake_bin: Path) -> Path:
             ),
             ("plugin marketplace update", "plugin update"),
             "Installed Claude plugin",
+            True,
+            "current",
             id="fresh-install",
+        ),
+        pytest.param(
+            [
+                {
+                    "name": "mateusz-klatt-mcp-agent-mail",
+                    "source": "github",
+                    "repo": "mateusz-klatt/mcp_agent_mail",
+                    "sparsePaths": [
+                        ".claude-plugin",
+                        "skills",
+                        "scripts/hooks",
+                    ],
+                }
+            ],
+            [
+                {
+                    "id": "mcp-agent-mail@mateusz-klatt-mcp-agent-mail",
+                    "scope": "user",
+                    "enabled": True,
+                    "errors": [],
+                }
+            ],
+            (
+                "plugin marketplace update mateusz-klatt-mcp-agent-mail",
+                "plugin update mcp-agent-mail@mateusz-klatt-mcp-agent-mail --scope user",
+            ),
+            ("plugin marketplace add", "plugin install"),
+            "Updated Claude plugin",
+            True,
+            "current",
+            id="tracked-github-update",
         ),
         pytest.param(
             [
@@ -1118,6 +1369,8 @@ def _install_fake_claude_plugin_cli(fake_bin: Path) -> Path:
                 {
                     "id": "mcp-agent-mail@mateusz-klatt-mcp-agent-mail",
                     "scope": "user",
+                    "enabled": True,
+                    "errors": [],
                 }
             ],
             (
@@ -1126,7 +1379,9 @@ def _install_fake_claude_plugin_cli(fake_bin: Path) -> Path:
             ),
             ("plugin marketplace add", "plugin install"),
             "Updated Claude plugin",
-            id="tracked-github-update",
+            True,
+            "custom-cache-root",
+            id="custom-plugin-cache-root-is-verified",
         ),
         pytest.param(
             [
@@ -1145,17 +1400,167 @@ def _install_fake_claude_plugin_cli(fake_bin: Path) -> Path:
                 "plugin install",
             ),
             "still points at a local directory",
+            True,
+            "current",
             id="legacy-directory-is-not-deleted",
+        ),
+        pytest.param(
+            [
+                {
+                    "name": "mateusz-klatt-mcp-agent-mail",
+                    "source": "github",
+                    "repo": "mateusz-klatt/mcp_agent_mail",
+                    "ref": "v0.5.0",
+                }
+            ],
+            [],
+            ("plugin marketplace list --json",),
+            ("plugin marketplace update", "plugin update", "plugin install"),
+            "is pinned to ref v0.5.0",
+            True,
+            "current",
+            id="pinned-ref-is-not-claimed-current",
+        ),
+        pytest.param(
+            [
+                {
+                    "name": "mateusz-klatt-mcp-agent-mail",
+                    "source": "github",
+                    "repo": "mateusz-klatt/mcp_agent_mail",
+                    "sparsePaths": [".claude-plugin", "scripts/hooks"],
+                }
+            ],
+            [],
+            ("plugin marketplace list --json",),
+            ("plugin marketplace update", "plugin update", "plugin install"),
+            "uses unexpected sparse checkout paths",
+            True,
+            "current",
+            id="incomplete-sparse-checkout-is-not-mutated",
+        ),
+        pytest.param(
+            [
+                {
+                    "name": "mateusz-klatt-mcp-agent-mail",
+                    "source": "github",
+                    "repo": "mateusz-klatt/mcp_agent_mail",
+                    "path": "other/marketplace.json",
+                }
+            ],
+            [],
+            ("plugin marketplace list --json",),
+            ("plugin marketplace update", "plugin update", "plugin install"),
+            "uses an unexpected manifest path",
+            True,
+            "current",
+            id="custom-marketplace-path-is-not-mutated",
+        ),
+        pytest.param(
+            [
+                {
+                    "name": "mateusz-klatt-mcp-agent-mail",
+                    "source": "github",
+                    "repo": "mateusz-klatt/mcp_agent_mail",
+                }
+            ],
+            [],
+            ("plugin marketplace list --json",),
+            ("plugin marketplace update", "plugin update", "plugin install"),
+            "is not declared at user scope",
+            False,
+            "current",
+            id="project-or-local-scope-is-not-mutated",
+        ),
+        pytest.param(
+            [
+                {
+                    "name": "mateusz-klatt-mcp-agent-mail",
+                    "source": "github",
+                    "repo": "mateusz-klatt/mcp_agent_mail",
+                }
+            ],
+            [
+                {
+                    "id": "mcp-agent-mail@mateusz-klatt-mcp-agent-mail",
+                    "scope": "user",
+                    "enabled": False,
+                    "errors": [],
+                }
+            ],
+            (
+                "plugin marketplace update mateusz-klatt-mcp-agent-mail",
+                "plugin update mcp-agent-mail@mateusz-klatt-mcp-agent-mail --scope user",
+                "plugin enable mcp-agent-mail@mateusz-klatt-mcp-agent-mail --scope user",
+            ),
+            ("plugin marketplace add", "plugin install"),
+            "Updated Claude plugin",
+            True,
+            "current",
+            id="disabled-plugin-is-enabled-and-verified",
+        ),
+        pytest.param(
+            [
+                {
+                    "name": "mateusz-klatt-mcp-agent-mail",
+                    "source": "github",
+                    "repo": "mateusz-klatt/mcp_agent_mail",
+                }
+            ],
+            [
+                {
+                    "id": "mcp-agent-mail@mateusz-klatt-mcp-agent-mail",
+                    "scope": "user",
+                    "enabled": True,
+                    "errors": [],
+                }
+            ],
+            (
+                "plugin marketplace update mateusz-klatt-mcp-agent-mail",
+                "plugin update mcp-agent-mail@mateusz-klatt-mcp-agent-mail --scope user",
+            ),
+            ("plugin marketplace add", "plugin install"),
+            "reports version",
+            True,
+            "stale-version",
+            id="stale-plugin-version-is-not-claimed-current",
+        ),
+        pytest.param(
+            [
+                {
+                    "name": "mateusz-klatt-mcp-agent-mail",
+                    "source": "github",
+                    "repo": "mateusz-klatt/mcp_agent_mail",
+                }
+            ],
+            [
+                {
+                    "id": "mcp-agent-mail@mateusz-klatt-mcp-agent-mail",
+                    "scope": "user",
+                    "enabled": True,
+                    "errors": [],
+                }
+            ],
+            (
+                "plugin marketplace update mateusz-klatt-mcp-agent-mail",
+                "plugin update mcp-agent-mail@mateusz-klatt-mcp-agent-mail --scope user",
+            ),
+            ("plugin marketplace add", "plugin install"),
+            "is not installed from its exact Git-SHA cache path",
+            True,
+            "wrong-install-path",
+            id="wrong-plugin-cache-path-is-not-claimed-current",
         ),
     ],
 )
 def test_claude_integrator_uses_tracked_github_plugin_source(
     tmp_path: Path,
-    marketplaces: list[dict[str, str]],
-    plugins: list[dict[str, str]],
+    marketplaces: list[dict[str, object]],
+    plugins: list[dict[str, object]],
     expected_calls: tuple[str, ...],
     forbidden_calls: tuple[str, ...],
     message: str,
+    declare_user: bool,
+    post_state: str,
 ) -> None:
     home = tmp_path / "home"
     project = tmp_path / "project"
@@ -1164,14 +1569,105 @@ def test_claude_integrator_uses_tracked_github_plugin_source(
     project.mkdir()
     fake_bin.mkdir()
     _install_fake_claude_plugin_cli(fake_bin)
+    repo_sha = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", "--verify", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    reported_version = "0" * 40 if post_state == "stale-version" else repo_sha
+    install_version = "0" * 40 if post_state == "wrong-install-path" else repo_sha
+    plugin_cache_root = (
+        tmp_path / "custom-claude-plugin-root"
+        if post_state == "custom-cache-root"
+        else home / ".claude" / "plugins"
+    )
+    reported_install_path = (
+        plugin_cache_root
+        / "cache"
+        / "mateusz-klatt-mcp-agent-mail"
+        / "mcp-agent-mail"
+        / install_version
+    )
+    if declare_user and marketplaces:
+        source = {
+            key: marketplaces[0][key]
+            for key in ("source", "repo", "path", "ref", "sparsePaths")
+            if key in marketplaces[0]
+        }
+        claude_dir = home / ".claude"
+        claude_dir.mkdir()
+        (claude_dir / "settings.json").write_text(
+            json.dumps(
+                {
+                    "extraKnownMarketplaces": {
+                        "mateusz-klatt-mcp-agent-mail": {"source": source},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+    verified_plugins = [
+        {
+            **plugin,
+            "enabled": True,
+            "errors": [],
+            "version": reported_version,
+            "installPath": str(reported_install_path),
+        }
+        for plugin in plugins
+    ]
+    if not verified_plugins:
+        verified_plugins = [
+            {
+                "id": "mcp-agent-mail@mateusz-klatt-mcp-agent-mail",
+                "scope": "user",
+                "enabled": True,
+                "errors": [],
+                "version": reported_version,
+                "installPath": str(reported_install_path),
+            }
+        ]
+    if marketplaces:
+        post_marketplaces = [
+            (
+                {**marketplace, "installLocation": str(ROOT)}
+                if marketplace.get("source") == "github"
+                else marketplace
+            )
+            for marketplace in marketplaces
+        ]
+    else:
+        post_marketplaces = [
+            {
+                "name": "mateusz-klatt-mcp-agent-mail",
+                "source": "github",
+                "repo": "mateusz-klatt/mcp_agent_mail",
+                "installLocation": str(ROOT),
+            }
+        ]
     call_log = tmp_path / "claude-plugin-calls.log"
     env = {
         **os.environ,
         **_integration_env(home, fake_bin),
         "AGENT_MAIL_MANAGE_CLAUDE_PLUGIN": "1",
+        "CLAUDE_CODE_PLUGIN_CACHE_DIR": (
+            str(plugin_cache_root) if post_state == "custom-cache-root" else ""
+        ),
+        "CLAUDE_CODE_PLUGIN_KEEP_MARKETPLACE_ON_FAILURE": "1",
         "FAKE_CLAUDE_PLUGIN_LOG": _git_bash_path(call_log),
         "FAKE_CLAUDE_MARKETPLACES_JSON": json.dumps(marketplaces),
+        "FAKE_CLAUDE_MARKETPLACES_AFTER_JSON": json.dumps(post_marketplaces),
         "FAKE_CLAUDE_PLUGINS_JSON": json.dumps(plugins),
+        "FAKE_CLAUDE_PLUGINS_AFTER_JSON": json.dumps(verified_plugins),
+        "HTTP_OAUTH_GITHUB_CLIENT_SECRET": "server-secret",
+        "HTTP_OAUTH_JWT_SIGNING_KEY": "server-secret",
+        "HTTP_JWT_SECRET": "server-secret",
+        "MAIL_UI_SESSION_SECRET": "server-secret",
+        "DATABASE_URL": "postgresql+asyncpg://server-secret",
+        "PGPASSWORD": "server-secret",
+        "OPENAI_API_KEY": "server-secret",
+        "GITHUB_TOKEN": "server-secret",
     }
 
     result = subprocess.run(
@@ -1191,12 +1687,14 @@ def test_claude_integrator_uses_tracked_github_plugin_source(
     for forbidden in forbidden_calls:
         assert not any(call.startswith(forbidden) for call in calls)
     assert "secret-env-present" not in calls
+    assert "stale-marketplace-retention-enabled" not in calls
     assert "test-bearer" not in result.stdout + result.stderr + "\n".join(calls)
+    assert "server-secret" not in result.stdout + result.stderr + "\n".join(calls)
     assert message in result.stdout
     if message.startswith(("Installed", "Updated")):
         assert "Restart Claude Code" in result.stdout
         assert not any("--yes" in call for call in calls)
-    else:
+    elif "local directory" in message:
         assert "marketplace remove mateusz-klatt-mcp-agent-mail --scope user" in result.stdout
 
 
@@ -6950,6 +7448,7 @@ printf '%s\n200' "$envelope"
 
 def test_session_end_racing_start_rpc_ends_returned_execution_without_publication(
     tmp_path: Path,
+    tracked_popen: PopenFactory,
 ) -> None:
     home = tmp_path / "home"
     state = tmp_path / "state"
@@ -7066,7 +7565,7 @@ exec {shlex.quote(_git_bash_path(Path(real_jq).resolve()))} "$@"
         "source": "startup",
         "permission_mode": "default",
     }
-    start_process = subprocess.Popen(
+    start_process = tracked_popen(
         [BASH, _git_bash_path(ROOT / "scripts" / "hooks" / "session_start.sh")],
         cwd=repo,
         env=env,
@@ -7238,7 +7737,10 @@ exec {shlex.quote(_git_bash_path(Path(real_jq).resolve()))} "$@"
     assert not jq_audit.exists() or jq_audit.read_text(encoding="utf-8") == ""
 
 
-def test_codex_old_session_end_cannot_end_resumed_generation(tmp_path: Path) -> None:
+def test_codex_old_session_end_cannot_end_resumed_generation(
+    tmp_path: Path,
+    tracked_popen: PopenFactory,
+) -> None:
     home = tmp_path / "home"
     state = tmp_path / "state"
     fake_bin = tmp_path / "bin"
@@ -7314,7 +7816,7 @@ printf '%s\n200' "$envelope"
     assert generation_one["lifecycle_generation"] == 1
 
     lock_path = Path(f"{generation_one_state_path}.lock")
-    lock_holder = subprocess.Popen(
+    lock_holder = tracked_popen(
         [
             BASH,
             "-c",
@@ -7335,7 +7837,7 @@ printf '%s\n200' "$envelope"
     assert lock_holder.stdout is not None
     assert lock_holder.stdout.readline().strip() == "ready"
 
-    end_process = subprocess.Popen(
+    end_process = tracked_popen(
         [*command, "session-end"],
         cwd=repo,
         env=env,
@@ -8459,6 +8961,7 @@ printf '%s\n200' "$envelope"
 
 def test_codex_session_end_tombstone_blocks_raced_cross_project_enrollment(
     tmp_path: Path,
+    tracked_popen: PopenFactory,
 ) -> None:
     home = tmp_path / "home"
     state = tmp_path / "state"
@@ -8578,7 +9081,7 @@ printf '%s\n200' "$envelope"
         "model": "gpt-5.6",
         "permission_mode": "default",
     }
-    enrollment = subprocess.Popen(
+    enrollment = tracked_popen(
         [*command, "heartbeat"],
         cwd=root_repo,
         env=env,
@@ -8827,6 +9330,7 @@ printf '%s\n200' "$envelope"
 
 def test_hook_refuses_secret_state_and_recovers_crash_locks_without_aba(
     tmp_path: Path,
+    tracked_popen: PopenFactory,
 ) -> None:
     repo = tmp_path / "repo"
     _init_git_repo(repo)
@@ -8867,7 +9371,7 @@ def test_hook_refuses_secret_state_and_recovers_crash_locks_without_aba(
     ).stdout
     (stale_lock / "pid").write_text(dead_owner, encoding="utf-8")
     recovery_lock = Path(f"{stale_lock}.recovery")
-    recovery_holder = subprocess.Popen(
+    recovery_holder = tracked_popen(
         [
             BASH,
             "--noprofile",
@@ -8900,7 +9404,7 @@ def test_hook_refuses_secret_state_and_recovers_crash_locks_without_aba(
     for marker, contention_marker, release_marker in zip(
         acquired_markers, contention_markers, release_markers, strict=True
     ):
-        healer = subprocess.Popen(
+        healer = tracked_popen(
             [
                 BASH,
                 "--noprofile",

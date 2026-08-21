@@ -68,20 +68,28 @@ two are not armed at once.
 **The plugin runs a copy, not your working tree.** The supported integrator
 registers `mateusz-klatt/mcp_agent_mail` as a GitHub marketplace with sparse
 paths `.claude-plugin`, `skills`, and `scripts/hooks`. Claude therefore clones
-only tracked plugin files before copying them under
+tracked content from those cones and their Git cone-mode ancestor directories
+before copying the plugin under
 `~/.claude/plugins/cache/<marketplace>/<plugin>/<git-sha>/`; `.env`, virtual
 environments, SQLite/WAL files, `node_modules`, coverage artifacts, and other
 ignored working-tree state cannot enter that snapshot. Both plugin manifests
 deliberately omit `version`, so Claude uses the source commit SHA and
-`marketplace update` plus `plugin update` sees every new commit.
+`marketplace update` plus `plugin update` sees every pushed commit on the
+source branch. The ordinary `claude plugin validate .` command accepts this
+SHA mode with its expected missing-version warning. Do not use `--strict` as a
+release gate for this plugin: that flag promotes the intentional warning to an
+error even though omitting both version fields is what enables commit-fresh
+updates.
 
 A legacy marketplace registered from a local checkout is unsafe for exactly the
 opposite reason: Claude copies the whole directory and does not apply
 `.gitignore`. `integrate_claude_code.sh --yes` detects that source and prints a
 one-time migration sequence, but it does not run `plugin uninstall` or
-`marketplace remove`; both delete cached state and require explicit operator
-approval. This keeps an ordinary hook refresh non-destructive while making the
-remaining exposure loud.
+`marketplace remove`; removal uninstalls marketplace plugins, while old cache
+versions become orphaned and may be cleaned later. The printed uninstall uses
+`--keep-data`, but both mutations still require explicit operator approval.
+This keeps an ordinary hook refresh non-destructive while making the remaining
+exposure loud.
 
 Which copy actually executes has differed between machines — on WSL both the
 skill and the monitor ran from the repository path while a stale cache copy sat

@@ -814,7 +814,8 @@ def test_chain_runner_windows_dispatches_shebang_children(monkeypatch, tmp_path:
         "hook-arg",
     ]
     assert native_cmd == [str(hooks / "hooks.d/pre-commit/30-native.cmd"), "hook-arg"]
-    assert shell_orig == ["C:/Git/usr/bin/sh.exe", str(hooks / "pre-commit.orig"), "hook-arg"]
+    shell_orig_path = str(hooks / "pre-commit.orig").replace("\\", "/")
+    assert shell_orig == ["C:/Git/usr/bin/sh.exe", shell_orig_path, "hook-arg"]
 
 
 def test_chain_runner_windows_resolves_git_bundled_sh(monkeypatch, tmp_path: Path):
@@ -861,9 +862,14 @@ def test_chain_runner_windows_husky_uses_real_hook_name(
     """Windows Husky uses Git sh, a slash-safe argv0, and preserves hook I/O."""
     from mcp_agent_mail.guard import _render_chain_runner_script
 
-    # A literal backslash in this POSIX test component stands in for the one
-    # WindowsPath would put after a drive prefix. Only sh-bound paths normalize it.
-    hooks = tmp_path / "C:\\repo" / ".husky/_"
+    # WindowsPath supplies real backslashes. On POSIX, use one literal
+    # backslash in a component so the simulated Windows branch still proves
+    # that only sh-bound paths are normalized.
+    hooks = (
+        tmp_path / ".husky/_"
+        if os.name == "nt"
+        else tmp_path / "C:\\repo" / ".husky/_"
+    )
     hooks.mkdir(parents=True)
     (hooks / "h").write_text("#!/usr/bin/env sh\n", encoding="utf-8")
     (hooks / f"{hook_name}.orig").write_text(

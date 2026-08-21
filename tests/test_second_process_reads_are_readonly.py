@@ -53,6 +53,21 @@ def test_readonly_helper_refuses_writes(live_database: Path) -> None:
         connection.close()
 
 
+def test_readonly_helper_accepts_relative_database_path(
+    live_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(live_database.parent)
+
+    connection = connect_sqlite_readonly(Path(live_database.name))
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM t").fetchone() == (2,)
+        with pytest.raises(sqlite3.OperationalError):
+            connection.execute("INSERT INTO t VALUES ('nope')")
+    finally:
+        connection.close()
+
+
 def test_readonly_helper_leaves_a_running_servers_wal_alone(live_database: Path) -> None:
     wal = Path(f"{live_database}-wal")
     size_before = wal.stat().st_size

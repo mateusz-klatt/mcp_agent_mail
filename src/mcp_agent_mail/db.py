@@ -3997,7 +3997,8 @@ def connect_sqlite_readonly(
     is belt and braces: it turns an accidental write into an error here rather
     than a surprise for whoever is writing.
     """
-    connection = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+    database_uri = db_path.expanduser().resolve().as_uri()
+    connection = sqlite3.connect(f"{database_uri}?mode=ro", uri=True)
     try:
         connection.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
         connection.execute("PRAGMA query_only=ON")

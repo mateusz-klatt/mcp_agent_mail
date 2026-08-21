@@ -47,6 +47,21 @@ def _git_bash_path(path: Path) -> str:
     return normalized
 
 
+def _shell_path_key(value: str) -> str:
+    """Normalize native and MSYS spellings of the same working directory."""
+    normalized = value.replace("\\", "/").rstrip("/")
+    if (
+        len(normalized) >= 3
+        and normalized[0] == "/"
+        and normalized[1].isalpha()
+        and normalized[2] == "/"
+    ):
+        normalized = f"{normalized[1]}:{normalized[2:]}"
+    if len(normalized) >= 3 and normalized[0].isalpha() and normalized[1:3] == ":/":
+        return normalized.casefold()
+    return normalized
+
+
 def _bash(script: str, *, cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [BASH, "-c", script],
@@ -124,6 +139,12 @@ def _run_install_cli(
     return _bash(script, cwd=ROOT, env=env), home, call_log
 
 
+def test_shell_path_key_equates_native_and_msys_drive_spellings() -> None:
+    assert _shell_path_key("D:/a/mcp_agent_mail/") == _shell_path_key(
+        "/d/a/mcp_agent_mail"
+    )
+
+
 def test_project_defines_one_canonical_cli_entrypoint() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
 
@@ -167,12 +188,18 @@ def test_installer_delegates_global_cli_installation_and_path_setup_to_uv(tmp_pa
     result, _home, call_log = _run_install_cli(tmp_path)
 
     assert result.returncode == 0, result.stdout + result.stderr
-    calls = call_log.read_text(encoding="utf-8").splitlines()
-    assert calls == [
-        f"{_git_bash_path(ROOT)}|tool install --editable --python 3.14 .",
-        f"{_git_bash_path(ROOT)}|tool update-shell",
-        f"{_git_bash_path(ROOT)}|tool run --offline mcp-agent-mail --help",
+    calls = [
+        line.rsplit("|", maxsplit=1)
+        for line in call_log.read_text(encoding="utf-8").splitlines()
     ]
+    assert [command for _cwd, command in calls] == [
+        "tool install --editable --python 3.14 .",
+        "tool update-shell",
+        "tool run --offline mcp-agent-mail --help",
+    ]
+    assert {_shell_path_key(cwd) for cwd, _command in calls} == {
+        _shell_path_key(str(ROOT))
+    }
     assert "Installed the mcp-agent-mail CLI" in result.stdout
 
 

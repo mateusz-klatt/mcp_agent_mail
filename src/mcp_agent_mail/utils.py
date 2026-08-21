@@ -435,3 +435,31 @@ def validate_thread_id_format(thread_id: str) -> bool:
     if not candidate:
         return False
     return _THREAD_ID_RE.fullmatch(candidate) is not None
+
+
+def package_version() -> str:
+    """Installed distribution version of this package.
+
+    Single source for every place that reports our version -- MCP `serverInfo`,
+    `health_check`, the OpenAPI `info` block and the CLI. It exists as one
+    function because three separate copies of this lookup already let the
+    fleet read FastMCP's version number as ours during a deploy audit.
+    """
+    import importlib.metadata as importlib_metadata
+
+    try:
+        return importlib_metadata.version("mcp-agent-mail")
+    except importlib_metadata.PackageNotFoundError:  # pragma: no cover - dev installs
+        return "0.0.0+local"
+
+
+def build_commit() -> Optional[str]:
+    """Commit the running artefact was built from, when the build recorded one.
+
+    Returns None rather than falling back to the working tree's git HEAD. That
+    fallback would describe the checkout a diagnostic is *run* from instead of
+    the image a server is *running*, which is precisely the substitution that
+    made a production deploy look one state while it was in another.
+    """
+    value = os.environ.get("MCP_AGENT_MAIL_BUILD_COMMIT", "").strip()
+    return value or None

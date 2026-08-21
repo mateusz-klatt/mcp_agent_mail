@@ -113,7 +113,9 @@ from .storage import (
     write_file_reservation_records,
 )
 from .utils import (
+    build_commit,
     generate_agent_name,
+    package_version,
     safe_build_path_component,
     sanitize_agent_name,
     slugify,
@@ -2304,13 +2306,24 @@ def _message_to_dict(message: Message, include_body: bool = True) -> dict[str, A
 
 
 def _public_runtime_descriptor(settings: Settings) -> dict[str, Any]:
-    """Return only non-secret runtime coordinates safe for public diagnostics."""
-    return {
+    """Return only non-secret runtime coordinates safe for public diagnostics.
+
+    `version` is here because its absence had a measurable cost: with no
+    application version on any public probe, a deploy audit fell back to
+    MCP `serverInfo.version` -- which reports FastMCP's version, not ours --
+    and read a current production as a stale one.
+    """
+    descriptor: dict[str, Any] = {
+        "version": package_version(),
         "environment": settings.environment,
         "http_host": settings.http.host,
         "http_port": settings.http.port,
         "http_path": settings.http.path,
     }
+    commit = build_commit()
+    if commit:
+        descriptor["commit"] = commit
+    return descriptor
 
 
 def _format_cross_project_agent_address(project_slug: str, agent_name: str) -> str:
@@ -7380,7 +7393,12 @@ def build_mcp_server() -> FastMCP:
         "{format:'toon', data:'<TOON>'}."
     )
 
-    mcp = FastMCP(name="mcp-agent-mail", instructions=instructions, lifespan=lifespan)
+    mcp = FastMCP(
+        name="mcp-agent-mail",
+        version=package_version(),
+        instructions=instructions,
+        lifespan=lifespan,
+    )
     mcp.add_middleware(_CredentialSafeValidationErrors())
     file_reservation_paths_direct: (
         Callable[..., Awaitable[dict[str, Any]]] | None

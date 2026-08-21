@@ -3342,3 +3342,59 @@ async def test_project_sibling_suggestions_backend(isolated_env, monkeypatch):
     assert any(entry["peer"]["id"] == second_id for entry in updated_map[first_id]["confirmed"])
     assert not any(entry["peer"]["id"] == second_id for entry in updated_map[first_id]["suggested"])
     assert any(entry["peer"]["id"] == first_id for entry in updated_map[second_id]["confirmed"])
+
+
+@pytest.mark.asyncio
+async def test_health_check_reports_our_version_not_the_frameworks(isolated_env, monkeypatch):
+    """A deploy audit must be able to read OUR version off a running server.
+
+    Without this, the only version a public probe could reach was MCP
+    `serverInfo.version`, which FastMCP fills with its own number -- and a
+    fleet audit duly read a current production as three commits stale.
+    """
+    from mcp_agent_mail.utils import package_version
+
+    monkeypatch.delenv("MCP_AGENT_MAIL_BUILD_COMMIT", raising=False)
+    server = build_mcp_server()
+    async with Client(server) as client:
+        health = await client.call_tool("health_check", {})
+
+    assert health.data["version"] == package_version()
+    # Negative control: the assertion above is only meaningful if our version is
+    # actually distinguishable from the framework's.
+    import fastmcp
+
+    assert health.data["version"] != fastmcp.__version__
+    # No commit was recorded by this build, so none must be claimed.
+    assert "commit" not in health.data
+
+
+@pytest.mark.asyncio
+async def test_health_check_surfaces_build_commit_only_when_the_build_recorded_one(
+    isolated_env, monkeypatch
+):
+    server = build_mcp_server()
+
+    monkeypatch.delenv("MCP_AGENT_MAIL_BUILD_COMMIT", raising=False)
+    async with Client(server) as client:
+        without = await client.call_tool("health_check", {})
+    assert "commit" not in without.data
+
+    monkeypatch.setenv("MCP_AGENT_MAIL_BUILD_COMMIT", "d6a78286f9c3a399c2ed7d723fe62e9b2d83f8b8")
+    async with Client(server) as client:
+        with_commit = await client.call_tool("health_check", {})
+    assert with_commit.data["commit"] == "d6a78286f9c3a399c2ed7d723fe62e9b2d83f8b8"
+
+    # Whitespace-only must read as absent, not as a commit named " ".
+    monkeypatch.setenv("MCP_AGENT_MAIL_BUILD_COMMIT", "   ")
+    async with Client(server) as client:
+        blank = await client.call_tool("health_check", {})
+    assert "commit" not in blank.data
+
+
+def test_public_runtime_descriptor_carries_version(isolated_env):
+    from mcp_agent_mail.utils import package_version
+
+    settings = get_settings()
+    payload = _public_runtime_descriptor(settings)
+    assert payload["version"] == package_version()

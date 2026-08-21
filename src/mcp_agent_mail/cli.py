@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import atexit
 import hashlib
-import importlib.metadata as importlib_metadata
 import json
 import os
 import re
@@ -112,6 +111,7 @@ from .storage import (
     migrate_agent_archive,
 )
 from .utils import (
+    package_version,
     parse_client_platform_host_agent_id,
     pid_is_alive as _pid_is_alive,
     safe_build_path_component as _safe_build_path_component,
@@ -4421,10 +4421,8 @@ def _archive_states_dir(*, create: bool) -> Path:
 
 
 def _package_version() -> str:
-    try:
-        return importlib_metadata.version("mcp-agent-mail")
-    except importlib_metadata.PackageNotFoundError:  # pragma: no cover - dev installs
-        return "0.0.0+local"
+    """Thin alias kept for existing callers; the lookup lives in utils."""
+    return package_version()
 
 
 def _format_bytes(value: int) -> str:

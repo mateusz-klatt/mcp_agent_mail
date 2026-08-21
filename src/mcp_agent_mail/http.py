@@ -6058,19 +6058,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
     # Now construct FastAPI with the composed lifespan so ASGI transports run it.
     # Give the app a real title/version so the auto-generated /openapi.json has a
-    # proper `info` block (derive the version from installed package metadata,
-    # mirroring cli._package_version; never hardcode a value that could drift).
-    def _package_version() -> str:
-        import importlib.metadata as _importlib_metadata
-
-        try:
-            return _importlib_metadata.version("mcp-agent-mail")
-        except _importlib_metadata.PackageNotFoundError:  # pragma: no cover - dev installs
-            return "0.0.0+local"
+    # proper `info` block. The version comes from utils.package_version, which is
+    # the single source shared with serverInfo, health_check and the CLI.
+    from .utils import package_version
 
     fastapi_app = FastAPI(
         title="MCP Agent Mail",
-        version=_package_version(),
+        version=package_version(),
         lifespan=lifespan_context,
     )
 

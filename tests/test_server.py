@@ -1210,6 +1210,9 @@ def test_oauth_configuration_fails_closed_in_production(
     monkeypatch.setenv("APP_ENVIRONMENT", "production")
     monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "false")
     monkeypatch.setenv("HTTP_OAUTH_ENABLED", "true")
+    monkeypatch.setenv("HTTP_OAUTH_BASE_URL", "")
+    monkeypatch.setenv("HTTP_RATE_LIMIT_ENABLED", "false")
+    monkeypatch.setenv("HTTP_RATE_LIMIT_PER_MINUTE", "60")
     clear_settings_cache()
     with pytest.raises(
         ConfigError,

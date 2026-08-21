@@ -5,6 +5,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from collections.abc import AsyncIterator
@@ -150,12 +151,26 @@ async def test_http_oauth_discovery_and_challenge_are_public(
                 'https://iris.example/.well-known/oauth-protected-resource/mcp"'
             )
     assert provider._github_http_client.is_closed is True
-    assert (tmp_path / "oauth").stat().st_mode & 0o777 == 0o700
-    assert (tmp_path / "oauth" / "protected").stat().st_mode & 0o777 == 0o700
-    assert (
-        (tmp_path / "oauth" / "registrations").stat().st_mode & 0o777
-        == 0o700
+    oauth_dirs = (
+        tmp_path / "oauth",
+        tmp_path / "oauth" / "protected",
+        tmp_path / "oauth" / "registrations",
     )
+    # The layout claim holds everywhere; the permission claim does not.
+    for oauth_dir in oauth_dirs:
+        assert oauth_dir.is_dir()
+    if os.name == "nt":
+        # Windows has no POSIX mode bits: `mkdir(mode=0o700)` and `chmod(0o700)`
+        # in _oauth_storage_path() are accepted and then ignored, so st_mode
+        # comes back 0o777. Asserting 0o700 here would only ever be a claim
+        # about the platform, never about our code. The directories are
+        # therefore NOT owner-private on Windows -- production runs Linux, so
+        # this is a gap in local dev, not in the deployment.
+        for oauth_dir in oauth_dirs:
+            assert oauth_dir.stat().st_mode & 0o777 == 0o777
+    else:
+        for oauth_dir in oauth_dirs:
+            assert oauth_dir.stat().st_mode & 0o777 == 0o700
 
 
 @pytest.mark.asyncio

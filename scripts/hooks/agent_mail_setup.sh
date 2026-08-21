@@ -416,7 +416,7 @@ claude_freshness_status() {
                         source_mode="explicit"
                     else
                         case "$marketplace_source" in
-                            github|git|url)
+                            github|git|url|directory)
                                 if [ -z "$catalog_source" ]; then
                                     printf 'Claude plugin source: Git-SHA mode requires the root-relative ./ plugin in the Git-backed marketplace\n'
                                     CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
@@ -424,10 +424,25 @@ claude_freshness_status() {
                                     source_git_sha="$(am_git "$marketplace_root" rev-parse HEAD)"
                                     if is_full_lower_git_sha "$source_git_sha"; then
                                         source_version="$source_git_sha"
-                                        source_mode="git"
-                                    else
-                                        printf 'Claude plugin source: marketplace Git HEAD is unavailable or invalid\n'
+                                        if [ "$marketplace_source" = "directory" ]; then
+                                            source_mode="directory"
+                                        else
+                                            source_mode="git"
+                                        fi
+                                    elif [ "$marketplace_source" = "directory" ] \
+                                        && [ "$(am_git "$marketplace_root" rev-parse --is-inside-work-tree)" = "true" ]; then
+                                        printf 'Claude plugin source: live marketplace directory is a Git worktree, but its exact HEAD is unavailable or invalid\n'
                                         CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+                                        source_version="live-directory"
+                                        source_mode="directory"
+                                    else
+                                        printf 'Claude plugin source: marketplace %s cannot be verified as a Git worktree with an exact HEAD\n' \
+                                            "$marketplace_source"
+                                        CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
+                                        if [ "$marketplace_source" = "directory" ]; then
+                                            source_version="live-directory"
+                                            source_mode="directory"
+                                        fi
                                     fi
                                 fi ;;
                             *)
@@ -443,8 +458,26 @@ claude_freshness_status() {
                         CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
                         versions_match=0
                     fi
-                    if [ -n "$source_version" ] && [ "$versions_match" -eq 1 ]; then
-                        source_ready=1
+                    if [ -n "$source_version" ]; then
+                        if [ "$versions_match" -eq 1 ] \
+                            || [ "$marketplace_source" = "directory" ]; then
+                            source_ready=1
+                        fi
+                    fi
+                    if [ "$source_ready" -eq 1 ] \
+                        && [ "$marketplace_source" = "directory" ]; then
+                        source_mode="directory"
+                        if [ -z "$source_git_sha" ]; then
+                            source_git_sha="$(am_git "$marketplace_root" rev-parse HEAD)"
+                        fi
+                        if is_full_lower_git_sha "$source_git_sha"; then
+                            printf 'Claude plugin source: live Git-backed directory at %s\n' \
+                                "$source_git_sha"
+                        else
+                            printf 'Claude plugin source: live directory has no verifiable exact Git HEAD\n'
+                        fi
+                        printf 'Claude plugin source: legacy directory mode is not an immutable tracked-file snapshot\n'
+                        CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
                     fi
                 fi
             else
@@ -465,7 +498,7 @@ claude_freshness_status() {
         CLAUDE_FRESHNESS_PROBLEMS=$((CLAUDE_FRESHNESS_PROBLEMS + 1))
     fi
 
-    if [ "$installed_ready" -eq 1 ]; then
+    if [ "$installed_ready" -eq 1 ] && [ "$source_mode" != "directory" ]; then
         if ! jq -e '
                 type == "object" and .name == "mcp-agent-mail" and
                 ((has("version") | not) or
@@ -501,7 +534,11 @@ claude_freshness_status() {
     fi
 
     if [ "$source_ready" -eq 1 ] && [ "$installed_ready" -eq 1 ]; then
-        if [ "$installed_version" != "$source_version" ]; then
+        if [ "$source_mode" = "directory" ]; then
+            printf 'Claude plugin version: cached inventory %s is not a freshness signal for a live directory source\n' \
+                "$installed_version"
+            printf 'Claude plugin files: live from marketplace directory; cache comparison is not applicable\n'
+        elif [ "$installed_version" != "$source_version" ]; then
             # Exact identity is intentional. Ordering version strings would
             # misclassify 0.10 versus 0.9 and still would not answer whether
             # the selected cache is the source snapshot Claude will execute.
@@ -523,7 +560,7 @@ claude_freshness_status() {
             fi
         fi
 
-        if [ "$versions_match" -eq 1 ]; then
+        if [ "$source_mode" != "directory" ] && [ "$versions_match" -eq 1 ]; then
             for rel in "${CLAUDE_AGENT_MAIL_PLUGIN_FILES[@]}"; do
                 if ! source_hash="$(normalized_file_sha256 "${marketplace_root}/${rel}")"; then
                     printf 'Claude plugin file: source missing or unreadable: %s\n' "$rel"
@@ -544,7 +581,7 @@ claude_freshness_status() {
                     "${#CLAUDE_AGENT_MAIL_PLUGIN_FILES[@]}" \
                     "${#CLAUDE_AGENT_MAIL_PLUGIN_FILES[@]}"
             fi
-        else
+        elif [ "$source_mode" != "directory" ]; then
             printf 'Claude plugin files: hash comparison deferred until version metadata agrees\n'
         fi
     fi

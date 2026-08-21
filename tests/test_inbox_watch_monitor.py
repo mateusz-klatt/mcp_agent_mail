@@ -141,6 +141,7 @@ def _install_doctor_freshness_fixture(
     sha_mode: bool = False,
     catalog_version: str | None = None,
     marketplace_inventory_source: str | None = None,
+    source_git_backed: bool = True,
 ) -> tuple[Path, Path, Path]:
     """Install a hermetic Claude inventory and its two managed file surfaces."""
     source = tmp_path / "plugin-source"
@@ -190,7 +191,7 @@ def _install_doctor_freshness_fixture(
         normalized = source_hook.read_text(encoding="utf-8").replace("\r\n", "\n")
         _write_fixture_text(installed_hooks / hook, normalized)
 
-    if sha_mode:
+    if sha_mode and source_git_backed:
         subprocess.run(
             ["git", "init", str(source)],
             check=True,
@@ -241,8 +242,8 @@ def _install_doctor_freshness_fixture(
     env["FAKE_CLAUDE_PLUGIN_VERSION"] = installed_version
     env["FAKE_CLAUDE_PLUGIN_PATH"] = _git_bash_path(installed)
     env["FAKE_CLAUDE_MARKETPLACE_PATH"] = _git_bash_path(source)
-    env["FAKE_CLAUDE_MARKETPLACE_SOURCE"] = marketplace_inventory_source or (
-        "github" if sha_mode else "directory"
+    env["FAKE_CLAUDE_MARKETPLACE_SOURCE"] = (
+        marketplace_inventory_source or "github"
     )
     fake_claude = tmp_path / "bin" / "claude"
     fake_claude.write_text(
@@ -1111,7 +1112,7 @@ def test_long_lived_common_shell_refreshes_only_a_file_backed_bearer(
         encoding="utf-8",
         newline="\n",
     )
-    env = {
+    env: dict[str, str] = {
         **os.environ,
         "HOME": _git_bash_path(home),
         "AGENT_MAIL_ENV_FILE": _git_bash_path(env_file),
@@ -1294,16 +1295,81 @@ def test_doctor_reports_stale_git_sha_inventory(tmp_path: Path) -> None:
     assert "hash comparison deferred until version metadata agrees" in doctor.stdout
 
 
-def test_doctor_rejects_versionless_directory_marketplace_even_when_git_backed(
+def test_doctor_checks_hook_copies_for_a_git_backed_live_directory_marketplace(
     tmp_path: Path,
 ) -> None:
     env, repo, _ = _monitor_env(tmp_path)
     _install_setup_server(tmp_path / "bin")
-    _install_doctor_freshness_fixture(
+    source, _installed, hooks = _install_doctor_freshness_fixture(
         tmp_path,
         env,
         sha_mode=True,
         marketplace_inventory_source="directory",
+    )
+    source_sha = subprocess.run(
+        ["git", "-C", str(source), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (hooks / "inbox_watch_monitor.sh").write_text(
+        "stale installed monitor\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    env["FAKE_ARGV_LOG"] = _git_bash_path(tmp_path / "argv.log")
+    onboard = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "onboard", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert onboard.returncode == 0, onboard.stdout + onboard.stderr
+
+    doctor = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "doctor", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert doctor.returncode == 1
+    assert f"live Git-backed directory at {source_sha}" in doctor.stdout
+    assert "legacy directory mode is not an immutable tracked-file snapshot" in doctor.stdout
+    assert "cached inventory" in doctor.stdout
+    assert "is not a freshness signal for a live directory source" in doctor.stdout
+    assert "cache comparison is not applicable" in doctor.stdout
+    assert "installed copy drift: inbox_watch_monitor.sh" in doctor.stdout
+    assert "marketplace source directory is not Git-backed" not in doctor.stdout
+
+
+def test_doctor_live_directory_checks_hooks_despite_manifest_version_disagreement(
+    tmp_path: Path,
+) -> None:
+    env, repo, _ = _monitor_env(tmp_path)
+    _install_setup_server(tmp_path / "bin")
+    _source, installed, hooks = _install_doctor_freshness_fixture(
+        tmp_path,
+        env,
+        source_version="0.5.0",
+        catalog_version="0.6.0",
+        marketplace_inventory_source="directory",
+    )
+    (installed / ".claude-plugin" / "plugin.json").write_text(
+        "not-json\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    (hooks / "inbox_watch_monitor.sh").write_text(
+        "stale installed monitor\n",
+        encoding="utf-8",
+        newline="\n",
     )
     env["FAKE_ARGV_LOG"] = _git_bash_path(tmp_path / "argv.log")
     onboard = subprocess.run(
@@ -1329,12 +1395,55 @@ def test_doctor_rejects_versionless_directory_marketplace_even_when_git_backed(
 
     assert doctor.returncode == 1
     assert (
-        "version fields are absent but marketplace source directory is not Git-backed"
+        "manifest version 0.5.0 differs from marketplace version 0.6.0"
         in doctor.stdout
     )
-    assert "Claude plugin version:" not in doctor.stdout
-    assert "Claude plugin file" not in doctor.stdout
-    assert "Claude hook" not in doctor.stdout
+    assert "cache comparison is not applicable" in doctor.stdout
+    assert "installed copy drift: inbox_watch_monitor.sh" in doctor.stdout
+    assert "Claude plugin cache: installed manifest is invalid" not in doctor.stdout
+
+
+def test_doctor_distinguishes_a_non_git_live_directory_and_still_checks_hooks(
+    tmp_path: Path,
+) -> None:
+    env, repo, _ = _monitor_env(tmp_path)
+    _install_setup_server(tmp_path / "bin")
+    _source, _installed, _hooks = _install_doctor_freshness_fixture(
+        tmp_path,
+        env,
+        sha_mode=True,
+        marketplace_inventory_source="directory",
+        source_git_backed=False,
+    )
+    env["FAKE_ARGV_LOG"] = _git_bash_path(tmp_path / "argv.log")
+    onboard = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "onboard", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert onboard.returncode == 0, onboard.stdout + onboard.stderr
+
+    doctor = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "doctor", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert doctor.returncode == 1
+    assert (
+        "marketplace directory cannot be verified as a Git worktree with an exact HEAD"
+        in doctor.stdout
+    )
+    assert "live directory has no verifiable exact Git HEAD" in doctor.stdout
+    assert "Claude hooks: current (9/9 normalized hashes match)" in doctor.stdout
 
 
 def test_doctor_does_not_hash_when_explicit_source_versions_disagree(

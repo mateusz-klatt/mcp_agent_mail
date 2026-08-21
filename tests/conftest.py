@@ -105,8 +105,38 @@ def isolated_env(tmp_path, monkeypatch):
     monkeypatch.setenv("HTTP_HOST", "127.0.0.1")
     monkeypatch.setenv("HTTP_PORT", "8765")
     monkeypatch.setenv("HTTP_PATH", "/mcp/")
+    # Empty values shadow both ambient process configuration and the real .env;
+    # delenv() would let python-decouple fall through to that file. OAuth stays
+    # disabled below, while every related value and limiter knob starts from
+    # its compile-time default regardless of the machine running the suite.
+    for variable in (
+        "HTTP_OAUTH_ACCESS_TOKEN_TTL_SECONDS",
+        "HTTP_OAUTH_ALLOWED_CLIENT_REDIRECT_URIS",
+        "HTTP_OAUTH_BASE_URL",
+        "HTTP_OAUTH_DCR_RATE_LIMIT_PER_MINUTE",
+        "HTTP_OAUTH_GITHUB_ALLOWED_IDENTITIES",
+        "HTTP_OAUTH_GITHUB_CLIENT_ID",
+        "HTTP_OAUTH_GITHUB_CLIENT_SECRET",
+        "HTTP_OAUTH_GITHUB_TOKEN_CACHE_TTL_SECONDS",
+        "HTTP_OAUTH_JWT_SIGNING_KEY",
+        "HTTP_OAUTH_RBAC_ROLE",
+        "HTTP_OAUTH_STORAGE_PATH",
+        "HTTP_RATE_LIMIT_BACKEND",
+        "HTTP_RATE_LIMIT_ENABLED",
+        "HTTP_RATE_LIMIT_PER_MINUTE",
+        "HTTP_RATE_LIMIT_REDIS_URL",
+        "HTTP_RATE_LIMIT_RESOURCES_BURST",
+        "HTTP_RATE_LIMIT_RESOURCES_PER_MINUTE",
+        "HTTP_RATE_LIMIT_TOOLS_BURST",
+        "HTTP_RATE_LIMIT_TOOLS_PER_MINUTE",
+    ):
+        monkeypatch.setenv(variable, "")
     monkeypatch.setenv("HTTP_OAUTH_ENABLED", "false")
     monkeypatch.setenv("APP_ENVIRONMENT", "test")
+    # An empty process value deliberately shadows any deploy provenance in the
+    # repository's real .env. delenv() would let python-decouple fall through
+    # to that file and make generic tests depend on the local production build.
+    monkeypatch.setenv("MCP_AGENT_MAIL_BUILD_COMMIT", "")
     storage_root = tmp_path / "storage"
     monkeypatch.setenv("STORAGE_ROOT", str(storage_root))
     monkeypatch.setenv("INLINE_IMAGE_MAX_BYTES", "128")

@@ -187,12 +187,9 @@ ENV HTTP_HOST=0.0.0.0 \
     STORAGE_ROOT=/data/mailbox \
     DATABASE_URL=sqlite+aiosqlite:////data/mailbox/iris.sqlite3
 
-# The commit this image was built from, surfaced by health_check so a deploy can
-# be verified from outside the host. Left empty unless the build passes it
-# (`--build-arg MCP_AGENT_MAIL_BUILD_COMMIT=$(git rev-parse HEAD)`), because an
-# absent commit must read as "this build did not record one" rather than as a
-# confident wrong answer -- reading the version off a running server is exactly
-# what went wrong when the only public number available was FastMCP's.
+# Immutable provenance for deploy diagnostics. Builds that do not supply a
+# full Git object ID deliberately report no commit; the server never guesses
+# from a runtime checkout that is absent from the image.
 ARG MCP_AGENT_MAIL_BUILD_COMMIT=""
 ENV MCP_AGENT_MAIL_BUILD_COMMIT=${MCP_AGENT_MAIL_BUILD_COMMIT}
 

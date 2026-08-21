@@ -6,13 +6,18 @@
 #     (db.py, `_SUPPORTED_BACKENDS = frozenset({"sqlite"})`). It is dead on arrival.
 # Keeping ours separate also keeps `git merge upstream/main` conflict-free.
 #
-#   docker compose -f compose.prod.yaml up -d --build
+#   MCP_AGENT_MAIL_BUILD_COMMIT="$(git rev-parse --verify HEAD)" \
+#     docker compose -f compose.prod.yaml up -d --build
 #
 services:
   mcp-agent-mail:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # A default keeps non-build commands such as `compose logs` usable.
+        # The documented build command above supplies the exact checkout SHA.
+        MCP_AGENT_MAIL_BUILD_COMMIT: "${MCP_AGENT_MAIL_BUILD_COMMIT:-}"
     image: mcp-agent-mail:local
     container_name: mcp-agent-mail
 
@@ -64,7 +69,12 @@ services:
       STORAGE_ROOT: "/data/mailbox"
       # DCR registrations, authorization transactions, and upstream tokens are
       # encrypted before they reach this persistent directory.
-      HTTP_OAUTH_STORAGE_PATH: "/data/oauth"
+      # Keep the default stable, but allow a coordinated key rotation to start
+      # against a fresh versioned directory. Reusing an encrypted store with a
+      # different HTTP_OAUTH_JWT_SIGNING_KEY makes its persisted records
+      # undecryptable; the previous directory must remain untouched for audit
+      # and rollback.
+      HTTP_OAUTH_STORAGE_PATH: "${HTTP_OAUTH_STORAGE_PATH:-/data/oauth}"
       # OAuth's DCR/browser endpoints are public by design. config.py refuses
       # production OAuth unless the limiter is enabled with a positive budget.
       HTTP_RATE_LIMIT_ENABLED: "${HTTP_RATE_LIMIT_ENABLED:-true}"

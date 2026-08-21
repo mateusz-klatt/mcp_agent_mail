@@ -205,6 +205,21 @@ def test_ty_version_is_explicit_and_shared_by_ci_and_makefile() -> None:
     assert 'uvx --from "ty==$(TY_VERSION)" ty check --python-version 3.14 --python-platform all' in makefile
 
 
+def test_container_builds_embed_the_exact_source_commit_when_available() -> None:
+    dockerfile = (REPOSITORY_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    compose = (REPOSITORY_ROOT / "compose.prod.yaml").read_text(encoding="utf-8")
+    release = _read_workflow(WORKFLOWS_DIR / "release.yml")
+
+    assert 'ARG MCP_AGENT_MAIL_BUILD_COMMIT=""' in dockerfile
+    assert "ENV MCP_AGENT_MAIL_BUILD_COMMIT=${MCP_AGENT_MAIL_BUILD_COMMIT}" in dockerfile
+    assert (
+        'MCP_AGENT_MAIL_BUILD_COMMIT: "${MCP_AGENT_MAIL_BUILD_COMMIT:-}"'
+        in compose
+    )
+    assert 'MCP_AGENT_MAIL_BUILD_COMMIT="$(git rev-parse --verify HEAD)"' in compose
+    assert release.count("MCP_AGENT_MAIL_BUILD_COMMIT=${{ github.sha }}") == 2
+
+
 def test_release_reuses_exact_sha_gates_before_publication() -> None:
     workflow = _read_workflow(WORKFLOWS_DIR / "release.yml")
     quality_gate = _job_block(workflow, "quality-gate")

@@ -28,7 +28,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select as _sa_select, text
 
 import mcp_agent_mail.http as http_module
-from mcp_agent_mail import config as _config, storage as storage_module
+from mcp_agent_mail import __version__, config as _config, storage as storage_module
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.models import Agent, Message, MessageRecipient, Project
@@ -295,8 +295,11 @@ class TestHealthEndpoints:
     """Test health check endpoints."""
 
     @pytest.mark.asyncio
-    async def test_liveness_returns_200(self, isolated_env):
+    async def test_liveness_returns_200(self, isolated_env, monkeypatch):
         """Liveness endpoint returns 200 with status 'alive'."""
+        build_sha = "d" * 40
+        monkeypatch.setenv("MCP_AGENT_MAIL_BUILD_COMMIT", build_sha)
+        _config.clear_settings_cache()
         settings = _config.get_settings()
         server = build_mcp_server()
         app = http_module.build_http_app(settings, server)
@@ -305,12 +308,20 @@ class TestHealthEndpoints:
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get("/health/liveness")
             assert response.status_code == 200
-            data = response.json()
-            assert data["status"] == "alive"
+            assert response.json() == {"status": "alive"}
+            assert build_sha not in response.text
+        assert app.version == __version__
 
     @pytest.mark.asyncio
-    async def test_readiness_returns_200_when_healthy(self, isolated_env):
+    async def test_readiness_returns_200_when_healthy(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
         """Readiness endpoint returns 200 when database is accessible."""
+        build_sha = "e" * 40
+        monkeypatch.setenv("MCP_AGENT_MAIL_BUILD_COMMIT", build_sha)
+        _config.clear_settings_cache()
         # Ensure schema exists for readiness check
         await ensure_schema()
 
@@ -322,8 +333,29 @@ class TestHealthEndpoints:
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get("/health/readiness")
             assert response.status_code == 200
-            data = response.json()
-            assert data["status"] == "ready"
+            assert response.json() == {"status": "ready"}
+            assert build_sha not in response.text
+
+    @pytest.mark.asyncio
+    async def test_api_health_remains_minimal_when_build_identity_is_available(
+        self,
+        isolated_env,
+        monkeypatch,
+    ):
+        build_sha = "f" * 40
+        monkeypatch.setenv("MCP_AGENT_MAIL_BUILD_COMMIT", build_sha)
+        _config.clear_settings_cache()
+        settings = _config.get_settings()
+        app = http_module.build_http_app(settings, build_mcp_server())
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/api/health")
+
+        assert response.status_code == 200
+        assert set(response.json()) == {"status", "timestamp"}
+        assert response.json()["status"] == "ok"
+        assert build_sha not in response.text
 
     @pytest.mark.asyncio
     async def test_health_endpoints_bypass_auth(self, isolated_env, monkeypatch):

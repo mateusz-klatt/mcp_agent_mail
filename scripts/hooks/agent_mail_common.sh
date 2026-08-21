@@ -70,9 +70,21 @@ am_normalize_runtime_user_path() {
 
 AM_PATH_CONFIGURATION_VALID=1
 
+# Remember whether the caller supplied the global bearer before this file had
+# any opportunity to read ~/.agent-mail.env. A long-running monitor must follow
+# rotations written to that file, while an explicit process-level override must
+# remain authoritative for the entire process. Testing the origin once avoids
+# confusing the value loaded below with a value inherited from the launcher.
+AM_HTTP_BEARER_FROM_PROCESS=0
+if [ -n "${HTTP_BEARER_TOKEN:-}" ]; then
+    AM_HTTP_BEARER_FROM_PROCESS=1
+fi
+AM_ENV_FILE_PATH=""
+
 # Per-machine configuration. Parsed rather than sourced: this file is read on
-# every edit, and executing whatever it happens to contain is not a property
-# worth having. Environment always wins, so a hook command can still override.
+# every edit (and its bearer is re-read for each request by am_bearer), and
+# executing whatever it happens to contain is not a property worth having.
+# Environment always wins, so a hook command can still override.
 am_load_env() {
     [ -n "${AM_ENV_LOADED:-}" ] && return 0
     AM_ENV_LOADED=1
@@ -85,12 +97,18 @@ am_load_env() {
         /*|[A-Za-z]:/*) ;;
         *) AM_PATH_CONFIGURATION_VALID=0; return 0 ;;
     esac
+    AM_ENV_FILE_PATH="$f"
     [ -r "$f" ] || return 0
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in ''|'#'*) continue ;; esac
         k="${line%%=*}"; v="${line#*=}"
         case "$k" in
-            HTTP_BEARER_TOKEN|AGENT_MAIL_URL|AGENT_MAIL_STATE_DIR)
+            HTTP_BEARER_TOKEN)
+                if [ "$AM_HTTP_BEARER_FROM_PROCESS" -eq 0 ] \
+                    && [ -z "${HTTP_BEARER_TOKEN:-}" ]; then
+                    export HTTP_BEARER_TOKEN="$v"
+                fi ;;
+            AGENT_MAIL_URL|AGENT_MAIL_STATE_DIR)
                 # shellcheck disable=SC2163
                 [ -z "$(eval "printf '%s' \"\${$k:-}\"")" ] && export "$k=$v" ;;
         esac
@@ -841,8 +859,42 @@ am_sync_model() {
     return 0
 }
 
+am_file_bearer() {
+    local f="${AM_ENV_FILE_PATH:-}" line k v
+    [ -n "$f" ] && [ -r "$f" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in ''|'#'*) continue ;; esac
+        k="${line%%=*}"
+        [ "$k" = "HTTP_BEARER_TOKEN" ] || continue
+        # Preserve the initial parser's first-non-empty behaviour. Duplicate
+        # keys are not a rotation mechanism, and letting a later line win here
+        # would make a short hook and an already-running monitor disagree.
+        v="${line#*=}"
+        if [ -n "$v" ]; then
+            printf '%s' "$v"
+            return 0
+        fi
+    done < "$f"
+}
+
 am_bearer() {
-    printf '%s' "${AGENT_MAIL_TOKEN:-${HTTP_BEARER_TOKEN:-}}"
+    local current
+    if [ -n "${AGENT_MAIL_TOKEN:-}" ]; then
+        printf '%s' "$AGENT_MAIL_TOKEN"
+        return 0
+    fi
+    if [ "$AM_HTTP_BEARER_FROM_PROCESS" -eq 1 ]; then
+        printf '%s' "${HTTP_BEARER_TOKEN:-}"
+        return 0
+    fi
+    # File-backed values are deliberately not cached. inbox_watch_monitor.sh
+    # can live for days, while a security rotation replaces this file in one
+    # atomic rename; the next reconnect/request must use the replacement without
+    # requiring another /wake or a CLI restart.
+    current="$(am_file_bearer)"
+    HTTP_BEARER_TOKEN="$current"
+    export HTTP_BEARER_TOKEN
+    printf '%s' "$current"
 }
 
 # --- server calls ------------------------------------------------------------
@@ -854,11 +906,10 @@ am_bearer() {
 # A file is the remaining way in: curl on Windows rejects /dev/fd/N and named
 # pipes ("error encountered when reading a file"), accepting only a real file.
 #
-# Written once per session, not per call — the token does not change mid-session,
-# so this is one write, not a temp file in the critical path. It lands in
-# AM_STATE_DIR beside credentials.json, which already holds registration tokens
-# under the same permissions; note this does put the bearer in a second place on
-# disk, where before it lived only in ~/.agent-mail.env.
+# Reused while the token is unchanged and atomically rewritten after a rotation.
+# It lands in AM_STATE_DIR beside credentials.json, which already holds
+# registration tokens under the same permissions; note this does put the bearer
+# in a second place on disk, where before it lived only in ~/.agent-mail.env.
 #
 # Returns nothing if the file cannot be written; am_call then swaps which of the
 # two stdin users gives way, rather than degrading to -H. A hook that cannot

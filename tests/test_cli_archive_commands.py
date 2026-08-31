@@ -71,6 +71,72 @@ def test_archive_states_dir_prefers_inner_git_repo_over_outer_pyproject(isolated
     assert archive_dir == repo.resolve() / cli_module.ARCHIVE_DIR_NAME
 
 
+def test_archive_states_dir_ignores_a_stray_git_directory_that_is_not_a_repo(
+    isolated_env, tmp_path, monkeypatch
+):
+    """An empty directory named `.git` must not capture the archive root.
+
+    `(candidate / ".git").exists()` answers a different question from "is this a
+    repository", and the gap is not academic: an empty `/tmp/.git` on one machine sent
+    every `archive save` run from a temporary directory into `/tmp/archived_mailbox_states`
+    instead of the intended root -- silently, and with a success message naming the wrong
+    path.
+
+    What actually landed there was this suite's isolated fixture data, so nothing real was
+    disclosed. The reason it matters anyway is that the same code path serves a genuine
+    `archive save`: an operator running it from a directory under a stray marker would have
+    had their mailbox snapshot written somewhere they were not told about.
+    """
+    stray = tmp_path / "not-a-repo"
+    work = stray / "deep" / "subdir"
+    work.mkdir(parents=True, exist_ok=True)
+    (stray / ".git").mkdir()  # empty: no HEAD, no objects, no refs
+    monkeypatch.chdir(work)
+
+    assert cli_module._archive_states_dir(create=False) == (
+        work.resolve() / cli_module.ARCHIVE_DIR_NAME
+    ), "a bare .git directory was mistaken for a repository root"
+
+
+def test_archive_states_dir_ignores_a_git_file_that_is_not_a_worktree_pointer(
+    isolated_env, tmp_path, monkeypatch
+):
+    """The file shape has the same hole: `.git` must actually point somewhere."""
+    stray = tmp_path / "not-a-worktree"
+    work = stray / "deep"
+    work.mkdir(parents=True, exist_ok=True)
+    (stray / ".git").write_text("this is not a gitdir pointer\n", encoding="utf-8")
+    monkeypatch.chdir(work)
+
+    assert cli_module._archive_states_dir(create=False) == (
+        work.resolve() / cli_module.ARCHIVE_DIR_NAME
+    )
+
+
+def test_archive_states_dir_still_anchors_to_a_real_repository(
+    isolated_env, tmp_path, monkeypatch
+):
+    """Control for the two above: a genuine repository is still found and preferred.
+
+    Without this, a detector that rejected every marker would pass both rejection tests.
+    """
+    repo = tmp_path / "real-repo"
+    work = repo / "deep" / "subdir"
+    work.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init"],
+        cwd=str(repo),
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    monkeypatch.chdir(work)
+
+    assert cli_module._archive_states_dir(create=False) == (
+        repo.resolve() / cli_module.ARCHIVE_DIR_NAME
+    )
+
+
 def test_detect_git_head_supports_git_worktrees(isolated_env, tmp_path):
     """_detect_git_head should resolve worktree .git files, not just .git directories."""
     repo = tmp_path / "repo"

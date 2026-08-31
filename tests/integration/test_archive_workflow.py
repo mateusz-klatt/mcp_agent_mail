@@ -67,9 +67,18 @@ def test_archive_save_list_restore_cycle(isolated_env):
     # Typer's CliRunner no longer forwards click's `isolated_filesystem`: since
     # typer vendored its own click, its runner exposes only what Typer itself
     # needs. The block below wants one thing from it — a throwaway working
-    # directory, because it resolves the archive directory from `Path.cwd()`.
-    # The stdlib says that directly, and stops the test depending on which
-    # click surface Typer happens to re-export.
+    # directory. The stdlib says that directly, and stops the test depending on
+    # which click surface Typer happens to re-export.
+    #
+    # The archive directory does NOT come from `Path.cwd()`, which an earlier
+    # version of this comment claimed. `_detect_project_root` walks UP from the
+    # cwd looking for a repository, and only falls back to the cwd when it finds
+    # none — so this assertion is hermetic solely because nothing above a
+    # temporary directory looks like one. That assumption held until an empty
+    # directory named `.git` appeared in `/tmp`, after which every archive here
+    # landed in `/tmp/archived_mailbox_states` and this test failed on that
+    # machine alone. See
+    # test_archive_states_dir_ignores_a_stray_git_directory_that_is_not_a_repo.
     with tempfile.TemporaryDirectory() as _cwd, contextlib.chdir(_cwd):
         archive_dir = Path.cwd() / cli_module.ARCHIVE_DIR_NAME
         before = set(archive_dir.glob("*.zip")) if archive_dir.exists() else set()

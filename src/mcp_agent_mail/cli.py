@@ -4407,12 +4407,29 @@ def _copy_bundle_contents(source: Path, destination: Path) -> BundleSyncResult:
     )
 
 
+def _looks_like_repository_root(candidate: Path) -> bool:
+    """Report whether ``candidate`` is a Git working tree, not merely `.git`-adjacent.
+
+    ``(candidate / ".git").exists()`` is not that question, and the difference is not
+    academic: an EMPTY DIRECTORY named ``.git`` satisfies it. One appeared in ``/tmp`` on
+    a developer machine, and from then on every ``archive save`` run from a temporary
+    directory wrote the operator's mailbox archive into ``/tmp/archived_mailbox_states``
+    instead of the intended root -- silently, with a success message naming the wrong path.
+
+    Git's own criterion is used instead: a repository directory contains ``HEAD``, and a
+    worktree or submodule is a ``.git`` FILE holding a ``gitdir:`` pointer. ``_resolve_git_dir``
+    already understands both shapes, so this only adds the check it does not make.
+    """
+    git_dir = _resolve_git_dir(candidate)
+    return git_dir is not None and (git_dir / "HEAD").exists()
+
+
 def _detect_project_root() -> Path:
     cwd = Path.cwd().resolve()
     candidates = [cwd, *cwd.parents]
     pyproject_candidate: Path | None = None
     for candidate in candidates:
-        if (candidate / ".git").exists():
+        if _looks_like_repository_root(candidate):
             return candidate
         if pyproject_candidate is None and (candidate / "pyproject.toml").exists():
             pyproject_candidate = candidate

@@ -895,11 +895,13 @@ def _seed_ticket_in(slug: str) -> None:
         from mcp_agent_mail.models import Ticket, TicketSequence
 
         async with get_session() as session:
+            # The whole model, not `Project.id`: `select` here is SQLAlchemy's own and a
+            # single mapped column does not match any of its overloads.
             project_id = (
                 await session.execute(
-                    select(Project.id).where(cast(ColumnElement[bool], Project.slug == slug))
+                    select(Project).where(cast(ColumnElement[bool], Project.slug == slug))
                 )
-            ).scalars().one()
+            ).scalars().one().id
             session.add(TicketSequence(project_id=project_id, prefix="ADPT", next_seq=2))
             session.add(
                 Ticket(

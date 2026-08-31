@@ -50,6 +50,7 @@ from sqlalchemy import (
 from sqlalchemy.engine import make_url
 from sqlalchemy.sql import ColumnElement
 
+from . import tickets
 from .app import (
     _LIKE_ESCAPE_CHAR,
     _canonicalize_project_identifier,
@@ -80,6 +81,7 @@ from .models import (
     ProductProjectLink,
     Project,
     Ticket,
+    TicketEvent,
     WindowIdentity,
 )
 from .share import (
@@ -466,6 +468,14 @@ doctor_app = typer.Typer(help="Diagnose and repair mailbox health issues")
 app.add_typer(doctor_app, name="doctor")
 ui_users_app = typer.Typer(help="Manage human logins for the /mail web viewer")
 app.add_typer(ui_users_app, name="ui-users")
+# Read-only on purpose. Writing a ticket records an actor in an append-only audit row, and
+# a CLI invocation has no authenticated agent identity to record -- it would land as `cli`
+# with no provenance, and the contact-policy check that governs every notification lives in
+# the MCP tool bodies rather than in the delivery helper, so a service-layer write would
+# skip it silently. Both are fixable; neither is fixed, so there is nothing here that
+# mutates.
+tickets_app = typer.Typer(help="Inspect epics and tickets (read-only)")
+app.add_typer(tickets_app, name="tickets")
 
 
 async def _ui_users_find_user(session: Any, username: str) -> Any:
@@ -7952,5 +7962,214 @@ def doctor_restore(
             raise typer.Exit(code=1)
 
 
+@tickets_app.command("list")
+def tickets_list(
+    project: str = typer.Argument(..., help="Project slug or human key"),
+    status: Optional[str] = typer.Option(None, "--status", help="open | in_progress | closed"),
+    kind: Optional[str] = typer.Option(None, "--kind", help="epic | task | bug | chore"),
+    assignee: Optional[str] = typer.Option(None, "--assignee", help="Restrict to one agent"),
+    epic: Optional[str] = typer.Option(None, "--epic", help="Restrict to one epic's children"),
+    include_closed: bool = typer.Option(
+        False, "--include-closed", help="Include closed tickets"
+    ),
+    limit: int = typer.Option(50, "--limit", help="Maximum tickets to display (1-500)"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON for machine parsing."),
+) -> None:
+    """List a project's tickets, most urgent first."""
+
+    async def _collect() -> tuple[Project, list[tuple[Ticket, Optional[str]]]]:
+        project_record = await _get_project_record(project)
+        async with get_session() as session:
+            parent_id: Optional[int] = None
+            if epic:
+                parent_id = (await tickets.load_ticket(session, ticket_key=epic)).id
+            assignee_id: Optional[int] = None
+            if assignee:
+                found = await session.execute(
+                    select(Agent.id).where(
+                        cast(ColumnElement[bool], Agent.project_id == project_record.id),
+                        cast(ColumnElement[bool], Agent.name == assignee),
+                    )
+                )
+                resolved = found.scalars().first()
+                if resolved is None:
+                    raise ValueError(f"No agent {assignee!r} in {project_record.human_key}")
+                assignee_id = resolved
+            rows = await tickets.list_tickets(
+                session,
+                project_id=cast(int, project_record.id),
+                status_filter=status,
+                kind_filter=kind,
+                assignee_agent_id=assignee_id,
+                parent_id=parent_id,
+                include_closed=include_closed,
+                limit=limit,
+            )
+            names: dict[int, str] = {}
+            wanted = {row.assignee_agent_id for row in rows if row.assignee_agent_id}
+            if wanted:
+                found = await session.execute(
+                    select(Agent.id, Agent.name).where(cast(Any, Agent.id).in_(wanted))
+                )
+                names = {row[0]: row[1] for row in found.all()}
+            return project_record, [
+                (row, names.get(row.assignee_agent_id) if row.assignee_agent_id else None)
+                for row in rows
+            ]
+
+    try:
+        project_record, rows = _run_async(_collect())
+    except Exception as exc:
+        if json_output:
+            console.print_json(json.dumps({"error": str(exc)}))
+        else:
+            console.print(f"[red]Failed to list tickets:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if json_output:
+        console.print_json(
+            json.dumps(
+                [
+                    {**tickets.ticket_to_dict(row), "assignee": assignee_name}
+                    for row, assignee_name in rows
+                ]
+            )
+        )
+        return
+
+    table = Table(title=f"Tickets — {project_record.human_key}")
+    table.add_column("Key")
+    table.add_column("Kind")
+    table.add_column("Pri")
+    table.add_column("Status")
+    table.add_column("Assignee")
+    table.add_column("Title")
+    for row, assignee_name in rows:
+        table.add_row(
+            row.key,
+            row.kind_key,
+            str(row.priority),
+            row.status_key if row.closed_ts is None else f"{row.status_key} ({row.resolution_key})",
+            assignee_name or "-",
+            row.title,
+        )
+    console.print(table)
+
+
+@tickets_app.command("show")
+def tickets_show(
+    ticket_key: str = typer.Argument(..., help="Ticket key, e.g. AM-12"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON for machine parsing."),
+) -> None:
+    """Show one ticket with its links and change history."""
+
+    async def _collect() -> dict[str, Any]:
+        await ensure_schema()
+        async with get_session() as session:
+            ticket = await tickets.load_ticket(session, ticket_key=ticket_key)
+            outgoing = await tickets.outgoing_links(session, ticket_id=cast(int, ticket.id))
+            incoming = await tickets.incoming_links(session, ticket_key=ticket.key)
+            events = (
+                await session.execute(
+                    select(TicketEvent)
+                    .where(cast(ColumnElement[bool], TicketEvent.ticket_id == ticket.id))
+                    .order_by(cast(Any, TicketEvent.id).asc())
+                )
+            ).scalars().all()
+            return {
+                "ticket": tickets.ticket_to_dict(ticket),
+                "links": [
+                    {
+                        "direction": "outgoing",
+                        "relation": link.relation,
+                        "target_kind": link.target_kind,
+                        "target_ref": link.target_ref,
+                        "available": await tickets.link_target_exists(
+                            session, target_kind=link.target_kind, target_ref=link.target_ref
+                        ),
+                    }
+                    for link in outgoing
+                ]
+                + [
+                    {
+                        "direction": "incoming",
+                        "relation": link.relation,
+                        "target_kind": "ticket",
+                        "target_ref": source_key,
+                        "available": True,
+                    }
+                    for source_key, link in incoming
+                ],
+                "events": [
+                    {
+                        "event_type": event.event_type,
+                        "field_name": event.field_name,
+                        "old_value": event.old_value,
+                        "new_value": event.new_value,
+                        "actor": event.actor_label,
+                        "created_ts": _iso(event.created_ts),
+                    }
+                    for event in events
+                ],
+            }
+
+    try:
+        payload = _run_async(_collect())
+    except Exception as exc:
+        if json_output:
+            console.print_json(json.dumps({"error": str(exc)}))
+        else:
+            console.print(f"[red]Failed to show ticket:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if json_output:
+        console.print_json(json.dumps(payload))
+        return
+
+    ticket_payload = payload["ticket"]
+    table = Table(title=f"{ticket_payload['key']} — {ticket_payload['title']}")
+    table.add_column("Field")
+    table.add_column("Value")
+    for field in ("kind", "status", "resolution", "priority", "reporter_label", "revision"):
+        table.add_row(field, str(ticket_payload.get(field)))
+    table.add_row("created", ticket_payload["created_ts"])
+    table.add_row("updated", ticket_payload["updated_ts"])
+    table.add_row("discussion_thread_id", ticket_payload["discussion_thread_id"])
+    console.print(table)
+
+    if payload["links"]:
+        links = Table(title="Links")
+        links.add_column("Direction")
+        links.add_column("Relation")
+        links.add_column("Target")
+        links.add_column("Available")
+        for link in payload["links"]:
+            links.add_row(
+                link["direction"],
+                link["relation"],
+                f"{link['target_kind']}:{link['target_ref']}",
+                "yes" if link["available"] else "no",
+            )
+        console.print(links)
+
+    if payload["events"]:
+        history = Table(title="History")
+        history.add_column("When")
+        history.add_column("Event")
+        history.add_column("Field")
+        history.add_column("Change")
+        history.add_column("Actor")
+        for event in payload["events"]:
+            change = ""
+            if event["old_value"] is not None or event["new_value"] is not None:
+                change = f"{event['old_value']} -> {event['new_value']}"
+            history.add_row(
+                event["created_ts"],
+                event["event_type"],
+                event["field_name"] or "-",
+                change,
+                event["actor"] or "-",
+            )
+        console.print(history)
 if __name__ == "__main__":
     app()

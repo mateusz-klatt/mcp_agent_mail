@@ -370,7 +370,7 @@ async def _topic_is_occupied(session: AsyncSession, project_id: int, candidate: 
         select(Message.id)
         .where(
             cast(ColumnElement[bool], Message.project_id == project_id),
-            cast(ColumnElement[bool], func.lower(Message.topic) == candidate.lower()),
+            func.lower(Message.topic) == candidate.lower(),
         )
         .limit(1)
     )
@@ -601,7 +601,7 @@ async def load_ticket(session: AsyncSession, *, ticket_key: str) -> Ticket:
     """Return one ticket by its globally unique key, matched case-insensitively."""
     key = validate_key(ticket_key)
     found = await session.execute(
-        select(Ticket).where(cast(ColumnElement[bool], func.lower(Ticket.key) == key.lower()))
+        select(Ticket).where(func.lower(Ticket.key) == key.lower())
     )
     ticket = found.scalars().first()
     if ticket is None:
@@ -645,7 +645,7 @@ async def list_tickets(
     if parent_id is not None:
         predicates.append(cast(ColumnElement[bool], Ticket.parent_id == parent_id))
     if not include_closed:
-        predicates.append(cast(ColumnElement[bool], Ticket.closed_ts.is_(None)))
+        predicates.append(cast(ColumnElement[bool], cast(Any, Ticket.closed_ts).is_(None)))
 
     found = await session.execute(
         select(Ticket)
@@ -814,7 +814,7 @@ async def _blocks_would_cycle(session: AsyncSession, source_key: str, target_key
             select(TicketLink.target_ref)
             .join(Ticket, cast(ColumnElement[bool], Ticket.id == TicketLink.ticket_id))
             .where(
-                cast(ColumnElement[bool], func.lower(Ticket.key) == current.lower()),
+                func.lower(Ticket.key) == current.lower(),
                 cast(ColumnElement[bool], TicketLink.relation == _ACYCLIC_RELATION),
                 cast(ColumnElement[bool], TicketLink.target_kind == "ticket"),
             )

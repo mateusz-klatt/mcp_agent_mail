@@ -101,7 +101,11 @@ def _existing_index_names(bind: sa.engine.Connection, table_name: str) -> set[st
             % table_name.replace("'", "''")
         ).fetchall()
         return {row[0] for row in rows}
-    return {index["name"] for index in sa.inspect(bind).get_indexes(table_name)}
+    return {
+        name
+        for name in (index["name"] for index in sa.inspect(bind).get_indexes(table_name))
+        if name is not None
+    }
 
 
 def upgrade() -> None:

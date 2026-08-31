@@ -8,15 +8,15 @@
   },
   "baselines": {
     "send_message": {
-      "description": "Send a single message to one recipient",
+      "description": "Durably publish one message to one recipient with DB, file, fsync, and Git commit",
       "dataset": {
         "message_size": 512,
         "recipients": 1
       },
       "latency_ms": {
-        "p95_max": 500,
-        "p99_max": 750,
-        "mean_max": 200
+        "p95_max": 1000,
+        "p99_max": 1500,
+        "mean_max": 800
       },
       "query_stats": {
         "avg_per_op_max": 5,

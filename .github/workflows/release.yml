@@ -190,6 +190,7 @@ jobs:
           context: .
           build-args: |
             TOON_RUST_REF=cb256dcf73ab78c248a14f65840a3fa722ec8682
+            MCP_AGENT_MAIL_BUILD_COMMIT=${{ github.sha }}
           platforms: linux/amd64
           provenance: false
           sbom: false
@@ -208,6 +209,7 @@ jobs:
           context: .
           build-args: |
             TOON_RUST_REF=cb256dcf73ab78c248a14f65840a3fa722ec8682
+            MCP_AGENT_MAIL_BUILD_COMMIT=${{ github.sha }}
           platforms: linux/arm64
           provenance: false
           sbom: false

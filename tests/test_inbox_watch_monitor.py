@@ -19,6 +19,7 @@ twelve existing assertions about inbox_watch.sh keep a file to themselves.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import signal
@@ -42,6 +43,29 @@ from tests.test_agent_hook_identity import (
 
 MONITOR = ROOT / "scripts" / "hooks" / "inbox_watch_monitor.sh"
 SETUP = ROOT / "scripts" / "hooks" / "agent_mail_setup.sh"
+COMMON = ROOT / "scripts" / "hooks" / "agent_mail_common.sh"
+CLAUDE_PLUGIN_ID = "mcp-agent-mail@mateusz-klatt-mcp-agent-mail"
+CLAUDE_MARKETPLACE = "mateusz-klatt-mcp-agent-mail"
+CLAUDE_PLUGIN_CONTROLLED_FILES = (
+    ".claude-plugin/plugin.json",
+    "skills/doctor/SKILL.md",
+    "skills/onboard/SKILL.md",
+    "skills/wake/SKILL.md",
+    "scripts/hooks/inbox_watch_monitor.sh",
+    "scripts/hooks/agent_mail_common.sh",
+    "scripts/hooks/agent_mail_setup.sh",
+)
+CLAUDE_INTEGRATOR_HOOKS = (
+    "agent_mail_common.sh",
+    "session_start.sh",
+    "inbox_check.sh",
+    "reservations_warn.sh",
+    "autoreserve.sh",
+    "session_end.sh",
+    "inbox_watch.sh",
+    "inbox_watch_monitor.sh",
+    "agent_mail_setup.sh",
+)
 
 
 def _monitor_env(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
@@ -95,6 +119,291 @@ jq -nc --argjson value "$result" '{result:{content:[{type:"text",text:($value|to
 printf '200\n'
 ''',
     )
+
+
+def _write_fixture_text(path: Path, text: str, *, crlf: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    newline = "\r\n" if crlf else "\n"
+    path.write_text(
+        text.replace("\r\n", "\n").replace("\n", newline),
+        encoding="utf-8",
+        newline="",
+    )
+
+
+def _install_doctor_freshness_fixture(
+    tmp_path: Path,
+    env: dict[str, str],
+    *,
+    source_version: str = "0.5.0",
+    installed_version: str | None = None,
+    source_crlf: bool = False,
+    sha_mode: bool = False,
+    catalog_version: str | None = None,
+    marketplace_inventory_source: str | None = None,
+    source_git_backed: bool = True,
+    claude_config_dir: Path | None = None,
+) -> tuple[Path, Path, Path]:
+    """Install a hermetic Claude inventory and its two managed file surfaces."""
+    source = tmp_path / "plugin-source"
+    installed = tmp_path / "plugin-cache"
+    claude_root = claude_config_dir or (tmp_path / "home" / ".claude")
+    installed_hooks = claude_root / "hooks" / "mcp-agent-mail"
+
+    source_manifest_data = {"name": "mcp-agent-mail"}
+    marketplace_plugin = {
+        "name": "mcp-agent-mail",
+        "source": "./",
+    }
+    if not sha_mode:
+        source_manifest_data["version"] = source_version
+        marketplace_plugin["version"] = catalog_version or source_version
+    source_manifest = json.dumps(source_manifest_data, sort_keys=True) + "\n"
+    marketplace_manifest = json.dumps(
+        {
+            "name": CLAUDE_MARKETPLACE,
+            "plugins": [marketplace_plugin],
+        },
+        sort_keys=True,
+    ) + "\n"
+    _write_fixture_text(
+        source / ".claude-plugin" / "plugin.json",
+        source_manifest,
+        crlf=source_crlf,
+    )
+    _write_fixture_text(
+        source / ".claude-plugin" / "marketplace.json",
+        marketplace_manifest,
+        crlf=source_crlf,
+    )
+    for relative in CLAUDE_PLUGIN_CONTROLLED_FILES:
+        if relative == ".claude-plugin/plugin.json":
+            continue
+        body = f"controlled fixture: {relative}\n"
+        _write_fixture_text(source / relative, body, crlf=source_crlf)
+        _write_fixture_text(installed / relative, body)
+    for hook in CLAUDE_INTEGRATOR_HOOKS:
+        source_hook = source / "scripts" / "hooks" / hook
+        if not source_hook.exists():
+            _write_fixture_text(
+                source_hook,
+                f"hook fixture: {hook}\n",
+                crlf=source_crlf,
+            )
+        normalized = source_hook.read_text(encoding="utf-8").replace("\r\n", "\n")
+        _write_fixture_text(installed_hooks / hook, normalized)
+
+    if sha_mode and source_git_backed:
+        subprocess.run(
+            ["git", "init", str(source)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(source), "add", "."],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source),
+                "-c",
+                "user.name=Agent Mail Tests",
+                "-c",
+                "user.email=agent-mail-tests@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        effective_source_version = subprocess.run(
+            ["git", "-C", str(source), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    else:
+        effective_source_version = source_version
+
+    installed_version = installed_version or effective_source_version
+    installed_manifest_data = {"name": "mcp-agent-mail"}
+    if not sha_mode:
+        installed_manifest_data["version"] = installed_version
+    _write_fixture_text(
+        installed / ".claude-plugin" / "plugin.json",
+        json.dumps(installed_manifest_data, sort_keys=True) + "\n",
+    )
+
+    fake_bin = tmp_path / "bin"
+    (fake_bin / "claude-plugin-inventory.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": CLAUDE_PLUGIN_ID,
+                    "version": installed_version,
+                    "installPath": _git_bash_path(installed),
+                    "scope": "user",
+                    "enabled": True,
+                    "errors": [],
+                }
+            ],
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    (fake_bin / "claude-marketplace-inventory.json").write_text(
+        json.dumps(
+            [
+                {
+                    "name": CLAUDE_MARKETPLACE,
+                    "source": marketplace_inventory_source or "github",
+                    "installLocation": _git_bash_path(source),
+                }
+            ],
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    fake_claude = fake_bin / "claude"
+    fake_claude.write_text(
+        r'''#!/usr/bin/env bash
+fixture_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+if [[ -n ${CLAUDE_CONFIG_DIR+x} ]]; then
+  printf 'set\n' >> "${fixture_dir}/claude-config-dir-presence.log"
+fi
+for secret_name in \
+  INTEGRATION_BEARER_TOKEN HTTP_BEARER_TOKEN MCP_AGENT_MAIL_TOKEN \
+  AGENT_MAIL_TOKEN AGENT_MAIL_REGISTRATION_TOKEN _TOKEN GROQ_API_KEY \
+  REDIS_URL REDIS_TLS_URL AGENT_MAIL_JQ_TOKEN AGENT_MAIL_JQ_ACCESS_TOKEN \
+  CLAUDE_CODE_OAUTH_TOKEN NODE_OPTIONS BASH_ENV PASSWORD; do
+  secret_value="$(eval "printf '%s' \"\${${secret_name}:-}\"")"
+  if [[ -n "$secret_value" ]]; then
+    printf '%s\n' "$secret_name" >> "${fixture_dir}/claude-secret-env.log"
+    exit 95
+  fi
+done
+if [[ "$1" == plugin && "$2" == list && "$3" == --json ]]; then
+  cat "${fixture_dir}/claude-plugin-inventory.json"
+elif [[ "$1" == plugin && "$2" == marketplace && "$3" == list && "$4" == --json ]]; then
+  cat "${fixture_dir}/claude-marketplace-inventory.json"
+else
+  exit 94
+fi
+''',
+        encoding="utf-8",
+        newline="\n",
+    )
+    fake_claude.chmod(0o700)
+    return source, installed, installed_hooks
+
+
+def _install_synthetic_doctor_monitor(
+    tmp_path: Path,
+    env: dict[str, str],
+    stream_body: str,
+) -> tuple[subprocess.Popen[bytes], int]:
+    """Publish the exact read-only monitor state consumed by `/doctor`."""
+    credentials = json.loads(
+        (tmp_path / "state" / "credentials.json").read_text(encoding="utf-8")
+    )
+    [(project, project_credentials)] = credentials.items()
+    [(agent, _token)] = project_credentials.items()
+    component_env = {
+        **env,
+        "COMMON_UNDER_TEST": _git_bash_path(COMMON),
+        "MONITOR_STATE_KEY": f"{project}|{agent}",
+    }
+    component = subprocess.run(
+        [
+            BASH,
+            "--noprofile",
+            "--norc",
+            "-c",
+            '. "$COMMON_UNDER_TEST"; am_state_component "$MONITOR_STATE_KEY"',
+        ],
+        env=component_env,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    ).stdout.strip()
+
+    pid_file = tmp_path / "synthetic-monitor.pid"
+    process_env = {
+        **env,
+        "SYNTHETIC_MONITOR_PID_FILE": _git_bash_path(pid_file),
+    }
+    process = subprocess.Popen(
+        [
+            BASH,
+            "--noprofile",
+            "--norc",
+            "-c",
+            'printf "%s\\n" "$$" > "$SYNTHETIC_MONITOR_PID_FILE"; '
+            "trap 'exit 0' TERM INT HUP; while :; do sleep 1; done",
+        ],
+        env=process_env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        assert _wait_until(pid_file.is_file), "synthetic monitor pid was not published"
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
+        watch = tmp_path / "state" / "watch"
+        watch.mkdir(parents=True, exist_ok=True)
+        (watch / f"monitor-{component}.pid").write_text(
+            f"{pid}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        (watch / f"monitor-{component}.json").write_text(
+            json.dumps(
+                {
+                    "pid": pid,
+                    "parent_pid": pid,
+                    "supervise_parent": 1,
+                    "project_key": project,
+                    "agent_name": agent,
+                    "source_sha256": hashlib.sha256(MONITOR.read_bytes())
+                    .hexdigest()[:32],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        (watch / f"monitor-{component}-{pid}.stream").write_text(
+            stream_body,
+            encoding="utf-8",
+            newline="\n",
+        )
+    except BaseException:
+        process.terminate()
+        process.wait(timeout=10)
+        raise
+    return process, pid
+
+
+def _stop_synthetic_doctor_monitor(
+    process: subprocess.Popen[bytes], pid: int
+) -> None:
+    subprocess.run(
+        [BASH, "-c", f"kill {pid} 2>/dev/null || true"],
+        check=False,
+        capture_output=True,
+    )
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=10)
 
 
 def _install_rotation_server(fake_bin: Path) -> None:
@@ -669,6 +978,7 @@ def test_onboard_persists_the_one_time_token_and_doctor_never_prints_it(
     env, repo, _ = _monitor_env(tmp_path)
     fake_bin = tmp_path / "bin"
     _install_setup_server(fake_bin)
+    _install_doctor_freshness_fixture(tmp_path, env, source_crlf=True)
     argv_log = tmp_path / "argv.log"
     env["FAKE_ARGV_LOG"] = _git_bash_path(argv_log)
 
@@ -722,8 +1032,795 @@ def test_onboard_persists_the_one_time_token_and_doctor_never_prints_it(
     assert "server authentication: valid" in doctor.stdout
     assert "local marker: absent (optional" in doctor.stdout
     assert "monitor: not armed for this project and Agent (optional" in doctor.stdout
+    assert "Claude plugin version: current (0.5.0 exact match)" in doctor.stdout
+    assert "Claude plugin files: current (7/7 normalized hashes match)" in doctor.stdout
+    assert "Claude hooks: current (9/9 normalized hashes match)" in doctor.stdout
     assert "result: healthy" in doctor.stdout
     assert "one-time-secret" not in doctor.stdout + doctor.stderr
+
+
+@pytest.mark.parametrize(
+    ("stream_body", "expected_returncode", "expected_status"),
+    [
+        (": ready\n\n", 0, "monitor delivery: authenticated (: ready observed)"),
+        (
+            '{"error":"Unauthorized","detail":"stream-body-sentinel"}\n',
+            1,
+            "monitor delivery: unauthorized; the running monitor may hold a stale bearer",
+        ),
+        (
+            "",
+            0,
+            "monitor delivery: unconfirmed; stream is empty or between reconnects",
+        ),
+    ],
+)
+def test_doctor_reports_live_monitor_delivery_authentication_without_dumping_stream(
+    tmp_path: Path,
+    stream_body: str,
+    expected_returncode: int,
+    expected_status: str,
+) -> None:
+    env, repo, _ = _monitor_env(tmp_path)
+    _install_setup_server(tmp_path / "bin")
+    _install_doctor_freshness_fixture(tmp_path, env)
+    env["FAKE_ARGV_LOG"] = _git_bash_path(tmp_path / "argv.log")
+    onboard = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "onboard", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert onboard.returncode == 0, onboard.stdout + onboard.stderr
+    process, pid = _install_synthetic_doctor_monitor(tmp_path, env, stream_body)
+    try:
+        doctor = subprocess.run(
+            [BASH, _git_bash_path(SETUP), "doctor", "claude", "1"],
+            cwd=repo,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    finally:
+        _stop_synthetic_doctor_monitor(process, pid)
+
+    assert doctor.returncode == expected_returncode, doctor.stdout + doctor.stderr
+    assert expected_status in doctor.stdout
+    assert "stream-body-sentinel" not in doctor.stdout + doctor.stderr
+    if expected_returncode == 0:
+        assert "monitor: healthy pid" in doctor.stdout
+        assert "result: healthy" in doctor.stdout
+    else:
+        assert "delivery authentication failed" in doctor.stdout
+        assert "result: 1 issue(s); no state was changed" in doctor.stdout
+
+
+@pytest.mark.parametrize(
+    ("override_name", "override_value", "expected"),
+    [
+        (None, None, ["file-old", "file-new"]),
+        (
+            "HTTP_BEARER_TOKEN",
+            "process-http-override",
+            ["process-http-override", "process-http-override"],
+        ),
+        (
+            "AGENT_MAIL_TOKEN",
+            "process-agent-override",
+            ["process-agent-override", "process-agent-override"],
+        ),
+    ],
+)
+def test_long_lived_common_shell_refreshes_only_a_file_backed_bearer(
+    tmp_path: Path,
+    override_name: str | None,
+    override_value: str | None,
+    expected: list[str],
+) -> None:
+    """A monitor follows atomic env rotation without defeating explicit env."""
+    home = tmp_path / "home"
+    state = tmp_path / "state"
+    home.mkdir()
+    state.mkdir()
+    env_file = home / ".agent-mail.env"
+    env_file.write_text(
+        "AGENT_MAIL_URL=https://hermes.example/mcp/\n"
+        "HTTP_BEARER_TOKEN=file-old\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    env: dict[str, str] = {
+        **os.environ,
+        "HOME": _git_bash_path(home),
+        "AGENT_MAIL_ENV_FILE": _git_bash_path(env_file),
+        "AGENT_MAIL_STATE_DIR": _git_bash_path(state),
+        "COMMON_UNDER_TEST": _git_bash_path(COMMON),
+    }
+    env.pop("HTTP_BEARER_TOKEN", None)
+    env.pop("AGENT_MAIL_TOKEN", None)
+    if override_name is not None and override_value is not None:
+        env[override_name] = override_value
+
+    result = subprocess.run(
+        [
+            BASH,
+            "--noprofile",
+            "--norc",
+            "-c",
+            r'''
+. "$COMMON_UNDER_TEST"
+first="$(am_bearer)"
+am_hdr_conf "$first" >/dev/null
+printf '%s\n' "$first"
+printf '%s\n' \
+  'AGENT_MAIL_URL=https://hermes.example/mcp/' \
+  'HTTP_BEARER_TOKEN=file-new' > "$AGENT_MAIL_ENV_FILE"
+second="$(am_bearer)"
+am_hdr_conf "$second" >/dev/null
+printf '%s\n' "$second"
+''',
+        ],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == expected
+    header_config = (state / "curl-headers.conf").read_text(encoding="utf-8")
+    assert f"Authorization: Bearer {expected[-1]}" in header_config
+    if expected[-1] != "file-old":
+        assert "Authorization: Bearer file-old" not in header_config
+
+
+def test_doctor_rejects_exact_version_mismatch_without_semver_ordering(
+    tmp_path: Path,
+) -> None:
+    env, repo, _ = _monitor_env(tmp_path)
+    _install_setup_server(tmp_path / "bin")
+    _install_doctor_freshness_fixture(
+        tmp_path,
+        env,
+        source_version="0.9.0",
+        installed_version="0.10.0",
+    )
+    env["FAKE_ARGV_LOG"] = _git_bash_path(tmp_path / "argv.log")
+    onboard = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "onboard", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert onboard.returncode == 0, onboard.stdout + onboard.stderr
+
+    doctor = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "doctor", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert doctor.returncode == 1
+    version_line = next(
+        line
+        for line in doctor.stdout.splitlines()
+        if line.startswith("Claude plugin version:")
+    )
+    assert "installed 0.10.0 differs from source 0.9.0" in version_line
+    assert "hash comparison deferred until version metadata agrees" in doctor.stdout
+    assert "newer" not in version_line
+    assert "older" not in version_line
+
+
+def test_doctor_accepts_versionless_github_marketplace_git_sha(
+    tmp_path: Path,
+) -> None:
+    env, repo, _ = _monitor_env(tmp_path)
+    _install_setup_server(tmp_path / "bin")
+    source, _installed, _hooks = _install_doctor_freshness_fixture(
+        tmp_path,
+        env,
+        sha_mode=True,
+    )
+    source_sha = subprocess.run(
+        ["git", "-C", str(source), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    env["FAKE_ARGV_LOG"] = _git_bash_path(tmp_path / "argv.log")
+    onboard = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "onboard", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert onboard.returncode == 0, onboard.stdout + onboard.stderr
+
+    doctor = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "doctor", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert doctor.returncode == 0, doctor.stdout + doctor.stderr
+    assert (
+        f"Claude plugin version: current ({source_sha} exact Git SHA match)"
+        in doctor.stdout
+    )
+    assert "Claude plugin files: current (7/7 normalized hashes match)" in doctor.stdout
+    assert "result: healthy" in doctor.stdout
+
+
+def test_doctor_reports_stale_git_sha_inventory(tmp_path: Path) -> None:
+    env, repo, _ = _monitor_env(tmp_path)
+    _install_setup_server(tmp_path / "bin")
+    source, _installed, _hooks = _install_doctor_freshness_fixture(
+        tmp_path,
+        env,
+        installed_version="0" * 40,
+        sha_mode=True,
+    )
+    source_sha = subprocess.run(
+        ["git", "-C", str(source), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    env["FAKE_ARGV_LOG"] = _git_bash_path(tmp_path / "argv.log")
+    onboard = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "onboard", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert onboard.returncode == 0, onboard.stdout + onboard.stderr
+
+    doctor = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "doctor", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert doctor.returncode == 1
+    assert (
+        f"installed {'0' * 40} differs from source Git HEAD {source_sha}"
+        in doctor.stdout
+    )
+    assert "hash comparison deferred until version metadata agrees" in doctor.stdout
+
+
+def test_doctor_checks_hook_copies_for_a_git_backed_live_directory_marketplace(
+    tmp_path: Path,
+) -> None:
+    env, repo, _ = _monitor_env(tmp_path)
+    _install_setup_server(tmp_path / "bin")
+    source, _installed, hooks = _install_doctor_freshness_fixture(
+        tmp_path,
+        env,
+        sha_mode=True,
+        marketplace_inventory_source="directory",
+    )
+    source_sha = subprocess.run(
+        ["git", "-C", str(source), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (hooks / "inbox_watch_monitor.sh").write_text(
+        "stale installed monitor\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    env["FAKE_ARGV_LOG"] = _git_bash_path(tmp_path / "argv.log")
+    onboard = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "onboard", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert onboard.returncode == 0, onboard.stdout + onboard.stderr
+
+    doctor = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "doctor", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert doctor.returncode == 1
+    assert f"live Git-backed directory at {source_sha}" in doctor.stdout
+    assert "legacy directory mode is not an immutable tracked-file snapshot" in doctor.stdout
+    assert "cached inventory" in doctor.stdout
+    assert "is not a freshness signal for a live directory source" in doctor.stdout
+    assert "cache comparison is not applicable" in doctor.stdout
+    assert "installed copy drift: inbox_watch_monitor.sh" in doctor.stdout
+    assert "marketplace source directory is not Git-backed" not in doctor.stdout
+
+
+def test_doctor_live_directory_checks_hooks_despite_manifest_version_disagreement(
+    tmp_path: Path,
+) -> None:
+    env, repo, _ = _monitor_env(tmp_path)
+    _install_setup_server(tmp_path / "bin")
+    _source, installed, hooks = _install_doctor_freshness_fixture(
+        tmp_path,
+        env,
+        source_version="0.5.0",
+        catalog_version="0.6.0",
+        marketplace_inventory_source="directory",
+    )
+    (installed / ".claude-plugin" / "plugin.json").write_text(
+        "not-json\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    (hooks / "inbox_watch_monitor.sh").write_text(
+        "stale installed monitor\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    env["FAKE_ARGV_LOG"] = _git_bash_path(tmp_path / "argv.log")
+    onboard = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "onboard", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert onboard.returncode == 0, onboard.stdout + onboard.stderr
+
+    doctor = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "doctor", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert doctor.returncode == 1
+    assert (
+        "manifest version 0.5.0 differs from marketplace version 0.6.0"
+        in doctor.stdout
+    )
+    assert "cache comparison is not applicable" in doctor.stdout
+    assert "installed copy drift: inbox_watch_monitor.sh" in doctor.stdout
+    assert "Claude plugin cache: installed manifest is invalid" not in doctor.stdout
+
+
+def test_doctor_distinguishes_a_non_git_live_directory_and_still_checks_hooks(
+    tmp_path: Path,
+) -> None:
+    env, repo, _ = _monitor_env(tmp_path)
+    _install_setup_server(tmp_path / "bin")
+    _source, _installed, _hooks = _install_doctor_freshness_fixture(
+        tmp_path,
+        env,
+        sha_mode=True,
+        marketplace_inventory_source="directory",
+        source_git_backed=False,
+    )
+    env["FAKE_ARGV_LOG"] = _git_bash_path(tmp_path / "argv.log")
+    onboard = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "onboard", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert onboard.returncode == 0, onboard.stdout + onboard.stderr
+
+    doctor = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "doctor", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert doctor.returncode == 1
+    assert (
+        "marketplace directory cannot be verified as a Git worktree with an exact HEAD"
+        in doctor.stdout
+    )
+    assert "live directory has no verifiable exact Git HEAD" in doctor.stdout
+    assert "Claude hooks: current (9/9 normalized hashes match)" in doctor.stdout
+
+
+def test_doctor_does_not_hash_when_explicit_source_versions_disagree(
+    tmp_path: Path,
+) -> None:
+    env, repo, _ = _monitor_env(tmp_path)
+    _install_setup_server(tmp_path / "bin")
+    _install_doctor_freshness_fixture(
+        tmp_path,
+        env,
+        source_version="0.5.0",
+        catalog_version="0.6.0",
+    )
+    env["FAKE_ARGV_LOG"] = _git_bash_path(tmp_path / "argv.log")
+    onboard = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "onboard", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert onboard.returncode == 0, onboard.stdout + onboard.stderr
+
+    doctor = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "doctor", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert doctor.returncode == 1
+    assert (
+        "manifest version 0.5.0 differs from marketplace version 0.6.0"
+        in doctor.stdout
+    )
+    assert "Claude plugin version:" not in doctor.stdout
+    assert "Claude plugin file" not in doctor.stdout
+    assert "Claude hook" not in doctor.stdout
+
+
+def test_doctor_does_not_forward_agent_mail_secrets_to_claude_cli(
+    tmp_path: Path,
+) -> None:
+    env, repo, _ = _monitor_env(tmp_path)
+    _install_setup_server(tmp_path / "bin")
+    _install_doctor_freshness_fixture(tmp_path, env)
+    env["FAKE_ARGV_LOG"] = _git_bash_path(tmp_path / "argv.log")
+    onboard = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "onboard", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert onboard.returncode == 0, onboard.stdout + onboard.stderr
+
+    secret_log = tmp_path / "bin" / "claude-secret-env.log"
+    secret_values: list[str] = []
+    for index, name in enumerate(
+        (
+            "INTEGRATION_BEARER_TOKEN",
+            "HTTP_BEARER_TOKEN",
+            "MCP_AGENT_MAIL_TOKEN",
+            "AGENT_MAIL_TOKEN",
+            "AGENT_MAIL_REGISTRATION_TOKEN",
+            "_TOKEN",
+            "GROQ_API_KEY",
+            "REDIS_URL",
+            "REDIS_TLS_URL",
+            "AGENT_MAIL_JQ_TOKEN",
+            "AGENT_MAIL_JQ_ACCESS_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "NODE_OPTIONS",
+            "PASSWORD",
+        )
+    ):
+        value = f"subprocess-secret-{index}"
+        env[name] = value
+        secret_values.append(value)
+
+    doctor = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "doctor", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert doctor.returncode == 0, doctor.stdout + doctor.stderr
+    assert not secret_log.exists()
+    exposed = doctor.stdout + doctor.stderr
+    for secret in secret_values:
+        assert secret not in exposed
+
+
+@pytest.mark.parametrize(
+    ("inventory_mode", "expected_returncode", "expected_message"),
+    (
+        ("disabled", 1, "but disabled"),
+        ("missing-enabled", 1, "enabled state is missing or invalid"),
+        ("string-enabled", 1, "enabled state is missing or invalid"),
+        ("reported-errors", 1, "reports plugin errors"),
+        ("invalid-errors", 1, "errors state is missing or invalid"),
+        ("missing-errors", 0, None),
+    ),
+)
+def test_doctor_requires_enabled_error_free_claude_plugin_inventory(
+    tmp_path: Path,
+    inventory_mode: str,
+    expected_returncode: int,
+    expected_message: str | None,
+) -> None:
+    env, repo, _ = _monitor_env(tmp_path)
+    _install_setup_server(tmp_path / "bin")
+    _install_doctor_freshness_fixture(tmp_path, env)
+    inventory_path = tmp_path / "bin" / "claude-plugin-inventory.json"
+    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+    entry = inventory[0]
+    if inventory_mode == "disabled":
+        entry["enabled"] = False
+    elif inventory_mode == "missing-enabled":
+        entry.pop("enabled")
+    elif inventory_mode == "string-enabled":
+        entry["enabled"] = "true"
+    elif inventory_mode == "reported-errors":
+        entry["errors"] = ["private-plugin-error-detail"]
+    elif inventory_mode == "invalid-errors":
+        entry["errors"] = "private-plugin-error-detail"
+    elif inventory_mode == "missing-errors":
+        entry.pop("errors")
+    inventory_path.write_text(json.dumps(inventory), encoding="utf-8")
+
+    env["FAKE_ARGV_LOG"] = _git_bash_path(tmp_path / "argv.log")
+    onboard = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "onboard", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert onboard.returncode == 0, onboard.stdout + onboard.stderr
+
+    doctor = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "doctor", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert doctor.returncode == expected_returncode, doctor.stdout + doctor.stderr
+    if expected_message is not None:
+        assert expected_message in doctor.stdout
+    assert "private-plugin-error-detail" not in doctor.stdout + doctor.stderr
+
+
+def test_doctor_uses_custom_claude_config_dir_for_installed_hooks(
+    tmp_path: Path,
+) -> None:
+    env, repo, _ = _monitor_env(tmp_path)
+    _install_setup_server(tmp_path / "bin")
+    custom_claude_root = tmp_path / "custom claude profile"
+    env["CLAUDE_CONFIG_DIR"] = _git_bash_path(custom_claude_root)
+    _install_doctor_freshness_fixture(
+        tmp_path,
+        env,
+        claude_config_dir=custom_claude_root,
+    )
+    env["FAKE_ARGV_LOG"] = _git_bash_path(tmp_path / "argv.log")
+    onboard = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "onboard", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert onboard.returncode == 0, onboard.stdout + onboard.stderr
+
+    doctor = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "doctor", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert doctor.returncode == 0, doctor.stdout + doctor.stderr
+    assert "Claude hooks: current" in doctor.stdout
+
+
+def test_doctor_rejects_empty_claude_config_dir_without_forwarding_it(
+    tmp_path: Path,
+) -> None:
+    env, repo, _ = _monitor_env(tmp_path)
+    _install_setup_server(tmp_path / "bin")
+    _install_doctor_freshness_fixture(tmp_path, env)
+    env["FAKE_ARGV_LOG"] = _git_bash_path(tmp_path / "argv.log")
+    onboard = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "onboard", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert onboard.returncode == 0, onboard.stdout + onboard.stderr
+
+    presence_log = tmp_path / "bin" / "claude-config-dir-presence.log"
+    assert not presence_log.exists()
+    env["CLAUDE_CONFIG_DIR"] = ""
+    doctor = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "doctor", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert doctor.returncode == 1, doctor.stdout + doctor.stderr
+    assert "CLAUDE_CONFIG_DIR must resolve to a non-empty absolute path" in doctor.stdout
+    assert not presence_log.exists()
+
+
+def test_doctor_detects_same_version_plugin_file_drift(tmp_path: Path) -> None:
+    env, repo, _ = _monitor_env(tmp_path)
+    _install_setup_server(tmp_path / "bin")
+    _source, installed, _hooks = _install_doctor_freshness_fixture(tmp_path, env)
+    env["FAKE_ARGV_LOG"] = _git_bash_path(tmp_path / "argv.log")
+    onboard = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "onboard", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert onboard.returncode == 0, onboard.stdout + onboard.stderr
+    (installed / "skills" / "doctor" / "SKILL.md").write_text(
+        "stale same-version skill\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    doctor = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "doctor", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert doctor.returncode == 1
+    assert "Claude plugin version: current (0.5.0 exact match)" in doctor.stdout
+    assert "same-version drift: skills/doctor/SKILL.md" in doctor.stdout
+
+
+def test_doctor_reports_every_integrator_managed_hook_drift(tmp_path: Path) -> None:
+    env, repo, _ = _monitor_env(tmp_path)
+    _install_setup_server(tmp_path / "bin")
+    _source, _installed, hooks = _install_doctor_freshness_fixture(tmp_path, env)
+    env["FAKE_ARGV_LOG"] = _git_bash_path(tmp_path / "argv.log")
+    onboard = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "onboard", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert onboard.returncode == 0, onboard.stdout + onboard.stderr
+    for hook in CLAUDE_INTEGRATOR_HOOKS:
+        (hooks / hook).write_text(
+            f"stale installed hook: {hook}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+    doctor = subprocess.run(
+        [BASH, _git_bash_path(SETUP), "doctor", "claude", "1"],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert doctor.returncode == 1
+    for hook in CLAUDE_INTEGRATOR_HOOKS:
+        assert f"Claude hook: installed copy drift: {hook}" in doctor.stdout
+
+
+def test_doctor_hook_inventory_matches_the_claude_integrator_contract() -> None:
+    integrator = (ROOT / "scripts" / "integrate_claude_code.sh").read_text(
+        encoding="utf-8"
+    )
+    setup = SETUP.read_text(encoding="utf-8")
+
+    def array_items(script: str, name: str) -> tuple[str, ...]:
+        body = script.split(f"{name}=(", 1)[1].split("\n)", 1)[0]
+        return tuple(
+            line.strip()
+            for line in body.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+
+    assert array_items(integrator, "AGENT_MAIL_HOOKS") == CLAUDE_INTEGRATOR_HOOKS
+    assert array_items(setup, "CLAUDE_AGENT_MAIL_HOOKS") == CLAUDE_INTEGRATOR_HOOKS
+
+
+def test_claude_skills_use_integrator_managed_diagnostic_paths() -> None:
+    expected_setup = (
+        '"${CLAUDE_CONFIG_DIR-${HOME}/.claude}/hooks/'
+        'mcp-agent-mail/agent_mail_setup.sh"'
+    )
+    for skill in ("doctor", "onboard", "wake"):
+        text = (ROOT / "skills" / skill / "SKILL.md").read_text(encoding="utf-8")
+        assert expected_setup in text
+        assert "${CLAUDE_PLUGIN_ROOT}/scripts/hooks/agent_mail_setup.sh" not in text
+    wake = (ROOT / "skills" / "wake" / "SKILL.md").read_text(encoding="utf-8")
+    assert (
+        '"${CLAUDE_CONFIG_DIR-${HOME}/.claude}/hooks/'
+        'mcp-agent-mail/inbox_watch_monitor.sh"'
+        in wake
+    )
+    plugin = json.loads(
+        (ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
+    )
+    monitor_command = plugin["experimental"]["monitors"][0]["command"]
+    assert monitor_command.startswith('"${CLAUDE_PLUGIN_ROOT}/scripts/hooks/')
+    assert 'inbox_watch_monitor.sh" claude ' in monitor_command
 
 
 def test_rotate_token_persists_verifies_and_redacts_the_replacement(
@@ -1039,6 +2136,7 @@ def test_onboard_local_marker_is_explicit_and_hidden_only_locally(
 ) -> None:
     env, repo, _ = _monitor_env(tmp_path)
     _install_setup_server(tmp_path / "bin")
+    _install_doctor_freshness_fixture(tmp_path, env)
     env["FAKE_ARGV_LOG"] = _git_bash_path(tmp_path / "argv.log")
 
     result = subprocess.run(

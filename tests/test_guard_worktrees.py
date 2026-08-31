@@ -295,6 +295,43 @@ async def test_guard_install_husky_v9_propagates_failure(isolated_env, tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_guard_install_husky_v9_runs_complete_preserved_stub(
+    isolated_env,
+    tmp_path: Path,
+):
+    """Commands surrounding Husky's resolver line must not be skipped."""
+    settings = get_settings()
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    _init_git_repo(repo)
+    runtime_dir, _tracked = _write_husky_v9_layout(
+        repo,
+        "pre-commit",
+        "#!/usr/bin/env sh\necho HUSKY_TRACKED_RAN\n",
+    )
+    stub = runtime_dir / "pre-commit"
+    stub.write_text(
+        "#!/usr/bin/env sh\n"
+        "echo HUSKY_STUB_RAN\n"
+        '. "$(dirname "$0")/h"\n',
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    _git_config(repo, "core.hooksPath", ".husky/_")
+
+    hook_path = await install_guard(settings, "husky-v9-complete-stub-test", repo)
+    result = _run_hook(
+        hook_path,
+        repo,
+        {"WORKTREES_ENABLED": "0", "GIT_IDENTITY_ENABLED": "0"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "HUSKY_STUB_RAN" in result.stdout
+    assert "HUSKY_TRACKED_RAN" in result.stdout
+
+
+@pytest.mark.asyncio
 async def test_prepush_guard_husky_v9_forwards_argv_and_stdin(isolated_env, tmp_path: Path):
     """Husky pre-push receives Git's arguments and a fresh copy of its stdin."""
     settings = get_settings()
@@ -392,6 +429,43 @@ async def test_guard_doesnt_overwrite_own_orig(isolated_env, tmp_path: Path):
 
     # .orig should still have original content
     assert orig_hook.read_text() == original_content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("hook_name", "installer"),
+    (
+        ("pre-commit", install_guard),
+        ("pre-push", install_prepush_guard),
+    ),
+)
+async def test_guard_refuses_to_overwrite_new_foreign_hook_when_orig_differs(
+    isolated_env,
+    tmp_path: Path,
+    hook_name: str,
+    installer,
+):
+    """A stale .orig must never license overwriting a newly replaced hook."""
+    settings = get_settings()
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    _init_git_repo(repo)
+    hooks_dir = repo / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    hook_path = hooks_dir / hook_name
+    hook_path.write_text("#!/bin/sh\necho original\n", encoding="utf-8")
+    hook_path.chmod(0o755)
+
+    await installer(settings, "preserve-conflict-test", repo)
+    orig_path = hooks_dir / f"{hook_name}.orig"
+    hook_path.write_text("#!/bin/sh\necho replacement\n", encoding="utf-8")
+    hook_path.chmod(0o755)
+
+    with pytest.raises(FileExistsError, match="Refusing to replace a foreign Git hook"):
+        await installer(settings, "preserve-conflict-test", repo)
+
+    assert "replacement" in hook_path.read_text(encoding="utf-8")
+    assert "original" in orig_path.read_text(encoding="utf-8")
 
 
 # =============================================================================
@@ -752,7 +826,13 @@ class _RecordingRun:
         return subprocess.CompletedProcess(normalized, 0, stdout="", stderr="")
 
 
-def _exec_chain_runner(hook_path: Path, script_text: str, *, os_name: str) -> None:
+def _exec_chain_runner(
+    hook_path: Path,
+    script_text: str,
+    *,
+    os_name: str,
+    expected_code: int = 0,
+) -> None:
     """Execute a rendered runner with only its imported os.name simulated."""
     exec_globals: dict[str, Any] = {"__file__": str(hook_path), "__name__": "__main__"}
     os_shim = types.SimpleNamespace(name=os_name)
@@ -766,7 +846,10 @@ def _exec_chain_runner(hook_path: Path, script_text: str, *, os_name: str) -> No
     exec_globals["__builtins__"] = {**vars(builtins), "__import__": _import}
     with pytest.raises(SystemExit) as exc_info:
         exec(compile(script_text, str(hook_path), "exec"), exec_globals)
-    assert exc_info.value.code in (0, None)
+    if expected_code == 0:
+        assert exc_info.value.code in (0, None)
+    else:
+        assert exc_info.value.code == expected_code
 
 
 def _write_windows_dispatch_layout(tmp_path: Path) -> Path:
@@ -779,7 +862,15 @@ def _write_windows_dispatch_layout(tmp_path: Path) -> Path:
         "#!/usr/bin/env python3\nprint('python shebang')\n",
         encoding="utf-8",
     )
-    (run_dir / "30-native.cmd").write_text("@echo off\r\nexit /b 0\r\n", encoding="utf-8")
+    (run_dir / "30-native.exe").write_bytes(b"MZ")
+    (run_dir / "40-node-script").write_text(
+        "#!/usr/bin/env node\nconsole.log('node')\n",
+        encoding="utf-8",
+    )
+    (run_dir / "50-bash-script.sh").write_text(
+        "#!/usr/bin/env bash\nprintf 'bash\\n'\n",
+        encoding="utf-8",
+    )
     (hooks / "pre-commit.orig").write_text(
         "#!/usr/bin/env sh\necho original\n",
         encoding="utf-8",
@@ -795,7 +886,12 @@ def test_chain_runner_windows_dispatches_shebang_children(monkeypatch, tmp_path:
     hook_path = hooks / "pre-commit"
     recorder = _RecordingRun()
     monkeypatch.setattr(subprocess, "run", recorder)
-    monkeypatch.setattr(shutil, "which", lambda _command: "C:/Git/usr/bin/sh.exe")
+    interpreters = {
+        "sh": "C:/Git/usr/bin/sh.exe",
+        "node": "C:/Program Files/nodejs/node.exe",
+        "bash": "C:/Git/usr/bin/bash.exe",
+    }
+    monkeypatch.setattr(shutil, "which", interpreters.get)
     monkeypatch.setattr(sys, "argv", [str(hook_path), "hook-arg"])
 
     _exec_chain_runner(hook_path, _render_chain_runner_script("pre-commit"), os_name="nt")
@@ -803,7 +899,9 @@ def test_chain_runner_windows_dispatches_shebang_children(monkeypatch, tmp_path:
     calls = [argv for argv, _kwargs in recorder.calls]
     python_file = next(argv for argv in calls if "10-plugin.py" in argv[1])
     python_shebang = next(argv for argv in calls if "20-python-script" in argv[1])
-    native_cmd = next(argv for argv in calls if "30-native.cmd" in argv[0])
+    native_exe = next(argv for argv in calls if "30-native.exe" in argv[0])
+    node_shebang = next(argv for argv in calls if "40-node-script" in argv[1])
+    bash_shebang = next(argv for argv in calls if "50-bash-script.sh" in argv[1])
     shell_orig = next(
         argv for argv in calls if any(value.endswith("pre-commit.orig") for value in argv)
     )
@@ -813,9 +911,49 @@ def test_chain_runner_windows_dispatches_shebang_children(monkeypatch, tmp_path:
         str(hooks / "hooks.d/pre-commit/20-python-script"),
         "hook-arg",
     ]
-    assert native_cmd == [str(hooks / "hooks.d/pre-commit/30-native.cmd"), "hook-arg"]
+    assert native_exe == [str(hooks / "hooks.d/pre-commit/30-native.exe"), "hook-arg"]
+    assert node_shebang == [
+        "C:/Program Files/nodejs/node.exe",
+        str(hooks / "hooks.d/pre-commit/40-node-script"),
+        "hook-arg",
+    ]
+    assert bash_shebang == [
+        "C:/Git/usr/bin/bash.exe",
+        str(hooks / "hooks.d/pre-commit/50-bash-script.sh").replace("\\", "/"),
+        "hook-arg",
+    ]
     shell_orig_path = str(hooks / "pre-commit.orig").replace("\\", "/")
     assert shell_orig == ["C:/Git/usr/bin/sh.exe", shell_orig_path, "hook-arg"]
+
+
+@pytest.mark.parametrize("filename", ("10-not-executable", "10-unsafe.cmd"))
+def test_chain_runner_windows_rejects_unsupported_children(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+    filename: str,
+):
+    """Unknown files and cmd scripts are never guessed into an interpreter."""
+    from mcp_agent_mail.guard import _render_chain_runner_script
+
+    hooks = tmp_path / "hooks"
+    run_dir = hooks / "hooks.d" / "pre-commit"
+    run_dir.mkdir(parents=True)
+    (run_dir / filename).write_text("echo unsafe\n", encoding="utf-8")
+    hook_path = hooks / "pre-commit"
+    recorder = _RecordingRun()
+    monkeypatch.setattr(subprocess, "run", recorder)
+    monkeypatch.setattr(sys, "argv", [str(hook_path), "remote&unexpected"])
+
+    _exec_chain_runner(
+        hook_path,
+        _render_chain_runner_script("pre-commit"),
+        os_name="nt",
+        expected_code=126,
+    )
+
+    assert recorder.calls == []
+    assert f"Unsupported Windows hook child: {run_dir / filename}" in capsys.readouterr().err
 
 
 def test_chain_runner_windows_resolves_git_bundled_sh(monkeypatch, tmp_path: Path):
@@ -832,7 +970,14 @@ def test_chain_runner_windows_resolves_git_bundled_sh(monkeypatch, tmp_path: Pat
     bundled_sh.write_text("", encoding="utf-8")
     recorder = _RecordingRun(git_exec_path=str(exec_path))
     monkeypatch.setattr(subprocess, "run", recorder)
-    monkeypatch.setattr(shutil, "which", lambda _command: None)
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda command: {
+            "node": "C:/Program Files/nodejs/node.exe",
+            "bash": "C:/Git/usr/bin/bash.exe",
+        }.get(command),
+    )
     monkeypatch.setattr(sys, "argv", [str(hook_path)])
 
     _exec_chain_runner(hook_path, _render_chain_runner_script("pre-commit"), os_name="nt")
@@ -892,11 +1037,11 @@ def test_chain_runner_windows_husky_uses_real_hook_name(
     assert argv[:3] == [
         "C:/Git/usr/bin/sh.exe",
         "-c",
-        'husky_h="$1"; shift; . "$husky_h"',
+        'orig="$1"; shift; . "$orig"',
     ]
     assert argv[3].endswith(f"/{hook_name}")
     assert not argv[3].endswith(".orig")
-    assert argv[4].endswith("/h")
+    assert argv[4].endswith(f"/{hook_name}.orig")
     assert "\\" not in argv[3]
     assert "\\" not in argv[4]
     assert argv[5:] == hook_args

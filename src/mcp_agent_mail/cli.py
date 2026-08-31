@@ -7616,14 +7616,16 @@ def doctor_repair(
         else:
             try:
                 lock_result = await heal_archive_locks(settings, project_slug=project_slug)
-                locks_removed = len(lock_result["locks_removed"])
-                metadata_removed = len(lock_result["metadata_removed"])
+                locks_removed = lock_result["locks_removed"]
+                metadata_removed = lock_result["metadata_removed"]
                 if locks_removed:
-                    console.print(f"  [green]Healed {locks_removed} stale lock(s)[/green]")
+                    console.print(
+                        f"  [green]Healed {len(locks_removed)} stale lock(s)[/green]"
+                    )
                 if metadata_removed:
                     console.print(
                         "  [green]Removed "
-                        f"{metadata_removed} orphaned lock metadata file(s)[/green]"
+                        f"{len(metadata_removed)} orphaned lock metadata file(s)[/green]"
                     )
                 if not locks_removed and not metadata_removed:
                     console.print("  [dim]No stale locks to heal[/dim]")

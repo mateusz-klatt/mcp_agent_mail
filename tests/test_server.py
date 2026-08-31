@@ -1210,6 +1210,9 @@ def test_oauth_configuration_fails_closed_in_production(
     monkeypatch.setenv("APP_ENVIRONMENT", "production")
     monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "false")
     monkeypatch.setenv("HTTP_OAUTH_ENABLED", "true")
+    monkeypatch.setenv("HTTP_OAUTH_BASE_URL", "")
+    monkeypatch.setenv("HTTP_RATE_LIMIT_ENABLED", "false")
+    monkeypatch.setenv("HTTP_RATE_LIMIT_PER_MINUTE", "60")
     clear_settings_cache()
     with pytest.raises(
         ConfigError,
@@ -3354,7 +3357,8 @@ async def test_health_check_reports_our_version_not_the_frameworks(isolated_env,
     """
     from mcp_agent_mail.utils import package_version
 
-    monkeypatch.delenv("MCP_AGENT_MAIL_BUILD_COMMIT", raising=False)
+    monkeypatch.setenv("MCP_AGENT_MAIL_BUILD_COMMIT", "")
+    clear_settings_cache()
     server = build_mcp_server()
     async with Client(server) as client:
         health = await client.call_tool("health_check", {})
@@ -3373,7 +3377,7 @@ async def test_health_check_reports_our_version_not_the_frameworks(isolated_env,
 async def test_health_check_surfaces_build_commit_only_when_the_build_recorded_one(
     isolated_env, monkeypatch
 ):
-    monkeypatch.delenv("MCP_AGENT_MAIL_BUILD_COMMIT", raising=False)
+    monkeypatch.setenv("MCP_AGENT_MAIL_BUILD_COMMIT", "")
     clear_settings_cache()
     server = build_mcp_server()
     async with Client(server) as client:

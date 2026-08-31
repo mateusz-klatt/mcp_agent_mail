@@ -11,7 +11,7 @@ from mcp_agent_mail.db import ensure_schema
 from mcp_agent_mail.http import build_http_app, main as http_main
 
 
-def test_http_main_invokes_uvicorn(monkeypatch):
+def test_http_main_invokes_uvicorn(isolated_env, monkeypatch):
     # Ensure settings default host/port are used
     with contextlib.suppress(Exception):
         _config.clear_settings_cache()

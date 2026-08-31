@@ -13,13 +13,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlsplit
 
+import fastmcp
 import pytest
 import respx
 from authlib.jose import JsonWebKey, jwt
 from fastmcp.server.auth import AccessToken
 from httpx import ASGITransport, AsyncClient, Response as HttpxResponse
 
-from mcp_agent_mail import config as _config
+from mcp_agent_mail import __version__, config as _config
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.http import _AllowlistedGitHubTokenVerifier, build_http_app
 
@@ -1015,6 +1016,8 @@ async def test_http_bearer_and_cors_preflight(isolated_env, monkeypatch):
     monkeypatch.setenv("HTTP_BEARER_TOKEN", "token123")
     monkeypatch.setenv("HTTP_CORS_ENABLED", "true")
     monkeypatch.setenv("HTTP_CORS_ORIGINS", "http://example.com")
+    build_sha = "c" * 40
+    monkeypatch.setenv("MCP_AGENT_MAIL_BUILD_COMMIT", build_sha)
     # Disable localhost auto-authentication to properly test bearer auth
     monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "false")
     with contextlib.suppress(Exception):
@@ -1041,6 +1044,11 @@ async def test_http_bearer_and_cors_preflight(isolated_env, monkeypatch):
             json=_rpc("tools/call", {"name": "health_check", "arguments": {}}),
         )
         assert r2.status_code == 200
+        assert r2.json()["result"]["structuredContent"]["build"] == {
+            "application_version": __version__,
+            "fastmcp_version": fastmcp.__version__,
+            "git_sha": build_sha,
+        }
         # CORS header present on response
         assert r2.headers.get("access-control-allow-origin") in ("*", "http://example.com")
 

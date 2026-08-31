@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -14,6 +15,9 @@ from decouple import (
 )
 
 _DOTENV_PATH: Final[Path] = Path(".env")
+_BUILD_COMMIT_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:[0-9a-f]{40}|[0-9a-f]{64})"
+)
 OAUTH_LOOPBACK_REDIRECT_PORT_PATTERNS: Final[frozenset[str]] = frozenset(
     {
         "http://127.0.0.1:*",
@@ -393,6 +397,18 @@ def _enum(value: str, *, default: str, allowed: frozenset[str], key: str) -> str
         return normalized
     raise ConfigError(
         f"{key}: invalid value {value!r}. Expected one of {sorted(allowed)} (or leave unset for default {default!r})."
+    )
+
+
+def _optional_build_commit(value: str, *, key: str) -> str | None:
+    """Validate optional immutable build provenance without echoing bad input."""
+    candidate = str(value or "").strip()
+    if not candidate:
+        return None
+    if _BUILD_COMMIT_RE.fullmatch(candidate) is not None:
+        return candidate
+    raise ConfigError(
+        f"{key}: expected a full lowercase 40- or 64-character hexadecimal Git object ID."
     )
 
 
@@ -806,8 +822,9 @@ def _build_settings() -> Settings:
 
     return Settings(
         environment=environment,
-        build_commit=(
-            decouple_config("MCP_AGENT_MAIL_BUILD_COMMIT", default="").strip() or None
+        build_commit=_optional_build_commit(
+            decouple_config("MCP_AGENT_MAIL_BUILD_COMMIT", default=""),
+            key="MCP_AGENT_MAIL_BUILD_COMMIT",
         ),
         # Gate: allow either legacy WORKTREES_ENABLED or new GIT_IDENTITY_ENABLED to enable features
         worktrees_enabled=(

@@ -17,7 +17,7 @@ orphan the server identity.
 From the project being onboarded:
 
 ```bash
-"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel)}/scripts/hooks/agent_mail_setup.sh" \
+"${CLAUDE_CONFIG_DIR-${HOME}/.claude}/hooks/mcp-agent-mail/agent_mail_setup.sh" \
   onboard claude "${AGENT_MAIL_CLAUDE_SLOT:-1}"
 ```
 

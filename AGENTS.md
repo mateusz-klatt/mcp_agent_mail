@@ -167,7 +167,7 @@ Macros vs granular tools
 - Composition details:
   - Installer writes a Python chain-runner to `.git/hooks/pre-commit` and `.git/hooks/pre-push` that executes `hooks.d/<hook>/*` and then `<hook>.orig` if present.
   - Agent Mail guard is installed as `hooks.d/pre-commit/50-agent-mail.py` and `hooks.d/pre-push/50-agent-mail.py`.
-  - On Windows, `.cmd` and `.ps1` shims are written alongside the chain-runner to invoke Python.
+  - On Windows, Git uses the extensionless Python chain-runner and an optional `.ps1` is written for direct PowerShell use. New `.cmd` wrappers are not created; reinstalling overwrites only an exact historical Agent Mail `.cmd` with a fail-closed retired marker and preserves foreign files.
 - Reserve before you edit:
   - `file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true)`
   - Patterns use Git pathspec semantics and respect repository `core.ignorecase`.

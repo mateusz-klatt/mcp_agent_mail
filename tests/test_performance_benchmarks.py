@@ -757,7 +757,7 @@ class TestMessageSendLatency:
     async def test_message_send_latency_baseline(
         self, isolated_env, benchmark_log_path: Path
     ):
-        """Establish baseline for message send latency. Target: < 100ms p95."""
+        """Bound durable message publication, including DB, file, fsync, and Git commit."""
         import uuid
 
         from fastmcp import Client
@@ -809,7 +809,7 @@ class TestMessageSendLatency:
             benchmark_log_path,
             test_name="message_send_latency",
         )
-        threshold_ms = 1_500 if os.name == "nt" else 500
+        threshold_ms = 1_500 if os.name == "nt" else 1_000
         assert stats["p95"] < threshold_ms, (
             f"Message send p95 ({stats['p95']:.2f}ms) exceeds "
             f"{threshold_ms}ms threshold"

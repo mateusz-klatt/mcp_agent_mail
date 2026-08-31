@@ -97,8 +97,8 @@ from .models import (
     ProjectSiblingSuggestion,
     Product,
     ProductProjectLink,
+    Ticket,
     TicketEvent,
-    TicketLink,
     WindowIdentity,
 )
 # Aliased: the module's function names (`create_ticket`, `list_tickets`, ...) are the same
@@ -16186,6 +16186,7 @@ def build_mcp_server() -> FastMCP:
         agent_name: str,
         ticket_key: str,
         include_events: bool = False,
+        include_discussion: bool = False,
         registration_token: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
@@ -16201,11 +16202,14 @@ def build_mcp_server() -> FastMCP:
             The ticket key, matched case-insensitively.
         include_events : bool
             Include the append-only change log (default false).
+        include_discussion : bool
+            Include the ticket's comments, which are ordinary messages on its
+            discussion thread (default false).
 
         Returns
         -------
         dict
-            { ticket: {...}, links: [...], [events: [...]] }
+            { ticket: {...}, links: [...], [events: [...]], [discussion: [...]] }
         """
         project = await _get_project_by_identifier(project_key)
         await _resolve_authenticated_agent(
@@ -16230,24 +16234,40 @@ def build_mcp_server() -> FastMCP:
                     recoverable=True,
                     data={"code": "ticket_not_found"},
                 )
-            links = (
-                await session.execute(
-                    select(TicketLink)
-                    .where(cast(Any, TicketLink.ticket_id) == ticket.id)
-                    .order_by(cast(Any, TicketLink.id).asc())
-                )
-            ).scalars().all()
+            outgoing = await ticketing.outgoing_links(session, ticket_id=cast(int, ticket.id))
+            incoming = await ticketing.incoming_links(session, ticket_key=ticket.key)
             payload: dict[str, Any] = {
                 "ticket": ticketing.ticket_to_dict(ticket),
                 "links": [
                     {
+                        "direction": "outgoing",
                         "relation": link.relation,
                         "target_kind": link.target_kind,
                         "target_ref": link.target_ref,
+                        # Re-resolved on every read. False means the referent is gone, not
+                        # that the edge is invalid: `target_ref` carries no foreign key so
+                        # a purged message leaves the relation and its author intact.
+                        "available": await ticketing.link_target_exists(
+                            session, target_kind=link.target_kind, target_ref=link.target_ref
+                        ),
                         "created_by": link.created_by_label,
                         "created_ts": link.created_ts.isoformat(),
                     }
-                    for link in links
+                    for link in outgoing
+                ]
+                + [
+                    {
+                        # Derived at read time rather than stored, so the two directions of
+                        # one edge cannot disagree.
+                        "direction": "incoming",
+                        "relation": link.relation,
+                        "target_kind": "ticket",
+                        "target_ref": source_key,
+                        "available": True,
+                        "created_by": link.created_by_label,
+                        "created_ts": link.created_ts.isoformat(),
+                    }
+                    for source_key, link in incoming
                 ],
             }
             if include_events:
@@ -16270,6 +16290,29 @@ def build_mcp_server() -> FastMCP:
                         "created_ts": event.created_ts.isoformat(),
                     }
                     for event in events
+                ]
+            if include_discussion:
+                # Keyed on the opaque thread id, not on the topic tag. The topic is a
+                # label anyone may reuse; the thread id is what this ticket owns.
+                comments = (
+                    await session.execute(
+                        select(Message, Agent.name)
+                        .join(Agent, cast(Any, Agent.id) == Message.sender_id, isouter=True)
+                        .where(cast(Any, Message.thread_id) == ticket.discussion_thread_id)
+                        .order_by(cast(Any, Message.id).asc())
+                        .limit(200)
+                    )
+                ).all()
+                payload["discussion"] = [
+                    {
+                        "message_id": message.id,
+                        "from": sender_name,
+                        "subject": message.subject,
+                        "body_md": message.body_md,
+                        "importance": message.importance,
+                        "created_ts": message.created_ts.isoformat(),
+                    }
+                    for message, sender_name in comments
                 ]
         return payload
 
@@ -16460,9 +16503,340 @@ def build_mcp_server() -> FastMCP:
                     "changed_fields": list(result.changed_fields),
                     "revision": result.revision,
                 }
+                notify_name: Optional[str] = None
+                if "assignee_agent_id" in result.changed_fields and assignee_id is not None:
+                    notify_name = assignee_name
+                notify_subject = f"[{result.ticket.key}] {result.ticket.title}"[:200]
+                notify_band = ticketing.priority_importance(result.ticket.priority)
+                notify_thread = result.ticket.discussion_thread_id
+                notify_key = result.ticket.key
                 await session.commit()
             except ticketing.TicketError as error:
                 raise _ticket_refusal(error) from error
+
+        # DB first, and the write transaction is closed before the send. Delivery commits
+        # to the git archive under a process-wide lock; holding the ticket's transaction
+        # across it would stall every other agent's mail behind this update. An assignment
+        # that lands but cannot be announced is a far better outcome than an assignment
+        # that is refused because the assignee's mailbox is blocked, so the notification is
+        # reported rather than raised.
+        if notify_name and notify_name != agent_name:
+            try:
+                delivery = await send_message(
+                    ctx=ctx,
+                    project_key=project_key,
+                    sender_name=agent_name,
+                    registration_token=registration_token,
+                    to=[notify_name],
+                    subject=notify_subject,
+                    body_md=(
+                        f"{agent_name} assigned **{notify_key}** to you.\n\n"
+                        f"Priority {payload['ticket']['priority']}, "
+                        f"status `{payload['ticket']['status']}`.\n\n"
+                        f"Reply on this thread to comment on the ticket."
+                    ),
+                    idempotency_key=_internal_delivery_idempotency_key(
+                        "ticket-assignment",
+                        {
+                            "ticket": notify_key,
+                            "revision": payload["revision"],
+                            "assignee": notify_name,
+                        },
+                    ),
+                    importance=notify_band,
+                    topic=notify_key,
+                    thread_id=notify_thread,
+                    format="json",
+                )
+                error_payload = _extract_delivery_error_payload(delivery)
+                if error_payload is not None:
+                    payload["notification"] = {
+                        "delivered": False,
+                        "reason": error_payload.get("type", "DELIVERY_FAILED"),
+                    }
+                else:
+                    payload["notification"] = {"delivered": True, "to": notify_name}
+            except Exception as exc:
+                payload["notification"] = {
+                    "delivered": False,
+                    "reason": _delivery_failure_from_exception(project, exc).get(
+                        "type", "DELIVERY_FAILED"
+                    ),
+                }
+        return payload
+
+    @mcp.tool(name="link_ticket")
+    @_instrument_tool(
+        "link_ticket",
+        cluster=CLUSTER_TICKETING,
+        capabilities={"ticketing", "write"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def link_ticket(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        ticket_key: str,
+        relation: str,
+        target_kind: str,
+        target_ref: str,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Point a ticket at another ticket, a delivered message, or a file reservation.
+
+        This is the edge a general-purpose tracker structurally cannot have, because it has
+        neither this mail archive nor these file reservations: a ticket can name the exact
+        message where the decision was made and the reservation realising it.
+
+        Parameters
+        ----------
+        relation : str
+            One of: blocks, relates, duplicates, decided_by, touches.
+            `blocks` is kept acyclic; the others are not constrained.
+        target_kind : str
+            One of: ticket, message, file_reservation.
+        target_ref : str
+            For `ticket`, the target's KEY (not its row id) -- keys are globally unique and
+            never rewritten, so a key-addressed edge may legitimately cross projects.
+            For `message` and `file_reservation`, the numeric id.
+
+        Notes
+        -----
+        Linking is idempotent: repeating the same edge returns `created: false` rather than
+        failing. The target must exist when the edge is created; if it is purged later the
+        edge survives and reads back as `available: false`, because a change in what a
+        pointer resolves to must not delete the relation, the author or the timestamp.
+
+        Returns
+        -------
+        dict
+            { created: bool, link: {...} }
+        """
+        project = await _get_project_by_identifier(project_key)
+        agent = await _resolve_authenticated_agent(
+            ctx,
+            project,
+            agent_name=agent_name,
+            provided_token=registration_token,
+            token_param="registration_token",
+            action="link_ticket",
+        )
+        # BEGIN IMMEDIATE: the `blocks` cycle walk followed by an insert is a
+        # read-then-write like any other, and is only race-free under the lock.
+        async with get_immediate_session() as session:
+            db_project = await session.get(Project, project.id)
+            if db_project is None:
+                raise ToolExecutionError(
+                    error_type="NOT_FOUND",
+                    message=f"Project {project_key!r} disappeared mid-transaction.",
+                    recoverable=True,
+                )
+            try:
+                ticket = await ticketing.load_ticket(session, ticket_key=ticket_key)
+                if ticket.project_id != project.id:
+                    raise ToolExecutionError(
+                        error_type="NOT_FOUND",
+                        message=f"No ticket {ticket_key!r} in project {project_key!r}.",
+                        recoverable=True,
+                        data={"code": "ticket_not_found"},
+                    )
+                result = await ticketing.set_ticket_link(
+                    session,
+                    ticket=ticket,
+                    project=db_project,
+                    actor=await _ticket_actor(agent),
+                    relation=relation,
+                    target_kind=target_kind,
+                    target_ref=target_ref,
+                )
+                payload = {
+                    "created": result.created,
+                    "link": {
+                        "ticket_key": ticket.key,
+                        "relation": result.link.relation,
+                        "target_kind": result.link.target_kind,
+                        "target_ref": result.link.target_ref,
+                        "created_by": result.link.created_by_label,
+                        "created_ts": result.link.created_ts.isoformat(),
+                    },
+                }
+                await session.commit()
+            except ticketing.TicketError as error:
+                raise _ticket_refusal(error) from error
+        return payload
+
+    async def _ticket_correspondents(
+        session: Any, ticket: Any, exclude_agent_id: Optional[int]
+    ) -> list[str]:
+        """Return the agents a ticket update concerns, excluding the actor.
+
+        Assignee and reporter only. A ticket is not a mailing list: broadcasting every
+        comment to the project would make the feature the reason people stop reading mail.
+        """
+        wanted = [
+            agent_id
+            for agent_id in (ticket.assignee_agent_id, ticket.reporter_agent_id)
+            if agent_id is not None and agent_id != exclude_agent_id
+        ]
+        if not wanted:
+            return []
+        found = await session.execute(
+            select(Agent.name).where(
+                cast(Any, Agent.id).in_(wanted),
+                cast(Any, Agent.retired_at).is_(None),
+            )
+        )
+        return sorted({row[0] for row in found.all()})
+
+    @mcp.tool(name="comment_ticket")
+    @_instrument_tool(
+        "comment_ticket",
+        cluster=CLUSTER_TICKETING,
+        capabilities={"ticketing", "messaging", "write"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def comment_ticket(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        ticket_key: str,
+        body_md: str,
+        idempotency_key: str,
+        to: Optional[list[str]] = None,
+        importance: Optional[str] = None,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Comment on a ticket. The comment IS a message.
+
+        There is no private comment table. A ticket's discussion is ordinary Agent Mail,
+        which is why it arrives in inboxes, carries read receipts and ACK, is committed to
+        the git archive and is full-text searchable -- none of which a private table would
+        have had without being rebuilt from scratch.
+
+        The message carries `topic = <ticket key>` (the readable tag) and
+        `thread_id = <the ticket's discussion_thread_id>` (the conversation's identity).
+        The two are deliberately different: `thread_id` has no uniqueness constraint and is
+        supplied by the caller, so any agent could have claimed the key as a thread before
+        the ticket existed. The opaque id is the reservation the mail system does not offer.
+
+        Parameters
+        ----------
+        body_md : str
+            The comment, in GitHub-Flavored Markdown.
+        idempotency_key : str
+            Required. Retrying the same key with the same payload recovers the same
+            delivery instead of posting the comment twice.
+        to : Optional[list[str]]
+            Override the recipients. By default the assignee and the reporter, minus you.
+        importance : Optional[str]
+            Defaults to the ticket's priority band: 0-1 high, 2-3 normal, 4+ low.
+
+        Returns
+        -------
+        dict
+            { ticket_key, thread_id, recipients, delivery, [notification_error] }
+        """
+        project = await _get_project_by_identifier(project_key)
+        agent = await _resolve_authenticated_agent(
+            ctx,
+            project,
+            agent_name=agent_name,
+            provided_token=registration_token,
+            token_param="registration_token",
+            action="comment_ticket",
+        )
+        # Read and close BEFORE sending. Delivery commits to the git archive under a
+        # process-wide lock, and holding a write transaction across it would make every
+        # other agent's mail wait behind this comment -- with busy_timeout at 60s, that
+        # shows up as a minute-long stall rather than as a wrong answer.
+        async with get_session() as session:
+            try:
+                ticket = await ticketing.load_ticket(session, ticket_key=ticket_key)
+            except ticketing.TicketError as error:
+                raise _ticket_refusal(error) from error
+            if ticket.project_id != project.id:
+                raise ToolExecutionError(
+                    error_type="NOT_FOUND",
+                    message=f"No ticket {ticket_key!r} in project {project_key!r}.",
+                    recoverable=True,
+                    data={"code": "ticket_not_found"},
+                )
+            ticket_id = cast(int, ticket.id)
+            resolved_key = ticket.key
+            thread_id = ticket.discussion_thread_id
+            band = ticketing.priority_importance(ticket.priority)
+            recipients = (
+                list(to)
+                if to
+                else await _ticket_correspondents(session, ticket, agent.id)
+            )
+
+        # An unassigned ticket whose reporter is commenting has nobody else to tell. A
+        # self-addressed comment is the correct outcome: refusing would mean a ticket can
+        # be discussed only once somebody else is involved.
+        if not recipients:
+            recipients = [agent.name]
+
+        delivery = await send_message(
+            ctx=ctx,
+            project_key=project_key,
+            sender_name=agent_name,
+            registration_token=registration_token,
+            to=recipients,
+            subject=f"[{resolved_key}] {ticket.title}"[:200],
+            body_md=body_md,
+            idempotency_key=idempotency_key,
+            importance=importance or band,
+            topic=resolved_key,
+            thread_id=thread_id,
+            format="json",
+        )
+        error_payload = _extract_delivery_error_payload(delivery)
+        payload: dict[str, Any] = {
+            "ticket_key": resolved_key,
+            "thread_id": thread_id,
+            "recipients": recipients,
+            "delivery": delivery,
+        }
+        if error_payload is not None:
+            payload["notification_error"] = _with_delivery_project(error_payload, project)
+            return payload
+
+        # The durable delivery id, not the message row id: SQLite reuses row ids, and this
+        # row has to stay meaningful after any retention ever removes the message itself.
+        # `send_message` returns {"deliveries": [...], "count": n, ...} -- one entry per
+        # target project -- not a bare message. Reading `delivery["message"]` here would
+        # silently record `None` for every comment.
+        delivery_id = None
+        if isinstance(delivery, dict):
+            entries = delivery.get("deliveries")
+            if isinstance(entries, list) and entries:
+                first = entries[0]
+                if isinstance(first, dict):
+                    message_payload = first.get("message")
+                    if isinstance(message_payload, dict):
+                        delivery_id = message_payload.get("delivery_id") or message_payload.get(
+                            "id"
+                        )
+        async with get_immediate_session() as session:
+            db_project = await session.get(Project, project.id)
+            db_ticket = await session.get(Ticket, ticket_id)
+            if db_project is not None and db_ticket is not None:
+                ticketing.record_ticket_event(
+                    session,
+                    ticket=db_ticket,
+                    project=db_project,
+                    actor=await _ticket_actor(agent),
+                    event_type="commented",
+                    new_value=str(delivery_id) if delivery_id is not None else None,
+                )
+                await session.commit()
         return payload
 
     # --- Build slots (coarse concurrency control) --------------------------------------------

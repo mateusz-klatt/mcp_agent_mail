@@ -263,6 +263,28 @@ def test_relinking_the_same_edge_is_idempotent() -> None:
     async def scenario() -> None:
         project = await _project()
         ticket = await _create(project, title="one")
+        # A real message: the target must exist when the edge is created, so a typo fails
+        # at the moment it is made. Only a LATER purge degrades the pointer.
+        async with get_immediate_session() as session:
+            sender = Agent(
+                project_id=project.id,
+                name="claude-linux-test-1",
+                program="claude-code",
+                model="test",
+                task_description="link target",
+            )
+            session.add(sender)
+            await session.flush()
+            decision = Message(
+                project_id=project.id,
+                sender_id=sender.id,
+                subject="where it was decided",
+                body_md="",
+            )
+            session.add(decision)
+            await session.commit()
+            await session.refresh(decision)
+            message_id = str(decision.id)
 
         async def link() -> bool:
             async with get_immediate_session() as session:
@@ -276,7 +298,7 @@ def test_relinking_the_same_edge_is_idempotent() -> None:
                     actor=ACTOR,
                     relation="decided_by",
                     target_kind="message",
-                    target_ref="4119",
+                    target_ref=message_id,
                 )
                 await session.commit()
                 return result.created

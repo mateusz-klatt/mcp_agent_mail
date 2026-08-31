@@ -32,6 +32,7 @@ from sqlmodel import select
 
 from .models import (
     Agent,
+    FileReservation,
     Message,
     Project,
     Ticket,
@@ -859,6 +860,13 @@ async def set_ticket_link(
         ):
             raise TicketError("link_cycle", f"{ticket.key} blocks {reference} closes a cycle")
 
+    elif not await link_target_exists(session, target_kind=edge_kind, target_ref=reference):
+        # Checked here and not at read time: a typo must fail at the moment it is made,
+        # while a referent purged later must degrade to "no longer available".
+        raise TicketError(
+            "link_target_not_found", f"no {edge_kind} matching {reference!r}"
+        )
+
     existing = await session.execute(
         select(TicketLink).where(
             cast(ColumnElement[bool], TicketLink.ticket_id == ticket.id),
@@ -914,6 +922,71 @@ async def resolve_discussion_thread(session: AsyncSession, *, ticket_key: str) -
     """
     ticket = await load_ticket(session, ticket_key=ticket_key)
     return ticket.discussion_thread_id
+
+
+async def link_target_exists(
+    session: AsyncSession, *, target_kind: str, target_ref: str
+) -> bool:
+    """Report whether a link target is resolvable right now.
+
+    Existence is checked at write time and re-checked at read time, but a dangling
+    reference is never an error: `target_ref` is TEXT with no foreign key precisely so an
+    edge outlives its referent. A purged message leaves the relation, the author and the
+    timestamp intact and only the pointer stops resolving.
+    """
+    if target_kind == "ticket":
+        found = await session.execute(
+            select(Ticket.id).where(func.lower(Ticket.key) == target_ref.lower()).limit(1)
+        )
+        return found.first() is not None
+    if target_kind == "message":
+        if not target_ref.isdigit():
+            return False
+        found = await session.execute(
+            select(Message.id)
+            .where(cast(ColumnElement[bool], Message.id == int(target_ref)))
+            .limit(1)
+        )
+        return found.first() is not None
+    if target_kind == "file_reservation":
+        if not target_ref.isdigit():
+            return False
+        found = await session.execute(
+            select(FileReservation.id)
+            .where(cast(ColumnElement[bool], FileReservation.id == int(target_ref)))
+            .limit(1)
+        )
+        return found.first() is not None
+    return False
+
+
+async def outgoing_links(session: AsyncSession, *, ticket_id: int) -> list[TicketLink]:
+    """Return the edges this ticket declares."""
+    found = await session.execute(
+        select(TicketLink)
+        .where(cast(ColumnElement[bool], TicketLink.ticket_id == ticket_id))
+        .order_by(cast(Any, TicketLink.id).asc())
+    )
+    return list(found.scalars().all())
+
+
+async def incoming_links(session: AsyncSession, *, ticket_key: str) -> list[tuple[str, TicketLink]]:
+    """Return the edges other tickets declare AT this one, each with its source key.
+
+    This is the half a tracker without a graph cannot answer: "what blocks this". The
+    reverse direction is derived at read time rather than stored, so there is only ever one
+    row per edge and the two directions cannot disagree.
+    """
+    found = await session.execute(
+        select(Ticket.key, TicketLink)
+        .join(Ticket, cast(ColumnElement[bool], Ticket.id == TicketLink.ticket_id))
+        .where(
+            cast(ColumnElement[bool], TicketLink.target_kind == "ticket"),
+            func.lower(TicketLink.target_ref) == ticket_key.lower(),
+        )
+        .order_by(cast(Any, TicketLink.id).asc())
+    )
+    return [(row[0], row[1]) for row in found.all()]
 
 
 def ticket_to_dict(ticket: Ticket) -> dict[str, Any]:

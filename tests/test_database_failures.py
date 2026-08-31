@@ -255,6 +255,13 @@ class TestDatabaseAutoCreation:
         assert "build_slot_artifact_projections" in table_names
         assert "build_slot_artifact_paths" in table_names
         assert "agent_links" in table_names
+        # Ticketing. These reach a live database through `create_all`, not through
+        # the Alembic revision, so their absence here is exactly the failure mode
+        # that would ship silently.
+        assert "tickets" in table_names
+        assert "ticket_sequences" in table_names
+        assert "ticket_links" in table_names
+        assert "ticket_events" in table_names
 
     @pytest.mark.asyncio
     async def test_ensure_schema_creates_fts_table(self, isolated_env):

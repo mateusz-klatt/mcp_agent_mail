@@ -15,7 +15,7 @@
             "commit_sha": "<delivery_commit_sha>",
             "document_sha256": "<delivery_document_sha256>",
             "error": null,
-            "id": "<delivery-6>",
+            "id": "<delivery-7>",
             "message_id": 6,
             "next_attempt_ts": null,
             "request_sha256": "<delivery_request_sha256>",
@@ -29,7 +29,7 @@
             "body_md": "approved path",
             "cc": [],
             "created_ts": "2025-01-01T00:03:26+00:00",
-            "delivery_id": "<delivery-6>",
+            "delivery_id": "<delivery-7>",
             "from": "codex-wsl-isomorphism-alpha-1",
             "from_address": "project:alpha#codex-wsl-isomorphism-alpha-1",
             "from_project": "/alpha",
@@ -71,7 +71,7 @@
           "commit_sha": "<delivery_commit_sha>",
           "document_sha256": "<delivery_document_sha256>",
           "error": null,
-          "id": "<delivery-5>",
+          "id": "<delivery-6>",
           "message_id": 5,
           "next_attempt_ts": null,
           "request_sha256": "<delivery_request_sha256>",
@@ -85,7 +85,7 @@
           "body_md": "deny-case",
           "cc": [],
           "created_ts": "2025-01-01T00:16:11+00:00",
-          "delivery_id": "<delivery-5>",
+          "delivery_id": "<delivery-6>",
           "from": "codex-wsl-isomorphism-alpha-1",
           "from_address": "project:alpha#codex-wsl-isomorphism-alpha-1",
           "from_project": "/alpha",
@@ -138,7 +138,7 @@
           "commit_sha": "<delivery_commit_sha>",
           "document_sha256": "<delivery_document_sha256>",
           "error": null,
-          "id": "<delivery-4>",
+          "id": "<delivery-5>",
           "message_id": 4,
           "next_attempt_ts": null,
           "request_sha256": "<delivery_request_sha256>",
@@ -152,7 +152,7 @@
           "body_md": "e2e",
           "cc": [],
           "created_ts": "2025-01-01T00:16:12+00:00",
-          "delivery_id": "<delivery-4>",
+          "delivery_id": "<delivery-5>",
           "from": "codex-wsl-isomorphism-alpha-1",
           "from_address": "project:alpha#codex-wsl-isomorphism-alpha-1",
           "from_project": "/alpha",
@@ -247,7 +247,7 @@
         "last_agent_activity_ts": "2025-01-01T00:02:01+00:00",
         "last_filesystem_activity_ts": null,
         "last_git_activity_ts": null,
-        "last_mail_activity_ts": "2025-01-01T00:03:22+00:00",
+        "last_mail_activity_ts": "2025-01-01T00:03:27+00:00",
         "path_pattern": "src/core.py",
         "reason": "e2e",
         "released_ts": "2025-01-01T00:11:41+00:00",
@@ -499,12 +499,29 @@
         "subject": "Follow Up",
         "thread_id": "THREAD-1",
         "topic": null
+      },
+      {
+        "ack_required": false,
+        "attachments": [],
+        "body_md": "Starting on the draft now.",
+        "created_ts": "2025-01-01T00:03:27+00:00",
+        "delivery_id": "<delivery-4>",
+        "from": "codex-wsl-isomorphism-alpha-1",
+        "id": 7,
+        "importance": "normal",
+        "kind": "to",
+        "project_id": 1,
+        "reply_to": null,
+        "sender_id": 1,
+        "subject": "[ALPH-2] Draft the launch plan",
+        "thread_id": "<ticket-thread-1>",
+        "topic": "ALPH-2"
       }
     ],
     "fetch_inbox_since": "2025-01-01T00:03:21",
     "mailbox": {
       "agent": "codex-wsl-isomorphism-alpha-2",
-      "count": 2,
+      "count": 3,
       "messages": [
         {
           "ack_required": true,
@@ -575,13 +592,47 @@
           "subject": "Follow Up",
           "thread_id": "THREAD-1",
           "topic": null
+        },
+        {
+          "ack_required": false,
+          "attachments": [],
+          "commit": {
+            "authored_ts": "<commit_authored_ts>",
+            "deletions": 0,
+            "delivery_id": "<delivery-4>",
+            "diff_summary": {
+              "excerpt": [
+                "+---json",
+                "<delivery_document_header>",
+                "+---",
+                "+",
+                "+Starting on the draft now."
+              ],
+              "hunks": 1
+            },
+            "hexsha": "<commit_hexsha>",
+            "insertions": 5,
+            "summary": "mail-delivery: publish <delivery-4>"
+          },
+          "created_ts": "2025-01-01T00:03:27+00:00",
+          "delivery_id": "<delivery-4>",
+          "from": "codex-wsl-isomorphism-alpha-1",
+          "id": 7,
+          "importance": "normal",
+          "kind": "to",
+          "project_id": 1,
+          "reply_to": null,
+          "sender_id": 1,
+          "subject": "[ALPH-2] Draft the launch plan",
+          "thread_id": "<ticket-thread-1>",
+          "topic": "ALPH-2"
         }
       ],
       "project": "/alpha"
     },
     "outbox": {
       "agent": "codex-wsl-isomorphism-alpha-1",
-      "count": 2,
+      "count": 3,
       "messages": [
         {
           "ack_required": true,
@@ -664,6 +715,44 @@
             "codex-wsl-isomorphism-alpha-2"
           ],
           "topic": null
+        },
+        {
+          "ack_required": false,
+          "attachments": [],
+          "bcc": [],
+          "cc": [],
+          "commit": {
+            "authored_ts": "<commit_authored_ts>",
+            "deletions": 0,
+            "delivery_id": "<delivery-4>",
+            "diff_summary": {
+              "excerpt": [
+                "+---json",
+                "<delivery_document_header>",
+                "+---",
+                "+",
+                "+Starting on the draft now."
+              ],
+              "hunks": 1
+            },
+            "hexsha": "<commit_hexsha>",
+            "insertions": 5,
+            "summary": "mail-delivery: publish <delivery-4>"
+          },
+          "created_ts": "2025-01-01T00:03:27+00:00",
+          "delivery_id": "<delivery-4>",
+          "from": "codex-wsl-isomorphism-alpha-1",
+          "id": 7,
+          "importance": "normal",
+          "project_id": 1,
+          "reply_to": null,
+          "sender_id": 1,
+          "subject": "[ALPH-2] Draft the launch plan",
+          "thread_id": "<ticket-thread-1>",
+          "to": [
+            "codex-wsl-isomorphism-alpha-2"
+          ],
+          "topic": "ALPH-2"
         }
       ],
       "project": "/alpha"
@@ -839,6 +928,15 @@
           "importance": "normal",
           "subject": "Launch Plan",
           "thread_id": "THREAD-1"
+        },
+        {
+          "ack_required": 0,
+          "created_ts": "2025-01-01T00:03:27+00:00",
+          "from": "codex-wsl-isomorphism-alpha-1",
+          "id": 7,
+          "importance": "normal",
+          "subject": "[ALPH-2] Draft the launch plan",
+          "thread_id": "<ticket-thread-1>"
         }
       ]
     }
@@ -866,8 +964,8 @@
         "meta_info": {
           "fts_enabled": true,
           "generated_at": "2025-01-01T12:00:00+00:00",
-          "message_count": 6,
-          "messages_cached": 6
+          "message_count": 7,
+          "messages_cached": 7
         }
       }
     },
@@ -881,7 +979,7 @@
       "signature": "<runtime-dependent-signature>"
     },
     "scrub_summary": {
-      "ack_flags_cleared": 6,
+      "ack_flags_cleared": 7,
       "agent_links_removed": 0,
       "agents_pseudonymized": 0,
       "agents_total": 7,
@@ -903,9 +1001,9 @@
         "total": 0
       },
       "importance": {
-        "normal": 6
+        "normal": 7
       },
-      "messages": 6,
+      "messages": 7,
       "projects": [
         {
           "human_key": "<phase2_project>",
@@ -920,7 +1018,7 @@
           "slug": "beta"
         }
       ],
-      "threads": 4
+      "threads": 5
     },
     "verify": {
       "bundle": "<bundle_root>",
@@ -928,5 +1026,148 @@
       "signature_verified": false,
       "sri_checked": true
     }
+  },
+  "ticketing": {
+    "comment_recipients": [
+      "codex-wsl-isomorphism-alpha-2"
+    ],
+    "comment_ticket_key": "ALPH-2",
+    "detail": {
+      "discussion": [
+        {
+          "body_md": "Starting on the draft now.",
+          "created_ts": "2025-01-01T00:03:27",
+          "from": "codex-wsl-isomorphism-alpha-1",
+          "importance": "normal",
+          "message_id": 7,
+          "subject": "[ALPH-2] Draft the launch plan"
+        }
+      ],
+      "events": [
+        {
+          "actor": "codex-wsl-isomorphism-alpha-1 Display",
+          "actor_kind": "agent",
+          "created_ts": "<ticket-event-ts>",
+          "event_type": "created",
+          "field_name": null,
+          "new_value": "Draft the launch plan",
+          "old_value": null,
+          "revision_after": 1
+        },
+        {
+          "actor": "codex-wsl-isomorphism-alpha-1 Display",
+          "actor_kind": "agent",
+          "created_ts": "<ticket-event-ts>",
+          "event_type": "linked",
+          "field_name": "decided_by",
+          "new_value": "message:1",
+          "old_value": null,
+          "revision_after": 1
+        },
+        {
+          "actor": "codex-wsl-isomorphism-alpha-1 Display",
+          "actor_kind": "agent",
+          "created_ts": "<ticket-event-ts>",
+          "event_type": "commented",
+          "field_name": null,
+          "new_value": "<delivery-4>",
+          "old_value": null,
+          "revision_after": 1
+        },
+        {
+          "actor": "codex-wsl-isomorphism-alpha-1 Display",
+          "actor_kind": "agent",
+          "created_ts": "<ticket-event-ts>",
+          "event_type": "field_changed",
+          "field_name": "status_key",
+          "new_value": "in_progress",
+          "old_value": "open",
+          "revision_after": 2
+        }
+      ],
+      "links": [
+        {
+          "available": true,
+          "created_by": "codex-wsl-isomorphism-alpha-1 Display",
+          "created_ts": "2025-01-01T00:01:31",
+          "direction": "outgoing",
+          "relation": "decided_by",
+          "target_kind": "message",
+          "target_ref": "1"
+        }
+      ],
+      "ticket": {
+        "assignee_agent_id": 2,
+        "closed_ts": null,
+        "created_ts": "2025-01-01T00:01:12",
+        "description_md": "",
+        "discussion_thread_id": "<ticket-thread-1>",
+        "external_ref": null,
+        "is_closed": false,
+        "key": "ALPH-2",
+        "kind": "task",
+        "origin_message_id": 1,
+        "parent_id": 1,
+        "priority": 2,
+        "project_id": 1,
+        "reporter_agent_id": 1,
+        "reporter_label": "codex-wsl-isomorphism-alpha-1 Display",
+        "resolution": null,
+        "revision": 2,
+        "status": "in_progress",
+        "title": "Draft the launch plan",
+        "updated_ts": "2025-01-01T00:01:12"
+      }
+    },
+    "link_created": true,
+    "list": [
+      {
+        "assignee_agent_id": null,
+        "closed_ts": null,
+        "created_ts": "2025-01-01T00:01:11",
+        "description_md": "",
+        "discussion_thread_id": "<ticket-thread-0>",
+        "external_ref": null,
+        "is_closed": false,
+        "key": "ALPH-1",
+        "kind": "epic",
+        "origin_message_id": null,
+        "parent_id": null,
+        "priority": 1,
+        "project_id": 1,
+        "reporter_agent_id": 1,
+        "reporter_label": "codex-wsl-isomorphism-alpha-1 Display",
+        "resolution": null,
+        "revision": 1,
+        "status": "open",
+        "title": "Ship the launch",
+        "updated_ts": "2025-01-01T00:01:11"
+      },
+      {
+        "assignee_agent_id": 2,
+        "closed_ts": null,
+        "created_ts": "2025-01-01T00:01:12",
+        "description_md": "",
+        "discussion_thread_id": "<ticket-thread-1>",
+        "external_ref": null,
+        "is_closed": false,
+        "key": "ALPH-2",
+        "kind": "task",
+        "origin_message_id": 1,
+        "parent_id": 1,
+        "priority": 2,
+        "project_id": 1,
+        "reporter_agent_id": 1,
+        "reporter_label": "codex-wsl-isomorphism-alpha-1 Display",
+        "resolution": null,
+        "revision": 2,
+        "status": "in_progress",
+        "title": "Draft the launch plan",
+        "updated_ts": "2025-01-01T00:01:12"
+      }
+    ],
+    "update_changed_fields": [
+      "status_key"
+    ]
   }
 }

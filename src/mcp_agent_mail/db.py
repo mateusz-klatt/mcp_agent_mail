@@ -3944,6 +3944,34 @@ def _setup_fts(
         END
         """
     )
+    # Ticket history is append-only, and the promise is worth only as much as its
+    # enforcement. The service layer has no update path, but a change log that a later
+    # bug -- or a hand-run UPDATE -- can rewrite is not a change log.
+    #
+    # These belong here rather than in the ticketing Alembic revision, and the reason is
+    # the same one that forbids a data seed in a revision body: on a fresh database
+    # ``was_fresh`` is True, ``_align_alembic_version`` stamps *head*, and the following
+    # ``upgrade head`` is a no-op -- so a trigger created only in the revision would exist
+    # on production and on no developer machine. ``_setup_fts`` runs on every start of
+    # every database, which is the property this needs.
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS ticket_events_immutable_bu
+        BEFORE UPDATE ON ticket_events
+        BEGIN
+            SELECT RAISE(ABORT, 'ticket_events are immutable');
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS ticket_events_immutable_bd
+        BEFORE DELETE ON ticket_events
+        BEGIN
+            SELECT RAISE(ABORT, 'ticket_events are immutable');
+        END
+        """
+    )
     if validate_execution_schema:
         _validate_agent_execution_schema(connection)
 

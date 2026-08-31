@@ -211,6 +211,58 @@ def _scrub_execution_reservation_meta(payload: Any) -> None:
     visit(payload)
 
 
+def _scrub_ticket_threads(payload: Any) -> None:
+    """Stabilize the opaque per-ticket discussion ids.
+
+    ``discussion_thread_id`` is deliberately unguessable -- it is the reservation the mail
+    system does not offer for ``thread_id`` -- so it is random by construction and can
+    never match a stored golden. Its STRUCTURE is what the golden should pin: that every
+    ticket has one, that it is distinct per ticket, and that it is not the key.
+    """
+    threads: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            thread = value.get("discussion_thread_id")
+            if isinstance(thread, str) and thread not in threads:
+                threads.append(thread)
+            for nested in value.values():
+                collect(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                collect(nested)
+
+    collect(payload)
+    replacements = {thread: f"<ticket-thread-{index}>" for index, thread in enumerate(threads)}
+
+    def scrub_event_times(value: Any) -> None:
+        """`ticket_events` is immutable by trigger, so its timestamps cannot be rewritten
+        the way every other table's are. The sequence is the invariant, not the clock."""
+        if isinstance(value, dict):
+            if "event_type" in value and isinstance(value.get("created_ts"), str):
+                value["created_ts"] = "<ticket-event-ts>"
+            for nested in value.values():
+                scrub_event_times(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                scrub_event_times(nested)
+
+    scrub_event_times(payload)
+
+    def rewrite(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: rewrite(nested) for key, nested in value.items()}
+        if isinstance(value, list):
+            return [rewrite(nested) for nested in value]
+        if isinstance(value, str):
+            return replacements.get(value, value)
+        return value
+
+    if isinstance(payload, dict):
+        for key, value in list(payload.items()):
+            payload[key] = rewrite(value)
+
+
 def _scrub_delivery_meta(payload: Any) -> None:
     """Stabilize opaque receipt identities while preserving typed structure."""
     delivery_ids: list[str] = []
@@ -281,6 +333,24 @@ async def _stabilize_timestamps(base: datetime) -> None:
             ts = base + timedelta(seconds=int(row[0]))
             await session.execute(
                 text("UPDATE projects SET created_at = :ts WHERE id = :id"),
+                {"ts": ts, "id": row[0]},
+            )
+
+        rows = await session.execute(text("SELECT id FROM tickets ORDER BY id"))
+        for row in rows.fetchall():
+            ts = base + timedelta(seconds=70 + int(row[0]))
+            # Both columns move together: ck_tickets_timestamps refuses updated_ts
+            # earlier than created_ts, so setting one alone would fail the CHECK.
+            await session.execute(
+                text("UPDATE tickets SET created_ts = :ts, updated_ts = :ts WHERE id = :id"),
+                {"ts": ts, "id": row[0]},
+            )
+
+        rows = await session.execute(text("SELECT id FROM ticket_links ORDER BY id"))
+        for row in rows.fetchall():
+            ts = base + timedelta(seconds=90 + int(row[0]))
+            await session.execute(
+                text("UPDATE ticket_links SET created_ts = :ts WHERE id = :id"),
                 {"ts": ts, "id": row[0]},
             )
 
@@ -789,6 +859,83 @@ async def test_isomorphism_e2e_suite(
             }
         )
 
+        render_phase(console, "ticketing", {"project": alpha_key})
+        ticket_epic = _tool_data(
+            await client.call_tool(
+                "create_ticket",
+                {
+                    "project_key": alpha_key,
+                    "agent_name": ISOMORPH_ALPHA_SENDER,
+                    "title": "Ship the launch",
+                    "kind": "epic",
+                    "priority": 1,
+                },
+            )
+        )
+        ticket_task = _tool_data(
+            await client.call_tool(
+                "create_ticket",
+                {
+                    "project_key": alpha_key,
+                    "agent_name": ISOMORPH_ALPHA_SENDER,
+                    "title": "Draft the launch plan",
+                    "parent_key": ticket_epic["key"],
+                    "assignee_name": ISOMORPH_ALPHA_RECIPIENT,
+                    "priority": 2,
+                    "origin_message_id": message_id,
+                },
+            )
+        )
+        # The edge a general-purpose tracker cannot have: the ticket names the delivered
+        # message in which the work was decided.
+        ticket_link = _tool_data(
+            await client.call_tool(
+                "link_ticket",
+                {
+                    "project_key": alpha_key,
+                    "agent_name": ISOMORPH_ALPHA_SENDER,
+                    "ticket_key": ticket_task["key"],
+                    "relation": "decided_by",
+                    "target_kind": "message",
+                    "target_ref": str(message_id),
+                },
+            )
+        )
+        ticket_comment = _tool_data(
+            await client.call_tool(
+                "comment_ticket",
+                {
+                    "project_key": alpha_key,
+                    "agent_name": ISOMORPH_ALPHA_SENDER,
+                    "ticket_key": ticket_task["key"],
+                    "body_md": "Starting on the draft now.",
+                    "idempotency_key": "isomorphism-ticket-comment",
+                },
+            )
+        )
+        ticket_update = _tool_data(
+            await client.call_tool(
+                "update_ticket",
+                {
+                    "project_key": alpha_key,
+                    "agent_name": ISOMORPH_ALPHA_SENDER,
+                    "ticket_key": ticket_task["key"],
+                    "status": "in_progress",
+                    "expected_revision": ticket_task["revision"],
+                },
+            )
+        )
+        phases.append(
+            {
+                "phase": "ticketing",
+                "epic": ticket_epic,
+                "task": ticket_task,
+                "link": ticket_link,
+                "comment": ticket_comment,
+                "update": ticket_update,
+            }
+        )
+
         base_time = datetime(2025, 1, 1, 0, 0, 0)
         await _stabilize_timestamps(base_time)
 
@@ -804,6 +951,32 @@ async def test_isomorphism_e2e_suite(
             return original_naive_utc(base_time if dt is None else dt)
 
         monkeypatch.setattr(app_module, "_naive_utc", _golden_naive_utc)
+
+        # Read after stabilization AND after the clock freeze above, in that order. Two
+        # things break otherwise, and only the first is obvious: a payload captured during
+        # the mutation phase carries wall-clock timestamps, and an authenticated read taken
+        # between stabilization and the freeze REPLACES the stabilized `last_active_ts`
+        # with wall-clock time -- which bakes today's date into the golden and fails every
+        # run afterwards. Measured: doing this three lines earlier put
+        # "2026-08-31T13:58:18" into three fields.
+        ticket_list = _tool_data(
+            await client.call_tool(
+                "list_tickets",
+                {"project_key": alpha_key, "agent_name": ISOMORPH_ALPHA_SENDER},
+            )
+        )
+        ticket_detail = _tool_data(
+            await client.call_tool(
+                "get_ticket",
+                {
+                    "project_key": alpha_key,
+                    "agent_name": ISOMORPH_ALPHA_SENDER,
+                    "ticket_key": ticket_task["key"],
+                    "include_events": True,
+                    "include_discussion": True,
+                },
+            )
+        )
 
         whois = _tool_data(
             await client.call_tool(
@@ -1184,6 +1357,16 @@ async def test_isomorphism_e2e_suite(
             "inbox": product_inbox,
             "thread_summary": product_thread,
         },
+        "ticketing": {
+            # Only the inherently stable fields of the mutation results, plus two reads
+            # taken after timestamp stabilization.
+            "comment_recipients": ticket_comment["recipients"],
+            "comment_ticket_key": ticket_comment["ticket_key"],
+            "link_created": ticket_link["created"],
+            "update_changed_fields": ticket_update["changed_fields"],
+            "list": ticket_list,
+            "detail": ticket_detail,
+        },
         "share_export": {
             "summary": summary,
             "scrub_summary": asdict(snapshot_ctx.scrub_summary),
@@ -1200,6 +1383,7 @@ async def test_isomorphism_e2e_suite(
         },
     }
     _scrub_execution_reservation_meta(result["file_reservations"])
+    _scrub_ticket_threads(result)
     _scrub_delivery_meta(result)
 
     update = os.getenv("E2E_UPDATE", "") == "1"

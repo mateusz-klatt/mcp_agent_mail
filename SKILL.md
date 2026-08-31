@@ -153,6 +153,25 @@ Prefer macros for speed and smaller models. Use granular tools when you need fin
 | `macro_file_reservation_cycle` | Reserve files, do work, optionally auto-release when done |
 | `macro_contact_handshake` | Request contact permission, optionally auto-accept, send welcome message |
 
+## Tickets
+
+| Tool | Purpose |
+|------|---------|
+| `create_ticket` | Create an epic (`kind="epic"`) or a ticket; `parent_key` hangs a task under an epic |
+| `get_ticket` | One ticket with links, optionally `include_events` and `include_discussion` |
+| `list_tickets` | Worklist, most urgent first; closed tickets excluded unless `include_closed` |
+| `update_ticket` | Change, assign, close or reopen; `expected_revision` is compare-and-swap |
+| `link_ticket` | `blocks`/`relates`/`duplicates` → ticket key, `decided_by` → message id, `touches` → reservation id |
+| `comment_ticket` | Comment on a ticket — the comment is delivered as a message |
+
+Closing needs a resolution (`done`, `wontfix`, `duplicate`, `obsolete`); reopening clears
+it. Priority is open-ended with 0 most urgent, and maps to mail importance as 0-1 high,
+2-3 normal, 4+ low.
+
+Do **not** send mail with `thread_id` set to a ticket key. A comment carries
+`topic = <ticket key>` and `thread_id = <the ticket's own opaque id>`: `thread_id` has no
+uniqueness constraint, so using the key there squats on a name the ticket did not reserve.
+
 ## Beads Integration (bd-### Workflow)
 
 When using Beads for task management, keep identifiers aligned:

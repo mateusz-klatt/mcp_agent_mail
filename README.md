@@ -451,7 +451,46 @@ This creates a feedback loop where graph intelligence drives coordination.
 - "Directory/LDAP" style queries for durable `client-os-host-slot` Agents and
   their session/subagent execution history
 - Advisory file reservations for editing surfaces; optional pre-commit guard
+- Native epics and tickets, linked into the mail and reservation graph
 - Resource layer for convenient reads (e.g., `resource://inbox/{agent}`)
+
+## Tickets and epics
+
+A tracker that lives inside the coordination server, rather than beside it.
+
+| Tool | Purpose |
+|------|---------|
+| `create_ticket` | Create a ticket. `kind` is `epic`, `task`, `bug` or `chore`; an epic is simply a ticket whose kind is `epic`, and a task hangs under one via `parent_key` |
+| `get_ticket` | One ticket with its links, optionally its change log and its discussion |
+| `list_tickets` | A project's worklist, most urgent first (`priority ASC, updated_ts DESC, id DESC`) |
+| `update_ticket` | Change fields, assign, close or reopen. `expected_revision` is a compare-and-swap token |
+| `link_ticket` | Point a ticket at another ticket, at a message, or at a file reservation |
+| `comment_ticket` | Comment — the comment *is* a message |
+
+Three things distinguish it from a general-purpose tracker, and all three come from what
+this server already knows:
+
+- **A ticket can name the message where it was decided**, and the file reservation
+  realising it. `link_ticket(..., relation="decided_by", target_kind="message", ...)` is
+  the edge Jira structurally cannot have, because Jira has neither this mail archive nor
+  these reservations. A referent removed later reads back as `available: false` rather than
+  taking the edge down with it.
+- **Comments are mail.** There is no private comment table, so a comment arrives in
+  inboxes, carries read receipts and ACK, is committed to the Git archive, and is
+  full-text searchable — none of which a private table would have had without being built
+  from scratch.
+- **Keys are globally unique** (`AM-12`), so one pasted into cross-project mail is
+  unambiguous. A key is a public label, not an authorization: reading a ticket still
+  requires membership of the project that owns it.
+
+There are two tables' worth of restraint in the design, too. There is no `epics` table —
+an epic is a `kind`, so adding a third level later is a new vocabulary entry rather than a
+third table. And `status` is deliberately just `open | in_progress | closed`: `blocked` is
+derivable from an unresolved `blocks` edge and storing it as well would create a second
+source of truth that can disagree with the first.
+
+Ticket history (`ticket_events`) is append-only and enforced by database trigger, not only
+by the absence of an update path.
 
 ## Typical use cases
 

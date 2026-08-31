@@ -97,8 +97,14 @@ from .models import (
     ProjectSiblingSuggestion,
     Product,
     ProductProjectLink,
+    Ticket,
+    TicketEvent,
     WindowIdentity,
 )
+# Aliased: the module's function names (`create_ticket`, `list_tickets`, ...) are the same
+# as the tool names registered below, and a bare `from .tickets import create_ticket` would
+# be shadowed by the nested tool of that name inside `build_mcp_server`.
+from . import tickets as ticketing
 from .storage import (
     _write_json_atomic_sync,
     GitIndexLockError,
@@ -436,6 +442,7 @@ CLUSTER_FILE_RESERVATIONS = "file_reservations"
 CLUSTER_MACROS = "workflow_macros"
 CLUSTER_BUILD_SLOTS = "build_slots"
 CLUSTER_PRODUCT = "product_bus"
+CLUSTER_TICKETING = "ticketing"
 
 # Keep crash recovery memory and lock hold time independent of audit history.
 # A pass may drain several batches, but every DB read and artifact projection
@@ -463,7 +470,13 @@ TOOL_FILTER_PROFILES: dict[str, dict[str, list[str] | set[str]]] = {
         "tools": [],
     },
     "core": {
-        "clusters": [CLUSTER_IDENTITY, CLUSTER_MESSAGING, CLUSTER_FILE_RESERVATIONS, CLUSTER_MACROS],
+        "clusters": [
+            CLUSTER_IDENTITY,
+            CLUSTER_MESSAGING,
+            CLUSTER_FILE_RESERVATIONS,
+            CLUSTER_MACROS,
+            CLUSTER_TICKETING,
+        ],
         "tools": ["health_check", "ensure_project"],
     },
     "minimal": {
@@ -5022,6 +5035,30 @@ def _agent_link_is_expired(link: AgentLink, now: datetime | None = None) -> bool
         return False
     naive_now = _naive_utc(now or datetime.now(timezone.utc))
     return link.expires_ts <= naive_now
+
+
+async def _ticket_agent_id(session: Any, project: Project, name: str) -> int:
+    """Resolve an agent name to its id inside the caller's transaction.
+
+    Deliberately not `_get_agent`, which opens its own session: an assignee resolved on a
+    different connection could be a row that no longer exists by the time the ticket is
+    written.
+    """
+    found = await session.execute(
+        select(Agent).where(
+            cast(Any, Agent.project_id) == project.id,
+            cast(Any, Agent.name) == name,
+        )
+    )
+    agent = found.scalars().first()
+    if agent is None or agent.id is None:
+        raise ToolExecutionError(
+            error_type="NOT_FOUND",
+            message=f"No agent {name!r} in this project.",
+            recoverable=True,
+            data={"argument": "assignee_name", "provided": name},
+        )
+    return agent.id
 
 
 async def _get_agents_batch(project: Project, names: Sequence[str]) -> dict[str, Agent]:
@@ -15984,6 +16021,823 @@ def build_mcp_server() -> FastMCP:
         if response_warnings:
             response["warnings"] = response_warnings
         return response
+
+    # --- Ticketing (epics and tickets) -------------------------------------------------------
+    #
+    # Thin adapters over `tickets.py`. Every rule lives in that module so the CLI and any
+    # later HTTP surface enforce the same ones; these functions authenticate, open the right
+    # kind of session, and render.
+    #
+    # Registered unconditionally rather than behind a settings flag: eight of the existing
+    # tools vanish on a default install because WORKTREES_ENABLED defaults to False, and a
+    # headline feature nobody can find has not shipped.
+    #
+    # `ctx` and `format` are looked up BY NAME by the instrumentation wrapper, so renaming
+    # either silently disables capability enforcement and TOON output with no error at all.
+    # `list_tickets` is annotated `-> ToonableList` and not `-> list[dict]`: with a bare list
+    # annotation, format="toon" puts a dict envelope where the list belongs and breaks the
+    # declared output schema.
+
+    def _ticket_refusal(error: ticketing.TicketError) -> ToolExecutionError:
+        """Map a domain refusal onto the tool error contract, preserving its code."""
+        not_found = {"ticket_not_found", "parent_not_found", "link_target_not_found"}
+        conflict = {"revision_conflict", "link_cycle", "key_namespace_exhausted", "prefix_unavailable"}
+        if error.code in not_found:
+            error_type = "NOT_FOUND"
+        elif error.code in conflict:
+            error_type = "CONFLICT"
+        else:
+            error_type = "INVALID_ARGUMENT"
+        return ToolExecutionError(
+            error_type=error_type,
+            message=str(error),
+            recoverable=True,
+            data={"code": error.code, "detail": error.detail},
+        )
+
+    async def _ticket_actor(agent: Agent) -> ticketing.TicketActor:
+        """Build the audit actor for an authenticated agent."""
+        return ticketing.TicketActor.from_agent(agent)
+
+    @mcp.tool(name="create_ticket")
+    @_instrument_tool(
+        "create_ticket",
+        cluster=CLUSTER_TICKETING,
+        capabilities={"ticketing", "write"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def create_ticket(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        title: str,
+        kind: str = "task",
+        description_md: str = "",
+        priority: int = 3,
+        parent_key: Optional[str] = None,
+        assignee_name: Optional[str] = None,
+        external_ref: Optional[str] = None,
+        origin_message_id: Optional[int] = None,
+        key_prefix: Optional[str] = None,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Create one epic or ticket and return it.
+
+        An epic is simply a ticket with ``kind="epic"``; there is no separate epic entity.
+        A ticket may hang under an epic through ``parent_key``, and the parent must itself
+        be an epic in the same project.
+
+        Parameters
+        ----------
+        project_key : str
+            Project identifier (same used with `ensure_project`/`register_agent`).
+        agent_name : str
+            The reporting agent; must be registered in the project.
+        title : str
+            Short summary. Surrounding whitespace is collapsed; a blank title is refused.
+        kind : str
+            One of: epic, task, bug, chore.
+        priority : int
+            0 is most urgent. There is deliberately no ceiling.
+        parent_key : Optional[str]
+            Key of the epic this ticket belongs to.
+        assignee_name : Optional[str]
+            Agent to assign. No mail is sent by this tool.
+        origin_message_id : Optional[int]
+            The message in which this work was decided.
+        key_prefix : Optional[str]
+            Override the derived key prefix. Honoured only for a project's first ticket.
+
+        Returns
+        -------
+        dict
+            The created ticket, including its generated `key` and `discussion_thread_id`.
+
+        Example
+        -------
+        ```json
+        {"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"create_ticket","arguments":{
+          "project_key":"/owner/backend","agent_name":"codex-wsl-home-1","title":"Rotate the signing key"
+        }}}
+        ```
+        """
+        project = await _get_project_by_identifier(project_key)
+        agent = await _resolve_authenticated_agent(
+            ctx,
+            project,
+            agent_name=agent_name,
+            provided_token=registration_token,
+            token_param="registration_token",
+            action="create_ticket",
+        )
+        # BEGIN IMMEDIATE, because key allocation is a read-then-write and is race-free
+        # only under the RESERVED lock it takes before the first read.
+        async with get_immediate_session() as session:
+            db_project = await session.get(Project, project.id)
+            if db_project is None:
+                raise ToolExecutionError(
+                    error_type="NOT_FOUND",
+                    message=f"Project {project_key!r} disappeared mid-transaction.",
+                    recoverable=True,
+                )
+            parent_id: Optional[int] = None
+            assignee_id: Optional[int] = None
+            try:
+                if parent_key:
+                    parent = await ticketing.load_ticket(session, ticket_key=parent_key)
+                    parent_id = parent.id
+                if assignee_name:
+                    assignee_id = await _ticket_agent_id(session, db_project, assignee_name)
+                ticket = await ticketing.create_ticket(
+                    session,
+                    project=db_project,
+                    actor=await _ticket_actor(agent),
+                    title=title,
+                    kind_key=kind,
+                    description_md=description_md,
+                    priority=priority,
+                    parent_id=parent_id,
+                    assignee_agent_id=assignee_id,
+                    reporter_agent_id=agent.id,
+                    external_ref=external_ref,
+                    origin_message_id=origin_message_id,
+                    key_prefix=key_prefix,
+                )
+                payload = ticketing.ticket_to_dict(ticket)
+                await session.commit()
+            except ticketing.TicketError as error:
+                raise _ticket_refusal(error) from error
+        return payload
+
+    @mcp.tool(name="get_ticket")
+    @_instrument_tool(
+        "get_ticket",
+        cluster=CLUSTER_TICKETING,
+        capabilities={"ticketing", "read"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def get_ticket(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        ticket_key: str,
+        include_events: bool = False,
+        include_discussion: bool = False,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Fetch one ticket by its key, with its links and optionally its history.
+
+        Ticket keys are globally unique, but reading one still requires membership of the
+        project that owns it: the key is a public label, not an authorization.
+
+        Parameters
+        ----------
+        ticket_key : str
+            The ticket key, matched case-insensitively.
+        include_events : bool
+            Include the append-only change log (default false).
+        include_discussion : bool
+            Include the ticket's comments, which are ordinary messages on its
+            discussion thread (default false).
+
+        Returns
+        -------
+        dict
+            { ticket: {...}, links: [...], [events: [...]], [discussion: [...]] }
+        """
+        project = await _get_project_by_identifier(project_key)
+        await _resolve_authenticated_agent(
+            ctx,
+            project,
+            agent_name=agent_name,
+            provided_token=registration_token,
+            token_param="registration_token",
+            action="get_ticket",
+        )
+        async with get_session() as session:
+            try:
+                ticket = await ticketing.load_ticket(session, ticket_key=ticket_key)
+            except ticketing.TicketError as error:
+                raise _ticket_refusal(error) from error
+            if ticket.project_id != project.id:
+                # Refused as NOT_FOUND rather than FORBIDDEN: confirming that a key exists
+                # in a project the caller cannot see is itself a disclosure.
+                raise ToolExecutionError(
+                    error_type="NOT_FOUND",
+                    message=f"No ticket {ticket_key!r} in project {project_key!r}.",
+                    recoverable=True,
+                    data={"code": "ticket_not_found"},
+                )
+            outgoing = await ticketing.outgoing_links(session, ticket_id=cast(int, ticket.id))
+            incoming = await ticketing.incoming_links(session, ticket_key=ticket.key)
+            payload: dict[str, Any] = {
+                "ticket": ticketing.ticket_to_dict(ticket),
+                "links": [
+                    {
+                        "direction": "outgoing",
+                        "relation": link.relation,
+                        "target_kind": link.target_kind,
+                        "target_ref": link.target_ref,
+                        # Re-resolved on every read. False means the referent is gone, not
+                        # that the edge is invalid: `target_ref` carries no foreign key so
+                        # a purged message leaves the relation and its author intact.
+                        "available": await ticketing.link_target_exists(
+                            session, target_kind=link.target_kind, target_ref=link.target_ref
+                        ),
+                        "created_by": link.created_by_label,
+                        "created_ts": link.created_ts.isoformat(),
+                    }
+                    for link in outgoing
+                ]
+                + [
+                    {
+                        # Derived at read time rather than stored, so the two directions of
+                        # one edge cannot disagree.
+                        "direction": "incoming",
+                        "relation": link.relation,
+                        "target_kind": "ticket",
+                        "target_ref": source_key,
+                        "available": True,
+                        "created_by": link.created_by_label,
+                        "created_ts": link.created_ts.isoformat(),
+                    }
+                    for source_key, link in incoming
+                ],
+            }
+            if include_events:
+                events = (
+                    await session.execute(
+                        select(TicketEvent)
+                        .where(cast(Any, TicketEvent.ticket_id) == ticket.id)
+                        .order_by(cast(Any, TicketEvent.id).asc())
+                    )
+                ).scalars().all()
+                payload["events"] = [
+                    {
+                        "event_type": event.event_type,
+                        "field_name": event.field_name,
+                        "old_value": event.old_value,
+                        "new_value": event.new_value,
+                        "actor_kind": event.actor_kind,
+                        "actor": event.actor_label,
+                        "revision_after": event.revision_after,
+                        "created_ts": event.created_ts.isoformat(),
+                    }
+                    for event in events
+                ]
+            if include_discussion:
+                # Keyed on the opaque thread id, not on the topic tag. The topic is a
+                # label anyone may reuse; the thread id is what this ticket owns.
+                comments = (
+                    await session.execute(
+                        select(Message, Agent.name)
+                        .join(Agent, cast(Any, Agent.id) == Message.sender_id, isouter=True)
+                        .where(cast(Any, Message.thread_id) == ticket.discussion_thread_id)
+                        .order_by(cast(Any, Message.id).asc())
+                        .limit(200)
+                    )
+                ).all()
+                payload["discussion"] = [
+                    {
+                        "message_id": message.id,
+                        "from": sender_name,
+                        "subject": message.subject,
+                        "body_md": message.body_md,
+                        "importance": message.importance,
+                        "created_ts": message.created_ts.isoformat(),
+                    }
+                    for message, sender_name in comments
+                ]
+        return payload
+
+    @mcp.tool(name="list_tickets")
+    @_instrument_tool(
+        "list_tickets",
+        cluster=CLUSTER_TICKETING,
+        capabilities={"ticketing", "read"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def list_tickets(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        status: Optional[str] = None,
+        kind: Optional[str] = None,
+        assignee_name: Optional[str] = None,
+        parent_key: Optional[str] = None,
+        include_closed: bool = False,
+        limit: int = 50,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> ToonableList:
+        """
+        List one project's tickets, most urgent first.
+
+        The order is `priority ASC, updated_ts DESC, id DESC`: the row id is a stable
+        tie-breaker, so paging cannot repeat or skip a ticket when two share a timestamp.
+        Closed tickets are excluded unless `include_closed` is set.
+
+        Parameters
+        ----------
+        status : Optional[str]
+            One of: open, in_progress, closed.
+        kind : Optional[str]
+            One of: epic, task, bug, chore.
+        assignee_name : Optional[str]
+            Restrict to one agent's work.
+        parent_key : Optional[str]
+            Restrict to the children of one epic.
+        limit : int
+            1..500, default 50.
+
+        Returns
+        -------
+        list[dict]
+            Ticket payloads in canonical order.
+        """
+        project = await _get_project_by_identifier(project_key)
+        await _resolve_authenticated_agent(
+            ctx,
+            project,
+            agent_name=agent_name,
+            provided_token=registration_token,
+            token_param="registration_token",
+            action="list_tickets",
+        )
+        # A plain session: a RESERVED lock on a listing would add write contention to a
+        # single-writer database that every other agent's mail waits behind.
+        async with get_session() as session:
+            try:
+                parent_id: Optional[int] = None
+                if parent_key:
+                    parent_id = (
+                        await ticketing.load_ticket(session, ticket_key=parent_key)
+                    ).id
+                assignee_id: Optional[int] = None
+                if assignee_name:
+                    assignee_id = await _ticket_agent_id(session, project, assignee_name)
+                rows = await ticketing.list_tickets(
+                    session,
+                    project_id=cast(int, project.id),
+                    status_filter=status,
+                    kind_filter=kind,
+                    assignee_agent_id=assignee_id,
+                    parent_id=parent_id,
+                    include_closed=include_closed,
+                    limit=limit,
+                )
+            except ticketing.TicketError as error:
+                raise _ticket_refusal(error) from error
+        return [ticketing.ticket_to_dict(row) for row in rows]
+
+    @mcp.tool(name="update_ticket")
+    @_instrument_tool(
+        "update_ticket",
+        cluster=CLUSTER_TICKETING,
+        capabilities={"ticketing", "write"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def update_ticket(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        ticket_key: str,
+        title: Optional[str] = None,
+        description_md: Optional[str] = None,
+        status: Optional[str] = None,
+        resolution: Optional[str] = None,
+        priority: Optional[int] = None,
+        kind: Optional[str] = None,
+        assignee_name: Optional[str] = None,
+        clear_assignee: bool = False,
+        parent_key: Optional[str] = None,
+        clear_parent: bool = False,
+        expected_revision: Optional[int] = None,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Change one ticket and append one history entry per changed field.
+
+        Closing requires a resolution; reopening clears both the resolution and the close
+        time. Assignment changes the row and records the change — this tool sends no mail.
+
+        Parameters
+        ----------
+        status : Optional[str]
+            One of: open, in_progress, closed. Closing needs `resolution`.
+        resolution : Optional[str]
+            One of: done, wontfix, duplicate, obsolete.
+        expected_revision : Optional[int]
+            Compare-and-swap token. Supply the revision you last read and a concurrent
+            edit fails loudly instead of silently overwriting.
+
+        Returns
+        -------
+        dict
+            { ticket: {...}, changed_fields: [...], revision: int }
+        """
+        project = await _get_project_by_identifier(project_key)
+        agent = await _resolve_authenticated_agent(
+            ctx,
+            project,
+            agent_name=agent_name,
+            provided_token=registration_token,
+            token_param="registration_token",
+            action="update_ticket",
+        )
+        async with get_immediate_session() as session:
+            db_project = await session.get(Project, project.id)
+            if db_project is None:
+                raise ToolExecutionError(
+                    error_type="NOT_FOUND",
+                    message=f"Project {project_key!r} disappeared mid-transaction.",
+                    recoverable=True,
+                )
+            try:
+                ticket = await ticketing.load_ticket(session, ticket_key=ticket_key)
+                if ticket.project_id != project.id:
+                    raise ToolExecutionError(
+                        error_type="NOT_FOUND",
+                        message=f"No ticket {ticket_key!r} in project {project_key!r}.",
+                        recoverable=True,
+                        data={"code": "ticket_not_found"},
+                    )
+                assignee_id: Optional[int] = None
+                if assignee_name:
+                    assignee_id = await _ticket_agent_id(session, db_project, assignee_name)
+                parent_id: Optional[int] = None
+                if parent_key:
+                    parent_id = (
+                        await ticketing.load_ticket(session, ticket_key=parent_key)
+                    ).id
+                result = await ticketing.apply_ticket_update(
+                    session,
+                    ticket=ticket,
+                    project=db_project,
+                    actor=await _ticket_actor(agent),
+                    update=ticketing.TicketUpdate(
+                        title=title,
+                        description_md=description_md,
+                        status_key=status,
+                        resolution_key=resolution,
+                        priority=priority,
+                        kind_key=kind,
+                        assignee_agent_id=assignee_id,
+                        clear_assignee=clear_assignee,
+                        parent_id=parent_id,
+                        clear_parent=clear_parent,
+                    ),
+                    expected_revision=expected_revision,
+                )
+                payload = {
+                    "ticket": ticketing.ticket_to_dict(result.ticket),
+                    "changed_fields": list(result.changed_fields),
+                    "revision": result.revision,
+                }
+                notify_name: Optional[str] = None
+                if "assignee_agent_id" in result.changed_fields and assignee_id is not None:
+                    notify_name = assignee_name
+                notify_subject = f"[{result.ticket.key}] {result.ticket.title}"[:200]
+                notify_band = ticketing.priority_importance(result.ticket.priority)
+                notify_thread = result.ticket.discussion_thread_id
+                notify_key = result.ticket.key
+                await session.commit()
+            except ticketing.TicketError as error:
+                raise _ticket_refusal(error) from error
+
+        # DB first, and the write transaction is closed before the send. Delivery commits
+        # to the git archive under a process-wide lock; holding the ticket's transaction
+        # across it would stall every other agent's mail behind this update. An assignment
+        # that lands but cannot be announced is a far better outcome than an assignment
+        # that is refused because the assignee's mailbox is blocked, so the notification is
+        # reported rather than raised.
+        if notify_name and notify_name != agent_name:
+            try:
+                delivery = await send_message(
+                    ctx=ctx,
+                    project_key=project_key,
+                    sender_name=agent_name,
+                    registration_token=registration_token,
+                    to=[notify_name],
+                    subject=notify_subject,
+                    body_md=(
+                        f"{agent_name} assigned **{notify_key}** to you.\n\n"
+                        f"Priority {payload['ticket']['priority']}, "
+                        f"status `{payload['ticket']['status']}`.\n\n"
+                        f"Reply on this thread to comment on the ticket."
+                    ),
+                    idempotency_key=_internal_delivery_idempotency_key(
+                        "ticket-assignment",
+                        {
+                            "ticket": notify_key,
+                            "revision": payload["revision"],
+                            "assignee": notify_name,
+                        },
+                    ),
+                    importance=notify_band,
+                    topic=notify_key,
+                    thread_id=notify_thread,
+                    format="json",
+                )
+                error_payload = _extract_delivery_error_payload(delivery)
+                if error_payload is not None:
+                    payload["notification"] = {
+                        "delivered": False,
+                        "reason": error_payload.get("type", "DELIVERY_FAILED"),
+                    }
+                else:
+                    payload["notification"] = {"delivered": True, "to": notify_name}
+            except Exception as exc:
+                payload["notification"] = {
+                    "delivered": False,
+                    "reason": _delivery_failure_from_exception(project, exc).get(
+                        "type", "DELIVERY_FAILED"
+                    ),
+                }
+        return payload
+
+    @mcp.tool(name="link_ticket")
+    @_instrument_tool(
+        "link_ticket",
+        cluster=CLUSTER_TICKETING,
+        capabilities={"ticketing", "write"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def link_ticket(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        ticket_key: str,
+        relation: str,
+        target_kind: str,
+        target_ref: str,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Point a ticket at another ticket, a delivered message, or a file reservation.
+
+        This is the edge a general-purpose tracker structurally cannot have, because it has
+        neither this mail archive nor these file reservations: a ticket can name the exact
+        message where the decision was made and the reservation realising it.
+
+        Parameters
+        ----------
+        relation : str
+            One of: blocks, relates, duplicates, decided_by, touches.
+            `blocks` is kept acyclic; the others are not constrained.
+        target_kind : str
+            One of: ticket, message, file_reservation.
+        target_ref : str
+            For `ticket`, the target's KEY (not its row id) -- keys are globally unique and
+            never rewritten, so a key-addressed edge may legitimately cross projects.
+            For `message` and `file_reservation`, the numeric id.
+
+        Notes
+        -----
+        Linking is idempotent: repeating the same edge returns `created: false` rather than
+        failing. The target must exist when the edge is created; if it is purged later the
+        edge survives and reads back as `available: false`, because a change in what a
+        pointer resolves to must not delete the relation, the author or the timestamp.
+
+        Returns
+        -------
+        dict
+            { created: bool, link: {...} }
+        """
+        project = await _get_project_by_identifier(project_key)
+        agent = await _resolve_authenticated_agent(
+            ctx,
+            project,
+            agent_name=agent_name,
+            provided_token=registration_token,
+            token_param="registration_token",
+            action="link_ticket",
+        )
+        # BEGIN IMMEDIATE: the `blocks` cycle walk followed by an insert is a
+        # read-then-write like any other, and is only race-free under the lock.
+        async with get_immediate_session() as session:
+            db_project = await session.get(Project, project.id)
+            if db_project is None:
+                raise ToolExecutionError(
+                    error_type="NOT_FOUND",
+                    message=f"Project {project_key!r} disappeared mid-transaction.",
+                    recoverable=True,
+                )
+            try:
+                ticket = await ticketing.load_ticket(session, ticket_key=ticket_key)
+                if ticket.project_id != project.id:
+                    raise ToolExecutionError(
+                        error_type="NOT_FOUND",
+                        message=f"No ticket {ticket_key!r} in project {project_key!r}.",
+                        recoverable=True,
+                        data={"code": "ticket_not_found"},
+                    )
+                result = await ticketing.set_ticket_link(
+                    session,
+                    ticket=ticket,
+                    project=db_project,
+                    actor=await _ticket_actor(agent),
+                    relation=relation,
+                    target_kind=target_kind,
+                    target_ref=target_ref,
+                )
+                payload = {
+                    "created": result.created,
+                    "link": {
+                        "ticket_key": ticket.key,
+                        "relation": result.link.relation,
+                        "target_kind": result.link.target_kind,
+                        "target_ref": result.link.target_ref,
+                        "created_by": result.link.created_by_label,
+                        "created_ts": result.link.created_ts.isoformat(),
+                    },
+                }
+                await session.commit()
+            except ticketing.TicketError as error:
+                raise _ticket_refusal(error) from error
+        return payload
+
+    async def _ticket_correspondents(
+        session: Any, ticket: Any, exclude_agent_id: Optional[int]
+    ) -> list[str]:
+        """Return the agents a ticket update concerns, excluding the actor.
+
+        Assignee and reporter only. A ticket is not a mailing list: broadcasting every
+        comment to the project would make the feature the reason people stop reading mail.
+        """
+        wanted = [
+            agent_id
+            for agent_id in (ticket.assignee_agent_id, ticket.reporter_agent_id)
+            if agent_id is not None and agent_id != exclude_agent_id
+        ]
+        if not wanted:
+            return []
+        found = await session.execute(
+            select(Agent.name).where(
+                cast(Any, Agent.id).in_(wanted),
+                cast(Any, Agent.retired_at).is_(None),
+            )
+        )
+        return sorted({row[0] for row in found.all()})
+
+    @mcp.tool(name="comment_ticket")
+    @_instrument_tool(
+        "comment_ticket",
+        cluster=CLUSTER_TICKETING,
+        capabilities={"ticketing", "messaging", "write"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def comment_ticket(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        ticket_key: str,
+        body_md: str,
+        idempotency_key: str,
+        to: Optional[list[str]] = None,
+        importance: Optional[str] = None,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Comment on a ticket. The comment IS a message.
+
+        There is no private comment table. A ticket's discussion is ordinary Agent Mail,
+        which is why it arrives in inboxes, carries read receipts and ACK, is committed to
+        the git archive and is full-text searchable -- none of which a private table would
+        have had without being rebuilt from scratch.
+
+        The message carries `topic = <ticket key>` (the readable tag) and
+        `thread_id = <the ticket's discussion_thread_id>` (the conversation's identity).
+        The two are deliberately different: `thread_id` has no uniqueness constraint and is
+        supplied by the caller, so any agent could have claimed the key as a thread before
+        the ticket existed. The opaque id is the reservation the mail system does not offer.
+
+        Parameters
+        ----------
+        body_md : str
+            The comment, in GitHub-Flavored Markdown.
+        idempotency_key : str
+            Required. Retrying the same key with the same payload recovers the same
+            delivery instead of posting the comment twice.
+        to : Optional[list[str]]
+            Override the recipients. By default the assignee and the reporter, minus you.
+        importance : Optional[str]
+            Defaults to the ticket's priority band: 0-1 high, 2-3 normal, 4+ low.
+
+        Returns
+        -------
+        dict
+            { ticket_key, thread_id, recipients, delivery, [notification_error] }
+        """
+        project = await _get_project_by_identifier(project_key)
+        agent = await _resolve_authenticated_agent(
+            ctx,
+            project,
+            agent_name=agent_name,
+            provided_token=registration_token,
+            token_param="registration_token",
+            action="comment_ticket",
+        )
+        # Read and close BEFORE sending. Delivery commits to the git archive under a
+        # process-wide lock, and holding a write transaction across it would make every
+        # other agent's mail wait behind this comment -- with busy_timeout at 60s, that
+        # shows up as a minute-long stall rather than as a wrong answer.
+        async with get_session() as session:
+            try:
+                ticket = await ticketing.load_ticket(session, ticket_key=ticket_key)
+            except ticketing.TicketError as error:
+                raise _ticket_refusal(error) from error
+            if ticket.project_id != project.id:
+                raise ToolExecutionError(
+                    error_type="NOT_FOUND",
+                    message=f"No ticket {ticket_key!r} in project {project_key!r}.",
+                    recoverable=True,
+                    data={"code": "ticket_not_found"},
+                )
+            ticket_id = cast(int, ticket.id)
+            resolved_key = ticket.key
+            thread_id = ticket.discussion_thread_id
+            band = ticketing.priority_importance(ticket.priority)
+            recipients = (
+                list(to)
+                if to
+                else await _ticket_correspondents(session, ticket, agent.id)
+            )
+
+        # An unassigned ticket whose reporter is commenting has nobody else to tell. A
+        # self-addressed comment is the correct outcome: refusing would mean a ticket can
+        # be discussed only once somebody else is involved.
+        if not recipients:
+            recipients = [agent.name]
+
+        delivery = await send_message(
+            ctx=ctx,
+            project_key=project_key,
+            sender_name=agent_name,
+            registration_token=registration_token,
+            to=recipients,
+            subject=f"[{resolved_key}] {ticket.title}"[:200],
+            body_md=body_md,
+            idempotency_key=idempotency_key,
+            importance=importance or band,
+            topic=resolved_key,
+            thread_id=thread_id,
+            format="json",
+        )
+        error_payload = _extract_delivery_error_payload(delivery)
+        payload: dict[str, Any] = {
+            "ticket_key": resolved_key,
+            "thread_id": thread_id,
+            "recipients": recipients,
+            "delivery": delivery,
+        }
+        if error_payload is not None:
+            payload["notification_error"] = _with_delivery_project(error_payload, project)
+            return payload
+
+        # The durable delivery id, not the message row id: SQLite reuses row ids, and this
+        # row has to stay meaningful after any retention ever removes the message itself.
+        # `send_message` returns {"deliveries": [...], "count": n, ...} -- one entry per
+        # target project -- not a bare message. Reading `delivery["message"]` here would
+        # silently record `None` for every comment.
+        delivery_id = None
+        if isinstance(delivery, dict):
+            entries = delivery.get("deliveries")
+            if isinstance(entries, list) and entries:
+                first = entries[0]
+                if isinstance(first, dict):
+                    message_payload = first.get("message")
+                    if isinstance(message_payload, dict):
+                        delivery_id = message_payload.get("delivery_id") or message_payload.get(
+                            "id"
+                        )
+        async with get_immediate_session() as session:
+            db_project = await session.get(Project, project.id)
+            db_ticket = await session.get(Ticket, ticket_id)
+            if db_project is not None and db_ticket is not None:
+                ticketing.record_ticket_event(
+                    session,
+                    ticket=db_ticket,
+                    project=db_project,
+                    actor=await _ticket_actor(agent),
+                    event_type="commented",
+                    new_value=str(delivery_id) if delivery_id is not None else None,
+                )
+                await session.commit()
+        return payload
 
     # --- Build slots (coarse concurrency control) --------------------------------------------
     # Only registered when WORKTREES_ENABLED=1 to reduce token overhead for single-worktree setups

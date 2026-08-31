@@ -84,6 +84,15 @@ def test_an_already_tracked_database_is_never_restamped(
     assert stamped == []
 
 
+def _current_head() -> str:
+    """Return the head revision Alembic would upgrade to, read from the scripts."""
+    from alembic.script import ScriptDirectory
+
+    head = ScriptDirectory.from_config(dbmod._alembic_config(None)).get_current_head()
+    assert head is not None, "the migrations directory has no head revision"
+    return head
+
+
 def _stamp_in(database: Path) -> str | None:
     connection = sqlite3.connect(database)
     try:
@@ -128,6 +137,11 @@ def test_ensure_schema_brings_a_database_under_alembic_control(
     assert _stamp_in(database) is None
 
     asyncio.run(_build_schema(database, monkeypatch))
-    assert _stamp_in(database) == dbmod._BASELINE_REVISION
+    # Stamped at the baseline, then carried to head by the `upgrade head` that
+    # follows it. Read head from the script directory rather than naming a
+    # revision: the docstring above notes that baseline and head coincided only
+    # while there was one revision, and this assertion must not need editing
+    # again the next time one is added.
+    assert _stamp_in(database) == _current_head()
 
     dbmod.reset_database_state()

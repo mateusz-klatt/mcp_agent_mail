@@ -236,14 +236,63 @@ Common pitfalls
 - "FILE_RESERVATION_CONFLICT": adjust patterns, wait for expiry, or use a non-exclusive reservation when appropriate.
 - Auth errors: if JWT+JWKS is enabled, include a bearer token with a `kid` that matches server JWKS; static bearer is used only when JWT is disabled.
 
-## Integrating with Beads (dependency‑aware task planning)
+## Tracking work
+
+There are two ways to track work here, and they answer different questions. Pick by who
+needs to see it, not by preference.
+
+### Native tickets (this server)
+
+MCP Agent Mail has its own epics and tickets. Use them for work the **fleet** coordinates
+on: anything another agent may need to find, be assigned, or comment on.
+
+- `create_ticket(project_key, agent_name, title, kind=..., priority=..., parent_key=...)`
+  — `kind` is one of `epic`, `task`, `bug`, `chore`. An epic is simply a ticket whose
+  kind is `epic`; a task hangs under one through `parent_key`.
+- `list_tickets(project_key, agent_name, ...)` — most urgent first
+  (`priority ASC, updated_ts DESC, id DESC`). `priority` is open-ended, 0 is most urgent.
+  Closed tickets are excluded unless you ask for them.
+- `get_ticket(project_key, agent_name, ticket_key, include_events=, include_discussion=)`
+- `update_ticket(..., expected_revision=)` — supply the revision you last read and a
+  concurrent edit fails loudly instead of silently overwriting yours. Closing requires a
+  resolution (`done`, `wontfix`, `duplicate`, `obsolete`); reopening clears it.
+- `link_ticket(..., relation, target_kind, target_ref)` — relations `blocks`, `relates`,
+  `duplicates`, `decided_by`, `touches`; targets `ticket` (by KEY), `message` or
+  `file_reservation` (by id).
+- `comment_ticket(..., body_md, idempotency_key)` — a comment **is** a message, so it
+  reaches inboxes, carries read receipts, is archived and is searchable.
+
+Two properties are worth knowing before you use them:
+
+- **Ticket keys are globally unique** (`AM-12`), so a key pasted into cross-project mail is
+  unambiguous. It is a public label and not an authorization: reading a ticket still
+  requires membership of the project that owns it.
+- **The key is a tag, not the conversation's identity.** A comment carries
+  `topic = <ticket key>` and `thread_id = <the ticket's own opaque id>`. Do not send mail
+  with `thread_id` set to a ticket key: `thread_id` has no uniqueness constraint, so doing
+  so squats on a name the ticket did not reserve.
+
+The link into the mail and reservation graph is the point of tracking work here rather than
+elsewhere — a ticket can name the exact message where it was decided and the reservation
+realising it, which a general-purpose tracker cannot.
+
+### External trackers (Beads, Jira, Linear)
+
+Use an external tracker for work whose source of truth lives outside this server — for
+example this repository's own development backlog, which is tracked in `.beads/` and must
+stay readable offline and on a branch. Nothing syncs automatically in either direction, and
+that is deliberate: two writers over one backlog is a consistency problem, not a feature.
+
+When you work from an external tracker, the conventions below keep its ids visible in mail.
+
+#### Beads (dependency‑aware task planning)
 
 Beads provides a lightweight, dependency‑aware issue database and a CLI (`br`) for selecting "ready work," setting priorities, and tracking status. It complements MCP Agent Mail's messaging, audit trail, and file‑reservation signals. Project: [Dicklesworthstone/beads_rust](https://github.com/Dicklesworthstone/beads_rust)
 
 **Note:** `br` (beads_rust) is non-invasive and never executes git commands directly. You must manually run git operations after `br sync --flush-only`.
 
 Recommended conventions
-- **Single source of truth**: Use **Beads** for task status/priority/dependencies; use **Agent Mail** for conversation, decisions, and attachments (audit).
+- **Single source of truth**: for work tracked in Beads, **Beads** owns status/priority/dependencies and **Agent Mail** carries conversation, decisions, and attachments (audit). Work coordinated between agents belongs in native tickets instead — see *Native tickets* above.
 - **Shared identifiers**: Use the Beads issue id (e.g., `br-123`) as the Mail `thread_id` and prefix message subjects with `[br-123]`.
 - **Reservations**: When starting a `br-###` task, call `file_reservation_paths(...)` for the affected paths; include the issue id in the `reason` and release on completion.
 
@@ -272,8 +321,12 @@ Event mirroring (optional automation)
 - On Mail "ACK overdue" for a critical decision, add a Beads label (e.g., `needs-ack`) or bump priority to surface it in `br ready`.
 
 Pitfalls to avoid
-- Don't create or manage tasks in Mail; treat Beads as the single task queue.
-- Always include `br-###` in message `thread_id` to avoid ID drift across tools.
+- Keep one source of truth per piece of work. If it lives in Beads, Beads owns its status;
+  do not mirror it into a native ticket as well. If it is fleet coordination, use a native
+  ticket and do not open a Beads issue for it too.
+- Always include `br-###` in message `thread_id` to avoid ID drift across tools — this is
+  the opposite of the native-ticket rule above, and deliberately so: an external id is not
+  a name this server reserves, so nothing here can collide with it.
 
 ### ast-grep vs ripgrep (quick guidance)
 

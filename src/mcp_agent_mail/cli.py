@@ -79,6 +79,7 @@ from .models import (
     Product,
     ProductProjectLink,
     Project,
+    Ticket,
     WindowIdentity,
 )
 from .share import (
@@ -6360,6 +6361,26 @@ def projects_adopt(
             if delivery_history is not None:
                 raise typer.BadParameter(
                     "Source project has immutable message delivery history and cannot be adopted"
+                )
+            # Tickets refuse adoption rather than being repointed, and that is the cheaper
+            # of the two honest options. Repointing would have to carry `ticket_sequences`
+            # across as well, and its `prefix` is GLOBALLY unique -- so a source that has
+            # ever minted a key holds a prefix the destination may also hold, and there is
+            # no correct merge: renaming keys is impossible once they are quoted in mail
+            # subjects and frozen in immutable archive documents. Refusing before touching
+            # anything matches the delivery-history rule directly above.
+            ticket_count = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(Ticket)
+                    .where(cast(ColumnElement[bool], Ticket.project_id == src.id))
+                )
+            ).scalar_one()
+            if ticket_count:
+                raise typer.BadParameter(
+                    f"Source project has {ticket_count} ticket(s) and cannot be adopted. "
+                    "Ticket keys are globally unique and are quoted in mail and in the "
+                    "archive, so they cannot be reissued under another project."
                 )
 
             settings = get_settings()

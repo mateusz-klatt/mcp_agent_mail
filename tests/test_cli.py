@@ -888,6 +888,70 @@ def test_adopt_apply_relocates_files_index_and_rows_leaving_no_uncommitted_work(
     assert _agent_project_id(ADOPTED_AGENT) == seeded.canonical_id
 
 
+def _seed_ticket_in(slug: str) -> None:
+    """Give a project one ticket, so adoption has something to refuse over."""
+
+    async def _seed() -> None:
+        from mcp_agent_mail.models import Ticket, TicketSequence
+
+        async with get_session() as session:
+            project_id = (
+                await session.execute(
+                    select(Project.id).where(cast(ColumnElement[bool], Project.slug == slug))
+                )
+            ).scalars().one()
+            session.add(TicketSequence(project_id=project_id, prefix="ADPT", next_seq=2))
+            session.add(
+                Ticket(
+                    project_id=project_id,
+                    key="ADPT-1",
+                    title="work that predates the adoption",
+                    reporter_label="cli",
+                )
+            )
+            await session.commit()
+
+    asyncio.run(_seed())
+
+
+def test_adopt_refuses_a_source_project_that_has_tickets(isolated_env, tmp_path) -> None:
+    """Refusal, not repointing, and it must fail before touching anything.
+
+    `ticket_sequences.prefix` is GLOBALLY unique, so a source that has ever minted a key
+    holds a prefix the destination may also hold, and there is no correct merge: keys are
+    quoted in mail subjects and frozen in immutable archive documents, so they cannot be
+    reissued. This mirrors the immutable-delivery-history refusal directly above it in
+    `cli.projects_adopt`.
+    """
+    legacy_key, canonical_key = _one_repo_two_worktrees(tmp_path)
+    seeded = _seed_adoptable_pair(legacy_key, canonical_key)
+    _seed_ticket_in(LEGACY_SLUG)
+
+    result = _run_cli("projects", "adopt", LEGACY_SLUG, CANONICAL_SLUG, "--apply")
+
+    assert result.exit_code != 0
+    assert "cannot be adopted" in result.output
+    assert "1 ticket" in result.output
+
+    # Nothing was touched: the artifact is still in the legacy tree and the agent still
+    # belongs to the legacy project. A refusal that half-moved things would be worse than
+    # an adoption that succeeded.
+    assert (seeded.legacy_root / ADOPTED_ARTIFACT).exists()
+    assert _agent_project_id(ADOPTED_AGENT) != seeded.canonical_id
+    assert seeded.archive_repo.git.status("--short") == ""
+
+
+def test_adopt_still_proceeds_when_the_source_has_no_tickets(isolated_env, tmp_path) -> None:
+    """Control for the refusal above: the same call without a ticket succeeds."""
+    legacy_key, canonical_key = _one_repo_two_worktrees(tmp_path)
+    seeded = _seed_adoptable_pair(legacy_key, canonical_key)
+
+    result = _run_cli("projects", "adopt", LEGACY_SLUG, CANONICAL_SLUG, "--apply")
+
+    assert result.exit_code == 0, result.output
+    assert _agent_project_id(ADOPTED_AGENT) == seeded.canonical_id
+
+
 def test_adopt_holds_both_archive_locks_while_the_move_is_committed(
     isolated_env,
     tmp_path,

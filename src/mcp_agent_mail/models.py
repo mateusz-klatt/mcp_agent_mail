@@ -155,6 +155,22 @@ def _new_delivery_id() -> str:
     return str(uuid.uuid4())
 
 
+def _new_discussion_thread_id() -> str:
+    """Return an unguessable, immutable identifier for one ticket's discussion.
+
+    A ticket's discussion is ordinary mail, so it needs a ``Message.thread_id``. It must
+    NOT be the ticket key: ``thread_id`` (models.py) carries no unique constraint and is
+    supplied by the caller, so any agent can send ``thread_id="AM-12"`` before that ticket
+    exists and nothing stops them. Binding a ticket's identity to a namespace anyone may
+    occupy and nothing reserves is not a collision risk -- it is the absence of a
+    reservation. An opaque random id is the reservation.
+
+    The shape stays inside ``validate_thread_id_format`` (ASCII alphanumerics plus
+    ``.``, ``_`` and ``-``, at most 128 characters), so it is a legal thread id verbatim.
+    """
+    return f"tkt-{secrets.token_hex(16)}"
+
+
 class Project(SQLModel, table=True):
     __tablename__ = "projects"
     __table_args__ = (
@@ -1143,3 +1159,461 @@ class ProjectSiblingSuggestion(SQLModel, table=True):
     evaluated_ts: datetime = Field(default_factory=_utcnow_naive)
     confirmed_ts: Optional[datetime] = Field(default=None)
     dismissed_ts: Optional[datetime] = Field(default=None)
+
+
+# =================================================================================================
+# Ticketing
+# =================================================================================================
+#
+# Design rule, and it is a SQLite rule rather than a taste: a table-level CHECK is a promise that
+# its vocabulary is closed forever, because widening one requires ``op.batch_alter_table`` -- a full
+# copy of the table that also silently drops dependent triggers and indexes (migrations/env.py:45,
+# migrations/script.py.mako:7-8). The ticket table therefore constrains SHAPE only: lengths,
+# character classes, temporal ordering, non-negativity -- predicates that are true for any
+# vocabulary. Membership (`open` / `in_progress` / `closed`, `epic` / `task` / ...) is a module
+# constant in ``tickets.py`` and is enforced on write, exactly as ``ProjectSiblingSuggestion.status``
+# (models.py:1139) and ``Agent.contact_policy`` (models.py:243) already are.
+
+
+class TicketSequence(SQLModel, table=True):
+    """Per-project allocator for human-readable ticket keys (``AM-12``).
+
+    A stored counter rather than ``MAX(seq) + 1`` over ``tickets``: SQLite reuses integer row ids
+    after a delete, which is why ``MessageDelivery`` carries a UUID beside its rowid
+    (models.py:560-562) and why ``Project``/``Agent`` carry random ``*_generation`` columns
+    (models.py:180-187, 230-237). A ticket key is quoted into mail subjects, ``topic`` tags,
+    reservation ``reason`` strings and commit messages, and neither ``messages`` nor the Git archive
+    has any content-rewrite path -- so the number must be minted once and never reissued, even if a
+    future retention command deletes closed tickets.
+
+    A dedicated table rather than a column on ``projects``: adding a column to the live ``projects``
+    table is an ALTER this design otherwise never needs.
+
+    ``prefix`` is GLOBALLY unique, not unique per project. A key pasted into cross-project mail
+    carries no project context, so a per-project prefix would let two of the four projects both mint
+    ``AM-1``. Global uniqueness is also the reversible direction: global -> per-project is a
+    constraint relaxation and is free; per-project -> global would require renaming keys that are
+    already frozen in immutable archive documents.
+
+    ``prefix`` is STORED, never derived from ``Project.slug``. Deriving it would make a mutable field
+    load-bearing -- rename the project and every memorised key points at nothing. That is the exact
+    failure reasoned about for ``Agent.display_name`` at models.py:258-276.
+    """
+
+    __tablename__ = "ticket_sequences"
+    __table_args__ = (
+        UniqueConstraint("prefix", name="uq_ticket_sequences_prefix"),
+        CheckConstraint(
+            "length(prefix) BETWEEN 2 AND 12 "
+            "AND upper(prefix) = prefix "
+            "AND substr(prefix, 1, 1) GLOB '[A-Z]' "
+            "AND prefix NOT GLOB '*[^A-Z0-9]*'",
+            name="ck_ticket_sequences_prefix",
+        ),
+        CheckConstraint("next_seq >= 1", name="ck_ticket_sequences_next_seq"),
+    )
+
+    project_id: int = Field(foreign_key="projects.id", primary_key=True)
+    prefix: str = Field(max_length=12)
+    next_seq: int = Field(
+        default=1,
+        sa_column=Column(Integer, nullable=False, server_default="1"),
+    )
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+    updated_ts: datetime = Field(default_factory=_utcnow_naive)
+
+
+class Ticket(SQLModel, table=True):
+    """One tracked unit of work: an epic, a task, a bug, or any future kind.
+
+    There is deliberately no ``epics`` table. An epic is a ticket whose ``kind_key`` is ``'epic'``
+    and whose children point at it through ``parent_id``. Two tables would have duplicated every
+    link, event, filter and authorization predicate, and would have made a third level (sub-task,
+    initiative, spike) a third table. Here a third level is a new member of one module constant.
+
+    Discussion is NOT stored here. A ticket's conversation is ordinary mail whose ``Message.topic``
+    equals this ``key``: already indexed (``idx_messages_project_topic``, models.py:533), already
+    delivered to inboxes, already carrying read receipts and ACK (models.py:523-524), already
+    committed to the Git archive, and already searchable through ``fts_messages`` (db.py:2346). A
+    private comment table would have had to grow all of that from scratch and would still have been
+    the one unsearchable corpus in a server built for searchable coordination.
+
+    ``key`` is the character class ``send_message`` accepts for ``topic`` (app.py:10546:
+    ``[A-Za-z0-9][A-Za-z0-9._-]*``, length <= 64), so every key is a legal ``topic`` and a legal
+    ``thread_id`` (models.py:545, 128 chars) verbatim, with no escaping anywhere. The class is
+    deliberately a SUPERSET of the shape we generate: it also admits ``bd-10s`` and ``br-abc.1``, so
+    a future one-way import is a generator change and never a schema change.
+
+    Uniqueness is enforced twice on purpose. ``uq_tickets_key`` is the exact-match constraint and
+    provides the lookup index; ``uq_tickets_key_nocase`` closes a collision the first cannot see --
+    ``fetch_topic`` matches case-INSENSITIVELY (app.py:13243), so ``AM-12`` and ``am-12`` would
+    otherwise be two tickets with permanently indistinguishable discussions.
+
+    ``closed_ts IS NOT NULL`` is the sole DATABASE-level meaning of "finished", which is why the hot
+    worklist indexes are partial on it rather than on a list of status names. The status word is a
+    label the service layer keeps in step; the physical invariant is that a resolution and a close
+    time are both present or both absent.
+    """
+
+    __tablename__ = "tickets"
+    __table_args__ = (
+        UniqueConstraint("key", name="uq_tickets_key"),
+        UniqueConstraint("discussion_thread_id", name="uq_tickets_discussion_thread_id"),
+        # Expression unique index; a UniqueConstraint cannot express case folding. Same technique as
+        # uq_message_deliveries_idempotency (models.py:713-723).
+        Index("uq_tickets_key_nocase", text("lower(key)"), unique=True),
+        # THE hot query: what is open in this project, most urgent first. Partial so closed history
+        # never enters the index, in the idiom of idx_agent_executions_active (models.py:399-405).
+        Index(
+            "idx_tickets_project_open",
+            "project_id",
+            "priority",
+            "updated_ts",
+            sqlite_where=text("closed_ts IS NULL"),
+        ),
+        Index(
+            "idx_tickets_project_assignee_open",
+            "project_id",
+            "assignee_agent_id",
+            "priority",
+            sqlite_where=text("closed_ts IS NULL"),
+        ),
+        Index("idx_tickets_project_status", "project_id", "status_key", "updated_ts"),
+        Index("idx_tickets_parent", "parent_id"),
+        # SQLite scans the child table once per parent delete when the referencing
+        # column is unindexed. `purge_old_messages` deletes messages in bulk, so
+        # without this the SET NULL above costs a full `tickets` scan per purged row.
+        Index("idx_tickets_origin_message", "origin_message_id"),
+        # Makes a later one-way import idempotent: re-importing an upstream issue updates rather
+        # than duplicating. Partial, so the overwhelming majority of rows never enter it.
+        Index(
+            "uq_tickets_project_external_ref",
+            "project_id",
+            "external_ref",
+            unique=True,
+            sqlite_where=text("external_ref IS NOT NULL"),
+        ),
+        # Shape, never vocabulary -- see the section header. The class is exactly app.py:10546's.
+        CheckConstraint(
+            "length(key) BETWEEN 3 AND 64 "
+            "AND substr(key, 1, 1) GLOB '[A-Za-z0-9]' "
+            "AND key NOT GLOB '*[^A-Za-z0-9._-]*'",
+            name="ck_tickets_key",
+        ),
+        CheckConstraint(
+            "length(kind_key) BETWEEN 1 AND 32 "
+            "AND lower(kind_key) = kind_key "
+            "AND kind_key NOT GLOB '*[^a-z0-9_]*'",
+            name="ck_tickets_kind_key",
+        ),
+        CheckConstraint(
+            "length(status_key) BETWEEN 1 AND 32 "
+            "AND lower(status_key) = status_key "
+            "AND status_key NOT GLOB '*[^a-z0-9_]*'",
+            name="ck_tickets_status_key",
+        ),
+        CheckConstraint(
+            "resolution_key IS NULL OR (length(resolution_key) BETWEEN 1 AND 32 "
+            "AND lower(resolution_key) = resolution_key "
+            "AND resolution_key NOT GLOB '*[^a-z0-9_]*')",
+            name="ck_tickets_resolution_key",
+        ),
+        # Both halves are needed. SQLite does not enforce ``VARCHAR(n)``, so ``max_length``
+        # creates no constraint at all; and ``trim()`` strips spaces only, so a 512-character
+        # title with trailing spaces satisfies a trim-only bound while overflowing the
+        # declared width. The same doubling is already written out at
+        # ck_agent_executions_task_description.
+        CheckConstraint(
+            "length(trim(title)) >= 1 AND length(title) <= 512",
+            name="ck_tickets_title",
+        ),
+        # A real ceiling on free text, in the idiom of ck_agent_executions_task_description
+        # (models.py:357-360): far above any honest description, far below what a runaway writer
+        # needs to bloat a single-writer database every other agent's mail waits behind.
+        CheckConstraint("length(description_md) <= 65536", name="ck_tickets_description_md"),
+        # Open-ended upward on purpose. 0 is most urgent, matching the convention already in
+        # .beads/issues.jsonl (priorities 0-4), so an imported priority needs no remapping.
+        CheckConstraint("priority >= 0", name="ck_tickets_priority"),
+        CheckConstraint("parent_id IS NULL OR parent_id != id", name="ck_tickets_parent_not_self"),
+        # The two halves of "finished" cannot drift apart. Vocabulary-free by construction, so
+        # renaming or adding a terminal status never touches this table. Mirrors the cross-column
+        # shape of ck_agent_executions_status_end (models.py:373-377).
+        CheckConstraint(
+            "(closed_ts IS NULL AND resolution_key IS NULL) "
+            "OR (closed_ts IS NOT NULL AND resolution_key IS NOT NULL)",
+            name="ck_tickets_closure",
+        ),
+        CheckConstraint(
+            "external_ref IS NULL OR (length(trim(external_ref)) >= 1 "
+            "AND length(external_ref) <= 256)",
+            name="ck_tickets_external_ref",
+        ),
+        CheckConstraint("revision >= 1", name="ck_tickets_revision"),
+        CheckConstraint(
+            "length(discussion_thread_id) BETWEEN 8 AND 128 "
+            "AND discussion_thread_id NOT GLOB '*[^A-Za-z0-9._-]*'",
+            name="ck_tickets_discussion_thread_id",
+        ),
+        # Closing is an update, so a close time later than the last update time describes
+        # a sequence that cannot have happened.
+        CheckConstraint(
+            "updated_ts >= created_ts "
+            "AND (closed_ts IS NULL OR (closed_ts >= created_ts AND updated_ts >= closed_ts))",
+            name="ck_tickets_timestamps",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="projects.id", index=True)
+    # Stored, never derived. SQLite reuses row ids, so a public identifier can never be a function
+    # of the primary key.
+    key: str = Field(max_length=64)
+    # Vocabulary in tickets.TICKET_KINDS: epic | task | bug | chore.
+    kind_key: str = Field(default="task", max_length=32)
+    # Self-reference: the task's epic. NULL for an epic and for a loose task. The complementary rule
+    # -- a parent must itself be an epic -- spans two rows and lives in tickets.py; SQLite CHECK
+    # cannot see another row.
+    parent_id: Optional[int] = Field(default=None, foreign_key="tickets.id")
+    title: str = Field(max_length=512)
+    description_md: str = Field(default="")
+    # Vocabulary in tickets.TICKET_STATUSES: open | in_progress | closed.
+    status_key: str = Field(default="open", max_length=32, index=True)
+    # Vocabulary in tickets.TICKET_RESOLUTIONS: done | wontfix | duplicate | obsolete.
+    resolution_key: Optional[str] = Field(default=None, max_length=32)
+    priority: int = Field(
+        default=3,
+        sa_column=Column(Integer, nullable=False, server_default="3"),
+    )
+    # Nullable for the FileReservation.agent_id reason (models.py:862-866): a ticket must outlive
+    # its assignee. An agent that is retired, swept or renamed must not take open work out of the
+    # worklist; an assignee whose Agent row is gone reads as unassigned, which is the correct
+    # *current* state.
+    # ``ondelete`` is part of the table DDL and cannot be added later without a full
+    # rebuild, so the promise in this class docstring -- a ticket outlives its assignee --
+    # has to be made physical now or not at all. Without it a hard delete of an Agent row
+    # would be REFUSED by the foreign key while ``PRAGMA foreign_keys=ON`` is set on every
+    # pooled connection (db.py:449), which is the opposite of "reads as unassigned".
+    assignee_agent_id: Optional[int] = Field(
+        default=None, foreign_key="agents.id", ondelete="SET NULL", index=True
+    )
+    reporter_agent_id: Optional[int] = Field(
+        default=None, foreign_key="agents.id", ondelete="SET NULL"
+    )
+    # Actor snapshot beside the FK, because not every writer is an Agent: ui_access.py:28 answers the
+    # same question with the literal "cli". Without it a CLI-created ticket reads as "created by
+    # nobody" forever. Same shape as message_delivery_recipients' name snapshots (models.py:826-828).
+    reporter_label: str = Field(default="", max_length=128)
+    # The message in which this work was decided; it normally predates the ticket, so the topic
+    # convention cannot recover it. ondelete="SET NULL" is load-bearing rather than defensive:
+    # purge_old_messages deletes Message rows (app.py:11760-11770) while PRAGMA foreign_keys=ON is
+    # set on every pooled connection (db.py:449), and the same command already NULLs the
+    # Message.reply_to self-FK for retained replies (app.py:11751-11758) -- i.e. SET NULL is this
+    # codebase's own answer to exactly this coupling. The only existing ondelete precedent is
+    # models.py:1049-1050.
+    origin_message_id: Optional[int] = Field(
+        default=None,
+        foreign_key="messages.id",
+        ondelete="SET NULL",
+    )
+    # Opaque and IMMUTABLE after creation: changing it would strand every message already
+    # committed to the git archive under the old thread. The key stays the readable tag
+    # (`Message.topic`); this is the conversation's identity.
+    discussion_thread_id: str = Field(
+        default_factory=_new_discussion_thread_id, max_length=128, index=True
+    )
+    external_ref: Optional[str] = Field(default=None, max_length=256)
+    # Compare-and-swap token for concurrent editors, in the idiom of ui_users.profile_revision
+    # (models.py:1010). Optional on the wire; every write returns the new value.
+    revision: int = Field(
+        default=1,
+        sa_column=Column(Integer, nullable=False, server_default="1"),
+    )
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+    updated_ts: datetime = Field(default_factory=_utcnow_naive)
+    closed_ts: Optional[datetime] = Field(default=None)
+
+
+class TicketLink(SQLModel, table=True):
+    """One directed edge from a ticket into the graph this server already owns.
+
+    This is the capability a general-purpose tracker structurally cannot have, because it has
+    neither this mail archive nor these file reservations: a ticket can point at the exact delivered
+    message where the decision was made and at the file reservation realising it.
+
+    ``target_ref`` is TEXT and carries NO foreign key, deliberately and uniformly. Three targets of
+    three different shapes cannot share one integer FK, and a polymorphic triple of nullable FK
+    columns would need an "exactly one" CHECK that then forces ``ondelete="CASCADE"`` on the message
+    column -- which deletes the whole edge (the relation, the source, the author, the timestamp)
+    rather than degrading the pointer. TEXT also survives ``purge_old_messages`` (app.py:11760-11770)
+    with no coupling at all. The precedent is ``UiAccessAuditEvent`` (models.py:1056-1127), which
+    carries no foreign keys for the same survive-the-referent reason.
+
+    For ``target_kind = 'ticket'`` the ref is the target ticket's ``key``, not its row id: keys are
+    globally unique and never rewritten, and a key-addressed edge may legitimately cross projects --
+    the case a fleet coordinating four repositories actually hits.
+
+    Existence is verified at write time by ``tickets.py``; a later dangling ref renders as "no longer
+    available" rather than as an error.
+
+    ``relation`` and ``target_kind`` are shape-checked strings with no membership CHECK: they are
+    server-defined and extensible, and extending them must not be a rewrite of this table.
+    """
+
+    __tablename__ = "ticket_links"
+    __table_args__ = (
+        UniqueConstraint(
+            "ticket_id", "relation", "target_kind", "target_ref", name="uq_ticket_links_edge"
+        ),
+        # The reverse read: "what blocks this ticket".
+        Index("idx_ticket_links_target", "target_kind", "target_ref"),
+        Index("idx_ticket_links_ticket", "ticket_id", "relation"),
+        CheckConstraint(
+            "length(relation) BETWEEN 1 AND 32 "
+            "AND lower(relation) = relation "
+            "AND relation NOT GLOB '*[^a-z_]*'",
+            name="ck_ticket_links_relation",
+        ),
+        CheckConstraint(
+            "length(target_kind) BETWEEN 1 AND 32 "
+            "AND lower(target_kind) = target_kind "
+            "AND target_kind NOT GLOB '*[^a-z_]*'",
+            name="ck_ticket_links_target_kind",
+        ),
+        CheckConstraint(
+            "length(trim(target_ref)) >= 1 AND length(target_ref) <= 128",
+            name="ck_ticket_links_target_ref",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    ticket_id: int = Field(foreign_key="tickets.id", index=True)
+    # Vocabulary in tickets.TICKET_RELATIONS: blocks | relates | duplicates | decided_by | touches.
+    # Inverses are derived at read time.
+    relation: str = Field(max_length=32)
+    # Vocabulary in tickets.TICKET_TARGET_KINDS: ticket | message | file_reservation.
+    # Reserved without any schema change: commit | execution | build_slot | url.
+    target_kind: str = Field(max_length=32)
+    target_ref: str = Field(max_length=128)
+    created_by_agent_id: Optional[int] = Field(
+        default=None, foreign_key="agents.id", ondelete="SET NULL"
+    )
+    created_by_label: str = Field(default="", max_length=128)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+
+
+class TicketEvent(SQLModel, table=True):
+    """Append-only record of one ticket mutation.
+
+    This table ships in v1 for one reason: history is the only part of the design that CANNOT be
+    added retroactively. Every other deferral here -- claims, full-text search, the web UI, a beads
+    importer -- is a new table or an additive index later at identical cost. A change log that was
+    not written on the day of the change has no source to backfill from.
+
+    It is also what makes the P2 decision safe. Ticket *discussion* is mail and is therefore subject
+    to ``purge_old_messages``; a ``commented`` event carrying the message id is a durable
+    in-database record that the comment existed, independent of whatever retention later removes.
+
+    No foreign keys and snapshot columns throughout, matching ``UiAccessAuditEvent``
+    (models.py:1056-1127) exactly: an audit row must outlive its subject and must read correctly
+    without a join.
+
+    Append-only is enforced by the database, not only by the absence of a service-layer update
+    path: ``_setup_fts`` installs ``ticket_events_immutable_bu`` and ``..._bd``, in the idiom it
+    already uses for ``ui_access_audit_events``. They live there rather than in the ticketing
+    Alembic revision for the reason that forbids a data seed in a revision body -- a fresh
+    database is stamped at *head* and never replays a revision, so a trigger created only there
+    would exist on production and on no developer machine.
+    """
+
+    __tablename__ = "ticket_events"
+    __table_args__ = (
+        Index("idx_ticket_events_ticket_created", "ticket_id", "created_ts"),
+        Index("idx_ticket_events_project_created", "project_id", "created_ts"),
+        CheckConstraint(
+            "length(event_type) BETWEEN 1 AND 32 "
+            "AND lower(event_type) = event_type "
+            "AND event_type NOT GLOB '*[^a-z_]*'",
+            name="ck_ticket_events_event_type",
+        ),
+        CheckConstraint(
+            "field_name IS NULL OR (length(field_name) BETWEEN 1 AND 64 "
+            "AND lower(field_name) = field_name "
+            "AND field_name NOT GLOB '*[^a-z0-9_]*')",
+            name="ck_ticket_events_field_name",
+        ),
+        CheckConstraint(
+            "(old_value IS NULL OR length(old_value) <= 1024) "
+            "AND (new_value IS NULL OR length(new_value) <= 1024)",
+            name="ck_ticket_events_values",
+        ),
+        CheckConstraint("revision_after >= 1", name="ck_ticket_events_revision_after"),
+        CheckConstraint(
+            "length(actor_kind) BETWEEN 1 AND 16 "
+            "AND lower(actor_kind) = actor_kind "
+            "AND actor_kind NOT GLOB '*[^a-z_]*'",
+            name="ck_ticket_events_actor_kind",
+        ),
+        # A generation snapshot is meaningful only beside the id it disambiguates, and an
+        # agent-authored event must carry one.
+        #
+        # ``IS NOT NULL`` is written out rather than left implied by ``length(...) = 64``,
+        # and that is not style. A CHECK is violated only when it evaluates to FALSE:
+        # NULL passes. With a non-null id and a null generation, ``length(NULL) = 64``
+        # is NULL, so the whole disjunction is NULL and the row is ACCEPTED -- measured
+        # here, on the first draft of this constraint. The nearby
+        # ck_ui_access_audit_actor_provenance (models.py:1093-1100) is written in that
+        # weaker shape and has the same hole; widening it would mean rebuilding a live
+        # audit table, so it is reported rather than changed from here.
+        CheckConstraint(
+            "(actor_agent_id IS NULL AND actor_generation_snapshot IS NULL) "
+            "OR (actor_agent_id IS NOT NULL "
+            "AND actor_generation_snapshot IS NOT NULL "
+            "AND length(actor_generation_snapshot) = 64 "
+            "AND actor_generation_snapshot NOT GLOB '*[^0-9a-f]*')",
+            name="ck_ticket_events_actor_provenance",
+        ),
+        # Binds the KIND to the pair above. Without it the table accepts two incoherent
+        # audit rows: ``actor_kind='agent'`` carrying no agent at all, and
+        # ``actor_kind='cli'`` carrying somebody else's agent id.
+        #
+        # This is the one place the ticketing schema names a vocabulary member, and the
+        # exception is deliberate. The section rule forbids closed vocabularies because
+        # widening one costs a table rebuild -- but this does not close a set: a new kind
+        # (``scheduler``, ``webhook``) still inserts freely, it merely has to carry no
+        # agent id. The only thing frozen is that the kind spelled ``agent`` is the one
+        # with an agent id, and that word is not going to be renamed while the table it
+        # refers to is called ``agents``. An audit row whose provenance contradicts itself
+        # is worth more than that flexibility.
+        CheckConstraint(
+            "(actor_kind = 'agent') = (actor_agent_id IS NOT NULL)",
+            name="ck_ticket_events_actor_kind_binds_agent",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    ticket_id: int = Field(index=True)
+    ticket_key_snapshot: str = Field(max_length=64)
+    project_id: int = Field(index=True)
+    project_slug_snapshot: str = Field(max_length=255)
+    # Vocabulary in tickets.TICKET_EVENT_TYPES:
+    # created | field_changed | commented | linked | unlinked | closed | reopened.
+    event_type: str = Field(max_length=32)
+    field_name: Optional[str] = Field(default=None, max_length=64)
+    old_value: Optional[str] = Field(default=None, max_length=1024)
+    new_value: Optional[str] = Field(default=None, max_length=1024)
+    # Not every writer is an Agent, and "which kind of actor" is not recoverable from a
+    # nullable id: a NULL actor_agent_id would conflate the CLI, a human in the web UI, a
+    # server-side sweep and a deleted agent into one indistinguishable state. Vocabulary in
+    # tickets.TICKET_ACTOR_KINDS: agent | human | cli | system.
+    # No default at all, on the lead's decision. An ``agent`` default made the
+    # default-constructed event violate the binding CHECK below, and a ``system`` default
+    # would merely hide the same question: every writer knows what it is, so it says so.
+    actor_kind: str = Field(max_length=16)
+    actor_agent_id: Optional[int] = Field(default=None)
+    # Distinguishes a recreated agent from its previous lifetime even though SQLite reuses
+    # numeric primary keys -- the same reason UiAccessAuditEvent snapshots
+    # ``target_account_generation`` (models.py:1084-1087) rather than trusting an id.
+    actor_generation_snapshot: Optional[str] = Field(default=None, max_length=64)
+    actor_label: str = Field(default="", max_length=128)
+    revision_after: int = Field(default=1)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)

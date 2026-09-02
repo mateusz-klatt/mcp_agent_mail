@@ -1264,11 +1264,29 @@ class Ticket(SQLModel, table=True):
         Index("uq_tickets_key_nocase", text("lower(key)"), unique=True),
         # THE hot query: what is open in this project, most urgent first. Partial so closed history
         # never enters the index, in the idiom of idx_agent_executions_active (models.py:399-405).
+        # The two trailing terms are DESC because `list_tickets` orders
+        # `priority ASC, updated_ts DESC, id DESC` (tickets.py:654-658), and SQLite walks
+        # an index to satisfy an ORDER BY only when the requested directions all match
+        # the index or are all exactly its opposite. Mixed directions match neither, so
+        # the all-ASC shape this replaces was not merely suboptimal for the query it was
+        # built for -- it was unreachable by it. Measured, SQLite 3.50.4:
+        #
+        #   all-ASC     SEARCH tickets USING INDEX ix_tickets_project_id (project_id=?)
+        #               USE TEMP B-TREE FOR ORDER BY
+        #   this shape  SEARCH tickets USING INDEX idx_tickets_project_open (project_id=?)
+        #
+        # The planner's fallback, ix_tickets_project_id, is not partial, so closed
+        # history was scanned after all -- the second cost, and the less visible one.
+        # Controls isolating direction as the cause: the all-ASC index IS chosen for
+        # `priority ASC, updated_ts ASC` and for `priority DESC, updated_ts DESC`.
+        # `id DESC` is not decoration; without it the plan keeps
+        # "USE TEMP B-TREE FOR LAST TERM OF ORDER BY".
         Index(
             "idx_tickets_project_open",
             "project_id",
             "priority",
-            "updated_ts",
+            text("updated_ts DESC"),
+            text("id DESC"),
             sqlite_where=text("closed_ts IS NULL"),
         ),
         Index(

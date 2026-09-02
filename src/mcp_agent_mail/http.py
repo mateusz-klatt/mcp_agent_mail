@@ -5629,6 +5629,41 @@ async def readiness_check() -> None:
     async with get_session() as session:
         await session.execute(text("SELECT 1"))
 
+    # A production image that cannot say which commit it is running is not fit
+    # to serve, even though it is running perfectly.
+    #
+    # This is READINESS and deliberately not the other two candidates.
+    #
+    # Not startup: raising a ConfigError would mean a build that forgot the
+    # argument does not start at all, and `compose up -d` stops the old
+    # container before starting the new one -- so a missing build argument
+    # would become an outage. The defect is a deployment mistake; the response
+    # to it must be louder than a log line and quieter than downtime.
+    #
+    # Not liveness: this condition is fixed for the life of the container and a
+    # restart cannot clear it. Kubernetes kills and restarts a container that
+    # fails liveness, so putting it there would turn one bad build into an
+    # unbounded restart loop. Readiness means "do not send me traffic", which
+    # is exactly the claim being made.
+    #
+    # `Dockerfile` therefore points HEALTHCHECK at /health/readiness, so
+    # `docker inspect` reports unhealthy and a deploy that waits for health --
+    # the way this repository's own deploys do -- stops instead of reporting
+    # success. Nothing in compose acts on unhealthy, so the container keeps
+    # serving: the signal is visible, not destructive.
+    #
+    # The message names the variable and never a value: this endpoint answers
+    # unauthenticated callers, which is also why the tests around it assert the
+    # commit does not appear in a health response.
+    settings = get_settings()
+    if settings.environment.strip().lower() in {"prod", "production"} and not settings.build_commit:
+        raise RuntimeError(
+            "build provenance missing: MCP_AGENT_MAIL_BUILD_COMMIT was empty at image "
+            "build time, so this production instance cannot report the commit it runs. "
+            "Rebuild supplying the argument (see compose.prod.yaml) rather than "
+            "restarting; a restart cannot fix it."
+        )
+
     # Fail readiness if FD usage from lockfile leaks is critically high.
     # This gives orchestrators a signal to restart the process before it
     # becomes completely wedged (issue #116).

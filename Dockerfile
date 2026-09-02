@@ -228,9 +228,23 @@ USER appuser
 RUN git config --global --add safe.directory /data/mailbox && \
     git config --global --add safe.directory '*'
 
-# Healthcheck
+# Healthcheck.
+#
+# Readiness, not liveness. Liveness answers only "the process is up", which it
+# always is for the two failures this container can actually suffer and keep
+# running: FD exhaustion from lockfile leaks (http.py, readiness_check) and a
+# production image built without MCP_AGENT_MAIL_BUILD_COMMIT, which then cannot
+# report the commit it runs. Both leave the process alive and unfit, so a
+# liveness probe reports healthy for exactly the states worth catching.
+#
+# Readiness is cheap enough to run every 30s: `ensure_schema` returns on its
+# `_schema_ready` flag after the first call (db.py), leaving a `SELECT 1`.
+#
+# Nothing in compose.prod.yaml acts on unhealthy -- `restart: unless-stopped`
+# does not restart on it -- so this reports without ever taking the service
+# down on its own.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=5 \
-  CMD curl -fsS http://127.0.0.1:8765/health/liveness || exit 1
+  CMD curl -fsS http://127.0.0.1:8765/health/readiness || exit 1
 
 # Run the HTTP server via the prebuilt venv (avoids uv overhead at startup)
 CMD ["/app/.venv/bin/python", "-m", "mcp_agent_mail.cli", "serve-http"]

@@ -2325,7 +2325,12 @@ image itself:
   ```
 - Notes:
   - Runs as an unprivileged user (`appuser`, uid 10001).
-  - Includes a HEALTHCHECK against `/health/liveness`.
+  - Includes a HEALTHCHECK against `/health/readiness`, not `/health/liveness`:
+    the two states this container can enter while still running fine — FD
+    exhaustion, and a production image built without
+    `MCP_AGENT_MAIL_BUILD_COMMIT`, which then cannot report the commit it runs —
+    both leave liveness answering `alive`. Nothing restarts on unhealthy, so this
+    reports without taking the service down.
   - The server reads config from `.env` via python-decouple. You can mount it read-only into the container at `/app/.env`.
   - Default bind host is `0.0.0.0` in the container; port `8765` is exposed.
   - Persistent archive lives under `/data/mailbox` (mapped to the `agent_mail_data` volume by default).

@@ -92,13 +92,27 @@ def test_the_hot_query_walks_its_own_index_instead_of_sorting(
 
     # Sabotage control. Without it this test would also pass against a planner
     # that never sorts anything, and would not be evidence about direction at all.
+    #
+    # The control asserts the SORT COMES BACK, and deliberately not which index
+    # the planner reaches for while sorting. That second question has a different
+    # answer on different SQLite builds, measured on this same test:
+    #
+    #   3.50.4  SEARCH ... USING INDEX ix_tickets_project_id (project_id=?)
+    #           USE TEMP B-TREE FOR ORDER BY
+    #   3.46.1  SEARCH ... USING INDEX idx_tickets_project_open (project_id=?)
+    #           USE TEMP B-TREE FOR LAST 2 TERMS OF ORDER BY
+    #
+    # Index choice is a cost-model decision -- a synthetic reproduction here also
+    # flipped it by nothing more than running ANALYZE -- so pinning it would make
+    # this file fail on a toolchain difference and say "the defect is gone".
+    # The sort is present in every configuration measured, and the sort is what
+    # the fix removes.
     _install_old_shape(database)
     sabotaged = _plan(database)
     assert "TEMP B-TREE" in sabotaged, (
         "the all-ASC shape no longer forces a sort, so this test has stopped "
         f"measuring what it claims to measure: {sabotaged}"
     )
-    assert "idx_tickets_project_open" not in sabotaged, sabotaged
 
 
 def test_an_already_deployed_database_has_the_index_rebuilt(

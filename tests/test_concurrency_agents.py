@@ -26,7 +26,8 @@ import os
 import random
 import string
 import time
-from collections.abc import Set as AbstractSet
+import traceback
+from collections.abc import Sequence, Set as AbstractSet
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
@@ -86,6 +87,84 @@ def require_dict_result(result: object, label: str) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise AssertionError(f"{label} returned non-dict result: {result}")
     return cast(dict[str, Any], result)
+
+
+# A gather(return_exceptions=True) result carries its failures in-band, and the
+# tolerant assertions below are written to survive a few of them. Counting those
+# failures and then dropping them is how ten copies of
+# `sqlite3.DatabaseError: database disk image is malformed` reached CI run
+# 33413410950 (c58ade5, windows-latest, chunk 3/8) rendered as the single line
+# "Too many agent failures: 0/10 completed" -- a message that names neither the
+# error nor its kind, and reads like an overloaded runner.
+#
+# Controls from the two preceding runs of the same chunk: e26e858 had 0 of them,
+# b5a6fdc had 0, c58ade5 had 10. So the signature is not background noise, and it
+# is the same one the production database produced twice on 2026-08-14.
+
+# Failures a stress test may legitimately absorb are transient: cancellation,
+# contention, a timeout. Corruption is not in that family -- it does not go away
+# on a retry and it does not mean "the runner was busy". These substrings appear
+# in SQLite's own wording for a damaged file, so a run carrying one fails on its
+# own account, whatever the success rate happens to be.
+_CORRUPTION_SIGNATURES = (
+    "database disk image is malformed",
+    "file is not a database",
+    "malformed database schema",
+    "database corruption",
+)
+
+
+def describe_gather_failures(results: Sequence[Any], *, limit: int = 3) -> str:
+    """Render the exceptions inside a gather(return_exceptions=True) result.
+
+    Groups identical (type, message) pairs so ten copies of one fault read as
+    one line with a count, and appends a full traceback for the first few so the
+    failure names a place in the code and not only a string.
+    """
+    grouped: dict[tuple[str, str], int] = {}
+    order: list[tuple[str, str]] = []
+    exceptions: list[BaseException] = []
+    for result in results:
+        if not isinstance(result, BaseException):
+            continue
+        exceptions.append(result)
+        key = (type(result).__name__, str(result))
+        if key not in grouped:
+            order.append(key)
+        grouped[key] = grouped.get(key, 0) + 1
+    if not exceptions:
+        return "no exceptions were raised"
+
+    lines = [f"{len(exceptions)} of {len(results)} tasks raised:"]
+    for name, message in order:
+        lines.append(f"  {grouped[(name, message)]}x {name}: {message}")
+    for exc in exceptions[:limit]:
+        rendered = "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        )
+        lines.append("--- traceback ---")
+        lines.append(rendered.rstrip())
+    return "\n".join(lines)
+
+
+def fail_on_database_corruption(results: Sequence[Any]) -> None:
+    """Fail immediately if any task died of a damaged database file.
+
+    Deliberately checked before any success-rate floor. A floor exists to let a
+    slow or loaded runner through; letting corruption through is a different
+    decision that nobody made on purpose.
+    """
+    for result in results:
+        if not isinstance(result, BaseException):
+            continue
+        message = str(result).lower()
+        if any(signature in message for signature in _CORRUPTION_SIGNATURES):
+            pytest.fail(
+                "SQLite reported a damaged database file during concurrent "
+                "access. This is not a transient concurrency failure and the "
+                "success-rate floor deliberately does not apply to it.\n"
+                + describe_gather_failures(results)
+            )
 
 
 async def count_messages_in_db(project_id: int) -> int:
@@ -911,6 +990,12 @@ class TestNoDeadlocks:
             # Count successes - under high concurrency some operations may get
             # transient cancellation. The key test is: no deadlock (timeout) occurred
             # and a high proportion of operations succeeded.
+            # Same blindness as test_high_concurrency_no_corruption had, in the
+            # same file: this loop also collected exceptions and reported only a
+            # count. Corruption is checked here for the same reason and the
+            # failure text carries the exceptions for the same reason.
+            fail_on_database_corruption(results)
+
             successes = sum(1 for r in results if not isinstance(r, Exception))
             # Floor only - the assertion that carries this test's meaning is the
             # wait_for above, which fails on a deadlock. Success rate is a
@@ -919,6 +1004,7 @@ class TestNoDeadlocks:
             assert successes >= min_expected, (
                 f"Too many failures: {successes}/{num_operations} succeeded "
                 f"(expected at least {min_expected})"
+                "\n" + describe_gather_failures(results)
             )
 
     @pytest.mark.asyncio
@@ -972,6 +1058,10 @@ class TestNoDeadlocks:
                 return_exceptions=True,
             )
 
+            # Corruption first, and before the tolerance floor below. A damaged
+            # database file is not something this test is entitled to absorb.
+            fail_on_database_corruption(results)
+
             # Under high concurrency some agents may fail due to transient async issues.
             # The key test is: successful agents have data integrity.
             successful_subjects: list[str] = []
@@ -988,6 +1078,7 @@ class TestNoDeadlocks:
             successful_agent_count = num_agents - failed_agents
             assert successful_agent_count >= min_success, (
                 f"Too many agent failures: {successful_agent_count}/{num_agents} completed"
+                "\n" + describe_gather_failures(results)
             )
 
             # Verify database integrity for successful sends

@@ -94,19 +94,22 @@ def test_the_hot_query_walks_its_own_index_instead_of_sorting(
     # that never sorts anything, and would not be evidence about direction at all.
     #
     # The control asserts the SORT COMES BACK, and deliberately not which index
-    # the planner reaches for while sorting. That second question has a different
-    # answer on different SQLite builds, measured on this same test:
+    # the planner reaches for while sorting. Which index wins is a cost-model
+    # decision that moves with the DATABASE, not with the schema. All three rows
+    # below are the same all-ASC shape on the same SQLite 3.46.1:
     #
-    #   3.50.4  SEARCH ... USING INDEX ix_tickets_project_id (project_id=?)
-    #           USE TEMP B-TREE FOR ORDER BY
-    #   3.46.1  SEARCH ... USING INDEX idx_tickets_project_open (project_id=?)
-    #           USE TEMP B-TREE FOR LAST 2 TERMS OF ORDER BY
+    #   empty db, as built here   USING INDEX idx_tickets_project_open (project_id=?)
+    #                             USE TEMP B-TREE FOR LAST 2 TERMS OF ORDER BY
+    #   the live deployment       USING INDEX ix_tickets_project_id (project_id=?)
+    #                             USE TEMP B-TREE FOR ORDER BY
+    #   synthetic, after ANALYZE  flips back to idx_tickets_project_open
     #
-    # Index choice is a cost-model decision -- a synthetic reproduction here also
-    # flipped it by nothing more than running ANALYZE -- so pinning it would make
-    # this file fail on a toolchain difference and say "the defect is gone".
-    # The sort is present in every configuration measured, and the sort is what
-    # the fix removes.
+    # This test necessarily runs against the first of those, which is the one
+    # row that does not resemble production -- so pinning index choice here
+    # asserts the least representative answer of the three, and reds the suite
+    # whenever a planner detail moves while reporting "the defect is gone".
+    # The sort was present in every configuration measured, on both 3.46.1 and
+    # 3.50.4, and the sort is what the fix removes.
     _install_old_shape(database)
     sabotaged = _plan(database)
     assert "TEMP B-TREE" in sabotaged, (

@@ -234,7 +234,8 @@ def test_blocks_edges_cannot_close_a_cycle() -> None:
             async with get_immediate_session() as session:
                 fresh_project = await session.get(Project, project.id)
                 fresh = await session.get(Ticket, source.id)
-                assert fresh is not None and fresh_project is not None
+                assert fresh is not None
+                assert fresh_project is not None
                 await tickets.set_ticket_link(
                     session,
                     ticket=fresh,
@@ -290,7 +291,8 @@ def test_relinking_the_same_edge_is_idempotent() -> None:
             async with get_immediate_session() as session:
                 fresh_project = await session.get(Project, project.id)
                 fresh = await session.get(Ticket, ticket.id)
-                assert fresh is not None and fresh_project is not None
+                assert fresh is not None
+                assert fresh_project is not None
                 result = await tickets.set_ticket_link(
                     session,
                     ticket=fresh,
@@ -318,7 +320,8 @@ def test_closing_requires_a_resolution_and_reopening_clears_it() -> None:
             async with get_immediate_session() as session:
                 fresh_project = await session.get(Project, project.id)
                 fresh = await session.get(Ticket, ticket.id)
-                assert fresh is not None and fresh_project is not None
+                assert fresh is not None
+                assert fresh_project is not None
                 await tickets.apply_ticket_update(
                     session,
                     ticket=fresh,
@@ -330,16 +333,19 @@ def test_closing_requires_a_resolution_and_reopening_clears_it() -> None:
                 await session.commit()
                 return await _load(ticket.key)
 
+        close_without_resolution = TicketUpdate(status_key="closed")
         with pytest.raises(TicketError) as refusal:
-            await apply(TicketUpdate(status_key="closed"))
+            await apply(close_without_resolution)
         assert refusal.value.code == "resolution_required"
 
         closed = await apply(TicketUpdate(status_key="closed", resolution_key="done"))
-        assert closed.closed_ts is not None and closed.resolution_key == "done"
+        assert closed.closed_ts is not None
+        assert closed.resolution_key == "done"
         assert closed.updated_ts >= closed.closed_ts, "the database refuses the alternative"
 
         reopened = await apply(TicketUpdate(status_key="open"))
-        assert reopened.closed_ts is None and reopened.resolution_key is None
+        assert reopened.closed_ts is None
+        assert reopened.resolution_key is None
 
     _run(scenario)
 
@@ -353,7 +359,8 @@ def test_a_stale_revision_is_refused_rather_than_overwriting() -> None:
             async with get_immediate_session() as session:
                 fresh_project = await session.get(Project, project.id)
                 fresh = await session.get(Ticket, ticket.id)
-                assert fresh is not None and fresh_project is not None
+                assert fresh is not None
+                assert fresh_project is not None
                 await tickets.apply_ticket_update(
                     session,
                     ticket=fresh,
@@ -388,7 +395,8 @@ def test_an_oversized_change_is_marked_not_silently_truncated() -> None:
         async with get_immediate_session() as session:
             fresh_project = await session.get(Project, project.id)
             fresh = await session.get(Ticket, ticket.id)
-            assert fresh is not None and fresh_project is not None
+            assert fresh is not None
+            assert fresh_project is not None
             await tickets.apply_ticket_update(
                 session,
                 ticket=fresh,

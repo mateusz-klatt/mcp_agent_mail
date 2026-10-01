@@ -214,7 +214,8 @@ def test_json_failures_emit_exactly_one_error_object_and_exit_one(args: tuple[st
     assert result.exit_code == 1, result.output
     payload = json.loads(result.stdout)
     assert set(payload) == {"error"}
-    assert isinstance(payload["error"], str) and payload["error"]
+    assert isinstance(payload["error"], str)
+    assert payload["error"]
 
 
 def test_a_human_failure_is_not_json() -> None:

@@ -691,6 +691,9 @@ html[data-flag-polyfill="true"] select {
 
 .message-row {
   grid-template-columns: auto minmax(0, 1fr) auto;
+  min-height: 104px;
+  color: inherit;
+  text-decoration: none;
 }
 
 .project-avatar {
@@ -810,6 +813,7 @@ html[data-flag-polyfill="true"] select {
 }
 
 .state-panel {
+  display: block;
   position: relative;
   overflow: hidden;
   margin: 1rem 0;
@@ -821,7 +825,7 @@ html[data-flag-polyfill="true"] select {
   box-shadow: var(--shadow);
 }
 
-.state-panel[role="status"]::before {
+output.state-panel::before {
   position: absolute;
   inset: 0 0 auto;
   height: 3px;
@@ -895,21 +899,6 @@ html[data-flag-polyfill="true"] select {
 .status-archived {
   color: #5f5b57;
   background: #eee9e2;
-}
-
-.role-admin {
-  color: #fff;
-  background: var(--iris-ink);
-}
-
-.role-operator {
-  color: #75401f;
-  background: #f8ddc9;
-}
-
-.role-viewer {
-  color: var(--success-text);
-  background: var(--mint);
 }
 
 .inbox-tools {
@@ -1061,12 +1050,6 @@ html[data-flag-polyfill="true"] select {
   display: inline-flex;
   min-height: 44px;
   align-items: center;
-}
-
-.message-row {
-  min-height: 104px;
-  color: inherit;
-  text-decoration: none;
 }
 
 .message-row:hover {
@@ -1619,6 +1602,7 @@ html[data-flag-polyfill="true"] select {
 .recipient-picker-state,
 .recipient-selected-count,
 .recipient-limit-notice {
+  display: block;
   margin: 0;
   color: var(--muted);
   line-height: 1.5;
@@ -1628,6 +1612,14 @@ html[data-flag-polyfill="true"] select {
   display: grid;
   min-width: 0;
   gap: 0.55rem;
+}
+
+.markdown-mode-switch,
+.markdown-toolbar {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
 }
 
 .recipient-picker-actions,
@@ -1970,6 +1962,7 @@ html[data-flag-polyfill="true"] select {
 }
 
 .form-status {
+  display: block;
   min-height: 1.5rem;
   margin: 0.25rem 0 0;
   color: var(--muted);
@@ -2324,7 +2317,7 @@ html[data-flag-polyfill="true"] select {
 
   .nav-link.is-active .nav-dot,
   .unread-mark,
-  .state-panel[role="status"]::before {
+  output.state-panel::before {
     background: Highlight;
   }
 

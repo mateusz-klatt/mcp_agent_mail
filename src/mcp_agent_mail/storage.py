@@ -39,11 +39,11 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, AsyncIterator, Iterable, Sequence, TypeVar, cast
+from typing import Any, AsyncIterator, Iterable, Sequence, cast
 from uuid import UUID, uuid4
 
 from filelock import FileLock, SoftFileLock, Timeout
-from git import NULL_TREE, Git, Repo
+from git import NULL_TREE, Commit, Diff, Git, Repo
 from git.exc import GitCommandError
 from git.objects.tree import Tree
 from PIL import Image
@@ -75,6 +75,18 @@ _IDENTITY_RENAME_SCHEMA_VERSION = 1
 _MESSAGE_DELIVERY_PENDING_EXCLUDE = "/projects/*/message_deliveries/*.pending"
 _GIT_LONG_PATHS_CONFIG = ["core.longpaths=true"]
 _GIT_LONG_PATHS_CLONE_OPTIONS = ["-c", "core.longpaths=true"]
+_NULL_DIFF_PATH = "/dev/null"
+_COMMIT_LOCK_NAME = ".commit.lock"
+_ARCHIVE_LOCK_NAME = ".archive.lock"
+_UTC_OFFSET = "+00:00"
+_AGENT_PROFILE_FILENAME = "profile.json"
+_PATH_TRAVERSAL_ERROR = "Invalid path: directory traversal not allowed"
+_WEBP_MEDIA_TYPE = "image/webp"
+_GIT_INDEX_LOCK_NAME = "index.lock"
+_MAIL_COMMIT_PREFIX = "mail: "
+_RESERVATION_COMMIT_PREFIX = "file_reservation: "
+_INVALID_COMMIT_SHA = "Invalid commit SHA format"
+_BACKUP_MANIFEST_FILENAME = "manifest.json"
 
 
 def _is_reparse_or_symlink_stat(path_stat: os.stat_result) -> bool:
@@ -177,7 +189,7 @@ class _CommitQueue:
 
     Usage:
         queue = _CommitQueue()
-        await queue.start()
+        queue.start()
         await queue.enqueue(repo_root, settings, message, rel_paths)
         await queue.stop()
     """
@@ -214,7 +226,7 @@ class _CommitQueue:
             "running": self._task is not None and not self._task.done(),
         }
 
-    async def start(self) -> None:
+    def start(self) -> None:
         """Start the background queue processor."""
         if self._task is not None and not self._task.done():
             return
@@ -228,7 +240,7 @@ class _CommitQueue:
             # Signal the processor to wake up and check stopped flag
             with contextlib.suppress(asyncio.QueueFull):
                 self._queue.put_nowait(_CommitRequest(
-                    repo_root=Path("/dev/null"),  # Sentinel
+                    repo_root=Path(_NULL_DIFF_PATH),  # Sentinel
                     settings=None,  # type: ignore
                     message="",
                     rel_paths=[],
@@ -288,51 +300,53 @@ class _CommitQueue:
         # Wait for the commit to complete
         await request.future
 
+    async def _collect_batch(self, first: _CommitRequest) -> list[_CommitRequest]:
+        """Collect immediately available requests within the batching window."""
+        batch = [first]
+        deadline = time.monotonic() + self._max_wait_ms / 1000.0
+        while len(batch) < self._max_batch_size and time.monotonic() < deadline:
+            try:
+                request = self._queue.get_nowait()
+                if request.settings is not None:
+                    batch.append(request)
+            except asyncio.QueueEmpty:
+                await asyncio.sleep(0.005)
+                break
+        return batch
+
+    async def _next_request(self) -> _CommitRequest | None:
+        """Wait for work, treating timeouts and stop sentinels identically."""
+        try:
+            first = await asyncio.wait_for(
+                self._queue.get(), timeout=self._max_wait_ms / 1000.0
+            )
+        except asyncio.TimeoutError:
+            return None
+        return first if first.settings is not None else None
+
     async def _process_loop(self) -> None:
         """Background loop that processes queued commits."""
         while True:
             try:
-                # Wait for first request with timeout
-                try:
-                    first = await asyncio.wait_for(
-                        self._queue.get(),
-                        timeout=self._max_wait_ms / 1000.0,
-                    )
-                except asyncio.TimeoutError:
-                    if self._stopped and self._queue.empty():
+                first = await self._next_request()
+                if first is None:
+                    if self._should_stop():
                         return
                     continue
 
-                # Skip sentinel requests
-                if first.settings is None:
-                    if self._stopped and self._queue.empty():
-                        return
-                    continue
-
-                # Collect more requests if available (non-blocking)
-                batch = [first]
-                deadline = time.monotonic() + (self._max_wait_ms / 1000.0)
-
-                while len(batch) < self._max_batch_size and time.monotonic() < deadline:
-                    try:
-                        request = self._queue.get_nowait()
-                        if request.settings is not None:  # Skip sentinels
-                            batch.append(request)
-                    except asyncio.QueueEmpty:
-                        # Brief wait to allow more requests to arrive
-                        await asyncio.sleep(0.005)
-                        break
-
-                # Process the batch
+                batch = await self._collect_batch(first)
                 await self._process_batch(batch)
-                if self._stopped and self._queue.empty():
+                if self._should_stop():
                     return
 
             except Exception as e:
                 _logger.exception("commit_queue.error", extra={"error": str(e)})
-                if self._stopped and self._queue.empty():
+                if self._should_stop():
                     return
                 await asyncio.sleep(0.1)  # Back off on errors
+
+    def _should_stop(self) -> bool:
+        return self._stopped and self._queue.empty()
 
     @staticmethod
     def _finish_request(request: _CommitRequest, error: Exception | None = None) -> None:
@@ -362,65 +376,57 @@ class _CommitQueue:
             key = str(req.repo_root)
             by_repo.setdefault(key, []).append(req)
 
-        for _repo_path, requests in by_repo.items():
-            if len(requests) == 1:
-                # Single request - just commit it directly
-                req = requests[0]
-                try:
-                    await _commit_direct(req.repo_root, req.settings, req.message, req.rel_paths)
-                    self._finish_request(req)
-                    self._commits += 1
-                except Exception as e:
-                    self._finish_request(req, e)
+        for requests in by_repo.values():
+            if self._can_merge_requests(requests):
+                await self._commit_merged_requests(requests)
             else:
-                # Multiple requests to same repo - try to batch if no path conflicts
-                all_paths: set[str] = set()
-                can_batch = True
-                for req in requests:
-                    path_set = set(req.rel_paths)
-                    if all_paths & path_set:  # Overlap detected
-                        can_batch = False
-                        break
-                    all_paths.update(path_set)
+                for request in requests:
+                    await self._commit_request(request)
 
-                if can_batch and len(requests) <= 5:  # Only batch small groups
-                    # Merge into single commit
-                    merged_paths: list[str] = []
-                    merged_messages: list[str] = []
-                    for req in requests:
-                        merged_paths.extend(req.rel_paths)
-                        merged_messages.append(req.message.split("\n")[0])  # First line only
+    @staticmethod
+    def _can_merge_requests(requests: list[_CommitRequest]) -> bool:
+        if not 1 < len(requests) <= 5:
+            return False
+        all_paths: set[str] = set()
+        for request in requests:
+            path_set = set(request.rel_paths)
+            if all_paths & path_set:
+                return False
+            all_paths.update(path_set)
+        return True
 
-                    combined_message = f"batch: {len(requests)} commits\n\n" + "\n".join(
-                        f"- {msg}" for msg in merged_messages
-                    )
+    async def _commit_request(self, request: _CommitRequest) -> None:
+        try:
+            await _commit_direct(
+                request.repo_root, request.settings, request.message, request.rel_paths
+            )
+            self._finish_request(request)
+            self._commits += 1
+        except Exception as exc:
+            self._finish_request(request, exc)
 
-                    try:
-                        await _commit_direct(
-                            requests[0].repo_root,
-                            requests[0].settings,
-                            combined_message,
-                            merged_paths,
-                        )
-                        for req in requests:
-                            self._finish_request(req)
-                        self._commits += 1
-                        # Record batch size
-                        self._batch_sizes.append(len(requests))
-                        if len(self._batch_sizes) > 100:
-                            self._batch_sizes.pop(0)
-                    except Exception as e:
-                        for req in requests:
-                            self._finish_request(req, e)
-                else:
-                    # Process sequentially (conflicts or large batch)
-                    for req in requests:
-                        try:
-                            await _commit_direct(req.repo_root, req.settings, req.message, req.rel_paths)
-                            self._finish_request(req)
-                            self._commits += 1
-                        except Exception as e:
-                            self._finish_request(req, e)
+    async def _commit_merged_requests(self, requests: list[_CommitRequest]) -> None:
+        merged_paths = [path for request in requests for path in request.rel_paths]
+        first_lines = [request.message.split("\n")[0] for request in requests]
+        combined_message = f"batch: {len(requests)} commits\n\n" + "\n".join(
+            f"- {message}" for message in first_lines
+        )
+        try:
+            await _commit_direct(
+                requests[0].repo_root,
+                requests[0].settings,
+                combined_message,
+                merged_paths,
+            )
+            for request in requests:
+                self._finish_request(request)
+            self._commits += 1
+            self._batch_sizes.append(len(requests))
+            if len(self._batch_sizes) > 100:
+                self._batch_sizes.pop(0)
+        except Exception as exc:
+            for request in requests:
+                self._finish_request(request, exc)
 
 
 # Global commit queue instance (lazily initialized)
@@ -444,7 +450,7 @@ async def _get_commit_queue() -> _CommitQueue:
     async with _get_commit_queue_lock():
         if _COMMIT_QUEUE is None or _COMMIT_QUEUE._task is None or _COMMIT_QUEUE._task.done():
             _COMMIT_QUEUE = _CommitQueue()
-            await _COMMIT_QUEUE.start()
+            _COMMIT_QUEUE.start()
         return _COMMIT_QUEUE
 
 
@@ -615,6 +621,19 @@ def _resolve_fd_path(fd_num: int, proc_entry: Path) -> str | None:
         return None
 
 
+def _is_unlinked_fd(fd_num: int) -> bool:
+    """Check the inode while tolerating descriptors closed during enumeration."""
+    try:
+        return os.fstat(fd_num).st_nlink == 0
+    except OSError:
+        return False
+
+
+def _is_lockfile_fd_path(path: str) -> bool:
+    base = Path(path.removesuffix(" (deleted)")).name
+    return base.endswith(".lock") or ".lock." in base
+
+
 def cleanup_leaked_lockfile_fds() -> int:
     """Scan the process's open FDs for ones pointing at deleted ``.lock`` files and close them.
 
@@ -662,17 +681,12 @@ def cleanup_leaked_lockfile_fds() -> int:
             # ".lock" ending is visible.
             if not path:
                 continue
-            clean_path = path.removesuffix(" (deleted)")
-            base = Path(clean_path).name
-            if not (base.endswith(".lock") or ".lock." in base):
+            if not _is_lockfile_fd_path(path):
                 continue
             # Cross-platform "deleted" signal: a still-open fd whose inode has
             # zero remaining hard links. A live, on-disk lockfile has
             # st_nlink >= 1 and is left untouched.
-            try:
-                if os.fstat(fd_num).st_nlink != 0:
-                    continue
-            except OSError:
+            if not _is_unlinked_fd(fd_num):
                 continue
             try:
                 os.close(fd_num)
@@ -1148,7 +1162,7 @@ class AsyncFileLock:
             self._lock.release()
             return True
         except Exception as exc:
-            _logger.error(
+            _logger.exception(
                 "lockfile_fd.release_failed",
                 extra={"path": str(self._path), "error": str(exc)},
             )
@@ -1206,7 +1220,8 @@ class AsyncFileLock:
         - Graceful handling of stale locks from crashed processes
         - Avoiding thundering herd with jittered backoff
         """
-        self._acquisition_start = time.monotonic()
+        acquisition_start = time.monotonic()
+        self._acquisition_start = acquisition_start
         self._acquisition_attempts = 0
 
         loop = asyncio.get_running_loop()
@@ -1225,119 +1240,100 @@ class AsyncFileLock:
         self._process_lock_held = True
         _PROCESS_LOCK_OWNERS[self._loop_key] = current_task_id
         try:
-            total_timeout = self._timeout if self._timeout > 0 else 60.0
-            remaining = total_timeout
-
-            for attempt in range(self._max_retries + 1):
-                self._acquisition_attempts = attempt + 1
-
-                # Adaptive timeout per attempt:
-                # - First attempt: 10% of total (fast path)
-                # - Middle attempts: progressively longer
-                # - Last attempt: all remaining time
-                if attempt == 0:
-                    per_attempt_timeout = min(total_timeout * 0.1, 5.0)  # 10%, max 5s
-                elif attempt == self._max_retries:
-                    per_attempt_timeout = remaining  # Use all remaining
-                else:
-                    # Exponential growth: 0.5s, 1s, 2s, 4s, ...
-                    per_attempt_timeout = min(0.5 * (2 ** attempt), remaining)
-
-                try:
-                    if self._timeout <= 0:
-                        await self._acquire_file_lock_cancellation_safe(None)
-                    else:
-                        await self._acquire_file_lock_cancellation_safe(
-                            per_attempt_timeout
-                        )
-                    self._held = True
-                    await self._write_lock_metadata_cancellation_safe()
-
-                    # Log successful acquisition if it took retries
-                    if attempt > 0:
-                        elapsed = time.monotonic() - self._acquisition_start
-                        _logger.info(
-                            "file_lock.acquired_after_retry",
-                            extra={
-                                "path": str(self._path),
-                                "attempts": attempt + 1,
-                                "elapsed_seconds": round(elapsed, 2),
-                            },
-                        )
-                    return None
-
-                except Timeout:
-                    elapsed = time.monotonic() - self._acquisition_start
-                    remaining = total_timeout - elapsed
-
-                    if remaining <= 0 or attempt >= self._max_retries:
-                        # Final attempt failed - try one last stale cleanup
-                        cleaned = await _to_thread_cancellation_safe(
-                            self._cleanup_if_stale
-                        )
-                        if cleaned:
-                            # Stale lock was cleaned - try once more with short timeout
-                            try:
-                                await self._acquire_file_lock_cancellation_safe(1.0)
-                                self._held = True
-                                await self._write_lock_metadata_cancellation_safe()
-                                _logger.info(
-                                    "file_lock.acquired_after_stale_cleanup",
-                                    extra={"path": str(self._path)},
-                                )
-                                return None
-                            except Timeout:
-                                pass  # Fall through to timeout error
-                        raise TimeoutError(
-                            f"Timed out acquiring lock {self._path} after {elapsed:.2f}s "
-                            f"({attempt + 1} attempts). No stale owner detected."
-                        ) from None
-
-                    # Check for stale lock before retrying
-                    cleaned = await _to_thread_cancellation_safe(
-                        self._cleanup_if_stale
-                    )
-                    if cleaned:
-                        _logger.info(
-                            "file_lock.stale_cleaned",
-                            extra={"path": str(self._path), "attempt": attempt + 1},
-                        )
-                        # Don't add backoff delay - immediately retry after cleanup
-                        continue
-
-                    # Add jittered backoff before retry (0.05s to 0.5s)
-                    backoff = min(0.05 * (2 ** attempt), 0.5)
-                    jitter = backoff * 0.25 * (2 * _jitter_rng.random() - 1)
-                    await asyncio.sleep(backoff + jitter)
-
+            await self._acquire_with_retries(acquisition_start)
         except BaseException:
             # Best-effort cleanup on any failure (including cancellation) to avoid leaking
             # lock file handles and process-level locks.
-            if self._held:
-                task = asyncio.create_task(_to_thread(self._release_strict))
-                release_ok, _cancellation = await _drain_archive_mutation_task(task)
-                if not release_ok:
-                    # release_strict already force-closed the FD; force-close
-                    # again as a safety net (idempotent)
-                    force_close_task = asyncio.create_task(
-                        _to_thread(self._force_close_fd)
-                    )
-                    await _drain_archive_mutation_task(force_close_task)
-                self._held = False
-
-            if self._loop_key is not None:
-                _PROCESS_LOCK_OWNERS.pop(self._loop_key, None)
-            if self._process_lock_held and self._process_lock:
-                self._process_lock.release()
-                self._process_lock_held = False
-            if (
-                self._loop_key is not None
-                and self._process_lock
-                and not self._process_lock.locked()
-            ):
-                _PROCESS_LOCKS.pop(self._loop_key, None)
-            self._process_lock = None
+            await self._cleanup_failed_acquisition()
             raise
+
+    def _attempt_timeout(self, attempt: int, total: float, remaining: float) -> float | None:
+        if self._timeout <= 0:
+            return None
+        if attempt == 0:
+            return min(total * 0.1, 5.0)
+        if attempt == self._max_retries:
+            return remaining
+        return min(0.5 * 2 ** attempt, remaining)
+
+    async def _acquire_with_retries(self, acquisition_start: float) -> None:
+        total_timeout = self._timeout if self._timeout > 0 else 60.0
+        remaining = total_timeout
+        for attempt in range(self._max_retries + 1):
+            self._acquisition_attempts = attempt + 1
+            try:
+                await self._acquire_file_lock_cancellation_safe(
+                    self._attempt_timeout(attempt, total_timeout, remaining)
+                )
+                self._held = True
+                await self._write_lock_metadata_cancellation_safe()
+                if attempt > 0:
+                    _logger.info(
+                        "file_lock.acquired_after_retry",
+                        extra={
+                            "path": str(self._path),
+                            "attempts": attempt + 1,
+                            "elapsed_seconds": round(time.monotonic() - acquisition_start, 2),
+                        },
+                    )
+                return
+            except Timeout:
+                elapsed = time.monotonic() - acquisition_start
+                remaining = total_timeout - elapsed
+                if remaining <= 0 or attempt >= self._max_retries:
+                    await self._acquire_after_final_timeout(elapsed, attempt)
+                    return
+                await self._wait_for_lock_retry(attempt)
+
+    async def _acquire_after_final_timeout(self, elapsed: float, attempt: int) -> None:
+        cleaned = await _to_thread_cancellation_safe(self._cleanup_if_stale)
+        if cleaned:
+            try:
+                await self._acquire_file_lock_cancellation_safe(1.0)
+                self._held = True
+                await self._write_lock_metadata_cancellation_safe()
+                _logger.info(
+                    "file_lock.acquired_after_stale_cleanup",
+                    extra={"path": str(self._path)},
+                )
+                return
+            except Timeout:
+                pass
+        raise TimeoutError(
+            f"Timed out acquiring lock {self._path} after {elapsed:.2f}s "
+            f"({attempt + 1} attempts). No stale owner detected."
+        ) from None
+
+    async def _wait_for_lock_retry(self, attempt: int) -> None:
+        cleaned = await _to_thread_cancellation_safe(self._cleanup_if_stale)
+        if cleaned:
+            _logger.info(
+                "file_lock.stale_cleaned",
+                extra={"path": str(self._path), "attempt": attempt + 1},
+            )
+            return
+        backoff = min(0.05 * 2 ** attempt, 0.5)
+        jitter_factor = 2 * _jitter_rng.random() - 1
+        jitter = backoff * 0.25 * jitter_factor
+        await asyncio.sleep(backoff + jitter)
+
+    async def _cleanup_failed_acquisition(self) -> None:
+        if self._held:
+            task = asyncio.create_task(_to_thread(self._release_strict))
+            release_ok, _cancellation = await _drain_archive_mutation_task(task)
+            if not release_ok:
+                # Idempotent safety net after release_strict force-closes the FD.
+                force_close_task = asyncio.create_task(_to_thread(self._force_close_fd))
+                await _drain_archive_mutation_task(force_close_task)
+            self._held = False
+        if self._loop_key is not None:
+            _PROCESS_LOCK_OWNERS.pop(self._loop_key, None)
+        if self._process_lock_held and self._process_lock:
+            self._process_lock.release()
+            self._process_lock_held = False
+        if self._loop_key is not None and self._process_lock and not self._process_lock.locked():
+            _PROCESS_LOCKS.pop(self._loop_key, None)
+        self._process_lock = None
 
     def _cleanup_if_stale(self) -> bool:
         """Remove lock and metadata when the lock is stale.
@@ -1357,7 +1353,7 @@ class AsyncFileLock:
         distinguish the dead generation they inspected from a successor that
         acquired the same pathname before their unlink.
         """
-        if self._path.name == ".commit.lock":
+        if self._path.name == _COMMIT_LOCK_NAME:
             return False
         # Stale detection followed by unlink is otherwise an ABA race: two
         # healers can inspect one dead generation, the first can remove it, a
@@ -1529,10 +1525,17 @@ async def archive_write_lock(archive: ProjectArchive, *, timeout_seconds: float 
         await _await_archive_mutation(task)
 
 
-T = TypeVar("T")
-
 async def _to_thread(func: Any, /, *args: Any, **kwargs: Any) -> Any:
     return await asyncio.to_thread(func, *args, **kwargs)
+
+
+def _consume_archive_cancellation(current_task: asyncio.Task[Any] | None) -> bool:
+    """Distinguish caller cancellation from a worker's CancelledError."""
+    if current_task is None or current_task.cancelling() == 0:
+        return False
+    while current_task.cancelling():
+        current_task.uncancel()
+    return True
 
 
 async def _drain_archive_task_cancellation(
@@ -1545,12 +1548,10 @@ async def _drain_archive_task_cancellation(
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError as exc:
-            if current_task is None or current_task.cancelling() == 0:
+            if not _consume_archive_cancellation(current_task):
                 raise
             if cancellation is None:
                 cancellation = exc
-            while current_task.cancelling():
-                current_task.uncancel()
         except BaseException:
             # A completed worker's own exception is observed through
             # ``task.result()`` by the caller.  Do not confuse it with caller
@@ -1561,7 +1562,7 @@ async def _drain_archive_task_cancellation(
     return cancellation
 
 
-async def _drain_archive_mutation_task(
+async def _drain_archive_mutation_task[T](
     task: asyncio.Task[T],
 ) -> tuple[T, asyncio.CancelledError | None]:
     """Finish one mutation task and return its result plus cancellation."""
@@ -1569,7 +1570,7 @@ async def _drain_archive_mutation_task(
     return task.result(), cancellation
 
 
-async def _await_archive_mutation(task: asyncio.Task[T]) -> T:
+async def _await_archive_mutation[T](task: asyncio.Task[T]) -> T:
     """Drain one archive mutation, then propagate caller cancellation."""
     result, cancellation = await _drain_archive_mutation_task(task)
     if cancellation is not None:
@@ -1716,104 +1717,107 @@ def collect_lock_status(settings: Settings, project_slug: str | None = None) -> 
     else:
         scan_roots = (root, git_common_dir / "agent-mail-locks")
 
+    candidates = _archive_lock_candidates(scan_roots)
+    now = time.time()
+    for lock_path in sorted(candidates, key=lambda p: str(p)):
+        info = _collect_lock_info(lock_path, now)
+        if info is None:
+            continue
+        summary["total"] += 1
+        if info["stale_suspected"]:
+            summary["stale"] += 1
+        elif info["owner_alive"] is True:
+            summary["active"] += 1
+        if not info["metadata_present"]:
+            summary["metadata_missing"] += 1
+        locks.append(info)
+
+    return {"locks": locks, "summary": summary}
+
+
+def _archive_lock_candidates(scan_roots: tuple[Path, ...]) -> set[Path]:
     candidates: set[Path] = set()
     for scan_root in scan_roots:
         if scan_root.is_file():
             candidates.add(scan_root)
         elif scan_root.exists():
             candidates.update(scan_root.rglob("*.lock"))
+    return candidates
 
-    if candidates:
-        now = time.time()
-        for lock_path in sorted(candidates, key=lambda p: str(p)):
-            metadata_path = lock_path.parent / f"{lock_path.name}.owner.json"
-            if not lock_path.exists():
-                continue
-            metadata_present = metadata_path.exists()
-            if (
-                not lock_path.name.endswith(".archive.lock")
-                and lock_path.name != ".commit.lock"
-                and not metadata_present
-            ):
-                continue
 
-            info: dict[str, Any] = {
-                "path": str(lock_path),
-                "metadata_path": str(metadata_path) if metadata_present else None,
-                "status": "held",
-                "metadata_present": metadata_present,
-                "category": (
-                    "archive"
-                    if lock_path.name.endswith(".archive.lock")
-                    else "commit"
-                    if lock_path.name == ".commit.lock"
-                    else "custom"
-                ),
-            }
+def _lock_category(lock_path: Path) -> str:
+    if lock_path.name.endswith(_ARCHIVE_LOCK_NAME):
+        return "archive"
+    if lock_path.name == _COMMIT_LOCK_NAME:
+        return "commit"
+    return "custom"
 
-            with contextlib.suppress(Exception):
-                stat = lock_path.stat()
-                info["size"] = stat.st_size
-                info["modified_ts"] = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
 
-            metadata: dict[str, Any] = {}
-            if metadata_present:
-                try:
-                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-                except Exception:
-                    metadata = {}
-            info["metadata"] = metadata
+def _add_lock_age(info: dict[str, Any], lock_path: Path, now: float) -> None:
+    metadata = info["metadata"]
+    created_ts = metadata.get("created_ts") if isinstance(metadata, dict) else None
+    if isinstance(created_ts, (int, float)):
+        info["created_ts"] = datetime.fromtimestamp(created_ts, tz=timezone.utc).isoformat()
+        info["age_seconds"] = max(0.0, now - float(created_ts))
+    else:
+        info["created_ts"] = None
+        info["age_seconds"] = None
+        with contextlib.suppress(Exception):
+            info["age_seconds"] = max(0.0, now - lock_path.stat().st_mtime)
 
-            pid_val = metadata.get("pid")
-            pid_int: int | None = None
-            if pid_val is not None:
-                with contextlib.suppress(Exception):
-                    pid_int = int(pid_val)
-            info["owner_pid"] = pid_int
-            owner_alive: bool | None = None
-            if pid_int is not None:
-                owner_alive = AsyncFileLock._pid_alive(pid_int)
-            info["owner_alive"] = owner_alive
 
-            created_ts = metadata.get("created_ts") if isinstance(metadata, dict) else None
-            if isinstance(created_ts, (int, float)):
-                info["created_ts"] = datetime.fromtimestamp(created_ts, tz=timezone.utc).isoformat()
-                info["age_seconds"] = max(0.0, now - float(created_ts))
-            else:
-                info["created_ts"] = None
-                with contextlib.suppress(Exception):
-                    info["age_seconds"] = max(0.0, now - lock_path.stat().st_mtime)
-                if "age_seconds" not in info:
-                    info["age_seconds"] = None
+def _add_lock_owner_status(info: dict[str, Any], lock_path: Path, now: float) -> None:
+    pid_val = info["metadata"].get("pid")
+    pid_int: int | None = None
+    if pid_val is not None:
+        with contextlib.suppress(Exception):
+            pid_int = int(pid_val)
+    info["owner_pid"] = pid_int
+    owner_alive = AsyncFileLock._pid_alive(pid_int) if pid_int is not None else None
+    info["owner_alive"] = owner_alive
+    _add_lock_age(info, lock_path, now)
+    stale_threshold = AsyncFileLock(lock_path)._stale_timeout
+    info["stale_timeout_seconds"] = stale_threshold
+    age_val = info.get("age_seconds")
+    age_expired = (
+        stale_threshold > 0
+        and isinstance(age_val, (int, float))
+        and age_val >= stale_threshold
+    )
+    if lock_path.name == _COMMIT_LOCK_NAME:
+        info["stale_suspected"] = pid_int is not None and owner_alive is False
+    else:
+        info["stale_suspected"] = owner_alive is False or (owner_alive is None and age_expired)
 
-            stale_threshold = AsyncFileLock(lock_path)._stale_timeout
-            info["stale_timeout_seconds"] = stale_threshold
-            age_val = info.get("age_seconds")
-            age_expired = (
-                stale_threshold > 0
-                and isinstance(age_val, (int, float))
-                and age_val >= stale_threshold
-            )
-            if lock_path.name == ".commit.lock":
-                is_stale = pid_int is not None and owner_alive is False
-            else:
-                is_stale = owner_alive is False or (
-                    owner_alive is None and age_expired
-                )
-            info["stale_suspected"] = is_stale
 
-            summary["total"] += 1
-
-            if is_stale:
-                summary["stale"] += 1
-            elif info["owner_alive"] is True:
-                summary["active"] += 1
-            if not metadata_present:
-                summary["metadata_missing"] += 1
-
-            locks.append(info)
-
-    return {"locks": locks, "summary": summary}
+def _collect_lock_info(lock_path: Path, now: float) -> dict[str, Any] | None:
+    if not lock_path.exists():
+        return None
+    metadata_path = lock_path.parent / f"{lock_path.name}.owner.json"
+    metadata_present = metadata_path.exists()
+    category = _lock_category(lock_path)
+    if category == "custom" and not metadata_present:
+        return None
+    info: dict[str, Any] = {
+        "path": str(lock_path),
+        "metadata_path": str(metadata_path) if metadata_present else None,
+        "status": "held",
+        "metadata_present": metadata_present,
+        "category": category,
+    }
+    with contextlib.suppress(Exception):
+        path_stat = lock_path.stat()
+        info["size"] = path_stat.st_size
+        info["modified_ts"] = datetime.fromtimestamp(path_stat.st_mtime, tz=timezone.utc).isoformat()
+    metadata: dict[str, Any] = {}
+    if metadata_present:
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except Exception:
+            metadata = {}
+    info["metadata"] = metadata
+    _add_lock_owner_status(info, lock_path, now)
+    return info
 
 
 def _mkdir_with_durable_parents_sync(directory: Path) -> None:
@@ -2075,7 +2079,7 @@ async def _create_repo_for_cache(root: Path, settings: Settings, cache_key: str)
         repo: Repo | None = None
         cached_repo = False
         try:
-            commit_lock_path = root / ".commit.lock"
+            commit_lock_path = root / _COMMIT_LOCK_NAME
             async with AsyncFileLock(commit_lock_path):
                 git_dir = root / ".git"
                 if await _to_thread(git_dir.exists):
@@ -2135,6 +2139,8 @@ def _complete_repo_single_flight(
     except asyncio.CancelledError:
         error: BaseException = RuntimeError(f"Repository initialization was cancelled for {cache_key}")
     except BaseException as exc:
+        # Publish the exact worker error to every cross-loop waiter, including
+        # control-flow exceptions outside Exception. The Future re-raises it.
         error = exc
     else:
         error = None
@@ -2322,7 +2328,7 @@ def _resolve_historical_identity_sync(
         value = entry.get("renamed_at")
         if not isinstance(value, str):
             raise ValueError("Identity rename ledger entry is missing renamed_at")
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", _UTC_OFFSET))
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
@@ -2350,15 +2356,15 @@ def _is_ephemeral_archive_path(path_value: str) -> bool:
         "storage.sqlite3-journal",
         "storage.sqlite3-shm",
         "storage.sqlite3-wal",
-        ".commit.lock",
+        _COMMIT_LOCK_NAME,
         ".commit.lock.owner.json",
     }:
         return True
     parts = path.parts
     if len(parts) == 3 and parts[0] == "projects" and name in {
-        ".archive.lock",
+        _ARCHIVE_LOCK_NAME,
         ".archive.lock.owner.json",
-        ".commit.lock",
+        _COMMIT_LOCK_NAME,
         ".commit.lock.owner.json",
     }:
         return True
@@ -2366,10 +2372,7 @@ def _is_ephemeral_archive_path(path_value: str) -> bool:
         len(parts) == 5
         and parts[0] == "projects"
         and parts[2:4] == ("messages", "threads")
-        and (
-            name.endswith(".md.lock")
-            or name.endswith(".md.lock.owner.json")
-        )
+        and name.endswith((".md.lock", ".md.lock.owner.json"))
     ):
         return True
     if (
@@ -2419,29 +2422,7 @@ def _archive_dirty_paths_sync(archive: ProjectArchive) -> list[str]:
     # absorb an operator's existing index.
     paths.update(value for value in staged_output.split("\0") if value)
     for value in unstaged_output.split("\0"):
-        if not value:
-            continue
-        entry = archive.repo.index.entries.get((value, 0))
-        full_path = archive.repo_root / PurePosixPath(value)
-        if entry is None or not os.path.lexists(full_path):
-            paths.add(value)
-            continue
-        try:
-            with archive.repo.git.custom_environment(GIT_OPTIONAL_LOCKS="0"):
-                worktree_sha = archive.repo.git.hash_object(
-                    f"--path={value}",
-                    "--",
-                    value,
-                ).strip()
-        except GitCommandError:
-            paths.add(value)
-            continue
-        expected_executable = bool(entry.mode & 0o111)
-        actual_executable = bool(full_path.stat().st_mode & 0o111)
-        if worktree_sha != entry.binsha.hex() or (
-            full_path.is_file()
-            and expected_executable != actual_executable
-        ):
+        if value and _unstaged_archive_path_changed_sync(archive, value):
             paths.add(value)
     for value in untracked_output.split("\0"):
         if not value:
@@ -2449,6 +2430,25 @@ def _archive_dirty_paths_sync(archive: ProjectArchive) -> list[str]:
         if not _is_ephemeral_archive_path(value):
             paths.add(value)
     return sorted(paths)
+
+
+def _unstaged_archive_path_changed_sync(archive: ProjectArchive, value: str) -> bool:
+    entry = archive.repo.index.entries.get((value, 0))
+    full_path = archive.repo_root / PurePosixPath(value)
+    if entry is None or not os.path.lexists(full_path):
+        return True
+    try:
+        with archive.repo.git.custom_environment(GIT_OPTIONAL_LOCKS="0"):
+            worktree_sha = archive.repo.git.hash_object(
+                f"--path={value}", "--", value
+            ).strip()
+    except GitCommandError:
+        return True
+    expected_executable = bool(entry.mode & 0o111)
+    actual_executable = bool(full_path.stat().st_mode & 0o111)
+    return worktree_sha != entry.binsha.hex() or (
+        full_path.is_file() and expected_executable != actual_executable
+    )
 
 
 async def get_archive_dirty_paths(archive: ProjectArchive) -> list[str]:
@@ -2483,7 +2483,7 @@ def _profile_agent_id_sync(profile_path: Path) -> int:
 def _normalize_identity_rename_boundary(value: str) -> str:
     """Return the second-resolution UTC timestamp shared with the Git commit."""
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", _UTC_OFFSET))
     except ValueError as exc:
         raise ValueError("Identity rename boundary must be an ISO 8601 timestamp") from exc
     if parsed.tzinfo is None:
@@ -2634,23 +2634,27 @@ def _matching_agent_reservation_paths_sync(
             raise ValueError(
                 f"File reservation artifact must contain an object: {reservation_path}"
             )
-        reservation_agent_id = reservation.get("agent_id")
-        if reservation_agent_id is None:
-            recorded_name = reservation.get("agent")
-            matches_agent = (
-                safe_legacy_name is not None
-                and isinstance(recorded_name, str)
-                and recorded_name.casefold() == safe_legacy_name.casefold()
-            )
-        else:
-            matches_agent = (
-                isinstance(reservation_agent_id, int)
-                and not isinstance(reservation_agent_id, bool)
-                and reservation_agent_id == agent_id
-            )
-        if matches_agent:
+        if _reservation_matches_agent(reservation, agent_id, safe_legacy_name):
             matching.append(reservation_path)
     return matching
+
+
+def _reservation_matches_agent(
+    reservation: dict[str, Any], agent_id: int, safe_legacy_name: str | None
+) -> bool:
+    reservation_agent_id = reservation.get("agent_id")
+    if reservation_agent_id is None:
+        recorded_name = reservation.get("agent")
+        return (
+            safe_legacy_name is not None
+            and isinstance(recorded_name, str)
+            and recorded_name.casefold() == safe_legacy_name.casefold()
+        )
+    return (
+        isinstance(reservation_agent_id, int)
+        and not isinstance(reservation_agent_id, bool)
+        and reservation_agent_id == agent_id
+    )
 
 
 async def get_agent_reservation_archive_paths(
@@ -2692,23 +2696,9 @@ def _inspect_agent_archive_rename_sync(
             f"Archive target collision: both '{old_dir.name}' and '{new_dir.name}' exist"
         )
     if old_dir is not None:
-        if dirty_paths:
-            preview = ", ".join(dirty_paths[:5])
-            suffix = f" (+{len(dirty_paths) - 5} more)" if len(dirty_paths) > 5 else ""
-            raise ValueError(
-                "The Git archive must be clean before identity migration. "
-                f"Commit or otherwise resolve: {preview}{suffix}"
-            )
-        profile_id = _profile_agent_id_sync(old_dir / "profile.json")
-        if profile_id != agent_id:
-            raise ValueError(
-                "Target collision or DB-ahead mismatch: legacy archive profile id "
-                f"{profile_id} does not match database Agent.id {agent_id}"
-            )
-        if ledger_entry is not None or tombstone is not None:
-            raise ValueError(
-                f"Identity '{old_name}' has a ledger/tombstone but its legacy archive directory still exists"
-            )
+        _validate_pending_archive_rename_sync(
+            old_dir, old_name, agent_id, dirty_paths, ledger_entry, tombstone
+        )
         _matching_agent_reservation_paths_sync(archive, agent_id)
         return {
             "state": "pending",
@@ -2718,44 +2708,9 @@ def _inspect_agent_archive_rename_sync(
         }
 
     if new_dir is not None:
-        _matching_agent_reservation_paths_sync(archive, agent_id)
-        profile_id = _profile_agent_id_sync(new_dir / "profile.json")
-        if profile_id != agent_id:
-            raise ValueError(
-                f"Archive rename evidence for '{old_name}' does not match database Agent.id {agent_id}"
-            )
-        if ledger_entry is not None and ledger_entry.get("agent_id") != agent_id:
-            raise ValueError(
-                f"Identity rename ledger for '{old_name}' does not match database Agent.id {agent_id}"
-            )
-        if tombstone is not None and tombstone.get("agent_id") != agent_id:
-            raise ValueError(
-                f"Identity tombstone for '{old_name}' does not match database Agent.id {agent_id}"
-            )
-        if dirty_paths:
-            _validate_partial_identity_rename_paths_sync(
-                archive,
-                dirty_paths,
-                old_name,
-                new_name,
-                agent_id,
-            )
-            return {
-                "state": "in_progress",
-                "old_directory": old_name,
-                "new_directory": new_dir.name,
-                "agent_id": agent_id,
-            }
-        if ledger_entry is None or tombstone is None:
-            raise ValueError(
-                f"Archive target collision: '{new_dir.name}' exists without a matching rename ledger and tombstone"
-            )
-        return {
-            "state": "already_applied",
-            "old_directory": old_name,
-            "new_directory": new_dir.name,
-            "agent_id": agent_id,
-        }
+        return _inspect_existing_archive_rename_sync(
+            archive, old_name, new_name, agent_id, new_dir, dirty_paths, (ledger_entry, tombstone)
+        )
 
     if dirty_paths:
         preview = ", ".join(dirty_paths[:5])
@@ -2768,6 +2723,76 @@ def _inspect_agent_archive_rename_sync(
         f"Legacy archive directory 'agents/{old_name}' does not exist, and no completed "
         f"rename to 'agents/{new_name}' can be verified"
     )
+
+
+def _validate_pending_archive_rename_sync(
+    old_dir: Path,
+    old_name: str,
+    agent_id: int,
+    dirty_paths: list[str],
+    ledger_entry: dict[str, object] | None,
+    tombstone: dict[str, object] | None,
+) -> None:
+    if dirty_paths:
+        preview = ", ".join(dirty_paths[:5])
+        suffix = f" (+{len(dirty_paths) - 5} more)" if len(dirty_paths) > 5 else ""
+        raise ValueError(
+            "The Git archive must be clean before identity migration. "
+            f"Commit or otherwise resolve: {preview}{suffix}"
+        )
+    profile_id = _profile_agent_id_sync(old_dir / _AGENT_PROFILE_FILENAME)
+    if profile_id != agent_id:
+        raise ValueError(
+            "Target collision or DB-ahead mismatch: legacy archive profile id "
+            f"{profile_id} does not match database Agent.id {agent_id}"
+        )
+    if ledger_entry is not None or tombstone is not None:
+        raise ValueError(
+            f"Identity '{old_name}' has a ledger/tombstone but its legacy archive directory still exists"
+        )
+
+
+def _inspect_existing_archive_rename_sync(
+    archive: ProjectArchive,
+    old_name: str,
+    new_name: str,
+    agent_id: int,
+    new_dir: Path,
+    dirty_paths: list[str],
+    evidence: tuple[dict[str, object] | None, dict[str, object] | None],
+) -> dict[str, object]:
+    ledger_entry, tombstone = evidence
+    _matching_agent_reservation_paths_sync(archive, agent_id)
+    profile_id = _profile_agent_id_sync(new_dir / _AGENT_PROFILE_FILENAME)
+    if profile_id != agent_id:
+        raise ValueError(
+            f"Archive rename evidence for '{old_name}' does not match database Agent.id {agent_id}"
+        )
+    if ledger_entry is not None and ledger_entry.get("agent_id") != agent_id:
+        raise ValueError(
+            f"Identity rename ledger for '{old_name}' does not match database Agent.id {agent_id}"
+        )
+    if tombstone is not None and tombstone.get("agent_id") != agent_id:
+        raise ValueError(
+            f"Identity tombstone for '{old_name}' does not match database Agent.id {agent_id}"
+        )
+    if dirty_paths:
+        _validate_partial_identity_rename_paths_sync(
+            archive, dirty_paths, old_name, new_name, agent_id
+        )
+        state = "in_progress"
+    else:
+        if ledger_entry is None or tombstone is None:
+            raise ValueError(
+                f"Archive target collision: '{new_dir.name}' exists without a matching rename ledger and tombstone"
+            )
+        state = "already_applied"
+    return {
+        "state": state,
+        "old_directory": old_name,
+        "new_directory": new_dir.name,
+        "agent_id": agent_id,
+    }
 
 
 async def inspect_agent_archive_rename(
@@ -2821,6 +2846,54 @@ def _write_json_atomic_sync(path: Path, payload: Mapping[str, object]) -> None:
             temporary.unlink()
 
 
+def _rename_archive_profile_sync(profile_path: Path, old_name: str, new_name: str, agent_id: int) -> None:
+    try:
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Agent profile is unreadable: {profile_path}") from exc
+    if not isinstance(profile, dict):
+        raise ValueError(f"Agent profile must contain an object: {profile_path}")
+    if profile.get("id") != agent_id:
+        raise ValueError(
+            f"Agent profile id does not match database Agent.id {agent_id}: {profile_path}"
+        )
+    profile["name"] = new_name
+    window_display_name = profile.get("window_display_name")
+    if isinstance(window_display_name, str) and window_display_name.casefold() == old_name.casefold():
+        profile["window_display_name"] = new_name
+    _write_json_atomic_sync(profile_path, cast(dict[str, object], profile))
+
+
+def _resolve_archive_rename_boundary(
+    archive: ProjectArchive,
+    renamed_at: str,
+    existing_entry: dict[str, object] | None,
+    existing_tombstone: dict[str, object] | None,
+) -> str:
+    boundary_source: object = renamed_at
+    if existing_entry is not None:
+        boundary_source = existing_entry.get("renamed_at")
+    elif existing_tombstone is not None:
+        boundary_source = existing_tombstone.get("renamed_at")
+    if not isinstance(boundary_source, str):
+        raise ValueError("Identity rename evidence is missing its timestamp boundary")
+    boundary = _normalize_identity_rename_boundary(boundary_source)
+    if existing_entry is None and existing_tombstone is None:
+        parent_boundary = archive.repo.head.commit.authored_datetime.astimezone(
+            timezone.utc
+        ).replace(microsecond=0)
+        requested_boundary = datetime.fromisoformat(boundary)
+        if requested_boundary <= parent_boundary:
+            boundary = (parent_boundary + timedelta(seconds=1)).isoformat()
+    if existing_entry is not None and existing_tombstone is not None:
+        tombstone_boundary = existing_tombstone.get("renamed_at")
+        if not isinstance(tombstone_boundary, str) or (
+            _normalize_identity_rename_boundary(tombstone_boundary) != boundary
+        ):
+            raise ValueError("Identity rename ledger and tombstone have different boundaries")
+    return boundary
+
+
 def _apply_agent_archive_rename_sync(
     archive: ProjectArchive,
     old_name: str,
@@ -2852,60 +2925,17 @@ def _apply_agent_archive_rename_sync(
             raise ValueError(f"Interrupted target directory disappeared during recovery: {new_name}")
         old_directory_name = str(inspection["old_directory"])
 
-    profile_path = target_dir / "profile.json"
-    try:
-        profile = json.loads(profile_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Agent profile is unreadable: {profile_path}") from exc
-    if not isinstance(profile, dict):
-        raise ValueError(f"Agent profile must contain an object: {profile_path}")
-    if profile.get("id") != agent_id:
-        raise ValueError(
-            f"Agent profile id does not match database Agent.id {agent_id}: {profile_path}"
-        )
-    profile["name"] = new_name
-    window_display_name = profile.get("window_display_name")
-    if isinstance(window_display_name, str) and window_display_name.casefold() == old_name.casefold():
-        profile["window_display_name"] = new_name
-    _write_json_atomic_sync(profile_path, cast(dict[str, object], profile))
+    _rename_archive_profile_sync(target_dir / _AGENT_PROFILE_FILENAME, old_name, new_name, agent_id)
 
     matching_reservations = _matching_agent_reservation_paths_sync(
         archive,
         agent_id,
     )
-    for reservation_path in matching_reservations:
-        reservation = json.loads(reservation_path.read_text(encoding="utf-8"))
-        assert isinstance(reservation, dict)
-        if reservation.get("agent") != new_name:
-            reservation["agent"] = new_name
-            _write_json_atomic_sync(
-                reservation_path,
-                cast(dict[str, object], reservation),
-            )
+    _rename_reservation_owners_sync(matching_reservations, new_name)
 
     existing_entry = _matching_rename_entry_sync(archive, old_name, new_name)
     existing_tombstone = _identity_rename_tombstone_sync(archive.root, old_name)
-    boundary_source: object = renamed_at
-    if existing_entry is not None:
-        boundary_source = existing_entry.get("renamed_at")
-    elif existing_tombstone is not None:
-        boundary_source = existing_tombstone.get("renamed_at")
-    if not isinstance(boundary_source, str):
-        raise ValueError("Identity rename evidence is missing its timestamp boundary")
-    boundary = _normalize_identity_rename_boundary(boundary_source)
-    if existing_entry is None and existing_tombstone is None:
-        parent_boundary = archive.repo.head.commit.authored_datetime.astimezone(
-            timezone.utc
-        ).replace(microsecond=0)
-        requested_boundary = datetime.fromisoformat(boundary)
-        if requested_boundary <= parent_boundary:
-            boundary = (parent_boundary + timedelta(seconds=1)).isoformat()
-    if existing_entry is not None and existing_tombstone is not None:
-        tombstone_boundary = existing_tombstone.get("renamed_at")
-        if not isinstance(tombstone_boundary, str) or (
-            _normalize_identity_rename_boundary(tombstone_boundary) != boundary
-        ):
-            raise ValueError("Identity rename ledger and tombstone have different boundaries")
+    boundary = _resolve_archive_rename_boundary(archive, renamed_at, existing_entry, existing_tombstone)
 
     entry: dict[str, object] = {
         "agent_id": agent_id,
@@ -3007,6 +3037,15 @@ def _apply_agent_archive_rename_sync(
     }
 
 
+def _rename_reservation_owners_sync(reservation_paths: list[Path], new_name: str) -> None:
+    for reservation_path in reservation_paths:
+        reservation = json.loads(reservation_path.read_text(encoding="utf-8"))
+        assert isinstance(reservation, dict)
+        if reservation.get("agent") != new_name:
+            reservation["agent"] = new_name
+            _write_json_atomic_sync(reservation_path, cast(dict[str, object], reservation))
+
+
 async def migrate_agent_archive(
     archive: ProjectArchive,
     old_name: str,
@@ -3031,7 +3070,7 @@ async def migrate_agent_archive(
 
 
 async def write_agent_profile(archive: ProjectArchive, agent: Mapping[str, object]) -> None:
-    profile_path = archive.root / "agents" / str(agent["name"]) / "profile.json"
+    profile_path = archive.root / "agents" / str(agent["name"]) / _AGENT_PROFILE_FILENAME
     await _write_json(profile_path, dict(agent))
     rel = profile_path.relative_to(archive.repo_root).as_posix()
     await _commit(archive.repo, archive.settings, f"agent: profile {agent['name']}", [rel])
@@ -3656,16 +3695,7 @@ async def publish_message_delivery(
         )
 
 
-async def write_message_bundle(
-    archive: ProjectArchive,
-    message: dict[str, object],
-    body_md: str,
-    sender: str,
-    recipients: Sequence[str],
-    extra_paths: Sequence[str] | None = None,
-    commit_text: str | None = None,
-    sender_outbox_name: str | None = None,
-) -> None:
+def _message_bundle_timestamp(message: dict[str, object]) -> tuple[datetime, str]:
     timestamp_obj: Any = message.get("created") or message.get("created_ts")
     now: datetime
     timestamp_str: str  # Always define to avoid UnboundLocalError
@@ -3677,7 +3707,7 @@ async def write_message_bundle(
         # Handle Z-suffixed timestamps (ISO 8601 UTC indicator)
         parse_str = timestamp_str
         if parse_str.endswith("Z"):
-            parse_str = parse_str[:-1] + "+00:00"
+            parse_str = parse_str[:-1] + _UTC_OFFSET
         try:
             now = datetime.fromisoformat(parse_str)
         except ValueError:
@@ -3690,6 +3720,64 @@ async def write_message_bundle(
     if now.tzinfo is None or now.tzinfo.utcoffset(now) is None:
         # Treat naive timestamps as UTC (matches SQLite naive-UTC convention)
         now = now.replace(tzinfo=timezone.utc)
+    return now, timestamp_str
+
+
+def _render_message_archive_content(
+    message: dict[str, object], body_md: str, bcc_names: set[str], viewer: str | None
+) -> str:
+    if viewer is None or not bcc_names:
+        view_message = message
+    else:
+        view_message = dict(message)
+        view_message["bcc"] = [viewer] if viewer in bcc_names else []
+    frontmatter = json.dumps(view_message, indent=2, sort_keys=True)
+    return f"---json\n{frontmatter}\n---\n\n{body_md.strip()}\n"
+
+
+def _message_archive_filename(message: dict[str, object], now: datetime) -> str:
+    created_iso = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
+    subject_value = str(message.get("subject", "")).strip() or "message"
+    subject_slug = _SUBJECT_SLUG_RE.sub("-", subject_value).strip("-_").lower()[:80] or "message"
+    id_suffix = str(message.get("id", ""))
+    if id_suffix:
+        return f"{created_iso}__{subject_slug}__{id_suffix}.md"
+    return f"{created_iso}__{subject_slug}.md"
+
+
+def _message_bundle_commit_text(
+    message: dict[str, object],
+    sender: str,
+    recipients: Sequence[str],
+    timestamp_str: str,
+    commit_text: str | None,
+) -> str:
+    thread_key = message.get("thread_id") or message.get("id")
+    if commit_text:
+        return commit_text if commit_text.endswith("\n") else f"{commit_text}\n"
+    commit_subject = f"mail: {sender} -> {', '.join(recipients)} | {message.get('subject', '')}"
+    commit_body_lines = [
+        "TOOL: send_message",
+        f"Agent: {sender}",
+        f"Project: {message.get('project', '')}",
+        f"Started: {timestamp_str}",
+        "Status: SUCCESS",
+        f"Thread: {thread_key}",
+    ]
+    return commit_subject + "\n\n" + "\n".join(commit_body_lines) + "\n"
+
+
+async def write_message_bundle(
+    archive: ProjectArchive,
+    message: dict[str, object],
+    body_md: str,
+    sender: str,
+    recipients: Sequence[str],
+    extra_paths: Sequence[str] | None = None,
+    commit_text: str | None = None,
+    sender_outbox_name: str | None = None,
+) -> None:
+    now, timestamp_str = _message_bundle_timestamp(message)
     y_dir = now.strftime("%Y")
     m_dir = now.strftime("%m")
 
@@ -3717,28 +3805,11 @@ async def write_message_bundle(
     bcc_list = message.get("bcc")
     bcc_names = {str(name) for name in bcc_list} if isinstance(bcc_list, (list, tuple)) else set()
 
-    def _render_content(viewer: str | None) -> str:
-        if viewer is None or not bcc_names:
-            view_message = message
-        else:
-            view_message = dict(message)
-            view_message["bcc"] = [viewer] if viewer in bcc_names else []
-        frontmatter = json.dumps(view_message, indent=2, sort_keys=True)
-        return f"---json\n{frontmatter}\n---\n\n{body_md.strip()}\n"
-
     # Sender-side copies (canonical archive + sender outbox) retain full bcc.
-    content = _render_content(None)
+    content = _render_message_archive_content(message, body_md, bcc_names, None)
 
     # Descriptive, ISO-prefixed filename: <ISO>__<subject-slug>__<id>.md
-    created_iso = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
-    subject_value = str(message.get("subject", "")).strip() or "message"
-    subject_slug = _SUBJECT_SLUG_RE.sub("-", subject_value).strip("-_").lower()[:80] or "message"
-    id_suffix = str(message.get("id", ""))
-    filename = (
-        f"{created_iso}__{subject_slug}__{id_suffix}.md"
-        if id_suffix
-        else f"{created_iso}__{subject_slug}.md"
-    )
+    filename = _message_archive_filename(message, now)
     canonical_path = canonical_dir / filename
     await _write_text(canonical_path, content)
     rel_paths.append(canonical_path.relative_to(archive.repo_root).as_posix())
@@ -3750,7 +3821,9 @@ async def write_message_bundle(
 
     for recipient_name, inbox_dir in inbox_dirs:
         inbox_path = inbox_dir / filename
-        await _write_text(inbox_path, _render_content(recipient_name))
+        await _write_text(
+            inbox_path, _render_message_archive_content(message, body_md, bcc_names, recipient_name)
+        )
         rel_paths.append(inbox_path.relative_to(archive.repo_root).as_posix())
 
     # Update thread-level digest for human review if thread_id present
@@ -3777,21 +3850,7 @@ async def write_message_bundle(
 
     if extra_paths:
         rel_paths.extend(extra_paths)
-    thread_key = message.get("thread_id") or message.get("id")
-    if commit_text:
-        commit_message = commit_text if commit_text.endswith("\n") else f"{commit_text}\n"
-    else:
-        commit_subject = f"mail: {sender} -> {', '.join(recipients)} | {message.get('subject', '')}"
-        # Enriched commit body mirroring console logs
-        commit_body_lines = [
-            "TOOL: send_message",
-            f"Agent: {sender}",
-            f"Project: {message.get('project', '')}",
-            f"Started: {timestamp_str}",
-            "Status: SUCCESS",
-            f"Thread: {thread_key}",
-        ]
-        commit_message = commit_subject + "\n\n" + "\n".join(commit_body_lines) + "\n"
+    commit_message = _message_bundle_commit_text(message, sender, recipients, timestamp_str, commit_text)
     await _commit(archive.repo, archive.settings, commit_message, rel_paths)
 
 
@@ -3868,7 +3927,7 @@ def _resolve_archive_relative_path(archive: ProjectArchive, raw_path: str) -> Pa
         or normalized.endswith("/..")
         or normalized == ".."
     ):
-        raise ValueError("Invalid path: directory traversal not allowed")
+        raise ValueError(_PATH_TRAVERSAL_ERROR)
 
     safe_rel = normalized.lstrip("/")
     root = archive.root.resolve()
@@ -3876,7 +3935,7 @@ def _resolve_archive_relative_path(archive: ProjectArchive, raw_path: str) -> Pa
     try:
         candidate.relative_to(root)
     except ValueError as exc:
-        raise ValueError("Invalid path: directory traversal not allowed") from exc
+        raise ValueError(_PATH_TRAVERSAL_ERROR) from exc
     return candidate
 
 
@@ -3903,32 +3962,39 @@ async def process_attachments(
             for m in _IMAGE_PATTERN.finditer(body_md):
                 raw_path = m.group("path")
                 if raw_path.startswith("data:"):
-                    try:
-                        header = raw_path.split(",", 1)[0]
-                        media_type = "image/webp"
-                        if ";" in header:
-                            mt = header[5:].split(";", 1)[0]
-                            if mt:
-                                media_type = mt
-                        attachments_meta.append({"type": "inline", "media_type": media_type})
-                    except Exception:
-                        attachments_meta.append({"type": "inline"})
+                    attachments_meta.append(_inline_image_metadata(raw_path))
     if attachment_paths:
         for path in attachment_paths:
-            p = Path(path)
-            if p.is_absolute():
-                if not archive.settings.storage.allow_absolute_attachment_paths:
-                    raise ValueError(
-                        "Absolute attachment paths are disabled. Set ALLOW_ABSOLUTE_ATTACHMENT_PATHS=true to enable."
-                    )
-                resolved = await _to_thread(_expanduser_resolve_path, p)
-            else:
-                resolved = _resolve_archive_relative_path(archive, path)
+            resolved = await _resolve_attachment_path(archive, path)
             meta, rel_path = await _store_image(archive, resolved, embed_policy=embed_policy)
             attachments_meta.append(meta)
             if rel_path:
                 commit_paths.append(rel_path)
     return updated_body, attachments_meta, commit_paths
+
+
+def _inline_image_metadata(raw_path: str) -> dict[str, object]:
+    try:
+        header = raw_path.split(",", 1)[0]
+        media_type = _WEBP_MEDIA_TYPE
+        if ";" in header:
+            parsed_type = header[5:].split(";", 1)[0]
+            if parsed_type:
+                media_type = parsed_type
+        return {"type": "inline", "media_type": media_type}
+    except Exception:
+        return {"type": "inline"}
+
+
+async def _resolve_attachment_path(archive: ProjectArchive, path: str) -> Path:
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        return _resolve_archive_relative_path(archive, path)
+    if not archive.settings.storage.allow_absolute_attachment_paths:
+        raise ValueError(
+            "Absolute attachment paths are disabled. Set ALLOW_ABSOLUTE_ATTACHMENT_PATHS=true to enable."
+        )
+    return cast(Path, await _to_thread(_expanduser_resolve_path, candidate))
 
 
 async def _convert_markdown_images(
@@ -3948,60 +4014,50 @@ async def _convert_markdown_images(
         path_start, path_end = match.span("path")
         result_parts.append(body_md[last_idx:path_start])
         raw_path = match.group("path")
-        normalized_path = raw_path.strip()
-        if raw_path.startswith("data:"):
-            # Preserve inline data URI and record minimal metadata so callers can assert inline behavior
-            try:
-                header = normalized_path.split(",", 1)[0]
-                media_type = "image/webp"
-                if ";" in header:
-                    mt = header[5:].split(";", 1)[0]
-                    if mt:
-                        media_type = mt
-                meta.append({
-                    "type": "inline",
-                    "media_type": media_type,
-                })
-            except Exception:
-                meta.append({"type": "inline"})
-            result_parts.append(raw_path)
-            last_idx = path_end
-            continue
-        file_path = Path(normalized_path)
-        if file_path.is_absolute():
-            if not archive.settings.storage.allow_absolute_attachment_paths:
-                result_parts.append(raw_path)
-                last_idx = path_end
-                continue
-            file_path = await _to_thread(_expanduser_resolve_path, file_path)
-        else:
-            try:
-                file_path = _resolve_archive_relative_path(archive, normalized_path)
-            except ValueError:
-                result_parts.append(raw_path)
-                last_idx = path_end
-                continue
-        if not file_path.is_file():
-            result_parts.append(raw_path)
-            last_idx = path_end
-            continue
-        attachment_meta, rel_path = await _store_image(archive, file_path, embed_policy=embed_policy)
-        replacement_value: str
-        if attachment_meta["type"] == "inline":
-            replacement_value = f"data:image/webp;base64,{attachment_meta['data_base64']}"
-        else:
-            replacement_value = str(attachment_meta["path"])
-        leading_ws_len = len(raw_path) - len(raw_path.lstrip())
-        trailing_ws_len = len(raw_path) - len(raw_path.rstrip())
-        leading_ws = raw_path[:leading_ws_len] if leading_ws_len else ""
-        trailing_ws = raw_path[len(raw_path) - trailing_ws_len :] if trailing_ws_len else ""
-        result_parts.append(f"{leading_ws}{replacement_value}{trailing_ws}")
-        meta.append(attachment_meta)
-        if rel_path:
-            commit_paths.append(rel_path)
+        result_parts.append(
+            await _convert_markdown_image(archive, raw_path, meta, commit_paths, embed_policy)
+        )
         last_idx = path_end
     result_parts.append(body_md[last_idx:])
     return "".join(result_parts)
+
+
+async def _convert_markdown_image(
+    archive: ProjectArchive,
+    raw_path: str,
+    meta: list[dict[str, object]],
+    commit_paths: list[str],
+    embed_policy: str,
+) -> str:
+    normalized_path = raw_path.strip()
+    if raw_path.startswith("data:"):
+        meta.append(_inline_image_metadata(normalized_path))
+        return raw_path
+    file_path = Path(normalized_path)
+    if file_path.is_absolute():
+        if not archive.settings.storage.allow_absolute_attachment_paths:
+            return raw_path
+        file_path = await _to_thread(_expanduser_resolve_path, file_path)
+    else:
+        try:
+            file_path = _resolve_archive_relative_path(archive, normalized_path)
+        except ValueError:
+            return raw_path
+    if not file_path.is_file():
+        return raw_path
+    attachment_meta, rel_path = await _store_image(archive, file_path, embed_policy=embed_policy)
+    if attachment_meta["type"] == "inline":
+        replacement_value = f"data:image/webp;base64,{attachment_meta['data_base64']}"
+    else:
+        replacement_value = str(attachment_meta["path"])
+    leading_ws_len = len(raw_path) - len(raw_path.lstrip())
+    trailing_ws_len = len(raw_path) - len(raw_path.rstrip())
+    leading_ws = raw_path[:leading_ws_len] if leading_ws_len else ""
+    trailing_ws = raw_path[len(raw_path) - trailing_ws_len :] if trailing_ws_len else ""
+    meta.append(attachment_meta)
+    if rel_path:
+        commit_paths.append(rel_path)
+    return f"{leading_ws}{replacement_value}{trailing_ws}"
 
 
 async def _store_image(archive: ProjectArchive, path: Path, *, embed_policy: str = "auto") -> tuple[dict[str, object], str | None]:
@@ -4086,7 +4142,7 @@ async def _store_image(archive: ProjectArchive, path: Path, *, embed_policy: str
             encoded = base64.b64encode(new_bytes).decode("ascii")
             return {
                 "type": "inline",
-                "media_type": "image/webp",
+                "media_type": _WEBP_MEDIA_TYPE,
                 "bytes": len(new_bytes),
                 "width": width,
                 "height": height,
@@ -4095,7 +4151,7 @@ async def _store_image(archive: ProjectArchive, path: Path, *, embed_policy: str
             }, rel_path
         meta: dict[str, object] = {
             "type": "file",
-            "media_type": "image/webp",
+            "media_type": _WEBP_MEDIA_TYPE,
             "bytes": len(new_bytes),
             "path": rel_path,
             "width": width,
@@ -4155,8 +4211,8 @@ def _commit_lock_path(repo_root: Path, rel_paths: Sequence[str]) -> Path:
         # Unit-level/custom callers may use the primitive before a repository
         # exists. Keep that standalone lock local; real archives always have a
         # Git common directory and therefore share the repository-wide lock.
-        return repo_root / ".commit.lock"
-    return git_common_dir / "agent-mail-locks" / ".commit.lock"
+        return repo_root / _COMMIT_LOCK_NAME
+    return git_common_dir / "agent-mail-locks" / _COMMIT_LOCK_NAME
 
 
 def _is_git_index_lock_error(exc: BaseException) -> bool:
@@ -4176,12 +4232,12 @@ def _is_git_index_lock_error(exc: BaseException) -> bool:
             for value in (exc, exc.stderr, exc.stdout)
             if value
         ).lower()
-        if "index.lock" in details or "unable to create lock" in details:
+        if _GIT_INDEX_LOCK_NAME in details or "unable to create lock" in details:
             return True
     # OSError wrapping FileExistsError from gitdb.util.LockedFD
     if isinstance(exc, OSError):
         err_str = str(exc).lower()
-        if "index.lock" in err_str or "lock at" in err_str:
+        if _GIT_INDEX_LOCK_NAME in err_str or "lock at" in err_str:
             return True
         # Check __cause__ chain
         cause = exc.__cause__
@@ -4196,7 +4252,7 @@ def _try_clean_stale_git_lock(repo_root: Path, max_age_seconds: float = 300.0) -
     Returns True if a stale lock was removed, False otherwise.
     Only removes locks older than max_age_seconds to avoid removing active locks.
     """
-    lock_path = repo_root / ".git" / "index.lock"
+    lock_path = repo_root / ".git" / _GIT_INDEX_LOCK_NAME
     try:
         if not lock_path.exists():
             return False
@@ -4288,32 +4344,28 @@ async def commit_archive_path_deletions(
                 GIT_COMMITTER_NAME=archive.settings.storage.git_author_name,
                 GIT_COMMITTER_EMAIL=archive.settings.storage.git_author_email,
             ):
-                max_attempts = 5
-                for attempt in range(max_attempts):
-                    try:
-                        repo.git.commit(
-                            "--only",
-                            "--no-gpg-sign",
-                            "--no-verify",
-                            "-m",
-                            message,
-                            "--",
-                            *tracked_pathspecs,
-                        )
-                        break
-                    except GitCommandError as exc:
-                        if (
-                            not _is_git_index_lock_error(exc)
-                            or attempt == max_attempts - 1
-                        ):
-                            raise
-                        time.sleep(0.05 * (2**attempt))
+                _commit_deleted_pathspecs_sync(repo, message, tracked_pathspecs)
             return True
         finally:
             repo.close()
 
     async with AsyncFileLock(commit_lock_path):
         return await _to_thread_cancellation_safe(_commit_only)
+
+
+def _commit_deleted_pathspecs_sync(repo: Repo, message: str, pathspecs: list[str]) -> None:
+    max_attempts = 5
+    for attempt in range(max_attempts):
+        try:
+            repo.git.commit(
+                "--only", "--no-gpg-sign", "--no-verify", "-m", message,
+                "--", *pathspecs,
+            )
+            return
+        except GitCommandError as exc:
+            if not _is_git_index_lock_error(exc) or attempt == max_attempts - 1:
+                raise
+            time.sleep(0.05 * 2**attempt)
 
 
 async def commit_archive_subtree_deletion(
@@ -4325,92 +4377,102 @@ async def commit_archive_subtree_deletion(
     return await commit_archive_path_deletions(archive, [tree_root], message)
 
 
+def _archive_commit_message(message: str) -> str:
+    """Add the inferred author trailer unless an explicit trailer exists."""
+    trailers: list[str] = []
+    try:
+        have_agent_line = "\nagent:" in message.lower()
+        if message.startswith(_MAIL_COMMIT_PREFIX) and not have_agent_line:
+            head = message[len(_MAIL_COMMIT_PREFIX) :]
+            agent_part = head.split("->", 1)[0].strip()
+            if agent_part:
+                trailers.append(f"Agent: {agent_part}")
+        elif message.startswith(_RESERVATION_COMMIT_PREFIX) and not have_agent_line:
+            head = message[len(_RESERVATION_COMMIT_PREFIX) :]
+            agent_part = head.split(" ", 1)[0].strip()
+            if agent_part:
+                trailers.append(f"Agent: {agent_part}")
+    except Exception:
+        pass
+    if trailers:
+        return message + "\n\n" + "\n".join(trailers) + "\n"
+    return message
+
+
+def _perform_archive_commit(
+    repo_root: Path, settings: Settings, message: str, rel_paths: Sequence[str], target_repo: Repo
+) -> None:
+    _normalize_archive_text_line_endings(repo_root, rel_paths)
+    literal_pathspecs = [f":(literal){path}" for path in rel_paths]
+    target_repo.git(c=_GIT_LONG_PATHS_CONFIG).add("--all", "--", *literal_pathspecs)
+    staged_paths = target_repo.git.diff("--cached", "--name-only", "--", *literal_pathspecs)
+    if not staged_paths.strip():
+        return
+    final_message = _archive_commit_message(message)
+    with target_repo.git.custom_environment(
+        GIT_AUTHOR_NAME=settings.storage.git_author_name,
+        GIT_AUTHOR_EMAIL=settings.storage.git_author_email,
+        GIT_COMMITTER_NAME=settings.storage.git_author_name,
+        GIT_COMMITTER_EMAIL=settings.storage.git_author_email,
+    ):
+        target_repo.git(c=_GIT_LONG_PATHS_CONFIG).commit(
+            "--only", "--no-gpg-sign", "--no-verify", "-m", final_message,
+            "--", *literal_pathspecs,
+        )
+
+
+def _index_lock_error(repo_root: Path, attempts: int) -> GitIndexLockError:
+    lock_path = repo_root / ".git" / _GIT_INDEX_LOCK_NAME
+    return GitIndexLockError(
+        f"Git index.lock contention after {attempts} retries. "
+        f"Another git operation may be in progress. "
+        f"If this persists, manually remove: {lock_path}",
+        lock_path=lock_path,
+        attempts=attempts,
+    )
+
+
+async def _wait_for_index_lock_retry(
+    repo_root: Path, attempts: int, max_retries: int, did_last_resort_clean: bool, error: OSError
+) -> bool:
+    if attempts > max_retries:
+        if not did_last_resort_clean and _try_clean_stale_git_lock(repo_root, max_age_seconds=60.0):
+            return True
+        raise _index_lock_error(repo_root, attempts) from error
+    retry_exponent = attempts - 1
+    await asyncio.sleep(0.1 * 2 ** retry_exponent)
+    with contextlib.suppress(Exception):
+        _try_clean_stale_git_lock(repo_root, max_age_seconds=300.0)
+    return did_last_resort_clean
+
+
+async def _recover_commit_repo(repo_root: Path, attempt_repo: Repo) -> Repo:
+    """Free cached and stray handles before retrying an EMFILE failure."""
+    with contextlib.suppress(Exception):
+        clear_repo_cache()
+    with contextlib.suppress(Exception):
+        import gc
+
+        gc.collect()
+    await asyncio.sleep(0.05)
+    with contextlib.suppress(Exception):
+        attempt_repo.close()
+    return Repo(str(repo_root))
+
+
 async def _commit_direct(
     repo_root: Path,
     settings: Settings,
     message: str,
     rel_paths: Sequence[str],
 ) -> None:
-    """Perform a git commit directly without queue batching.
-
-    This is the core commit implementation used by both the commit queue
-    and direct commits. It handles:
-    - Git index.lock contention with exponential backoff
-    - Stale lock cleanup
-    - EMFILE recovery
-    - Trailer injection for agent/thread metadata
-
-    Args:
-        repo_root: Path to the git repository root
-        settings: Application settings
-        message: Commit message
-        rel_paths: Relative paths to add and commit
-    """
+    """Commit exact paths under the global lock, with contention/EMFILE recovery."""
     import errno
 
     if not rel_paths:
         return
-
     repo = Repo(str(repo_root))
     attempt_repo = repo  # May diverge from `repo` during EMFILE recovery
-
-    def _perform_commit(target_repo: Repo) -> None:
-        _normalize_archive_text_line_endings(repo_root, rel_paths)
-        literal_pathspecs = [f":(literal){path}" for path in rel_paths]
-        target_repo.git(c=_GIT_LONG_PATHS_CONFIG).add(
-            "--all",
-            "--",
-            *literal_pathspecs,
-        )
-        staged_paths = target_repo.git.diff(
-            "--cached",
-            "--name-only",
-            "--",
-            *literal_pathspecs,
-        )
-        if not staged_paths.strip():
-            return
-
-        # Append commit trailers with Agent and optional Thread if present in message text
-        trailers: list[str] = []
-        # Extract simple Agent/Thread heuristics from the message subject line
-        # Expected message formats include:
-        #   mail: <Agent> -> ... | <Subject>
-        #   file_reservation: <Agent> ...
-        try:
-            # Avoid duplicating trailers if already embedded
-            lower_msg = message.lower()
-            have_agent_line = "\nagent:" in lower_msg
-            if message.startswith("mail: ") and not have_agent_line:
-                head = message[len("mail: ") :]
-                agent_part = head.split("->", 1)[0].strip()
-                if agent_part:
-                    trailers.append(f"Agent: {agent_part}")
-            elif message.startswith("file_reservation: ") and not have_agent_line:
-                head = message[len("file_reservation: ") :]
-                agent_part = head.split(" ", 1)[0].strip()
-                if agent_part:
-                    trailers.append(f"Agent: {agent_part}")
-        except Exception:
-            pass
-        final_message = message
-        if trailers:
-            final_message = message + "\n\n" + "\n".join(trailers) + "\n"
-        with target_repo.git.custom_environment(
-            GIT_AUTHOR_NAME=settings.storage.git_author_name,
-            GIT_AUTHOR_EMAIL=settings.storage.git_author_email,
-            GIT_COMMITTER_NAME=settings.storage.git_author_name,
-            GIT_COMMITTER_EMAIL=settings.storage.git_author_email,
-        ):
-            target_repo.git(c=_GIT_LONG_PATHS_CONFIG).commit(
-                "--only",
-                "--no-gpg-sign",
-                "--no-verify",
-                "-m",
-                final_message,
-                "--",
-                *literal_pathspecs,
-            )
 
     commit_lock_path = _commit_lock_path(repo_root, rel_paths)
     await _to_thread(commit_lock_path.parent.mkdir, parents=True, exist_ok=True)
@@ -4427,23 +4489,14 @@ async def _commit_direct(
             # +2 to allow: normal retries + 1 potential EMFILE recovery + 1 last resort after stale lock clean
             for attempt in range(max(2, max_index_lock_retries + 2)):
                 try:
-                    await _to_thread_cancellation_safe(_perform_commit, attempt_repo)
+                    await _to_thread_cancellation_safe(
+                        _perform_archive_commit, repo_root, settings, message, rel_paths, attempt_repo
+                    )
                     break
                 except OSError as exc:
                     # Handle EMFILE (too many open files)
                     if exc.errno == errno.EMFILE and attempt < 1:
-                        # Low ulimit environments (e.g., macOS CI) can hit EMFILE when spawning git subprocesses.
-                        # Best-effort recovery: free cached repos, GC stray Repo handles, and retry with a fresh Repo.
-                        with contextlib.suppress(Exception):
-                            clear_repo_cache()
-                        with contextlib.suppress(Exception):
-                            import gc
-
-                            gc.collect()
-                        await asyncio.sleep(0.05)
-                        with contextlib.suppress(Exception):
-                            attempt_repo.close()
-                        attempt_repo = Repo(str(repo_root))
+                        attempt_repo = await _recover_commit_repo(repo_root, attempt_repo)
                         continue
 
                     # Handle git index.lock contention (concurrent git operations)
@@ -4451,32 +4504,9 @@ async def _commit_direct(
                         index_lock_attempts += 1
                         last_index_lock_exc = exc
 
-                        if index_lock_attempts > max_index_lock_retries:
-                            # Already exhausted normal retries
-                            if not did_last_resort_clean:
-                                # Try cleaning stale lock as last resort (lower threshold: 60s instead of 5min)
-                                cleaned = _try_clean_stale_git_lock(repo_root, max_age_seconds=60.0)
-                                if cleaned:
-                                    did_last_resort_clean = True
-                                    continue  # Try one more time after cleaning
-                            # Give up with a helpful error
-                            lock_path = repo_root / ".git" / "index.lock"
-                            raise GitIndexLockError(
-                                f"Git index.lock contention after {index_lock_attempts} retries. "
-                                f"Another git operation may be in progress. "
-                                f"If this persists, manually remove: {lock_path}",
-                                lock_path=lock_path,
-                                attempts=index_lock_attempts,
-                            ) from exc
-
-                        # Exponential backoff: 0.1s, 0.2s, 0.4s, 0.8s, 1.6s
-                        # (index_lock_attempts is 1-indexed here, so 2^0=1 -> 0.1s first)
-                        delay = 0.1 * (2 ** (index_lock_attempts - 1))
-                        await asyncio.sleep(delay)
-
-                        # Try cleaning stale lock (only if older than 5 minutes)
-                        with contextlib.suppress(Exception):
-                            _try_clean_stale_git_lock(repo_root, max_age_seconds=300.0)
+                        did_last_resort_clean = await _wait_for_index_lock_retry(
+                            repo_root, index_lock_attempts, max_index_lock_retries, did_last_resort_clean, exc
+                        )
                         continue
 
                     # Other OSError - re-raise
@@ -4484,14 +4514,7 @@ async def _commit_direct(
             else:
                 # Loop exhausted without break - should only happen for unexpected error patterns
                 if last_index_lock_exc is not None:
-                    lock_path = repo_root / ".git" / "index.lock"
-                    raise GitIndexLockError(
-                        f"Git index.lock contention after {index_lock_attempts} retries. "
-                        f"Another git operation may be in progress. "
-                        f"If this persists, manually remove: {lock_path}",
-                        lock_path=lock_path,
-                        attempts=index_lock_attempts,
-                    ) from last_index_lock_exc
+                    raise _index_lock_error(repo_root, index_lock_attempts) from last_index_lock_exc
                 raise RuntimeError("git commit failed after recovery attempts")
 
             if attempt_repo is not repo:
@@ -4595,6 +4618,29 @@ async def heal_archive_locks(settings: Settings, project_slug: str | None = None
         except FileNotFoundError:
             continue
 
+    await _heal_orphan_lock_metadata(scan_roots, summary)
+    return summary
+
+
+async def _heal_orphan_lock_metadata(scan_roots: tuple[Path, ...], summary: dict[str, Any]) -> None:
+    metadata_paths = await _lock_metadata_candidates(scan_roots)
+    for metadata_path in sorted(metadata_paths, key=str):
+        name = metadata_path.name
+        if not name.endswith(".owner.json"):
+            continue
+        lock_candidate = metadata_path.parent / name[: -len(".owner.json")]
+        if await _to_thread(_path_exists, lock_candidate):
+            continue
+        try:
+            await _to_thread(metadata_path.unlink)
+            summary["metadata_removed"].append(str(metadata_path))
+        except FileNotFoundError:
+            continue
+        except PermissionError:
+            continue
+
+
+async def _lock_metadata_candidates(scan_roots: tuple[Path, ...]) -> set[Path]:
     metadata_paths: set[Path] = set()
     for scan_root in scan_roots:
         if scan_root.is_file():
@@ -4611,22 +4657,7 @@ async def heal_archive_locks(settings: Settings, project_slug: str | None = None
                     "*.lock.owner.json",
                 )
             )
-    for metadata_path in sorted(metadata_paths, key=str):
-        name = metadata_path.name
-        if not name.endswith(".owner.json"):
-            continue
-        lock_candidate = metadata_path.parent / name[: -len(".owner.json")]
-        if await _to_thread(_path_exists, lock_candidate):
-            continue
-        try:
-            await _to_thread(metadata_path.unlink)
-            summary["metadata_removed"].append(str(metadata_path))
-        except FileNotFoundError:
-            continue
-        except PermissionError:
-            continue
-
-    return summary
+    return metadata_paths
 
 
 # ==================================================================================
@@ -4676,21 +4707,7 @@ async def get_recent_commits(
 
             # Calculate relative date
             commit_time = datetime.fromtimestamp(commit.authored_date, tz=timezone.utc)
-            now = datetime.now(timezone.utc)
-            delta = now - commit_time
-
-            if delta.days > 30:
-                relative_date = commit_time.strftime("%b %d, %Y")
-            elif delta.days > 0:
-                relative_date = f"{delta.days} day{'s' if delta.days != 1 else ''} ago"
-            elif delta.seconds > 3600:
-                hours = delta.seconds // 3600
-                relative_date = f"{hours} hour{'s' if hours != 1 else ''} ago"
-            elif delta.seconds > 60:
-                minutes = delta.seconds // 60
-                relative_date = f"{minutes} minute{'s' if minutes != 1 else ''} ago"
-            else:
-                relative_date = "just now"
+            relative_date = _relative_commit_date(commit_time)
 
             message_str = _ensure_str(commit.message)
             commits.append({
@@ -4713,6 +4730,133 @@ async def get_recent_commits(
     return result
 
 
+def _relative_commit_date(commit_time: datetime) -> str:
+    delta = datetime.now(timezone.utc) - commit_time
+    if delta.days > 30:
+        return commit_time.strftime("%b %d, %Y")
+    if delta.days > 0:
+        return f"{delta.days} day{'s' if delta.days != 1 else ''} ago"
+    if delta.seconds > 3600:
+        hours = delta.seconds // 3600
+        return f"{hours} hour{'s' if hours != 1 else ''} ago"
+    if delta.seconds > 60:
+        minutes = delta.seconds // 60
+        return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+    return "just now"
+
+
+def _changed_file_metadata(diff: Diff) -> dict[str, str]:
+    a_path = diff.a_path or _NULL_DIFF_PATH
+    b_path = diff.b_path or _NULL_DIFF_PATH
+    if diff.new_file:
+        change_type = "added"
+    elif diff.deleted_file:
+        change_type = "deleted"
+    elif diff.renamed_file:
+        change_type = "renamed"
+    else:
+        change_type = "modified"
+    return {
+        "path": b_path if b_path != _NULL_DIFF_PATH else a_path,
+        "change_type": change_type,
+        "a_path": a_path,
+        "b_path": b_path,
+    }
+
+
+def _read_bounded_git_diff(repo: Repo, command: list[str], max_diff_size: int) -> tuple[bytes, bool]:
+    process: subprocess.Popen[bytes] = subprocess.Popen(
+        command,
+        cwd=str(repo.working_tree_dir or repo.git_dir),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=False,
+    )
+    if process.stdout is None:  # pragma: no cover - guaranteed by PIPE
+        process.kill()
+        raise RuntimeError("Git diff stdout pipe was not created")
+    raw_diff_buffer = bytearray()
+    while len(raw_diff_buffer) <= max_diff_size:
+        chunk = process.stdout.read(min(64 * 1024, max_diff_size + 1 - len(raw_diff_buffer)))
+        if not chunk:
+            break
+        raw_diff_buffer.extend(chunk)
+    raw_diff = bytes(raw_diff_buffer)
+    diff_truncated = len(raw_diff) > max_diff_size
+    if diff_truncated:
+        process.kill()
+    remaining_stdout, stderr = process.communicate()
+    if not diff_truncated:
+        raw_diff += remaining_stdout
+    if not diff_truncated and process.returncode:
+        raise GitCommandError(command, process.returncode, stderr=stderr.decode("utf-8", errors="replace"))
+    return raw_diff, diff_truncated
+
+
+def _complete_diff_sections(raw_diff: bytes, max_diff_size: int, truncated: bool) -> list[bytes]:
+    bounded_diff = raw_diff
+    if truncated:
+        bounded_diff = raw_diff[:max_diff_size]
+        section_starts = [match.start() for match in re.finditer(rb"(?m)^diff --git ", bounded_diff)]
+        # Omit the necessarily incomplete final file section from Diff2Html.
+        bounded_diff = bounded_diff[:section_starts[-1]] if len(section_starts) >= 2 else b""
+    starts = [match.start() for match in re.finditer(rb"(?m)^diff --git ", bounded_diff)]
+    if not starts:
+        return [bounded_diff] if bounded_diff else []
+    return [
+        bounded_diff[0 if index == 0 else start : end]
+        for index, (start, end) in enumerate(zip(starts, [*starts[1:], len(bounded_diff)], strict=True))
+    ]
+
+
+def _decode_bounded_git_diff(raw_diff: bytes, max_diff_size: int, truncated: bool) -> tuple[str, bool]:
+    # Invalid source bytes expand under UTF-8 replacement: bound the decoded
+    # response again, retaining only complete file sections.
+    decoded_sections: list[str] = []
+    decoded_size = 0
+    for section in _complete_diff_sections(raw_diff, max_diff_size, truncated):
+        decoded_section = section.decode("utf-8", errors="replace")
+        section_size = len(decoded_section.encode("utf-8"))
+        if decoded_size + section_size > max_diff_size:
+            truncated = True
+            break
+        decoded_sections.append(decoded_section)
+        decoded_size += section_size
+    return "".join(decoded_sections), truncated
+
+
+def _split_commit_body_trailers(rest_lines: list[str]) -> tuple[list[str], list[str]]:
+    """Recognize a trailing block only when a blank line separates the body."""
+    end_idx = len(rest_lines) - 1
+    while end_idx >= 0 and not rest_lines[end_idx].strip():
+        end_idx -= 1
+    trailer_start_idx = end_idx + 1
+    for index in range(end_idx, -1, -1):
+        line = rest_lines[index]
+        if line.strip() and ": " in line and not line.startswith(" "):
+            trailer_start_idx = index
+        else:
+            break
+    if trailer_start_idx > end_idx:
+        return rest_lines[:trailer_start_idx], []
+    if trailer_start_idx > 0 and rest_lines[trailer_start_idx - 1].strip():
+        return rest_lines[:end_idx + 1], []
+    return rest_lines[:trailer_start_idx], rest_lines[trailer_start_idx:end_idx + 1]
+
+
+def _parse_archive_commit_message(message: str) -> tuple[str, str, dict[str, str]]:
+    lines = message.split("\n")
+    subject = lines[0] if lines else ""
+    rest_lines = lines[1:] if len(lines) > 1 else []
+    body_lines, trailer_lines = _split_commit_body_trailers(rest_lines)
+    trailers = {}
+    for line in trailer_lines:
+        if ": " in line:
+            key, value = line.split(": ", 1)
+            trailers[key.strip()] = value.strip()
+    return subject, "\n".join(body_lines).strip(), trailers
+
+
 async def get_commit_detail(
     repo: Repo, sha: str, max_diff_size: int = 5 * 1024 * 1024
 ) -> dict[str, Any]:
@@ -4730,7 +4874,7 @@ async def get_commit_detail(
     def _get_detail() -> dict[str, Any]:
         # Validate SHA format (basic check)
         if not sha or not (7 <= len(sha) <= 40) or not all(c in "0123456789abcdef" for c in sha.lower()):
-            raise ValueError("Invalid commit SHA format")
+            raise ValueError(_INVALID_COMMIT_SHA)
         if max_diff_size < 0:
             raise ValueError("max_diff_size must be non-negative")
 
@@ -4747,29 +4891,7 @@ async def get_commit_detail(
         # Build file metadata from GitPython's structured diff.  ``Diff.diff``
         # contains only hunk bodies, without the ``diff --git`` / file headers
         # required by unified-diff consumers such as Diff2Html.
-        changed_files = []
-
-        for diff in diffs:
-            # File metadata
-            a_path = diff.a_path or "/dev/null"
-            b_path = diff.b_path or "/dev/null"
-
-            # Change type
-            if diff.new_file:
-                change_type = "added"
-            elif diff.deleted_file:
-                change_type = "deleted"
-            elif diff.renamed_file:
-                change_type = "renamed"
-            else:
-                change_type = "modified"
-
-            changed_files.append({
-                "path": b_path if b_path != "/dev/null" else a_path,
-                "change_type": change_type,
-                "a_path": a_path,
-                "b_path": b_path,
-            })
+        changed_files = [_changed_file_metadata(diff) for diff in diffs]
 
         # Read at most ``max_diff_size + 1`` bytes from Git.  This bounds the
         # Python process even for hostile or accidentally enormous archive
@@ -4797,155 +4919,11 @@ async def get_commit_detail(
                 commit.hexsha,
             ])
 
-        process: subprocess.Popen[bytes] = subprocess.Popen(
-            command,
-            cwd=str(repo.working_tree_dir or repo.git_dir),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=False,
-        )
-        if process.stdout is None:  # pragma: no cover - guaranteed by PIPE
-            process.kill()
-            raise RuntimeError("Git diff stdout pipe was not created")
-        raw_diff_buffer = bytearray()
-        while len(raw_diff_buffer) <= max_diff_size:
-            chunk = process.stdout.read(
-                min(64 * 1024, max_diff_size + 1 - len(raw_diff_buffer))
-            )
-            if not chunk:
-                break
-            raw_diff_buffer.extend(chunk)
-        raw_diff = bytes(raw_diff_buffer)
-        diff_truncated = len(raw_diff) > max_diff_size
-        if diff_truncated:
-            process.kill()
-        remaining_stdout, stderr = process.communicate()
-        if not diff_truncated:
-            raw_diff += remaining_stdout
-        if not diff_truncated and process.returncode:
-            raise GitCommandError(
-                command,
-                process.returncode,
-                stderr=stderr.decode("utf-8", errors="replace"),
-            )
-
-        if diff_truncated:
-            bounded_diff = raw_diff[:max_diff_size]
-            section_starts = [
-                match.start()
-                for match in re.finditer(rb"(?m)^diff --git ", bounded_diff)
-            ]
-            # Only complete file sections are safe to hand to Diff2Html.  The
-            # final captured section is necessarily incomplete because Git had
-            # more output than the byte limit, so omit it.  A separate UI flag
-            # makes the truncation explicit even when no section fits.
-            bounded_diff = (
-                bounded_diff[:section_starts[-1]]
-                if len(section_starts) >= 2
-                else b""
-            )
-        else:
-            bounded_diff = raw_diff
-
-        # Replacement characters expand invalid source bytes to three UTF-8
-        # bytes.  Apply the public byte limit again to the final response
-        # representation, one complete file section at a time, so the bound is
-        # strict without handing Diff2Html a partial header or hunk.
-        complete_section_starts = [
-            match.start()
-            for match in re.finditer(rb"(?m)^diff --git ", bounded_diff)
-        ]
-        if complete_section_starts:
-            complete_sections = [
-                bounded_diff[0 if index == 0 else start : end]
-                for index, (start, end) in enumerate(
-                    zip(
-                        complete_section_starts,
-                        [*complete_section_starts[1:], len(bounded_diff)],
-                        strict=True,
-                    )
-                )
-            ]
-        else:
-            complete_sections = [bounded_diff] if bounded_diff else []
-
-        decoded_sections: list[str] = []
-        decoded_size = 0
-        for section in complete_sections:
-            decoded_section = section.decode("utf-8", errors="replace")
-            section_size = len(decoded_section.encode("utf-8"))
-            if decoded_size + section_size > max_diff_size:
-                diff_truncated = True
-                break
-            decoded_sections.append(decoded_section)
-            decoded_size += section_size
-        diff_text = "".join(decoded_sections)
+        raw_diff, diff_truncated = _read_bounded_git_diff(repo, command, max_diff_size)
+        diff_text, diff_truncated = _decode_bounded_git_diff(raw_diff, max_diff_size, diff_truncated)
 
         # Parse commit body into message and trailers
-        message_str = _ensure_str(commit.message)
-        lines = message_str.split("\n")
-        subject = lines[0] if lines else ""
-
-        # Find where trailers start (Git trailers are at end after blank line)
-        # We scan backwards to find the trailer block
-        body_lines: list[str] = []
-        trailer_lines: list[str] = []
-
-        rest_lines = lines[1:] if len(lines) > 1 else []
-        if not rest_lines:
-            body = ""
-            body_lines = []
-            trailer_lines = []
-        else:
-            # Find trailer block by scanning from end
-            # Git trailers must be consecutive lines at the end
-            # First, skip trailing blank lines to find last content
-            end_idx = len(rest_lines) - 1
-            while end_idx >= 0 and not rest_lines[end_idx].strip():
-                end_idx -= 1
-
-            # Now scan backwards collecting consecutive trailer-looking lines
-            trailer_start_idx = end_idx + 1  # Default: no trailers
-            for i in range(end_idx, -1, -1):
-                line = rest_lines[i]
-                # Trailers have format "Key: Value" with specific pattern
-                if line.strip() and ": " in line and not line.startswith(" "):
-                    # This looks like a trailer, keep going
-                    trailer_start_idx = i
-                else:
-                    # Not a trailer (blank or other content), stop
-                    break
-
-            # Git spec: trailers must be separated from body by blank line
-            # If we found trailers, verify there's a blank line before them
-            if trailer_start_idx <= end_idx:  # We found some trailers
-                if trailer_start_idx > 0:
-                    # Check if line before trailers is blank
-                    if rest_lines[trailer_start_idx - 1].strip():
-                        # No blank line separator - these aren't trailers!
-                        trailer_start_idx = end_idx + 1
-                        trailer_lines = []
-                    else:
-                        # Valid trailers with blank separator
-                        trailer_lines = rest_lines[trailer_start_idx:end_idx + 1]
-                else:
-                    # Trailers start at beginning (no body) - this is valid
-                    trailer_lines = rest_lines[trailer_start_idx:end_idx + 1]
-            else:
-                trailer_lines = []
-
-            # Split body and trailers
-            body_lines = rest_lines[:trailer_start_idx]
-
-        body = "\n".join(body_lines).strip()
-
-        # Parse trailers into dict (only first occurrence of ": " to handle multiple colons)
-        trailers = {}
-        for line in trailer_lines:
-            if ": " in line:
-                parts = line.split(": ", 1)  # Split on first ": " only
-                if len(parts) == 2:
-                    trailers[parts[0].strip()] = parts[1].strip()
+        subject, body, trailers = _parse_archive_commit_message(_ensure_str(commit.message))
 
         commit_time = datetime.fromtimestamp(commit.authored_date, tz=timezone.utc)
 
@@ -4995,33 +4973,75 @@ async def get_message_commit_sha(archive: ProjectArchive, message_id: int) -> st
         pattern = f"__{message_id}.md"
 
         # Use iterdir with depth limit instead of rglob for better performance
-        for year_dir in messages_dir.iterdir():
-            if not year_dir.is_dir():
-                continue
-            for month_dir in year_dir.iterdir():
-                if not month_dir.is_dir():
-                    continue
-                for md_file in month_dir.iterdir():
-                    if md_file.is_file() and md_file.name.endswith(pattern):
-                        try:
-                            # Get relative path from repo root
-                            rel_path = md_file.relative_to(archive.repo_root)
-
-                            # Get FIRST commit that created this file (oldest, not most recent)
-                            # iter_commits returns newest first, so we need to get all and take the last
-                            # Limit to 1000 commits to prevent performance issues
-                            commits_list = list(archive.repo.iter_commits(paths=[str(rel_path)], max_count=1000))
-                            if commits_list:
-                                # The last commit in the list is the oldest (first commit)
-                                return commits_list[-1].hexsha
-                        except (ValueError, StopIteration, FileNotFoundError, OSError):
-                            # File may have been deleted or moved during iteration
-                            continue
+        for md_file in _matching_message_files(messages_dir, pattern):
+            commit_sha = _first_message_file_commit(archive, md_file)
+            if commit_sha is not None:
+                return commit_sha
 
         return None
 
     result: str | None = await _to_thread(_find_commit)
     return result
+
+
+def _message_month_directories(messages_dir: Path) -> Iterable[Path]:
+    for year_dir in messages_dir.iterdir():
+        if not year_dir.is_dir():
+            continue
+        for month_dir in year_dir.iterdir():
+            if month_dir.is_dir():
+                yield month_dir
+
+
+def _matching_message_files(messages_dir: Path, pattern: str) -> Iterable[Path]:
+    for month_dir in _message_month_directories(messages_dir):
+        for md_file in month_dir.iterdir():
+            if md_file.is_file() and md_file.name.endswith(pattern):
+                yield md_file
+
+
+def _first_message_file_commit(archive: ProjectArchive, md_file: Path) -> str | None:
+    try:
+        rel_path = md_file.relative_to(archive.repo_root)
+        # Newest first: retain the oldest within the existing 1000-commit bound.
+        commits = list(archive.repo.iter_commits(paths=[str(rel_path)], max_count=1000))
+        return commits[-1].hexsha if commits else None
+    except (ValueError, StopIteration, OSError):
+        return None
+
+
+def _archive_read_path(path: str) -> str:
+    normalized = path.replace("\\", "/")
+    if (
+        normalized.startswith(("/", ".."))
+        or "/../" in normalized
+        or normalized.endswith("/..")
+        or normalized == ".."
+    ):
+        raise ValueError(_PATH_TRAVERSAL_ERROR)
+    return normalized.lstrip("/")
+
+
+def _archive_read_commit(archive: ProjectArchive, commit_sha: str | None) -> Commit:
+    if not commit_sha:
+        return archive.repo.head.commit
+    if not (7 <= len(commit_sha) <= 40) or not all(c in "0123456789abcdef" for c in commit_sha.lower()):
+        raise ValueError(_INVALID_COMMIT_SHA)
+    return archive.repo.commit(commit_sha)
+
+
+def _archive_tree_entries(tree_obj: Tree, path: str) -> list[dict[str, Any]]:
+    entries = []
+    for item in tree_obj:
+        entries.append({
+            "name": item.name,
+            "path": f"{path}/{item.name}" if path else item.name,
+            "type": "dir" if item.type == "tree" else "file",
+            "size": item.size if hasattr(item, "size") else 0,
+            "mode": item.mode,
+        })
+    entries.sort(key=lambda entry: (entry["type"] != "dir", str(entry["name"]).lower()))
+    return entries
 
 
 async def get_archive_tree(
@@ -5042,30 +5062,10 @@ async def get_archive_tree(
     """
     def _get_tree() -> list[dict[str, Any]]:
         # Sanitize path to prevent directory traversal
-        if path:
-            # Normalize path separators to forward slash
-            normalized = path.replace("\\", "/")
-            # Reject any path traversal patterns
-            if (
-                normalized.startswith("/")
-                or normalized.startswith("..")
-                or "/../" in normalized
-                or normalized.endswith("/..")
-                or normalized == ".."
-            ):
-                raise ValueError("Invalid path: directory traversal not allowed")
-            safe_path = normalized.lstrip("/")
-        else:
-            safe_path = ""
+        safe_path = _archive_read_path(path) if path else ""
 
         # Get commit (HEAD if not specified)
-        if commit_sha:
-            # Validate SHA format
-            if not (7 <= len(commit_sha) <= 40) or not all(c in "0123456789abcdef" for c in commit_sha.lower()):
-                raise ValueError("Invalid commit SHA format")
-            commit = archive.repo.commit(commit_sha)
-        else:
-            commit = archive.repo.head.commit
+        commit = _archive_read_commit(archive, commit_sha)
 
         # Navigate to the requested path within project root
         project_rel = f"projects/{archive.slug}"
@@ -5082,23 +5082,7 @@ async def get_archive_tree(
         if not isinstance(tree_obj, Tree):
             return []
 
-        entries = []
-        for item in tree_obj:
-            entry_type = "dir" if item.type == "tree" else "file"
-            size = item.size if hasattr(item, "size") else 0
-
-            entries.append({
-                "name": item.name,
-                "path": f"{path}/{item.name}" if path else item.name,
-                "type": entry_type,
-                "size": size,
-                "mode": item.mode,
-            })
-
-        # Sort: directories first, then files, both alphabetically
-        entries.sort(key=lambda x: (x["type"] != "dir", str(x["name"]).lower()))
-
-        return entries
+        return _archive_tree_entries(tree_obj, path)
 
     result: list[dict[str, Any]] = await _to_thread(_get_tree)
     return result
@@ -5124,29 +5108,10 @@ async def get_file_content(
     """
     def _get_content() -> str | None:
         # Sanitize path to prevent directory traversal
-        if path:
-            # Normalize path separators to forward slash
-            normalized = path.replace("\\", "/")
-            # Reject any path traversal patterns
-            if (
-                normalized.startswith("/")
-                or normalized.startswith("..")
-                or "/../" in normalized
-                or normalized.endswith("/..")
-                or normalized == ".."
-            ):
-                raise ValueError("Invalid path: directory traversal not allowed")
-            safe_path = normalized.lstrip("/")
-        else:
+        if not path:
             return None
-
-        if commit_sha:
-            # Validate SHA format
-            if not (7 <= len(commit_sha) <= 40) or not all(c in "0123456789abcdef" for c in commit_sha.lower()):
-                raise ValueError("Invalid commit SHA format")
-            commit = archive.repo.commit(commit_sha)
-        else:
-            commit = archive.repo.head.commit
+        safe_path = _archive_read_path(path)
+        commit = _archive_read_commit(archive, commit_sha)
 
         project_rel = f"projects/{archive.slug}/{safe_path}"
 
@@ -5200,43 +5165,7 @@ async def get_agent_communication_graph(
             message_str = _ensure_str(commit.message)
             subject = message_str.split("\n")[0]
 
-            if not subject.startswith("mail: "):
-                continue
-
-            # Extract sender and recipients
-            try:
-                rest = subject[len("mail: "):]
-                sender_part, _ = rest.split(" | ", 1) if " | " in rest else (rest, "")
-
-                if " -> " not in sender_part:
-                    continue
-
-                sender, recipients_str = sender_part.split(" -> ", 1)
-                sender = str(sender).strip()
-                recipients = [r.strip() for r in recipients_str.split(",")]
-
-                # Update sender stats
-                if sender not in agent_stats:
-                    agent_stats[sender] = {"sent": 0, "received": 0}
-                agent_stats[sender]["sent"] = agent_stats[sender].get("sent", 0) + 1
-
-                # Update recipient stats and connections
-                for recipient in recipients:
-                    if not recipient:
-                        continue
-
-                    recipient = str(recipient)
-                    if recipient not in agent_stats:
-                        agent_stats[recipient] = {"sent": 0, "received": 0}
-                    agent_stats[recipient]["received"] = agent_stats[recipient].get("received", 0) + 1
-
-                    # Track connection
-                    conn_key: tuple[str, str] = (sender, recipient)
-                    connections[conn_key] = int(connections.get(conn_key, 0)) + 1
-
-            except Exception:
-                # Skip malformed commit messages
-                continue
+            _record_mail_commit_stats(subject, agent_stats, connections)
 
         # Build nodes list
         nodes = []
@@ -5268,6 +5197,58 @@ async def get_agent_communication_graph(
     return result
 
 
+def _record_mail_commit_stats(
+    subject: str, agent_stats: dict[str, dict[str, int]], connections: dict[tuple[str, str], int]
+) -> None:
+    if not subject.startswith(_MAIL_COMMIT_PREFIX):
+        return
+    try:
+        rest = subject[len(_MAIL_COMMIT_PREFIX):]
+        sender_part, _ = rest.split(" | ", 1) if " | " in rest else (rest, "")
+        if " -> " not in sender_part:
+            return
+        sender, recipients_str = sender_part.split(" -> ", 1)
+        sender = str(sender).strip()
+        recipients = [recipient.strip() for recipient in recipients_str.split(",")]
+        if sender not in agent_stats:
+            agent_stats[sender] = {"sent": 0, "received": 0}
+        agent_stats[sender]["sent"] = agent_stats[sender].get("sent", 0) + 1
+        for recipient in recipients:
+            if not recipient:
+                continue
+            recipient = str(recipient)
+            if recipient not in agent_stats:
+                agent_stats[recipient] = {"sent": 0, "received": 0}
+            agent_stats[recipient]["received"] = agent_stats[recipient].get("received", 0) + 1
+            conn_key = (sender, recipient)
+            connections[conn_key] = int(connections.get(conn_key, 0)) + 1
+    except Exception:
+        # Preserve the existing tolerance of malformed historical commits.
+        pass
+
+
+def _timeline_commit_participants(subject: str) -> tuple[str, str | None, list[str]]:
+    commit_type = "other"
+    sender = None
+    recipients = []
+    if subject.startswith(_MAIL_COMMIT_PREFIX):
+        commit_type = "message"
+        try:
+            rest = subject[len(_MAIL_COMMIT_PREFIX):]
+            sender_part, _ = rest.split(" | ", 1) if " | " in rest else (rest, "")
+            if " -> " in sender_part:
+                sender, recipients_str = sender_part.split(" -> ", 1)
+                sender = sender.strip()
+                recipients = [recipient.strip() for recipient in recipients_str.split(",")]
+        except Exception:
+            pass
+    elif subject.startswith(_RESERVATION_COMMIT_PREFIX):
+        commit_type = "file_reservation"
+    elif subject.startswith("chore: "):
+        commit_type = "chore"
+    return commit_type, sender, recipients
+
+
 async def get_timeline_commits(
     repo: Repo,
     project_slug: str,
@@ -5294,26 +5275,7 @@ async def get_timeline_commits(
             commit_time = datetime.fromtimestamp(commit.authored_date, tz=timezone.utc)
 
             # Classify commit type
-            commit_type = "other"
-            sender = None
-            recipients = []
-
-            if subject.startswith("mail: "):
-                commit_type = "message"
-                # Parse sender and recipients
-                try:
-                    rest = subject[len("mail: "):]
-                    sender_part, _ = rest.split(" | ", 1) if " | " in rest else (rest, "")
-                    if " -> " in sender_part:
-                        sender, recipients_str = sender_part.split(" -> ", 1)
-                        sender = sender.strip()
-                        recipients = [r.strip() for r in recipients_str.split(",")]
-                except Exception:
-                    pass
-            elif subject.startswith("file_reservation: "):
-                commit_type = "file_reservation"
-            elif subject.startswith("chore: "):
-                commit_type = "chore"
+            commit_type, sender, recipients = _timeline_commit_participants(subject)
 
             timeline.append({
                 "sha": commit.hexsha,
@@ -5371,7 +5333,7 @@ async def get_historical_inbox_snapshot(
     def _get_snapshot() -> dict[str, Any]:
         try:
             # Parse timestamp - handle both with and without timezone
-            timestamp_clean = timestamp.replace('Z', '+00:00')
+            timestamp_clean = timestamp.replace('Z', _UTC_OFFSET)
             target_time = datetime.fromisoformat(timestamp_clean)
 
             # If naive datetime (no timezone), assume UTC
@@ -5401,33 +5363,7 @@ async def get_historical_inbox_snapshot(
         inbox_path = f"projects/{archive.slug}/agents/{resolved_agent_name}/inbox"
 
         # Find commit closest to (but not after) target timestamp
-        closest_commit = None
-
-        def commit_contains_inbox(commit: Any) -> bool:
-            """Ignore a rename commit that only deleted the historical path."""
-            try:
-                candidate_tree = commit.tree
-                for part in inbox_path.split("/"):
-                    candidate_tree = candidate_tree / part
-                return True
-            except (KeyError, AttributeError):
-                return False
-
-        try:
-            commit_iter = archive.repo.iter_commits(max_count=10000, paths=[inbox_path])
-        except Exception:
-            commit_iter = archive.repo.iter_commits(max_count=10000)
-        for commit in commit_iter:
-            if commit.authored_date <= target_timestamp and commit_contains_inbox(commit):
-                closest_commit = commit
-                break
-
-        if not closest_commit:
-            # Fall back to full history when the inbox path has never been touched
-            for commit in archive.repo.iter_commits(max_count=10000):
-                if commit.authored_date <= target_timestamp and commit_contains_inbox(commit):
-                    closest_commit = commit
-                    break
+        closest_commit = _closest_inbox_commit(archive.repo, inbox_path, target_timestamp)
 
         if not closest_commit:
             # No commits before this time
@@ -5447,93 +5383,7 @@ async def get_historical_inbox_snapshot(
             for part in inbox_path.split("/"):
                 tree = tree / part
 
-            # Recursively traverse inbox subdirectories (YYYY/MM/) to find message files
-            def traverse_tree(subtree: Any, depth: int = 0) -> None:
-                """Recursively traverse git tree looking for .md files"""
-                if depth > 3:  # Safety limit: inbox/YYYY/MM is 2 levels, add buffer
-                    return
-
-                for item in subtree:
-                    if item.type == "blob" and item.name.endswith(".md"):
-                        # Parse filename: YYYY-MM-DDTHH-MM-SSZ__subject-slug__id.md
-                        parts = item.name.rsplit("__", 2)
-
-                        if len(parts) >= 2:
-                            date_str = parts[0]
-                            # Handle both 2-part and 3-part filenames
-                            if len(parts) == 3:
-                                subject_slug = parts[1]
-                                msg_id = parts[2].replace(".md", "")
-                            else:
-                                # 2-part filename: date__subject.md
-                                subject_slug = parts[1].replace(".md", "")
-                                msg_id = "unknown"
-
-                            # Convert slug back to readable subject
-                            subject = subject_slug.replace("-", " ").replace("_", " ").title()
-
-                            # Read file content to get From field and other metadata
-                            from_agent = "unknown"
-                            importance = "normal"
-
-                            try:
-                                stream = item.data_stream
-                                try:
-                                    blob_content = stream.read().decode('utf-8', errors='ignore')
-                                finally:
-                                    stream.close()
-
-                                # Parse JSON frontmatter (format: ---json\n{...}\n---)
-                                if blob_content.startswith('---json\n') or blob_content.startswith('---json\r\n'):
-                                    # Find the closing --- delimiter
-                                    end_marker = blob_content.find('\n---\n', 8)
-                                    if end_marker == -1:
-                                        end_marker = blob_content.find('\r\n---\r\n', 8)
-
-                                    if end_marker > 0:
-                                        # Extract JSON between markers
-                                        # '---json\n' is 8 chars, '---json\r\n' is 9 chars
-                                        json_start = 8 if blob_content.startswith('---json\n') else 9
-                                        json_str = blob_content[json_start:end_marker]
-
-                                        try:
-                                            metadata = json.loads(json_str)
-                                            # Extract sender from 'from' field
-                                            if 'from' in metadata:
-                                                from_agent = str(metadata['from'])
-                                            # Extract importance
-                                            if 'importance' in metadata:
-                                                importance = str(metadata['importance'])
-                                            # Extract actual subject
-                                            if 'subject' in metadata:
-                                                actual_subject = str(metadata['subject']).strip()
-                                                if actual_subject:
-                                                    subject = actual_subject
-                                        except (json.JSONDecodeError, KeyError, TypeError):
-                                            pass  # Use defaults if JSON parsing fails
-
-                            except Exception:
-                                pass  # Use defaults if parsing fails
-
-                            messages.append({
-                                "id": msg_id,
-                                "subject": subject,
-                                "date": date_str,
-                                "from": from_agent,
-                                "importance": importance,
-                            })
-
-                            if len(messages) >= limit:
-                                return  # Stop when we hit the limit
-
-                    elif item.type == "tree":
-                        # Recursively traverse subdirectory
-                        traverse_tree(item, depth + 1)
-                        if len(messages) >= limit:
-                            return  # Stop when we hit the limit
-
-            # Start recursive traversal
-            traverse_tree(tree)
+            _collect_snapshot_messages(tree, messages, limit)
 
         except (KeyError, AttributeError):
             # Inbox directory didn't exist at that time
@@ -5552,6 +5402,101 @@ async def get_historical_inbox_snapshot(
 
     result: dict[str, Any] = await _to_thread(_get_snapshot)
     return result
+
+
+def _commit_contains_inbox(commit: Commit, inbox_path: str) -> bool:
+    """Ignore rename commits that only deleted the historical inbox path."""
+    try:
+        candidate_tree = cast(Any, commit.tree)
+        for part in inbox_path.split("/"):
+            candidate_tree = candidate_tree / part
+        return True
+    except (KeyError, AttributeError):
+        return False
+
+
+def _closest_inbox_commit(repo: Repo, inbox_path: str, target_timestamp: float) -> Commit | None:
+    try:
+        commit_iter = repo.iter_commits(max_count=10000, paths=[inbox_path])
+    except Exception:
+        commit_iter = repo.iter_commits(max_count=10000)
+    for commit in commit_iter:
+        if commit.authored_date <= target_timestamp and _commit_contains_inbox(commit, inbox_path):
+            return commit
+    # Fall back when the inbox path has never been touched.
+    for commit in repo.iter_commits(max_count=10000):
+        if commit.authored_date <= target_timestamp and _commit_contains_inbox(commit, inbox_path):
+            return commit
+    return None
+
+
+def _collect_snapshot_messages(
+    subtree: Any, messages: list[dict[str, Any]], limit: int, depth: int = 0
+) -> None:
+    if depth > 3:  # inbox/YYYY/MM is two levels; retain the existing safety buffer.
+        return
+    for item in subtree:
+        if item.type == "blob" and item.name.endswith(".md"):
+            message = _snapshot_blob_message(item)
+            if message is None:
+                continue
+            messages.append(message)
+        elif item.type == "tree":
+            _collect_snapshot_messages(item, messages, limit, depth + 1)
+        else:
+            continue
+        if len(messages) >= limit:
+            return
+
+
+def _snapshot_blob_message(item: Any) -> dict[str, Any] | None:
+    parts = item.name.rsplit("__", 2)
+    if len(parts) < 2:
+        return None
+    if len(parts) == 3:
+        subject_slug = parts[1]
+        msg_id = parts[2].replace(".md", "")
+    else:
+        subject_slug = parts[1].replace(".md", "")
+        msg_id = "unknown"
+    message = {
+        "id": msg_id,
+        "subject": subject_slug.replace("-", " ").replace("_", " ").title(),
+        "date": parts[0],
+        "from": "unknown",
+        "importance": "normal",
+    }
+    _enrich_snapshot_message(item, message)
+    return message
+
+
+def _enrich_snapshot_message(item: Any, message: dict[str, Any]) -> None:
+    try:
+        stream = item.data_stream
+        try:
+            content = stream.read().decode("utf-8", errors="ignore")
+        finally:
+            stream.close()
+        if not content.startswith(("---json\n", "---json\r\n")):
+            return
+        end_marker = content.find("\n---\n", 8)
+        if end_marker == -1:
+            end_marker = content.find("\r\n---\r\n", 8)
+        if end_marker <= 0:
+            return
+        json_start = 8 if content.startswith("---json\n") else 9
+        metadata = json.loads(content[json_start:end_marker])
+        if "from" in metadata:
+            message["from"] = str(metadata["from"])
+        if "importance" in metadata:
+            message["importance"] = str(metadata["importance"])
+        if "subject" in metadata:
+            actual_subject = str(metadata["subject"]).strip()
+            if actual_subject:
+                message["subject"] = actual_subject
+    except Exception:
+        # Keep defaults (and any fields parsed before a malformed later field).
+        pass
 
 
 # =============================================================================
@@ -5585,13 +5530,8 @@ def _parse_backup_manifest(data: Any) -> BackupManifest:
     if isinstance(version, bool) or not isinstance(version, int) or version < 1:
         raise ValueError("manifest.json must include an integer version >= 1")
 
-    created_at = data.get("created_at")
-    if not isinstance(created_at, str) or not created_at.strip():
-        raise ValueError("manifest.json must include a non-empty created_at string")
-
-    reason = data.get("reason")
-    if not isinstance(reason, str) or not reason.strip():
-        raise ValueError("manifest.json must include a non-empty reason string")
+    created_at = _backup_manifest_text(data, "created_at", "manifest.json must include a non-empty created_at string")
+    reason = _backup_manifest_text(data, "reason", "manifest.json must include a non-empty reason string")
 
     database_path = data.get("database_path")
     if database_path is not None and not isinstance(database_path, str):
@@ -5602,13 +5542,10 @@ def _parse_backup_manifest(data: Any) -> BackupManifest:
         raise ValueError("manifest.json project_bundles must be a list of strings")
     project_bundles = [str(item) for item in project_bundles_raw]
 
-    storage_root = data.get("storage_root")
-    if not isinstance(storage_root, str) or not storage_root.strip():
-        raise ValueError("manifest.json must include a non-empty storage_root string")
-
-    restore_instructions = data.get("restore_instructions")
-    if not isinstance(restore_instructions, str) or not restore_instructions.strip():
-        raise ValueError("manifest.json must include non-empty restore_instructions")
+    storage_root = _backup_manifest_text(data, "storage_root", "manifest.json must include a non-empty storage_root string")
+    restore_instructions = _backup_manifest_text(
+        data, "restore_instructions", "manifest.json must include non-empty restore_instructions"
+    )
 
     if database_path is None and not project_bundles:
         raise ValueError("manifest.json must include a database backup or at least one archive bundle")
@@ -5622,6 +5559,13 @@ def _parse_backup_manifest(data: Any) -> BackupManifest:
         storage_root=storage_root,
         restore_instructions=restore_instructions,
     )
+
+
+def _backup_manifest_text(data: dict[str, Any], key: str, error_message: str) -> str:
+    value = data.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(error_message)
+    return value
 
 
 def _resolve_backup_artifact_path(backup_path: Path, manifest_ref: str) -> Path:
@@ -5666,8 +5610,6 @@ async def create_diagnostic_backup(
         - database.sqlite3 (copy of full database)
         - manifest.json (what was backed up, when, why, restore instructions)
     """
-    import shutil
-
     from .db import get_database_path
     from .share import create_sqlite_snapshot
 
@@ -5741,7 +5683,7 @@ async def create_diagnostic_backup(
             ),
         )
 
-        manifest_path = backup_path / "manifest.json"
+        manifest_path = backup_path / _BACKUP_MANIFEST_FILENAME
 
         def _write_manifest() -> None:
             with manifest_path.open("w", encoding="utf-8") as f:
@@ -5783,50 +5725,49 @@ async def list_backups(settings: Settings) -> list[dict[str, Any]]:
     def _scan_backups() -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         for entry in sorted(backup_dir.iterdir(), reverse=True):
-            if entry.is_dir():
-                manifest_path = entry / "manifest.json"
-                if manifest_path.exists():
-                    try:
-                        with manifest_path.open(encoding="utf-8") as f:
-                            manifest_data = _parse_backup_manifest(json.load(f))
-                        if manifest_data.database_path is not None:
-                            try:
-                                _resolve_backup_file_artifact(entry, manifest_data.database_path)
-                            except FileNotFoundError as exc:
-                                raise ValueError(
-                                    f"Backup database artifact missing: {manifest_data.database_path}"
-                                ) from exc
-                            except IsADirectoryError as exc:
-                                raise ValueError(
-                                    f"Backup database artifact is not a file: {manifest_data.database_path}"
-                                ) from exc
-                        for bundle_ref in manifest_data.project_bundles:
-                            try:
-                                _resolve_backup_file_artifact(entry, bundle_ref)
-                            except FileNotFoundError as exc:
-                                raise ValueError(f"Backup bundle artifact missing: {bundle_ref}") from exc
-                            except IsADirectoryError as exc:
-                                raise ValueError(
-                                    f"Backup bundle artifact is not a file: {bundle_ref}"
-                                ) from exc
-                        # Calculate total size
-                        total_size = sum(
-                            p.stat().st_size for p in entry.rglob("*") if p.is_file()
-                        )
-                        results.append({
-                            "path": str(entry),
-                            "created_at": manifest_data.created_at,
-                            "reason": manifest_data.reason,
-                            "size_bytes": total_size,
-                            "has_database": manifest_data.database_path is not None,
-                            "bundle_count": len(manifest_data.project_bundles),
-                        })
-                    except (ValueError, json.JSONDecodeError, OSError):
-                        pass
+            if not entry.is_dir():
+                continue
+            manifest_path = entry / _BACKUP_MANIFEST_FILENAME
+            if not manifest_path.exists():
+                continue
+            with contextlib.suppress(ValueError, OSError):
+                results.append(_diagnostic_backup_summary(entry, manifest_path))
         return results
 
     backups = await _to_thread(_scan_backups)
     return backups
+
+
+def _validate_backup_artifacts(backup_path: Path, manifest: BackupManifest) -> None:
+    if manifest.database_path is not None:
+        try:
+            _resolve_backup_file_artifact(backup_path, manifest.database_path)
+        except FileNotFoundError as exc:
+            raise ValueError(f"Backup database artifact missing: {manifest.database_path}") from exc
+        except IsADirectoryError as exc:
+            raise ValueError(f"Backup database artifact is not a file: {manifest.database_path}") from exc
+    for bundle_ref in manifest.project_bundles:
+        try:
+            _resolve_backup_file_artifact(backup_path, bundle_ref)
+        except FileNotFoundError as exc:
+            raise ValueError(f"Backup bundle artifact missing: {bundle_ref}") from exc
+        except IsADirectoryError as exc:
+            raise ValueError(f"Backup bundle artifact is not a file: {bundle_ref}") from exc
+
+
+def _diagnostic_backup_summary(backup_path: Path, manifest_path: Path) -> dict[str, Any]:
+    with manifest_path.open(encoding="utf-8") as stream:
+        manifest = _parse_backup_manifest(json.load(stream))
+    _validate_backup_artifacts(backup_path, manifest)
+    total_size = sum(path.stat().st_size for path in backup_path.rglob("*") if path.is_file())
+    return {
+        "path": str(backup_path),
+        "created_at": manifest.created_at,
+        "reason": manifest.reason,
+        "size_bytes": total_size,
+        "has_database": manifest.database_path is not None,
+        "bundle_count": len(manifest.project_bundles),
+    }
 
 
 async def restore_from_backup(
@@ -5845,11 +5786,9 @@ async def restore_from_backup(
     Returns:
         Dict with restoration results
     """
-    import shutil
-
     from .db import get_database_path
 
-    manifest_path = backup_path / "manifest.json"
+    manifest_path = backup_path / _BACKUP_MANIFEST_FILENAME
     if not await _to_thread(_path_exists, manifest_path):
         raise ValueError(f"No manifest.json found in {backup_path}")
 
@@ -5870,93 +5809,17 @@ async def restore_from_backup(
     }
 
     if dry_run:
-        would_restore_database = False
-        if manifest.database_path is not None:
-            db_path = get_database_path(settings)
-            if db_path is None:
-                results["errors"].append(
-                    "Current configuration does not use a SQLite database file; "
-                    "cannot restore database payload"
-                )
-            else:
-                try:
-                    _resolve_backup_file_artifact(backup_path, manifest.database_path)
-                    would_restore_database = True
-                except FileNotFoundError:
-                    results["errors"].append(f"Database backup not found: {manifest.database_path}")
-                except IsADirectoryError:
-                    results["errors"].append(
-                        f"Database backup artifact is not a file: {manifest.database_path}"
-                    )
-        would_restore_bundles: list[str] = []
-        for bundle_ref in manifest.project_bundles:
-            try:
-                _resolve_backup_file_artifact(backup_path, bundle_ref)
-                would_restore_bundles.append(bundle_ref)
-            except FileNotFoundError:
-                results["errors"].append(f"Bundle not found: {bundle_ref}")
-            except IsADirectoryError:
-                results["errors"].append(f"Bundle artifact is not a file: {bundle_ref}")
-        results["would_restore_database"] = would_restore_database
-        results["would_restore_bundles"] = would_restore_bundles
+        db_path = get_database_path(settings) if manifest.database_path is not None else None
+        _preview_backup_restore(backup_path, manifest, db_path, results)
         return results
 
     # Restore database
     db_backup: Path | None = None
     if manifest.database_path:
-        try:
-            db_backup = _resolve_backup_file_artifact(backup_path, manifest.database_path)
-        except FileNotFoundError:
-            results["errors"].append(f"Database backup not found: {manifest.database_path}")
-        except IsADirectoryError:
-            results["errors"].append(
-                f"Database backup artifact is not a file: {manifest.database_path}"
-            )
+        db_backup = _resolve_database_backup(backup_path, manifest.database_path, results["errors"])
 
     if db_backup is not None:
-        db_path = get_database_path(settings)
-        if db_path is None:
-            results["errors"].append(
-                "Current configuration does not use a SQLite database file; "
-                "cannot restore database payload"
-            )
-        else:
-            try:
-
-                def _restore_db() -> None:
-                    # Backup current DB first (safety)
-                    db_path.parent.mkdir(parents=True, exist_ok=True)
-                    wal_target, shm_target = get_sqlite_sidecar_paths(db_path)
-                    pre_restore_db = get_sqlite_pre_restore_path(db_path)
-                    pre_restore_wal, pre_restore_shm = get_sqlite_sidecar_paths(pre_restore_db)
-                    if db_path.exists():
-                        shutil.copy2(db_path, pre_restore_db)
-                    else:
-                        pre_restore_db.unlink(missing_ok=True)
-                    if wal_target.exists():
-                        shutil.copy2(wal_target, pre_restore_wal)
-                    else:
-                        pre_restore_wal.unlink(missing_ok=True)
-                    if shm_target.exists():
-                        shutil.copy2(shm_target, pre_restore_shm)
-                    else:
-                        pre_restore_shm.unlink(missing_ok=True)
-                    shutil.copy2(db_backup, db_path)
-                    # Also restore WAL and SHM if present in backup
-                    backup_wal, backup_shm = get_sqlite_sidecar_paths(db_backup)
-                    for backup_file, target_file in (
-                        (backup_wal, wal_target),
-                        (backup_shm, shm_target),
-                    ):
-                        if backup_file.exists():
-                            shutil.copy2(backup_file, target_file)
-                        else:
-                            target_file.unlink(missing_ok=True)
-
-                await _to_thread(_restore_db)
-                results["database_restored"] = True
-            except Exception as e:
-                results["errors"].append(f"Database restore failed: {e}")
+        await _restore_database_backup(db_backup, get_database_path(settings), results)
 
     # Restore git bundles
     bundles = manifest.project_bundles
@@ -5984,6 +5847,84 @@ async def restore_from_backup(
             results["errors"].append(f"Bundle restore failed for {bundle_path}: {e}")
 
     return results
+
+
+def _resolve_database_backup(backup_path: Path, database_ref: str, errors: list[str]) -> Path | None:
+    try:
+        return _resolve_backup_file_artifact(backup_path, database_ref)
+    except FileNotFoundError:
+        errors.append(f"Database backup not found: {database_ref}")
+    except IsADirectoryError:
+        errors.append(f"Database backup artifact is not a file: {database_ref}")
+    return None
+
+
+def _preview_backup_restore(
+    backup_path: Path, manifest: BackupManifest, db_path: Path | None, results: dict[str, Any]
+) -> None:
+    would_restore_database = False
+    if manifest.database_path is not None:
+        if db_path is None:
+            results["errors"].append(
+                "Current configuration does not use a SQLite database file; "
+                "cannot restore database payload"
+            )
+        else:
+            would_restore_database = _resolve_database_backup(
+                backup_path, manifest.database_path, results["errors"]
+            ) is not None
+    would_restore_bundles: list[str] = []
+    for bundle_ref in manifest.project_bundles:
+        try:
+            _resolve_backup_file_artifact(backup_path, bundle_ref)
+            would_restore_bundles.append(bundle_ref)
+        except FileNotFoundError:
+            results["errors"].append(f"Bundle not found: {bundle_ref}")
+        except IsADirectoryError:
+            results["errors"].append(f"Bundle artifact is not a file: {bundle_ref}")
+    results["would_restore_database"] = would_restore_database
+    results["would_restore_bundles"] = would_restore_bundles
+
+
+async def _restore_database_backup(db_backup: Path, db_path: Path | None, results: dict[str, Any]) -> None:
+    if db_path is None:
+        results["errors"].append(
+            "Current configuration does not use a SQLite database file; "
+            "cannot restore database payload"
+        )
+        return
+    try:
+        await _to_thread(_restore_database_files, db_backup, db_path)
+        results["database_restored"] = True
+    except Exception as exc:
+        results["errors"].append(f"Database restore failed: {exc}")
+
+
+def _restore_database_files(db_backup: Path, db_path: Path) -> None:
+    # Preserve the current database and its sidecars before replacing anything.
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    wal_target, shm_target = get_sqlite_sidecar_paths(db_path)
+    pre_restore_db = get_sqlite_pre_restore_path(db_path)
+    pre_restore_wal, pre_restore_shm = get_sqlite_sidecar_paths(pre_restore_db)
+    if db_path.exists():
+        shutil.copy2(db_path, pre_restore_db)
+    else:
+        pre_restore_db.unlink(missing_ok=True)
+    if wal_target.exists():
+        shutil.copy2(wal_target, pre_restore_wal)
+    else:
+        pre_restore_wal.unlink(missing_ok=True)
+    if shm_target.exists():
+        shutil.copy2(shm_target, pre_restore_shm)
+    else:
+        pre_restore_shm.unlink(missing_ok=True)
+    shutil.copy2(db_backup, db_path)
+    backup_wal, backup_shm = get_sqlite_sidecar_paths(db_backup)
+    for backup_file, target_file in ((backup_wal, wal_target), (backup_shm, shm_target)):
+        if backup_file.exists():
+            shutil.copy2(backup_file, target_file)
+        else:
+            target_file.unlink(missing_ok=True)
 
 
 # -------------------------------------------------------------------------------------------------

@@ -119,11 +119,11 @@ try {
 
 function escapeHtml(value) {
   return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
 }
 
 /**
@@ -167,7 +167,7 @@ function renderMarkdownSafe(markdown) {
     }
   } else {
     // Fallback: treat as plain text
-    html = escapeHtml(markdown).replace(/\n/g, "<br>");
+    html = escapeHtml(markdown).replaceAll("\n", "<br>");
   }
 
   // Sanitize with DOMPurify + Trusted Types
@@ -186,7 +186,7 @@ function renderMarkdownSafe(markdown) {
 }
 
 function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return value.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
 }
 
 function markdownToPlainText(markdown) {
@@ -197,8 +197,8 @@ function markdownToPlainText(markdown) {
     .replace(/```[\s\S]*?```/g, " ")
     .replace(/`[^`]*`/g, " ")
     .replace(/!\[[^\]]*]\([^)]*\)/g, " ")
-    .replace(/\[([^\]]+)]\([^)]+\)/g, "$1")
-    .replace(/[#>*_~\-]+/g, " ")
+    .replace(/\[([^[\]]+)]\([^)]+\)/g, "$1")
+    .replace(/[#>*_~-]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -212,6 +212,23 @@ function buildPreviewSnippet(sourceText) {
     return plain;
   }
   return `${plain.slice(0, 157)}...`;
+}
+
+function threadCategoryFor(hasAdministrative, hasNonAdministrative) {
+  if (!hasAdministrative) {
+    return 'user';
+  }
+  return hasNonAdministrative ? 'mixed' : 'admin';
+}
+
+function importanceBadgeHtml(importance) {
+  if (importance === 'urgent') {
+    return '<span class="inline-flex items-center gap-1 px-2 py-0.5 bg-danger-100 dark:bg-danger-900/30 text-danger-700 dark:text-danger-300 text-xs font-bold rounded-full"><i data-lucide="alert-circle" class="w-3 h-3"></i>Urgent</span>';
+  }
+  if (importance === 'high') {
+    return '<span class="inline-flex items-center gap-1 px-2 py-0.5 bg-warning-100 dark:bg-warning-900/30 text-warning-700 dark:text-warning-300 text-xs font-semibold rounded-full"><i data-lucide="alert-triangle" class="w-3 h-3"></i>High</span>';
+  }
+  return '';
 }
 
 function highlightText(text, term) {
@@ -364,6 +381,17 @@ async function fetchDatabaseFromNetwork(manifest) {
   return { bytes: merged, source: `${chunkManifest.pattern} (${chunkManifest.chunk_count} chunks)` };
 }
 
+async function invalidateDatabaseCache(cacheKey, metadata) {
+  console.warn("[viewer] Stale OPFS cache detected, invalidating", {
+    cached: metadata?.cacheKey,
+    current: cacheKey
+  });
+  await removeFromOpfs(cacheKey);
+  if (metadata?.cacheKey) {
+    await removeFromOpfs(metadata.cacheKey);
+  }
+}
+
 async function loadDatabaseBytes(manifest) {
   const sha = manifest.database?.sha256;
   const fallbackKey = manifest.database?.path && manifest.database?.size_bytes
@@ -376,23 +404,15 @@ async function loadDatabaseBytes(manifest) {
     if (cached) {
       // Check cache version to ensure it matches current manifest
       const metadata = await readOpfsMetadata(state.cacheKey);
-      if (metadata && metadata.cacheKey === state.cacheKey) {
+      if (metadata?.cacheKey === state.cacheKey) {
         console.info("[viewer] Using OPFS cache", { key: state.cacheKey, cachedAt: metadata.cachedAt });
         state.cacheState = "opfs";
         state.lastDatabaseBytes = cached;
         state.databaseSource = "opfs cache";
         return { bytes: cached, source: "OPFS cache" };
-      } else {
-        // Stale cache detected - invalidate and fetch fresh
-        console.warn("[viewer] Stale OPFS cache detected, invalidating", {
-          cached: metadata?.cacheKey,
-          current: state.cacheKey
-        });
-        await removeFromOpfs(state.cacheKey);
-        if (metadata?.cacheKey) {
-          await removeFromOpfs(metadata.cacheKey);
-        }
       }
+      // Stale cache detected - invalidate and fetch fresh.
+      await invalidateDatabaseCache(state.cacheKey, metadata);
     }
   }
 
@@ -647,6 +667,132 @@ function getThreadMessages(threadKey, limit = 50000) {
   return results;
 }
 
+function tokenizeSearchQuery(raw) {
+  const tokens = [];
+  const pattern = /(\(|\)|"([^"]*)"|AND|OR|NOT|\||[^\s()"]+)/gi;
+  for (const match of raw.matchAll(pattern)) {
+    const full = match[1];
+    if (full === '(' || full === ')') {
+      tokens.push({ kind: full });
+    } else if (/^AND$/i.test(full)) {
+      tokens.push({ kind: 'op', value: 'AND' });
+    } else if (/^(OR|\|)$/i.test(full)) {
+      tokens.push({ kind: 'op', value: 'OR' });
+    } else if (/^NOT$/i.test(full)) {
+      tokens.push({ kind: 'op', value: 'NOT' });
+    } else if (match[2] !== undefined) {
+      tokens.push({ kind: 'term', value: match[2] });
+    } else if (full?.trim()) {
+      tokens.push({ kind: 'term', value: full.trim() });
+    }
+  }
+  return tokens;
+}
+
+function endsSearchOperand(token) {
+  return !!token && (token.kind === 'term' || token.kind === ')');
+}
+
+function startsSearchOperand(token) {
+  return !!token && (
+    token.kind === 'term' || token.kind === '(' ||
+    (token.kind === 'op' && token.value === 'NOT')
+  );
+}
+
+function expandSearchTokens(tokens) {
+  const expanded = [];
+  for (const token of tokens) {
+    if (endsSearchOperand(expanded.at(-1)) && startsSearchOperand(token)) {
+      expanded.push({ kind: 'op', value: 'AND' });
+    }
+    expanded.push(token);
+  }
+  return expanded;
+}
+
+function searchOperatorPrecedes(previous, incoming) {
+  if (previous?.kind !== 'op') {
+    return false;
+  }
+  const precedence = { NOT: 3, AND: 2, OR: 1 };
+  return incoming.value === 'NOT'
+    ? precedence[previous.value] > precedence[incoming.value]
+    : precedence[previous.value] >= precedence[incoming.value];
+}
+
+function searchTokensToRpn(tokens) {
+  const output = [];
+  const operators = [];
+  for (const token of tokens) {
+    switch (token.kind) {
+      case 'term':
+        output.push(token);
+        break;
+      case 'op':
+        while (searchOperatorPrecedes(operators.at(-1), token)) {
+          output.push(operators.pop());
+        }
+        operators.push(token);
+        break;
+      case '(':
+        operators.push(token);
+        break;
+      case ')':
+        while (operators.length > 0 && operators.at(-1).kind !== '(') {
+          output.push(operators.pop());
+        }
+        if (operators.at(-1)?.kind === '(') operators.pop();
+        break;
+    }
+  }
+  while (operators.length > 0) output.push(operators.pop());
+  return output;
+}
+
+function applySearchOperator(token, stack) {
+  if (token.value === 'NOT') {
+    if (stack.length < 1) return false;
+    stack.push({ type: 'not', child: stack.pop() });
+    return true;
+  }
+  if (stack.length < 2) return false;
+  const right = stack.pop();
+  const left = stack.pop();
+  stack.push({ type: token.value.toLowerCase(), left, right });
+  return true;
+}
+
+// Reject malformed expressions instead of dereferencing a missing operand.
+function buildSearchAst(rpn) {
+  const stack = [];
+  for (const token of rpn) {
+    if (token.kind === 'term') {
+      stack.push({ type: 'term', value: token.value });
+    } else if (token.kind === 'op' && !applySearchOperator(token, stack)) {
+      return null;
+    }
+  }
+  return stack.length === 1 ? stack[0] : null;
+}
+
+function buildFtsExpression(node) {
+  if (!node) return '';
+  switch (node.type) {
+    case 'term':
+      return /\s/.test(node.value)
+        ? `"${String(node.value).replaceAll('"', '""')}"`
+        : node.value;
+    case 'not':
+      return `(NOT ${buildFtsExpression(node.child)})`;
+    case 'and':
+      return `(${buildFtsExpression(node.left)} AND ${buildFtsExpression(node.right)})`;
+    case 'or':
+      return `(${buildFtsExpression(node.left)} OR ${buildFtsExpression(node.right)})`;
+  }
+  return '';
+}
+
 // Alpine.js Controllers
 // These functions must be defined before Alpine.js loads (we use defer on Alpine script)
 
@@ -662,7 +808,7 @@ function darkModeController() {
       // Initialize from localStorage or system preference
       try {
         const stored = localStorage.getItem('darkMode');
-        const prefers = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+        const prefers = window.matchMedia?.('(prefers-color-scheme: dark)').matches;
         this.darkMode = stored === 'true' || (stored === null && prefers);
       } catch (error) {
         console.warn('Failed to read darkMode from localStorage', error);
@@ -772,9 +918,11 @@ function viewerController() {
       // Initialize dark mode state
       try {
         const stored = localStorage.getItem('darkMode');
-        const prefers = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+        const prefers = window.matchMedia?.('(prefers-color-scheme: dark)').matches;
         this.darkMode = stored === 'true' || (stored === null && prefers);
-      } catch (_err) {
+      } catch (error) {
+        // Storage can be unavailable; preserve the already applied document theme.
+        console.debug('[viewer] Theme preference unavailable', error);
         this.darkMode = document.documentElement.classList.contains('dark');
       }
       if (this.darkMode) {
@@ -881,7 +1029,7 @@ function viewerController() {
       }
     },
     setupResponsiveHandlers() {
-      if (typeof window === 'undefined' || typeof window.matchMedia === 'undefined') {
+      if (typeof window === 'undefined' || window.matchMedia === undefined) {
         return;
       }
       const query = window.matchMedia('(max-width: 768px)');
@@ -901,11 +1049,7 @@ function viewerController() {
       };
       this._mobileMedia = query;
       this._mobileMediaListener = updateMobile;
-      if (typeof query.addEventListener === 'function') {
-        query.addEventListener('change', updateMobile);
-      } else if (typeof query.addListener === 'function') {
-        query.addListener(updateMobile);
-      }
+      query.addEventListener('change', updateMobile);
       updateMobile();
       this.lastScrollY = window.scrollY || 0;
       this._onMobileScroll = () => {
@@ -974,9 +1118,7 @@ function viewerController() {
             : `msg:${msg.id}`;
         const threadCount = this.threadMessageCounts?.get(threadKey) || 1;
         const hasThread = Boolean(msg.thread_id && msg.thread_id !== '') || threadCount > 1;
-        const threadReference = hasThread
-          ? (msg.thread_id && msg.thread_id !== '' ? msg.thread_id : threadKey)
-          : null;
+        const threadReference = hasThread ? threadKey : null;
 
         return {
           ...msg,
@@ -1018,140 +1160,12 @@ function viewerController() {
       const raw = String(query || '').trim();
       if (!raw) return new Set();
 
-      // 1) Tokenize: terms, quoted phrases, operators, parentheses
-      const tokens = [];
-      const re = /\s*(\(|\)|"([^"]*)"|AND|OR|NOT|\||[^\s()"]+)\s*/gi;
-      let m;
-      while ((m = re.exec(raw)) !== null) {
-        const full = m[1];
-        if (full === '(' || full === ')') {
-          tokens.push({ kind: full });
-        } else if (/^AND$/i.test(full)) {
-          tokens.push({ kind: 'op', value: 'AND' });
-        } else if (/^(OR|\|)$/i.test(full)) {
-          tokens.push({ kind: 'op', value: 'OR' });
-        } else if (/^NOT$/i.test(full)) {
-          tokens.push({ kind: 'op', value: 'NOT' });
-        } else if (m[2] !== null && m[2] !== undefined) {
-          tokens.push({ kind: 'term', value: m[2] });
-        } else if (full && full.trim()) {
-          tokens.push({ kind: 'term', value: full.trim() });
-        }
-      }
-      if (tokens.length === 0) return new Set();
-
-      // 1b) Insert an implicit AND between adjacent operands so a bare
-      // multi-word query like `hello world` is treated as `hello AND world`
-      // (#222). Without this, the tokens produce a malformed RPN (multiple
-      // values left on the stack) and buildAst returns null → zero results.
-      const endsOperand = (t) => !!t && (t.kind === 'term' || t.kind === ')');
-      const startsOperand = (t) => !!t && (t.kind === 'term' || t.kind === '(' || (t.kind === 'op' && t.value === 'NOT'));
-      const expandedTokens = [];
-      for (let i = 0; i < tokens.length; i++) {
-        if (i > 0 && endsOperand(tokens[i - 1]) && startsOperand(tokens[i])) {
-          expandedTokens.push({ kind: 'op', value: 'AND' });
-        }
-        expandedTokens.push(tokens[i]);
-      }
-
-      // 2) Shunting-yard → RPN with precedence: NOT(3) > AND(2) > OR(1)
-      const prec = { NOT: 3, AND: 2, OR: 1 };
-      const rightAssoc = { NOT: true };
-      const output = [];
-      const ops = [];
-      for (const t of expandedTokens) {
-        if (t.kind === 'term') {
-          output.push(t);
-        } else if (t.kind === 'op') {
-          while (
-            ops.length > 0 && ops[ops.length - 1].kind === 'op' && (
-              (rightAssoc[t.value] !== true && prec[ops[ops.length - 1].value] >= prec[t.value]) ||
-              (rightAssoc[t.value] === true && prec[ops[ops.length - 1].value] > prec[t.value])
-            )
-          ) {
-            output.push(ops.pop());
-          }
-          ops.push(t);
-        } else if (t.kind === '(') {
-          ops.push(t);
-        } else if (t.kind === ')') {
-          while (ops.length > 0 && ops[ops.length - 1].kind !== '(') {
-            output.push(ops.pop());
-          }
-          if (ops.length > 0 && ops[ops.length - 1].kind === '(') ops.pop();
-        }
-      }
-      while (ops.length > 0) output.push(ops.pop());
-
-      // 3) Build AST from RPN.
-      // Returns null for malformed input (operators missing operands, or leftover
-      // operands), so callers treat it as a clean no-op rather than crashing on a
-      // stack underflow or an operator node with undefined children (e.g. a bare
-      // "NOT" or "a AND").
-      function buildAst(rpn) {
-        const stack = [];
-        for (const t of rpn) {
-          if (t.kind === 'term') {
-            stack.push({ type: 'term', value: t.value });
-          } else if (t.kind === 'op') {
-            if (t.value === 'NOT') {
-              if (stack.length < 1) return null;
-              const a = stack.pop();
-              stack.push({ type: 'not', child: a });
-            } else {
-              if (stack.length < 2) return null;
-              const b = stack.pop();
-              const a = stack.pop();
-              stack.push({ type: t.value.toLowerCase(), left: a, right: b });
-            }
-          }
-        }
-        // A well-formed expression collapses to exactly one node.
-        return stack.length === 1 ? stack[0] : null;
-      }
-      const ast = buildAst(output);
+      // Adjacent operands imply AND; operators use NOT > AND > OR precedence.
+      const tokens = expandSearchTokens(tokenizeSearchQuery(raw));
+      const ast = buildSearchAst(searchTokensToRpn(tokens));
       if (!ast) return new Set();
-
-      const ids = new Set();
-
-      // 4) Try FTS
-      const ftsQuote = (s) => `"${String(s).replace(/"/g, '"')}"`;
-      function buildFts(node) {
-        if (!node) return '';
-        switch (node.type) {
-          case 'term':
-            return /\s/.test(node.value) ? ftsQuote(node.value) : node.value;
-          case 'not':
-            return `(NOT ${buildFts(node.child)})`;
-          case 'and':
-            return `(${buildFts(node.left)} AND ${buildFts(node.right)})`;
-          case 'or':
-            return `(${buildFts(node.left)} OR ${buildFts(node.right)})`;
-        }
-        return '';
-      }
-
-      if (this.ftsEnabled) {
-        const ftsExpr = buildFts(ast).trim();
-        if (ftsExpr) {
-          const sql = `SELECT rowid AS id FROM fts_messages WHERE fts_messages MATCH ?`;
-          let stmt;
-          try {
-            explainQuery(state.db, sql, [ftsExpr], 'searchDatabaseIds (FTS)');
-            stmt = state.db.prepare(sql);
-            stmt.bind([ftsExpr]);
-            while (stmt.step()) {
-              const row = stmt.getAsObject();
-              if (row.id !== null && row.id !== undefined) ids.add(Number(row.id));
-            }
-          } catch (error) {
-            console.warn('[viewer] FTS search failed, falling back to LIKE', error);
-          } finally {
-            if (stmt) stmt.free();
-          }
-          if (ids.size > 0) return ids;
-        }
-      }
+      const ids = this.searchFullTextIds(ast);
+      if (ids.size > 0) return ids;
 
       // 5) LIKE fallback
       function buildLike(node, acc) {
@@ -1212,6 +1226,29 @@ function viewerController() {
       return ids;
     },
 
+    searchFullTextIds(ast) {
+      const ids = new Set();
+      if (!this.ftsEnabled) return ids;
+      const expression = buildFtsExpression(ast).trim();
+      if (!expression) return ids;
+      const sql = 'SELECT rowid AS id FROM fts_messages WHERE fts_messages MATCH ?';
+      let statement;
+      try {
+        explainQuery(state.db, sql, [expression], 'searchDatabaseIds (FTS)');
+        statement = state.db.prepare(sql);
+        statement.bind([expression]);
+        while (statement.step()) {
+          const row = statement.getAsObject();
+          if (row.id !== null && row.id !== undefined) ids.add(Number(row.id));
+        }
+      } catch (error) {
+        console.warn('[viewer] FTS search failed, falling back to LIKE', error);
+      } finally {
+        statement?.free();
+      }
+      return ids;
+    },
+
     buildRecipientsMap() {
       // Build a map of message_id -> comma-separated recipient names
       // This is done in ONE query instead of N queries!
@@ -1263,9 +1300,7 @@ function viewerController() {
         const adminCount = messages.filter((msg) => msg.isAdministrative).length;
         const hasAdministrative = adminCount > 0;
         const hasNonAdministrative = adminCount < messages.length;
-        const threadCategory = hasAdministrative
-          ? (hasNonAdministrative ? 'mixed' : 'admin')
-          : 'user';
+        const threadCategory = threadCategoryFor(hasAdministrative, hasNonAdministrative);
 
         threads.push({
           id: thread.thread_key,
@@ -1326,9 +1361,7 @@ function viewerController() {
           subject: msg.subject,
           body_md: msg.body_md,
         });
-        const recipientsFromMap = this.recipientsMap && this.recipientsMap.get(msg.id)
-          ? this.recipientsMap.get(msg.id)
-          : '';
+        const recipientsFromMap = this.recipientsMap?.get(msg.id) || '';
         const recipients = msg.recipients || recipientsFromMap || 'Unknown';
         const previewSource = msg.latest_snippet || msg.body_md || '';
         const preview_plain = buildPreviewSnippet(previewSource);
@@ -1445,7 +1478,7 @@ function viewerController() {
         const messages = this.getMessagesInThread(normalizedId);
         const hasAdministrative = messages.some((msg) => msg.isAdministrative);
         const hasNonAdministrative = messages.some((msg) => !msg.isAdministrative);
-        const latestMessage = messages[messages.length - 1];
+        const latestMessage = messages.at(-1);
         thread = {
           id: normalizedId,
           subject: latestMessage?.subject || '(no subject)',
@@ -1457,9 +1490,7 @@ function viewerController() {
           latest_snippet: latestMessage?.latest_snippet || latestMessage?.preview_plain || '',
           hasAdministrative,
           hasNonAdministrative,
-          thread_category: hasAdministrative
-            ? (hasNonAdministrative ? 'mixed' : 'admin')
-            : 'user',
+          thread_category: threadCategoryFor(hasAdministrative, hasNonAdministrative),
         };
         this.allThreads.push(thread);
       }
@@ -1595,14 +1626,14 @@ function viewerController() {
           if (!list) {
             return;
           }
-          const rawId = thread && thread.id ? String(thread.id) : "";
+          const rawId = thread?.id ? String(thread.id) : "";
           if (!rawId) {
             return;
           }
           const escapedId =
             typeof CSS !== "undefined" && typeof CSS.escape === "function"
               ? CSS.escape(rawId)
-              : rawId.replace(/"/g, '\\"');
+              : rawId.replaceAll('"', String.raw`\"`);
           const button = list.querySelector(
             `[data-thread-id="${escapedId}"]`,
           );
@@ -1869,11 +1900,7 @@ function viewerController() {
         + `<i data-lucide="folder" class="w-3 h-3"></i>`
         + `<span class="truncate max-w-[100px]">${escapeHtml(msg.project_name || '')}</span>`
         + `</span>`
-        + (msg.importance === 'urgent'
-          ? `<span class=\"inline-flex items-center gap-1 px-2 py-0.5 bg-danger-100 dark:bg-danger-900/30 text-danger-700 dark:text-danger-300 text-xs font-bold rounded-full\"><i data-lucide=\"alert-circle\" class=\"w-3 h-3\"></i>Urgent</span>`
-          : msg.importance === 'high'
-            ? `<span class=\"inline-flex items-center gap-1 px-2 py-0.5 bg-warning-100 dark:bg-warning-900/30 text-warning-700 dark:text-warning-300 text-xs font-semibold rounded-full\"><i data-lucide=\"alert-triangle\" class=\"w-3 h-3\"></i>High</span>`
-            : '')
+        + importanceBadgeHtml(msg.importance)
         + `</div>`
         + `<div class="text-sm mb-1 text-slate-900 dark:text-white truncate">${escapeHtml(msg.subject || '')}</div>`
         + `<div class="text-xs text-slate-600 dark:text-slate-400 line-clamp-2">${escapeHtml(msg.excerpt || '')}</div>`
@@ -1903,7 +1930,9 @@ function viewerController() {
           const vh = window.innerHeight || document.documentElement.clientHeight || 800;
           const h = Math.max(240, Math.floor(vh - rect.top - 12));
           scrollElem.style.height = `${h}px`;
-        } catch (_) {}
+        } catch (error) {
+          console.debug('[viewer] Viewport measurement skipped', error);
+        }
       };
 
       setHeightFromViewport();
@@ -1953,7 +1982,7 @@ function viewerController() {
         this._onRowClick = (event) => {
           const selectionControl = event.target.closest('[data-select-message-id]');
           if (selectionControl) {
-            const selectedId = Number(selectionControl.getAttribute('data-select-message-id'));
+            const selectedId = Number(selectionControl.dataset.selectMessageId);
             const controller = window.Alpine?.$data(document.body);
             controller?.toggleMessageSelection(selectedId);
             controller?.renderVirtualSlice(true);
@@ -1961,7 +1990,7 @@ function viewerController() {
           }
           const row = event.target.closest('[data-message-id]');
           if (!row) return;
-          const id = Number(row.getAttribute('data-message-id'));
+          const id = Number(row.dataset.messageId);
           const controller = window.Alpine?.$data(document.body);
           const msg = controller?.filteredMessages.find(m => m.id === id);
           if (msg) {
@@ -2051,7 +2080,9 @@ function viewerController() {
         if (typeof lucide !== 'undefined') {
           lucide.createIcons();
         }
-      } catch (_) {}
+      } catch (error) {
+        console.debug('[viewer] Icon refresh skipped', error);
+      }
 
       this.syncVisibleSelectionHighlight();
     },
@@ -2070,7 +2101,9 @@ function viewerController() {
         if (sel) {
           sel.classList.add('bg-primary-50', 'dark:bg-primary-900/20', 'border-l-4', 'border-l-primary-500');
         }
-      } catch (_) {}
+      } catch (error) {
+        console.debug('[viewer] Selection highlight skipped', error);
+      }
     },
     selectFirstMessage() {
       if (this.filteredMessages.length > 0 && !this.selectedMessage) {
@@ -2083,7 +2116,7 @@ function viewerController() {
       // Return Tailwind classes for project badge based on project name
       // Use a hash to get consistent colors for same project
       const hash = projectName.split('').reduce((acc, char) => {
-        return char.charCodeAt(0) + ((acc << 5) - acc);
+        return char.codePointAt(0) + ((acc << 5) - acc);
       }, 0);
 
       const colors = [
@@ -2121,6 +2154,23 @@ function viewerController() {
       }
     },
 
+    destroyVirtualList() {
+      if (this.virtualList?.scrollElem) {
+        try {
+          this.virtualList.scrollElem.removeEventListener('scroll', this._onVirtualScroll);
+          this.virtualList.scrollElem.removeEventListener('click', this._onRowClick);
+          if (this.virtualList.renderRaf) {
+            clearTimeout(this.virtualList.renderRaf);
+          }
+        } catch (error) {
+          console.debug('[viewer] Virtual list cleanup skipped', error);
+        }
+      }
+      this._onVirtualScroll = null;
+      this._onRowClick = null;
+      this.virtualList = null;
+    },
+
     // Cleanup when component is destroyed
     destroy() {
       // Clear auto-refresh interval to prevent memory leaks
@@ -2134,35 +2184,20 @@ function viewerController() {
         this._onMobileScroll = null;
       }
       if (this._mobileMedia && this._mobileMediaListener) {
-        if (typeof this._mobileMedia.removeEventListener === 'function') {
-          this._mobileMedia.removeEventListener('change', this._mobileMediaListener);
-        } else if (typeof this._mobileMedia.removeListener === 'function') {
-          this._mobileMedia.removeListener(this._mobileMediaListener);
-        }
+        this._mobileMedia.removeEventListener('change', this._mobileMediaListener);
       }
       this._mobileMedia = null;
       this._mobileMediaListener = null;
       if (typeof document !== 'undefined' && document.body) {
         document.body.classList.remove('mobile-modal-open');
       }
-      if (this.virtualList && this.virtualList.scrollElem) {
-        try {
-          this.virtualList.scrollElem.removeEventListener('scroll', this._onVirtualScroll);
-          this.virtualList.scrollElem.removeEventListener('click', this._onRowClick);
-          if (this.virtualList.renderRaf) {
-            clearTimeout(this.virtualList.renderRaf);
-          }
-        } catch (_) {}
-      }
-      if (this._onVirtualScroll) {
-        this._onVirtualScroll = null;
-      }
-      if (this._onRowClick) {
-        this._onRowClick = null;
-      }
-      this.virtualList = null;
+      this.destroyVirtualList();
       if (this._onResize) {
-        try { window.removeEventListener('resize', this._onResize); } catch (_) {}
+        try {
+          window.removeEventListener('resize', this._onResize);
+        } catch (error) {
+          console.debug('[viewer] Resize listener cleanup skipped', error);
+        }
         this._onResize = null;
       }
     },

@@ -29,7 +29,8 @@ def test_iso_and_parse_helpers():
     assert _iso("not-iso") == "not-iso"
 
     parsed = _parse_iso("2025-01-01T00:00:00Z")
-    assert parsed is not None and parsed.year == 2025
+    assert parsed is not None
+    assert parsed.year == 2025
     assert _parse_iso("bad-value") is None
 
     raw = '{"a": 1}'
@@ -40,6 +41,20 @@ def test_iso_and_parse_helpers():
     assert _parse_json_safely(noisy) == {"y": 3}
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ('before ```json\n{"value": 1}\n``` after', {"value": 1}),
+        ('```\n{"value": 2}\n```', {"value": 2}),
+        ('```json\n{"value": 3}', {"value": 3}),
+        ('```' + ' ' * 50_000, None),
+        ('```json\n[]\n```', None),
+    ],
+)
+def test_json_extraction_handles_fences_without_backtracking(payload, expected):
+    assert _parse_json_safely(payload) == expected
+
+
 def test_enforce_capabilities_denied():
     # Minimal stand-in that matches the Context metadata surface
     class DummyCtx:
@@ -47,8 +62,9 @@ def test_enforce_capabilities_denied():
             self.metadata = {"allowed_capabilities": ["read", "audit"]}
 
     # Call through and expect a ToolExecutionError with explanatory message
+    ctx = cast(Context, DummyCtx())
     with pytest.raises(ToolExecutionError) as exc:
-        _enforce_capabilities(cast(Context, DummyCtx()), {"write"}, "send_message")
+        _enforce_capabilities(ctx, {"write"}, "send_message")
     assert "requires capabilities" in str(exc.value)
 
 
@@ -161,7 +177,7 @@ async def test_tool_metrics_resource_populates_after_calls(isolated_env):
 
         # tooling metrics resource
         metrics_blocks = await client.read_resource("resource://tooling/metrics")
-        assert metrics_blocks and metrics_blocks[0].text
+        assert metrics_blocks
+        assert metrics_blocks[0].text
         # the text is JSON; ensure tools list contains health_check
         assert "health_check" in metrics_blocks[0].text
-

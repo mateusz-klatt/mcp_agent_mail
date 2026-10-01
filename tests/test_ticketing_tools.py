@@ -202,7 +202,7 @@ def test_closing_without_a_resolution_is_refused_with_its_domain_code() -> None:
         }
         ticket = await _call("create_ticket", {**common, "title": "needs a resolution"})
 
-        with pytest.raises(Exception) as refusal:
+        with pytest.raises(ToolError, match="resolution_required") as refusal:
             await _call("update_ticket", {**common, "ticket_key": ticket["key"], "status": "closed"})
         assert "resolution_required" in str(refusal.value)
 
@@ -232,7 +232,7 @@ def test_a_stale_expected_revision_is_refused() -> None:
             "update_ticket",
             {**common, "ticket_key": ticket["key"], "title": "first writer", "expected_revision": 1},
         )
-        with pytest.raises(Exception) as refusal:
+        with pytest.raises(ToolError, match="revision_conflict") as refusal:
             await _call(
                 "update_ticket",
                 {
@@ -274,7 +274,7 @@ def test_a_ticket_in_another_project_is_not_readable_even_with_its_global_key() 
             },
         )
 
-        with pytest.raises(Exception) as refusal:
+        with pytest.raises(ToolError) as refusal:
             await _call(
                 "get_ticket",
                 {
@@ -357,7 +357,7 @@ def test_an_epic_takes_children_and_a_task_does_not() -> None:
         )
         assert child["parent_id"] is not None
 
-        with pytest.raises(Exception) as refusal:
+        with pytest.raises(ToolError, match="parent_not_an_epic") as refusal:
             await _call(
                 "create_ticket", {**common, "title": "orphan", "parent_key": task["key"]}
             )
@@ -379,7 +379,7 @@ def test_an_unknown_assignee_is_refused_rather_than_silently_dropped() -> None:
             "agent_name": "claude-linux-holzera-1",
             "registration_token": token,
         }
-        with pytest.raises(Exception) as refusal:
+        with pytest.raises(ToolError, match="ghost-agent-9") as refusal:
             await _call(
                 "create_ticket",
                 {**common, "title": "assigned to nobody", "assignee_name": "ghost-agent-9"},

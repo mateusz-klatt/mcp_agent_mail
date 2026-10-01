@@ -175,7 +175,8 @@ async def test_bare_name_prefers_cross_project_over_local_shadow(isolated_env):
         await s.commit()
         await s.refresh(p_local)
         await s.refresh(p_remote)
-        assert p_local.id is not None and p_remote.id is not None
+        assert p_local.id is not None
+        assert p_remote.id is not None
 
         sender = Agent(
             project_id=p_local.id,

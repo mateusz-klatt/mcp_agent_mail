@@ -288,11 +288,12 @@ async def test_register_agent_requires_explicit_name_without_mutation(isolated_e
             "ensure_project", {"human_key": pkey("test/names")}
         )
 
+        project_key = pkey("test/names")
         with pytest.raises(ToolError, match=r"name\n\s+Missing required argument"):
             await client.call_tool(
                 "register_agent",
                 {
-                    "project_key": pkey("test/names"),
+                    "project_key": project_key,
                     "program": "test-program",
                     "model": "test-model",
                 },
@@ -436,11 +437,12 @@ async def test_register_agent_rejects_descriptive_name_without_mutation(isolated
             "ensure_project", {"human_key": pkey("test/invalid-descriptive")}
         )
 
+        project_key = pkey("test/invalid-descriptive")
         with pytest.raises(ToolError, match="must match client-os-host-slot"):
             await client.call_tool(
                 "register_agent",
                 {
-                    "project_key": pkey("test/invalid-descriptive"),
+                    "project_key": project_key,
                     "program": "test",
                     "model": "test",
                     "name": "BackendHarmonizer",
@@ -465,11 +467,12 @@ async def test_register_agent_rejects_program_name_without_mutation(isolated_env
             "ensure_project", {"human_key": pkey("test/invalid-program")}
         )
 
+        project_key = pkey("test/invalid-program")
         with pytest.raises(ToolError, match="must match client-os-host-slot"):
             await client.call_tool(
                 "register_agent",
                 {
-                    "project_key": pkey("test/invalid-program"),
+                    "project_key": project_key,
                     "program": "claude-code",
                     "model": "opus",
                     "name": "claude-code",
@@ -575,11 +578,12 @@ async def test_register_agent_rejects_malformed_canonical_name(isolated_env):
             "ensure_project", {"human_key": pkey("test/malformed-canonical")}
         )
 
+        project_key = pkey("test/malformed-canonical")
         with pytest.raises(ToolError, match="must match client-os-host-slot"):
             await client.call_tool(
                 "register_agent",
                 {
-                    "project_key": pkey("test/malformed-canonical"),
+                    "project_key": project_key,
                     "program": "claude-code",
                     "model": "opus",
                     "name": "claude-wsl-home-session",
@@ -641,11 +645,12 @@ async def test_create_agent_identity_requires_name_hint_without_mutation(isolate
             "ensure_project", {"human_key": pkey("test/identity")}
         )
 
+        project_key = pkey("test/identity")
         with pytest.raises(ToolError, match=r"name_hint\n\s+Missing required argument"):
             await client.call_tool(
                 "create_agent_identity",
                 {
-                    "project_key": pkey("test/identity"),
+                    "project_key": project_key,
                     "program": "test",
                     "model": "test",
                 },
@@ -689,11 +694,12 @@ async def test_create_agent_identity_rejects_invalid_hint_without_mutation(isola
             "ensure_project", {"human_key": pkey("test/invalid-hint")}
         )
 
+        project_key = pkey("test/invalid-hint")
         with pytest.raises(ToolError, match="must match client-os-host-slot"):
             await client.call_tool(
                 "create_agent_identity",
                 {
-                    "project_key": pkey("test/invalid-hint"),
+                    "project_key": project_key,
                     "program": "test",
                     "model": "test",
                     "name_hint": "InvalidDescriptiveName",
@@ -744,11 +750,12 @@ async def test_create_agent_identity_rejects_duplicate_durable_hint(isolated_env
             },
         )
 
+        project_key = pkey("test/duplicate-hint")
         with pytest.raises(ToolError, match="already in use"):
             await client.call_tool(
                 "create_agent_identity",
                 {
-                    "project_key": pkey("test/duplicate-hint"),
+                    "project_key": project_key,
                     "program": "changed",
                     "model": "changed",
                     "name_hint": "codex-wsl-duplicate-1",
@@ -791,11 +798,12 @@ async def test_send_message_validates_recipient_names(isolated_env):
         sender_name = sender_result.data["name"]
 
         # Try to send to non-existent recipient - use a valid-format name that doesn't exist
-        with pytest.raises(Exception) as exc_info:
+        project_key = pkey("test/msg")
+        with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
                 "send_message",
                 {
-                    "project_key": pkey("test/msg"),
+                    "project_key": project_key,
                     "sender_name": sender_name,
                     "to": ["claude-wsl-missing-1"],
                     "subject": "Test",

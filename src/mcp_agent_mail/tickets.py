@@ -378,6 +378,17 @@ async def _topic_is_occupied(session: AsyncSession, project_id: int, candidate: 
     return found.first() is not None
 
 
+async def _available_ticket_prefix(session: AsyncSession, base: str) -> str:
+    """Choose a free prefix within the caller's serialized transaction."""
+    if not await _prefix_is_taken(session, base):
+        return base
+    for suffix in _PREFIX_SUFFIXES:
+        candidate = f"{base[: _MAX_PREFIX_LENGTH - len(suffix)]}{suffix}"
+        if not await _prefix_is_taken(session, candidate):
+            return candidate
+    raise TicketError("prefix_unavailable", f"every variant of {base!r} is taken")
+
+
 async def allocate_ticket_key(
     session: AsyncSession,
     *,
@@ -407,16 +418,7 @@ async def allocate_ticket_key(
     existing = await session.get(TicketSequence, project_id)
     if existing is None:
         base = validate_prefix(prefix_hint) if prefix_hint else derive_prefix(project.slug)
-        prefix = base
-        if await _prefix_is_taken(session, prefix):
-            prefix = ""
-            for suffix in _PREFIX_SUFFIXES:
-                candidate_prefix = f"{base[: _MAX_PREFIX_LENGTH - len(suffix)]}{suffix}"
-                if not await _prefix_is_taken(session, candidate_prefix):
-                    prefix = candidate_prefix
-                    break
-            if not prefix:
-                raise TicketError("prefix_unavailable", f"every variant of {base!r} is taken")
+        prefix = await _available_ticket_prefix(session, base)
         now = _utcnow_naive()
         session.add(
             TicketSequence(
@@ -683,6 +685,62 @@ def _closure_change(
     return (None, None)
 
 
+type _PendingTicketField = tuple[str, Optional[str], Optional[str], Any]
+
+
+def _stage_ticket_field(
+    pending: list[_PendingTicketField], field: str, current: Any, proposed: Any
+) -> None:
+    if proposed == current:
+        return
+    pending.append(
+        (
+            field,
+            None if current is None else str(current),
+            None if proposed is None else str(proposed),
+            proposed,
+        )
+    )
+
+
+def _collect_ticket_field_changes(
+    ticket: Ticket,
+    update: TicketUpdate,
+    status: str | None,
+    new_resolution: str | None,
+) -> list[_PendingTicketField]:
+    """Validate proposed values and stage changes without mutating the ticket."""
+    pending: list[_PendingTicketField] = []
+    if update.title is not None:
+        _stage_ticket_field(pending, "title", ticket.title, normalize_title(update.title))
+    if update.description_md is not None:
+        _stage_ticket_field(pending, "description_md", ticket.description_md, normalize_description(update.description_md))
+    if update.priority is not None:
+        _stage_ticket_field(pending, "priority", ticket.priority, normalize_priority(update.priority))
+    if update.kind_key is not None:
+        _stage_ticket_field(pending, "kind_key", ticket.kind_key, normalize_kind(update.kind_key))
+    if status is not None:
+        _stage_ticket_field(pending, "status_key", ticket.status_key, status)
+    if update.clear_assignee:
+        _stage_ticket_field(pending, "assignee_agent_id", ticket.assignee_agent_id, None)
+    elif update.assignee_agent_id is not None:
+        _stage_ticket_field(pending, "assignee_agent_id", ticket.assignee_agent_id, update.assignee_agent_id)
+    if update.clear_parent:
+        _stage_ticket_field(pending, "parent_id", ticket.parent_id, None)
+    elif update.parent_id is not None:
+        _stage_ticket_field(pending, "parent_id", ticket.parent_id, update.parent_id)
+    _stage_ticket_field(pending, "resolution_key", ticket.resolution_key, new_resolution)
+    return pending
+
+
+async def _validate_ticket_parent(session: AsyncSession, ticket: Ticket, parent_id: int | None) -> None:
+    if parent_id is None:
+        return
+    await _load_parent(session, ticket.project_id, parent_id)
+    if parent_id == ticket.id:
+        raise TicketError("link_self", "a ticket cannot be its own parent")
+
+
 async def apply_ticket_update(
     session: AsyncSession,
     *,
@@ -702,51 +760,13 @@ async def apply_ticket_update(
             "revision_conflict",
             f"expected revision {expected_revision}, found {ticket.revision}",
         )
-
     status = normalize_status(update.status_key) if update.status_key is not None else None
     resolution = (
         normalize_resolution(update.resolution_key) if update.resolution_key is not None else None
     )
     new_resolution, new_closed_ts = _closure_change(ticket, status, resolution)
-
-    if update.parent_id is not None:
-        await _load_parent(session, ticket.project_id, update.parent_id)
-        if update.parent_id == ticket.id:
-            raise TicketError("link_self", "a ticket cannot be its own parent")
-
-    pending: list[tuple[str, Optional[str], Optional[str], Any]] = []
-
-    def stage(field: str, current: Any, proposed: Any) -> None:
-        if proposed == current:
-            return
-        pending.append(
-            (
-                field,
-                None if current is None else str(current),
-                None if proposed is None else str(proposed),
-                proposed,
-            )
-        )
-
-    if update.title is not None:
-        stage("title", ticket.title, normalize_title(update.title))
-    if update.description_md is not None:
-        stage("description_md", ticket.description_md, normalize_description(update.description_md))
-    if update.priority is not None:
-        stage("priority", ticket.priority, normalize_priority(update.priority))
-    if update.kind_key is not None:
-        stage("kind_key", ticket.kind_key, normalize_kind(update.kind_key))
-    if status is not None:
-        stage("status_key", ticket.status_key, status)
-    if update.clear_assignee:
-        stage("assignee_agent_id", ticket.assignee_agent_id, None)
-    elif update.assignee_agent_id is not None:
-        stage("assignee_agent_id", ticket.assignee_agent_id, update.assignee_agent_id)
-    if update.clear_parent:
-        stage("parent_id", ticket.parent_id, None)
-    elif update.parent_id is not None:
-        stage("parent_id", ticket.parent_id, update.parent_id)
-    stage("resolution_key", ticket.resolution_key, new_resolution)
+    await _validate_ticket_parent(session, ticket, update.parent_id)
+    pending = _collect_ticket_field_changes(ticket, update, status, new_resolution)
 
     if not pending and new_closed_ts == ticket.closed_ts:
         return TicketMutationResult(ticket=ticket, changed_fields=(), revision=ticket.revision)

@@ -21,7 +21,8 @@ def test_utils_functions_basic():
     assert sanitize_agent_name(" Blue-Lake! ") == "BlueLake"
     assert sanitize_agent_name("@@@") is None
     name = generate_agent_name()
-    assert isinstance(name, str) and len(name) > 0
+    assert isinstance(name, str)
+    assert len(name) > 0
 
 
 def test_bridge_provider_env_populates_from_env(monkeypatch):
@@ -68,4 +69,3 @@ async def test_complete_system_user_handles_missing_router(monkeypatch):
 
     out = await complete_system_user("sys", "user")
     assert out.model
-

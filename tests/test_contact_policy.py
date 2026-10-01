@@ -231,7 +231,8 @@ async def test_contact_blocked_and_contacts_only(isolated_env, monkeypatch):
             },
         )
         deliveries = r2.data.get("deliveries") or []
-        assert deliveries and deliveries[0]["message"]["subject"] == "Hi"
+        assert deliveries
+        assert deliveries[0]["message"]["subject"] == "Hi"
 
 
 @pytest.mark.asyncio
@@ -320,7 +321,8 @@ async def test_cross_project_contact_and_delivery(isolated_env):
             },
         )
         deliveries = sent.data.get("deliveries") or []
-        assert deliveries and any(d.get("project") in {"Frontend", pkey("frontend")} for d in deliveries)
+        assert deliveries
+        assert any(d.get("project") in {"Frontend", pkey("frontend")} for d in deliveries)
 
         alternate = await client.call_tool(
             "send_message",
@@ -334,7 +336,8 @@ async def test_cross_project_contact_and_delivery(isolated_env):
             },
         )
         alternate_deliveries = alternate.data.get("deliveries") or []
-        assert alternate_deliveries and any(
+        assert alternate_deliveries
+        assert any(
             delivery.get("project") in {"Frontend", pkey("frontend")}
             for delivery in alternate_deliveries
         )
@@ -691,4 +694,5 @@ async def test_send_message_supports_at_address(isolated_env):
             },
         )
         deliveries = response.data.get("deliveries") or []
-        assert deliveries and any(item.get("project") == frontend for item in deliveries)
+        assert deliveries
+        assert any(item.get("project") == frontend for item in deliveries)

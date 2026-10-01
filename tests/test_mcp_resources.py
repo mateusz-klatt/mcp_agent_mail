@@ -1001,13 +1001,8 @@ async def test_project_resource_nonexistent_returns_error(isolated_env):
     """Accessing nonexistent project returns error."""
     server = build_mcp_server()
     async with Client(server) as client:
-        try:
+        with pytest.raises(Exception, match=r"(?i)not found|error"):
             await client.read_resource("resource://project/nonexistent-project-xyz")
-            # If it doesn't raise, check for error in response
-            pytest.fail("Should raise error for nonexistent project")
-        except Exception as e:
-            # Expected - resource should fail for nonexistent project
-            assert "not found" in str(e).lower() or "error" in str(e).lower()
 
 
 @pytest.mark.asyncio
@@ -1050,8 +1045,9 @@ async def test_agent_scoped_resources_require_project(isolated_env, uri_template
         )
         agent_name = agent_result.data["name"]
 
+        resource_uri = uri_template.format(agent=agent_name)
         with pytest.raises(Exception, match="project"):
-            await client.read_resource(uri_template.format(agent=agent_name))
+            await client.read_resource(resource_uri)
 
 
 @pytest.mark.asyncio
@@ -1127,7 +1123,7 @@ async def test_private_resources_never_transport_registration_tokens(isolated_en
             ),
         ]
         for uri, stateless_tool in private_reads:
-            with pytest.raises(Exception) as exc_info:
+            with pytest.raises(Exception, match="already authenticated in this MCP session") as exc_info:
                 await stateless_client.read_resource(uri)
 
             error_text = str(exc_info.value)

@@ -1,5 +1,6 @@
 import {
   type ChangeEvent,
+  type ComponentProps,
   type FormEvent,
   type KeyboardEvent,
   type ReactNode,
@@ -99,6 +100,18 @@ const recipientDirectoryConflictCodes = new Set([
   "recipient_blocked",
 ]);
 
+const reservationStateLabels: Record<ReservationClaim["scope_state"], string> = {
+  execution_scoped: "reservations.stateScoped",
+  legacy_unscoped: "reservations.stateLegacy",
+  orphaned: "reservations.stateOrphaned",
+};
+
+const searchErrorLabels = {
+  invalid: "search.invalid",
+  unavailable: "search.unavailable",
+  generic: "search.error",
+};
+
 function recipientSelectionKey(agent: MailRecipientAgent): string {
   return `${agent.agent_id}:${agent.agent_generation}`;
 }
@@ -162,7 +175,7 @@ interface SafeMarkdownProps {
   components: MarkdownComponents;
 }
 
-function SafeMarkdown({ body, components }: SafeMarkdownProps) {
+function SafeMarkdown({ body, components }: Readonly<SafeMarkdownProps>) {
   return (
     <ReactMarkdown
       remarkPlugins={markdownRemarkPlugins}
@@ -195,7 +208,7 @@ function CollapsibleThreadMessage({
   importanceLabel,
   senderLabel,
   subject,
-}: CollapsibleThreadMessageProps) {
+}: Readonly<CollapsibleThreadMessageProps>) {
   const [open, setOpen] = useState(defaultOpen);
   return (
     <details
@@ -246,7 +259,7 @@ function MarkdownComposer({
   disabled,
   submitDisabled,
   components,
-}: MarkdownComposerProps) {
+}: Readonly<MarkdownComposerProps>) {
   const { i18n: translationI18n, t } = useTranslation();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const pendingSelectionRef = useRef<{ end: number; start: number } | null>(null);
@@ -316,7 +329,7 @@ function MarkdownComposer({
     <div className="markdown-composer">
       <div className="markdown-composer-header">
         {showEditor ? <label htmlFor={id}>{label}</label> : <span>{label}</span>}
-        <div className="markdown-mode-switch" role="group" aria-label={t("markdown.mode")}>
+        <fieldset className="markdown-mode-switch" aria-label={t("markdown.mode")}>
           {modes.map((candidate) => (
             <button
               key={candidate}
@@ -329,12 +342,12 @@ function MarkdownComposer({
               {t(`markdown.${candidate}`)}
             </button>
           ))}
-        </div>
+        </fieldset>
       </div>
       <div className={`markdown-composer-layout is-${mode}`}>
         {showEditor ? (
           <div className="markdown-editor-pane">
-            <div className="markdown-toolbar" role="group" aria-label={t("markdown.toolbar")}>
+            <fieldset className="markdown-toolbar" aria-label={t("markdown.toolbar")}>
               {formats.map((format) => (
                 <button
                   key={format.key}
@@ -345,7 +358,7 @@ function MarkdownComposer({
                   {t(`markdown.${format.key}`)}
                 </button>
               ))}
-            </div>
+            </fieldset>
             <textarea
               ref={textareaRef}
               id={id}
@@ -362,7 +375,7 @@ function MarkdownComposer({
           </div>
         ) : null}
         {showPreview ? (
-          <div className="markdown-preview-pane" role="region" aria-label={previewLabel}>
+          <section className="markdown-preview-pane" aria-label={previewLabel}>
             {value.trim() === "" ? (
               <p className="markdown-empty-preview">{t("markdown.emptyPreview")}</p>
             ) : (
@@ -370,7 +383,7 @@ function MarkdownComposer({
                 <SafeMarkdown body={value} components={components} />
               </div>
             )}
-          </div>
+          </section>
         ) : null}
       </div>
       <div className="markdown-composer-meta">
@@ -418,7 +431,7 @@ function DeliveryConfirmation({
   subject,
   threadId,
   title,
-}: DeliveryConfirmationProps) {
+}: Readonly<DeliveryConfirmationProps>) {
   const { t } = useTranslation();
   const regionRef = useRef<HTMLElement>(null);
   const Heading = headingLevel === 2 ? "h2" : "h3";
@@ -436,7 +449,6 @@ function DeliveryConfirmation({
     <section
       ref={regionRef}
       className="delivery-confirmation"
-      role="region"
       aria-labelledby={`${id}-heading`}
       tabIndex={-1}
     >
@@ -479,9 +491,8 @@ function DeliveryConfirmation({
           {t("confirmation.multipleRecipientsWarning", { count: recipients.length })}
         </p>
       ) : null}
-      <div
+      <section
         className="confirmation-preview"
-        role="region"
         aria-labelledby={`${id}-preview-heading`}
       >
         <strong id={`${id}-preview-heading`}>{t("confirmation.finalPreview")}</strong>
@@ -493,7 +504,7 @@ function DeliveryConfirmation({
         <div className="message-body">
           <SafeMarkdown body={previewBody} components={components} />
         </div>
-      </div>
+      </section>
       <div className="confirmation-actions">
         <button
           type="button"
@@ -665,14 +676,92 @@ function mergeThreadMessages(
   return mergeMessages(current, incoming).sort((left, right) => {
     const leftTimestamp = canonicalUtcTimestampSortKey(left.created_ts);
     const rightTimestamp = canonicalUtcTimestampSortKey(right.created_ts);
-    const timestampOrder =
-      leftTimestamp < rightTimestamp
-        ? -1
-        : leftTimestamp > rightTimestamp
-          ? 1
-          : 0;
-    return timestampOrder || left.id - right.id;
+    if (leftTimestamp === rightTimestamp) {
+      return left.id - right.id;
+    }
+    return leftTimestamp < rightTimestamp ? -1 : 1;
   });
+}
+
+function MarkdownTaskInput({ checked, disabled }: Readonly<ComponentProps<"input">>) {
+  const { t } = useTranslation();
+  return (
+    <input
+      type="checkbox"
+      checked={checked}
+      disabled={disabled}
+      aria-label={t(checked ? "markdown.completedTask" : "markdown.incompleteTask")}
+    />
+  );
+}
+
+function MarkdownCodeBlock({ children }: Readonly<ComponentProps<"pre">>) {
+  const { t } = useTranslation();
+  return <pre tabIndex={0} aria-label={t("markdown.codeBlock")}>{children}</pre>;
+}
+
+function MarkdownTable({ children }: Readonly<ComponentProps<"table">>) {
+  const { t } = useTranslation();
+  return (
+    <section className="markdown-table-scroll" aria-label={t("markdown.table")} tabIndex={0}>
+      <table>{children}</table>
+    </section>
+  );
+}
+
+const markdownComponents: MarkdownComponents = {
+  h1({ children }) {
+    return <h2>{children}</h2>;
+  },
+  h2({ children }) {
+    return <h3>{children}</h3>;
+  },
+  h3({ children }) {
+    return <h4>{children}</h4>;
+  },
+  h4({ children }) {
+    return <h5>{children}</h5>;
+  },
+  h5({ children }) {
+    return <h6>{children}</h6>;
+  },
+  h6({ children }) {
+    return <h6>{children}</h6>;
+  },
+  a({ href, children, title }) {
+    if (href === undefined) {
+      return <span className="markdown-rejected-link">{children}</span>;
+    }
+    return <a href={href} title={title}>{children}</a>;
+  },
+  img({ src, alt, title }) {
+    if (src === undefined) {
+      return <span className="markdown-image-alt">{alt}</span>;
+    }
+    return <img src={src} alt={alt} title={title} loading="lazy" decoding="async" />;
+  },
+  input: MarkdownTaskInput,
+  pre: MarkdownCodeBlock,
+  table: MarkdownTable,
+};
+
+function searchFailureCode(error: unknown): "invalid" | "unavailable" | "generic" {
+  if (!(error instanceof MailHttpError)) {
+    return "generic";
+  }
+  if (error.status === 422 || error.code === "invalid_search_query") {
+    return "invalid";
+  }
+  return error.status === 503 || error.code === "search_unavailable"
+    ? "unavailable"
+    : "generic";
+}
+
+function adminUserStatusLabel(user: AdminUser): string {
+  if (user.disabled) {
+    return "admin.disabled";
+  }
+  return user.global_role === "admin" ? "admin.administrator" : "admin.member";
 }
 
 export function App({
@@ -680,82 +769,8 @@ export function App({
   navigateTo = defaultNavigate,
   createEventSource = defaultCreateEventSource,
   prepareLocaleCatalog = prepareLocale,
-}: AppProps = {}) {
+}: Readonly<AppProps> = {}) {
   const { t } = useTranslation();
-  const markdownComponents = useMemo<MarkdownComponents>(
-    () => ({
-      h1({ children }) {
-        return <h2>{children}</h2>;
-      },
-      h2({ children }) {
-        return <h3>{children}</h3>;
-      },
-      h3({ children }) {
-        return <h4>{children}</h4>;
-      },
-      h4({ children }) {
-        return <h5>{children}</h5>;
-      },
-      h5({ children }) {
-        return <h6>{children}</h6>;
-      },
-      h6({ children }) {
-        return <h6>{children}</h6>;
-      },
-      a({ href, children, title }) {
-        if (href === undefined) {
-          return <span className="markdown-rejected-link">{children}</span>;
-        }
-        return <a href={href} title={title}>{children}</a>;
-      },
-      img({ src, alt, title }) {
-        if (src === undefined) {
-          return <span className="markdown-image-alt">{alt}</span>;
-        }
-        return (
-          <img
-            src={src}
-            alt={alt}
-            title={title}
-            loading="lazy"
-            decoding="async"
-          />
-        );
-      },
-      input({ checked, disabled }) {
-        return (
-          <input
-            type="checkbox"
-            checked={checked}
-            disabled={disabled}
-            aria-label={t(
-              checked ? "markdown.completedTask" : "markdown.incompleteTask",
-            )}
-          />
-        );
-      },
-      pre({ children }) {
-        return (
-          <pre tabIndex={0} aria-label={t("markdown.codeBlock")}>
-            {children}
-          </pre>
-        );
-      },
-      table({ children }) {
-        return (
-          <div
-            className="markdown-table-scroll"
-            role="region"
-            aria-label={t("markdown.table")}
-            tabIndex={0}
-          >
-            <table>{children}</table>
-          </div>
-        );
-      },
-    }),
-    [t],
-  );
   const [locale, setLocale] = useState<SupportedLocale>("en");
   const [preferenceStatus, setPreferenceStatus] =
     useState<PreferenceStatus>("loading");
@@ -798,8 +813,8 @@ export function App({
     useState<PaginationStatus>("idle");
   const [searchNextCursor, setSearchNextCursor] = useState<string | null>(null);
   const [searchErrorCode, setSearchErrorCode] = useState<
-    "invalid" | "unavailable" | "generic" | null
-  >(null);
+    "invalid" | "unavailable" | "generic"
+  >("generic");
   const [searchQuery, setSearchQuery] = useState(
     route.view === "search" ? route.query : "",
   );
@@ -909,7 +924,7 @@ export function App({
   const replyAttemptRef = useRef<Map<string, string>>(new Map());
   const localeChangeBusyRef = useRef(false);
   const mailRouteActive =
-    mailNavigation.some((item) => route.view === item) ||
+    (mailNavigation as readonly string[]).includes(route.view) ||
     route.view === "message" ||
     route.view === "thread" ||
     route.view === "compose" ||
@@ -1257,14 +1272,14 @@ export function App({
     if (route.view !== "search" || route.query.trim() === "") {
       setSearchResults([]);
       setSearchNextCursor(null);
-      setSearchErrorCode(null);
+      setSearchErrorCode("generic");
       setSearchStatus("idle");
       return undefined;
     }
     const controller = new AbortController();
     setSearchResults([]);
     setSearchNextCursor(null);
-    setSearchErrorCode(null);
+    setSearchErrorCode("generic");
     setSearchStatus("loading");
     void loadSearch({
       query: route.query,
@@ -1293,15 +1308,7 @@ export function App({
           setSearchStatus("unauthorized");
           return;
         }
-        setSearchErrorCode(
-          error instanceof MailHttpError &&
-            (error.status === 422 || error.code === "invalid_search_query")
-            ? "invalid"
-            : error instanceof MailHttpError &&
-                (error.status === 503 || error.code === "search_unavailable")
-              ? "unavailable"
-              : "generic",
-        );
+        setSearchErrorCode(searchFailureCode(error));
         setSearchStatus("error");
       });
     return () => controller.abort();
@@ -2259,7 +2266,7 @@ export function App({
     refresh: (deliveryId: string) => Promise<void>,
   ) => {
     if (formStatus === "sending") {
-      return <p className="form-status" role="status">{t("delivery.sending")}</p>;
+      return <output className="form-status">{t("delivery.sending")}</output>;
     }
     if (formStatus === "conflict") {
       return <p className="form-status state-error" role="alert">{t("delivery.conflict")}</p>;
@@ -2272,9 +2279,9 @@ export function App({
     }
     const terminal = delivery.status === "published" || delivery.status === "quarantined";
     return (
-      <div
+      <output
         className={`delivery-result delivery-${delivery.status}`}
-        role={delivery.status === "quarantined" ? "alert" : "status"}
+        role={delivery.status === "quarantined" ? "alert" : undefined}
         aria-live="polite"
       >
         <strong>{t(`delivery.status.${delivery.status}`)}</strong>
@@ -2288,7 +2295,7 @@ export function App({
             {t("delivery.checkStatus")}
           </button>
         ) : null}
-      </div>
+      </output>
     );
   };
 
@@ -2305,36 +2312,12 @@ export function App({
       (agent) => String(agent.agent_id) === selectedAgentId,
     );
     const saving = agentMutationStatus === "saving";
-    return (
-      <section aria-labelledby="agents-heading">
-        <div className="page-heading">
-          <div>
-            <p className="eyebrow">{t("agents.eyebrow")}</p>
-            <h1 id="agents-heading">{t("agents.title")}</h1>
-            <p>{t("agents.hint")}</p>
-          </div>
-        </div>
-        {profileStatus === "loading" || projectsStatus === "loading" ? (
-          <p className="state-panel" role="status">{t("agents.loading")}</p>
-        ) : null}
-        {profileStatus === "error" || projectsStatus === "error" ? (
-          <p className="state-panel state-error" role="alert">
-            {t("agents.loadError")}
-          </p>
-        ) : null}
-        {profileStatus === "ready" &&
-        projectsStatus === "ready" &&
-        !canManageAgents ? (
-          <p className="state-panel state-error" role="alert">
-            {t("agents.forbidden")}
-          </p>
-        ) : null}
-        {profileStatus === "ready" &&
-        projectsStatus === "ready" &&
-        canManageAgents ? (
-          activeProjects.length === 0 ? (
-            <p className="state-panel">{t("agents.noProjects")}</p>
-          ) : (
+    const settingsReady = profileStatus === "ready" && projectsStatus === "ready";
+    const renderSettings = () => {
+      if (activeProjects.length === 0) {
+        return <p className="state-panel">{t("agents.noProjects")}</p>;
+      }
+      return (
             <div className="settings-grid">
               <section
                 className="settings-card"
@@ -2364,9 +2347,9 @@ export function App({
                     ))}
                   </select>
                   {agentSettingsStatus === "loading" ? (
-                    <p className="form-status" role="status">
+                    <output className="form-status">
                       {t("agents.loadingAgents")}
-                    </p>
+                    </output>
                   ) : null}
                   {agentSettingsStatus === "error" ||
                   agentSettingsStatus === "unauthorized" ? (
@@ -2492,23 +2475,41 @@ export function App({
                     >
                       {t("agents.save")}
                     </button>
-                    <p
+                    <output
                       id="agent-profile-status"
                       className="form-status"
-                      role="status"
                       aria-live="polite"
                       data-state={agentMutationStatus}
                     >
                       {agentMutationMessage[agentMutationStatus] === null
                         ? ""
                         : t(agentMutationMessage[agentMutationStatus])}
-                    </p>
+                    </output>
                   </form>
                 ) : null}
               </section>
             </div>
-          )
+      );
+    };
+    return (
+      <section aria-labelledby="agents-heading">
+        <div className="page-heading">
+          <div>
+            <p className="eyebrow">{t("agents.eyebrow")}</p>
+            <h1 id="agents-heading">{t("agents.title")}</h1>
+            <p>{t("agents.hint")}</p>
+          </div>
+        </div>
+        {profileStatus === "loading" || projectsStatus === "loading" ? (
+          <output className="state-panel">{t("agents.loading")}</output>
         ) : null}
+        {profileStatus === "error" || projectsStatus === "error" ? (
+          <p className="state-panel state-error" role="alert">{t("agents.loadError")}</p>
+        ) : null}
+        {settingsReady && !canManageAgents ? (
+          <p className="state-panel state-error" role="alert">{t("agents.forbidden")}</p>
+        ) : null}
+        {settingsReady && canManageAgents ? renderSettings() : null}
       </section>
     );
   };
@@ -2543,70 +2544,8 @@ export function App({
       composeRecipients.length === 0 ||
       composeSubject.trim() === "" ||
       composeBody.trim() === "";
-    return (
-      <section aria-labelledby="compose-heading">
-        <div className="page-heading">
-          <div>
-            <p className="eyebrow">{t("compose.eyebrow")}</p>
-            <h1 id="compose-heading">{t("compose.title")}</h1>
-            <p>{t("compose.hint")}</p>
-          </div>
-        </div>
-        {profileStatus === "loading" || projectsStatus === "loading" ? (
-          <p className="state-panel" role="status">{t("compose.loading")}</p>
-        ) : null}
-        {/* Waits for the project list too. canCompose reads roles out of it, so
-            judging a member before it arrives would flash "no access" at an
-            operator on every load. */}
-        {profileStatus === "ready" && projectsStatus === "ready" && !canCompose ? (
-          <p className="state-panel state-error" role="alert">{t("compose.forbidden")}</p>
-        ) : null}
-        {profileStatus === "error" || projectsStatus === "error" ? (
-          <p className="state-panel state-error" role="alert">{t("compose.loadError")}</p>
-        ) : null}
-        {profileStatus === "ready" && canCompose && projectsStatus === "ready" ? (
-          activeProjects.length === 0 ? (
-            <p className="state-panel">{t("compose.noProjects")}</p>
-          ) : (
-            <form className="delivery-form settings-card" onSubmit={handleComposeSubmit}>
-              <label htmlFor="compose-project">{t("compose.project")}</label>
-              <select
-                id="compose-project"
-                name="compose-project"
-                value={composeProjectId}
-                onChange={handleComposeProjectChange}
-                required
-                disabled={composeIsSending}
-              >
-                <option value="">{t("compose.chooseProject")}</option>
-                {activeProjects.map((project) => (
-                  <option key={project.id} value={project.id}>{project.human_key}</option>
-                ))}
-              </select>
-              <fieldset className="recipient-picker" aria-describedby="compose-recipients-hint">
-                <legend>{t("compose.recipients")}</legend>
-                <small id="compose-recipients-hint">{t("compose.recipientsHint")}</small>
-                {composeProjectId === "" ? (
-                  <p className="recipient-picker-state">{t("compose.chooseRecipientsProject")}</p>
-                ) : null}
-                {composeAgentsStatus === "loading" ? (
-                  <p className="recipient-picker-state" role="status">{t("compose.loadingRecipients")}</p>
-                ) : null}
-                {composeDirectoryNotice !== null ? (
-                  <p
-                    className={`recipient-picker-state ${composeDirectoryNotice === "refreshError" ? "state-error" : ""}`}
-                    role={composeDirectoryNotice === "refreshError" ? "alert" : "status"}
-                  >
-                    {t(`compose.directory.${composeDirectoryNotice}`)}
-                  </p>
-                ) : null}
-                {composeAgentsStatus === "error" || composeAgentsStatus === "unauthorized" ? (
-                  <p className="recipient-picker-state state-error" role="alert">{t("compose.recipientsLoadError")}</p>
-                ) : null}
-                {composeAgentsStatus === "ready" && composeAgents.length === 0 ? (
-                  <p className="recipient-picker-state">{t("compose.noRecipients")}</p>
-                ) : null}
-                {composeAgentsStatus === "ready" && composeAgents.length > 0 ? (
+    const composeReady = profileStatus === "ready" && projectsStatus === "ready";
+    const renderRecipientControls = () => (
                   <div className="recipient-picker-controls">
                     <label htmlFor="compose-recipient-search">{t("compose.recipientSearch")}</label>
                     <input
@@ -2701,8 +2640,55 @@ export function App({
                       </ul>
                     )}
                   </div>
-                ) : null}
-              </fieldset>
+    );
+    const renderRecipientPicker = () => (
+      <fieldset className="recipient-picker" aria-describedby="compose-recipients-hint">
+        <legend>{t("compose.recipients")}</legend>
+        <small id="compose-recipients-hint">{t("compose.recipientsHint")}</small>
+        {composeProjectId === "" ? (
+          <p className="recipient-picker-state">{t("compose.chooseRecipientsProject")}</p>
+        ) : null}
+        {composeAgentsStatus === "loading" ? (
+          <output className="recipient-picker-state">{t("compose.loadingRecipients")}</output>
+        ) : null}
+        {composeDirectoryNotice !== null ? (
+          <output
+            className={`recipient-picker-state ${composeDirectoryNotice === "refreshError" ? "state-error" : ""}`}
+            role={composeDirectoryNotice === "refreshError" ? "alert" : undefined}
+          >
+            {t(`compose.directory.${composeDirectoryNotice}`)}
+          </output>
+        ) : null}
+        {composeAgentsStatus === "error" || composeAgentsStatus === "unauthorized" ? (
+          <p className="recipient-picker-state state-error" role="alert">{t("compose.recipientsLoadError")}</p>
+        ) : null}
+        {composeAgentsStatus === "ready" && composeAgents.length === 0 ? (
+          <p className="recipient-picker-state">{t("compose.noRecipients")}</p>
+        ) : null}
+        {composeAgentsStatus === "ready" && composeAgents.length > 0 ? renderRecipientControls() : null}
+      </fieldset>
+    );
+    const renderComposeForm = () => {
+      if (activeProjects.length === 0) {
+        return <p className="state-panel">{t("compose.noProjects")}</p>;
+      }
+      return (
+            <form className="delivery-form settings-card" onSubmit={handleComposeSubmit}>
+              <label htmlFor="compose-project">{t("compose.project")}</label>
+              <select
+                id="compose-project"
+                name="compose-project"
+                value={composeProjectId}
+                onChange={handleComposeProjectChange}
+                required
+                disabled={composeIsSending}
+              >
+                <option value="">{t("compose.chooseProject")}</option>
+                {activeProjects.map((project) => (
+                  <option key={project.id} value={project.id}>{project.human_key}</option>
+                ))}
+              </select>
+              {renderRecipientPicker()}
               <label htmlFor="compose-subject">{t("compose.subject")}</label>
               <input
                 id="compose-subject"
@@ -2779,8 +2765,28 @@ export function App({
                 refreshComposeDelivery,
               )}
             </form>
-          )
+      );
+    };
+    return (
+      <section aria-labelledby="compose-heading">
+        <div className="page-heading">
+          <div>
+            <p className="eyebrow">{t("compose.eyebrow")}</p>
+            <h1 id="compose-heading">{t("compose.title")}</h1>
+            <p>{t("compose.hint")}</p>
+          </div>
+        </div>
+        {profileStatus === "loading" || projectsStatus === "loading" ? (
+          <output className="state-panel">{t("compose.loading")}</output>
         ) : null}
+        {/* Wait for project roles before deciding whether composition is available. */}
+        {composeReady && !canCompose ? (
+          <p className="state-panel state-error" role="alert">{t("compose.forbidden")}</p>
+        ) : null}
+        {profileStatus === "error" || projectsStatus === "error" ? (
+          <p className="state-panel state-error" role="alert">{t("compose.loadError")}</p>
+        ) : null}
+        {composeReady && canCompose ? renderComposeForm() : null}
       </section>
     );
   };
@@ -2795,13 +2801,13 @@ export function App({
         </div>
       </div>
       {reservationsStatus === "loading" ? (
-        <p className="state-panel" role="status">{t("reservations.title")}</p>
+        <output className="state-panel">{t("reservations.title")}</output>
       ) : null}
       {reservationsStatus === "error" ? (
         <p className="state-panel state-error" role="alert">{t("errors.projects")}</p>
       ) : null}
       {reservationsStatus === "unauthorized" ? (
-        <p className="state-panel" role="status">{t("errors.unauthorized")}</p>
+        <output className="state-panel">{t("errors.unauthorized")}</output>
       ) : null}
       {reservationsStatus === "ready" && reservations.length === 0 ? (
         <p className="state-panel">{t("reservations.empty")}</p>
@@ -2845,11 +2851,7 @@ export function App({
                       className="reservation-state"
                       data-state={claim.scope_state}
                     >
-                      {claim.scope_state === "execution_scoped"
-                        ? t("reservations.stateScoped")
-                        : claim.scope_state === "legacy_unscoped"
-                          ? t("reservations.stateLegacy")
-                          : t("reservations.stateOrphaned")}
+                      {t(reservationStateLabels[claim.scope_state])}
                     </span>
                   </td>
                   <td>
@@ -2886,13 +2888,13 @@ export function App({
         ) : null}
       </div>
       {projectsStatus === "loading" ? (
-        <p className="state-panel" role="status">{t("projects.loading")}</p>
+        <output className="state-panel">{t("projects.loading")}</output>
       ) : null}
       {projectsStatus === "error" ? (
         <p className="state-panel state-error" role="alert">{t("errors.projects")}</p>
       ) : null}
       {projectsStatus === "unauthorized" ? (
-        <p className="state-panel" role="status">{t("errors.unauthorized")}</p>
+        <output className="state-panel">{t("errors.unauthorized")}</output>
       ) : null}
       {projectsStatus === "ready" && projects.length === 0 ? (
         <p className="state-panel">{t("projects.empty")}</p>
@@ -2959,13 +2961,13 @@ export function App({
         <span className={`stream-status stream-${streamStatus}`}>{t(`stream.${streamStatus}`)}</span>
       </div>
       {inboxStatus === "loading" ? (
-        <p className="state-panel" role="status">{t("inbox.loading")}</p>
+        <output className="state-panel">{t("inbox.loading")}</output>
       ) : null}
       {inboxStatus === "error" ? (
         <p className="state-panel state-error" role="alert">{t("errors.inbox")}</p>
       ) : null}
       {inboxStatus === "unauthorized" ? (
-        <p className="state-panel" role="status">{t("errors.unauthorized")}</p>
+        <output className="state-panel">{t("errors.unauthorized")}</output>
       ) : null}
       {inboxStatus === "ready" && messages.length === 0 ? (
         <p className="state-panel">{t("inbox.empty")}</p>
@@ -3108,21 +3110,15 @@ export function App({
         <p className="state-panel">{t("search.prompt")}</p>
       ) : null}
       {searchStatus === "loading" ? (
-        <p className="state-panel" role="status">{t("search.loading")}</p>
+        <output className="state-panel">{t("search.loading")}</output>
       ) : null}
       {searchStatus === "error" ? (
         <p className="state-panel state-error" role="alert">
-          {t(
-            searchErrorCode === "invalid"
-              ? "search.invalid"
-              : searchErrorCode === "unavailable"
-                ? "search.unavailable"
-                : "search.error",
-          )}
+          {t(searchErrorLabels[searchErrorCode])}
         </p>
       ) : null}
       {searchStatus === "unauthorized" ? (
-        <p className="state-panel" role="status">{t("errors.unauthorized")}</p>
+        <output className="state-panel">{t("errors.unauthorized")}</output>
       ) : null}
       {searchStatus === "ready" && searchResults.length === 0 ? (
         <p className="state-panel">{t("search.empty")}</p>
@@ -3212,6 +3208,26 @@ export function App({
     });
     const project = projectNames.get(activeRoute.projectId);
     const heading = threadSubject === "" ? activeRoute.threadId : threadSubject;
+    const renderPagination = () => {
+      if (threadStatus !== "ready" || threadNextCursor === null) {
+        return null;
+      }
+      return (
+        <div className="load-more-area">
+          <button
+            type="button"
+            className="primary-button"
+            onClick={() => void handleThreadLoadMore(threadNextCursor, activeRoute)}
+            disabled={threadPaginationStatus === "loading"}
+          >
+            {t(threadPaginationStatus === "loading" ? "inbox.loadingMore" : "inbox.loadMore")}
+          </button>
+          {threadPaginationStatus === "error" ? (
+            <p role="alert">{t("errors.loadMore")}</p>
+          ) : null}
+        </div>
+      );
+    };
     return (
       <section aria-labelledby="thread-heading">
         <a className="back-link" href={inboxHash}>← {t("message.back")}</a>
@@ -3234,7 +3250,7 @@ export function App({
           ) : null}
         </div>
         {threadStatus === "loading" ? (
-          <p className="state-panel" role="status">{t("message.loading")}</p>
+          <output className="state-panel">{t("message.loading")}</output>
         ) : null}
         {threadStatus === "error" ? (
           <p className="state-panel state-error" role="alert">
@@ -3242,7 +3258,7 @@ export function App({
           </p>
         ) : null}
         {threadStatus === "unauthorized" ? (
-          <p className="state-panel" role="status">{t("errors.unauthorized")}</p>
+          <output className="state-panel">{t("errors.unauthorized")}</output>
         ) : null}
         {threadStatus === "ready" && threadMessages.length === 0 ? (
           <p className="state-panel">{t("inbox.empty")}</p>
@@ -3330,64 +3346,20 @@ export function App({
             })}
           </ol>
         ) : null}
-        {threadStatus === "ready" && threadNextCursor !== null ? (
-          <div className="load-more-area">
-            <button
-              type="button"
-              className="primary-button"
-              onClick={() =>
-                void handleThreadLoadMore(threadNextCursor, activeRoute)
-              }
-              disabled={threadPaginationStatus === "loading"}
-            >
-              {t(
-                threadPaginationStatus === "loading"
-                  ? "inbox.loadingMore"
-                  : "inbox.loadMore",
-              )}
-            </button>
-            {threadPaginationStatus === "error" ? (
-              <p role="alert">{t("errors.loadMore")}</p>
-            ) : null}
-          </div>
-        ) : null}
+        {renderPagination()}
       </section>
     );
   };
 
-  const renderMessage = (projectId: number, messageId: number) => {
-    const inboxHash = mailRouteHash({ view: "inbox", projectId });
-    const currentDetail =
-      detail?.project_id === projectId && detail.id === messageId ? detail : null;
-    const detailSender =
-      currentDetail?.sender_display_name ?? currentDetail?.sender_name;
+  const renderMessageDetail = (currentDetail: MessageDetail) => {
+    const detailSender = currentDetail.sender_display_name ?? currentDetail.sender_name;
     const detailSenderIdentity =
-      currentDetail !== null &&
-      detailSender !== undefined &&
       currentDetail.sender !== detailSender
         ? ` · ${currentDetail.sender}`
         : "";
-    const detailThreadId =
-      currentDetail === null
-        ? null
-        : currentDetail.thread_id ?? String(currentDetail.id);
-    const detailThreadHash =
-      currentDetail === null || detailThreadId === null
-        ? null
-        : mailThreadRouteHash(currentDetail.project_id, detailThreadId);
+    const detailThreadId = currentDetail.thread_id ?? String(currentDetail.id);
+    const detailThreadHash = mailThreadRouteHash(currentDetail.project_id, detailThreadId);
     return (
-      <section aria-labelledby="message-heading">
-        <a className="back-link" href={inboxHash}>← {t("message.back")}</a>
-        {detailStatus === "loading" ? (
-          <p className="state-panel" role="status">{t("message.loading")}</p>
-        ) : null}
-        {detailStatus === "error" ? (
-          <p className="state-panel state-error" role="alert">{t("errors.message")}</p>
-        ) : null}
-        {detailStatus === "unauthorized" ? (
-          <p className="state-panel" role="status">{t("errors.unauthorized")}</p>
-        ) : null}
-        {detailStatus === "ready" && currentDetail !== null ? (
           <article className="message-detail">
             <header>
               <p className="eyebrow">{t("message.eyebrow")}</p>
@@ -3419,7 +3391,7 @@ export function App({
                 <p>{t("reply.hint")}</p>
                 <form
                   className="delivery-form"
-                  onSubmit={(event) => void handleReplySubmit(event, currentDetail)}
+                  onSubmit={(event) => handleReplySubmit(event, currentDetail)}
                 >
                   <MarkdownComposer
                     id="reply-body"
@@ -3484,7 +3456,26 @@ export function App({
               </section>
             ) : null}
           </article>
+    );
+  };
+
+  const renderMessage = (projectId: number, messageId: number) => {
+    const inboxHash = mailRouteHash({ view: "inbox", projectId });
+    const currentDetail =
+      detail?.project_id === projectId && detail.id === messageId ? detail : null;
+    return (
+      <section aria-labelledby="message-heading">
+        <a className="back-link" href={inboxHash}>← {t("message.back")}</a>
+        {detailStatus === "loading" ? (
+          <output className="state-panel">{t("message.loading")}</output>
         ) : null}
+        {detailStatus === "error" ? (
+          <p className="state-panel state-error" role="alert">{t("errors.message")}</p>
+        ) : null}
+        {detailStatus === "unauthorized" ? (
+          <output className="state-panel">{t("errors.unauthorized")}</output>
+        ) : null}
+        {detailStatus === "ready" && currentDetail !== null ? renderMessageDetail(currentDetail) : null}
       </section>
     );
   };
@@ -3499,13 +3490,13 @@ export function App({
         </div>
       </div>
       {profileStatus === "loading" ? (
-        <p className="state-panel" role="status">{t("account.loading")}</p>
+        <output className="state-panel">{t("account.loading")}</output>
       ) : null}
       {profileStatus === "error" ? (
         <p className="state-panel state-error" role="alert">{t("account.loadError")}</p>
       ) : null}
       {profileStatus === "unauthorized" ? (
-        <p className="state-panel" role="status">{t("errors.unauthorized")}</p>
+        <output className="state-panel">{t("errors.unauthorized")}</output>
       ) : null}
       {profileStatus === "ready" && profile !== null ? (
         <div className="settings-grid">
@@ -3547,17 +3538,16 @@ export function App({
               >
                 {t("account.saveDisplayName")}
               </button>
-              <p
+              <output
                 id="display-name-status"
                 className="form-status"
-                role="status"
                 aria-live="polite"
                 data-state={profileMutationStatus}
               >
                 {profileMutationMessage[profileMutationStatus] === null
                   ? ""
                   : t(profileMutationMessage[profileMutationStatus])}
-              </p>
+              </output>
             </form>
           </section>
 
@@ -3607,17 +3597,16 @@ export function App({
                   </option>
                 ))}
               </select>
-              <p
+              <output
                 id="correspondence-status"
                 className="form-status"
-                role="status"
                 aria-live="polite"
                 data-state={correspondenceStatus}
               >
                 {correspondenceMessage[correspondenceStatus] === null
                   ? ""
                   : t(correspondenceMessage[correspondenceStatus])}
-              </p>
+              </output>
             </div>
           </section>
 
@@ -3683,16 +3672,15 @@ export function App({
               >
                 {t("account.changePassword")}
               </button>
-              <p
+              <output
                 className="form-status"
-                role="status"
                 aria-live="polite"
                 data-state={passwordStatus}
               >
                 {passwordMessage[passwordStatus] === null
                   ? ""
                   : t(passwordMessage[passwordStatus])}
-              </p>
+              </output>
             </form>
           </section>
         </div>
@@ -3700,51 +3688,17 @@ export function App({
     </section>
   );
 
-  const renderAdmin = () => {
-    const profileIsAdmin = profile?.global_role === "admin";
+  const renderAdminContents = (snapshot: AdminAccessSnapshot) => {
     const selectedUserReadOnly =
       selectedAdminUser?.disabled === true ||
       selectedAdminUser?.global_role === "admin";
     return (
-      <section aria-labelledby="admin-heading">
-        <div className="page-heading">
-          <div>
-            <p className="eyebrow">{t("admin.eyebrow")}</p>
-            <h1 id="admin-heading">{t("admin.title")}</h1>
-            <p>{t("admin.hint")}</p>
-          </div>
-        </div>
-        {profileStatus === "loading" ? (
-          <p className="state-panel" role="status">{t("account.loading")}</p>
-        ) : null}
-        {profileStatus === "error" ? (
-          <p className="state-panel state-error" role="alert">{t("account.loadError")}</p>
-        ) : null}
-        {profileStatus === "unauthorized" ? (
-          <p className="state-panel" role="status">{t("errors.unauthorized")}</p>
-        ) : null}
-        {profileStatus === "ready" && !profileIsAdmin ? (
-          <p className="state-panel state-error" role="alert">{t("admin.forbidden")}</p>
-        ) : null}
-        {profileStatus === "ready" && profileIsAdmin && adminStatus === "loading" ? (
-          <p className="state-panel" role="status">{t("admin.loading")}</p>
-        ) : null}
-        {profileStatus === "ready" && profileIsAdmin && adminStatus === "error" ? (
-          <p className="state-panel state-error" role="alert">{t("admin.loadError")}</p>
-        ) : null}
-        {profileStatus === "ready" && profileIsAdmin && adminStatus === "unauthorized" ? (
-          <p className="state-panel" role="status">{t("errors.unauthorized")}</p>
-        ) : null}
-        {profileStatus === "ready" &&
-        profileIsAdmin &&
-        adminStatus === "ready" &&
-        adminSnapshot !== null ? (
           <div className="admin-layout">
             <section className="settings-card admin-people" aria-labelledby="people-heading">
               <h2 id="people-heading">{t("admin.usersTitle")}</h2>
-              {adminSnapshot.users.length === 0 ? <p>{t("admin.usersEmpty")}</p> : null}
+              {snapshot.users.length === 0 ? <p>{t("admin.usersEmpty")}</p> : null}
               <ul className="admin-user-list">
-                {adminSnapshot.users.map((user) => {
+                {snapshot.users.map((user) => {
                   const label = user.display_name ?? user.username;
                   return (
                     <li key={user.id}>
@@ -3760,13 +3714,7 @@ export function App({
                         <strong>{label}</strong>
                         {label === user.username ? null : <small>{user.username}</small>}
                         <span>
-                          {t(
-                            user.disabled
-                              ? "admin.disabled"
-                              : user.global_role === "admin"
-                                ? "admin.administrator"
-                                : "admin.member",
-                          )}
+                          {t(adminUserStatusLabel(user))}
                         </span>
                       </button>
                     </li>
@@ -3789,11 +3737,11 @@ export function App({
                   {selectedUserReadOnly ? (
                     <p className="readonly-notice">{t("admin.readOnly")}</p>
                   ) : null}
-                  {adminSnapshot.projects.length === 0 ? (
+                  {snapshot.projects.length === 0 ? (
                     <p>{t("admin.projectsEmpty")}</p>
                   ) : (
                     <ul className="assignment-list">
-                      {adminSnapshot.projects.map((project) => {
+                      {snapshot.projects.map((project) => {
                         const assignment = selectedAdminUser.assignments.find(
                           (candidate) => candidate.project_id === project.id,
                         );
@@ -3821,7 +3769,7 @@ export function App({
                                     selectedAdminUser,
                                     project,
                                     value === "" ? null : (value as AssignmentRole),
-                                    adminSnapshot,
+                                    snapshot,
                                   );
                                 }}
                               >
@@ -3835,9 +3783,8 @@ export function App({
                       })}
                     </ul>
                   )}
-                  <p
+                  <output
                     className="form-status"
-                    role="status"
                     aria-live="polite"
                     data-state={adminMutationStatus}
                   >
@@ -3846,14 +3793,77 @@ export function App({
                       : t(adminMutationMessage[adminMutationStatus], {
                           project: adminMutationProject,
                         })}
-                  </p>
+                  </output>
                 </>
               )}
             </section>
           </div>
+    );
+  };
+
+  const renderAdmin = () => {
+    const profileIsAdmin = profile?.global_role === "admin";
+    const adminAllowed = profileStatus === "ready" && profileIsAdmin;
+    return (
+      <section aria-labelledby="admin-heading">
+        <div className="page-heading">
+          <div>
+            <p className="eyebrow">{t("admin.eyebrow")}</p>
+            <h1 id="admin-heading">{t("admin.title")}</h1>
+            <p>{t("admin.hint")}</p>
+          </div>
+        </div>
+        {profileStatus === "loading" ? (
+          <output className="state-panel">{t("account.loading")}</output>
         ) : null}
+        {profileStatus === "error" ? (
+          <p className="state-panel state-error" role="alert">{t("account.loadError")}</p>
+        ) : null}
+        {profileStatus === "unauthorized" ? (
+          <output className="state-panel">{t("errors.unauthorized")}</output>
+        ) : null}
+        {profileStatus === "ready" && !profileIsAdmin ? (
+          <p className="state-panel state-error" role="alert">{t("admin.forbidden")}</p>
+        ) : null}
+        {adminAllowed && adminStatus === "loading" ? (
+          <output className="state-panel">{t("admin.loading")}</output>
+        ) : null}
+        {adminAllowed && adminStatus === "error" ? (
+          <p className="state-panel state-error" role="alert">{t("admin.loadError")}</p>
+        ) : null}
+        {adminAllowed && adminStatus === "unauthorized" ? (
+          <output className="state-panel">{t("errors.unauthorized")}</output>
+        ) : null}
+        {adminAllowed && adminStatus === "ready" && adminSnapshot !== null
+          ? renderAdminContents(adminSnapshot)
+          : null}
       </section>
     );
+  };
+
+  const renderRoute = () => {
+    switch (route.view) {
+      case "projects":
+        return renderProjects();
+      case "inbox":
+        return renderInbox();
+      case "search":
+        return renderSearch(route);
+      case "reservations":
+        return renderReservations();
+      case "compose":
+        return renderCompose();
+      case "agents":
+        return renderAgentSettings();
+      case "message":
+        return renderMessage(route.projectId, route.messageId);
+      case "thread":
+        return renderThread(route);
+      case "account":
+        return renderAccount();
+      case "admin":
+        return renderAdmin();
+    }
   };
 
   return (
@@ -3912,15 +3922,14 @@ export function App({
               )}
               onSelect={(nextLocale) => void handleLocaleChange(nextLocale)}
             />
-            <small
+            <output
               id="locale-preference-status"
               className="locale-hint"
               data-state={preferenceStatus}
-              role="status"
               aria-live="polite"
             >
               {t(preferenceStatusKey[preferenceStatus])}
-            </small>
+            </output>
           </div>
           <form className="logout-form" action="/mail/logout" method="post">
             <button className="logout-button" type="submit">
@@ -3960,18 +3969,7 @@ export function App({
         </aside>
 
         <main id="main-content" className="content">
-          {route.view === "projects" ? renderProjects() : null}
-          {route.view === "inbox" ? renderInbox() : null}
-          {route.view === "search" ? renderSearch(route) : null}
-          {route.view === "reservations" ? renderReservations() : null}
-          {route.view === "compose" ? renderCompose() : null}
-          {route.view === "agents" ? renderAgentSettings() : null}
-          {route.view === "message"
-            ? renderMessage(route.projectId, route.messageId)
-            : null}
-          {route.view === "thread" ? renderThread(route) : null}
-          {route.view === "account" ? renderAccount() : null}
-          {route.view === "admin" ? renderAdmin() : null}
+          {renderRoute()}
         </main>
       </div>
     </div>

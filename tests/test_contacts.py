@@ -76,7 +76,8 @@ async def test_contacts_only_requires_approval_then_allows(isolated_env):
             },
         )
         deliveries_first = first.data.get("deliveries") or []
-        assert deliveries_first and deliveries_first[0]["message"]["subject"] == "Ping"
+        assert deliveries_first
+        assert deliveries_first[0]["message"]["subject"] == "Ping"
 
         ok = await client.call_tool(
             "send_message",
@@ -90,7 +91,8 @@ async def test_contacts_only_requires_approval_then_allows(isolated_env):
             },
         )
         deliveries = ok.data.get("deliveries") or []
-        assert deliveries and deliveries[0]["message"]["subject"] == "AfterApproval"
+        assert deliveries
+        assert deliveries[0]["message"]["subject"] == "AfterApproval"
 
 
 @pytest.mark.asyncio
@@ -142,7 +144,8 @@ async def test_contact_auto_allows_recent_overlapping_file_reservations(isolated
             },
         )
         deliveries = ok.data.get("deliveries") or []
-        assert deliveries and deliveries[0]["message"]["subject"] == "OverlapOK"
+        assert deliveries
+        assert deliveries[0]["message"]["subject"] == "OverlapOK"
 
 
 @pytest.mark.asyncio

@@ -1349,7 +1349,8 @@ def test_scrub_snapshot_archive_preset_preserves_runtime_state(tmp_path: Path) -
     subject, body, attachments = _read_message(snapshot)
     assert "sk-" in subject
     assert "bearer" in body.lower()
-    assert attachments and "download_url" in attachments[0]
+    assert attachments
+    assert "download_url" in attachments[0]
 
 
 def test_scrub_snapshot_invalid_attachments_json(tmp_path: Path) -> None:
@@ -1926,7 +1927,8 @@ def test_share_export_chunking_and_viewer_data(monkeypatch, tmp_path: Path) -> N
     messages_json = viewer_data_dir / "messages.json"
     assert messages_json.is_file()
     messages = json.loads(messages_json.read_text())
-    assert messages and messages[0]["subject"]
+    assert messages
+    assert messages[0]["subject"]
 
     manifest = json.loads((output_dir / "manifest.json").read_text())
     assert manifest["database"]["chunked"] is True

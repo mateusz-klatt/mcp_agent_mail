@@ -13,7 +13,7 @@ from collections.abc import Generator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Optional, cast
+from typing import Any, Optional
 
 from rich import box
 from rich.align import Align
@@ -32,6 +32,12 @@ from rich.tree import Tree
 # Force truecolor to ensure vivid themes and consistent styling in real TTYs
 # and exec'd foreground runs; enable soft wrap for wide panels.
 console = Console(stderr=True, force_terminal=True, color_system="truecolor", soft_wrap=True)
+
+_SUCCESS_STYLE = "bold bright_green"
+_INFO_STYLE = "bold bright_cyan"
+_TITLE_STYLE = "bold bright_white"
+_WARNING_STYLE = "bold bright_yellow"
+_TABLE_HEADER_STYLE = "bold bright_white on bright_blue"
 
 
 @dataclass
@@ -108,7 +114,7 @@ def _create_info_table(ctx: ToolCallContext) -> Table:
         show_edge=False,
     )
     table.add_column("Icon", style="bold", width=3, no_wrap=True)
-    table.add_column("Key", style="bold bright_yellow", width=17)
+    table.add_column("Key", style=_WARNING_STYLE, width=17)
     table.add_column("Value", style="white", overflow="fold")
 
     # Add rows with icons
@@ -125,7 +131,7 @@ def _create_info_table(ctx: ToolCallContext) -> Table:
     if ctx.end_time:
         # Duration with gradient colors
         if ctx.duration_ms < 50:
-            duration_style = "bold bright_green"
+            duration_style = _SUCCESS_STYLE
             duration_icon = "⚡"
         elif ctx.duration_ms < 100:
             duration_style = "bold green"
@@ -134,7 +140,7 @@ def _create_info_table(ctx: ToolCallContext) -> Table:
             duration_style = "bold yellow"
             duration_icon = "⏱"
         elif ctx.duration_ms < 1000:
-            duration_style = "bold bright_yellow"
+            duration_style = _WARNING_STYLE
             duration_icon = "⏱"
         else:
             duration_style = "bold red"
@@ -187,7 +193,7 @@ def _create_params_display(ctx: ToolCallContext) -> Panel | None:
         "json",
         theme="dracula",
         border_style="bright_blue",
-        title_style="bold bright_white",
+        title_style=_TITLE_STYLE,
     )
 
 
@@ -222,7 +228,7 @@ def _create_result_display(ctx: ToolCallContext) -> Panel:
         "json",
         theme="dracula",
         border_style="bright_green",
-        title_style="bold bright_white",
+        title_style=_TITLE_STYLE,
     )
 
 
@@ -235,12 +241,12 @@ def _create_query_stats_panel(stats: dict[str, Any]) -> Panel | None:
     table = Table(
         title="DB Query Breakdown",
         show_header=True,
-        header_style="bold bright_cyan",
+        header_style=_INFO_STYLE,
         box=box.SIMPLE_HEAVY,
         border_style="bright_cyan",
     )
     table.add_column("Table", style="white", overflow="fold")
-    table.add_column("Count", style="bold bright_green", justify="right")
+    table.add_column("Count", style=_SUCCESS_STYLE, justify="right")
     for name, count in list(per_table.items())[:5]:
         table.add_row(str(name), str(count))
 
@@ -260,20 +266,33 @@ def _create_query_stats_panel(stats: dict[str, Any]) -> Panel | None:
     return Panel(table, border_style="bright_cyan", box=box.ROUNDED)
 
 
+def _format_duration(duration_ms: float) -> str:
+    """Style elapsed time consistently across summary tables."""
+    if duration_ms < 50:
+        return f"[bold bright_green]⚡ {duration_ms:.2f}ms[/bold bright_green]"
+    if duration_ms < 100:
+        return f"[bold green]⚡ {duration_ms:.2f}ms[/bold green]"
+    if duration_ms < 500:
+        return f"[bold yellow]⏱ {duration_ms:.2f}ms[/bold yellow]"
+    if duration_ms < 1000:
+        return f"[bold bright_yellow]⏱ {duration_ms:.2f}ms[/bold bright_yellow]"
+    return f"[bold red]🐌 {duration_ms:.2f}ms[/bold red]"
+
+
 def _create_tool_call_summary_table(ctx: ToolCallContext) -> Table:
     """Create a compact summary table for tool calls."""
     table = Table(
         box=box.DOUBLE_EDGE,
         border_style="bright_cyan",
         show_header=True,
-        header_style="bold bright_white on bright_blue",
+        header_style=_TABLE_HEADER_STYLE,
         title="[bold bright_yellow]⚡ MCP Tool Call Summary[/bold bright_yellow]",
         title_style="bold",
         padding=(0, 1),
         show_edge=True,
     )
 
-    table.add_column("Field", style="bold bright_cyan", width=15, no_wrap=True)
+    table.add_column("Field", style=_INFO_STYLE, width=15, no_wrap=True)
     table.add_column("Value", style="white", overflow="fold")
 
     # Tool name with icon
@@ -289,19 +308,7 @@ def _create_tool_call_summary_table(ctx: ToolCallContext) -> Table:
     table.add_row("🕐 Started", f"[dim]{ctx.timestamp}[/dim]")
 
     if ctx.end_time:
-        # Duration with gradient styling
-        if ctx.duration_ms < 50:
-            duration_display = f"[bold bright_green]⚡ {ctx.duration_ms:.2f}ms[/bold bright_green]"
-        elif ctx.duration_ms < 100:
-            duration_display = f"[bold green]⚡ {ctx.duration_ms:.2f}ms[/bold green]"
-        elif ctx.duration_ms < 500:
-            duration_display = f"[bold yellow]⏱ {ctx.duration_ms:.2f}ms[/bold yellow]"
-        elif ctx.duration_ms < 1000:
-            duration_display = f"[bold bright_yellow]⏱ {ctx.duration_ms:.2f}ms[/bold bright_yellow]"
-        else:
-            duration_display = f"[bold red]🐌 {ctx.duration_ms:.2f}ms[/bold red]"
-
-        table.add_row("⏱ Duration", duration_display)
+        table.add_row("⏱ Duration", _format_duration(ctx.duration_ms))
 
         # Status with enhanced visual indicator
         if ctx.success:
@@ -504,7 +511,7 @@ def tool_call_logger(
 
 def log_info(message: str, **kwargs: Any) -> None:
     """Log an informational message with Rich formatting."""
-    text = Text(f"ℹ️  {message}", style="bold bright_cyan")  # noqa: RUF001
+    text = Text(f"ℹ️  {message}", style=_INFO_STYLE)  # noqa: RUF001
     if kwargs:
         details = _safe_json_format(kwargs, max_length=500)
         syntax = Syntax(details, "json", theme="dracula", line_numbers=False, word_wrap=True)
@@ -523,7 +530,7 @@ def log_info(message: str, **kwargs: Any) -> None:
 
 def log_warning(message: str, **kwargs: Any) -> None:
     """Log a warning message with Rich formatting."""
-    text = Text(f"⚠️  {message}", style="bold bright_yellow")
+    text = Text(f"⚠️  {message}", style=_WARNING_STYLE)
     if kwargs:
         details = _safe_json_format(kwargs, max_length=500)
         syntax = Syntax(details, "json", theme="monokai", line_numbers=False, word_wrap=True)
@@ -565,7 +572,7 @@ def log_error(message: str, error: Optional[Exception] = None, **kwargs: Any) ->
 
 def log_success(message: str, **kwargs: Any) -> None:
     """Log a success message with Rich formatting."""
-    text = Text(f"✅ {message}", style="bold bright_green")
+    text = Text(f"✅ {message}", style=_SUCCESS_STYLE)
     if kwargs:
         details = _safe_json_format(kwargs, max_length=500)
         syntax = Syntax(details, "json", theme="dracula", line_numbers=False, word_wrap=True)
@@ -580,6 +587,21 @@ def log_success(message: str, **kwargs: Any) -> None:
         console.print(panel)
     else:
         console.print(text)
+
+
+def _add_startup_settings(branch: Tree, values: Any) -> None:
+    """Render one configuration section while masking credential values."""
+    if not isinstance(values, dict):
+        branch.add(f"[white]{escape(str(values))}[/white]")
+        return
+    for key, value in values.items():
+        if any(fragment in key.lower() for fragment in ("token", "secret", "password")):
+            display_value = "[dim red]●●●●●●●●[/dim red]" if value else "[dim]not set[/dim]"
+            key_style = "bright_red"
+        else:
+            display_value = escape(str(value))
+            key_style = "bright_yellow"
+        branch.add(f"[{key_style}]{key}[/{key_style}]: [white]{display_value}[/white]")
 
 
 def create_startup_panel(config: dict[str, Any]) -> Panel:
@@ -603,19 +625,7 @@ def create_startup_panel(config: dict[str, Any]) -> Panel:
         section_icon = icon_map.get(section.lower(), "⚙️")
         section_branch = tree.add(f"{section_icon} [bold bright_cyan]{section}[/bold bright_cyan]")
 
-        if isinstance(values, dict):
-            for key, value in values.items():
-                # Mask sensitive values
-                if "token" in key.lower() or "secret" in key.lower() or "password" in key.lower():
-                    display_value = "[dim red]●●●●●●●●[/dim red]" if value else "[dim]not set[/dim]"
-                    key_style = "bright_red"
-                else:
-                    display_value = escape(str(value))
-                    key_style = "bright_yellow"
-
-                section_branch.add(f"[{key_style}]{key}[/{key_style}]: [white]{display_value}[/white]")
-        else:
-            section_branch.add(f"[white]{escape(str(values))}[/white]")
+        _add_startup_settings(section_branch, values)
 
     return Panel(
         tree,
@@ -634,11 +644,11 @@ def create_metadata_table(metadata: dict[str, Any], title: str = "Metadata") -> 
         box=box.ROUNDED,
         border_style="bright_cyan",
         show_header=True,
-        header_style="bold bright_white on bright_blue",
+        header_style=_TABLE_HEADER_STYLE,
         padding=(0, 1),
     )
 
-    table.add_column("Property", style="bold bright_yellow", width=20)
+    table.add_column("Property", style=_WARNING_STYLE, width=20)
     table.add_column("Value", style="white", overflow="fold")
 
     for key, value in metadata.items():
@@ -657,36 +667,36 @@ def create_metadata_table(metadata: dict[str, Any], title: str = "Metadata") -> 
     return table
 
 
+def _add_tree_items(parent: Tree, items: dict[str, Any] | list[Any]) -> None:
+    """Recursively append keyed fields or indexed list entries."""
+    if isinstance(items, dict):
+        for key, value in items.items():
+            _add_tree_field(parent, key, value)
+        return
+    for index, item in enumerate(items):
+        if isinstance(item, (dict, list)):
+            branch = parent.add(f"[dim]{index}[/dim]")
+            _add_tree_items(branch, item)
+        else:
+            parent.add(f"[dim]{index}:[/dim] [white]{escape(str(item))}[/white]")
+
+
+def _add_tree_field(parent: Tree, key: str, value: Any) -> None:
+    label = escape(str(key))
+    if isinstance(value, dict):
+        branch = parent.add(f"[bold bright_cyan]{label}[/bold bright_cyan]")
+        _add_tree_items(branch, value)
+    elif isinstance(value, list):
+        branch = parent.add(f"[bold bright_magenta]{label}[/bold bright_magenta] [dim](list)[/dim]")
+        _add_tree_items(branch, value)
+    else:
+        parent.add(f"[bright_yellow]{label}[/bright_yellow]: [white]{escape(str(value))}[/white]")
+
+
 def create_data_tree(data: dict[str, Any], root_label: str = "Data") -> Tree:
     """Create a rich tree view for nested data structures."""
     tree = Tree(f"[bold bright_white]{root_label}[/bold bright_white]")
-
-    def add_items(parent: Tree, items: dict[str, Any] | list[Any]) -> None:
-        """Recursively add items to the tree."""
-        if isinstance(items, dict):
-            for key, value in items.items():
-                if isinstance(value, dict):
-                    branch = parent.add(f"[bold bright_cyan]{escape(str(key))}[/bold bright_cyan]")
-                    add_items(branch, value)
-                elif isinstance(value, list):
-                    branch = parent.add(f"[bold bright_magenta]{escape(str(key))}[/bold bright_magenta] [dim](list)[/dim]")
-                    for i, item in enumerate(value):
-                        if isinstance(item, (dict, list)):
-                            subbranch = branch.add(f"[dim]{i}[/dim]")
-                            add_items(subbranch, cast(dict[str, Any] | list[Any], item))
-                        else:
-                            branch.add(f"[dim]{i}:[/dim] [white]{escape(str(item))}[/white]")
-                else:
-                    parent.add(f"[bright_yellow]{escape(str(key))}[/bright_yellow]: [white]{escape(str(value))}[/white]")
-        elif isinstance(items, list):
-            for i, item in enumerate(items):
-                if isinstance(item, (dict, list)):
-                    branch = parent.add(f"[dim]{i}[/dim]")
-                    add_items(branch, item)
-                else:
-                    parent.add(f"[dim]{i}:[/dim] [white]{escape(str(item))}[/white]")
-
-    add_items(tree, data)
+    _add_tree_items(tree, data)
     return tree
 
 
@@ -708,16 +718,16 @@ def log_message_with_metadata(
 
     # Add message header
     if message_type == "success":
-        header = Text(f"✅ {message}", style="bold bright_green")
+        header = Text(f"✅ {message}", style=_SUCCESS_STYLE)
         border_style = "bright_green"
     elif message_type == "warning":
-        header = Text(f"⚠️  {message}", style="bold bright_yellow")
+        header = Text(f"⚠️  {message}", style=_WARNING_STYLE)
         border_style = "bright_yellow"
     elif message_type == "error":
         header = Text(f"❌ {message}", style="bold bright_red")
         border_style = "bright_red"
     else:
-        header = Text(f"ℹ️  {message}", style="bold bright_cyan")  # noqa: RUF001
+        header = Text(f"ℹ️  {message}", style=_INFO_STYLE)  # noqa: RUF001
         border_style = "bright_cyan"
 
     components.append(header)
@@ -782,7 +792,7 @@ def display_startup_banner(settings: Any, host: str, port: int, path: str) -> No
     ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
     """
 
-    console.print(Text(mail_art, style="bold bright_cyan"))
+    console.print(Text(mail_art, style=_INFO_STYLE))
     console.print()
 
     # Get database statistics
@@ -793,11 +803,11 @@ def display_startup_banner(settings: Any, host: str, port: int, path: str) -> No
         box=box.ROUNDED,
         border_style="bright_blue",
         show_header=True,
-        header_style="bold bright_white on bright_blue",
+        header_style=_TABLE_HEADER_STYLE,
         title="[bold bright_yellow]🚀 Server Configuration[/bold bright_yellow]",
         padding=(0, 1),
     )
-    server_table.add_column("Setting", style="bold bright_cyan", width=18)
+    server_table.add_column("Setting", style=_INFO_STYLE, width=18)
     server_table.add_column("Value", style="white", overflow="fold")
 
     server_table.add_row("🌍 Environment", f"[bold bright_green]{settings.environment}[/bold bright_green]")
@@ -822,7 +832,7 @@ def display_startup_banner(settings: Any, host: str, port: int, path: str) -> No
         title="[bold bright_yellow]📊 Database Statistics[/bold bright_yellow]",
         padding=(0, 1),
     )
-    stats_table.add_column("Resource", style="bold bright_cyan", width=18)
+    stats_table.add_column("Resource", style=_INFO_STYLE, width=18)
     stats_table.add_column("Count", style="bright_yellow", justify="right")
 
     stats_table.add_row("📦 Projects", f"[bold bright_green]{db_stats['projects']}[/bold bright_green]")
@@ -844,7 +854,7 @@ def display_startup_banner(settings: Any, host: str, port: int, path: str) -> No
 
     link_style = Style(bold=True, color="bright_cyan", link=ui_url)
     ui_text = Text()
-    ui_text.append("Open the Web UI to view all agent messages:\n", style="bold bright_white")
+    ui_text.append("Open the Web UI to view all agent messages:\n", style=_TITLE_STYLE)
     ui_text.append(ui_url, style=link_style)
     ui_text.append("\n\n", style="white")
     ui_text.append("Tip: Per-agent inbox: ", style="dim")
@@ -888,14 +898,14 @@ def display_startup_banner(settings: Any, host: str, port: int, path: str) -> No
     # Success message
     if settings.tools_log_enabled:
         success_msg = Text()
-        success_msg.append("✅ ", style="bold bright_green")
-        success_msg.append("Rich Logging ENABLED", style="bold bright_white")
+        success_msg.append("✅ ", style=_SUCCESS_STYLE)
+        success_msg.append("Rich Logging ENABLED", style=_TITLE_STYLE)
         success_msg.append(" — All MCP tool calls will be displayed with ", style="white")
-        success_msg.append("beautiful panels", style="bold bright_cyan")
+        success_msg.append("beautiful panels", style=_INFO_STYLE)
         success_msg.append(", ", style="white")
         success_msg.append("syntax highlighting", style="bold bright_magenta")
         success_msg.append(", and ", style="white")
-        success_msg.append("performance metrics", style="bold bright_yellow")
+        success_msg.append("performance metrics", style=_WARNING_STYLE)
         success_msg.append("! 🎨✨", style="white")
 
         console.print(Panel(

@@ -2707,13 +2707,12 @@ class TestMailUiPreferences:
         assert int(columns["preferred_correspondence_locale"][3]) == 0
 
         async with get_session() as session:
+            invalid_locale_update = text(
+                "UPDATE ui_users SET preferred_ui_locale = 'zz' "
+                "WHERE username = 'raw-defaults'"
+            )
             with pytest.raises(IntegrityError, match="invalid preferred_ui_locale"):
-                await session.execute(
-                    text(
-                        "UPDATE ui_users SET preferred_ui_locale = 'zz' "
-                        "WHERE username = 'raw-defaults'"
-                    )
-                )
+                await session.execute(invalid_locale_update)
 
     @pytest.mark.asyncio
     async def test_get_returns_stored_and_effective_defaults(self, isolated_env, monkeypatch):

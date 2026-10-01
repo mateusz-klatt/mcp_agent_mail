@@ -537,11 +537,12 @@ async def test_window_persists_but_cannot_authenticate_a_new_session(isolated_en
     # but must still prove the durable Agent credential. This is especially
     # important for HTTP, where unrelated clients share one server process.
     async with Client(server) as client:
+        project_key = pkey("test/window")
         with pytest.raises(ToolError, match="requires registration_token"):
             await client.call_tool(
                 "register_agent",
                 {
-                    "project_key": pkey("test/window"),
+                    "project_key": project_key,
                     "program": "session-2",
                     "model": "test",
                     "name": WINDOW_PERSIST_AGENT,

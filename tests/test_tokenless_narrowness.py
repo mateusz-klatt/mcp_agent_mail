@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import pytest
 from fastmcp import Client
+from fastmcp.exceptions import ToolError
 from sqlalchemy import text
 
 from mcp_agent_mail.app import build_mcp_server
@@ -106,7 +107,7 @@ async def test_a_peer_may_not_speak_as_a_tokenless_agent(isolated_env):
     peer = await _seed(server)
     async with Client(server) as bystander:
         await _bind(bystander, KEY, PEER_AGENT, peer["registration_token"])
-        with pytest.raises(Exception) as refused:
+        with pytest.raises(ToolError, match="does not have a registration token") as refused:
             await bystander.call_tool(
                 "send_message",
                 {
@@ -143,7 +144,7 @@ async def test_a_peer_in_another_project_may_not_retire_it(isolated_env):
         await _bind(
             stranger, OTHER_KEY, OUTSIDER_AGENT, outsider["registration_token"]
         )
-        with pytest.raises(Exception) as refused:
+        with pytest.raises(ToolError, match="does not have a registration token") as refused:
             await stranger.call_tool(
                 "retire_agent", {"project_key": KEY, "agent_name": TOKENLESS_AGENT}
             )
@@ -164,7 +165,7 @@ async def test_an_unauthenticated_session_may_not_retire_it(isolated_env):
     server = build_mcp_server()
     await _seed(server)
     async with Client(server) as anonymous:
-        with pytest.raises(Exception) as refused:
+        with pytest.raises(ToolError, match="does not have a registration token") as refused:
             await anonymous.call_tool(
                 "retire_agent", {"project_key": KEY, "agent_name": TOKENLESS_AGENT}
             )
@@ -197,7 +198,7 @@ async def test_cleaning_up_a_tokenless_agent_does_not_become_it(isolated_env):
         )
 
         # ...and walking through it did not make this session that agent
-        with pytest.raises(Exception) as refused:
+        with pytest.raises(ToolError, match="does not have a registration token") as refused:
             await bystander.call_tool(
                 "send_message",
                 {

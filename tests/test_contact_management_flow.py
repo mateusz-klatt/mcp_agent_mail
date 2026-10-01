@@ -305,7 +305,8 @@ async def test_request_without_a_reason_still_explains_itself(mail, duo):
     )
 
     body = opened.data["notification_message"]["message"]["body_md"]
-    assert sender in body and receiver in body
+    assert sender in body
+    assert receiver in body
 
 
 async def test_request_window_matches_the_requested_ttl(mail, duo):
@@ -406,7 +407,8 @@ async def test_repeat_request_never_shortens_an_open_window(mail, duo):
         },
     )
     opened = await stored_link(HOME, sender, receiver)
-    assert opened is not None and opened["expires_ts"] is not None
+    assert opened is not None
+    assert opened["expires_ts"] is not None
 
     second = await mail.call_tool(
         "request_contact",
@@ -500,7 +502,8 @@ async def test_repeat_request_leaves_a_live_approval_approved(mail, duo):
         },
     )
     approved = await stored_link(HOME, sender, receiver)
-    assert approved is not None and approved["expires_ts"] is not None
+    assert approved is not None
+    assert approved["expires_ts"] is not None
 
     repeated = await mail.call_tool(
         "request_contact",

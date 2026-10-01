@@ -14,16 +14,20 @@ async def test_tooling_resources_and_recent(isolated_env):
         await client.call_tool("health_check", {})
         # directory
         d = await client.read_resource("resource://tooling/directory")
-        assert d and "metrics" in (d[0].text or "")
+        assert d
+        assert "metrics" in (d[0].text or "")
         # metrics
         m = await client.read_resource("resource://tooling/metrics")
-        assert m and "health_check" in (m[0].text or "")
+        assert m
+        assert "health_check" in (m[0].text or "")
         # capabilities for unknown agent -> []
         c = await client.read_resource("resource://tooling/capabilities/Someone")
-        assert c and "[]" in (c[0].text or "[]")
+        assert c
+        assert "[]" in (c[0].text or "[]")
         # recent window
         r = await client.read_resource("resource://tooling/recent/5")
-        assert r and "tool" in (r[0].text or "")
+        assert r
+        assert "tool" in (r[0].text or "")
 
 
 @pytest.mark.asyncio
@@ -62,4 +66,5 @@ async def test_ack_views_resources(isolated_env):
             "resource://outbox/codex-wsl-tooling-views-1?project=Backend",
         ]:
             blocks = await client.read_resource(uri)
-            assert blocks and isinstance(blocks[0].text, str)
+            assert blocks
+            assert isinstance(blocks[0].text, str)

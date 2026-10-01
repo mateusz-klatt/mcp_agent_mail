@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import pathlib
 
-from pytest import approx, mark, raises
+import pytest
 
 from mcp_agent_mail import config as config_module, db as db_module, utils as utils_module
 
@@ -44,7 +44,7 @@ def _refusal_for(monkeypatch, variable: str, written: str) -> str:
     """The ConfigError text produced when ``variable`` holds an unparseable value."""
     monkeypatch.setenv(variable, written)
     config_module.clear_settings_cache()
-    with raises(config_module.ConfigError) as refusal:
+    with pytest.raises(config_module.ConfigError) as refusal:
         config_module.get_settings()
     return str(refusal.value)
 
@@ -81,7 +81,7 @@ def test_explicit_values_reach_settings_in_their_typed_form(monkeypatch):
     )
     assert settings.http.port == 9999
     assert settings.http.rate_limit_enabled is True
-    assert settings.llm.temperature == approx(0.7)
+    assert settings.llm.temperature == pytest.approx(0.7)
     assert settings.http.rate_limit_backend == "redis"
 
 
@@ -103,7 +103,7 @@ def test_an_absent_variable_takes_the_compiled_default(monkeypatch):
     assert config_module.get_settings().database.pool_size == 50
 
 
-@mark.parametrize("git_sha", (BUILD_SHA_1, BUILD_SHA_256))
+@pytest.mark.parametrize("git_sha", (BUILD_SHA_1, BUILD_SHA_256))
 def test_build_commit_accepts_only_full_lowercase_object_ids(monkeypatch, git_sha):
     settings = _settings_from(monkeypatch, **{BUILD_COMMIT_VARIABLE: git_sha})
     assert settings.build_commit == git_sha
@@ -121,7 +121,7 @@ def test_absent_build_commit_means_provenance_is_unavailable(tmp_path, monkeypat
     assert config_module.get_settings().build_commit is None
 
 
-@mark.parametrize(
+@pytest.mark.parametrize(
     "written",
     (
         "a" * 39,
@@ -157,7 +157,7 @@ UNPARSEABLE_SETTINGS = (
 )
 
 
-@mark.parametrize(("variable", "written", "also_reported"), UNPARSEABLE_SETTINGS)
+@pytest.mark.parametrize(("variable", "written", "also_reported"), UNPARSEABLE_SETTINGS)
 def test_an_unparseable_value_stops_startup_naming_its_variable(monkeypatch, variable, written, also_reported):
     message = _refusal_for(monkeypatch, variable, written)
     assert variable in message
@@ -199,7 +199,7 @@ SQLITE_URLS = (
 )
 
 
-@mark.parametrize("database_url", SQLITE_URLS)
+@pytest.mark.parametrize("database_url", SQLITE_URLS)
 def test_every_sqlite_spelling_passes_the_backend_guard(database_url):
     # Returning at all is the assertion: this guard speaks only by raising.
     assert db_module._assert_supported_backend(database_url) is None
@@ -208,7 +208,7 @@ def test_every_sqlite_spelling_passes_the_backend_guard(database_url):
 UNREADABLE_URLS = ("", "this is not a url")
 
 
-@mark.parametrize("database_url", UNREADABLE_URLS)
+@pytest.mark.parametrize("database_url", UNREADABLE_URLS)
 def test_a_string_that_is_not_a_url_is_left_for_the_engine_to_report(database_url):
     # Backend policy has nothing to say about a value it cannot parse, and two
     # components reporting the same mistake with different words is worse than
@@ -223,9 +223,9 @@ FOREIGN_URLS = (
 )
 
 
-@mark.parametrize(("database_url", "backend"), FOREIGN_URLS)
+@pytest.mark.parametrize(("database_url", "backend"), FOREIGN_URLS)
 def test_a_backend_we_do_not_support_is_refused_without_echoing_the_url(database_url, backend):
-    with raises(db_module.UnsupportedDatabaseBackendError) as refusal:
+    with pytest.raises(db_module.UnsupportedDatabaseBackendError) as refusal:
         db_module._assert_supported_backend(database_url)
     message = str(refusal.value)
     assert backend in message.lower()
@@ -241,7 +241,7 @@ def test_engine_init_refuses_postgres_before_it_reaches_the_schema(isolated_env,
     monkeypatch.setenv("DATABASE_URL", f"postgresql+asyncpg://mcp:{URL_SECRET}@example.invalid:5432/mail")
     config_module.clear_settings_cache()
     db_module.reset_database_state()
-    with raises(db_module.UnsupportedDatabaseBackendError):
+    with pytest.raises(db_module.UnsupportedDatabaseBackendError):
         db_module.init_engine()
 
 

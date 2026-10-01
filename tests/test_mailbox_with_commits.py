@@ -32,6 +32,7 @@ async def test_mailbox_with_commits_includes_commit_meta(isolated_env):
         blocks = await client.read_resource(
             f"resource://mailbox-with-commits/{MAILBOX_AGENT}?project=Backend&limit=5"
         )
-        assert blocks and blocks[0].text
+        assert blocks
+        assert blocks[0].text
         # Text is JSON; ensure it mentions commit key when present
         assert "messages" in blocks[0].text

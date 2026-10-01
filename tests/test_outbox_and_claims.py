@@ -37,7 +37,8 @@ async def test_outbox_resource_lists_sent_messages(isolated_env):
         blocks = await client.read_resource(
             f"resource://mailbox/{OUTBOX_AGENT}?project=Backend&limit=10"
         )
-        assert blocks and "OutboxTest" in (blocks[0].text or "")
+        assert blocks
+        assert "OutboxTest" in (blocks[0].text or "")
 
 
 @pytest.mark.asyncio
@@ -67,7 +68,8 @@ async def test_renew_file_reservations_extends_expiry_and_updates_artifact(isola
         renewals = ren.data.get("file_reservations") or []
         renewed = renewals[0]
         after = renewed.get("new_expires_ts")
-        assert isinstance(after, str) and after > before
+        assert isinstance(after, str)
+        assert after > before
 
         # Also confirm JSON artifact on disk reflects updated expires_ts
         # The artifact is stored by sha1(path_pattern).json under file_reservations/

@@ -112,7 +112,7 @@ export function isNotificationSoundName(
 ): value is NotificationSoundName {
   return (
     typeof value === "string" &&
-    Object.prototype.hasOwnProperty.call(tones, value)
+    Object.hasOwn(tones, value)
   );
 }
 

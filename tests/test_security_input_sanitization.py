@@ -166,6 +166,18 @@ class TestQuoteHyphenatedTokens:
         assert _quote_hyphenated_tokens("hello world") == "hello world"
         assert _quote_hyphenated_tokens("test123") == "test123"
 
+    def test_preserves_quoted_phrases_in_mixed_query(self):
+        query = '"POL-358" FEAT-123 "two words-with-hyphens"'
+        assert _quote_hyphenated_tokens(query) == (
+            '"POL-358" "FEAT-123" "two words-with-hyphens"'
+        )
+
+    def test_long_plain_word_before_hyphenated_token(self):
+        plain_word = "a" * 50_000
+        assert _quote_hyphenated_tokens(plain_word + " POL-358") == (
+            plain_word + ' "POL-358"'
+        )
+
     def test_empty_and_none_input(self):
         """Empty string is returned as-is."""
         assert _quote_hyphenated_tokens("") == ""

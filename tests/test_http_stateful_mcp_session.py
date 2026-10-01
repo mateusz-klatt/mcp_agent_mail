@@ -39,7 +39,7 @@ def _tools_call_payload(name: str, arguments: dict | None = None) -> dict:
     }
 
 
-@pytest.fixture()
+@pytest.fixture
 def http_app(isolated_env, monkeypatch):
     monkeypatch.setenv("HTTP_BEARER_TOKEN", "token250")
     monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "false")

@@ -844,8 +844,9 @@ def _exec_chain_runner(
         return real_import(name, *args, **kwargs)
 
     exec_globals["__builtins__"] = {**vars(builtins), "__import__": _import}
+    compiled_script = compile(script_text, str(hook_path), "exec")
     with pytest.raises(SystemExit) as exc_info:
-        exec(compile(script_text, str(hook_path), "exec"), exec_globals)
+        exec(compiled_script, exec_globals)
     if expected_code == 0:
         assert exc_info.value.code in (0, None)
     else:

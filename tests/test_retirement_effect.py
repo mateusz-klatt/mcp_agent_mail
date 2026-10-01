@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import pytest
 from fastmcp import Client
+from fastmcp.exceptions import ToolError
 
 from mcp_agent_mail.app import build_mcp_server
 
@@ -125,7 +126,7 @@ async def test_retiring_closes_the_mailbox_and_unretiring_reopens_it(isolated_en
     await owner.__aexit__(None, None, None)
 
     writer = await _as(server, SENDER, sender["registration_token"])
-    with pytest.raises(Exception) as refused:
+    with pytest.raises(ToolError, match="is retired and no longer accepts new messages") as refused:
         await _send(writer, "while-retired")
     await writer.__aexit__(None, None, None)
 

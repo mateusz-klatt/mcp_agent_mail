@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 from fastmcp import Client
+from fastmcp.exceptions import ToolError
 
 from mcp_agent_mail.app import _get_agent, _get_project_by_identifier, _list_outbox, build_mcp_server
 from mcp_agent_mail.db import ensure_schema, track_queries
@@ -930,11 +931,12 @@ async def test_send_message_nonexistent_recipient_fails(isolated_env):
         agents = await setup_project_with_agents(client, pkey("test/error"), count=1)
         existing_agent = agents[0]
 
-        with pytest.raises(Exception) as exc_info:
+        project_key = pkey("test/error")
+        with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
                 "send_message",
                 {
-                    "project_key": pkey("test/error"),
+                    "project_key": project_key,
                     "sender_name": existing_agent,
                     # Use a valid adjective+noun format that doesn't exist
                     "to": ["SilentGlacier"],
@@ -956,11 +958,12 @@ async def test_send_message_nonexistent_sender_fails(isolated_env):
         agents = await setup_project_with_agents(client, pkey("test/error2"), count=1)
         receiver = agents[0]
 
-        with pytest.raises(Exception) as exc_info:
+        project_key = pkey("test/error2")
+        with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
                 "send_message",
                 {
-                    "project_key": pkey("test/error2"),
+                    "project_key": project_key,
                     # Use a valid adjective+noun format that doesn't exist
                     "sender_name": "QuietMountain",
                     "to": [receiver],
@@ -982,11 +985,12 @@ async def test_reply_to_nonexistent_message_fails(isolated_env):
         agents = await setup_project_with_agents(client, pkey("test/error3"), count=1)
         agent = agents[0]
 
-        with pytest.raises(Exception) as exc_info:
+        project_key = pkey("test/error3")
+        with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
                 "reply_message",
                 {
-                    "project_key": pkey("test/error3"),
+                    "project_key": project_key,
                     "message_id": 999999,  # Non-existent
                     "sender_name": agent,
                     "body_md": "Reply to nothing.",

@@ -1046,13 +1046,15 @@ class TestMailMutationLockBoundaries:
         monkeypatch.setattr(http_module, "archive_write_lock", delete_after_holder_commit)
         monkeypatch.setattr(http_module, "write_agent_profile", unexpected_profile_write)
 
+        settings = _config.get_settings()
+        now_naive = _now_naive_utc()
         with pytest.raises(Exception, match="lifetime no longer exists"):
             await http_module._ensure_ack_escalation_holder(
-                settings=_config.get_settings(),
+                settings=settings,
                 project=project,
                 recipient_agent=recipient,
                 claim_name="RedStone",
-                now_naive=_now_naive_utc(),
+                now_naive=now_naive,
             )
 
         archive = await storage_module.ensure_archive(_config.get_settings(), slug)

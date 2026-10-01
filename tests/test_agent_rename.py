@@ -17,6 +17,7 @@ from typing import Any, cast
 import pytest
 from click import unstyle
 from fastmcp import Client
+from fastmcp.exceptions import ToolError
 from git import Git
 from sqlalchemy import func, select as _sa_select, text
 from sqlalchemy.engine import make_url
@@ -766,7 +767,7 @@ def test_rename_agent_tombstone_blocks_stale_registration(isolated_env) -> None:
     async def attempt_registration() -> str:
         server = build_mcp_server()
         async with Client(server) as client:
-            with pytest.raises(Exception) as exc_info:
+            with pytest.raises(ToolError, match="IDENTITY_RENAMED") as exc_info:
                 await client.call_tool(
                     "register_agent",
                     {
@@ -870,7 +871,7 @@ def test_tombstone_blocks_raw_old_name_before_durable_name_validation(
     async def attempt_registration() -> str:
         server = build_mcp_server()
         async with Client(server) as client:
-            with pytest.raises(Exception) as exc_info:
+            with pytest.raises(ToolError, match="IDENTITY_RENAMED") as exc_info:
                 await client.call_tool(
                     "register_agent",
                     {

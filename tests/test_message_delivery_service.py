@@ -341,10 +341,12 @@ async def test_accept_is_idempotent_and_pending_is_invisible(isolated_env: Any) 
     assert second.reused is True
     assert await _row_count(MessageDelivery) == 1
     assert await _row_count(Message) == 0
+    conflicting_request = replace(request, body_md="different canonical payload")
+    retry_time = BASE_TIME + timedelta(seconds=2)
     with pytest.raises(MessageDeliveryIdempotencyConflictError):
         await accept_message_delivery(
-            replace(request, body_md="different canonical payload"),
-            now=BASE_TIME + timedelta(seconds=2),
+            conflicting_request,
+            now=retry_time,
         )
 
 
@@ -387,10 +389,11 @@ async def test_stale_fence_cannot_renew_after_takeover(isolated_env: Any) -> Non
     )
     assert second is not None
     assert second.fence == first.fence + 1
+    renewal_time = BASE_TIME + timedelta(seconds=2)
     with pytest.raises(MessageDeliveryLeaseLostError):
         await renew_message_delivery_lease(
             first,
-            now=BASE_TIME + timedelta(seconds=2),
+            now=renewal_time,
         )
 
 
@@ -400,11 +403,20 @@ async def test_slow_publication_renews_its_owned_lease(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seeded = await _seed_identities()
+    from mcp_agent_mail import delivery as delivery_module
+
+    # Advance logical lease time at the two publication barriers. Real SQLite
+    # operations on a loaded Windows runner can exceed a one-second wall-clock
+    # lease; disk speed must not decide whether this tests renewal correctly.
+    current_time = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    def publication_clock() -> datetime:
+        return current_time
+
+    monkeypatch.setattr(delivery_module, "_utcnow_naive", publication_clock)
     accepted = await accept_message_delivery(seeded.request("slow-publication"))
     lease = await claim_message_delivery(accepted.delivery_id, lease_seconds=1)
     assert lease is not None
-
-    from mcp_agent_mail import delivery as delivery_module
 
     archive_started = asyncio.Event()
     release_archive = asyncio.Event()
@@ -429,9 +441,12 @@ async def test_slow_publication_renews_its_owned_lease(
             publication_started.is_set() and not release_publication.is_set()
         )
         refreshed = await original_refresh(current)
-        if refreshed is not None and archive_is_blocked:
+        expected_horizon = current_time + timedelta(seconds=lease.lease_seconds)
+        if refreshed is None or refreshed.expires_ts < expected_horizon:
+            return refreshed
+        if archive_is_blocked:
             renewal_during_archive.set()
-        if refreshed is not None and publication_is_blocked:
+        if publication_is_blocked:
             delivery_module._LEASE_RENEWAL_MAX_DELAY_SECONDS = 20.0
             renewal_during_publication.set()
         return refreshed
@@ -478,9 +493,11 @@ async def test_slow_publication_renews_its_owned_lease(
             process_claimed_message_delivery(lease, settings=get_settings())
         )
         await asyncio.wait_for(archive_started.wait(), timeout=5.0)
+        current_time += timedelta(seconds=0.25)
         await asyncio.wait_for(renewal_during_archive.wait(), timeout=5.0)
         release_archive.set()
         await asyncio.wait_for(publication_started.wait(), timeout=5.0)
+        current_time += timedelta(seconds=0.25)
         await asyncio.wait_for(renewal_during_publication.wait(), timeout=5.0)
         async with get_immediate_session() as session:
             delivery = await session.get(MessageDelivery, accepted.delivery_id)
@@ -489,11 +506,7 @@ async def test_slow_publication_renews_its_owned_lease(
             assert delivery.lease_fence == lease.fence
             assert delivery.lease_expires_ts is not None
             assert delivery.lease_expires_ts > lease.expires_ts
-        remaining_original_seconds = (
-            lease.expires_ts
-            - datetime.now(timezone.utc).replace(tzinfo=None)
-        ).total_seconds()
-        await asyncio.sleep(max(0.0, remaining_original_seconds) + 0.05)
+        current_time = lease.expires_ts + timedelta(seconds=0.05)
         assert await claim_message_delivery(accepted.delivery_id) is None
         release_publication.set()
 
@@ -942,9 +955,10 @@ async def test_reply_rejects_forged_thread_numeric_collision_and_nonrecipient(
         recipients=(DeliveryRecipientSnapshot(kind="to", agent=seeded.to),),
     )
 
+    forged_request = replace(base_request, thread_id="forged-thread")
     with pytest.raises(MessageDeliveryValidationError) as forged:
         await accept_message_delivery(
-            replace(base_request, thread_id="forged-thread"),
+            forged_request,
             now=BASE_TIME,
         )
     assert forged.value.code == "reply_route_invalid"
@@ -954,13 +968,14 @@ async def test_reply_rejects_forged_thread_numeric_collision_and_nonrecipient(
         thread_id=None,
         project=seeded.target,
     )
+    numeric_collision_request = replace(
+        base_request,
+        idempotency_key="reply-numeric-collision",
+        thread_id=str(unrelated_id),
+    )
     with pytest.raises(MessageDeliveryValidationError) as numeric_collision:
         await accept_message_delivery(
-            replace(
-                base_request,
-                idempotency_key="reply-numeric-collision",
-                thread_id=str(unrelated_id),
-            ),
+            numeric_collision_request,
             now=BASE_TIME,
         )
     assert numeric_collision.value.code == "reply_route_invalid"
@@ -970,29 +985,31 @@ async def test_reply_rejects_forged_thread_numeric_collision_and_nonrecipient(
         thread_id="sender-not-recipient",
         recipient=seeded.cc,
     )
+    sender_not_recipient_request = replace(
+        base_request,
+        idempotency_key="reply-sender-not-recipient",
+        thread_id="sender-not-recipient",
+    )
     with pytest.raises(MessageDeliveryValidationError) as sender_not_recipient:
         await accept_message_delivery(
-            replace(
-                base_request,
-                idempotency_key="reply-sender-not-recipient",
-                thread_id="sender-not-recipient",
-            ),
+            sender_not_recipient_request,
             now=BASE_TIME,
         )
     assert sender_not_recipient.value.code == "reply_route_invalid"
 
     await _set_route_status(seeded, seeded.cc, "blocked")
+    extra_external_request = replace(
+        base_request,
+        idempotency_key="reply-extra-external",
+        thread_id="real-thread",
+        recipients=(
+            DeliveryRecipientSnapshot(kind="to", agent=seeded.to),
+            DeliveryRecipientSnapshot(kind="cc", agent=seeded.cc),
+        ),
+    )
     with pytest.raises(MessageDeliveryValidationError) as extra_external:
         await accept_message_delivery(
-            replace(
-                base_request,
-                idempotency_key="reply-extra-external",
-                thread_id="real-thread",
-                recipients=(
-                    DeliveryRecipientSnapshot(kind="to", agent=seeded.to),
-                    DeliveryRecipientSnapshot(kind="cc", agent=seeded.cc),
-                ),
-            ),
+            extra_external_request,
             now=BASE_TIME,
         )
     assert extra_external.value.code == "reply_route_invalid"
@@ -1051,10 +1068,11 @@ async def test_deleted_inbound_reply_source_quarantines_before_claim(
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         connection.commit()
 
+    claim_time = BASE_TIME + timedelta(seconds=1)
     with pytest.raises(MessageDeliveryTerminalError):
         await claim_message_delivery(
             accepted.delivery_id,
-            now=BASE_TIME + timedelta(seconds=1),
+            now=claim_time,
         )
     status = await get_message_delivery_status(
         accepted.delivery_id,
@@ -1248,8 +1266,9 @@ async def test_storage_quarantine_is_terminal_and_never_visible(
 
 @pytest.mark.asyncio
 async def test_status_reports_missing_and_pending_without_claiming(isolated_env: Any) -> None:
+    missing_delivery_id = str(uuid.uuid4())
     with pytest.raises(MessageDeliveryNotFoundError):
-        await get_message_delivery_status(str(uuid.uuid4()), now=BASE_TIME)
+        await get_message_delivery_status(missing_delivery_id, now=BASE_TIME)
 
     seeded = await _seed_identities()
     accepted = await accept_message_delivery(
@@ -1328,20 +1347,22 @@ async def test_contact_request_shape_rejects_non_agent_or_extra_recipient(
 ) -> None:
     seeded = await _seed_identities(cross_project=True)
     request = seeded.request("contact-shape")
+    extra_recipient_request = replace(request, purpose="contact_request")
     with pytest.raises(MessageDeliveryValidationError) as extra_recipient:
         await accept_message_delivery(
-            replace(request, purpose="contact_request"),
+            extra_recipient_request,
             now=BASE_TIME,
         )
     assert extra_recipient.value.code == "invalid_contact_request_shape"
+    system_actor_request = replace(
+        request,
+        purpose="contact_request",
+        actor=DeliveryActorSnapshot.system(),
+        recipients=(DeliveryRecipientSnapshot(kind="to", agent=seeded.to),),
+    )
     with pytest.raises(MessageDeliveryValidationError) as system_actor:
         await accept_message_delivery(
-            replace(
-                request,
-                purpose="contact_request",
-                actor=DeliveryActorSnapshot.system(),
-                recipients=(DeliveryRecipientSnapshot(kind="to", agent=seeded.to),),
-            ),
+            system_actor_request,
             now=BASE_TIME,
         )
     assert system_actor.value.code == "invalid_contact_request_shape"
@@ -1512,10 +1533,11 @@ async def test_recipient_retirement_quarantines_before_claim(isolated_env: Any) 
         session.add(recipient)
         await session.commit()
 
+    claim_time = BASE_TIME + timedelta(seconds=1)
     with pytest.raises(MessageDeliveryTerminalError):
         await claim_message_delivery(
             accepted.delivery_id,
-            now=BASE_TIME + timedelta(seconds=1),
+            now=claim_time,
         )
     async with get_immediate_session() as session:
         delivery = await session.get(MessageDelivery, accepted.delivery_id)
@@ -1563,10 +1585,11 @@ async def test_ui_session_revocation_quarantines_pending_delivery(isolated_env: 
         current_user.session_epoch += 1
         session.add(current_user)
         await session.commit()
+    claim_time = BASE_TIME + timedelta(seconds=1)
     with pytest.raises(MessageDeliveryTerminalError):
         await claim_message_delivery(
             accepted.delivery_id,
-            now=BASE_TIME + timedelta(seconds=1),
+            now=claim_time,
         )
 
 
@@ -1687,9 +1710,10 @@ async def test_normal_message_needs_an_operator_assignment_not_an_admin(
 
     # Negative control on the same project: the permission comes from the
     # assignment row, so downgrading it to viewer must refuse the same request.
+    viewer_request = seeded.request("viewer-normal-message", actor=_actor(viewer_id, viewer))
     with pytest.raises(MessageDeliveryValidationError) as denied:
         await accept_message_delivery(
-            seeded.request("viewer-normal-message", actor=_actor(viewer_id, viewer)),
+            viewer_request,
             now=BASE_TIME,
         )
     assert denied.value.code == "ui_actor_operator_required"

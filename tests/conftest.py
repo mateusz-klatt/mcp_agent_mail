@@ -82,7 +82,6 @@ def open_mail_ui_gate(isolated_env, monkeypatch):
     """
     monkeypatch.setenv("MAIL_UI_AUTH_ENABLED", "false")
     clear_settings_cache()
-    yield
 
 
 @pytest.fixture(autouse=True)

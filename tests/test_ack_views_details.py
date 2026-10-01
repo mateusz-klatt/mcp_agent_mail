@@ -34,9 +34,11 @@ async def test_ack_overdue_and_stale_detail_fields(isolated_env):
         stale = await client.read_resource(
             f"resource://views/acks-stale/{ACK_AGENT}?project=Backend&ttl_seconds=0&limit=5"
         )
-        assert stale and "age_seconds" in (stale[0].text or "")
+        assert stale
+        assert "age_seconds" in (stale[0].text or "")
         # ack-overdue with ttl_minutes 0 should list messages
         overdue = await client.read_resource(
             f"resource://views/ack-overdue/{ACK_AGENT}?project=Backend&ttl_minutes=0&limit=5"
         )
-        assert overdue and "messages" in (overdue[0].text or "")
+        assert overdue
+        assert "messages" in (overdue[0].text or "")

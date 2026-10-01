@@ -33,7 +33,8 @@ async def test_tooling_directory_and_metrics_populate(isolated_env):
         )
 
         project_blocks = await client.read_resource(f"resource://project/{project_slug}")
-        assert project_blocks and project_blocks[0].text
+        assert project_blocks
+        assert project_blocks[0].text
         project_payload = json.loads(project_blocks[0].text)
         agents = project_payload.get("agents") or []
         assert agents, "Expected at least one agent after registration"
@@ -57,7 +58,8 @@ async def test_tooling_directory_and_metrics_populate(isolated_env):
         assert "messaging" in body or "file_reservations" in body
         # Metrics
         blocks2 = await client.read_resource("resource://tooling/metrics")
-        assert blocks2 and "tools" in (blocks2[0].text or "")
+        assert blocks2
+        assert "tools" in (blocks2[0].text or "")
 
 
 @pytest.mark.asyncio
@@ -80,7 +82,8 @@ async def test_tooling_recent_filters(isolated_env):
         )
 
         project_blocks = await client.read_resource(f"resource://project/{project_slug}")
-        assert project_blocks and project_blocks[0].text
+        assert project_blocks
+        assert project_blocks[0].text
         project_payload = json.loads(project_blocks[0].text)
         agents = project_payload.get("agents") or []
         assert agents, "Expected at least one agent after registration"
@@ -92,7 +95,8 @@ async def test_tooling_recent_filters(isolated_env):
         blocks = await client.read_resource(
             f"resource://tooling/recent/60?agent={agent_name}&project={project_slug}"
         )
-        assert blocks and blocks[0].text
+        assert blocks
+        assert blocks[0].text
         import json as _json
         data = _json.loads(blocks[0].text)
         assert isinstance(data, dict)
@@ -101,7 +105,8 @@ async def test_tooling_recent_filters(isolated_env):
         entries = data.get("entries") or []
         assert isinstance(entries, list)
         for e in entries:
-            assert "tool" in e and isinstance(e["tool"], str)
+            assert "tool" in e
+            assert isinstance(e["tool"], str)
             if e.get("agent") is not None:
                 assert e["agent"] == agent_name
 

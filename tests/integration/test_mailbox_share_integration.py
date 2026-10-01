@@ -355,7 +355,16 @@ def test_viewer_playwright_smoke(monkeypatch, tmp_path: Path) -> None:
                           && rect.bottom > 0
                           && rect.left < viewportWidth
                           && rect.top < innerHeight;
-                        if (!active || (rect.width >= 43.5 && rect.height >= 43.5)) return [];
+                        if (!active) return [];
+                        const clickTargets = [element, ...Array.from(element.labels || [])];
+                        const hasAdequateTarget = clickTargets.some((target) => {
+                          const hitArea = visibleRect(target);
+                          return hitArea.visible
+                            && getComputedStyle(target).pointerEvents !== 'none'
+                            && hitArea.rect.width >= 43.5
+                            && hitArea.rect.height >= 43.5;
+                        });
+                        if (hasAdequateTarget) return [];
                         return [{
                           tag: element.tagName.toLowerCase(),
                           label: element.getAttribute('aria-label')
@@ -452,6 +461,26 @@ def test_viewer_playwright_smoke(monkeypatch, tmp_path: Path) -> None:
                 polling=50,
             )
             assert_mobile_touch_targets()
+
+            # The native checkbox is 20px wide; its associated 44px label is
+            # the touch target. Exercise the label padding with real clicks.
+            select_all = page.get_by_role("checkbox", name="Select all messages")
+            label_box = select_all.locator("..").bounding_box()
+            checkbox_box = select_all.bounding_box()
+            assert label_box is not None and checkbox_box is not None
+            click_x = label_box["x"] + 2
+            click_y = label_box["y"] + label_box["height"] / 2
+            assert click_x < checkbox_box["x"]
+            page.mouse.click(click_x, click_y)
+            page.wait_for_function(
+                "document.querySelector('input[aria-label=\"Select all messages\"]').checked",
+                polling=50,
+            )
+            page.mouse.click(click_x, click_y)
+            page.wait_for_function(
+                "!document.querySelector('input[aria-label=\"Select all messages\"]').checked",
+                polling=50,
+            )
 
             # The CI Chromium renderer can suppress animation frames while
             # headless, so Playwright's separate "stable for two frames"

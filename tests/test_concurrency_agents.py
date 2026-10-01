@@ -1204,25 +1204,24 @@ class TestRaceConditions:
                     )
 
                 now = datetime.now(timezone.utc).replace(tzinfo=None)
-                with pytest.raises(IntegrityError, match="active Agent"):
-                    async with get_session() as session:
-                        await session.execute(
-                            text(
-                                "INSERT INTO file_reservations "
-                                "(project_id, agent_id, origin, path_pattern, exclusive, "
-                                "reason, created_ts, expires_ts, archive_revision, "
-                                "archive_synced_revision) "
-                                "VALUES (:project_id, :agent_id, 'explicit', 'blocked.py', "
-                                "1, 'provisioning barrier', :created_ts, :expires_ts, 1, 0)"
-                            ),
-                            {
-                                "project_id": project.data["id"],
-                                "agent_id": target_id,
-                                "created_ts": now,
-                                "expires_ts": now + timedelta(minutes=5),
-                            },
-                        )
-                        await session.commit()
+                insert_reservation = text(
+                    "INSERT INTO file_reservations "
+                    "(project_id, agent_id, origin, path_pattern, exclusive, "
+                    "reason, created_ts, expires_ts, archive_revision, "
+                    "archive_synced_revision) "
+                    "VALUES (:project_id, :agent_id, 'explicit', 'blocked.py', "
+                    "1, 'provisioning barrier', :created_ts, :expires_ts, 1, 0)"
+                )
+                reservation_parameters = {
+                    "project_id": project.data["id"],
+                    "agent_id": target_id,
+                    "created_ts": now,
+                    "expires_ts": now + timedelta(minutes=5),
+                }
+                async with get_session() as session:
+                    with pytest.raises(IntegrityError, match="active Agent"):
+                        await session.execute(insert_reservation, reservation_parameters)
+                    await session.rollback()
 
                 release_profile_write.set()
                 created = await asyncio.wait_for(provisioning, timeout=10)

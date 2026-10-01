@@ -73,7 +73,8 @@ async def test_guard_render_and_conflict_message(isolated_env, tmp_path: Path):
     settings = get_settings()
     archive = await ensure_archive(settings, "backend")
     script = render_precommit_script(archive)
-    assert "FILE_RESERVATIONS_DIR" in script and "AGENT_NAME" in script
+    assert "FILE_RESERVATIONS_DIR" in script
+    assert "AGENT_NAME" in script
 
     # Initialize dummy repo and write a file_reservation artifact that conflicts with the staged file
     repo_dir = tmp_path / "repo"

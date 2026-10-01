@@ -40,11 +40,13 @@ async def test_whois_and_projects_resources(isolated_env, monkeypatch):
 
         # Projects list
         blocks = await client.read_resource("resource://tooling/projects")
-        assert blocks and "backend" in (blocks[0].text or "")
+        assert blocks
+        assert "backend" in (blocks[0].text or "")
 
         # Project detail
         blocks2 = await client.read_resource("resource://project/backend")
-        assert blocks2 and IDENTITY_AGENT in (blocks2[0].text or "")
+        assert blocks2
+        assert IDENTITY_AGENT in (blocks2[0].text or "")
 
 
 @pytest.mark.asyncio

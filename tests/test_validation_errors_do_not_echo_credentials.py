@@ -15,11 +15,14 @@ from typing import Any
 
 import pytest
 from fastmcp import Client, Context
+from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, field_validator
 
 from mcp_agent_mail.app import (
     RECENT_TOOL_USAGE,
+    _FastMCPSensitiveLogFilter,
     _instrument_tool,
+    _redact_tool_log_value,
     build_mcp_server,
 )
 from mcp_agent_mail.config import clear_settings_cache
@@ -30,7 +33,7 @@ SECRET = "SUPERSECRET-TOKEN-VALUE-0123456789abcdef"
 async def _error_text(arguments: dict[str, Any]) -> str:
     server = build_mcp_server()
     async with Client(server) as client:
-        with pytest.raises(Exception) as caught:
+        with pytest.raises(ToolError) as caught:
             await client.call_tool("whois", arguments)
     return str(caught.value)
 
@@ -217,7 +220,7 @@ async def test_instrumented_body_validation_never_logs_or_returns_a_credential(
     app_logger.addHandler(broken_handler)
     try:
         async with Client(server) as client:
-            with pytest.raises(Exception) as caught:
+            with pytest.raises(ToolError) as caught:
                 await client.call_tool(
                     "body_validation_credential_probe",
                     {
@@ -239,3 +242,47 @@ async def test_instrumented_body_validation_never_logs_or_returns_a_credential(
     assert SECRET not in captured.err
     assert "redacted" in str(caught.value).casefold()
     assert RECENT_TOOL_USAGE[-1][2] != SECRET
+
+
+def test_log_redaction_removes_aliases_and_preserves_safe_container_values():
+    class Payload(BaseModel):
+        execution_token: str
+        safe: int
+
+    response = {
+        "before_secret": {"token": SECRET},
+        SECRET: f"copied: {SECRET}",
+        "tuple": (Payload(execution_token=SECRET, safe=3), "visible"),
+        "set": frozenset({SECRET}),
+    }
+    redacted = _redact_tool_log_value(response)
+
+    assert redacted == {
+        "before_secret": "***",
+        "***": "***",
+        "tuple": ({"execution_token": "***", "safe": 3}, "visible"),
+        "set": ["***"],
+    }
+    assert response[SECRET] == f"copied: {SECRET}"
+    assert response["tuple"][0].execution_token == SECRET
+
+
+@pytest.mark.parametrize(
+    ("name", "message", "args", "expected"),
+    [
+        ("fastmcp.server.auth.oauth_proxy.proxy", SECRET, (),
+         "FastMCP OAuth proxy event (details redacted)"),
+        ("fastmcp.server.server", "Handler called: call_tool %s with %s",
+         ("probe", {"token": SECRET}), "FastMCP tool call received (arguments redacted)"),
+        ("fastmcp.server.server", "Invalid arguments for tool %r: %s",
+         ("probe", SECRET), "Invalid arguments for tool 'probe' (details redacted)"),
+        ("fastmcp.server.server", "ordinary %s", ("event",), "ordinary event"),
+        ("fastmcp.server.server", 42, (), "42"),
+    ],
+)
+def test_sensitive_log_filter_keeps_records_with_sanitized_messages(name, message, args, expected):
+    record = logging.LogRecord(name, logging.WARNING, __file__, 1, message, args, None)
+
+    assert _FastMCPSensitiveLogFilter().filter(record) is True
+    assert record.getMessage() == expected
+    assert SECRET not in repr(record.__dict__)

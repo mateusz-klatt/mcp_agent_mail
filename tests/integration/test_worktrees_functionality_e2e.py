@@ -27,7 +27,8 @@ async def _call_tool(server: Any, tool_name: str, args: dict[str, Any]) -> Any:
 async def _read_json_resource(server: Any, uri: str) -> dict[str, Any]:
     async with Client(server) as client:
         res_list = await client.read_resource(uri)
-    assert res_list and res_list[0].text
+    assert res_list
+    assert res_list[0].text
     return json.loads(res_list[0].text)
 
 

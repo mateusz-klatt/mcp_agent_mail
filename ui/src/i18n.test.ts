@@ -88,6 +88,18 @@ describe("Iris locale catalog contract", () => {
     expect(canonicalLocale("not-a-locale")).toBeNull();
   });
 
+  it.each([
+    ["lt", 10, ["10 projektų", "10 pranešimų", "10 priedų"]],
+    ["lt", 1.5, ["1.5 projekto", "1.5 pranešimo", "1.5 priedo"]],
+    ["sk", 5, ["5 projektov", "5 správ", "5 príloh"]],
+    ["sk", 1.5, ["1.5 projektu", "1.5 správy", "1.5 prílohy"]],
+    ["lv", 2, ["2 projekti", "2 ziņojumi", "2 pielikumi"]],
+    ["lv", 10, ["10 projektu", "10 ziņojumu", "10 pielikumu"]],
+  ] as const)("uses the correct %s noun forms for count %s", async (locale, count, expected) => {
+    await loadLocale(locale);
+    expect(pluralRoots.map((key) => i18n.t(key, { count }))).toEqual(expected);
+  });
+
   it("fails closed when an unregistered catalog reaches the typed loader boundary", async () => {
     await expect(
       loadLocale("not-a-locale" as SupportedLocale),

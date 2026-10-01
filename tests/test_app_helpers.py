@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastmcp import Client, Context
-from sqlalchemy.exc import NoResultFound
+from sqlalchemy.exc import IntegrityError, NoResultFound, TimeoutError as SATimeoutError
 
 from mcp_agent_mail import app as app_module
 from mcp_agent_mail.app import (
@@ -25,8 +28,135 @@ from mcp_agent_mail.app import (
     build_mcp_server,
 )
 from mcp_agent_mail.config import get_settings
-from mcp_agent_mail.models import Agent, Project
+from mcp_agent_mail.models import Agent, AgentLink, Project
+from mcp_agent_mail.storage import GitIndexLockError
 from tests.keys import pkey
+
+
+@pytest.mark.parametrize(
+    ("exception", "error_type", "recoverable", "hint"),
+    [
+        (TypeError("got an unexpected keyword argument 'recipient'"), "TYPE_ERROR", True, "Check parameter names"),
+        (TypeError("missing required argument: recipient"), "TYPE_ERROR", True, "Ensure all required parameters"),
+        (TypeError("NoneType is not iterable"), "TYPE_ERROR", True, "None/null"),
+        (TypeError("invalid operand"), "TYPE_ERROR", True, "Argument type mismatch"),
+        (RuntimeError("sqlite database failed"), "DATABASE_ERROR", True, "transient issue"),
+        (RuntimeError("resource busy"), "RESOURCE_BUSY", True, "Wait a moment"),
+        (RuntimeError("permission denied"), "PERMISSION_ERROR", False, "Access denied"),
+        (RuntimeError("network unavailable"), "CONNECTION_ERROR", True, "Check network"),
+        (RuntimeError("unexpected state"), "UNHANDLED_EXCEPTION", False, "Unexpected error"),
+        (TimeoutError("request expired"), "TIMEOUT", True, "Try again"),
+    ],
+)
+def test_tool_exception_reports_actionable_recovery(exception, error_type, recoverable, hint):
+    error = app_module._wrap_tool_exception("probe", get_settings(), exception)
+
+    assert error.error_type == error_type
+    assert error.recoverable is recoverable
+    assert hint in str(error)
+    assert error.data["tool"] == "probe"
+    assert error.data["error_detail"] == str(exception)
+    if isinstance(exception, RuntimeError):
+        assert error.data["original_error"] == "RuntimeError"
+
+
+def test_tool_exception_preserves_resource_and_field_diagnostics(monkeypatch):
+    settings = get_settings()
+    clear_cache = Mock(return_value=4)
+    monkeypatch.setattr(app_module, "clear_repo_cache", clear_cache)
+
+    exhausted = app_module._wrap_tool_exception("probe", settings, OSError(errno.EMFILE, "open files"))
+    assert exhausted.error_type == "RESOURCE_EXHAUSTED"
+    assert exhausted.recoverable is True
+    assert exhausted.data["freed_repos"] == 4
+    assert "Freed 4 cached repos" in str(exhausted)
+    clear_cache.assert_called_once_with()
+
+    denied = app_module._wrap_tool_exception("probe", settings, OSError(errno.EACCES, "denied"))
+    assert denied.error_type == "OS_ERROR"
+    assert denied.recoverable is False
+    assert denied.data["errno"] == errno.EACCES
+    clear_cache.assert_called_once_with()
+
+    pool = app_module._wrap_tool_exception("probe", settings, SATimeoutError("pool busy"))
+    assert pool.error_type == "DATABASE_POOL_EXHAUSTED"
+    assert pool.recoverable is True
+    assert pool.data == {
+        "tool": "probe", "pool_size": settings.database.pool_size,
+        "max_overflow": settings.database.max_overflow,
+        "pool_timeout": settings.database.pool_timeout, "error_detail": "pool busy",
+    }
+
+    lock = app_module._wrap_tool_exception("probe", settings, GitIndexLockError("locked", Path("index.lock"), 3))
+    assert lock.error_type == "GIT_INDEX_LOCK"
+    assert lock.recoverable is True
+    assert lock.data == {"tool": "probe", "lock_path": "index.lock", "attempts": 3}
+
+    missing = app_module._wrap_tool_exception("probe", settings, KeyError("recipient"))
+    assert missing.error_type == "MISSING_FIELD"
+    assert missing.recoverable is True
+    assert missing.data == {"tool": "probe", "missing_field": "'recipient'"}
+    original = ToolExecutionError("CUSTOM", "specific failure", recoverable=False, data={"detail": 7})
+    assert app_module._wrap_tool_exception("probe", settings, original) is original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("winner_state", ["pending", "expired", "approved", "missing"])
+async def test_contact_link_creation_conflict_recovers_winner_without_duplicate_notification(monkeypatch, winner_state):
+    now = datetime(2026, 1, 1)
+    expires = now + timedelta(days=7)
+    project = Project(id=1, slug="contacts", human_key="/contacts")
+    sender = Agent(id=1, project_id=1, name="sender", program="test", model="test")
+    target = Agent(id=2, project_id=1, name="target", program="test", model="test")
+    update = app_module._ContactLinkUpdate(project, sender, project, target, "retry reason", now, expires)
+    earlier = now - timedelta(days=1)
+    winner = None if winner_state == "missing" else AgentLink(
+        id=17, a_project_id=1, a_agent_id=1, b_project_id=1, b_agent_id=2,
+        status="approved" if winner_state == "approved" else "pending",
+        reason="original request", created_ts=earlier, updated_ts=earlier,
+        expires_ts=earlier if winner_state == "expired" else now + timedelta(days=1),
+    )
+    conflict = IntegrityError("insert agent_link", {}, RuntimeError("unique constraint"))
+    session = Mock()
+    session.commit = AsyncMock(side_effect=[conflict, None])
+    session.rollback = AsyncMock()
+    lookups = 0
+
+    async def existing(requested_session):
+        nonlocal lookups
+        assert requested_session is session
+        lookups += 1
+        if lookups == 1:
+            return None
+        session.rollback.assert_awaited_once_with()
+        return winner
+
+    @asynccontextmanager
+    async def session_context():
+        yield session
+
+    monkeypatch.setattr(app_module, "get_session", session_context)
+    monkeypatch.setattr(update, "_existing", existing)
+
+    if winner is None:
+        with pytest.raises(IntegrityError) as caught:
+            await update.persist()
+        assert caught.value is conflict
+        assert session.commit.await_count == 1
+        assert session.add.call_count == 1
+    else:
+        link, notify = await update.persist()
+        assert link is winner
+        assert notify is (winner_state == "expired")
+        assert link.status == ("approved" if winner_state == "approved" else "pending")
+        assert link.created_ts == earlier
+        assert link.updated_ts == (earlier if winner_state == "pending" else now)
+        assert link.reason == ("original request" if winner_state == "pending" else "retry reason")
+        assert link.expires_ts == expires
+        assert session.commit.await_count == 2
+        assert session.add.call_args.args[0] is winner
+    assert lookups == 2
+    session.rollback.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio

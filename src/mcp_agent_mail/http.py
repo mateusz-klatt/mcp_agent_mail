@@ -13,6 +13,7 @@ import functools
 import hashlib
 import hmac
 import importlib
+import itertools
 import json
 import logging
 import math
@@ -6742,6 +6743,43 @@ class _MailUiRoutes:
             group.register(self.app)
 
     class Rendering(_MailRouteGroup):
+        @classmethod
+        def _fts_query_parts(cls, raw: str) -> list[str]:
+            """Split quoted/scoped terms in linear time, including malformed input.
+
+            A quoted alternative wins only when it contains at least one
+            character and closes. Otherwise the next non-whitespace run is
+            one literal term. Indexing successive quotes once avoids rescanning
+            the remaining input for every unmatched opening quote or prefix.
+            """
+            quote_positions = [index for index, char in enumerate(raw) if char == '"']
+            quote_ends = dict(itertools.pairwise(quote_positions))
+            parts: list[str] = []
+            cursor = 0
+            while cursor < len(raw):
+                if raw[cursor].isspace():
+                    cursor += 1
+                    continue
+                start = cursor
+                cursor = cls._fts_token_end(raw, start, quote_ends)
+                parts.append(raw[start:cursor])
+            return parts
+
+        @staticmethod
+        def _fts_token_end(raw: str, start: int, quote_ends: dict[int, int]) -> int:
+            cursor = start
+            while cursor < len(raw) and (raw[cursor].isalnum() or raw[cursor] == "_"):
+                cursor += 1
+            quote_start = start if raw[start] == '"' else -1
+            if cursor > start and raw[cursor:cursor + 2] == ':"':
+                quote_start = cursor + 1
+            quote_end = quote_ends.get(quote_start)
+            if quote_end is not None and quote_end > quote_start + 1:
+                return quote_end + 1
+            while cursor < len(raw) and not raw[cursor].isspace():
+                cursor += 1
+            return cursor
+
         async def _render(self, name: str, status_code: int = 200, **ctx: Any) -> HTMLResponse:
             ctx.setdefault("mail_ui_user", _mail_ui_template_user.get())
             ctx.setdefault("mail_ui_access", None)
@@ -6765,7 +6803,7 @@ class _MailUiRoutes:
                 return "", "", "both", []
             scope_pref = scope_preference if scope_preference in {"subject", "body"} else "both"
             # tokens: key:"phrase" | "phrase" | key:word | word
-            parts = re.findall(r'\w++:"[^"]+"|"[^"]+"|\S+', raw)
+            parts = cls._fts_query_parts(raw)
             exprs: list[str] = []
             like_terms: list[str] = []
             like_scope = scope_pref

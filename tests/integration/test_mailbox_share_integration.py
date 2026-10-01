@@ -467,7 +467,8 @@ def test_viewer_playwright_smoke(monkeypatch, tmp_path: Path) -> None:
             select_all = page.get_by_role("checkbox", name="Select all messages")
             label_box = select_all.locator("..").bounding_box()
             checkbox_box = select_all.bounding_box()
-            assert label_box is not None and checkbox_box is not None
+            assert label_box is not None
+            assert checkbox_box is not None
             click_x = label_box["x"] + 2
             click_y = label_box["y"] + label_box["height"] / 2
             assert click_x < checkbox_box["x"]
@@ -496,6 +497,13 @@ def test_viewer_playwright_smoke(monkeypatch, tmp_path: Path) -> None:
             page.get_by_role("button", name="Sort messages").dispatch_event("click")
             page.get_by_role("button", name="Newest First").wait_for(state="visible")
             assert_mobile_touch_targets()
+            page.get_by_role("button", name="Newest First").press("Escape")
+            page.get_by_role("button", name="Newest First").wait_for(state="hidden")
+            sort_toggle = page.get_by_role("button", name="Sort messages")
+            assert sort_toggle.get_attribute("aria-expanded") == "false"
+            assert sort_toggle.evaluate("button => document.activeElement === button")
+            sort_toggle.press("Enter")
+            page.get_by_role("button", name="Newest First").wait_for(state="visible")
             page.get_by_role("button", name="Newest First").dispatch_event("click")
 
             page.get_by_role(
@@ -545,6 +553,24 @@ def test_viewer_playwright_smoke(monkeypatch, tmp_path: Path) -> None:
             assert_mobile_touch_targets()
             page.locator("[data-thread-id]").first.dispatch_event("click")
             assert_mobile_touch_targets()
+            thread_disclosure = page.get_by_role(
+                "button", name="Collapse message 1", exact=True
+            )
+            thread_disclosure.wait_for(state="visible")
+            assert thread_disclosure.get_attribute("aria-expanded") == "true"
+            thread_body = page.locator("article > header + div").first
+            thread_body.wait_for(state="visible")
+            thread_disclosure.press("Enter")
+            collapsed_disclosure = page.get_by_role(
+                "button", name="Expand message 1", exact=True
+            )
+            collapsed_disclosure.wait_for(state="visible")
+            assert collapsed_disclosure.get_attribute("aria-expanded") == "false"
+            thread_body.wait_for(state="hidden")
+            collapsed_disclosure.press("Space")
+            thread_disclosure.wait_for(state="visible")
+            assert thread_disclosure.get_attribute("aria-expanded") == "true"
+            thread_body.wait_for(state="visible")
             external_requests = [
                 url
                 for url in request_urls
@@ -563,6 +589,42 @@ def test_viewer_playwright_smoke(monkeypatch, tmp_path: Path) -> None:
             # Ensure sanitization removed inline script execution.
             xss_value = page.evaluate("window._xss || null")
             assert xss_value is None
+            chunk_failure = page.evaluate(
+                """
+                async () => {
+                  const originalFetch = window.fetch;
+                  const requests = [];
+                  let countReads = 0;
+                  const chunks = {
+                    pattern: 'chunks/{index:04d}.bin',
+                    get chunk_count() {
+                      countReads += 1;
+                      // Bound the regression itself: eager iteration must fail
+                      // before it can allocate a billion pending promises.
+                      if (countReads > 1) throw new Error('eager chunk iteration');
+                      return 1_000_000_000;
+                    },
+                  };
+                  window.fetch = async (path) => {
+                    requests.push(path);
+                    throw new Error('first chunk unavailable');
+                  };
+                  try {
+                    await fetchDatabaseFromNetwork({database: {chunk_manifest: chunks}});
+                    return {unexpectedSuccess: true};
+                  } catch (error) {
+                    return {error: error.message, requests, countReads};
+                  } finally {
+                    window.fetch = originalFetch;
+                  }
+                }
+                """
+            )
+            assert chunk_failure == {
+                "error": "first chunk unavailable",
+                "requests": ["../chunks/0000.bin"],
+                "countReads": 1,
+            }
             context.close()
             browser.close()
     finally:

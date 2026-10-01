@@ -4964,9 +4964,7 @@ def _reset_database_files(db_url: str) -> list[Path]:
                 console.print("[yellow]Warning:[/] SQLite database path is empty; nothing to delete.")
             else:
                 db_path = _resolve_path(database)
-                database_files.append(db_path)
-                database_files.append(Path(f"{db_path}-wal"))
-                database_files.append(Path(f"{db_path}-shm"))
+                database_files.extend((db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")))
     except Exception as exc:  # pragma: no cover - defensive
         console.print(f"[red]Failed to parse database URL '{db_url}': {exc}[/]")
     return database_files
@@ -6254,9 +6252,10 @@ def projects_adopt(
         console.print("[yellow]Source and target refer to the same project; nothing to do.[/]")
         return
 
-    plan: list[str] = []
-    plan.append(f"Source: id={src.id} slug={src.slug} key={src.human_key}")
-    plan.append(f"Target: id={dst.id} slug={dst.slug} key={dst.human_key}")
+    plan = [
+        f"Source: id={src.id} slug={src.slug} key={src.human_key}",
+        f"Target: id={dst.id} slug={dst.slug} key={dst.human_key}",
+    ]
 
     # Heuristic: same repo if git-common-dir hashes match
     src_gdir = _git_output(Path(src.human_key), "rev-parse", "--git-common-dir")
@@ -6273,9 +6272,11 @@ def projects_adopt(
     from .storage import ensure_archive as _ensure_archive
     src_archive = _run_async(_ensure_archive(settings, src.slug))
     dst_archive = _run_async(_ensure_archive(settings, dst.slug))
-    plan.append(f"Move Git artifacts: {src_archive.root} -> {dst_archive.root}")
-    plan.append("Re-key DB rows: source project_id -> target project_id (messages, agents, file_reservations, etc.)")
-    plan.append("Write aliases.json under target 'projects/<slug>/' with former_slugs")
+    plan.extend((
+        f"Move Git artifacts: {src_archive.root} -> {dst_archive.root}",
+        "Re-key DB rows: source project_id -> target project_id (messages, agents, file_reservations, etc.)",
+        "Write aliases.json under target 'projects/<slug>/' with former_slugs",
+    ))
 
     console.print("[bold]Projects adopt plan (dry-run)[/bold]")
     for line in plan:

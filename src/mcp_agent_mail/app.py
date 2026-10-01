@@ -1145,9 +1145,11 @@ def _coerce_flag_to_bool(value: str, *, default: bool) -> bool:
     return default
 
 
+_JSON_MIME_TYPE = "application/json"
+_TOOLING_METRICS_URI = "resource://tooling/metrics"
 _OUTPUT_FORMAT_AUTO_VALUES: frozenset[str] = frozenset({"", "auto", "default", "none", "null"})
 _OUTPUT_FORMAT_ALIASES: dict[str, str] = {
-    "application/json": "json",
+    _JSON_MIME_TYPE: "json",
     "text/json": "json",
     "application/toon": "toon",
     "text/toon": "toon",
@@ -1524,7 +1526,7 @@ def _apply_resource_output_format(
         if isinstance(payload, list):
             return ResourceResult(
                 contents=[
-                    ResourceContent(payload, mime_type="application/json")
+                    ResourceContent(payload, mime_type=_JSON_MIME_TYPE)
                 ]
             )
         return payload
@@ -7760,7 +7762,7 @@ class _SendExternalContacts:
     async def _purge_resolved(self) -> None:
         try:
             async with get_session() as session:
-                for label, pending in list(self.router.unknown_external.items()):
+                for label, pending in self.router.unknown_external.copy().items():
                     await self._purge_project(session, label, pending)
         except Exception:
             logger.exception("Failed to purge resolved unknown_external entries after in-session approvals")
@@ -8983,7 +8985,7 @@ class _MCPSessionBindings:
         if not execution_ids:
             return
         for current in self.session_current_executions.values():
-            for project_id, binding in list(current.items()):
+            for project_id, binding in current.copy().items():
                 execution_id = binding.execution_id
                 if execution_id in execution_ids:
                     current.pop(project_id, None)
@@ -10353,23 +10355,19 @@ class _MCPServerRuntime(_MCPSessionBindings):
                     mcp, method_name, declaration.tool_options, declaration.instrumentation
                 )
 
+    def _register_declared_tool(self, mcp: FastMCP, method_name: str) -> None:
+        """Register one declaration where tools and resources are interleaved."""
+        declaration = getattr(type(self), method_name)._mcp_tool_registration
+        self._register_bound_tool(
+            mcp, method_name, declaration.tool_options, declaration.instrumentation
+        )
+
 
 class _MCPServerTools(_MCPServerRuntime):
-    def register_setup_tools(self, mcp: FastMCP) -> None:
-        self._register_bound_tool(
-            mcp, "health_check",
-            {"name": "health_check", "description": "Return basic readiness information for the Agent Mail server."},
-            {"cluster": CLUSTER_SETUP, "capabilities": {"infrastructure"}, "complexity": "low"},
-        )
-        self._register_bound_tool(
-            mcp, "ensure_project", {"name": "ensure_project"},
-            {"cluster": CLUSTER_SETUP, "capabilities": {"infrastructure", "storage"}, "complexity": "low", "project_arg": "human_key"},
-        )
-        self._register_bound_tool(
-            mcp, "register_agent", {"name": "register_agent"},
-            {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity"}, "agent_arg": "name", "project_arg": "project_key"},
-        )
-
+    @_MCPToolRegistration(
+        {"name": "health_check", "description": "Return basic readiness information for the Agent Mail server."},
+        {"cluster": CLUSTER_SETUP, "capabilities": {"infrastructure"}, "complexity": "low"},
+    )
     async def health_check(self, ctx: Context, format: Optional[str] = None) -> dict[str, Any]:
         """
         Quick readiness probe for agents and orchestrators.
@@ -10447,6 +10445,10 @@ class _MCPServerTools(_MCPServerRuntime):
             **_public_runtime_descriptor(settings),
         }
 
+    @_MCPToolRegistration(
+        {"name": "ensure_project"},
+        {"cluster": CLUSTER_SETUP, "capabilities": {"infrastructure", "storage"}, "complexity": "low", "project_arg": "human_key"},
+    )
     async def ensure_project(
         self,
         ctx: Context,
@@ -10564,6 +10566,10 @@ class _MCPServerTools(_MCPServerRuntime):
                 payload[key] = identity_payload.get(key)
         return payload
 
+    @_MCPToolRegistration(
+        {"name": "register_agent"},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity"}, "agent_arg": "name", "project_arg": "project_key"},
+    )
     async def register_agent(
         self,
         ctx: Context,
@@ -10725,24 +10731,10 @@ class _MCPServerTools(_MCPServerRuntime):
                 result["window_id"] = wi.window_uuid
                 result["window_display_name"] = wi.display_name
 
-    def register_execution_tools(self, mcp: FastMCP) -> None:
-        self._register_bound_tool(
-            mcp, "start_agent_execution", {"name": "start_agent_execution"},
-            {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity", "repository"}, "project_arg": "project_key", "agent_arg": "agent_name"},
-        )
-        self._register_bound_tool(
-            mcp, "heartbeat_agent_execution", {"name": "heartbeat_agent_execution"},
-            {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity", "repository"}, "project_arg": "project_key", "agent_arg": "agent_name"},
-        )
-        self._register_bound_tool(
-            mcp, "end_agent_execution", {"name": "end_agent_execution"},
-            {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity", "file_reservations"}, "project_arg": "project_key", "agent_arg": "agent_name"},
-        )
-        self._register_bound_tool(
-            mcp, "list_agent_executions", {"name": "list_agent_executions"},
-            {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity"}, "project_arg": "project_key", "agent_arg": "agent_name"},
-        )
-
+    @_MCPToolRegistration(
+        {"name": "start_agent_execution"},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity", "repository"}, "project_arg": "project_key", "agent_arg": "agent_name"},
+    )
     async def start_agent_execution(
         self,
         ctx: Context,
@@ -11096,6 +11088,10 @@ class _MCPServerTools(_MCPServerRuntime):
                 data={"execution_id": execution.id, "external_id": external_id},
             )
 
+    @_MCPToolRegistration(
+        {"name": "heartbeat_agent_execution"},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity", "repository"}, "project_arg": "project_key", "agent_arg": "agent_name"},
+    )
     async def heartbeat_agent_execution(
         self,
         ctx: Context,
@@ -11204,6 +11200,10 @@ class _MCPServerTools(_MCPServerRuntime):
             response["warnings"] = [protocol_warning]
         return response
 
+    @_MCPToolRegistration(
+        {"name": "end_agent_execution"},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity", "file_reservations"}, "project_arg": "project_key", "agent_arg": "agent_name"},
+    )
     async def end_agent_execution(
         self,
         ctx: Context,
@@ -11477,6 +11477,10 @@ class _MCPServerTools(_MCPServerRuntime):
             retry_payload["warnings"] = [protocol_warning]
         return retry_payload
 
+    @_MCPToolRegistration(
+        {"name": "list_agent_executions"},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity"}, "project_arg": "project_key", "agent_arg": "agent_name"},
+    )
     async def list_agent_executions(
         self,
         ctx: Context,
@@ -11532,61 +11536,12 @@ class _MCPServerTools(_MCPServerRuntime):
         ]
 
 
-    def register_identity_tools(self, mcp: FastMCP) -> None:
-        identity_options = {
-            "cluster": CLUSTER_IDENTITY, "capabilities": {"identity"},
-            "agent_arg": "agent_name", "project_arg": "project_key",
-        }
-        project_options = {
-            "cluster": CLUSTER_SETUP, "capabilities": {"infrastructure"},
-            "project_arg": "project_key",
-        }
-        self._register_bound_tool(
-            mcp, "retire_agent",
-            {"name": "retire_agent", "description":
-             "Soft-delete an agent: mark it as retired so it stops accepting new messages while preserving message history. "
-             "Retired agents are hidden from active agent lists but visible in 'all agents' views."},
-            identity_options,
-        )
-        self._register_bound_tool(
-            mcp, "sweep_stale_agents_tool",
-            {"name": "sweep_stale_agents", "description":
-             "Retire abandoned agents in the caller's project using the server's conservative inactivity heuristic. "
-             "The caller is never retired, the threshold has a 60-second floor, and active file reservations block "
-             "retirement by default."},
-            {**identity_options, "capabilities": {"identity", "file_reservations"}},
-        )
-        self._register_bound_tool(
-            mcp, "unretire_agent",
-            {"name": "unretire_agent", "description":
-             "Restore a retired agent back to active status. The agent will resume accepting new messages."},
-            identity_options,
-        )
-        self._register_bound_tool(
-            mcp, "archive_project",
-            {"name": "archive_project", "description":
-             "Soft-delete a project: mark it as archived so it is hidden from active project lists. "
-             "All messages are preserved and the project can be restored with unarchive_project."},
-            project_options,
-        )
-        self._register_bound_tool(
-            mcp, "unarchive_project",
-            {"name": "unarchive_project", "description":
-             "Restore an archived project back to active status."},
-            project_options,
-        )
-        self._register_bound_tool(
-            mcp, "whois", {"name": "whois"},
-            {**identity_options, "capabilities": {"identity", "audit"}},
-        )
-        self._register_bound_tool(
-            mcp, "rotate_registration_token", {"name": "rotate_registration_token"}, identity_options
-        )
-        self._register_bound_tool(
-            mcp, "create_agent_identity", {"name": "create_agent_identity"},
-            {**identity_options, "agent_arg": "name_hint"},
-        )
-
+    @_MCPToolRegistration(
+        {"name": "retire_agent", "description":
+         "Soft-delete an agent: mark it as retired so it stops accepting new messages while preserving message history. "
+         "Retired agents are hidden from active agent lists but visible in 'all agents' views."},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity"}, "agent_arg": "agent_name", "project_arg": "project_key"},
+    )
     async def retire_agent(
         self,
         ctx: Context,
@@ -11629,6 +11584,13 @@ class _MCPServerTools(_MCPServerRuntime):
             "project_key": project_key,
         }
 
+    @_MCPToolRegistration(
+        {"name": "sweep_stale_agents", "description":
+         "Retire abandoned agents in the caller's project using the server's conservative inactivity heuristic. "
+         "The caller is never retired, the threshold has a 60-second floor, and active file reservations block "
+         "retirement by default."},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity", "file_reservations"}, "agent_arg": "agent_name", "project_arg": "project_key"},
+    )
     async def sweep_stale_agents_tool(
         self,
         ctx: Context,
@@ -11671,6 +11633,11 @@ class _MCPServerTools(_MCPServerRuntime):
             "count": len(retired_names),
         }
 
+    @_MCPToolRegistration(
+        {"name": "unretire_agent", "description":
+         "Restore a retired agent back to active status. The agent will resume accepting new messages."},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity"}, "agent_arg": "agent_name", "project_arg": "project_key"},
+    )
     async def unretire_agent(
         self,
         ctx: Context,
@@ -11713,6 +11680,12 @@ class _MCPServerTools(_MCPServerRuntime):
             "project_key": project_key,
         }
 
+    @_MCPToolRegistration(
+        {"name": "archive_project", "description":
+         "Soft-delete a project: mark it as archived so it is hidden from active project lists. "
+         "All messages are preserved and the project can be restored with unarchive_project."},
+        {"cluster": CLUSTER_SETUP, "capabilities": {"infrastructure"}, "project_arg": "project_key"},
+    )
     async def archive_project(
         self,
         ctx: Context,
@@ -11749,6 +11722,10 @@ class _MCPServerTools(_MCPServerRuntime):
             "slug": project.slug,
         }
 
+    @_MCPToolRegistration(
+        {"name": "unarchive_project", "description": "Restore an archived project back to active status."},
+        {"cluster": CLUSTER_SETUP, "capabilities": {"infrastructure"}, "project_arg": "project_key"},
+    )
     async def unarchive_project(
         self,
         ctx: Context,
@@ -11785,6 +11762,10 @@ class _MCPServerTools(_MCPServerRuntime):
             "slug": project.slug,
         }
 
+    @_MCPToolRegistration(
+        {"name": "whois"},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity", "audit"}, "agent_arg": "agent_name", "project_arg": "project_key"},
+    )
     async def whois(
         self,
         ctx: Context,
@@ -11852,6 +11833,10 @@ class _MCPServerTools(_MCPServerRuntime):
         await ctx.info(f"whois for '{agent_name}' in '{project.human_key}' returned {len(recent)} commits")
         return profile
 
+    @_MCPToolRegistration(
+        {"name": "rotate_registration_token"},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity"}, "agent_arg": "agent_name", "project_arg": "project_key"},
+    )
     async def rotate_registration_token(
         self,
         ctx: Context,
@@ -11916,6 +11901,10 @@ class _MCPServerTools(_MCPServerRuntime):
             "already_current": already_current,
         }
 
+    @_MCPToolRegistration(
+        {"name": "create_agent_identity"},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity"}, "agent_arg": "name_hint", "project_arg": "project_key"},
+    )
     async def create_agent_identity(
         self,
         ctx: Context,
@@ -12033,19 +12022,10 @@ class _MCPServerTools(_MCPServerRuntime):
         return result
 
 
-    def register_window_tools(self, mcp: FastMCP) -> None:
-        self._register_bound_tool(
-            mcp, "list_window_identities", {"name": "list_window_identities"},
-            {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity"},
-             "project_arg": "project_key", "complexity": "low"},
-        )
-        for name in ("rename_window", "expire_window"):
-            self._register_bound_tool(
-                mcp, name, {"name": name},
-                {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity", "write"},
-                 "project_arg": "project_key"},
-            )
-
+    @_MCPToolRegistration(
+        {"name": "list_window_identities"},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity"}, "project_arg": "project_key", "complexity": "low"},
+    )
     async def list_window_identities(
         self,
         ctx: Context,
@@ -12092,6 +12072,10 @@ class _MCPServerTools(_MCPServerRuntime):
             })
         return {"identities": items, "count": len(items)}
 
+    @_MCPToolRegistration(
+        {"name": "rename_window"},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity", "write"}, "project_arg": "project_key"},
+    )
     async def rename_window(
         self,
         ctx: Context,
@@ -12163,6 +12147,10 @@ class _MCPServerTools(_MCPServerRuntime):
             "last_active_ts": _iso(wi.last_active_ts),
         }
 
+    @_MCPToolRegistration(
+        {"name": "expire_window"},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity", "write"}, "project_arg": "project_key"},
+    )
     async def expire_window(
         self,
         ctx: Context,
@@ -16547,10 +16535,6 @@ def build_mcp_server() -> FastMCP:
     )
     mcp.add_middleware(_CredentialSafeValidationErrors())
     runtime = _MCPServer(settings)
-    runtime.register_setup_tools(mcp)
-    runtime.register_execution_tools(mcp)
-    runtime.register_identity_tools(mcp)
-    runtime.register_window_tools(mcp)
     runtime._register_declared_tools(mcp, _MCPServerTools)
 
     runtime.register_build_slots(mcp)
@@ -17106,32 +17090,17 @@ class _MCPBuildSlots(_MCPServerRuntime):
 
 class _MCPProductBus(_MCPServerRuntime):
     def register_product_bus(self, mcp: FastMCP) -> None:
-        mcp.resource("resource://config/environment", mime_type="application/json")(self.environment_resource_exact)
-        mcp.resource("resource://config/environment{?format}", mime_type="application/json")(self.environment_resource)
+        mcp.resource("resource://config/environment", mime_type=_JSON_MIME_TYPE)(self.environment_resource_exact)
+        mcp.resource("resource://config/environment{?format}", mime_type=_JSON_MIME_TYPE)(self.environment_resource)
         if not self.settings.worktrees_enabled:
             return
-        self._register_bound_tool(
-            mcp, "ensure_product_tool", {"name": "ensure_product"},
-            {"cluster": CLUSTER_PRODUCT, "capabilities": {"product"}},
-        )
-        self._register_bound_tool(
-            mcp, "products_link_tool", {"name": "products_link"},
-            {"cluster": CLUSTER_PRODUCT, "capabilities": {"product"}, "project_arg": "project_key"},
-        )
-        mcp.resource("resource://product/{key}{?format}", mime_type="application/json")(self.product_resource)
-        self._register_bound_tool(
-            mcp, "search_messages_product", {"name": "search_messages_product"},
-            {"cluster": CLUSTER_PRODUCT, "capabilities": {"search"}},
-        )
-        self._register_bound_tool(
-            mcp, "fetch_inbox_product", {"name": "fetch_inbox_product"},
-            {"cluster": CLUSTER_PRODUCT, "capabilities": {"messaging", "read"}},
-        )
-        self._register_bound_tool(
-            mcp, "summarize_thread_product", {"name": "summarize_thread_product"},
-            {"cluster": CLUSTER_PRODUCT, "capabilities": {"summarization", "search"}},
-        )
-        mcp.resource("resource://identity/{project}{?format}", mime_type="application/json")(self.identity_resource)
+        self._register_declared_tool(mcp, "ensure_product_tool")
+        self._register_declared_tool(mcp, "products_link_tool")
+        mcp.resource("resource://product/{key}{?format}", mime_type=_JSON_MIME_TYPE)(self.product_resource)
+        self._register_declared_tool(mcp, "search_messages_product")
+        self._register_declared_tool(mcp, "fetch_inbox_product")
+        self._register_declared_tool(mcp, "summarize_thread_product")
+        mcp.resource("resource://identity/{project}{?format}", mime_type=_JSON_MIME_TYPE)(self.identity_resource)
 
     def _read_environment_resource(self, format: Optional[str] = None) -> dict[str, Any]:
         """
@@ -17184,6 +17153,10 @@ class _MCPProductBus(_MCPServerRuntime):
 
     # --- Product Bus (Phase 2): ensure/link/search/resources ---------------------------------
 
+    @_MCPToolRegistration(
+        {"name": "ensure_product"},
+        {"cluster": CLUSTER_PRODUCT, "capabilities": {"product"}},
+    )
     async def ensure_product_tool(
         self,
         ctx: Context,
@@ -17222,6 +17195,10 @@ class _MCPProductBus(_MCPServerRuntime):
                 await session.refresh(prod)
         return {"id": prod.id, "product_uid": prod.product_uid, "name": prod.name, "created_at": _iso(prod.created_at)}
 
+    @_MCPToolRegistration(
+        {"name": "products_link"},
+        {"cluster": CLUSTER_PRODUCT, "capabilities": {"product"}, "project_arg": "project_key"},
+    )
     async def products_link_tool(
         self,
         ctx: Context,
@@ -17300,6 +17277,10 @@ class _MCPProductBus(_MCPServerRuntime):
             format_value=format_value,
         )
 
+    @_MCPToolRegistration(
+        {"name": "search_messages_product"},
+        {"cluster": CLUSTER_PRODUCT, "capabilities": {"search"}},
+    )
     async def search_messages_product(
         self,
         ctx: Context,
@@ -17371,6 +17352,10 @@ class _MCPProductBus(_MCPServerRuntime):
         except Exception:
             return items
 
+    @_MCPToolRegistration(
+        {"name": "fetch_inbox_product"},
+        {"cluster": CLUSTER_PRODUCT, "capabilities": {"messaging", "read"}},
+    )
     async def fetch_inbox_product(
         self,
         ctx: Context,
@@ -17423,6 +17408,10 @@ class _MCPProductBus(_MCPServerRuntime):
         messages.sort(key=_dt_key, reverse=True)
         return messages[: max(0, int(limit))]
 
+    @_MCPToolRegistration(
+        {"name": "summarize_thread_product"},
+        {"cluster": CLUSTER_PRODUCT, "capabilities": {"summarization", "search"}},
+    )
     async def summarize_thread_product(
         self,
         ctx: Context,
@@ -17713,7 +17702,7 @@ class _MCPServerResources(_MCPServerRuntime):
             ("resource://tooling/directory{?format}", self.tooling_directory_resource),
             ("resource://tooling/schemas", self.tooling_schemas_resource_exact),
             ("resource://tooling/schemas{?format}", self.tooling_schemas_resource),
-            ("resource://tooling/metrics", self.tooling_metrics_resource_exact),
+            (_TOOLING_METRICS_URI, self.tooling_metrics_resource_exact),
             ("resource://tooling/metrics{?format}", self.tooling_metrics_resource),
             ("resource://tooling/locks", self.tooling_locks_resource_exact),
             ("resource://tooling/locks{?format}", self.tooling_locks_resource),
@@ -17736,7 +17725,7 @@ class _MCPServerResources(_MCPServerRuntime):
             ("resource://outbox/{agent}{?project,limit,include_bodies,since_ts,format}", self.outbox_resource),
         ]
         for uri, handler in definitions:
-            mcp.resource(uri, mime_type="application/json")(handler)
+            mcp.resource(uri, mime_type=_JSON_MIME_TYPE)(handler)
 
     def _read_tooling_directory_resource(self, format: Optional[str] = None) -> dict[str, Any]:
         """
@@ -18121,7 +18110,7 @@ class _MCPServerResources(_MCPServerRuntime):
         default_format = self.settings.output_format_default or self.settings.toon_default_format or "json"
         payload = {
             "generated_at": _iso(datetime.now(timezone.utc)),
-            "metrics_uri": "resource://tooling/metrics",
+            "metrics_uri": _TOOLING_METRICS_URI,
             "output_formats": {
                 "default": default_format,
                 "tool_param": "format",
@@ -18274,7 +18263,7 @@ class _MCPServerResources(_MCPServerRuntime):
         return _apply_resource_output_format(
             payload,
             settings=self.settings,
-            resource_name="resource://tooling/metrics",
+            resource_name=_TOOLING_METRICS_URI,
             format_value=format,
         )
 
@@ -18381,7 +18370,7 @@ class _MCPServerResources(_MCPServerRuntime):
         agent: str | None,
     ) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
-        for ts, tool_name, proj, ag in list(RECENT_TOOL_USAGE):
+        for ts, tool_name, proj, ag in RECENT_TOOL_USAGE.copy():
             if ts < cutoff:
                 continue
             if project and proj != project:

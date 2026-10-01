@@ -354,6 +354,13 @@ function formatChunkPath(pattern, index) {
   });
 }
 
+async function* _databaseChunks(chunkManifest) {
+  for (let index = 0; index < chunkManifest.chunk_count; index += 1) {
+    const relativeChunk = formatChunkPath(chunkManifest.pattern, index);
+    yield loadBinary(`../${relativeChunk}`);
+  }
+}
+
 async function fetchDatabaseFromNetwork(manifest) {
   const dbInfo = manifest.database ?? {};
   const dbPath = dbInfo.path ?? "mailbox.sqlite3";
@@ -365,9 +372,8 @@ async function fetchDatabaseFromNetwork(manifest) {
 
   const buffers = [];
   let total = 0;
-  for (let index = 0; index < chunkManifest.chunk_count; index += 1) {
-    const relativeChunk = formatChunkPath(chunkManifest.pattern, index);
-    const chunkBytes = await loadBinary(`../${relativeChunk}`);
+  // Request each chunk only after the preceding download succeeds.
+  for await (const chunkBytes of _databaseChunks(chunkManifest)) {
     buffers.push(chunkBytes);
     total += chunkBytes.length;
   }
@@ -991,7 +997,7 @@ function viewerController() {
 
         // Initialize virtual list and select the first message
         this.initVirtualList();
-        this.selectFirstMessage();
+        await this.selectFirstMessage();
 
         // Update cache state
         this.cacheState = state.cacheState;
@@ -1029,7 +1035,7 @@ function viewerController() {
       }
     },
     setupResponsiveHandlers() {
-      if (typeof window === 'undefined' || window.matchMedia === undefined) {
+      if (typeof window.matchMedia !== 'function') {
         return;
       }
       const query = window.matchMedia('(max-width: 768px)');
@@ -1846,7 +1852,10 @@ function viewerController() {
       if (this.autoRefreshEnabled) {
         // Start auto-refresh (every 30 seconds)
         this.refreshInterval = setInterval(() => {
-          this.fetchLatestMessages();
+          this.fetchLatestMessages().catch(error => {
+            console.error('[Alpine] Auto-refresh failed', error);
+            this.refreshError = 'Failed to refresh';
+          });
         }, 30000);
         console.info('[Alpine] Auto-refresh enabled');
       } else {
@@ -2105,9 +2114,9 @@ function viewerController() {
         console.debug('[viewer] Selection highlight skipped', error);
       }
     },
-    selectFirstMessage() {
+    async selectFirstMessage() {
       if (this.filteredMessages.length > 0 && !this.selectedMessage) {
-        this.handleMessageClick(this.filteredMessages[0]);
+        await this.handleMessageClick(this.filteredMessages[0]);
       }
     },
 

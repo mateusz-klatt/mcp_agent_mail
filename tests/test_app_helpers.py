@@ -50,6 +50,7 @@ def test_iso_and_parse_helpers():
         ('```' + ' ' * 50_000, None),
         ('```json\n[]\n```', None),
     ],
+    ids=["surrounded-json", "plain-fence", "unclosed-json", "long-whitespace", "array-rejected"],
 )
 def test_json_extraction_handles_fences_without_backtracking(payload, expected):
     assert _parse_json_safely(payload) == expected

@@ -42,10 +42,12 @@ class ShareExportError(RuntimeError):
 
 
 SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"(?i:ghp_)[A-Za-z0-9]{36,}"),
+    # Preserve Unicode IGNORECASE prefix matches (long s/Kelvin sign) while
+    # keeping token bodies strictly ASCII, without scoped flag groups.
+    re.compile(r"[gG][hH][pP]_[A-Za-z0-9]{36,}"),
     re.compile(r"(?i:github_pat_)(?a:\w{20,})"),
-    re.compile(r"(?i:xox[baprs]-)[A-Za-z0-9-]{10,}"),
-    re.compile(r"(?i:sk-)[A-Za-z0-9]{20,}"),
+    re.compile(r"[xX][oO][xX][bBaApPrRsS\u017f]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"[sS\u017f][kK\u212a]-[A-Za-z0-9]{20,}"),
     re.compile(r"(?i:bearer)\s+(?a:[\w.-]{16,})"),
     re.compile(r"eyJ[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+"),  # JWT tokens
 )
@@ -526,12 +528,13 @@ def detect_hosting_hints(output_dir: Path) -> list[HostingHint]:
 
 
 def build_how_to_deploy(hosting_hints: Sequence[HostingHint]) -> str:
-    sections: list[str] = []
-    sections.append("# HOW_TO_DEPLOY\n")
-    sections.append("## Quick Local Preview\n")
-    sections.append("1. Run `uv run python -m mcp_agent_mail.cli share preview ./` from this bundle directory.")
-    sections.append("2. Open the printed URL (default `http://127.0.0.1:9000/`).")
-    sections.append("3. Press Ctrl+C to stop the preview server when finished.\n")
+    sections: list[str] = [
+        "# HOW_TO_DEPLOY\n",
+        "## Quick Local Preview\n",
+        "1. Run `uv run python -m mcp_agent_mail.cli share preview ./` from this bundle directory.",
+        "2. Open the printed URL (default `http://127.0.0.1:9000/`).",
+        "3. Press Ctrl+C to stop the preview server when finished.\n",
+    ]
 
     if hosting_hints:
         sections.append("## Detected Hosting Targets\n")
@@ -1609,14 +1612,8 @@ def scrub_snapshot(
     snapshot_path: Path,
     *,
     preset: str = "standard",
-    export_salt: Optional[bytes] = None,
 ) -> ScrubSummary:
-    """Apply in-place redactions to the snapshot and return a summary.
-
-    ``export_salt`` remains a keyword for callers of the former pseudonymizing
-    implementation. Agent names are retained now, so the salt must not affect
-    snapshot contents or exported metadata.
-    """
+    """Apply in-place redactions to the snapshot and return a summary."""
 
     preset_key = _normalize_scrub_preset(preset)
     preset_opts = SCRUB_PRESETS[preset_key]
@@ -2438,6 +2435,32 @@ def _external_attachment(
     }
 
 
+def _write_bundled_attachment(
+    destination: Path, data: bytes, config: _AttachmentBundleConfig
+) -> bool:
+    """Create a confined attachment without overwriting a deduplicated file."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    resolved = destination.resolve()
+    if (
+        destination.is_symlink()
+        or not resolved.is_relative_to(config.output_root)
+        or not resolved.is_relative_to(config.attachments_dir)
+    ):
+        raise ShareExportError(
+            "Attachment bundle path must stay within the bundle output directory"
+        )
+    try:
+        # Exclusive creation refuses a final-component link appearing after
+        # validation. Existing regular files are intentional digest deduplication.
+        with resolved.open("xb") as stream:
+            stream.write(data)
+    except FileExistsError:
+        if resolved.is_symlink() or not resolved.is_file():
+            raise ShareExportError("Existing attachment bundle path must be a regular file") from None
+        return False
+    return True
+
+
 def _stored_attachment(
     *,
     data: bytes,
@@ -2453,16 +2476,15 @@ def _stored_attachment(
     if rel_path is None:
         extension = source_path.suffix or ".bin"
         rel_path = Path("attachments") / sha256[:2] / f"{sha256}{extension}"
-        destination = (config.output_root / rel_path).resolve()
-        if not destination.is_relative_to(
+        destination = config.output_root / rel_path
+        resolved = destination.resolve()
+        if not resolved.is_relative_to(
             config.output_root
-        ) or not destination.is_relative_to(config.attachments_dir):
+        ) or not resolved.is_relative_to(config.attachments_dir):
             raise ShareExportError(
                 "Attachment bundle path must stay within the bundle output directory"
             )
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if not destination.exists():
-            destination.write_bytes(data)
+        if _write_bundled_attachment(destination, data, config):
             state.bytes_copied += len(data)
         state.bundles[sha256] = rel_path
     media_record["mode"] = "file"
@@ -2728,7 +2750,7 @@ def build_bundle_assets(
 ) -> BundleArtifacts:
     """Bundle attachments, viewer assets, and scaffolding for the export."""
 
-    project_filters, exporter_version = _resolve_bundle_asset_options(options)
+    _, exporter_version = _resolve_bundle_asset_options(options)
     attachments_manifest = bundle_attachments(
         snapshot_path,
         output_dir,
@@ -2748,7 +2770,6 @@ def build_bundle_assets(
         output_dir,
         snapshot=snapshot_path,
         scope=scope,
-        project_filters=project_filters,
         scrub_summary=scrub_summary,
         attachments_manifest=attachments_manifest,
         chunk_manifest=chunk_manifest,
@@ -3197,7 +3218,6 @@ def write_bundle_scaffolding(
     *,
     snapshot: Path,
     scope: ProjectScopeResult,
-    project_filters: Sequence[str],
     scrub_summary: ScrubSummary,
     attachments_manifest: dict[str, Any],
     chunk_manifest: Optional[dict[str, Any]],
@@ -3208,8 +3228,6 @@ def write_bundle_scaffolding(
 ) -> None:
     """Create manifest and helper docs around the freshly minted snapshot.
 
-    ``project_filters`` is retained for the public call contract but is
-    deliberately not serialized: raw selectors may be private human keys.
     Public scope metadata is derived only from the sanitized project records.
     """
 

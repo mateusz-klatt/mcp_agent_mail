@@ -1353,6 +1353,121 @@ def test_clear_and_reset_skips_archive_when_disabled(isolated_env, monkeypatch):
     assert result.exit_code == 0
 
 
+@pytest.mark.parametrize(
+    ("key", "running", "deploy", "reloads"),
+    [("r", True, False, 1), ("R", True, False, 1), ("d", False, True, 0),
+     ("q", False, False, 0), ("?", True, False, 0)],
+)
+def test_preview_keyboard_commands_do_not_confuse_reload_deploy_and_quit(
+    monkeypatch: pytest.MonkeyPatch,
+    key: str,
+    running: bool,
+    deploy: bool,
+    reloads: int,
+) -> None:
+    signals: list[str] = []
+
+    def reload_signal() -> int:
+        signals.append("reload")
+        return 1
+
+    monkeypatch.setattr(cli_module, "_bump_preview_force_token", reload_signal)
+    state = cli_module._PreviewInputState()
+
+    state.handle_key(key, ("\x03", "\x04"))
+
+    assert state.running is running
+    assert state.deployment_requested is deploy
+    assert signals == ["reload"] * reloads
+
+
+def test_preview_posix_interrupt_restores_original_terminal_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    events: list[tuple[object, ...]] = []
+    original_settings = [1, 2, 3]
+    terminal = SimpleNamespace(
+        TCSADRAIN=7,
+        tcgetattr=lambda fd: original_settings,
+        tcsetattr=lambda *args: events.append(("restore", *args)),
+    )
+    monkeypatch.setitem(sys.modules, "termios", terminal)
+    monkeypatch.setitem(sys.modules, "tty", SimpleNamespace(
+        setcbreak=lambda fd: events.append(("cbreak", fd)),
+    ))
+    stdin = SimpleNamespace(fileno=lambda: 5, read=lambda count: "\x03")
+    monkeypatch.setattr(sys, "stdin", stdin)
+    monkeypatch.setitem(sys.modules, "select", SimpleNamespace(
+        select=lambda *_args: ([stdin], [], []),
+    ))
+    thread = cast(threading.Thread, SimpleNamespace(is_alive=lambda: True))
+    state = cli_module._PreviewInputState()
+
+    with pytest.raises(KeyboardInterrupt):
+        cli_module._run_posix_preview_input(thread, state)
+
+    assert events == [("cbreak", 5), ("restore", 5, 7, original_settings)]
+    assert state.deployment_requested is False
+
+
+def test_preview_windows_deploy_leaves_subsequent_input_unconsumed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keys = ["r", "d", "q"]
+    reloads: list[bool] = []
+    monkeypatch.setattr(cli_module, "_bump_preview_force_token", lambda: reloads.append(True))
+    monkeypatch.setitem(sys.modules, "msvcrt", SimpleNamespace(
+        kbhit=lambda: bool(keys), getwch=lambda: keys.pop(0),
+    ))
+    state = cli_module._PreviewInputState()
+
+    cli_module._poll_windows_preview_input(state)
+
+    assert state.deployment_requested is True
+    assert state.running is False
+    assert keys == ["q"]
+    assert reloads == [True]
+
+
+@pytest.mark.parametrize("key", ["d", "q", "\x03"], ids=["deploy", "quit", "interrupt"])
+def test_preview_always_closes_server_before_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    key: str,
+) -> None:
+    events: list[str] = []
+    server = SimpleNamespace(
+        server_address=("127.0.0.1", 9000),
+        serve_forever=lambda: None,
+        shutdown=lambda: events.append("shutdown"),
+        server_close=lambda: events.append("close"),
+    )
+    thread = SimpleNamespace(
+        start=lambda: events.append("start"),
+        join=lambda timeout: events.append("join"),
+    )
+
+    def input_command(_thread: object, state: cli_module._PreviewInputState) -> None:
+        state.handle_key(key, ("\x03", "\x04"))
+
+    monkeypatch.setattr(cli_module, "copy_viewer_assets", lambda _path: None)
+    monkeypatch.setattr(cli_module, "_start_preview_server", lambda *_args: server)
+    monkeypatch.setattr(cli_module.threading, "Thread", lambda **_kwargs: thread)
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(isatty=lambda: False))
+    monkeypatch.setattr(cli_module, "_run_other_preview_input", input_command)
+
+    if key == "d":
+        with pytest.raises(cli_module.typer.Exit) as exc:
+            cli_module.share_preview(str(tmp_path), "127.0.0.1", 9000, False)
+        assert exc.value.exit_code == 42
+    else:
+        cli_module.share_preview(str(tmp_path), "127.0.0.1", 9000, False)
+
+    assert events == ["start", "shutdown", "close", "join"]
+
+
 # ---------- doctor: scaffolding ----------
 #
 # Each helper below builds only the *state* a doctor subcommand is supposed to

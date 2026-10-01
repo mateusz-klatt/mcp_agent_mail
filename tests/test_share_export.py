@@ -1265,7 +1265,7 @@ def test_share_update_prunes_stale_chunk_files_and_reports_it(
 def test_scrub_snapshot_pseudonymizes_and_clears(tmp_path: Path) -> None:
     snapshot = _build_snapshot(tmp_path)
 
-    summary = scrub_snapshot(snapshot, export_salt=b"unit-test-salt")
+    summary = scrub_snapshot(snapshot)
 
     assert summary.preset == "standard"
     assert summary.agents_total == 1
@@ -1300,7 +1300,7 @@ def test_scrub_snapshot_pseudonymizes_and_clears(tmp_path: Path) -> None:
 def test_scrub_snapshot_strict_preset(tmp_path: Path) -> None:
     snapshot = _build_snapshot(tmp_path)
 
-    summary = scrub_snapshot(snapshot, preset="strict", export_salt=b"strict-mode")
+    summary = scrub_snapshot(snapshot, preset="strict")
 
     assert summary.preset == "strict"
     assert summary.bodies_redacted == 1
@@ -1319,7 +1319,7 @@ def test_scrub_snapshot_strict_preset(tmp_path: Path) -> None:
 def test_scrub_snapshot_archive_preset_preserves_runtime_state(tmp_path: Path) -> None:
     snapshot = _build_snapshot(tmp_path)
 
-    summary = scrub_snapshot(snapshot, preset="archive", export_salt=b"archive-mode")
+    summary = scrub_snapshot(snapshot, preset="archive")
 
     assert summary.preset == "archive"
     assert summary.ack_flags_cleared == 0
@@ -1363,7 +1363,7 @@ def test_scrub_snapshot_invalid_attachments_json(tmp_path: Path) -> None:
     finally:
         conn.close()
 
-    scrub_snapshot(snapshot, export_salt=b"invalid-json")
+    scrub_snapshot(snapshot)
 
     conn = sqlite3.connect(snapshot)
     try:
@@ -1505,6 +1505,103 @@ def test_bundle_attachments_rejects_noncanonical_sha256_before_writing(
 
     assert list(tmp_path.glob("escaped-attachment*")) == []
     assert list((output_dir / "attachments").rglob("*")) == []
+
+
+@pytest.mark.parametrize("destination_kind", ["shard-symlink", "late-shard-symlink", "file-symlink", "late-file-symlink", "existing-file"])
+def test_bundle_attachments_confines_destination_and_preserves_existing_file(
+    destination_kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = _build_snapshot(tmp_path)
+    storage_root = tmp_path / "storage"
+    storage_root.mkdir()
+    data = b"bounded attachment payload"
+    source_path = storage_root / "payload.bin"
+    source_path.write_bytes(data)
+    connection = sqlite3.connect(snapshot)
+    try:
+        connection.execute(
+            "UPDATE messages SET attachments = ? WHERE id = 1",
+            (json.dumps([{"type": "file", "path": "payload.bin"}]),),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    digest = hashlib.sha256(data).hexdigest()
+    output_dir = tmp_path / "bundle"
+    attachments_dir = output_dir / "attachments"
+    attachments_dir.mkdir(parents=True)
+    shard = attachments_dir / digest[:2]
+    destination = shard / f"{digest}.bin"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.bin"
+    sentinel.write_bytes(b"private data remains untouched")
+    original_mkdir = Path.mkdir
+    original_open = Path.open
+
+    def redirected_mkdir(path: Path, *args, **kwargs) -> None:
+        if path == shard:
+            path.symlink_to(outside, target_is_directory=True)
+        else:
+            original_mkdir(path, *args, **kwargs)
+
+    def redirected_open(path: Path, mode="r", *args, **kwargs):
+        if mode == "xb":
+            assert path == destination
+            path.symlink_to(sentinel)
+        return original_open(path, mode, *args, **kwargs)
+
+    try:
+        if destination_kind == "shard-symlink":
+            shard.symlink_to(outside, target_is_directory=True)
+        elif destination_kind == "late-shard-symlink":
+            # Probe support before intercepting directory creation below.
+            (tmp_path / "symlink-probe").symlink_to(outside, target_is_directory=True)
+            monkeypatch.setattr(Path, "mkdir", redirected_mkdir)
+        else:
+            shard.mkdir()
+            if destination_kind == "file-symlink":
+                destination.symlink_to(sentinel)
+            elif destination_kind == "late-file-symlink":
+                (tmp_path / "symlink-probe").symlink_to(sentinel)
+                monkeypatch.setattr(Path, "open", redirected_open)
+            else:
+                destination.write_bytes(data)
+    except (NotImplementedError, OSError):
+        pytest.skip("Symlinks are unavailable on this platform")
+
+    if destination_kind == "existing-file":
+        previous_mtime = destination.stat().st_mtime_ns
+        manifest = bundle_attachments(
+            snapshot, output_dir, storage_root=storage_root,
+            inline_threshold=0, detach_threshold=1024,
+        )
+        assert destination.read_bytes() == data
+        assert destination.stat().st_mtime_ns == previous_mtime
+        assert manifest["stats"]["bytes_copied"] == 0
+    else:
+        with pytest.raises(ShareExportError, match="bundle path must"):
+            bundle_attachments(
+                snapshot, output_dir, storage_root=storage_root,
+                inline_threshold=0, detach_threshold=1024,
+            )
+    assert sentinel.read_bytes() == b"private data remains untouched"
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel.bin"]
+
+
+@pytest.mark.parametrize(
+    ("pattern_index", "prefix", "body_length"),
+    [(0, "GHP_", 36), (2, "XOXB-", 10), (2, "xox\u017f-", 10), (3, "SK-", 20), (3, "\u017f\u212a-", 20)],
+)
+def test_secret_patterns_preserve_casefolded_prefixes_and_ascii_bodies(
+    pattern_index: int, prefix: str, body_length: int,
+) -> None:
+    pattern = share.SECRET_PATTERNS[pattern_index]
+    assert pattern.fullmatch(prefix + "A" * body_length) is not None
+    assert pattern.fullmatch(prefix + "\u0130" * body_length) is None
 
 
 def test_bundle_attachments_rejects_attachment_symlink_outside_output(tmp_path: Path) -> None:

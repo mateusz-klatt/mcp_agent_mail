@@ -494,7 +494,12 @@ def test_viewer_playwright_smoke(monkeypatch, tmp_path: Path) -> None:
             )
             assert_mobile_touch_targets()
 
-            page.get_by_role("button", name="Sort messages").dispatch_event("click")
+            sort_box = page.get_by_role("button", name="Sort messages").bounding_box()
+            assert sort_box is not None
+            page.mouse.click(
+                sort_box["x"] + sort_box["width"] / 2,
+                sort_box["y"] + sort_box["height"] / 2,
+            )
             page.get_by_role("button", name="Newest First").wait_for(state="visible")
             assert_mobile_touch_targets()
             page.get_by_role("button", name="Newest First").press("Escape")

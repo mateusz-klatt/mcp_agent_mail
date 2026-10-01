@@ -633,7 +633,7 @@
 
           <!-- Sort Options -->
           <div class="relative" x-data="{ sortOpen: false }">
-            <button x-ref="sortToggle" @click="sortOpen = !sortOpen" :aria-expanded="sortOpen"
+            <button x-ref="sortToggle" @click.stop="sortOpen = !sortOpen" :aria-expanded="sortOpen"
               class="px-2 py-1 text-xs bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded border border-slate-200 dark:border-slate-700 transition-colors flex items-center gap-1"
               aria-label="Sort messages">
               <i data-lucide="arrow-down-up" class="w-3 h-3"></i>

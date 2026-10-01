@@ -46,13 +46,11 @@ async def test_ensure_project_requires_absolute_path(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
         # Relative path should fail
-        try:
+        with pytest.raises(ToolError) as exc_info:
             await client.call_tool("ensure_project", {"human_key": "relative/path"})
-            pytest.fail("Should reject relative path")
-        except ToolError as e:
-            error_str = str(e).lower()
-            # Must mention 'absolute' or 'path' (but not just "/" which is too loose)
-            assert "absolute" in error_str or "path" in error_str
+        error_str = str(exc_info.value).lower()
+        # Must mention 'absolute' or 'path' (but not just "/" which is too loose)
+        assert "absolute" in error_str or "path" in error_str
 
 
 @pytest.mark.asyncio
@@ -109,7 +107,7 @@ async def test_register_agent_nonexistent_project(isolated_env):
     """register_agent should fail for non-existent project."""
     server = build_mcp_server()
     async with Client(server) as client:
-        try:
+        with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
                 "register_agent",
                 {
@@ -119,10 +117,8 @@ async def test_register_agent_nonexistent_project(isolated_env):
                     "name": "codex-wsl-nonexistent-project-1",
                 },
             )
-            pytest.fail("Should reject non-existent project")
-        except ToolError as e:
-            error_str = str(e).lower()
-            assert "not found" in error_str or "project" in error_str
+        error_str = str(exc_info.value).lower()
+        assert "not found" in error_str or "project" in error_str
 
 
 # ============================================================================
@@ -157,7 +153,7 @@ async def test_send_message_nonexistent_agent(isolated_env):
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": pkey("nonexistentagent")})
 
-        try:
+        with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
                 "send_message",
                 {
@@ -169,10 +165,8 @@ async def test_send_message_nonexistent_agent(isolated_env):
                     "idempotency_key": "invalid-missing-sender",
                 },
             )
-            pytest.fail("Should reject non-existent sender")
-        except ToolError as e:
-            error_str = str(e).lower()
-            assert "not found" in error_str or "agent" in error_str
+        error_str = str(exc_info.value).lower()
+        assert "not found" in error_str or "agent" in error_str
 
 
 @pytest.mark.asyncio
@@ -192,7 +186,7 @@ async def test_send_message_nonexistent_recipient(isolated_env):
         )
         sender_name = agent_result.data["name"]
 
-        try:
+        with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
                 "send_message",
                 {
@@ -204,10 +198,8 @@ async def test_send_message_nonexistent_recipient(isolated_env):
                     "idempotency_key": "invalid-missing-recipient",
                 },
             )
-            pytest.fail("Should reject non-existent recipient")
-        except ToolError as e:
-            error_str = str(e).lower()
-            assert "not found" in error_str or "recipient" in error_str or "agent" in error_str
+        error_str = str(exc_info.value).lower()
+        assert "not found" in error_str or "recipient" in error_str or "agent" in error_str
 
 
 # ============================================================================
@@ -395,7 +387,8 @@ async def test_set_contact_policy_invalid_policy(isolated_env):
 
         message = str(excinfo.value)
         assert "invalid_policy_value" in message
-        assert "auto" in message and "block" in message
+        assert "auto" in message
+        assert "block" in message
 
         # The rejection must not have applied anything: a policy that raised and
         # still wrote would be worse than the normalisation this replaced.
@@ -461,7 +454,7 @@ async def test_file_reservation_empty_paths(isolated_env):
         )
         agent_name = agent_result.data["name"]
 
-        try:
+        with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
                 "file_reservation_paths",
                 {
@@ -470,10 +463,8 @@ async def test_file_reservation_empty_paths(isolated_env):
                     "paths": [],
                 },
             )
-            pytest.fail("Should reject empty paths")
-        except ToolError as e:
-            error_str = str(e).lower()
-            assert "path" in error_str or "empty" in error_str or "required" in error_str
+        error_str = str(exc_info.value).lower()
+        assert "path" in error_str or "empty" in error_str or "required" in error_str
 
 
 @pytest.mark.asyncio
@@ -483,7 +474,7 @@ async def test_file_reservation_nonexistent_agent(isolated_env):
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": pkey("reservenoagent")})
 
-        try:
+        with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
                 "file_reservation_paths",
                 {
@@ -492,10 +483,8 @@ async def test_file_reservation_nonexistent_agent(isolated_env):
                     "paths": ["test.py"],
                 },
             )
-            pytest.fail("Should reject non-existent agent")
-        except ToolError as e:
-            error_str = str(e).lower()
-            assert "not found" in error_str or "agent" in error_str
+        error_str = str(exc_info.value).lower()
+        assert "not found" in error_str or "agent" in error_str
 
 
 # ============================================================================
@@ -508,7 +497,7 @@ async def test_whois_nonexistent_project(isolated_env):
     """whois should fail for non-existent project."""
     server = build_mcp_server()
     async with Client(server) as client:
-        try:
+        with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
                 "whois",
                 {
@@ -516,10 +505,8 @@ async def test_whois_nonexistent_project(isolated_env):
                     "agent_name": "SomeAgent",
                 },
             )
-            pytest.fail("Should fail for non-existent project")
-        except ToolError as e:
-            error_str = str(e).lower()
-            assert "not found" in error_str or "project" in error_str
+        error_str = str(exc_info.value).lower()
+        assert "not found" in error_str or "project" in error_str
 
 
 @pytest.mark.asyncio
@@ -529,7 +516,7 @@ async def test_whois_nonexistent_agent(isolated_env):
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": pkey("whoisnoagent")})
 
-        try:
+        with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
                 "whois",
                 {
@@ -537,10 +524,8 @@ async def test_whois_nonexistent_agent(isolated_env):
                     "agent_name": "NonExistentAgent",
                 },
             )
-            pytest.fail("Should fail for non-existent agent")
-        except ToolError as e:
-            error_str = str(e).lower()
-            assert "not found" in error_str or "agent" in error_str
+        error_str = str(exc_info.value).lower()
+        assert "not found" in error_str or "agent" in error_str
 
 
 # ============================================================================
@@ -553,7 +538,7 @@ async def test_fetch_inbox_nonexistent_project(isolated_env):
     """fetch_inbox should fail for non-existent project."""
     server = build_mcp_server()
     async with Client(server) as client:
-        try:
+        with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
                 "fetch_inbox",
                 {
@@ -561,10 +546,8 @@ async def test_fetch_inbox_nonexistent_project(isolated_env):
                     "agent_name": "SomeAgent",
                 },
             )
-            pytest.fail("Should fail for non-existent project")
-        except ToolError as e:
-            error_str = str(e).lower()
-            assert "not found" in error_str or "project" in error_str
+        error_str = str(exc_info.value).lower()
+        assert "not found" in error_str or "project" in error_str
 
 
 @pytest.mark.asyncio
@@ -574,7 +557,7 @@ async def test_fetch_inbox_nonexistent_agent(isolated_env):
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": pkey("inboxnoagent")})
 
-        try:
+        with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
                 "fetch_inbox",
                 {
@@ -582,10 +565,8 @@ async def test_fetch_inbox_nonexistent_agent(isolated_env):
                     "agent_name": "NonExistentAgent",
                 },
             )
-            pytest.fail("Should fail for non-existent agent")
-        except ToolError as e:
-            error_str = str(e).lower()
-            assert "not found" in error_str or "agent" in error_str
+        error_str = str(exc_info.value).lower()
+        assert "not found" in error_str or "agent" in error_str
 
 
 # ============================================================================
@@ -610,7 +591,7 @@ async def test_mark_message_read_nonexistent_message(isolated_env):
         )
         agent_name = agent_result.data["name"]
 
-        try:
+        with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
                 "mark_message_read",
                 {
@@ -619,10 +600,8 @@ async def test_mark_message_read_nonexistent_message(isolated_env):
                     "message_id": 999999,  # Non-existent
                 },
             )
-            pytest.fail("Should fail for non-existent message")
-        except ToolError as e:
-            error_str = str(e).lower()
-            assert "not found" in error_str or "message" in error_str
+        error_str = str(exc_info.value).lower()
+        assert "not found" in error_str or "message" in error_str
 
 
 @pytest.mark.asyncio
@@ -642,7 +621,7 @@ async def test_acknowledge_message_nonexistent_message(isolated_env):
         )
         agent_name = agent_result.data["name"]
 
-        try:
+        with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
                 "acknowledge_message",
                 {
@@ -651,10 +630,8 @@ async def test_acknowledge_message_nonexistent_message(isolated_env):
                     "message_id": 999999,  # Non-existent
                 },
             )
-            pytest.fail("Should fail for non-existent message")
-        except ToolError as e:
-            error_str = str(e).lower()
-            assert "not found" in error_str or "message" in error_str
+        error_str = str(exc_info.value).lower()
+        assert "not found" in error_str or "message" in error_str
 
 
 # ============================================================================
@@ -679,7 +656,7 @@ async def test_reply_message_nonexistent_original(isolated_env):
         )
         agent_name = agent_result.data["name"]
 
-        try:
+        with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
                 "reply_message",
                 {
@@ -690,10 +667,8 @@ async def test_reply_message_nonexistent_original(isolated_env):
                     "idempotency_key": "invalid-missing-reply-target",
                 },
             )
-            pytest.fail("Should fail for non-existent original message")
-        except ToolError as e:
-            error_str = str(e).lower()
-            assert "not found" in error_str or "message" in error_str
+        error_str = str(exc_info.value).lower()
+        assert "not found" in error_str or "message" in error_str
 
 
 # ============================================================================
@@ -708,7 +683,7 @@ async def test_release_file_reservations_nonexistent_agent(isolated_env):
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": pkey("releasenoagent")})
 
-        try:
+        with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
                 "release_file_reservations",
                 {
@@ -716,10 +691,8 @@ async def test_release_file_reservations_nonexistent_agent(isolated_env):
                     "agent_name": "NonExistentAgent",
                 },
             )
-            pytest.fail("Should fail for non-existent agent")
-        except ToolError as e:
-            error_str = str(e).lower()
-            assert "not found" in error_str or "agent" in error_str
+        error_str = str(exc_info.value).lower()
+        assert "not found" in error_str or "agent" in error_str
 
 
 @pytest.mark.asyncio
@@ -809,7 +782,7 @@ async def test_renew_file_reservations_nonexistent_agent(isolated_env):
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": pkey("renewnoagent")})
 
-        try:
+        with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
                 "renew_file_reservations",
                 {
@@ -817,10 +790,8 @@ async def test_renew_file_reservations_nonexistent_agent(isolated_env):
                     "agent_name": "NonExistentAgent",
                 },
             )
-            pytest.fail("Should fail for non-existent agent")
-        except ToolError as e:
-            error_str = str(e).lower()
-            assert "not found" in error_str or "agent" in error_str
+        error_str = str(exc_info.value).lower()
+        assert "not found" in error_str or "agent" in error_str
 
 
 @pytest.mark.asyncio
@@ -913,7 +884,7 @@ async def test_search_messages_nonexistent_project(isolated_env):
     """search_messages should fail for non-existent project."""
     server = build_mcp_server()
     async with Client(server) as client:
-        try:
+        with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
                 "search_messages",
                 {
@@ -921,10 +892,8 @@ async def test_search_messages_nonexistent_project(isolated_env):
                     "query": "test",
                 },
             )
-            pytest.fail("Should fail for non-existent project")
-        except ToolError as e:
-            error_str = str(e).lower()
-            assert "not found" in error_str or "project" in error_str
+        error_str = str(exc_info.value).lower()
+        assert "not found" in error_str or "project" in error_str
 
 
 # ============================================================================
@@ -949,7 +918,7 @@ async def test_request_contact_nonexistent_agent(isolated_env):
         )
         agent_name = agent_result.data["name"]
 
-        try:
+        with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
                 "request_contact",
                 {
@@ -958,10 +927,8 @@ async def test_request_contact_nonexistent_agent(isolated_env):
                     "to_agent": agent_name,
                 },
             )
-            pytest.fail("Should fail for non-existent from_agent")
-        except ToolError as e:
-            error_str = str(e).lower()
-            assert "not found" in error_str or "agent" in error_str or "register" in error_str
+        error_str = str(exc_info.value).lower()
+        assert "not found" in error_str or "agent" in error_str or "register" in error_str
 
 
 @pytest.mark.asyncio
@@ -981,7 +948,7 @@ async def test_respond_contact_nonexistent_agent(isolated_env):
         )
         agent_name = agent_result.data["name"]
 
-        try:
+        with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
                 "respond_contact",
                 {
@@ -991,7 +958,5 @@ async def test_respond_contact_nonexistent_agent(isolated_env):
                     "accept": True,
                 },
             )
-            pytest.fail("Should fail for non-existent to_agent")
-        except ToolError as e:
-            error_str = str(e).lower()
-            assert "not found" in error_str or "agent" in error_str
+        error_str = str(exc_info.value).lower()
+        assert "not found" in error_str or "agent" in error_str

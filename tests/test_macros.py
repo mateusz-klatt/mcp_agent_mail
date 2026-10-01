@@ -60,7 +60,8 @@ async def test_macro_start_session(isolated_env):
         assert data["execution"]["lifecycle_protocol_version"] == 1
         assert "execution_token" not in data["execution"]
         assert "registration_token" not in data
-        assert "file_reservations" in data and "inbox" in data
+        assert "file_reservations" in data
+        assert "inbox" in data
 
 
 @pytest.mark.asyncio
@@ -242,11 +243,12 @@ async def test_reservation_enforcement_requires_execution_without_mutation(
                 },
             )
 
+            project_key = pkey("enforced")
             with pytest.raises(ToolError, match="Call start_agent_execution first"):
                 await client.call_tool(
                     "file_reservation_paths",
                     {
-                        "project_key": pkey("enforced"),
+                        "project_key": project_key,
                         "agent_name": "codex-wsl-enforced-1",
                         "paths": ["src/unscoped.py"],
                     },

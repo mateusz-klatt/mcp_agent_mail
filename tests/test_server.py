@@ -109,6 +109,66 @@ async def _register_durable_test_agent(
     return result.data
 
 
+@pytest.mark.asyncio
+async def test_mcp_instances_preserve_settings_and_session_authentication(isolated_env, monkeypatch):
+    monkeypatch.setenv("HTTP_PORT", "8765")
+    clear_settings_cache()
+    first_server = build_mcp_server()
+    project_key = pkey("factory-session-isolation")
+    async with Client(first_server) as first:
+        await first.call_tool("ensure_project", {"human_key": project_key})
+        first_agent = await _register_durable_test_agent(first, project_key, "codex-wsl-firsthost-1")
+        first_identity = {
+            "project_key": project_key,
+            "agent_name": first_agent["name"],
+            "include_recent_commits": False,
+        }
+        assert (await first.call_tool("whois", first_identity)).data["name"] == first_agent["name"]
+
+        monkeypatch.setenv("HTTP_PORT", "9876")
+        clear_settings_cache()
+        second_server = build_mcp_server()
+        async with Client(second_server) as second:
+            second_agent = await _register_durable_test_agent(second, project_key, "codex-wsl-secondhost-1")
+            second_identity = {
+                "project_key": project_key,
+                "agent_name": second_agent["name"],
+                "include_recent_commits": False,
+            }
+
+            # Both servers remain live while tool and resource handlers read
+            # their original settings, despite the changed settings cache.
+            first_health, second_health, first_environment, second_environment = await asyncio.gather(
+                first.call_tool("health_check", {}),
+                second.call_tool("health_check", {}),
+                first.read_resource("resource://config/environment"),
+                second.read_resource("resource://config/environment"),
+            )
+            assert first_health.data["http_port"] == 8765
+            assert second_health.data["http_port"] == 9876
+            assert json.loads(first_environment[0].text)["http"]["port"] == 8765
+            assert json.loads(second_environment[0].text)["http"]["port"] == 9876
+
+            for client, own_identity, other_identity in (
+                (first, first_identity, second_identity),
+                (second, second_identity, first_identity),
+            ):
+                assert (await client.call_tool("whois", own_identity)).data["name"] == own_identity["agent_name"]
+                with pytest.raises(ToolError, match="whois requires registration_token"):
+                    await client.call_tool("whois", other_identity)
+
+            # Sharing the database does not authorize a second session. An
+            # explicit credential can bind it without disturbing the first.
+            authenticated = await second.call_tool(
+                "whois", {**first_identity, "registration_token": first_agent["registration_token"]}
+            )
+            assert authenticated.data["name"] == first_agent["name"]
+            assert (await second.call_tool("whois", first_identity)).data["name"] == first_agent["name"]
+            assert (await first.call_tool("whois", first_identity)).data["name"] == first_agent["name"]
+            with pytest.raises(ToolError, match="whois requires registration_token"):
+                await first.call_tool("whois", second_identity)
+
+
 async def _register_build_slot_test_agent(
     client: Client,
     *,
@@ -1356,7 +1416,8 @@ async def test_messaging_flow(isolated_env):
         # New response shape: deliveries list
         deliveries = message.data.get("deliveries") or []
         assert isinstance(deliveries, list)
-        assert deliveries and deliveries[0]["delivery"]["status"] == "published"
+        assert deliveries
+        assert deliveries[0]["delivery"]["status"] == "published"
         assert deliveries[0]["message"]["subject"] == "Test"
         assert deliveries[0]["delivery"]["message_id"] == deliveries[0]["message"]["id"]
 
@@ -2928,7 +2989,8 @@ async def test_force_release_rejects_recent_activity(isolated_env, monkeypatch):
 
             resource = await client.read_resource("resource://file_reservations/backend?active_only=true")
             entries = json.loads(resource[0].text)
-            assert entries and entries[0]["id"] == reservation_id
+            assert entries
+            assert entries[0]["id"] == reservation_id
             assert entries[0]["released_ts"] is None
     finally:
         clear_settings_cache()
@@ -3135,6 +3197,7 @@ async def test_attachment_rejection_precedes_path_resolution(isolated_env, monke
                 "name": "codex-wsl-pathguard-1",
             },
         )
+        attachment_path_text = str(attachment_path)
         with pytest.raises(
             Exception,
             match="attachment_paths and convert_images are disabled",
@@ -3147,7 +3210,7 @@ async def test_attachment_rejection_precedes_path_resolution(isolated_env, monke
                     "to": ["codex-wsl-pathguard-1"],
                     "subject": "No path resolution",
                     "body_md": "Reserved attachment input.",
-                    "attachment_paths": [str(attachment_path)],
+                    "attachment_paths": [attachment_path_text],
                     "idempotency_key": "attachment-resolution-rejected",
                 },
             )
@@ -3335,7 +3398,8 @@ async def test_project_sibling_suggestions_backend(isolated_env, monkeypatch):
 
     assert len(project_ids) == 2
     first_id, second_id = project_ids
-    assert first_id in data and second_id in data
+    assert first_id in data
+    assert second_id in data
     assert any(entry["peer"]["id"] == second_id for entry in data[first_id]["suggested"])
 
     confirmation = await update_project_sibling_status(first_id, second_id, "confirmed")

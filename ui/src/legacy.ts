@@ -150,8 +150,8 @@ mermaid.initialize({
 });
 
 const startAlpine = () => {
-  if (!document.documentElement.hasAttribute("data-hermes-alpine-started")) {
-    document.documentElement.setAttribute("data-hermes-alpine-started", "true");
+  if (document.documentElement.dataset.hermesAlpineStarted === undefined) {
+    document.documentElement.dataset.hermesAlpineStarted = "true";
     Alpine.start();
   }
 };

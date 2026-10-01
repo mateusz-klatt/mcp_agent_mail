@@ -24,7 +24,8 @@ async def test_empty_inbox_and_pagination(isolated_env):
             "fetch_inbox",
             {"project_key": "Backend", "agent_name": EDGE_AGENT, "limit": 5},
         )
-        assert isinstance(inbox.data, list) and len(inbox.data) == 0
+        assert isinstance(inbox.data, list)
+        assert len(inbox.data) == 0
 
         # Create 25 messages
         for i in range(25):
@@ -74,4 +75,5 @@ async def test_empty_inbox_and_pagination(isolated_env):
         last_msg_id = _get("id", items[0])
         if last_msg_id is not None:
             blocks = await client.read_resource(f"resource://thread/{last_msg_id}?project=Backend&include_bodies=false")
-            assert blocks and "messages" in (blocks[0].text or "")
+            assert blocks
+            assert "messages" in (blocks[0].text or "")

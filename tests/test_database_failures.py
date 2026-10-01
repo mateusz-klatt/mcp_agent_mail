@@ -788,8 +788,8 @@ class TestDatabaseAutoCreation:
             ),
         ]
         for statement, parameters in invalid_rows:
-            with pytest.raises(IntegrityError):
-                async with engine.begin() as conn:
+            async with engine.connect() as conn:
+                with pytest.raises(IntegrityError):
                     await conn.exec_driver_sql(statement, parameters)
 
         async with engine.begin() as conn:
@@ -797,8 +797,16 @@ class TestDatabaseAutoCreation:
                 "UPDATE agents SET retired_at = ? WHERE id = ?",
                 ("2026-08-13 10:00:04", int(agent_two.id)),
             )
-        with pytest.raises(IntegrityError, match="retired"):
-            async with engine.begin() as conn:
+        retired_parameters = (
+            str(uuid.uuid4()),
+            int(project_two.id),
+            int(agent_two.id),
+            "6" * 64,
+            "2026-08-13 10:00:00",
+            "2026-08-13 10:00:01",
+        )
+        async with engine.connect() as conn:
+            with pytest.raises(IntegrityError, match="retired"):
                 await conn.exec_driver_sql(
                     "INSERT INTO agent_executions "
                     "(id, project_id, agent_id, external_id, client_name, "
@@ -806,18 +814,15 @@ class TestDatabaseAutoCreation:
                     "task_description, started_ts, last_active_ts) "
                     "VALUES (?, ?, ?, 'retired-owner', 'codex', ?, 1, "
                     "'session', 'active', '', ?, ?)",
-                    (
-                        str(uuid.uuid4()),
-                        int(project_two.id),
-                        int(agent_two.id),
-                        "6" * 64,
-                        "2026-08-13 10:00:00",
-                        "2026-08-13 10:00:01",
-                    ),
+                    retired_parameters,
                 )
 
-        with pytest.raises(IntegrityError):
-            async with engine.begin() as conn:
+        duplicate_root_parameters = (
+            str(uuid.uuid4()), int(project_one.id), int(agent_one.id),
+            "2026-08-13 10:00:00", "2026-08-13 10:00:01",
+        )
+        async with engine.connect() as conn:
+            with pytest.raises(IntegrityError):
                 await conn.exec_driver_sql(
                     "INSERT INTO agent_executions "
                     "(id, project_id, agent_id, external_id, client_name, "
@@ -825,10 +830,14 @@ class TestDatabaseAutoCreation:
                     "started_ts, last_active_ts) "
                     "VALUES (?, ?, ?, 'root-turn', 'codex', lower(hex(randomblob(32))), "
                     "'session', 'active', '', ?, ?)",
-                    (str(uuid.uuid4()), int(project_one.id), int(agent_one.id), "2026-08-13 10:00:00", "2026-08-13 10:00:01"),
+                    duplicate_root_parameters,
                 )
-        with pytest.raises(IntegrityError):
-            async with engine.begin() as conn:
+        duplicate_child_parameters = (
+            str(uuid.uuid4()), int(project_one.id), int(agent_one.id), parent_id,
+            "2026-08-13 10:00:02", "2026-08-13 10:00:03",
+        )
+        async with engine.connect() as conn:
+            with pytest.raises(IntegrityError):
                 await conn.exec_driver_sql(
                     "INSERT INTO agent_executions "
                     "(id, project_id, agent_id, parent_execution_id, external_id, "
@@ -836,7 +845,7 @@ class TestDatabaseAutoCreation:
                     "started_ts, last_active_ts) "
                     "VALUES (?, ?, ?, ?, 'child-turn', 'codex', "
                     "lower(hex(randomblob(32))), 'subagent', 'active', '', ?, ?)",
-                    (str(uuid.uuid4()), int(project_one.id), int(agent_one.id), parent_id, "2026-08-13 10:00:02", "2026-08-13 10:00:03"),
+                    duplicate_child_parameters,
                 )
         async with engine.begin() as conn:
             await conn.exec_driver_sql(
@@ -855,29 +864,31 @@ class TestDatabaseAutoCreation:
                 ),
             )
 
-        with pytest.raises(IntegrityError, match="owner is immutable"):
-            async with engine.begin() as conn:
+        sibling_id = int(agent_sibling.id)
+        async with engine.connect() as conn:
+            with pytest.raises(IntegrityError, match="owner is immutable"):
                 await conn.exec_driver_sql(
                     "UPDATE agent_executions SET agent_id = ? WHERE id = ?",
-                    (int(agent_sibling.id), independent_id),
+                    (sibling_id, independent_id),
                 )
 
-        with pytest.raises(IntegrityError, match="project-bound executions"):
-            async with engine.begin() as conn:
+        reparent_parameters = (int(project_two.id), int(agent_one.id))
+        async with engine.connect() as conn:
+            with pytest.raises(IntegrityError, match="project-bound executions"):
                 await conn.exec_driver_sql(
                     "UPDATE agents SET project_id = ? WHERE id = ?",
-                    (int(project_two.id), int(agent_one.id)),
+                    reparent_parameters,
                 )
 
-        with pytest.raises(IntegrityError, match="active children"):
-            async with engine.begin() as conn:
+        async with engine.connect() as conn:
+            with pytest.raises(IntegrityError, match="active children"):
                 await conn.exec_driver_sql(
                     "UPDATE agent_executions "
                     "SET status = 'completed', ended_ts = ? WHERE id = ?",
                     ("2026-08-13 10:00:04", parent_id),
                 )
-        with pytest.raises(IntegrityError, match="FOREIGN KEY"):
-            async with engine.begin() as conn:
+        async with engine.connect() as conn:
+            with pytest.raises(IntegrityError, match="FOREIGN KEY"):
                 await conn.exec_driver_sql(
                     "DELETE FROM agent_executions WHERE id = ?",
                     (parent_id,),
@@ -971,8 +982,8 @@ class TestDatabaseAutoCreation:
             ),
         ]
         for statement, parameters in terminal_mutations:
-            with pytest.raises(IntegrityError, match="terminal agent execution"):
-                async with engine.begin() as conn:
+            async with engine.connect() as conn:
+                with pytest.raises(IntegrityError, match="terminal agent execution"):
                     await conn.exec_driver_sql(statement, parameters)
 
         invalid_claims = [
@@ -982,8 +993,8 @@ class TestDatabaseAutoCreation:
             (int(project.id), int(owner.id), str(uuid.uuid4())),
         ]
         for project_id, agent_id, candidate_execution_id in invalid_claims:
-            with pytest.raises(IntegrityError):
-                async with engine.begin() as conn:
+            async with engine.connect() as conn:
+                with pytest.raises(IntegrityError):
                     await conn.exec_driver_sql(
                         "INSERT INTO file_reservations "
                         "(project_id, agent_id, execution_id, path_pattern, exclusive, "
@@ -1042,8 +1053,8 @@ class TestDatabaseAutoCreation:
             ),
         ]
         for statement, message in invalid_archive_versions:
-            with pytest.raises(IntegrityError, match=message):
-                async with engine.begin() as conn:
+            async with engine.connect() as conn:
+                with pytest.raises(IntegrityError, match=message):
                     await conn.exec_driver_sql(
                         statement,
                         (explicit_reservation_id,),
@@ -1072,12 +1083,12 @@ class TestDatabaseAutoCreation:
             ),
         ]
         for statement, parameters, message in immutable_binding_mutations:
-            with pytest.raises(IntegrityError, match=message):
-                async with engine.begin() as conn:
+            async with engine.connect() as conn:
+                with pytest.raises(IntegrityError, match=message):
                     await conn.exec_driver_sql(statement, parameters)
 
-        with pytest.raises(IntegrityError, match="active reservations"):
-            async with engine.begin() as conn:
+        async with engine.connect() as conn:
+            with pytest.raises(IntegrityError, match="active reservations"):
                 await conn.exec_driver_sql(
                     "UPDATE agent_executions "
                     "SET status = 'completed', ended_ts = CURRENT_TIMESTAMP WHERE id = ?",
@@ -1103,8 +1114,8 @@ class TestDatabaseAutoCreation:
                 (execution_id,),
             )
 
-        with pytest.raises(IntegrityError, match="execution binding mismatch"):
-            async with engine.begin() as conn:
+        async with engine.connect() as conn:
+            with pytest.raises(IntegrityError, match="execution binding mismatch"):
                 await conn.exec_driver_sql(
                     "UPDATE file_reservations "
                     "SET released_ts = NULL, expires_ts = datetime('now', '+1 hour') "
@@ -1397,8 +1408,8 @@ class TestDatabaseAutoCreation:
             "message_delivery_recipients_active_agent_guard_bi",
         }
 
-        with pytest.raises(IntegrityError, match="invalid reservation origin"):
-            async with engine.begin() as conn:
+        async with engine.connect() as conn:
+            with pytest.raises(IntegrityError, match="invalid reservation origin"):
                 await conn.exec_driver_sql(
                     "INSERT INTO file_reservations "
                     "(id, project_id, agent_id, origin, path_pattern, exclusive, "
@@ -1813,11 +1824,12 @@ class TestDatabaseAutoCreation:
             session.add_all([pending_delivery, terminal_delivery])
             await session.commit()
 
-        with pytest.raises(IntegrityError, match="pending message delivery"):
-            async with engine.begin() as conn:
+        pending_project_id = int(pending_project.id)
+        async with engine.connect() as conn:
+            with pytest.raises(IntegrityError, match="pending message delivery"):
                 await conn.exec_driver_sql(
                     "DELETE FROM projects WHERE id = ?",
-                    (int(pending_project.id),),
+                    (pending_project_id,),
                 )
 
         async with engine.begin() as conn:

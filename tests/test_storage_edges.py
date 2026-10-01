@@ -765,7 +765,7 @@ async def test_get_commit_queue_restarts_after_stop(monkeypatch):
     import mcp_agent_mail.storage as storage_module
 
     queue = storage_module._CommitQueue(max_wait_ms=1.0)
-    await queue.start()
+    queue.start()
     await queue.stop()
 
     monkeypatch.setattr(storage_module, "_COMMIT_QUEUE", queue)
@@ -789,7 +789,7 @@ async def test_commit_queue_start_restarts_done_task():
     queue._task = stale_task
     await stale_task
 
-    await queue.start()
+    queue.start()
 
     assert queue.stats["running"] is True
     assert queue._task is not stale_task
@@ -830,7 +830,7 @@ async def test_commit_queue_stop_drains_pending_requests(isolated_env, monkeypat
 
     monkeypatch.setattr(queue._queue, "put_nowait", put_nowait_and_signal)
 
-    await queue.start()
+    queue.start()
     first_task = asyncio.create_task(queue.enqueue(repo_root, settings, "first", ["a.txt"]))
     await asyncio.wait_for(first_started.wait(), timeout=1.0)
 

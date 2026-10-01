@@ -113,7 +113,7 @@ async def test_the_agent_parameter_cannot_name_someone_else(isolated_env):
             f"thread as itself; got {mine}"
         )
 
-        with pytest.raises(Exception) as refused:
+        with pytest.raises(Exception, match="already authenticated in this MCP session") as refused:
             await session.read_resource(
                 f"resource://thread/SHARED?project={KEY}&agent={OTHER}"
             )

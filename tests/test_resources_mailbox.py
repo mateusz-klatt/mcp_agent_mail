@@ -53,7 +53,8 @@ async def test_views_ack_required_and_ack_overdue_resources(isolated_env):
         blocks = await client.read_resource(
             "resource://views/ack-required/codex-wsl-mailbox-2?project=Backend&limit=10"
         )
-        assert blocks and "NeedsAck" in (blocks[0].text or "")
+        assert blocks
+        assert "NeedsAck" in (blocks[0].text or "")
 
         # Backdate created_ts in DB to ensure it's older than 1 minute
         backdate = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(minutes=5)
@@ -65,7 +66,8 @@ async def test_views_ack_required_and_ack_overdue_resources(isolated_env):
         blocks2 = await client.read_resource(
             "resource://views/ack-overdue/codex-wsl-mailbox-2?project=Backend&ttl_minutes=1&limit=10"
         )
-        assert blocks2 and "NeedsAck" in (blocks2[0].text or "")
+        assert blocks2
+        assert "NeedsAck" in (blocks2[0].text or "")
 
         # After acknowledgement, it should disappear from ack-required
         await client.call_tool(
@@ -114,13 +116,15 @@ async def test_mailbox_and_mailbox_with_commits(isolated_env):
         blocks = await client.read_resource(
             "resource://mailbox/codex-wsl-mailbox-1?project=Backend&limit=5"
         )
-        assert blocks and "CommitMeta" in (blocks[0].text or "")
+        assert blocks
+        assert "CommitMeta" in (blocks[0].text or "")
 
         # With commits metadata
         blocks2 = await client.read_resource(
             "resource://mailbox-with-commits/codex-wsl-mailbox-1?project=Backend&limit=5"
         )
-        assert blocks2 and "CommitMeta" in (blocks2[0].text or "")
+        assert blocks2
+        assert "CommitMeta" in (blocks2[0].text or "")
 
 
 @pytest.mark.asyncio
@@ -155,8 +159,10 @@ async def test_outbox_and_message_resource(isolated_env):
         blocks = await client.read_resource(
             "resource://outbox/codex-wsl-mailbox-1?project=Backend&limit=5"
         )
-        assert blocks and "OutboxMsg" in (blocks[0].text or "")
+        assert blocks
+        assert "OutboxMsg" in (blocks[0].text or "")
 
         # Message resource returns full payload with body
         blocks2 = await client.read_resource(f"resource://message/{mid}?project=Backend")
-        assert blocks2 and "OutboxMsg" in (blocks2[0].text or "")
+        assert blocks2
+        assert "OutboxMsg" in (blocks2[0].text or "")

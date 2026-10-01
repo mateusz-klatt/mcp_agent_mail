@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import binascii
 import configparser
 import hashlib
 import json
@@ -18,7 +17,17 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from importlib import resources
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal, Mapping, Optional, Sequence, cast
+from typing import (
+    Any,
+    Literal,
+    Mapping,
+    NotRequired,
+    Optional,
+    Sequence,
+    TypedDict,
+    Unpack,
+    cast,
+)
 from urllib.parse import urlsplit
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
@@ -33,11 +42,13 @@ class ShareExportError(RuntimeError):
 
 
 SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"ghp_[A-Za-z0-9]{36,}", re.IGNORECASE),
-    re.compile(r"github_pat_[A-Za-z0-9_]{20,}", re.IGNORECASE),
-    re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}", re.IGNORECASE),
-    re.compile(r"sk-[A-Za-z0-9]{20,}", re.IGNORECASE),
-    re.compile(r"(?i)bearer\s+[A-Za-z0-9_\-\.]{16,}"),
+    # Preserve Unicode IGNORECASE prefix matches (long s/Kelvin sign) while
+    # keeping token bodies strictly ASCII, without scoped flag groups.
+    re.compile(r"[gG][hH][pP]_[A-Za-z0-9]{36,}"),
+    re.compile(r"(?i:github_pat_)(?a:\w{20,})"),
+    re.compile(r"[xX][oO][xX][bBaApPrRsS\u017f]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"[sS\u017f][kK\u212a]-[A-Za-z0-9]{20,}"),
+    re.compile(r"(?i:bearer)\s+(?a:[\w.-]{16,})"),
     re.compile(r"eyJ[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+"),  # JWT tokens
 )
 
@@ -58,6 +69,14 @@ DETACH_ATTACHMENT_THRESHOLD = 25 * 1024 * 1024  # 25 MiB
 DEFAULT_CHUNK_THRESHOLD = 20 * 1024 * 1024  # 20 MiB
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MiB
 _SHA256_LOWER_HEX_PATTERN = re.compile(r"[0-9a-f]{64}")
+_MESSAGES_TABLE_INFO_PRAGMA = "PRAGMA table_info(messages)"
+_VIEWER_ASSETS_PACKAGE = "mcp_agent_mail.viewer_assets"
+_VERIFY_ISOLATION_INSTRUCTION = (
+    "Verify isolation: open browser DevTools console and check that "
+    "`window.crossOriginIsolated === true`."
+)
+_INDENTED_BASH_FENCE = "   ```bash"
+_INDENTED_CODE_FENCE = "   ```"
 INDEX_REDIRECT_HTML = """<!doctype html>
 <html lang="en">
 
@@ -226,7 +245,7 @@ HOSTING_GUIDES: dict[str, dict[str, object]] = {
             "GitHub Pages does not support the `_headers` file, so the service worker intercepts requests and adds the required headers.",
             "Commit and push, then enable GitHub Pages for your repository branch in repository settings.",
             "On first visit, the page will reload automatically once the service worker activates (this is normal behavior).",
-            "Verify isolation: open browser DevTools console and check that `window.crossOriginIsolated === true`."
+            _VERIFY_ISOLATION_INSTRUCTION,
         ],
     },
     "cloudflare_pages": {
@@ -236,7 +255,7 @@ HOSTING_GUIDES: dict[str, dict[str, object]] = {
             "Ensure `wrangler.toml` references the bundle directory (or upload the ZIP directly via the dashboard).",
             "The included `_headers` file will automatically apply `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` headers.",
             "These headers are required for OPFS caching and optimal sqlite-wasm performance.",
-            "Verify isolation: open browser DevTools console and check that `window.crossOriginIsolated === true`.",
+            _VERIFY_ISOLATION_INSTRUCTION,
             "For attachments >25 MiB, push them to R2 and reference the signed URLs in the manifest."
         ],
     },
@@ -247,7 +266,7 @@ HOSTING_GUIDES: dict[str, dict[str, object]] = {
             "The included `_headers` file will automatically apply `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` headers.",
             "These headers are required for OPFS caching and optimal sqlite-wasm performance.",
             "Deploy the bundle directory (or ZIP) via CLI or the Netlify UI.",
-            "Verify isolation: open browser DevTools console and check that `window.crossOriginIsolated === true`.",
+            _VERIFY_ISOLATION_INSTRUCTION,
             "Verify `.wasm` assets are served with `application/wasm` using Netlify's response headers tooling."
         ],
     },
@@ -268,7 +287,7 @@ GENERIC_HOSTING_NOTES: list[str] = [
     "For optimal performance, enable Cross-Origin-Isolation (COOP/COEP headers). The included `_headers` file is automatically applied by Cloudflare Pages and Netlify.",
     "If your host doesn't support `_headers` (e.g., GitHub Pages), uncomment the `coi-serviceworker.js` script in `viewer/index.html` to enable isolation via service worker.",
     "If cross-origin isolation is unavailable, the viewer will show a warning banner with platform-specific instructions and fall back to streaming mode.",
-    "Verify isolation: open browser DevTools console and check that `window.crossOriginIsolated === true`.",
+    _VERIFY_ISOLATION_INSTRUCTION,
 ]
 
 
@@ -285,6 +304,44 @@ class BundleArtifacts:
     attachments_manifest: dict[str, Any]
     chunk_manifest: Optional[dict[str, Any]]
     viewer_data: Optional[dict[str, Any]]
+
+
+class _BundleAssetOptions(TypedDict):
+    project_filters: Sequence[str]
+    exporter_version: NotRequired[str]
+
+
+@dataclass(slots=True)
+class _AttachmentBundleState:
+    bundles: dict[str, Path]
+    manifest_items: list[dict[str, Any]]
+    inline_count: int = 0
+    copied_count: int = 0
+    externalized_count: int = 0
+    missing_count: int = 0
+    bytes_copied: int = 0
+
+
+@dataclass(slots=True, frozen=True)
+class _AttachmentBundleConfig:
+    storage_root: Path
+    output_root: Path
+    attachments_dir: Path
+    inline_threshold: int
+    detach_threshold: int
+
+
+@dataclass(slots=True, frozen=True)
+class _ScrubbedMessage:
+    thread_id: str
+    subject: str
+    body: str
+    attachments: list[Any]
+    attachments_updated: bool
+    secret_replacements: int
+    attachment_replacements: int
+    attachment_keys_removed: int
+    attachments_cleared: int
 
 
 def _find_repo_root(start: Path) -> Optional[Path]:
@@ -367,63 +424,74 @@ def _git_remote_hostname(remote_url: str) -> str | None:
     return None
 
 
-def detect_hosting_hints(output_dir: Path) -> list[HostingHint]:
-    signals: dict[str, list[str]] = defaultdict(list)
-    resolved_output_dir = output_dir.expanduser().resolve()
-    repo_root = _find_repo_root(resolved_output_dir)
-    remote_urls: list[str] = []
-    if repo_root:
-        remote_urls = _read_git_remotes(repo_root)
-        workflows_dir = repo_root / ".github" / "workflows"
-        if workflows_dir.exists():
-            for workflow in workflows_dir.glob("*.yml"):
-                text = workflow.read_text(encoding="utf-8", errors="ignore")
-                if "github-pages" in text or "pages" in workflow.name.lower():
-                    signals["github_pages"].append(f"Workflow {workflow.name} references Pages")
-                    break
-        if (repo_root / "wrangler.toml").exists():
-            signals["cloudflare_pages"].append("Found wrangler.toml")
-        if (repo_root / "netlify.toml").exists():
-            signals["netlify"].append("Found netlify.toml")
-        if (repo_root / "deploy" / "s3").exists() or (repo_root / "deploy" / "aws").exists():
-            signals["s3"].append("Detected deploy scripts referencing S3/AWS")
+def _find_pages_workflow(repo_root: Path) -> str | None:
+    workflows_dir = repo_root / ".github" / "workflows"
+    if not workflows_dir.exists():
+        return None
+    for workflow in workflows_dir.glob("*.yml"):
+        text = workflow.read_text(encoding="utf-8", errors="ignore")
+        if "github-pages" in text or "pages" in workflow.name.lower():
+            return f"Workflow {workflow.name} references Pages"
+    return None
 
+
+def _collect_repository_hosting_signals(
+    signals: dict[str, list[str]],
+    repo_root: Path,
+    resolved_output_dir: Path,
+) -> list[str]:
+    pages_workflow = _find_pages_workflow(repo_root)
+    if pages_workflow is not None:
+        signals["github_pages"].append(pages_workflow)
+    if (repo_root / "wrangler.toml").exists():
+        signals["cloudflare_pages"].append("Found wrangler.toml")
+    if (repo_root / "netlify.toml").exists():
+        signals["netlify"].append("Found netlify.toml")
+    if (repo_root / "deploy" / "s3").exists() or (repo_root / "deploy" / "aws").exists():
+        signals["s3"].append("Detected deploy scripts referencing S3/AWS")
+    docs_dir = repo_root / "docs"
+    if docs_dir.exists() and resolved_output_dir.is_relative_to(docs_dir):
+        signals["github_pages"].append("Export path inside docs/ directory")
+    return _read_git_remotes(repo_root)
+
+
+def _collect_remote_hosting_signals(
+    signals: dict[str, list[str]],
+    remote_urls: Sequence[str],
+) -> None:
+    remote_hosts = (
+        ("github_pages", "github.com", "GitHub remote detected"),
+        ("cloudflare_pages", "cloudflare.com", "Cloudflare remote detected"),
+        ("netlify", "netlify.com", "Netlify remote detected"),
+        ("s3", "amazonaws.com", "AWS remote detected"),
+    )
     for url in remote_urls:
         hostname = (_git_remote_hostname(url) or "").casefold()
-        if hostname == "github.com" or hostname.endswith(".github.com"):
-            signals["github_pages"].append("GitHub remote detected")
-        if hostname == "cloudflare.com" or hostname.endswith(".cloudflare.com"):
-            signals["cloudflare_pages"].append("Cloudflare remote detected")
-        if hostname == "netlify.com" or hostname.endswith(".netlify.com"):
-            signals["netlify"].append("Netlify remote detected")
-        if hostname == "amazonaws.com" or hostname.endswith(".amazonaws.com"):
-            signals["s3"].append("AWS remote detected")
+        for key, expected_hostname, message in remote_hosts:
+            if hostname == expected_hostname or hostname.endswith(f".{expected_hostname}"):
+                signals[key].append(message)
 
-    env = os.environ
-    if env.get("GITHUB_REPOSITORY"):
-        signals["github_pages"].append("GITHUB_REPOSITORY env set")
-    if env.get("CF_PAGES") or env.get("CF_ACCOUNT_ID"):
-        signals["cloudflare_pages"].append("Cloudflare Pages environment variables detected")
-    if env.get("NETLIFY") or env.get("NETLIFY_SITE_ID"):
-        signals["netlify"].append("Netlify environment variables detected")
-    if env.get("AWS_S3_BUCKET") or env.get("AWS_BUCKET"):
-        signals["s3"].append("AWS S3 bucket environment detected")
 
-    if repo_root:
-        docs_dir = repo_root / "docs"
-        if docs_dir.exists():
-            try:
-                if resolved_output_dir.is_relative_to(docs_dir):
-                    signals["github_pages"].append("Export path inside docs/ directory")
-            except AttributeError:
-                try:
-                    resolved_output_dir.relative_to(docs_dir)
-                    signals["github_pages"].append("Export path inside docs/ directory")
-                except ValueError:
-                    pass
-            except ValueError:
-                pass
+def _collect_environment_hosting_signals(
+    signals: dict[str, list[str]],
+    env: Mapping[str, str],
+) -> None:
+    environment_signals = (
+        ("github_pages", ("GITHUB_REPOSITORY",), "GITHUB_REPOSITORY env set"),
+        (
+            "cloudflare_pages",
+            ("CF_PAGES", "CF_ACCOUNT_ID"),
+            "Cloudflare Pages environment variables detected",
+        ),
+        ("netlify", ("NETLIFY", "NETLIFY_SITE_ID"), "Netlify environment variables detected"),
+        ("s3", ("AWS_S3_BUCKET", "AWS_BUCKET"), "AWS S3 bucket environment detected"),
+    )
+    for key, variable_names, message in environment_signals:
+        if any(env.get(name) for name in variable_names):
+            signals[key].append(message)
 
+
+def _build_hosting_hints(signals: Mapping[str, list[str]]) -> list[HostingHint]:
     hints: list[HostingHint] = []
     for key, evidence in signals.items():
         guide = HOSTING_GUIDES.get(key)
@@ -445,13 +513,28 @@ def detect_hosting_hints(output_dir: Path) -> list[HostingHint]:
     return hints
 
 
+def detect_hosting_hints(output_dir: Path) -> list[HostingHint]:
+    signals: dict[str, list[str]] = defaultdict(list)
+    resolved_output_dir = output_dir.expanduser().resolve()
+    repo_root = _find_repo_root(resolved_output_dir)
+    remote_urls = (
+        _collect_repository_hosting_signals(signals, repo_root, resolved_output_dir)
+        if repo_root is not None
+        else []
+    )
+    _collect_remote_hosting_signals(signals, remote_urls)
+    _collect_environment_hosting_signals(signals, os.environ)
+    return _build_hosting_hints(signals)
+
+
 def build_how_to_deploy(hosting_hints: Sequence[HostingHint]) -> str:
-    sections: list[str] = []
-    sections.append("# HOW_TO_DEPLOY\n")
-    sections.append("## Quick Local Preview\n")
-    sections.append("1. Run `uv run python -m mcp_agent_mail.cli share preview ./` from this bundle directory.")
-    sections.append("2. Open the printed URL (default `http://127.0.0.1:9000/`).")
-    sections.append("3. Press Ctrl+C to stop the preview server when finished.\n")
+    sections: list[str] = [
+        "# HOW_TO_DEPLOY\n",
+        "## Quick Local Preview\n",
+        "1. Run `uv run python -m mcp_agent_mail.cli share preview ./` from this bundle directory.",
+        "2. Open the printed URL (default `http://127.0.0.1:9000/`).",
+        "3. Press Ctrl+C to stop the preview server when finished.\n",
+    ]
 
     if hosting_hints:
         sections.append("## Detected Hosting Targets\n")
@@ -479,6 +562,36 @@ def build_how_to_deploy(hosting_hints: Sequence[HostingHint]) -> str:
     sections.append("Review `manifest.json` before publication to confirm the included projects, hashing, and scrubbing policies.")
 
     return "\n".join(sections)
+
+
+def _viewer_table_columns(
+    conn: sqlite3.Connection,
+    table_name: str,
+) -> set[str]:
+    return {
+        str(row[1])
+        for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+
+
+def _is_allowed_viewer_table(name: str, allowed_tables: set[str]) -> bool:
+    return (
+        name in allowed_tables
+        or name == "fts_messages"
+        or name.startswith("fts_messages_")
+        or name == "sqlite_stat1"
+    )
+
+
+def _assert_viewer_table_columns(
+    conn: sqlite3.Connection,
+    table_name: str,
+    expected_columns: set[str],
+) -> None:
+    if _viewer_table_columns(conn, table_name) != expected_columns:
+        raise ShareExportError(
+            f"Viewer snapshot table {table_name} has unexpected columns."
+        )
 
 
 def _assert_viewer_snapshot_schema(snapshot_path: Path) -> None:
@@ -571,44 +684,25 @@ def _assert_viewer_snapshot_schema(snapshot_path: Path) -> None:
         unexpected_tables = sorted(
             name
             for name in table_names
-            if name not in allowed_tables
-            and name != "fts_messages"
-            and not name.startswith("fts_messages_")
-            and name != "sqlite_stat1"
+            if not _is_allowed_viewer_table(name, allowed_tables)
         )
         if unexpected_tables:
             raise ShareExportError(
                 "Viewer snapshot contains unexpected tables: " + ", ".join(unexpected_tables)
             )
         for table_name, expected_columns in allowed_base_columns.items():
-            actual_columns = {
-                str(row[1])
-                for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-            }
-            if actual_columns != expected_columns:
-                raise ShareExportError(
-                    f"Viewer snapshot table {table_name} has unexpected columns."
-                )
+            _assert_viewer_table_columns(conn, table_name, expected_columns)
         for table_name, expected_columns in expected_derived_columns.items():
             if table_name not in table_names:
                 if table_name == "fts_search_overview_mv" and "fts_messages" not in table_names:
                     continue
                 raise ShareExportError(f"Viewer snapshot is missing table {table_name}.")
-            actual_columns = {
-                str(row[1])
-                for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-            }
-            if actual_columns != expected_columns:
-                raise ShareExportError(
-                    f"Viewer snapshot table {table_name} has unexpected columns."
-                )
-        if "fts_messages" in table_names:
-            actual_fts_columns = {
-                str(row[1])
-                for row in conn.execute("PRAGMA table_info(fts_messages)").fetchall()
-            }
-            if actual_fts_columns != expected_fts_columns:
-                raise ShareExportError("Viewer snapshot FTS table has unexpected columns.")
+            _assert_viewer_table_columns(conn, table_name, expected_columns)
+        if (
+            "fts_messages" in table_names
+            and _viewer_table_columns(conn, "fts_messages") != expected_fts_columns
+        ):
+            raise ShareExportError("Viewer snapshot FTS table has unexpected columns.")
         integrity_result = conn.execute("PRAGMA integrity_check").fetchone()
         if integrity_result is None or integrity_result[0] != "ok":
             raise ShareExportError("Viewer snapshot failed SQLite integrity_check.")
@@ -677,63 +771,39 @@ def export_viewer_data(
     }
 
 
-def sign_manifest(
-    manifest_path: Path,
-    signing_key_path: Path,
-    output_path: Path,
-    *,
-    public_out: Optional[Path] = None,
-    overwrite: bool = False,
-) -> dict[str, str]:
+def _read_signing_input(path: Path, label: str) -> tuple[Path, bytes]:
+    resolved_path = path.expanduser().resolve()
+    if not resolved_path.exists():
+        raise ShareExportError(f"{label} file not found: {resolved_path}")
+    if not resolved_path.is_file():
+        raise ShareExportError(f"{label} path must be a file: {resolved_path}")
     try:
-        from nacl.signing import SigningKey
-    except ImportError as exc:  # pragma: no cover - optional dependency
+        return resolved_path, resolved_path.read_bytes()
+    except OSError as exc:
         raise ShareExportError(
-            "PyNaCl is required for Ed25519 signing. Install it with `uv add PyNaCl`."
+            f"Failed to read {label.lower()} file {resolved_path}: {exc}"
         ) from exc
 
-    # Expand and validate manifest path
-    manifest_path = manifest_path.expanduser().resolve()
-    if not manifest_path.exists():
-        raise ShareExportError(f"Manifest file not found: {manifest_path}")
-    if not manifest_path.is_file():
-        raise ShareExportError(f"Manifest path must be a file: {manifest_path}")
 
-    # Expand and validate signing key path
-    signing_key_path = signing_key_path.expanduser().resolve()
-    if not signing_key_path.exists():
-        raise ShareExportError(f"Signing key file not found: {signing_key_path}")
-    if not signing_key_path.is_file():
-        raise ShareExportError(f"Signing key path must be a file: {signing_key_path}")
-
+def _create_manifest_signature(
+    manifest_bytes: bytes,
+    key_raw: bytes,
+    signing_key_type: Any,
+) -> tuple[bytes, bytes]:
     try:
-        manifest_bytes = manifest_path.read_bytes()
-    except (IOError, OSError) as exc:
-        raise ShareExportError(f"Failed to read manifest file {manifest_path}: {exc}") from exc
-
-    try:
-        key_raw = signing_key_path.read_bytes()
-    except (IOError, OSError) as exc:
-        raise ShareExportError(f"Failed to read signing key file {signing_key_path}: {exc}") from exc
-
-    if len(key_raw) not in (32, 64):
-        raise ShareExportError("Signing key must be 32-byte seed or 64-byte expanded Ed25519 key.")
-
-    try:
-        signing_key = SigningKey(key_raw[:32])
+        signing_key = signing_key_type(key_raw[:32])
         signature = signing_key.sign(manifest_bytes).signature
         public_key = signing_key.verify_key.encode()
     except Exception as exc:
         raise ShareExportError(f"Failed to sign manifest with Ed25519 key: {exc}") from exc
+    return signature, public_key
 
-    payload = {
-        "algorithm": "ed25519",
-        "signature": base64.b64encode(signature).decode("ascii"),
-        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
-        "public_key": base64.b64encode(public_key).decode("ascii"),
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-    }
 
+def _write_manifest_signature_payload(
+    output_path: Path,
+    payload: dict[str, str],
+    overwrite: bool,
+) -> None:
     sig_path = output_path / "manifest.sig.json"
     try:
         if overwrite and sig_path.exists():
@@ -749,30 +819,75 @@ def sign_manifest(
     except Exception as exc:
         raise ShareExportError(f"Failed to write signature file: {exc}") from exc
 
-    if public_out is not None:
-        # Expand and validate public key output path
-        public_out = public_out.expanduser().resolve()
-        if public_out.exists():
-            if public_out.is_dir():
-                raise ShareExportError(f"Public key output path must be a file: {public_out}")
-            if not overwrite:
-                raise ShareExportError(f"Public key output file already exists: {public_out}")
 
-        # Ensure parent directory exists
-        try:
-            public_out.parent.mkdir(parents=True, exist_ok=True)
-        except (IOError, OSError) as exc:
-            raise ShareExportError(f"Failed to create parent directory for public key: {exc}") from exc
-
-        try:
-            public_out.write_text(
-                base64.b64encode(public_key).decode("ascii"),
-                encoding="utf-8",
-                newline="\n",
+def _write_public_key(
+    public_out: Path,
+    public_key: bytes,
+    overwrite: bool,
+) -> None:
+    resolved_public_out = public_out.expanduser().resolve()
+    if resolved_public_out.exists():
+        if resolved_public_out.is_dir():
+            raise ShareExportError(
+                f"Public key output path must be a file: {resolved_public_out}"
             )
-        except (IOError, OSError) as exc:
-            raise ShareExportError(f"Failed to write public key to {public_out}: {exc}") from exc
+        if not overwrite:
+            raise ShareExportError(
+                f"Public key output file already exists: {resolved_public_out}"
+            )
+    try:
+        resolved_public_out.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ShareExportError(
+            f"Failed to create parent directory for public key: {exc}"
+        ) from exc
+    try:
+        resolved_public_out.write_text(
+            base64.b64encode(public_key).decode("ascii"),
+            encoding="utf-8",
+            newline="\n",
+        )
+    except OSError as exc:
+        raise ShareExportError(
+            f"Failed to write public key to {resolved_public_out}: {exc}"
+        ) from exc
 
+
+def sign_manifest(
+    manifest_path: Path,
+    signing_key_path: Path,
+    output_path: Path,
+    *,
+    public_out: Optional[Path] = None,
+    overwrite: bool = False,
+) -> dict[str, str]:
+    try:
+        from nacl.signing import SigningKey
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise ShareExportError(
+            "PyNaCl is required for Ed25519 signing. Install it with `uv add PyNaCl`."
+        ) from exc
+
+    _, manifest_bytes = _read_signing_input(manifest_path, "Manifest")
+    _, key_raw = _read_signing_input(signing_key_path, "Signing key")
+    if len(key_raw) not in (32, 64):
+        raise ShareExportError("Signing key must be 32-byte seed or 64-byte expanded Ed25519 key.")
+
+    signature, public_key = _create_manifest_signature(
+        manifest_bytes,
+        key_raw,
+        SigningKey,
+    )
+    payload = {
+        "algorithm": "ed25519",
+        "signature": base64.b64encode(signature).decode("ascii"),
+        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "public_key": base64.b64encode(public_key).decode("ascii"),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_manifest_signature_payload(output_path, payload, overwrite)
+    if public_out is not None:
+        _write_public_key(public_out, public_key, overwrite)
     return payload
 
 
@@ -933,6 +1048,37 @@ def _row_value(row: sqlite3.Row, column: str, default: Any = None) -> Any:
         return default
 
 
+def _assert_viewer_source_schema(source_conn: sqlite3.Connection) -> None:
+    required_columns = {
+        "projects": {"id", "slug", "human_key"},
+        "agents": {"id", "project_id", "name"},
+        "messages": {
+            "id",
+            "project_id",
+            "sender_id",
+            "thread_id",
+            "subject",
+            "body_md",
+            "importance",
+            "ack_required",
+            "created_ts",
+            "attachments",
+        },
+        "message_recipients": {"message_id", "agent_id"},
+    }
+    for table_name, expected_columns in required_columns.items():
+        actual_columns = {
+            str(row["name"])
+            for row in source_conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+        missing_columns = sorted(expected_columns - actual_columns)
+        if missing_columns:
+            raise ShareExportError(
+                f"Source database is missing required {table_name} columns: "
+                + ", ".join(missing_columns)
+            )
+
+
 def _create_viewer_snapshot(
     source: Path,
     destination: Path,
@@ -956,34 +1102,7 @@ def _create_viewer_snapshot(
     try:
         source_conn.row_factory = sqlite3.Row
         source_conn.execute("BEGIN")
-        required_columns = {
-            "projects": {"id", "slug", "human_key"},
-            "agents": {"id", "project_id", "name"},
-            "messages": {
-                "id",
-                "project_id",
-                "sender_id",
-                "thread_id",
-                "subject",
-                "body_md",
-                "importance",
-                "ack_required",
-                "created_ts",
-                "attachments",
-            },
-            "message_recipients": {"message_id", "agent_id"},
-        }
-        for table_name, expected_columns in required_columns.items():
-            actual_columns = {
-                str(row["name"])
-                for row in source_conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-            }
-            missing_columns = sorted(expected_columns - actual_columns)
-            if missing_columns:
-                raise ShareExportError(
-                    f"Source database is missing required {table_name} columns: "
-                    + ", ".join(missing_columns)
-                )
+        _assert_viewer_source_schema(source_conn)
         selected, removed_count = _select_projects_for_export(source_conn, identifiers)
         public_projects = [
             ProjectRecord(record.id, record.slug, record.slug) for record in selected
@@ -1283,20 +1402,221 @@ def _scrub_structure(value: Any) -> tuple[Any, int, int]:
     return value, 0, 0
 
 
+def _clear_snapshot_state(
+    conn: sqlite3.Connection,
+    preset_opts: Mapping[str, Any],
+) -> tuple[int, int, int, int]:
+    ack_flags_cleared = 0
+    if bool(preset_opts.get("clear_ack_state", True)):
+        ack_cursor = conn.execute("UPDATE messages SET ack_required = 0")
+        ack_flags_cleared = ack_cursor.rowcount or 0
+
+    recipients_cleared = 0
+    recipient_columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(message_recipients)").fetchall()
+    }
+    if bool(preset_opts.get("clear_recipients", True)) and {
+        "read_ts",
+        "ack_ts",
+    }.issubset(recipient_columns):
+        recipients_cursor = conn.execute(
+            "UPDATE message_recipients SET read_ts = NULL, ack_ts = NULL"
+        )
+        recipients_cleared = recipients_cursor.rowcount or 0
+
+    file_reservations_removed = 0
+    if bool(preset_opts.get("clear_file_reservations", True)) and _table_exists(
+        conn,
+        "file_reservations",
+    ):
+        file_res_cursor = conn.execute("DELETE FROM file_reservations")
+        file_reservations_removed = file_res_cursor.rowcount or 0
+
+    agent_links_removed = 0
+    if bool(preset_opts.get("clear_agent_links", True)) and _table_exists(
+        conn,
+        "agent_links",
+    ):
+        agent_links_cursor = conn.execute("DELETE FROM agent_links")
+        agent_links_removed = agent_links_cursor.rowcount or 0
+
+    return (
+        ack_flags_cleared,
+        recipients_cleared,
+        file_reservations_removed,
+        agent_links_removed,
+    )
+
+
+def _scrub_message_text(
+    message: sqlite3.Row,
+    *,
+    scrub_secrets: bool,
+) -> tuple[str, str, str, int]:
+    thread_original = message["thread_id"] or ""
+    subject_original = message["subject"] or ""
+    body_original = message["body_md"] or ""
+    if not scrub_secrets:
+        return thread_original, subject_original, body_original, 0
+
+    thread_id, thread_replacements = _scrub_text(thread_original)
+    subject, subject_replacements = _scrub_text(subject_original)
+    body, body_replacements = _scrub_text(body_original)
+    return (
+        thread_id,
+        subject,
+        body,
+        thread_replacements + subject_replacements + body_replacements,
+    )
+
+
+def _parse_scrub_attachments(value: Any) -> tuple[list[Any], bool]:
+    if not value:
+        return [], False
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return [], True
+    elif isinstance(value, list):
+        parsed = value
+    else:
+        return [], True
+    if isinstance(parsed, list):
+        return parsed, False
+    return [], True
+
+
+def _scrub_message_attachments(
+    value: Any,
+    *,
+    drop_attachments: bool,
+    scrub_secrets: bool,
+) -> tuple[list[Any], bool, int, int, int]:
+    attachments, attachments_updated = _parse_scrub_attachments(value)
+    attachments_cleared = 0
+    if drop_attachments and attachments:
+        attachments = []
+        attachments_updated = True
+        attachments_cleared = 1
+
+    attachment_replacements = 0
+    attachment_keys_removed = 0
+    if scrub_secrets and attachments:
+        sanitized, attachment_replacements, attachment_keys_removed = (
+            _scrub_structure(attachments)
+        )
+        if sanitized != attachments:
+            attachments = sanitized
+            attachments_updated = True
+    return (
+        attachments,
+        attachments_updated,
+        attachment_replacements,
+        attachment_keys_removed,
+        attachments_cleared,
+    )
+
+
+def _update_scrubbed_message(
+    conn: sqlite3.Connection,
+    message: sqlite3.Row,
+    scrubbed: _ScrubbedMessage,
+    preset_opts: Mapping[str, Any],
+) -> int:
+    if scrubbed.attachments_updated:
+        sanitized_json = json.dumps(
+            scrubbed.attachments,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        conn.execute(
+            "UPDATE messages SET attachments = ? WHERE id = ?",
+            (sanitized_json, message["id"]),
+        )
+    if scrubbed.subject != message["subject"]:
+        conn.execute(
+            "UPDATE messages SET subject = ? WHERE id = ?",
+            (scrubbed.subject, message["id"]),
+        )
+    if scrubbed.thread_id != message["thread_id"]:
+        conn.execute(
+            "UPDATE messages SET thread_id = ? WHERE id = ?",
+            (scrubbed.thread_id, message["id"]),
+        )
+    if preset_opts["redact_body"]:
+        body = preset_opts.get("body_placeholder") or "[Message body redacted]"
+        if message["body_md"] != body:
+            conn.execute(
+                "UPDATE messages SET body_md = ? WHERE id = ?",
+                (body, message["id"]),
+            )
+            return 1
+    elif scrubbed.body != message["body_md"]:
+        conn.execute(
+            "UPDATE messages SET body_md = ? WHERE id = ?",
+            (scrubbed.body, message["id"]),
+        )
+    return 0
+
+
+def _scrub_message(
+    conn: sqlite3.Connection,
+    message: sqlite3.Row,
+    preset_opts: Mapping[str, Any],
+    *,
+    scrub_secrets: bool,
+) -> tuple[int, int, int, int]:
+    thread_id, subject, body, text_replacements = _scrub_message_text(
+        message,
+        scrub_secrets=scrub_secrets,
+    )
+    (
+        attachments,
+        attachments_updated,
+        attachment_replacements,
+        attachment_keys_removed,
+        attachments_cleared,
+    ) = _scrub_message_attachments(
+        message["attachments"],
+        drop_attachments=bool(preset_opts["drop_attachments"]),
+        scrub_secrets=scrub_secrets,
+    )
+    scrubbed = _ScrubbedMessage(
+        thread_id=thread_id,
+        subject=subject,
+        body=body,
+        attachments=attachments,
+        attachments_updated=attachments_updated,
+        secret_replacements=text_replacements + attachment_replacements,
+        attachment_replacements=attachment_replacements,
+        attachment_keys_removed=attachment_keys_removed,
+        attachments_cleared=attachments_cleared,
+    )
+    body_redacted = _update_scrubbed_message(conn, message, scrubbed, preset_opts)
+    attachments_sanitized = int(
+        scrubbed.attachments_updated
+        or scrubbed.attachment_replacements
+        or scrubbed.attachment_keys_removed
+    )
+    return (
+        scrubbed.secret_replacements,
+        attachments_sanitized,
+        body_redacted,
+        scrubbed.attachments_cleared,
+    )
+
+
 def scrub_snapshot(
     snapshot_path: Path,
     *,
     preset: str = "standard",
-    export_salt: Optional[bytes] = None,
 ) -> ScrubSummary:
     """Apply in-place redactions to the snapshot and return a summary."""
 
     preset_key = _normalize_scrub_preset(preset)
     preset_opts = SCRUB_PRESETS[preset_key]
-    clear_ack_state = bool(preset_opts.get("clear_ack_state", True))
-    clear_recipients = bool(preset_opts.get("clear_recipients", True))
-    clear_file_reservations = bool(preset_opts.get("clear_file_reservations", True))
-    clear_agent_links = bool(preset_opts.get("clear_agent_links", True))
     scrub_secrets = bool(preset_opts.get("scrub_secrets", True))
 
     bodies_redacted = 0
@@ -1312,35 +1632,12 @@ def scrub_snapshot(
         agents_total = conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0]
         agents_pseudonymized = 0
 
-        if clear_ack_state:
-            ack_cursor = conn.execute("UPDATE messages SET ack_required = 0")
-            ack_flags_cleared = ack_cursor.rowcount or 0
-        else:
-            ack_flags_cleared = 0
-
-        recipient_columns = {
-            str(row["name"])
-            for row in conn.execute("PRAGMA table_info(message_recipients)").fetchall()
-        }
-        if clear_recipients and {"read_ts", "ack_ts"}.issubset(recipient_columns):
-            recipients_cursor = conn.execute(
-                "UPDATE message_recipients SET read_ts = NULL, ack_ts = NULL"
-            )
-            recipients_cleared = recipients_cursor.rowcount or 0
-        else:
-            recipients_cleared = 0
-
-        if clear_file_reservations and _table_exists(conn, "file_reservations"):
-            file_res_cursor = conn.execute("DELETE FROM file_reservations")
-            file_res_removed = file_res_cursor.rowcount or 0
-        else:
-            file_res_removed = 0
-
-        if clear_agent_links and _table_exists(conn, "agent_links"):
-            agent_links_cursor = conn.execute("DELETE FROM agent_links")
-            agent_links_removed = agent_links_cursor.rowcount or 0
-        else:
-            agent_links_removed = 0
+        (
+            ack_flags_cleared,
+            recipients_cleared,
+            file_res_removed,
+            agent_links_removed,
+        ) = _clear_snapshot_state(conn, preset_opts)
 
         secrets_replaced = 0
         attachments_sanitized = 0
@@ -1348,79 +1645,22 @@ def scrub_snapshot(
         message_rows = conn.execute(
             "SELECT id, thread_id, subject, body_md, attachments FROM messages"
         ).fetchall()
-        for msg in message_rows:
-            thread_original = msg["thread_id"] or ""
-            subject_original = msg["subject"] or ""
-            body_original = msg["body_md"] or ""
-            if scrub_secrets:
-                thread_id, thread_replacements = _scrub_text(thread_original)
-                subject, subj_replacements = _scrub_text(subject_original)
-                body, body_replacements = _scrub_text(body_original)
-            else:
-                thread_id = thread_original
-                subject = subject_original
-                body = body_original
-                thread_replacements = 0
-                subj_replacements = 0
-                body_replacements = 0
-            secrets_replaced += thread_replacements + subj_replacements + body_replacements
-            attachments_value = msg["attachments"]
-            attachments_updated = False
-            attachment_replacements = 0
-            attachment_keys_removed = 0
-            if attachments_value:
-                if isinstance(attachments_value, str):
-                    try:
-                        parsed = json.loads(attachments_value)
-                    except json.JSONDecodeError:
-                        parsed = []
-                        attachments_updated = True
-                    if isinstance(parsed, list):
-                        attachments_data = parsed
-                    else:
-                        attachments_data = []
-                        attachments_updated = True
-                elif isinstance(attachments_value, list):
-                    attachments_data = attachments_value
-                else:
-                    attachments_data = []
-                    attachments_updated = True
-            else:
-                attachments_data = []
-            if preset_opts["drop_attachments"] and attachments_data:
-                attachments_data = []
-                attachments_cleared += 1
-                attachments_updated = True
-            if scrub_secrets and attachments_data:
-                sanitized, rep_count, removed_count = _scrub_structure(attachments_data)
-                attachment_replacements += rep_count
-                attachment_keys_removed += removed_count
-                if sanitized != attachments_data:
-                    attachments_data = sanitized
-                    attachments_updated = True
-            if attachments_updated:
-                sanitized_json = json.dumps(attachments_data, separators=(",", ":"), sort_keys=True)
-                conn.execute(
-                    "UPDATE messages SET attachments = ? WHERE id = ?",
-                    (sanitized_json, msg["id"]),
-                )
-            if subject != msg["subject"]:
-                conn.execute("UPDATE messages SET subject = ? WHERE id = ?", (subject, msg["id"]))
-            if thread_id != msg["thread_id"]:
-                conn.execute(
-                    "UPDATE messages SET thread_id = ? WHERE id = ?",
-                    (thread_id, msg["id"]),
-                )
-            if preset_opts["redact_body"]:
-                body = preset_opts.get("body_placeholder") or "[Message body redacted]"
-                if msg["body_md"] != body:
-                    bodies_redacted += 1
-                    conn.execute("UPDATE messages SET body_md = ? WHERE id = ?", (body, msg["id"]))
-            elif body != msg["body_md"]:
-                conn.execute("UPDATE messages SET body_md = ? WHERE id = ?", (body, msg["id"]))
-            secrets_replaced += attachment_replacements
-            if attachments_updated or attachment_replacements or attachment_keys_removed:
-                attachments_sanitized += 1
+        for message in message_rows:
+            (
+                message_replacements,
+                message_attachments_sanitized,
+                message_bodies_redacted,
+                message_attachments_cleared,
+            ) = _scrub_message(
+                conn,
+                message,
+                preset_opts,
+                scrub_secrets=scrub_secrets,
+            )
+            secrets_replaced += message_replacements
+            attachments_sanitized += message_attachments_sanitized
+            bodies_redacted += message_bodies_redacted
+            attachments_cleared += message_attachments_cleared
 
         conn.commit()
     finally:
@@ -1461,7 +1701,7 @@ def build_search_indexes(snapshot_path: Path) -> bool:
         )
         conn.execute("DELETE FROM fts_messages")
         # Detect presence of thread_id column to avoid compile-time failures on older snapshots
-        cols = [row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()]
+        cols = [row[1] for row in conn.execute(_MESSAGES_TABLE_INFO_PRAGMA).fetchall()]
         has_thread_id = "thread_id" in {c.lower() for c in cols}
         if has_thread_id:
             conn.execute(
@@ -1566,7 +1806,7 @@ def build_materialized_views(snapshot_path: Path) -> None:
         conn.execute("CREATE TABLE IF NOT EXISTS message_recipients (message_id INTEGER, agent_id INTEGER)")
         # Message overview materialized view
         # Denormalizes messages with sender names and sender origin for efficient list rendering
-        cols = [row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()]
+        cols = [row[1] for row in conn.execute(_MESSAGES_TABLE_INFO_PRAGMA).fetchall()]
         colset = {c.lower() for c in cols}
         has_thread_id = "thread_id" in colset
         has_sender_id = "sender_id" in colset
@@ -1839,7 +2079,7 @@ def create_performance_indexes(snapshot_path: Path) -> None:
             with suppress(sqlite3.OperationalError):
                 conn.execute(f"ALTER TABLE messages ADD COLUMN {column} TEXT")
 
-        cols = [row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()]
+        cols = [row[1] for row in conn.execute(_MESSAGES_TABLE_INFO_PRAGMA).fetchall()]
         colset = {c.lower() for c in cols}
         has_sender_id = "sender_id" in colset
         if has_sender_id:
@@ -1890,6 +2130,75 @@ def create_performance_indexes(snapshot_path: Path) -> None:
         conn.close()
 
 
+def _parse_attachment_list(raw: Any) -> list[Any]:
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except json.JSONDecodeError:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _update_attachment_summary(
+    stats: dict[str, int],
+    entry: Any,
+    *,
+    storage_root: Path,
+    inline_threshold: int,
+    detach_threshold: int,
+) -> None:
+    if not isinstance(entry, dict) or entry.get("type") != "file":
+        return
+    stats["total"] += 1
+    original_path = entry.get("path") or entry.get("original_path")
+    if not original_path:
+        stats["missing"] += 1
+        return
+    source_path = Path(original_path)
+    if not source_path.is_absolute():
+        source_path = (storage_root / original_path).resolve()
+    if not source_path.exists():
+        stats["missing"] += 1
+        return
+    try:
+        size = source_path.stat().st_size
+    except OSError:
+        stats["missing"] += 1
+        return
+    stats["largest_bytes"] = max(stats["largest_bytes"], size)
+    if size <= inline_threshold:
+        stats["inline_candidates"] += 1
+    if size >= detach_threshold:
+        stats["external_candidates"] += 1
+
+
+def _summarize_attachments(
+    rows: Sequence[sqlite3.Row],
+    *,
+    storage_root: Path,
+    inline_threshold: int,
+    detach_threshold: int,
+) -> dict[str, int]:
+    stats = {
+        "total": 0,
+        "inline_candidates": 0,
+        "external_candidates": 0,
+        "missing": 0,
+        "largest_bytes": 0,
+    }
+    for row in rows:
+        for entry in _parse_attachment_list(row["attachments"]):
+            _update_attachment_summary(
+                stats,
+                entry,
+                storage_root=storage_root,
+                inline_threshold=inline_threshold,
+                detach_threshold=detach_threshold,
+            )
+    return stats
+
+
 def summarize_snapshot(
     snapshot_path: Path,
     *,
@@ -1926,50 +2235,13 @@ def summarize_snapshot(
                 "SELECT COALESCE(importance, 'normal') AS importance, COUNT(*) AS count FROM messages GROUP BY COALESCE(importance, 'normal')"
             )
         }
-
-        attachments_stats = {
-            "total": 0,
-            "inline_candidates": 0,
-            "external_candidates": 0,
-            "missing": 0,
-            "largest_bytes": 0,
-        }
-
         rows = conn.execute("SELECT id, attachments FROM messages").fetchall()
-        for row in rows:
-            raw = row["attachments"]
-            if not raw:
-                continue
-            try:
-                data = json.loads(raw) if isinstance(raw, str) else raw
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(data, list):
-                continue
-            for entry in data:
-                if not isinstance(entry, dict) or entry.get("type") != "file":
-                    continue
-                attachments_stats["total"] += 1
-                original_path = entry.get("path") or entry.get("original_path")
-                if not original_path:
-                    attachments_stats["missing"] += 1
-                    continue
-                source_path = Path(original_path)
-                if not source_path.is_absolute():
-                    source_path = (storage_root / original_path).resolve()
-                if not source_path.exists():
-                    attachments_stats["missing"] += 1
-                    continue
-                try:
-                    size = source_path.stat().st_size
-                except OSError:
-                    attachments_stats["missing"] += 1
-                    continue
-                attachments_stats["largest_bytes"] = max(attachments_stats["largest_bytes"], size)
-                if size <= inline_threshold:
-                    attachments_stats["inline_candidates"] += 1
-                if size >= detach_threshold:
-                    attachments_stats["external_candidates"] += 1
+        attachments_stats = _summarize_attachments(
+            rows,
+            storage_root=storage_root,
+            inline_threshold=inline_threshold,
+            detach_threshold=detach_threshold,
+        )
     finally:
         conn.close()
 
@@ -2053,6 +2325,295 @@ def create_snapshot_context(
     )
 
 
+def _prepare_attachment_bundle_config(
+    output_dir: Path,
+    *,
+    storage_root: Path,
+    inline_threshold: int,
+    detach_threshold: int,
+) -> _AttachmentBundleConfig:
+    storage_root = storage_root.resolve()
+    output_root = output_dir.expanduser().resolve()
+    attachments_dir = (output_root / "attachments").resolve()
+    if not attachments_dir.is_relative_to(output_root):
+        raise ShareExportError("Attachment directory must stay within the bundle output directory")
+    attachments_dir.mkdir(parents=True, exist_ok=True)
+    attachments_dir = attachments_dir.resolve()
+    if not attachments_dir.is_relative_to(output_root):
+        raise ShareExportError("Attachment directory must stay within the bundle output directory")
+    return _AttachmentBundleConfig(
+        storage_root=storage_root,
+        output_root=output_root,
+        attachments_dir=attachments_dir,
+        inline_threshold=inline_threshold,
+        detach_threshold=detach_threshold,
+    )
+
+
+def _resolve_attachment_source_path(
+    original_path: Any,
+    config: _AttachmentBundleConfig,
+) -> Path:
+    source_path = Path(original_path)
+    if not source_path.is_absolute():
+        source_path = config.storage_root / source_path
+    try:
+        source_path = source_path.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ShareExportError(
+            "Attachment source path could not be resolved safely"
+        ) from exc
+    if not source_path.is_relative_to(config.storage_root):
+        raise ShareExportError(
+            "Attachment source path must stay within the configured storage directory"
+        )
+    return source_path
+
+
+def _missing_attachment(
+    *,
+    message_id: int,
+    media_type: Any,
+    sha_hint: Any,
+    state: _AttachmentBundleState,
+) -> dict[str, Any]:
+    state.missing_count += 1
+    state.manifest_items.append(
+        {
+            "message_id": message_id,
+            "mode": "missing",
+            "sha_hint": sha_hint,
+            "media_type": media_type,
+        }
+    )
+    return {
+        "type": "missing",
+        "media_type": media_type,
+        "sha_hint": sha_hint,
+    }
+
+
+def _inline_attachment(
+    *,
+    data: bytes,
+    media_type: Any,
+    sha256: str,
+    media_record: dict[str, Any],
+    state: _AttachmentBundleState,
+) -> dict[str, Any]:
+    encoded = base64.b64encode(data).decode("ascii")
+    media_record["mode"] = "inline"
+    state.manifest_items.append(media_record)
+    state.inline_count += 1
+    return {
+        "type": "inline",
+        "media_type": media_type,
+        "bytes": len(data),
+        "sha256": sha256,
+        "data_uri": f"data:{media_type};base64,{encoded}",
+    }
+
+
+def _external_attachment(
+    *,
+    size: int,
+    media_type: Any,
+    sha256: str,
+    media_record: dict[str, Any],
+    state: _AttachmentBundleState,
+) -> dict[str, Any]:
+    media_record["mode"] = "external"
+    media_record["note"] = "Attachment exceeds detach threshold; not bundled."
+    state.manifest_items.append(media_record)
+    state.externalized_count += 1
+    return {
+        "type": "external",
+        "media_type": media_type,
+        "bytes": size,
+        "sha256": sha256,
+        "note": "Requires manual hosting (exceeds bundle threshold).",
+    }
+
+
+def _write_bundled_attachment(
+    destination: Path, data: bytes, config: _AttachmentBundleConfig
+) -> bool:
+    """Create a confined attachment without overwriting a deduplicated file."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    resolved = destination.resolve()
+    if (
+        destination.is_symlink()
+        or not resolved.is_relative_to(config.output_root)
+        or not resolved.is_relative_to(config.attachments_dir)
+    ):
+        raise ShareExportError(
+            "Attachment bundle path must stay within the bundle output directory"
+        )
+    try:
+        # Exclusive creation refuses a final-component link appearing after
+        # validation. Existing regular files are intentional digest deduplication.
+        with resolved.open("xb") as stream:
+            stream.write(data)
+    except FileExistsError:
+        if resolved.is_symlink() or not resolved.is_file():
+            raise ShareExportError("Existing attachment bundle path must be a regular file") from None
+        return False
+    return True
+
+
+def _stored_attachment(
+    *,
+    data: bytes,
+    source_path: Path,
+    media_type: Any,
+    sha256: str,
+    sha_hint: Any,
+    media_record: dict[str, Any],
+    config: _AttachmentBundleConfig,
+    state: _AttachmentBundleState,
+) -> dict[str, Any]:
+    rel_path = state.bundles.get(sha256)
+    if rel_path is None:
+        extension = source_path.suffix or ".bin"
+        rel_path = Path("attachments") / sha256[:2] / f"{sha256}{extension}"
+        destination = config.output_root / rel_path
+        resolved = destination.resolve()
+        if not resolved.is_relative_to(
+            config.output_root
+        ) or not resolved.is_relative_to(config.attachments_dir):
+            raise ShareExportError(
+                "Attachment bundle path must stay within the bundle output directory"
+            )
+        if _write_bundled_attachment(destination, data, config):
+            state.bytes_copied += len(data)
+        state.bundles[sha256] = rel_path
+    media_record["mode"] = "file"
+    media_record["bundle_path"] = rel_path.as_posix()
+    if sha_hint and sha_hint != sha256:
+        media_record["sha_hint"] = sha_hint
+    state.manifest_items.append(media_record)
+    state.copied_count += 1
+    return {
+        "type": "file",
+        "media_type": media_type,
+        "bytes": len(data),
+        "sha256": sha256,
+        "path": rel_path.as_posix(),
+    }
+
+
+def _bundle_file_attachment(
+    entry: dict[str, Any],
+    *,
+    message_id: int,
+    config: _AttachmentBundleConfig,
+    state: _AttachmentBundleState,
+) -> tuple[dict[str, Any], bool]:
+    original_path = entry.get("path")
+    if not original_path:
+        return entry, False
+    media_type = entry.get("media_type", "application/octet-stream")
+    sha_hint = entry.get("sha256") or entry.get("sha1")
+    source_path = _resolve_attachment_source_path(original_path, config)
+    if not source_path.is_file():
+        return (
+            _missing_attachment(
+                message_id=message_id,
+                media_type=media_type,
+                sha_hint=sha_hint,
+                state=state,
+            ),
+            True,
+        )
+
+    data = source_path.read_bytes()
+    size = len(data)
+    sha256 = hashlib.sha256(data).hexdigest()
+    if _SHA256_LOWER_HEX_PATTERN.fullmatch(sha256) is None:
+        raise ShareExportError(
+            "Attachment SHA-256 digest must be exactly 64 lowercase hexadecimal characters"
+        )
+    media_record = {
+        "message_id": message_id,
+        "sha256": sha256,
+        "media_type": media_type,
+        "bytes": size,
+    }
+    if size <= config.inline_threshold:
+        return (
+            _inline_attachment(
+                data=data,
+                media_type=media_type,
+                sha256=sha256,
+                media_record=media_record,
+                state=state,
+            ),
+            True,
+        )
+    if size >= config.detach_threshold:
+        return (
+            _external_attachment(
+                size=size,
+                media_type=media_type,
+                sha256=sha256,
+                media_record=media_record,
+                state=state,
+            ),
+            True,
+        )
+    return (
+        _stored_attachment(
+            data=data,
+            source_path=source_path,
+            media_type=media_type,
+            sha256=sha256,
+            sha_hint=sha_hint,
+            media_record=media_record,
+            config=config,
+            state=state,
+        ),
+        True,
+    )
+
+
+def _bundle_attachment_entry(
+    entry: Any,
+    *,
+    message_id: int,
+    config: _AttachmentBundleConfig,
+    state: _AttachmentBundleState,
+) -> tuple[Any, bool]:
+    if not isinstance(entry, dict) or entry.get("type") != "file":
+        return entry, False
+    return _bundle_file_attachment(
+        cast(dict[str, Any], entry),
+        message_id=message_id,
+        config=config,
+        state=state,
+    )
+
+
+def _bundle_message_attachments(
+    raw_attachments: Any,
+    *,
+    message_id: int,
+    config: _AttachmentBundleConfig,
+    state: _AttachmentBundleState,
+) -> tuple[list[Any], bool]:
+    updated_list: list[Any] = []
+    changed = False
+    for entry in _parse_attachment_list(raw_attachments):
+        updated_entry, entry_changed = _bundle_attachment_entry(
+            entry,
+            message_id=message_id,
+            config=config,
+            state=state,
+        )
+        updated_list.append(updated_entry)
+        changed = changed or entry_changed
+    return updated_list, changed
+
+
 def bundle_attachments(
     snapshot_path: Path,
     output_dir: Path,
@@ -2063,167 +2624,25 @@ def bundle_attachments(
 ) -> dict[str, Any]:
     """Materialize attachment assets referenced by the snapshot into the bundle."""
 
-    storage_root = storage_root.resolve()
-    output_root = output_dir.expanduser().resolve()
-    attachments_dir = (output_root / "attachments").resolve()
-    if not attachments_dir.is_relative_to(output_root):
-        raise ShareExportError("Attachment directory must stay within the bundle output directory")
-    attachments_dir.mkdir(parents=True, exist_ok=True)
-    attachments_dir = attachments_dir.resolve()
-    if not attachments_dir.is_relative_to(output_root):
-        raise ShareExportError("Attachment directory must stay within the bundle output directory")
-    bundles: dict[str, Path] = {}
-    manifest_items: list[dict[str, Any]] = []
-    inline_count = 0
-    copied_count = 0
-    externalized_count = 0
-    missing_count = 0
-    bytes_copied = 0
+    config = _prepare_attachment_bundle_config(
+        output_dir,
+        storage_root=storage_root,
+        inline_threshold=inline_threshold,
+        detach_threshold=detach_threshold,
+    )
+    state = _AttachmentBundleState(bundles={}, manifest_items=[])
 
     conn = sqlite3.connect(str(snapshot_path))
     try:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("SELECT id, attachments FROM messages").fetchall()
         for row in rows:
-            raw_attachments = row["attachments"]
-            if not raw_attachments:
-                continue
-            if isinstance(raw_attachments, str):
-                try:
-                    attachments_list = json.loads(raw_attachments)
-                except json.JSONDecodeError:
-                    attachments_list = []
-            else:
-                attachments_list = raw_attachments
-            if not isinstance(attachments_list, list):
-                continue
-            updated_list: list[Any] = []
-            changed = False
-            for entry in attachments_list:
-                if not isinstance(entry, dict):
-                    updated_list.append(entry)
-                    continue
-                entry_type = entry.get("type")
-                if entry_type != "file":
-                    updated_list.append(entry)
-                    continue
-                original_path = entry.get("path")
-                media_type = entry.get("media_type", "application/octet-stream")
-                sha_hint = entry.get("sha256") or entry.get("sha1")
-                if not original_path:
-                    updated_list.append(entry)
-                    continue
-                source_path = Path(original_path)
-                if not source_path.is_absolute():
-                    source_path = storage_root / source_path
-                try:
-                    source_path = source_path.resolve()
-                except (OSError, RuntimeError) as exc:
-                    raise ShareExportError(
-                        "Attachment source path could not be resolved safely"
-                    ) from exc
-                if not source_path.is_relative_to(storage_root):
-                    raise ShareExportError(
-                        "Attachment source path must stay within the configured storage directory"
-                    )
-                if not source_path.is_file():
-                    missing_count += 1
-                    manifest_items.append(
-                        {
-                            "message_id": int(row["id"]),
-                            "mode": "missing",
-                            "sha_hint": sha_hint,
-                            "media_type": media_type,
-                        }
-                    )
-                    updated_list.append(
-                        {
-                            "type": "missing",
-                            "media_type": media_type,
-                            "sha_hint": sha_hint,
-                        }
-                    )
-                    changed = True
-                    continue
-
-                data = source_path.read_bytes()
-                size = len(data)
-                sha256 = hashlib.sha256(data).hexdigest()
-                if _SHA256_LOWER_HEX_PATTERN.fullmatch(sha256) is None:
-                    raise ShareExportError(
-                        "Attachment SHA-256 digest must be exactly 64 lowercase hexadecimal characters"
-                    )
-                ext = source_path.suffix or ".bin"
-                media_record = {
-                    "message_id": int(row["id"]),
-                    "sha256": sha256,
-                    "media_type": media_type,
-                    "bytes": size,
-                }
-
-                if size <= inline_threshold:
-                    encoded = base64.b64encode(data).decode("ascii")
-                    updated_list.append(
-                        {
-                            "type": "inline",
-                            "media_type": media_type,
-                            "bytes": size,
-                            "sha256": sha256,
-                            "data_uri": f"data:{media_type};base64,{encoded}",
-                        }
-                    )
-                    media_record["mode"] = "inline"
-                    manifest_items.append(media_record)
-                    inline_count += 1
-                    changed = True
-                    continue
-
-                if size >= detach_threshold:
-                    media_record["mode"] = "external"
-                    media_record["note"] = "Attachment exceeds detach threshold; not bundled."
-                    manifest_items.append(media_record)
-                    updated_list.append(
-                        {
-                            "type": "external",
-                            "media_type": media_type,
-                            "bytes": size,
-                            "sha256": sha256,
-                            "note": "Requires manual hosting (exceeds bundle threshold).",
-                        }
-                    )
-                    externalized_count += 1
-                    changed = True
-                    continue
-
-                rel_path = bundles.get(sha256)
-                if rel_path is None:
-                    rel_path = Path("attachments") / sha256[:2] / f"{sha256}{ext}"
-                    dest_path = (output_root / rel_path).resolve()
-                    if not dest_path.is_relative_to(output_root) or not dest_path.is_relative_to(attachments_dir):
-                        raise ShareExportError(
-                            "Attachment bundle path must stay within the bundle output directory"
-                        )
-                    dest_path.parent.mkdir(parents=True, exist_ok=True)
-                    if not dest_path.exists():
-                        dest_path.write_bytes(data)
-                        bytes_copied += size
-                    bundles[sha256] = rel_path
-                media_record["mode"] = "file"
-                media_record["bundle_path"] = rel_path.as_posix()
-                manifest_items.append(media_record)
-                updated_list.append(
-                    {
-                        "type": "file",
-                        "media_type": media_type,
-                        "bytes": size,
-                        "sha256": sha256,
-                        "path": rel_path.as_posix(),
-                    }
-                )
-                copied_count += 1
-                if sha_hint and sha_hint != sha256:
-                    media_record["sha_hint"] = sha_hint
-                changed = True
+            updated_list, changed = _bundle_message_attachments(
+                row["attachments"],
+                message_id=int(row["id"]),
+                config=config,
+                state=state,
+            )
             if changed:
                 conn.execute(
                     "UPDATE messages SET attachments = ? WHERE id = ?",
@@ -2235,17 +2654,17 @@ def bundle_attachments(
 
     return {
         "stats": {
-            "inline": inline_count,
-            "copied": copied_count,
-            "externalized": externalized_count,
-            "missing": missing_count,
-            "bytes_copied": bytes_copied,
+            "inline": state.inline_count,
+            "copied": state.copied_count,
+            "externalized": state.externalized_count,
+            "missing": state.missing_count,
+            "bytes_copied": state.bytes_copied,
         },
         "config": {
             "inline_threshold": inline_threshold,
             "detach_threshold": detach_threshold,
         },
-        "items": manifest_items,
+        "items": state.manifest_items,
     }
 
 
@@ -2296,6 +2715,23 @@ def maybe_chunk_database(
     return config
 
 
+def _resolve_bundle_asset_options(
+    options: _BundleAssetOptions,
+) -> tuple[Sequence[str], str]:
+    unexpected_options = set(options) - {"project_filters", "exporter_version"}
+    if unexpected_options:
+        unexpected = min(unexpected_options)
+        raise TypeError(
+            f"build_bundle_assets() got an unexpected keyword argument {unexpected!r}"
+        )
+    if "project_filters" not in options:
+        raise TypeError(
+            "build_bundle_assets() missing 1 required keyword-only argument: "
+            "'project_filters'"
+        )
+    return options["project_filters"], options.get("exporter_version", "prototype")
+
+
 def build_bundle_assets(
     snapshot_path: Path,
     output_dir: Path,
@@ -2306,15 +2742,15 @@ def build_bundle_assets(
     chunk_threshold: int,
     chunk_size: int,
     scope: ProjectScopeResult,
-    project_filters: Sequence[str],
     scrub_summary: ScrubSummary,
     hosting_hints: Sequence[HostingHint],
     fts_enabled: bool,
     export_config: Mapping[str, Any],
-    exporter_version: str = "prototype",
+    **options: Unpack[_BundleAssetOptions],
 ) -> BundleArtifacts:
     """Bundle attachments, viewer assets, and scaffolding for the export."""
 
+    _, exporter_version = _resolve_bundle_asset_options(options)
     attachments_manifest = bundle_attachments(
         snapshot_path,
         output_dir,
@@ -2334,7 +2770,6 @@ def build_bundle_assets(
         output_dir,
         snapshot=snapshot_path,
         scope=scope,
-        project_filters=project_filters,
         scrub_summary=scrub_summary,
         attachments_manifest=attachments_manifest,
         chunk_manifest=chunk_manifest,
@@ -2369,6 +2804,35 @@ def _is_runtime_viewer_artifact(relative_path: Path) -> bool:
     }
 
 
+def _copy_source_tree_viewer_assets(source_tree: Path, viewer_root: Path) -> None:
+    for source_path in sorted(source_tree.rglob("*")):
+        if not source_path.is_file():
+            continue
+        relative_path = source_path.relative_to(source_tree)
+        if _is_runtime_viewer_artifact(relative_path):
+            continue
+        destination = viewer_root / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(source_path.read_bytes())
+
+
+def _copy_packaged_viewer_assets(
+    node: Any,
+    relative_path: Path,
+    viewer_root: Path,
+) -> None:
+    for child in node.iterdir():
+        child_relative = relative_path / child.name
+        if _is_runtime_viewer_artifact(child_relative):
+            continue
+        if child.is_dir():
+            _copy_packaged_viewer_assets(child, child_relative, viewer_root)
+        else:
+            destination = viewer_root / child_relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(child.read_bytes())
+
+
 def copy_viewer_assets(output_dir: Path) -> None:
     """Copy viewer assets into the export output directory.
 
@@ -2387,39 +2851,17 @@ def copy_viewer_assets(output_dir: Path) -> None:
         # tampered/stale vendored asset in the source tree was copied into the
         # export (and later SRI-hashed) without ever being checked.
         _verify_viewer_vendor_assets(source_tree)
-        for src_path in sorted(source_tree.rglob("*")):
-            if not src_path.is_file():
-                continue
-            rel = src_path.relative_to(source_tree)
-            if _is_runtime_viewer_artifact(rel):
-                continue
-            dest = viewer_root / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(src_path.read_bytes())
+        _copy_source_tree_viewer_assets(source_tree, viewer_root)
         return
 
     # Fallback to packaged resources
     _verify_viewer_vendor_assets()
-
-    package_root = resources.files("mcp_agent_mail.viewer_assets")
-
-    def _walk(node: Any, relative: Path) -> None:
-        for child in node.iterdir():
-            child_relative = relative / child.name
-            if _is_runtime_viewer_artifact(child_relative):
-                continue
-            if child.is_dir():
-                _walk(child, child_relative)
-            else:
-                destination = viewer_root / child_relative
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_bytes(child.read_bytes())
-
-    _walk(package_root, Path())
+    package_root = resources.files(_VIEWER_ASSETS_PACKAGE)
+    _copy_packaged_viewer_assets(package_root, Path(), viewer_root)
 
 
 def _load_vendor_manifest(base: Any | None = None) -> dict[str, Any]:
-    asset_base = base if base is not None else resources.files("mcp_agent_mail.viewer_assets")
+    asset_base = base if base is not None else resources.files(_VIEWER_ASSETS_PACKAGE)
     manifest_path = asset_base / "vendor_manifest.json"
     try:
         with manifest_path.open("r", encoding="utf-8") as handle:
@@ -2429,7 +2871,7 @@ def _load_vendor_manifest(base: Any | None = None) -> dict[str, Any]:
 
 
 def _verify_viewer_vendor_assets(base: Any | None = None) -> None:
-    asset_base = base if base is not None else resources.files("mcp_agent_mail.viewer_assets")
+    asset_base = base if base is not None else resources.files(_VIEWER_ASSETS_PACKAGE)
     manifest = _load_vendor_manifest(asset_base)
     vendor_root = asset_base / "vendor"
     for manifest_group in manifest.values():
@@ -2543,24 +2985,24 @@ def _resolve_bundle_asset_path(bundle_root: Path, relative_path: str) -> Path:
     return candidate
 
 
-def verify_bundle(bundle_path: Path, *, public_key: Optional[str] = None) -> dict[str, Any]:
-    bundle_root = Path(bundle_path).expanduser().resolve()
-    manifest_path = bundle_root / "manifest.json"
-    if not manifest_path.exists():
-        raise ShareExportError(f"manifest.json not found in bundle at {bundle_root}")
-
+def _read_bundle_manifest(
+    manifest_path: Path,
+) -> tuple[bytes, dict[str, Any]]:
     try:
         manifest_bytes = manifest_path.read_bytes()
-    except (IOError, OSError) as exc:
+    except OSError as exc:
         raise ShareExportError(f"Failed to read manifest.json: {exc}") from exc
-
     try:
-        manifest_data = json.loads(manifest_bytes)
+        manifest_data = cast(dict[str, Any], json.loads(manifest_bytes))
     except json.JSONDecodeError as exc:
         raise ShareExportError(f"manifest.json is not valid JSON: {exc}") from exc
+    return manifest_bytes, manifest_data
 
-    viewer_section = cast(dict[str, Any], manifest_data.get("viewer", {}))
-    sri_entries = cast(dict[str, str], viewer_section.get("sri", {}))
+
+def _collect_sri_failures(
+    bundle_root: Path,
+    sri_entries: Mapping[str, str],
+) -> list[str]:
     sri_failures: list[str] = []
     for relative_path, expected in sri_entries.items():
         try:
@@ -2576,87 +3018,143 @@ def verify_bundle(bundle_path: Path, *, public_key: Optional[str] = None) -> dic
             sri_failures.append(
                 f"SRI mismatch for {relative_path}: expected {expected}, got {actual}"
             )
+    return sri_failures
+
+
+def _read_signature_payload(sig_path: Path) -> dict[str, Any]:
+    try:
+        return cast(
+            dict[str, Any],
+            json.loads(sig_path.read_text(encoding="utf-8")),
+        )
+    except OSError as exc:
+        raise ShareExportError(f"Failed to read manifest.sig.json: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ShareExportError(f"manifest.sig.json is not valid JSON: {exc}") from exc
+
+
+def _load_verify_key(encoded_key: Any, verify_key_type: Any) -> Any:
+    try:
+        return verify_key_type(base64.b64decode(encoded_key))
+    except ValueError as exc:
+        raise ShareExportError(f"Invalid base64 in public_key: {exc}") from exc
+
+
+def _decode_signature(encoded_signature: Any) -> bytes:
+    try:
+        return base64.b64decode(encoded_signature)
+    except ValueError as exc:
+        raise ShareExportError(f"Invalid base64 in signature: {exc}") from exc
+
+
+def _verify_with_key(
+    verify_key: Any,
+    manifest_bytes: bytes,
+    signature_bytes: bytes,
+    bad_signature_error: type[Exception],
+    *,
+    pinned: bool,
+) -> None:
+    try:
+        verify_key.verify(manifest_bytes, signature_bytes)
+    except bad_signature_error as exc:
+        if pinned:
+            raise ShareExportError(
+                "Manifest signature verification failed: the bundle is not signed "
+                "by the pinned public key."
+            ) from exc
+        raise ShareExportError("Manifest signature verification failed.") from exc
+
+
+def _verify_signature_payload(
+    sig_payload: Mapping[str, Any],
+    manifest_bytes: bytes,
+    public_key: str | None,
+) -> bool:
+    algorithm = str(sig_payload.get("algorithm") or "").strip().lower()
+    if not algorithm:
+        raise ShareExportError("manifest.sig.json missing algorithm field.")
+    if algorithm != "ed25519":
+        raise ShareExportError(
+            f"Unsupported signature algorithm in manifest.sig.json: {algorithm}"
+        )
+
+    embedded_key_b64 = sig_payload.get("public_key")
+    signature_b64 = sig_payload.get("signature")
+    if not (public_key or embedded_key_b64) or not signature_b64:
+        raise ShareExportError(
+            "manifest.sig.json missing public_key or signature fields."
+        )
+    try:
+        from nacl.exceptions import BadSignatureError
+        from nacl.signing import VerifyKey
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise ShareExportError(
+            "PyNaCl is required to verify manifest signatures."
+        ) from exc
+
+    # The embedded key proves only internal consistency. Only a caller-pinned
+    # key can establish origin and set signature_verified.
+    embedded_verify_key = (
+        _load_verify_key(embedded_key_b64, VerifyKey) if embedded_key_b64 else None
+    )
+    pinned_verify_key = _load_verify_key(public_key, VerifyKey) if public_key else None
+    signature_bytes = _decode_signature(signature_b64)
+    if embedded_verify_key is not None:
+        _verify_with_key(
+            embedded_verify_key,
+            manifest_bytes,
+            signature_bytes,
+            BadSignatureError,
+            pinned=False,
+        )
+    signature_verified = False
+    if pinned_verify_key is not None:
+        _verify_with_key(
+            pinned_verify_key,
+            manifest_bytes,
+            signature_bytes,
+            BadSignatureError,
+            pinned=True,
+        )
+        signature_verified = True
+
+    manifest_sha256 = str(sig_payload.get("manifest_sha256") or "").strip().lower()
+    if not manifest_sha256:
+        raise ShareExportError("manifest.sig.json missing manifest_sha256 field.")
+    actual_manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    if manifest_sha256 != actual_manifest_sha256:
+        raise ShareExportError(
+            "manifest.sig.json manifest_sha256 does not match manifest.json."
+        )
+    return signature_verified
+
+
+def verify_bundle(bundle_path: Path, *, public_key: Optional[str] = None) -> dict[str, Any]:
+    bundle_root = Path(bundle_path).expanduser().resolve()
+    manifest_path = bundle_root / "manifest.json"
+    if not manifest_path.exists():
+        raise ShareExportError(f"manifest.json not found in bundle at {bundle_root}")
+
+    manifest_bytes, manifest_data = _read_bundle_manifest(manifest_path)
+    viewer_section = cast(dict[str, Any], manifest_data.get("viewer", {}))
+    sri_entries = cast(dict[str, str], viewer_section.get("sri", {}))
+    sri_failures = _collect_sri_failures(bundle_root, sri_entries)
 
     signature_checked = False
     signature_verified = False
     sig_path = bundle_root / "manifest.sig.json"
     if sig_path.exists() or public_key:
         if not sig_path.exists():
-            raise ShareExportError("manifest.sig.json missing but a public key was provided for verification.")
-
-        try:
-            sig_payload = json.loads(sig_path.read_text(encoding="utf-8"))
-        except (IOError, OSError) as exc:
-            raise ShareExportError(f"Failed to read manifest.sig.json: {exc}") from exc
-        except json.JSONDecodeError as exc:
-            raise ShareExportError(f"manifest.sig.json is not valid JSON: {exc}") from exc
-
-        algorithm = str(sig_payload.get("algorithm") or "").strip().lower()
-        if not algorithm:
-            raise ShareExportError("manifest.sig.json missing algorithm field.")
-        if algorithm != "ed25519":
             raise ShareExportError(
-                f"Unsupported signature algorithm in manifest.sig.json: {algorithm}"
+                "manifest.sig.json missing but a public key was provided for verification."
             )
-
-        embedded_key_b64 = sig_payload.get("public_key")
-        signature_b64 = sig_payload.get("signature")
-        if not (public_key or embedded_key_b64) or not signature_b64:
-            raise ShareExportError("manifest.sig.json missing public_key or signature fields.")
-        try:
-            from nacl.exceptions import BadSignatureError
-            from nacl.signing import VerifyKey
-        except ImportError as exc:  # pragma: no cover - optional dependency
-            raise ShareExportError("PyNaCl is required to verify manifest signatures.") from exc
-
-        # Two keys that are never interchangeable. The key the bundle carries is
-        # an argument the bundle makes about itself: checking against it proves
-        # the manifest was not edited after signing, and nothing whatever about
-        # who signed it. Only a key the CALLER pinned can establish origin, so
-        # only that one may set ``signature_verified``. Folding the two into one
-        # `public_key or sig_payload["public_key"]` -- which is what stood here --
-        # let a forger sign their own manifest, ship their own key beside it, and
-        # be reported as verified.
-        try:
-            embedded_verify_key = (
-                VerifyKey(base64.b64decode(embedded_key_b64)) if embedded_key_b64 else None
-            )
-            pinned_verify_key = (
-                VerifyKey(base64.b64decode(public_key)) if public_key else None
-            )
-        except (ValueError, binascii.Error) as exc:
-            raise ShareExportError(f"Invalid base64 in public_key: {exc}") from exc
-
-        try:
-            signature_bytes = base64.b64decode(signature_b64)
-        except (ValueError, binascii.Error) as exc:
-            raise ShareExportError(f"Invalid base64 in signature: {exc}") from exc
-
-        if embedded_verify_key is not None:
-            try:
-                embedded_verify_key.verify(manifest_bytes, signature_bytes)
-            except BadSignatureError as exc:
-                raise ShareExportError("Manifest signature verification failed.") from exc
-
-        if pinned_verify_key is not None:
-            try:
-                pinned_verify_key.verify(manifest_bytes, signature_bytes)
-            except BadSignatureError as exc:
-                # Reached when the bundle is signed by *some* key that is not the
-                # caller's -- the self-signed forgery the embedded check cannot see.
-                raise ShareExportError(
-                    "Manifest signature verification failed: the bundle is not signed "
-                    "by the pinned public key."
-                ) from exc
-            signature_verified = True
-        manifest_sha256 = str(sig_payload.get("manifest_sha256") or "").strip().lower()
-        if not manifest_sha256:
-            raise ShareExportError("manifest.sig.json missing manifest_sha256 field.")
-        actual_manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
-        if manifest_sha256 != actual_manifest_sha256:
-            raise ShareExportError(
-                "manifest.sig.json manifest_sha256 does not match manifest.json."
-            )
+        signature_payload = _read_signature_payload(sig_path)
+        signature_verified = _verify_signature_payload(
+            signature_payload,
+            manifest_bytes,
+            public_key,
+        )
         signature_checked = True
 
     if sri_failures:
@@ -2720,7 +3218,6 @@ def write_bundle_scaffolding(
     *,
     snapshot: Path,
     scope: ProjectScopeResult,
-    project_filters: Sequence[str],
     scrub_summary: ScrubSummary,
     attachments_manifest: dict[str, Any],
     chunk_manifest: Optional[dict[str, Any]],
@@ -2729,7 +3226,10 @@ def write_bundle_scaffolding(
     export_config: Mapping[str, Any],
     exporter_version: str = "prototype",
 ) -> None:
-    """Create manifest and helper docs around the freshly minted snapshot."""
+    """Create manifest and helper docs around the freshly minted snapshot.
+
+    Public scope metadata is derived only from the sanitized project records.
+    """
 
     project_entries = [
         {"slug": record.slug, "human_key": record.slug}
@@ -2824,17 +3324,17 @@ def write_bundle_scaffolding(
             "## Quick Start",
             "",
             "1. **Install dependencies** (first time only):",
-            "   ```bash",
+            _INDENTED_BASH_FENCE,
             "   uv sync",
-            "   ```",
+            _INDENTED_CODE_FENCE,
             "2. **Rebuild or update the export** from the source project:",
-            "   ```bash",
+            _INDENTED_BASH_FENCE,
             "   uv run python -m mcp_agent_mail.cli share update /path/to/this/repo",
-            "   ```",
+            _INDENTED_CODE_FENCE,
             "3. **Preview locally**:",
-            "   ```bash",
+            _INDENTED_BASH_FENCE,
             "   uv run python -m mcp_agent_mail.cli share preview .",
-            "   ```",
+            _INDENTED_CODE_FENCE,
             "   The command serves the viewer at `http://127.0.0.1:9000/` with hot reload.",
             "4. **Deploy** using GitHub Pages (built into the `share wizard`) or manually follow `HOW_TO_DEPLOY.md`.",
             "",

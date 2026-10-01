@@ -87,7 +87,8 @@ async def test_non_utf8_body_is_rejected_with_400(isolated_env, monkeypatch):
     assert response.status_code == 400
     detail = response.json()["detail"]
     # The offset is the one thing that lets a caller find the offending byte.
-    assert "UTF-8" in detail and "offset" in detail
+    assert "UTF-8" in detail
+    assert "offset" in detail
 
 
 @pytest.mark.asyncio

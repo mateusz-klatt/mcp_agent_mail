@@ -142,6 +142,92 @@ async def _begin_immediate(
     await connection.exec_driver_sql("BEGIN IMMEDIATE")
 
 
+async def _resolve_access_actor(
+    session: AsyncSession,
+    actor_user_id: int | None,
+    actor_account_generation: str | None,
+    expected_actor_session_epoch: int | None,
+    trusted_cli_actor: bool,
+) -> tuple[str, str | None, int | None]:
+    """Validate the actor under the mutation's existing writer lock."""
+    if actor_user_id is None:
+        if (
+            not trusted_cli_actor
+            or actor_account_generation is not None
+            or expected_actor_session_epoch is not None
+        ):
+            raise UiAccessMutationError("actor_contract_invalid")
+        return _CLI_ACTOR_USERNAME, None, None
+    if trusted_cli_actor or actor_account_generation is None or expected_actor_session_epoch is None:
+        raise UiAccessMutationError("actor_contract_invalid")
+    actor_result = await session.execute(
+        select(UiUser).where(UiUser.id == actor_user_id).execution_options(populate_existing=True)
+    )
+    actor = actor_result.scalars().first()
+    if actor is None:
+        raise UiAccessMutationError("actor_forbidden")
+    if actor.session_generation != actor_account_generation:
+        raise UiAccessMutationError("actor_recreated")
+    if actor.session_epoch != expected_actor_session_epoch:
+        raise UiAccessMutationError("actor_session_epoch_conflict")
+    if actor.disabled or normalize_ui_user_role(actor.role) != ROLE_ADMIN:
+        raise UiAccessMutationError("actor_forbidden")
+    return actor.username, actor_account_generation, expected_actor_session_epoch
+
+
+async def _require_access_target(
+    session: AsyncSession,
+    target_user_id: int,
+    account_generation: str,
+    expected_access_version: int,
+) -> UiUser:
+    """Require the exact active member lifetime named by the caller."""
+    target_result = await session.execute(
+        select(UiUser).where(UiUser.id == target_user_id).execution_options(populate_existing=True)
+    )
+    target = target_result.scalars().first()
+    if target is None:
+        raise UiAccessMutationError("target_not_found")
+    if target.disabled:
+        raise UiAccessMutationError("target_disabled")
+    target_role = normalize_ui_user_role(target.role)
+    if target_role == ROLE_ADMIN:
+        raise UiAccessMutationError("target_global_admin")
+    if target_role != ROLE_MEMBER:
+        raise UiAccessMutationError("target_invalid_global_role")
+    if target.session_generation != account_generation:
+        raise UiAccessMutationError("account_recreated")
+    if target.session_epoch != expected_access_version:
+        raise UiAccessMutationError("access_version_conflict")
+    return target
+
+
+async def _require_access_project(
+    session: AsyncSession,
+    project_id: int,
+    expected_project_generation: str,
+) -> Project:
+    """Require the same project lifetime that the administrator reviewed."""
+    project_result = await session.execute(
+        select(Project).where(Project.id == project_id).execution_options(populate_existing=True)
+    )
+    project = project_result.scalars().first()
+    if project is None:
+        raise UiAccessMutationError("project_not_found")
+    if project.project_generation != expected_project_generation:
+        raise UiAccessMutationError("project_recreated")
+    return project
+
+
+def _assignment_role(assignment: UiProjectAssignment | None) -> ProjectRole | None:
+    if assignment is None:
+        return None
+    role = normalize_project_role(assignment.role)
+    if role is None:
+        raise UiAccessMutationError("invalid_existing_role")
+    return role
+
+
 async def mutate_ui_project_access(
     session: AsyncSession,
     *,
@@ -196,71 +282,17 @@ async def mutate_ui_project_access(
 
     await _begin_immediate(session, profile_operation=False)
     try:
-        actor_username = _CLI_ACTOR_USERNAME
-        actor_generation_snapshot: str | None = None
-        actor_epoch_snapshot: int | None = None
-        if actor_user_id is None:
-            if (
-                not trusted_cli_actor
-                or actor_account_generation is not None
-                or expected_actor_session_epoch is not None
-            ):
-                raise UiAccessMutationError("actor_contract_invalid")
-        else:
-            if (
-                trusted_cli_actor
-                or actor_account_generation is None
-                or expected_actor_session_epoch is None
-            ):
-                raise UiAccessMutationError("actor_contract_invalid")
-            actor_result = await session.execute(
-                select(UiUser)
-                .where(UiUser.id == actor_user_id)
-                .execution_options(populate_existing=True)
-            )
-            actor = actor_result.scalars().first()
-            if actor is None:
-                raise UiAccessMutationError("actor_forbidden")
-            if actor.session_generation != actor_account_generation:
-                raise UiAccessMutationError("actor_recreated")
-            if actor.session_epoch != expected_actor_session_epoch:
-                raise UiAccessMutationError("actor_session_epoch_conflict")
-            if actor.disabled or normalize_ui_user_role(actor.role) != ROLE_ADMIN:
-                raise UiAccessMutationError("actor_forbidden")
-            actor_username = actor.username
-            actor_generation_snapshot = actor_account_generation
-            actor_epoch_snapshot = expected_actor_session_epoch
-
-        target_result = await session.execute(
-            select(UiUser)
-            .where(UiUser.id == target_user_id)
-            .execution_options(populate_existing=True)
+        actor_username, actor_generation_snapshot, actor_epoch_snapshot = await _resolve_access_actor(
+            session,
+            actor_user_id,
+            actor_account_generation,
+            expected_actor_session_epoch,
+            trusted_cli_actor,
         )
-        target = target_result.scalars().first()
-        if target is None:
-            raise UiAccessMutationError("target_not_found")
-        if target.disabled:
-            raise UiAccessMutationError("target_disabled")
-        target_role = normalize_ui_user_role(target.role)
-        if target_role == ROLE_ADMIN:
-            raise UiAccessMutationError("target_global_admin")
-        if target_role != ROLE_MEMBER:
-            raise UiAccessMutationError("target_invalid_global_role")
-        if target.session_generation != account_generation:
-            raise UiAccessMutationError("account_recreated")
-        if target.session_epoch != expected_access_version:
-            raise UiAccessMutationError("access_version_conflict")
-
-        project_result = await session.execute(
-            select(Project)
-            .where(Project.id == project_id)
-            .execution_options(populate_existing=True)
+        target = await _require_access_target(
+            session, target_user_id, account_generation, expected_access_version
         )
-        project = project_result.scalars().first()
-        if project is None:
-            raise UiAccessMutationError("project_not_found")
-        if project.project_generation != expected_project_generation:
-            raise UiAccessMutationError("project_recreated")
+        project = await _require_access_project(session, project_id, expected_project_generation)
 
         assignment_result = await session.execute(
             select(UiProjectAssignment).where(
@@ -269,11 +301,7 @@ async def mutate_ui_project_access(
             ).execution_options(populate_existing=True)
         )
         assignment = assignment_result.scalars().first()
-        old_role = None
-        if assignment is not None:
-            old_role = normalize_project_role(assignment.role)
-            if old_role is None:
-                raise UiAccessMutationError("invalid_existing_role")
+        old_role = _assignment_role(assignment)
 
         if old_role == requested_role:
             await session.commit()

@@ -316,7 +316,8 @@ async def test_reading_and_acknowledging_keep_separate_timestamps(server):
         assert read["message_id"] == message_id
         assert read["read"] is True
         read_at = read["read_at"]
-        assert isinstance(read_at, str) and read_at
+        assert isinstance(read_at, str)
+        assert read_at
 
         acknowledged = await _call(
             client,

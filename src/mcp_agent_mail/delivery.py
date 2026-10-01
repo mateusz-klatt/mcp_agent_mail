@@ -15,7 +15,7 @@ import hashlib
 import json
 import re
 import uuid
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -323,7 +323,7 @@ def _recipient_payload(
     }
 
 
-def _normalize_delivery_request(request: MessageDeliveryRequest) -> _NormalizedDeliveryRequest:
+def _validate_delivery_identities(request: MessageDeliveryRequest) -> None:
     if request.purpose not in {"message", "reply", "contact_request"}:
         raise MessageDeliveryValidationError(
             "invalid_delivery_purpose",
@@ -342,59 +342,91 @@ def _normalize_delivery_request(request: MessageDeliveryRequest) -> _NormalizedD
             "Sender source-project snapshot is invalid",
         )
 
+
+
+def _validate_system_actor(actor: DeliveryActorSnapshot) -> None:
+    if (
+        actor.actor_id != 0
+        or actor.name != "system"
+        or actor.generation is not None
+        or actor.epoch is not None
+        or actor.source_project is not None
+    ):
+        raise MessageDeliveryValidationError(
+            "invalid_system_actor",
+            "System actor must use id 0 and contain no identity lifetime",
+        )
+
+
+def _validate_agent_actor(actor: DeliveryActorSnapshot, sender: DeliveryAgentSnapshot) -> None:
+    if actor.actor_id < 1 or not actor.name or actor.generation is None:
+        raise MessageDeliveryValidationError("invalid_agent_actor", "Agent actor is invalid")
+    _validate_generation(actor.generation, "agent actor generation")
+    if actor.epoch is not None or actor.source_project is None:
+        raise MessageDeliveryValidationError(
+            "invalid_agent_actor",
+            "Agent actor requires a source project and no session epoch",
+        )
+    _validate_generation(actor.source_project.generation, "actor project generation")
+    if (
+        actor.actor_id != sender.agent_id
+        or actor.name != sender.name
+        or actor.generation != sender.generation
+        or actor.source_project != sender.project
+    ):
+        raise MessageDeliveryValidationError(
+            "agent_actor_sender_mismatch",
+            "An agent principal may only authorize its own sender identity",
+        )
+
+
+def _validate_ui_actor_snapshot(actor: DeliveryActorSnapshot, sender: DeliveryAgentSnapshot) -> None:
+    if (
+        actor.actor_id < 1
+        or not actor.name
+        or actor.generation is None
+        or actor.epoch is None
+        or actor.epoch < 1
+        or actor.source_project is None
+        or actor.source_project != sender.project
+    ):
+        raise MessageDeliveryValidationError(
+            "invalid_ui_actor",
+            "UI actor requires an account lifetime, positive session epoch, "
+            "and the sender mailbox project lifetime",
+        )
+    _validate_generation(actor.generation, "UI actor generation")
+    _validate_generation(actor.source_project.generation, "UI actor project generation")
+
+
+def _validate_delivery_actor(request: MessageDeliveryRequest) -> None:
     actor = request.actor
     if actor.kind == "system":
-        if (
-            actor.actor_id != 0
-            or actor.name != "system"
-            or actor.generation is not None
-            or actor.epoch is not None
-            or actor.source_project is not None
-        ):
-            raise MessageDeliveryValidationError(
-                "invalid_system_actor",
-                "System actor must use id 0 and contain no identity lifetime",
-            )
+        _validate_system_actor(actor)
     elif actor.kind == "agent":
-        if actor.actor_id < 1 or not actor.name or actor.generation is None:
-            raise MessageDeliveryValidationError("invalid_agent_actor", "Agent actor is invalid")
-        _validate_generation(actor.generation, "agent actor generation")
-        if actor.epoch is not None or actor.source_project is None:
-            raise MessageDeliveryValidationError(
-                "invalid_agent_actor",
-                "Agent actor requires a source project and no session epoch",
-            )
-        _validate_generation(actor.source_project.generation, "actor project generation")
-        if (
-            actor.actor_id != request.sender.agent_id
-            or actor.name != request.sender.name
-            or actor.generation != request.sender.generation
-            or actor.source_project != request.sender.project
-        ):
-            raise MessageDeliveryValidationError(
-                "agent_actor_sender_mismatch",
-                "An agent principal may only authorize its own sender identity",
-            )
+        _validate_agent_actor(actor, request.sender)
     elif actor.kind == "ui_user":
-        if (
-            actor.actor_id < 1
-            or not actor.name
-            or actor.generation is None
-            or actor.epoch is None
-            or actor.epoch < 1
-            or actor.source_project is None
-            or actor.source_project != request.sender.project
-        ):
-            raise MessageDeliveryValidationError(
-                "invalid_ui_actor",
-                "UI actor requires an account lifetime, positive session epoch, "
-                "and the sender mailbox project lifetime",
-            )
-        _validate_generation(actor.generation, "UI actor generation")
-        _validate_generation(actor.source_project.generation, "UI actor project generation")
+        _validate_ui_actor_snapshot(actor, request.sender)
     else:
         raise MessageDeliveryValidationError("invalid_actor_kind", "Unsupported actor kind")
 
+
+def _normalize_delivery_thread(request: MessageDeliveryRequest) -> str | None:
+    thread_id = request.thread_id.strip() if request.thread_id is not None else None
+    if thread_id is not None and not validate_thread_id_format(thread_id):
+        raise MessageDeliveryValidationError("invalid_thread_id", "Thread id is invalid")
+    if request.purpose == "reply" and (
+        request.actor.kind not in {"agent", "ui_user"} or thread_id is None
+    ):
+        raise MessageDeliveryValidationError(
+            "invalid_reply_shape",
+            "Replies require an authenticated sender agent or mailbox operator "
+            "and a nonempty thread id",
+        )
+    return thread_id
+
+
+def _normalize_delivery_content(request: MessageDeliveryRequest) -> tuple[str, str, str, str | None, str | None]:
     idempotency_key = request.idempotency_key.strip()
     if not idempotency_key or len(idempotency_key) > 128:
         raise MessageDeliveryValidationError(
@@ -407,22 +439,16 @@ def _normalize_delivery_request(request: MessageDeliveryRequest) -> _NormalizedD
         raise MessageDeliveryValidationError("subject_too_long", "Subject exceeds 512 characters")
     if len(request.importance) > 16 or not request.importance:
         raise MessageDeliveryValidationError("invalid_importance", "Importance is invalid")
-    thread_id = request.thread_id.strip() if request.thread_id is not None else None
-    if thread_id is not None and not validate_thread_id_format(thread_id):
-        raise MessageDeliveryValidationError("invalid_thread_id", "Thread id is invalid")
-    if request.purpose == "reply" and (
-        request.actor.kind not in {"agent", "ui_user"} or thread_id is None
-    ):
-        raise MessageDeliveryValidationError(
-            "invalid_reply_shape",
-            "Replies require an authenticated sender agent or mailbox operator "
-            "and a nonempty thread id",
-        )
+    thread_id = _normalize_delivery_thread(request)
     topic = request.topic.strip() if request.topic is not None else None
     if topic is not None and (len(topic) > 64 or _TOPIC_RE.fullmatch(topic) is None):
         raise MessageDeliveryValidationError("invalid_topic", "Topic is invalid")
     if request.reply_to_message_id is not None and request.reply_to_message_id < 1:
         raise MessageDeliveryValidationError("invalid_reply_target", "Reply target is invalid")
+    return idempotency_key, subject, body_md, thread_id, topic
+
+
+def _validate_delivery_recipients(request: MessageDeliveryRequest) -> tuple[DeliveryRecipientSnapshot, ...]:
     if not request.recipients:
         raise MessageDeliveryValidationError("missing_recipients", "At least one recipient is required")
     if request.purpose == "contact_request" and (
@@ -457,6 +483,14 @@ def _normalize_delivery_request(request: MessageDeliveryRequest) -> _NormalizedD
                 "Every recipient must belong to the target project lifetime",
             )
         normalized_recipients.append(recipient)
+    return tuple(normalized_recipients)
+
+
+def _normalize_delivery_request(request: MessageDeliveryRequest) -> _NormalizedDeliveryRequest:
+    _validate_delivery_identities(request)
+    _validate_delivery_actor(request)
+    idempotency_key, subject, body_md, thread_id, topic = _normalize_delivery_content(request)
+    normalized_recipients = _validate_delivery_recipients(request)
 
     if request.attachments:
         raise MessageDeliveryValidationError(
@@ -470,7 +504,7 @@ def _normalize_delivery_request(request: MessageDeliveryRequest) -> _NormalizedD
         target_project=request.target_project,
         sender=request.sender,
         actor=request.actor,
-        recipients=tuple(normalized_recipients),
+        recipients=normalized_recipients,
         idempotency_key=idempotency_key,
         subject=subject,
         body_md=body_md,
@@ -1752,6 +1786,34 @@ async def _record_processing_failure(
         )
 
 
+async def _load_claimed_delivery(
+    lease: MessageDeliveryLease,
+    operation_time: Callable[[], datetime],
+) -> MessageDeliveryProcessingResult | tuple[str, bytes, str]:
+    async with get_immediate_session() as load_session:
+        delivery = await load_session.get(MessageDelivery, lease.delivery_id)
+        if delivery is None:
+            raise MessageDeliveryNotFoundError(lease.delivery_id)
+        if delivery.state in {"published", "quarantined"}:
+            return _processing_result_from_delivery(delivery, now=operation_time())
+        _assert_current_lease(delivery, lease, operation_time())
+        recipients = await _load_delivery_recipients(load_session, delivery.id)
+        request = _request_from_delivery(delivery, recipients)
+        await _validate_request_lifetimes(load_session, request, operation_time())
+        return (
+            delivery.project_slug_snapshot,
+            delivery.archive_document.encode(),
+            delivery.document_sha256,
+        )
+
+
+def _delivery_processing_time(now: datetime | None) -> datetime:
+    processed_at = now or _utcnow_naive()
+    if processed_at.tzinfo is not None:
+        return processed_at.astimezone(timezone.utc).replace(tzinfo=None)
+    return processed_at
+
+
 async def process_claimed_message_delivery(
     lease: MessageDeliveryLease,
     *,
@@ -1762,9 +1824,7 @@ async def process_claimed_message_delivery(
     """Publish and finalize one already-claimed delivery lease."""
     if max_attempts < 1:
         raise ValueError("max_attempts must be positive")
-    processed_at = now or _utcnow_naive()
-    if processed_at.tzinfo is not None:
-        processed_at = processed_at.astimezone(timezone.utc).replace(tzinfo=None)
+    processed_at = _delivery_processing_time(now)
     resolved_settings = settings or get_settings()
 
     def _operation_time() -> datetime:
@@ -1774,31 +1834,10 @@ async def process_claimed_message_delivery(
         # Explicit time freezes service tests and deterministic recovery
         # simulations; no wall-clock lease heartbeat belongs in that mode.
         async with _maintain_message_delivery_lease(lease, enabled=now is None):
-            async with get_immediate_session() as load_session:
-                delivery = await load_session.get(MessageDelivery, lease.delivery_id)
-                if delivery is None:
-                    raise MessageDeliveryNotFoundError(lease.delivery_id)
-                if delivery.state == "published":
-                    return _processing_result_from_delivery(
-                        delivery,
-                        now=_operation_time(),
-                    )
-                if delivery.state == "quarantined":
-                    return _processing_result_from_delivery(
-                        delivery,
-                        now=_operation_time(),
-                    )
-                _assert_current_lease(delivery, lease, _operation_time())
-                recipients = await _load_delivery_recipients(load_session, delivery.id)
-                request = _request_from_delivery(delivery, recipients)
-                await _validate_request_lifetimes(
-                    load_session,
-                    request,
-                    _operation_time(),
-                )
-                project_slug = delivery.project_slug_snapshot
-                document_bytes = delivery.archive_document.encode()
-                document_sha256 = delivery.document_sha256
+            loaded = await _load_claimed_delivery(lease, _operation_time)
+            if isinstance(loaded, MessageDeliveryProcessingResult):
+                return loaded
+            project_slug, document_bytes, document_sha256 = loaded
 
             archive = await ensure_archive(resolved_settings, project_slug)
             publication = await publish_message_delivery(
@@ -1851,9 +1890,7 @@ async def process_claimed_message_delivery(
         # A final COMMIT may have succeeded and lost its return value. Re-read
         # in a fresh serialized session before classifying it as retryable.
         current = await _reconciled_processing_result(lease)
-        if current.status == "published":
-            return current
-        if current.status == "quarantined":
+        if current.status in {"published", "quarantined"}:
             return current
         return await _record_processing_failure(
             lease,

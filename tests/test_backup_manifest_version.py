@@ -31,8 +31,9 @@ def _manifest(**overrides: object) -> dict[str, object]:
 
 
 def test_a_boolean_version_is_not_an_integer_version() -> None:
+    manifest = _manifest(version=True)
     with pytest.raises(ValueError, match="integer version"):
-        _parse_backup_manifest(_manifest(version=True))
+        _parse_backup_manifest(manifest)
 
 
 def test_the_same_manifest_with_a_real_integer_is_accepted() -> None:
@@ -42,11 +43,13 @@ def test_the_same_manifest_with_a_real_integer_is_accepted() -> None:
 
 
 def test_false_is_rejected_like_the_zero_it_equals() -> None:
+    manifest = _manifest(version=False)
     with pytest.raises(ValueError, match="integer version"):
-        _parse_backup_manifest(_manifest(version=False))
+        _parse_backup_manifest(manifest)
 
 
 @pytest.mark.parametrize("version", ["1", 0, -1, None, 1.0])
 def test_non_integer_and_out_of_range_versions_stay_rejected(version: object) -> None:
+    manifest = _manifest(version=version)
     with pytest.raises(ValueError, match="integer version"):
-        _parse_backup_manifest(_manifest(version=version))
+        _parse_backup_manifest(manifest)

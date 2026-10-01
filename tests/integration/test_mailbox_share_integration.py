@@ -355,7 +355,16 @@ def test_viewer_playwright_smoke(monkeypatch, tmp_path: Path) -> None:
                           && rect.bottom > 0
                           && rect.left < viewportWidth
                           && rect.top < innerHeight;
-                        if (!active || (rect.width >= 43.5 && rect.height >= 43.5)) return [];
+                        if (!active) return [];
+                        const clickTargets = [element, ...Array.from(element.labels || [])];
+                        const hasAdequateTarget = clickTargets.some((target) => {
+                          const hitArea = visibleRect(target);
+                          return hitArea.visible
+                            && getComputedStyle(target).pointerEvents !== 'none'
+                            && hitArea.rect.width >= 43.5
+                            && hitArea.rect.height >= 43.5;
+                        });
+                        if (hasAdequateTarget) return [];
                         return [{
                           tag: element.tagName.toLowerCase(),
                           label: element.getAttribute('aria-label')
@@ -453,6 +462,27 @@ def test_viewer_playwright_smoke(monkeypatch, tmp_path: Path) -> None:
             )
             assert_mobile_touch_targets()
 
+            # The native checkbox is 20px wide; its associated 44px label is
+            # the touch target. Exercise the label padding with real clicks.
+            select_all = page.get_by_role("checkbox", name="Select all messages")
+            label_box = select_all.locator("..").bounding_box()
+            checkbox_box = select_all.bounding_box()
+            assert label_box is not None
+            assert checkbox_box is not None
+            click_x = label_box["x"] + 2
+            click_y = label_box["y"] + label_box["height"] / 2
+            assert click_x < checkbox_box["x"]
+            page.mouse.click(click_x, click_y)
+            page.wait_for_function(
+                "document.querySelector('input[aria-label=\"Select all messages\"]').checked",
+                polling=50,
+            )
+            page.mouse.click(click_x, click_y)
+            page.wait_for_function(
+                "!document.querySelector('input[aria-label=\"Select all messages\"]').checked",
+                polling=50,
+            )
+
             # The CI Chromium renderer can suppress animation frames while
             # headless, so Playwright's separate "stable for two frames"
             # actionability probe may never resolve. Geometry and visibility
@@ -464,9 +494,21 @@ def test_viewer_playwright_smoke(monkeypatch, tmp_path: Path) -> None:
             )
             assert_mobile_touch_targets()
 
-            page.get_by_role("button", name="Sort messages").dispatch_event("click")
+            sort_box = page.get_by_role("button", name="Sort messages").bounding_box()
+            assert sort_box is not None
+            page.mouse.click(
+                sort_box["x"] + sort_box["width"] / 2,
+                sort_box["y"] + sort_box["height"] / 2,
+            )
             page.get_by_role("button", name="Newest First").wait_for(state="visible")
             assert_mobile_touch_targets()
+            page.get_by_role("button", name="Newest First").press("Escape")
+            page.get_by_role("button", name="Newest First").wait_for(state="hidden")
+            sort_toggle = page.get_by_role("button", name="Sort messages")
+            assert sort_toggle.get_attribute("aria-expanded") == "false"
+            assert sort_toggle.evaluate("button => document.activeElement === button")
+            sort_toggle.press("Enter")
+            page.get_by_role("button", name="Newest First").wait_for(state="visible")
             page.get_by_role("button", name="Newest First").dispatch_event("click")
 
             page.get_by_role(
@@ -516,6 +558,24 @@ def test_viewer_playwright_smoke(monkeypatch, tmp_path: Path) -> None:
             assert_mobile_touch_targets()
             page.locator("[data-thread-id]").first.dispatch_event("click")
             assert_mobile_touch_targets()
+            thread_disclosure = page.get_by_role(
+                "button", name="Collapse message 1", exact=True
+            )
+            thread_disclosure.wait_for(state="visible")
+            assert thread_disclosure.get_attribute("aria-expanded") == "true"
+            thread_body = page.locator("article > header + div").first
+            thread_body.wait_for(state="visible")
+            thread_disclosure.press("Enter")
+            collapsed_disclosure = page.get_by_role(
+                "button", name="Expand message 1", exact=True
+            )
+            collapsed_disclosure.wait_for(state="visible")
+            assert collapsed_disclosure.get_attribute("aria-expanded") == "false"
+            thread_body.wait_for(state="hidden")
+            collapsed_disclosure.press("Space")
+            thread_disclosure.wait_for(state="visible")
+            assert thread_disclosure.get_attribute("aria-expanded") == "true"
+            thread_body.wait_for(state="visible")
             external_requests = [
                 url
                 for url in request_urls
@@ -534,6 +594,42 @@ def test_viewer_playwright_smoke(monkeypatch, tmp_path: Path) -> None:
             # Ensure sanitization removed inline script execution.
             xss_value = page.evaluate("window._xss || null")
             assert xss_value is None
+            chunk_failure = page.evaluate(
+                """
+                async () => {
+                  const originalFetch = window.fetch;
+                  const requests = [];
+                  let countReads = 0;
+                  const chunks = {
+                    pattern: 'chunks/{index:04d}.bin',
+                    get chunk_count() {
+                      countReads += 1;
+                      // Bound the regression itself: eager iteration must fail
+                      // before it can allocate a billion pending promises.
+                      if (countReads > 1) throw new Error('eager chunk iteration');
+                      return 1_000_000_000;
+                    },
+                  };
+                  window.fetch = async (path) => {
+                    requests.push(path);
+                    throw new Error('first chunk unavailable');
+                  };
+                  try {
+                    await fetchDatabaseFromNetwork({database: {chunk_manifest: chunks}});
+                    return {unexpectedSuccess: true};
+                  } catch (error) {
+                    return {error: error.message, requests, countReads};
+                  } finally {
+                    window.fetch = originalFetch;
+                  }
+                }
+                """
+            )
+            assert chunk_failure == {
+                "error": "first chunk unavailable",
+                "requests": ["../chunks/0000.bin"],
+                "countReads": 1,
+            }
             context.close()
             browser.close()
     finally:

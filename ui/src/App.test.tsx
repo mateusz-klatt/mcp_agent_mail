@@ -1580,11 +1580,9 @@ describe("Iris landing shell", () => {
     await user.type(screen.getByLabelText("Subject"), "Review the release");
     await user.type(screen.getByLabelText("Thread ID (optional)"), "release-2026");
     await user.type(screen.getByLabelText("Message in Markdown"), "**Proceed** after UAT.");
-    await act(async () => {
-      fireEvent.keyDown(screen.getByLabelText("Message in Markdown"), {
-        key: "Enter",
-        ctrlKey: true,
-      });
+    fireEvent.keyDown(screen.getByLabelText("Message in Markdown"), {
+      key: "Enter",
+      ctrlKey: true,
     });
 
     const confirmation = await screen.findByRole("region", {
@@ -1679,11 +1677,9 @@ describe("Iris landing shell", () => {
       }),
     );
     await user.type(await screen.findByLabelText("Reply in Markdown"), "Approved.");
-    await act(async () => {
-      fireEvent.keyDown(screen.getByLabelText("Reply in Markdown"), {
-        key: "Enter",
-        metaKey: true,
-      });
+    fireEvent.keyDown(screen.getByLabelText("Reply in Markdown"), {
+      key: "Enter",
+      metaKey: true,
     });
 
     const confirmation = await screen.findByRole("region", {
@@ -3011,8 +3007,8 @@ describe("Iris landing shell", () => {
     const polish = screen.getByRole("option", { name: /use polski/i });
     const french = screen.getByRole("option", { name: /use français/i });
     act(() => {
-      fireEvent.click(polish);
-      fireEvent.click(french);
+      polish.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      french.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
 
     expect(prepareLocaleCatalog).toHaveBeenCalledTimes(1);
@@ -4135,6 +4131,16 @@ describe("Iris landing shell", () => {
     expect(screen.getByLabelText("Blok kodu")).toBeVisible();
     expect(screen.queryByLabelText("Markdown table")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Code block")).not.toBeInTheDocument();
+
+    const codeBlock = screen.getByLabelText("Blok kodu");
+    const tableRegion = screen.getByRole("region", { name: "Tabela Markdown" });
+    codeBlock.focus();
+    await act(async () => {
+      await i18n.changeLanguage("en");
+    });
+    expect(screen.getByLabelText("Code block")).toBe(codeBlock);
+    expect(screen.getByRole("region", { name: "Markdown table" })).toBe(tableRegion);
+    expect(codeBlock).toHaveFocus();
   });
 
   it.each([
@@ -5390,6 +5396,24 @@ describe("Iris landing shell", () => {
       expect(screen.queryByText("private-marker server failure")).not.toBeInTheDocument();
     },
   );
+
+  it("redacts transport failures when searching messages", async () => {
+    window.history.replaceState({}, "", "/mail/#search?q=private-marker");
+    const originalFetch = globalThis.fetch.bind(globalThis);
+    vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => {
+      const requestUrl = input instanceof Request ? input.url : String(input);
+      if (requestUrl.includes("/mail/api/v1/search?")) {
+        return Promise.reject(new TypeError("private-marker network failure"));
+      }
+      return originalFetch(input, init);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText(/Messages could not be searched/)).toBeVisible();
+    expect(screen.queryByText("private-marker network failure")).not.toBeInTheDocument();
+    expect(screen.queryByText("Searching messages…")).not.toBeInTheDocument();
+  });
 
   it("paginates search results without duplicates", async () => {
     const user = userEvent.setup();

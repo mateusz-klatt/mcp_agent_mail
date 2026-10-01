@@ -412,6 +412,172 @@ def _optional_build_commit(value: str, *, key: str) -> str | None:
     )
 
 
+def _float(value: str, *, default: float, key: str) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return default
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{key}: invalid float value {value!r} (or leave unset for default).") from None
+
+
+def _optional_int_setting(config: DecoupleConfig, name: str, default: int | None) -> int | None:
+    raw = str(config(name, default="") or "").strip()
+    return _int_optional(raw, key=name) if raw else default
+
+
+def _optional_config_value(config: DecoupleConfig, name: str) -> str | None:
+    return config(name, default="") or None
+
+
+def _validate_oauth_base_url(base_url: str) -> None:
+    parsed = urlsplit(base_url)
+    localhost = parsed.hostname in {"127.0.0.1", "::1", "localhost"}
+    if parsed.scheme not in {"http", "https"}:
+        raise ConfigError(
+            "HTTP_OAUTH_BASE_URL must use https, or http for localhost development."
+        )
+    if parsed.scheme != "https" and not localhost:
+        raise ConfigError("HTTP_OAUTH_BASE_URL must use https outside localhost development.")
+    if (
+        not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ConfigError(
+            "HTTP_OAUTH_BASE_URL must be an origin URL without credentials, "
+            "path, query, or fragment (for example https://iris.example)."
+        )
+
+
+def _validate_oauth_redirect_uri(redirect_pattern: str) -> None:
+    if "*" in redirect_pattern:
+        if redirect_pattern not in OAUTH_LOOPBACK_REDIRECT_PORT_PATTERNS:
+            raise ConfigError(
+                "HTTP_OAUTH_ALLOWED_CLIENT_REDIRECT_URIS permits wildcards "
+                "only in an explicit loopback port pattern."
+            )
+        parsed = urlsplit(redirect_pattern[:-1] + "1")
+    else:
+        parsed = urlsplit(redirect_pattern)
+    try:
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ConfigError(
+            "HTTP_OAUTH_ALLOWED_CLIENT_REDIRECT_URIS contains an invalid URI."
+        ) from exc
+    loopback = hostname in {"127.0.0.1", "::1", "localhost"}
+    if (
+        not parsed.netloc
+        or (redirect_pattern in OAUTH_LOOPBACK_REDIRECT_PORT_PATTERNS and port is None)
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or (parsed.scheme != "https" and not (parsed.scheme == "http" and loopback))
+    ):
+        raise ConfigError(
+            "HTTP_OAUTH_ALLOWED_CLIENT_REDIRECT_URIS entries must be "
+            "credential-free HTTPS URIs or HTTP loopback URIs without fragments."
+        )
+
+
+def _validate_oauth_github_identity(identity: str) -> None:
+    prefix, separator, value = identity.partition(":")
+    if not separator:
+        return
+    normalized_prefix = prefix.casefold()
+    normalized_value = value.strip()
+    if normalized_prefix not in {"id", "login"} or not normalized_value:
+        raise ConfigError(
+            "HTTP_OAUTH_GITHUB_ALLOWED_IDENTITIES entries must be GitHub "
+            "logins, numeric IDs, login:<login>, or id:<numeric-id>."
+        )
+    if normalized_prefix == "id" and not normalized_value.isdecimal():
+        raise ConfigError(
+            "HTTP_OAUTH_GITHUB_ALLOWED_IDENTITIES id: entries must use numeric GitHub user IDs."
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _OAuthValidation:
+    base_url: str
+    github_client_id: str | None
+    github_client_secret: str | None
+    github_allowed_identities: list[str]
+    github_token_cache_ttl_seconds: int
+    dcr_rate_limit_per_minute: int
+    jwt_signing_key: str | None
+    storage_path: str
+    access_token_ttl_seconds: int
+    allowed_client_redirect_uris: list[str]
+    rbac_role: str
+    rbac_reader_roles: list[str]
+    rbac_writer_roles: list[str]
+    production_environment: bool
+    rate_limit_enabled: bool
+    rate_limit_per_minute: int
+
+    def validate(self) -> None:
+        self._require_credentials()
+        _validate_oauth_base_url(self.base_url)
+        self._validate_token_settings()
+        for redirect_pattern in self.allowed_client_redirect_uris:
+            _validate_oauth_redirect_uri(redirect_pattern)
+        for identity in self.github_allowed_identities:
+            _validate_oauth_github_identity(identity)
+        if self.rbac_role not in {*self.rbac_reader_roles, *self.rbac_writer_roles}:
+            raise ConfigError(
+                "HTTP_OAUTH_RBAC_ROLE must be present in HTTP_RBAC_READER_ROLES "
+                "or HTTP_RBAC_WRITER_ROLES."
+            )
+        if self.production_environment and (
+            not self.rate_limit_enabled or self.rate_limit_per_minute <= 0
+        ):
+            raise ConfigError(
+                "Production OAuth requires HTTP_RATE_LIMIT_ENABLED=true and a "
+                "positive HTTP_RATE_LIMIT_PER_MINUTE to protect public OAuth endpoints."
+            )
+
+    def _require_credentials(self) -> None:
+        missing = [
+            name for name, value in (
+                ("HTTP_OAUTH_BASE_URL", self.base_url),
+                ("HTTP_OAUTH_GITHUB_CLIENT_ID", self.github_client_id),
+                ("HTTP_OAUTH_GITHUB_CLIENT_SECRET", self.github_client_secret),
+                ("HTTP_OAUTH_GITHUB_ALLOWED_IDENTITIES", self.github_allowed_identities),
+                ("HTTP_OAUTH_JWT_SIGNING_KEY", self.jwt_signing_key),
+                ("HTTP_OAUTH_ALLOWED_CLIENT_REDIRECT_URIS", self.allowed_client_redirect_uris),
+            ) if not value
+        ]
+        if missing:
+            raise ConfigError(
+                "HTTP_OAUTH_ENABLED requires non-empty values for: " + ", ".join(missing)
+            )
+
+    def _validate_token_settings(self) -> None:
+        if self.production_environment and not Path(self.storage_path).expanduser().is_absolute():
+            raise ConfigError("HTTP_OAUTH_STORAGE_PATH must be absolute in production.")
+        if self.jwt_signing_key is not None and len(self.jwt_signing_key) < 32:
+            raise ConfigError("HTTP_OAUTH_JWT_SIGNING_KEY must contain at least 32 characters.")
+        if not 300 <= self.access_token_ttl_seconds <= 365 * 24 * 60 * 60:
+            raise ConfigError(
+                "HTTP_OAUTH_ACCESS_TOKEN_TTL_SECONDS must be between 300 and 31536000 seconds."
+            )
+        if not 0 <= self.github_token_cache_ttl_seconds <= 300:
+            raise ConfigError(
+                "HTTP_OAUTH_GITHUB_TOKEN_CACHE_TTL_SECONDS must be between 0 and 300 seconds."
+            )
+        if not 1 <= self.dcr_rate_limit_per_minute <= 60:
+            raise ConfigError(
+                "HTTP_OAUTH_DCR_RATE_LIMIT_PER_MINUTE must be between 1 and 60."
+            )
+
+
 def _build_settings() -> Settings:
     decouple_config = _get_decouple_config()
     environment = decouple_config("APP_ENVIRONMENT", default="development")
@@ -440,10 +606,7 @@ def _build_settings() -> Settings:
         # non-empty value is parsed fail-closed (raises on garbage). Note we
         # cannot push ``default`` through decouple as a string, because a
         # malformed *explicit* value must still raise — so handle empty here.
-        raw = str(decouple_config(name, default="") or "").strip()
-        if not raw:
-            return default
-        return _int_optional(raw, key=name)
+        return _optional_int_setting(decouple_config, name, default)
 
     allow_localhost_unauthenticated = _b(
         "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED",
@@ -511,154 +674,24 @@ def _build_settings() -> Settings:
     rate_limit_per_minute = _i("HTTP_RATE_LIMIT_PER_MINUTE", default=60)
 
     if oauth_enabled:
-        missing = [
-            name
-            for name, value in (
-                ("HTTP_OAUTH_BASE_URL", oauth_base_url),
-                ("HTTP_OAUTH_GITHUB_CLIENT_ID", oauth_github_client_id),
-                (
-                    "HTTP_OAUTH_GITHUB_CLIENT_SECRET",
-                    oauth_github_client_secret,
-                ),
-                (
-                    "HTTP_OAUTH_GITHUB_ALLOWED_IDENTITIES",
-                    oauth_github_allowed_identities,
-                ),
-                ("HTTP_OAUTH_JWT_SIGNING_KEY", oauth_jwt_signing_key),
-                (
-                    "HTTP_OAUTH_ALLOWED_CLIENT_REDIRECT_URIS",
-                    oauth_allowed_client_redirect_uris,
-                ),
-            )
-            if not value
-        ]
-        if missing:
-            raise ConfigError(
-                "HTTP_OAUTH_ENABLED requires non-empty values for: "
-                + ", ".join(missing)
-            )
-
-        parsed_oauth_base = urlsplit(oauth_base_url)
-        localhost_oauth = parsed_oauth_base.hostname in {
-            "127.0.0.1",
-            "::1",
-            "localhost",
-        }
-        if parsed_oauth_base.scheme not in {"http", "https"}:
-            raise ConfigError(
-                "HTTP_OAUTH_BASE_URL must use https, or http for localhost development."
-            )
-        if parsed_oauth_base.scheme != "https" and not localhost_oauth:
-            raise ConfigError(
-                "HTTP_OAUTH_BASE_URL must use https outside localhost development."
-            )
-        if (
-            not parsed_oauth_base.netloc
-            or parsed_oauth_base.username is not None
-            or parsed_oauth_base.password is not None
-            or parsed_oauth_base.path not in {"", "/"}
-            or parsed_oauth_base.query
-            or parsed_oauth_base.fragment
-        ):
-            raise ConfigError(
-                "HTTP_OAUTH_BASE_URL must be an origin URL without credentials, "
-                "path, query, or fragment (for example https://iris.example)."
-            )
-        if production_environment and not Path(
-            oauth_storage_path
-        ).expanduser().is_absolute():
-            raise ConfigError(
-                "HTTP_OAUTH_STORAGE_PATH must be absolute in production."
-            )
-        if oauth_jwt_signing_key is not None and len(oauth_jwt_signing_key) < 32:
-            raise ConfigError(
-                "HTTP_OAUTH_JWT_SIGNING_KEY must contain at least 32 characters."
-            )
-        if not 300 <= oauth_access_token_ttl_seconds <= 365 * 24 * 60 * 60:
-            raise ConfigError(
-                "HTTP_OAUTH_ACCESS_TOKEN_TTL_SECONDS must be between 300 and "
-                "31536000 seconds."
-            )
-        if not 0 <= oauth_github_token_cache_ttl_seconds <= 300:
-            raise ConfigError(
-                "HTTP_OAUTH_GITHUB_TOKEN_CACHE_TTL_SECONDS must be between 0 "
-                "and 300 seconds."
-            )
-        if not 1 <= oauth_dcr_rate_limit_per_minute <= 60:
-            raise ConfigError(
-                "HTTP_OAUTH_DCR_RATE_LIMIT_PER_MINUTE must be between 1 and 60."
-            )
-        for redirect_pattern in oauth_allowed_client_redirect_uris:
-            if "*" in redirect_pattern:
-                if redirect_pattern not in OAUTH_LOOPBACK_REDIRECT_PORT_PATTERNS:
-                    raise ConfigError(
-                        "HTTP_OAUTH_ALLOWED_CLIENT_REDIRECT_URIS permits wildcards "
-                        "only in an explicit loopback port pattern."
-                    )
-                parsed_redirect = urlsplit(redirect_pattern[:-1] + "1")
-            else:
-                parsed_redirect = urlsplit(redirect_pattern)
-            try:
-                redirect_hostname = parsed_redirect.hostname
-                redirect_port = parsed_redirect.port
-            except ValueError as exc:
-                raise ConfigError(
-                    "HTTP_OAUTH_ALLOWED_CLIENT_REDIRECT_URIS contains an invalid URI."
-                ) from exc
-            loopback_redirect = redirect_hostname in {
-                "127.0.0.1",
-                "::1",
-                "localhost",
-            }
-            if (
-                not parsed_redirect.netloc
-                or (
-                    redirect_pattern in OAUTH_LOOPBACK_REDIRECT_PORT_PATTERNS
-                    and redirect_port is None
-                )
-                or parsed_redirect.username is not None
-                or parsed_redirect.password is not None
-                or parsed_redirect.fragment
-                or (
-                    parsed_redirect.scheme != "https"
-                    and not (
-                        parsed_redirect.scheme == "http" and loopback_redirect
-                    )
-                )
-            ):
-                raise ConfigError(
-                    "HTTP_OAUTH_ALLOWED_CLIENT_REDIRECT_URIS entries must be "
-                    "credential-free HTTPS URIs or HTTP loopback URIs without "
-                    "fragments."
-                )
-        for identity in oauth_github_allowed_identities:
-            prefix, separator, value = identity.partition(":")
-            if not separator:
-                continue
-            normalized_prefix = prefix.casefold()
-            normalized_value = value.strip()
-            if normalized_prefix not in {"id", "login"} or not normalized_value:
-                raise ConfigError(
-                    "HTTP_OAUTH_GITHUB_ALLOWED_IDENTITIES entries must be GitHub "
-                    "logins, numeric IDs, login:<login>, or id:<numeric-id>."
-                )
-            if normalized_prefix == "id" and not normalized_value.isdecimal():
-                raise ConfigError(
-                    "HTTP_OAUTH_GITHUB_ALLOWED_IDENTITIES id: entries must use "
-                    "numeric GitHub user IDs."
-                )
-        if oauth_rbac_role not in {*rbac_reader_roles, *rbac_writer_roles}:
-            raise ConfigError(
-                "HTTP_OAUTH_RBAC_ROLE must be present in HTTP_RBAC_READER_ROLES "
-                "or HTTP_RBAC_WRITER_ROLES."
-            )
-        if production_environment and (
-            not rate_limit_enabled or rate_limit_per_minute <= 0
-        ):
-            raise ConfigError(
-                "Production OAuth requires HTTP_RATE_LIMIT_ENABLED=true and a "
-                "positive HTTP_RATE_LIMIT_PER_MINUTE to protect public OAuth endpoints."
-            )
+        _OAuthValidation(
+            base_url=oauth_base_url,
+            github_client_id=oauth_github_client_id,
+            github_client_secret=oauth_github_client_secret,
+            github_allowed_identities=oauth_github_allowed_identities,
+            github_token_cache_ttl_seconds=oauth_github_token_cache_ttl_seconds,
+            dcr_rate_limit_per_minute=oauth_dcr_rate_limit_per_minute,
+            jwt_signing_key=oauth_jwt_signing_key,
+            storage_path=oauth_storage_path,
+            access_token_ttl_seconds=oauth_access_token_ttl_seconds,
+            allowed_client_redirect_uris=oauth_allowed_client_redirect_uris,
+            rbac_role=oauth_rbac_role,
+            rbac_reader_roles=rbac_reader_roles,
+            rbac_writer_roles=rbac_writer_roles,
+            production_environment=production_environment,
+            rate_limit_enabled=rate_limit_enabled,
+            rate_limit_per_minute=rate_limit_per_minute,
+        ).validate()
 
     http_settings = HttpSettings(
         host=decouple_config("HTTP_HOST", default="127.0.0.1"),
@@ -668,7 +701,7 @@ def _build_settings() -> Settings:
             decouple_config("HTTP_FORWARDED_ALLOW_IPS", default="127.0.0.1").strip()
             or "127.0.0.1"
         ),
-        bearer_token=decouple_config("HTTP_BEARER_TOKEN", default="") or None,
+        bearer_token=_optional_config_value(decouple_config, "HTTP_BEARER_TOKEN"),
         oauth_enabled=oauth_enabled,
         oauth_base_url=oauth_base_url,
         oauth_github_client_id=oauth_github_client_id,
@@ -702,10 +735,10 @@ def _build_settings() -> Settings:
         otel_exporter_otlp_endpoint=decouple_config("OTEL_EXPORTER_OTLP_ENDPOINT", default=""),
         jwt_enabled=_b("HTTP_JWT_ENABLED", default=False),
         jwt_algorithms=_csv("HTTP_JWT_ALGORITHMS", default="HS256"),
-        jwt_secret=decouple_config("HTTP_JWT_SECRET", default="") or None,
-        jwt_jwks_url=decouple_config("HTTP_JWT_JWKS_URL", default="") or None,
-        jwt_audience=decouple_config("HTTP_JWT_AUDIENCE", default="") or None,
-        jwt_issuer=decouple_config("HTTP_JWT_ISSUER", default="") or None,
+        jwt_secret=_optional_config_value(decouple_config, "HTTP_JWT_SECRET"),
+        jwt_jwks_url=_optional_config_value(decouple_config, "HTTP_JWT_JWKS_URL"),
+        jwt_audience=_optional_config_value(decouple_config, "HTTP_JWT_AUDIENCE"),
+        jwt_issuer=_optional_config_value(decouple_config, "HTTP_JWT_ISSUER"),
         jwt_role_claim=decouple_config("HTTP_JWT_ROLE_CLAIM", default="role") or "role",
         rbac_enabled=_b("HTTP_RBAC_ENABLED", default=True),
         rbac_reader_roles=rbac_reader_roles,
@@ -759,16 +792,6 @@ def _build_settings() -> Settings:
         or "agent_mail_session",
         session_ttl_seconds=_i("MAIL_UI_SESSION_TTL_SECONDS", default=14 * 24 * 3600),
     )
-
-    def _float(value: str, *, default: float, key: str) -> float:
-        text = str(value or "").strip()
-        # Empty/unset → legitimate fallback to default.
-        if not text:
-            return default
-        try:
-            return float(text)
-        except (TypeError, ValueError):
-            raise ConfigError(f"{key}: invalid float value {value!r} (or leave unset for default).") from None
 
     def _f(name: str, *, default: float) -> float:
         return _float(decouple_config(name, default=""), default=default, key=name)

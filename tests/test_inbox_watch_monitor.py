@@ -1003,7 +1003,8 @@ def test_onboard_persists_the_one_time_token_and_doctor_never_prints_it(
         (tmp_path / "state" / "credentials.json").read_text(encoding="utf-8")
     )
     [(agent_name, stored_token)] = credentials["/owner/repo"].items()
-    assert agent_name.startswith("claude-") and agent_name.endswith("-1")
+    assert agent_name.startswith("claude-")
+    assert agent_name.endswith("-1")
     assert stored_token == "one-time-secret"
     assert list((tmp_path / "state" / "granted").iterdir())
 
@@ -2259,7 +2260,8 @@ def test_monitor_is_singleton_per_project_and_agent_with_diagnostic_argv(
             "other",
         )
         assert _wait_until(lambda: len(list(watch_dir.glob("monitor-*.json"))) == 2)
-        assert first.poll() is None and other.poll() is None
+        assert first.poll() is None
+        assert other.poll() is None
 
         metadata = [
             json.loads(path.read_text(encoding="utf-8"))

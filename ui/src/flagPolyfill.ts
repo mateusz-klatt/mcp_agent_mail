@@ -49,18 +49,19 @@ interface FlagPolyfillEnvironment {
 
 export const initFlagPolyfill = (
   supportsEmoji: EmojiSupportProbe = browserSupportsEmoji,
-  environment: FlagPolyfillEnvironment = {
+  environment?: FlagPolyfillEnvironment,
+): boolean => {
+  const browserEnvironment = environment ?? {
     document: globalThis.document,
     window: globalThis.window,
-  },
-): boolean => {
-  if (environment.window === undefined) {
+  };
+  if (browserEnvironment.window === undefined) {
     return false;
   }
-  if (environment.document === undefined) {
+  if (browserEnvironment.document === undefined) {
     return false;
   }
-  const browserDocument = environment.document;
+  const browserDocument = browserEnvironment.document;
   delete browserDocument.documentElement.dataset.flagPolyfill;
   let needsPolyfill: boolean;
   try {

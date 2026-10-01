@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import pytest
 from fastmcp import Client
+from fastmcp.exceptions import ToolError
 
 from mcp_agent_mail.app import build_mcp_server
 
@@ -81,7 +82,7 @@ async def test_a_foreign_token_cannot_archive_a_project(isolated_env):
     mine, theirs = await _seed(server)
 
     async with Client(server) as intruder:
-        with pytest.raises(Exception) as refused:
+        with pytest.raises(ToolError) as refused:
             await intruder.call_tool(
                 "archive_project",
                 {"project_key": MINE, "registration_token": theirs["registration_token"]},
@@ -121,7 +122,7 @@ async def test_a_foreign_token_cannot_unarchive_a_project(isolated_env):
         )
 
     async with Client(server) as intruder:
-        with pytest.raises(Exception) as refused:
+        with pytest.raises(ToolError) as refused:
             await intruder.call_tool(
                 "unarchive_project",
                 {"project_key": MINE, "registration_token": theirs["registration_token"]},
@@ -152,7 +153,7 @@ async def test_no_token_is_refused_by_name(isolated_env):
     await _seed(server)
 
     async with Client(server) as anonymous:
-        with pytest.raises(Exception) as refused:
+        with pytest.raises(ToolError, match="requires registration_token") as refused:
             await anonymous.call_tool("archive_project", {"project_key": MINE})
     assert "requires registration_token" in str(refused.value), (
         f"a missing token must be named as missing; got: {refused.value}"

@@ -7,13 +7,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
-import binascii
 import contextlib
 import contextvars
 import functools
 import hashlib
 import hmac
 import importlib
+import itertools
 import json
 import logging
 import math
@@ -48,6 +48,7 @@ from fastapi.responses import (
     Response,
     StreamingResponse,
 )
+from fastmcp import FastMCP
 from fastmcp.server.auth import AccessToken as FastMCPAccessToken, OAuthProxy, TokenVerifier
 from fastmcp.server.auth.auth import ClientAuthenticator, TokenHandler
 from fastmcp.server.auth.providers.github import GitHubTokenVerifier
@@ -68,6 +69,7 @@ from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOption
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, SecretStr, field_validator
 from sqlalchemy import select, text, update
+from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import col
@@ -155,6 +157,37 @@ from .ui_access import (
     mutate_ui_project_access,
     mutate_ui_user_display_name,
 )
+
+_HTTP_BAD_REQUEST_RESPONSE = {"description": "Invalid request parameters or body."}
+_HTTP_FORBIDDEN_RESPONSE = {"description": "The authenticated caller lacks permission."}
+_HTTP_NOT_FOUND_RESPONSE = {"description": "The resource is missing or inaccessible."}
+_HTTP_CONFLICT_RESPONSE = {"description": "The resource changed or the operation conflicts with its current state."}
+_HTTP_INTERNAL_ERROR_RESPONSE = {"description": "The operation failed on the server."}
+_HTTP_SERVICE_UNAVAILABLE_RESPONSE = {"description": "The operation is temporarily unavailable."}
+_UTC_OFFSET = "+00:00"
+_HTTP_REQUEST_EVENT = "http.request"
+_OAUTH_TOKEN_PATH = "/token"
+_OAUTH_AUTHORIZATION_METADATA_PATH = "/.well-known/oauth-authorization-server"
+_BEARER_PREFIX = "Bearer "
+_MAIL_PATH_PREFIX = "/mail/"
+_MAIL_API_V1_PREFIX = "/mail/api/v1/"
+_GENERATION_PATTERN = r"^[0-9a-f]{64}$"
+_SQL_AND = " AND "
+_NOT_FOUND_DETAIL = "Not Found"
+_CROSS_ORIGIN_DETAIL = "Cross-origin request rejected"
+_STALE_SESSION_DETAIL = "Authenticated Mail UI session is no longer current."
+_PROJECT_NOT_FOUND_DETAIL = "Project not found"
+_RICH_CONSOLE_MODULE = "rich.console"
+_RICH_PANEL_MODULE = "rich.panel"
+_MESSAGE_IDS_REQUIRED_DETAIL = "No message IDs provided"
+_AGENT_NOT_FOUND_DETAIL = "Agent not found"
+_ERROR_TEMPLATE = "error.html"
+_AGENT_ID_BY_NAME_SQL = "SELECT id FROM agents WHERE project_id = :pid AND name = :name"
+_PROJECT_OPERATOR_REQUIRED_DETAIL = "Forbidden: new messages require the project operator role"
+_ARCHIVE_NOT_FOUND_DETAIL = "Archive repository not found"
+_INVALID_PROJECT_DETAIL = "Invalid project identifier"
+_PROJECT_ARCHIVE_NOT_FOUND_DETAIL = "Project archive not found"
+_FILE_NOT_FOUND_DETAIL = "File not found"
 
 
 async def _project_slug_from_id(pid: int | None) -> str | None:
@@ -315,7 +348,7 @@ def _coerce_http_archive_timestamp(created_ts_raw: Any) -> datetime:
     try:
         if isinstance(created_ts_raw, str):
             text_value = (
-                created_ts_raw.replace("Z", "+00:00")
+                created_ts_raw.replace("Z", _UTC_OFFSET)
                 if created_ts_raw.endswith("Z")
                 else created_ts_raw
             )
@@ -370,10 +403,10 @@ async def _delete_messages_from_archive(
                 archive.root / "messages" / y_dir / m_dir,
                 archive.root / "agents" / sender_name / "outbox" / y_dir / m_dir,
             ]
-            for recip_name in recip_map.get(msg_id, []):
-                candidate_dirs.append(
-                    archive.root / "agents" / recip_name / "inbox" / y_dir / m_dir
-                )
+            candidate_dirs.extend(
+                archive.root / "agents" / recip_name / "inbox" / y_dir / m_dir
+                for recip_name in recip_map.get(msg_id, [])
+            )
 
             for cdir in candidate_dirs:
                 fpath = cdir / filename
@@ -467,6 +500,45 @@ async def _open_existing_project_archive(settings: Settings, slug: str) -> Proje
     )
 
 
+def _directory_children(path: Path):
+    return path.iterdir() if path.is_dir() else iter(())
+
+
+def _count_retained_old_messages(message_root: Path, cutoff: datetime) -> int:
+    """Count old markdown messages within the archive's year/month layout."""
+    count = 0
+    if not message_root.exists():
+        return count
+    for year_dir in message_root.iterdir():
+        for month_dir in _directory_children(year_dir):
+            for file_path in _directory_children(month_dir):
+                if file_path.suffix.lower() != ".md":
+                    continue
+                with contextlib.suppress(Exception):
+                    timestamp = datetime.fromtimestamp(file_path.stat().st_mtime, timezone.utc)
+                    count += timestamp < cutoff
+    return count
+
+
+def _count_project_inbox_files(inbox_root: Path) -> int:
+    count = 0
+    for inbox_file in inbox_root.rglob("inbox/*/*/*.md"):
+        with contextlib.suppress(Exception):
+            count += inbox_file.is_file()
+    return count
+
+
+def _project_attachment_bytes(attachment_root: Path) -> int | None:
+    """Return None when no attachment could be statted, preserving report keys."""
+    total = None
+    if attachment_root.exists():
+        for attachment_file in attachment_root.rglob("*.webp"):
+            with contextlib.suppress(Exception):
+                size_bytes = attachment_file.stat().st_size
+                total = (total or 0) + size_bytes
+    return total
+
+
 def _collect_retention_quota_report_sync(settings: Settings) -> dict[str, Any]:
     import datetime as _dt
     import fnmatch as _fnmatch
@@ -488,32 +560,14 @@ def _collect_retention_quota_report_sync(settings: Settings) -> dict[str, Any]:
         proj_name = proj_dir.name
         if any(_fnmatch.fnmatch(proj_name, pat) for pat in ignore_patterns):
             continue
-        msg_root = proj_dir / "messages"
-        if msg_root.exists():
-            for ydir in msg_root.iterdir():
-                for mdir in ydir.iterdir() if ydir.is_dir() else []:
-                    for file_path in mdir.iterdir() if mdir.is_dir() else []:
-                        if file_path.suffix.lower() != ".md":
-                            continue
-                        with contextlib.suppress(Exception):
-                            ts = _dt.datetime.fromtimestamp(file_path.stat().st_mtime, _dt.timezone.utc)
-                            if ts < cutoff:
-                                old_messages += 1
+        old_messages += _count_retained_old_messages(proj_dir / "messages", cutoff)
         inbox_root = proj_dir / "agents"
         if inbox_root.exists():
-            count_inbox = 0
-            for inbox_file in inbox_root.rglob("inbox/*/*/*.md"):
-                with contextlib.suppress(Exception):
-                    if inbox_file.is_file():
-                        count_inbox += 1
-            per_project_inbox_counts[proj_name] = count_inbox
-        att_root = proj_dir / "attachments"
-        if att_root.exists():
-            for attachment_file in att_root.rglob("*.webp"):
-                with contextlib.suppress(Exception):
-                    size_bytes = attachment_file.stat().st_size
-                    total_attach_bytes += size_bytes
-                    per_project_attach[proj_name] = per_project_attach.get(proj_name, 0) + size_bytes
+            per_project_inbox_counts[proj_name] = _count_project_inbox_files(inbox_root)
+        attachment_bytes = _project_attachment_bytes(proj_dir / "attachments")
+        if attachment_bytes is not None:
+            total_attach_bytes += attachment_bytes
+            per_project_attach[proj_name] = attachment_bytes
 
     return {
         "old_messages": old_messages,
@@ -561,7 +615,7 @@ def _collect_archive_guide_stats_sync(settings: Settings) -> dict[str, Any]:
                     timeout=5.0,
                 )
                 repo_size = result.stdout.split()[0] if getattr(result, "returncode", 1) == 0 else "Unknown"
-            except (_subprocess.TimeoutExpired, FileNotFoundError, PermissionError, OSError):
+            except (_subprocess.TimeoutExpired, OSError):
                 repo_size = "Unknown"
         except Exception:
             pass
@@ -674,29 +728,20 @@ def _configure_logging(settings: Settings) -> None:
             "available agents:",
         )
 
+        def _is_expected(self, exc: BaseException | None) -> bool:
+            if exc is None:
+                return False
+            return any(pattern in str(exc).lower() for pattern in self._EXPECTED_PATTERNS) or bool(
+                getattr(exc, "recoverable", False)
+            )
+
         def filter(self, record: logging.LogRecord) -> bool:
             # Only process FastMCP tool-failure records with exception info
             if not record.exc_info or record.exc_info[1] is None:
                 return True
 
             exc = record.exc_info[1]
-            exc_str = str(exc).lower()
-
-            # Check if this is an expected error based on message content
-            is_expected = any(pattern in exc_str for pattern in self._EXPECTED_PATTERNS)
-
-            # Also check for our ToolExecutionError with recoverable flag
-            if hasattr(exc, "recoverable") and exc.recoverable:
-                is_expected = True
-
-            # Check the cause chain for ToolExecutionError
-            cause = getattr(exc, "__cause__", None)
-            if cause is not None:
-                cause_str = str(cause).lower()
-                if any(pattern in cause_str for pattern in self._EXPECTED_PATTERNS):
-                    is_expected = True
-                if hasattr(cause, "recoverable") and cause.recoverable:
-                    is_expected = True
+            is_expected = self._is_expected(exc) or self._is_expected(getattr(exc, "__cause__", None))
 
             if is_expected:
                 # Clear exc_info to prevent traceback printing, but keep the log message
@@ -750,7 +795,6 @@ async def _fetch_jwks(jwks_url: str, *, force: bool = False):
     from time import monotonic
 
     jose_mod = importlib.import_module("authlib.jose")
-    JsonWebKey = jose_mod.JsonWebKey
 
     now = monotonic()
     with _jwks_cache_lock:
@@ -759,9 +803,8 @@ async def _fetch_jwks(jwks_url: str, *, force: bool = False):
             return cached[1]
 
     try:
-        httpx = importlib.import_module("httpx")
-        AsyncClient = httpx.AsyncClient
-        async with AsyncClient(timeout=5) as client:
+        httpx_module = importlib.import_module("httpx")
+        async with httpx_module.AsyncClient(timeout=5) as client:
             response = await client.get(jwks_url)
             # Only a success status makes the body an answer. Without this the
             # document was parsed whatever the server said, so anything able to
@@ -773,7 +816,7 @@ async def _fetch_jwks(jwks_url: str, *, force: bool = False):
             # key set rather than trusting the new one.
             response.raise_for_status()
             jwks = response.json()
-        key_set = JsonWebKey.import_key_set(jwks)
+        key_set = jose_mod.JsonWebKey.import_key_set(jwks)
     except Exception:
         # Fall back to any cached (possibly stale) key set on fetch failure.
         with _jwks_cache_lock:
@@ -785,7 +828,7 @@ async def _fetch_jwks(jwks_url: str, *, force: bool = False):
     return key_set
 
 
-def _select_jwks_key(key_set, header: dict, algorithms: list[str]):
+def _select_jwks_key(key_set, header: dict):
     """Resolve the verification key from a JWKS key set by ``kid``.
 
     Never blindly picks ``keys[0]`` (#211). With a ``kid`` we look it up
@@ -800,7 +843,7 @@ def _select_jwks_key(key_set, header: dict, algorithms: list[str]):
     return None
 
 
-def _jwks_candidate_keys(key_set, header: dict, algorithms: list[str]) -> list:
+def _jwks_candidate_keys(key_set, algorithms: list[str]) -> list:
     """Return JWKS keys to try when no ``kid`` is present.
 
     Filters by signing use and by algorithm compatibility (matching the key's
@@ -815,15 +858,16 @@ def _jwks_candidate_keys(key_set, header: dict, algorithms: list[str]) -> list:
     }
     wanted_kty = {kty_for_alg[a[:2]] for a in alg_set if a[:2] in kty_for_alg}
     candidates = []
-    for key in list(getattr(key_set, "keys", []) or []):
+    for key in getattr(key_set, "keys", []) or []:
         with contextlib.suppress(Exception):
-            use = key.tokens.get("use") if hasattr(key, "tokens") else None
+            tokens = getattr(key, "tokens", {})
+            use = tokens.get("use")
             if use not in (None, "sig"):
                 continue
-            key_alg = key.tokens.get("alg") if hasattr(key, "tokens") else None
+            key_alg = tokens.get("alg")
             if key_alg is not None and str(key_alg) not in alg_set:
                 continue
-            kty = getattr(key, "kty", None) or (key.tokens.get("kty") if hasattr(key, "tokens") else None)
+            kty = getattr(key, "kty", None) or tokens.get("kty")
             if wanted_kty and kty is not None and kty not in wanted_kty:
                 continue
             candidates.append(key)
@@ -857,7 +901,7 @@ class Utf8BodyGuardMiddleware:
     MAX_INSPECT_BYTES = 4 * 1024 * 1024
     OAUTH_DCR_MAX_BODY_BYTES = 8 * 1024
     OAUTH_BOUNDED_POST_PATHS = frozenset(
-        {"/authorize", "/consent", "/register", "/token"}
+        {"/authorize", "/consent", "/register", _OAUTH_TOKEN_PATH}
     )
 
     def __init__(self, app: Any) -> None:
@@ -872,6 +916,39 @@ class Utf8BodyGuardMiddleware:
                     return None
         return None
 
+    @staticmethod
+    def _oversized_oauth_response() -> JSONResponse:
+        return JSONResponse(
+            {"detail": "OAuth request body exceeds 8 KiB."},
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
+
+    async def _receive_body(
+        self, scope: Scope, receive: Receive, send: Send, *, bounded: bool
+    ) -> bytes | None:
+        """Read the body, answering a disconnect or a size violation immediately."""
+        chunks: list[bytes] = []
+        body_size = 0
+        while True:
+            message = await receive()
+            if message.get("type") == "http.disconnect":
+                await self._app(scope, receive, send)
+                return None
+            chunk = message.get("body", b"") or b""
+            body_size += len(chunk)
+            if (
+                bounded
+                and body_size > self.OAUTH_DCR_MAX_BODY_BYTES
+            ):
+                response = self._oversized_oauth_response()
+                await response(scope, receive, send)
+                return None
+            chunks.append(chunk)
+            if not message.get("more_body", False):
+                break
+        return b"".join(chunks)
+
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope.get("type") != "http" or scope.get("method") != "POST":
             await self._app(scope, receive, send)
@@ -879,50 +956,16 @@ class Utf8BodyGuardMiddleware:
         length = self._declared_length(scope)
         path = str(scope.get("path") or "").rstrip("/") or "/"
         is_bounded_oauth_request = path in self.OAUTH_BOUNDED_POST_PATHS
-        if (
-            is_bounded_oauth_request
-            and length is not None
-            and length > self.OAUTH_DCR_MAX_BODY_BYTES
-        ):
-            response = JSONResponse(
-                {"detail": "OAuth request body exceeds 8 KiB."},
-                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-                headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
-            )
+        if is_bounded_oauth_request and length is not None and length > self.OAUTH_DCR_MAX_BODY_BYTES:
+            response = self._oversized_oauth_response()
             await response(scope, receive, send)
             return
-        if not is_bounded_oauth_request and (
-            length is None or length <= 0 or length > self.MAX_INSPECT_BYTES
-        ):
+        if not is_bounded_oauth_request and (length is None or length <= 0 or length > self.MAX_INSPECT_BYTES):
             await self._app(scope, receive, send)
             return
-        chunks: list[bytes] = []
-        body_size = 0
-        while True:
-            message = await receive()
-            if message.get("type") == "http.disconnect":
-                await self._app(scope, receive, send)
-                return
-            chunk = message.get("body", b"") or b""
-            body_size += len(chunk)
-            if (
-                is_bounded_oauth_request
-                and body_size > self.OAUTH_DCR_MAX_BODY_BYTES
-            ):
-                response = JSONResponse(
-                    {"detail": "OAuth request body exceeds 8 KiB."},
-                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-                    headers={
-                        "Cache-Control": "no-store",
-                        "Pragma": "no-cache",
-                    },
-                )
-                await response(scope, receive, send)
-                return
-            chunks.append(chunk)
-            if not message.get("more_body", False):
-                break
-        body = b"".join(chunks)
+        body = await self._receive_body(scope, receive, send, bounded=is_bounded_oauth_request)
+        if body is None:
+            return
 
         try:
             body.decode("utf-8")
@@ -936,11 +979,10 @@ class Utf8BodyGuardMiddleware:
             response = JSONResponse(
                 {"detail": detail},
                 status_code=status.HTTP_400_BAD_REQUEST,
-                headers=(
+                headers=
                     {"Cache-Control": "no-store", "Pragma": "no-cache"}
                     if is_bounded_oauth_request
-                    else None
-                ),
+                    else None,
             )
             await response(scope, receive, send)
             return
@@ -951,7 +993,7 @@ class Utf8BodyGuardMiddleware:
             nonlocal replayed
             if not replayed:
                 replayed = True
-                return {"type": "http.request", "body": body, "more_body": False}
+                return {"type": _HTTP_REQUEST_EVENT, "body": body, "more_body": False}
             return await receive()
 
         await self._app(scope, replay, send)
@@ -1013,6 +1055,64 @@ class _AllowlistedGitHubTokenVerifier(TokenVerifier):
         return None
 
 
+def _sanitized_oauth_callback_location(location: str) -> str:
+    parsed = urlsplit(location)
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    has_client_code = any(key == "code" for key, _value in query_pairs)
+    has_oauth_error = any(key == "error" for key, _value in query_pairs)
+    if not has_oauth_error or has_client_code:
+        return location
+    standard_errors = {
+        "access_denied", "invalid_request", "invalid_scope", "server_error",
+        "temporarily_unavailable", "unauthorized_client", "unsupported_response_type",
+    }
+    safe_pairs = []
+    for key, value in query_pairs:
+        if key == "error_description":
+            continue
+        if key == "error" and value not in standard_errors:
+            value = "server_error"
+        safe_pairs.append((key, value))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(safe_pairs), parsed.fragment))
+
+
+def _oauth_token_error_response(error: str, description: str) -> JSONResponse:
+    return JSONResponse(
+        {"error": error, "error_description": description},
+        status_code=status.HTTP_400_BAD_REQUEST,
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
+
+
+async def _resource_bound_token_request(
+    request: Request, token_handler: TokenHandler, resource_url: str
+) -> Response:
+    content_type = request.headers.get("content-type", "").partition(";")[0].strip().casefold()
+    if content_type != "application/x-www-form-urlencoded":
+        return _oauth_token_error_response(
+            "invalid_request", "The token request must use application/x-www-form-urlencoded."
+        )
+    try:
+        form_data = await request.form()
+    except Exception:
+        return _oauth_token_error_response("invalid_request", "The token request form could not be parsed.")
+    duplicate_parameters = sorted(
+        str(parameter) for parameter in form_data if len(form_data.getlist(parameter)) != 1
+    )
+    if duplicate_parameters:
+        return _oauth_token_error_response(
+            "invalid_request", "Token request parameters must not be repeated: " + ", ".join(duplicate_parameters)
+        )
+    resource_values = form_data.getlist("resource")
+    if (
+        len(resource_values) != 1
+        or not isinstance(resource_values[0], str)
+        or not _oauth_resource_uris_match(resource_values[0], resource_url)
+    ):
+        return _oauth_token_error_response("invalid_target", "The resource parameter must identify this MCP server.")
+    return await token_handler.handle(request)
+
+
 class _AllowlistedGitHubOAuthProxy(OAuthProxy):
     """Bind OAuth tokens to this resource and allowlisted GitHub identities."""
 
@@ -1065,41 +1165,7 @@ class _AllowlistedGitHubOAuthProxy(OAuthProxy):
 
         location = response.headers.get("location")
         if location:
-            parsed_location = urlsplit(location)
-            query_pairs = parse_qsl(
-                parsed_location.query,
-                keep_blank_values=True,
-            )
-            has_client_code = any(key == "code" for key, _value in query_pairs)
-            has_oauth_error = any(
-                key == "error" for key, _value in query_pairs
-            )
-            if has_oauth_error and not has_client_code:
-                standard_errors = {
-                    "access_denied",
-                    "invalid_request",
-                    "invalid_scope",
-                    "server_error",
-                    "temporarily_unavailable",
-                    "unauthorized_client",
-                    "unsupported_response_type",
-                }
-                safe_pairs: list[tuple[str, str]] = []
-                for key, value in query_pairs:
-                    if key == "error_description":
-                        continue
-                    if key == "error" and value not in standard_errors:
-                        value = "server_error"
-                    safe_pairs.append((key, value))
-                response.headers["location"] = urlunsplit(
-                    (
-                        parsed_location.scheme,
-                        parsed_location.netloc,
-                        parsed_location.path,
-                        urlencode(safe_pairs),
-                        parsed_location.fragment,
-                    )
-                )
+            response.headers["location"] = _sanitized_oauth_callback_location(location)
             return response
 
         if response.status_code >= status.HTTP_400_BAD_REQUEST:
@@ -1135,7 +1201,7 @@ class _AllowlistedGitHubOAuthProxy(OAuthProxy):
         )
         metadata.token_endpoint_auth_methods_supported = ["none"]
         metadata_route = Route(
-            "/.well-known/oauth-authorization-server",
+            _OAUTH_AUTHORIZATION_METADATA_PATH,
             endpoint=cors_middleware(
                 MetadataHandler(metadata).handle,
                 ["GET", "OPTIONS"],
@@ -1148,66 +1214,11 @@ class _AllowlistedGitHubOAuthProxy(OAuthProxy):
             client_authenticator=ClientAuthenticator(self),
         )
 
-        def _token_error_response(
-            error: str,
-            description: str,
-        ) -> JSONResponse:
-            return JSONResponse(
-                {"error": error, "error_description": description},
-                status_code=status.HTTP_400_BAD_REQUEST,
-                headers={
-                    "Cache-Control": "no-store",
-                    "Pragma": "no-cache",
-                },
-            )
-
         async def resource_bound_token_endpoint(request: Request) -> Response:
-            content_type = (
-                request.headers.get("content-type", "")
-                .partition(";")[0]
-                .strip()
-                .casefold()
-            )
-            if content_type != "application/x-www-form-urlencoded":
-                return _token_error_response(
-                    "invalid_request",
-                    "The token request must use application/x-www-form-urlencoded.",
-                )
-            try:
-                form_data = await request.form()
-            except Exception:
-                return _token_error_response(
-                    "invalid_request",
-                    "The token request form could not be parsed.",
-                )
-            duplicate_parameters = sorted(
-                str(parameter)
-                for parameter in form_data
-                if len(form_data.getlist(parameter)) != 1
-            )
-            if duplicate_parameters:
-                return _token_error_response(
-                    "invalid_request",
-                    "Token request parameters must not be repeated: "
-                    + ", ".join(duplicate_parameters),
-                )
-            resource_values = form_data.getlist("resource")
-            if (
-                len(resource_values) != 1
-                or not isinstance(resource_values[0], str)
-                or not _oauth_resource_uris_match(
-                    resource_values[0],
-                    self._oauth_resource_url,
-                )
-            ):
-                return _token_error_response(
-                    "invalid_target",
-                    "The resource parameter must identify this MCP server.",
-                )
-            return await token_handler.handle(request)
+            return await _resource_bound_token_request(request, token_handler, self._oauth_resource_url)
 
         token_route = Route(
-            "/token",
+            _OAUTH_TOKEN_PATH,
             endpoint=cors_middleware(
                 resource_bound_token_endpoint,
                 ["POST", "OPTIONS"],
@@ -1217,9 +1228,9 @@ class _AllowlistedGitHubOAuthProxy(OAuthProxy):
 
         replaced_routes: list[Route] = []
         for route in routes:
-            if route.path == "/.well-known/oauth-authorization-server":
+            if route.path == _OAUTH_AUTHORIZATION_METADATA_PATH:
                 replaced_routes.append(metadata_route)
-            elif route.path == "/token":
+            elif route.path == _OAUTH_TOKEN_PATH:
                 replaced_routes.append(token_route)
             else:
                 replaced_routes.append(route)
@@ -1402,7 +1413,7 @@ def _oauth_metadata_alias_paths(configured_mcp_path: str) -> frozenset[str]:
         if normalized != "/":
             paths.add(f"{normalized}/")
 
-    _add("/.well-known/oauth-authorization-server")
+    _add(_OAUTH_AUTHORIZATION_METADATA_PATH)
     _add("/.well-known/oauth-authorization-server/mcp")
     _add("/.well-known/oauth-protected-resource")
     _add("/.well-known/oauth-protected-resource/mcp")
@@ -1452,7 +1463,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if host in {"127.0.0.1", "::1", "localhost"}:
             return True
         # IPv4-mapped IPv6 address (::ffff:127.0.0.1)
-        return bool(host.lower().startswith("::ffff:") and host[7:] == "127.0.0.1")
+        return host.lower() == "::ffff:127.0.0.1"
 
     @staticmethod
     def _has_forwarded_headers(request: Request) -> bool:
@@ -1463,34 +1474,30 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             for name in ("x-forwarded-for", "x-forwarded-proto", "x-forwarded-host", "forwarded")
         )
 
-    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
-        if request.method == "OPTIONS":  # allow CORS preflight
-            return await call_next(request)
-        if request.url.path.startswith("/health/") or request.url.path == "/api/health":
-            return await call_next(request)
-        if _oauth_path_is_public(
-            request.url.path,
-            self._oauth_public_paths,
-        ):
-            return await call_next(request)
+    def _bypasses_bearer_auth(self, request: Request) -> bool:
         # MailUiAuthMiddleware sits OUTSIDE this one and has already rendered a
         # verdict for /mail: either it authenticated a browser session (and set
         # this flag) or it redirected to the login page. Re-checking the bearer
         # here would 401 every logged-in human, since a browser cannot attach an
         # Authorization header to an ordinary navigation.
-        if getattr(request.state, "mail_ui_authenticated", False):
-            return await call_next(request)
-        if _localhost_bypass_allowed(
-            request,
-            allow_localhost=self._allow_localhost,
-        ):
+        return (
+            request.method == "OPTIONS"
+            or request.url.path.startswith("/health/")
+            or request.url.path == "/api/health"
+            or _oauth_path_is_public(request.url.path, self._oauth_public_paths)
+            or getattr(request.state, "mail_ui_authenticated", False)
+            or _localhost_bypass_allowed(request, allow_localhost=self._allow_localhost)
+        )
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
+        if self._bypasses_bearer_auth(request):
             return await call_next(request)
         auth_header = request.headers.get("Authorization", "")
         expected_header = f"Bearer {self._token}" if self._token else ""
         # Use constant-time comparison to prevent timing attacks.
         if expected_header and hmac.compare_digest(auth_header, expected_header):
             return await call_next(request)
-        if self._oauth_provider is not None and auth_header.startswith("Bearer "):
+        if self._oauth_provider is not None and auth_header.startswith(_BEARER_PREFIX):
             oauth_token = auth_header.split(" ", 1)[1].strip()
             if oauth_token:
                 validated = await self._oauth_provider.verify_token(oauth_token)
@@ -1500,7 +1507,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         # Static bearer did not match. If JWT auth is enabled, defer to the inner
         # JWT-validating middleware instead of rejecting here, so EITHER a valid
         # static bearer OR a valid JWT is accepted (#210).
-        if self._jwt_enabled and auth_header.startswith("Bearer "):
+        if self._jwt_enabled and auth_header.startswith(_BEARER_PREFIX):
             return await call_next(request)
         headers = {}
         if self._oauth_resource_metadata_url:
@@ -2138,6 +2145,33 @@ _MAIL_LOGIN_ACCEPT_LANGUAGE_MAX_RANGES = 32
 _MAIL_LOGIN_LANGUAGE_RANGE_RE = re.compile(r"^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$")
 
 
+def _mail_login_language_quality(parameters: list[str]) -> float | None:
+    quality = 1.0
+    for parameter in parameters:
+        name, separator, value = parameter.partition("=")
+        if name.casefold() != "q" or not separator:
+            return None
+        try:
+            quality = float(value)
+        except ValueError:
+            return None
+        if not math.isfinite(quality) or not 0.0 <= quality <= 1.0:
+            return None
+    return quality
+
+
+def _mail_login_language_range_locale(language_range: str) -> MailUiLocale | None:
+    locale = MailUiLocale.canonicalize(language_range)
+    folded = language_range.casefold()
+    if locale is None and (
+        folded.startswith("zh-hant-") or folded in {"zh-hant", "zh-tw", "zh-hk", "zh-mo"}
+    ):
+        locale = MailUiLocale.ZH_HANT
+    if locale is None:
+        locale = MailUiLocale.canonicalize(language_range.partition("-")[0])
+    return locale
+
+
 def _mail_login_accept_language_locale(raw: str) -> MailUiLocale:
     """Resolve a bounded browser language header into the closed locale set."""
     if not raw or len(raw.encode("utf-8", errors="ignore")) > _MAIL_LOGIN_ACCEPT_LANGUAGE_MAX_BYTES:
@@ -2151,34 +2185,12 @@ def _mail_login_accept_language_locale(raw: str) -> MailUiLocale:
         language_range = parts[0]
         if not _MAIL_LOGIN_LANGUAGE_RANGE_RE.fullmatch(language_range):
             continue
-        quality = 1.0
-        invalid_quality = False
-        for parameter in parts[1:]:
-            name, separator, value = parameter.partition("=")
-            if name.casefold() != "q" or not separator:
-                invalid_quality = True
-                break
-            try:
-                quality = float(value)
-            except ValueError:
-                invalid_quality = True
-                break
-            if not math.isfinite(quality) or not 0.0 <= quality <= 1.0:
-                invalid_quality = True
-                break
-        # The range check above pins quality to [0.0, 1.0], so <= 0.0 is the
+        quality = _mail_login_language_quality(parts[1:])
+        # The range check pins quality to [0.0, 1.0], so <= 0.0 is the
         # RFC 9110 "not acceptable" q=0 case without a float equality test.
-        if invalid_quality or quality <= 0.0:
+        if quality is None or quality <= 0.0:
             continue
-        locale = MailUiLocale.canonicalize(language_range)
-        folded = language_range.casefold()
-        if locale is None and (
-            folded.startswith("zh-hant-")
-            or folded in {"zh-hant", "zh-tw", "zh-hk", "zh-mo"}
-        ):
-            locale = MailUiLocale.ZH_HANT
-        if locale is None:
-            locale = MailUiLocale.canonicalize(language_range.partition("-")[0])
+        locale = _mail_login_language_range_locale(language_range)
         if locale is not None:
             candidates.append((quality, -index, locale))
     if not candidates:
@@ -2250,7 +2262,7 @@ _MAIL_LEGACY_THREAD_PATH_RE = re.compile(
     r"^/mail/(?P<project>[a-z0-9](?:[a-z0-9-]{0,253}[a-z0-9])?)/thread/"
     r"(?P<thread_id>[^/]+)$"
 )
-_MAIL_UI_NUMERIC_THREAD_ID_RE = re.compile(r"^[1-9][0-9]{0,18}$")
+_MAIL_UI_NUMERIC_THREAD_ID_RE = re.compile(r"^[1-9]\d{0,18}$", re.ASCII)
 _MAIL_UI_ENCODE_COMPONENT_SAFE = "-_.!~*'()"
 _MAIL_LEGACY_SEARCH_PATH_RE = re.compile(
     r"^/mail/(?P<project>[a-z0-9](?:[a-z0-9-]{0,253}[a-z0-9])?)/search$"
@@ -2293,7 +2305,7 @@ def _mail_ui_inline_image_source_allowed(value: str) -> bool:
             return False
         try:
             raw = base64.b64decode(payload, validate=True)
-        except (binascii.Error, ValueError):
+        except ValueError:
             return False
         return (
             0 < len(raw) <= _MAIL_BODY_INLINE_IMAGE_MAX_BYTES
@@ -2421,11 +2433,9 @@ def _mail_ui_canonical_legacy_bookmark(
         return None
     if decoded_bookmark["kind"] == "thread":
         raw_match = _MAIL_LEGACY_THREAD_PATH_RE.fullmatch(raw_path)
-        if raw_match is None:
-            return None
         project_slug = decoded_bookmark["project_slug"]
         thread_id = decoded_bookmark["thread_id"]
-        if project_slug is None or thread_id is None:
+        if raw_match is None or project_slug is None or thread_id is None:
             return None
         if raw_match.group("project") != project_slug:
             return None
@@ -2468,8 +2478,8 @@ def _mail_ui_active_path(path: str) -> bool:
     """Expose one human UI surface and the exact services it consumes."""
     return (
         path in {
-            "/mail",
-            "/mail/",
+            _MAIL_REACT_BASE_PATH,
+            _MAIL_PATH_PREFIX,
             _MAIL_LOGIN_PATH,
             _MAIL_LOGOUT_PATH,
             "/mail/events",
@@ -2477,7 +2487,7 @@ def _mail_ui_active_path(path: str) -> bool:
         }
         or path.startswith("/mail/assets/")
         or path == "/mail/api/v1"
-        or path.startswith("/mail/api/v1/")
+        or path.startswith(_MAIL_API_V1_PREFIX)
         or _mail_ui_legacy_bookmark(path) is not None
     )
 
@@ -2648,7 +2658,7 @@ class MailUiAdminUserSummary(BaseModel):
     display_name: str | None
     disabled: bool
     global_role: MailUiGlobalRole
-    account_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    account_generation: str = Field(pattern=_GENERATION_PATTERN)
     access_version: int = Field(ge=1)
     assignments: list[MailUiAdminAssignmentSummary]
 
@@ -2661,7 +2671,7 @@ class MailUiAdminProjectSummary(BaseModel):
     id: int = Field(gt=0)
     slug: str
     human_key: str
-    project_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    project_generation: str = Field(pattern=_GENERATION_PATTERN)
     archived_at: datetime | None
 
 
@@ -2681,8 +2691,8 @@ class MailUiAdminProjectAccessPut(BaseModel):
 
     role: MailUiAssignmentRole | None
     expected_access_version: int = Field(ge=1)
-    account_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
-    expected_project_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    account_generation: str = Field(pattern=_GENERATION_PATTERN)
+    expected_project_generation: str = Field(pattern=_GENERATION_PATTERN)
 
 
 class MailUiAdminProjectAccessResponse(BaseModel):
@@ -2855,7 +2865,7 @@ class MailUiAgentDirectoryItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     agent_id: int = Field(gt=0)
-    agent_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    agent_generation: str = Field(pattern=_GENERATION_PATTERN)
     name: str = Field(min_length=1, max_length=128)
     display_name: str | None
     # The tone this colleague picked, so a reader can tell who wrote without
@@ -2876,8 +2886,8 @@ class MailUiAgentProfilePatch(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    expected_project_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
-    expected_agent_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_project_generation: str = Field(pattern=_GENERATION_PATTERN)
+    expected_agent_generation: str = Field(pattern=_GENERATION_PATTERN)
     expected_display_name: str | None = Field(max_length=128)
     expected_notify_sound: MailUiNotifySound | None
     display_name: str | None = Field(max_length=1024)
@@ -2891,7 +2901,7 @@ class MailUiAgentProfileMutationResponse(BaseModel):
 
     changed: bool
     agent_id: int = Field(gt=0)
-    agent_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    agent_generation: str = Field(pattern=_GENERATION_PATTERN)
     agent_name: str = Field(min_length=1, max_length=128)
     display_name: str | None
     notify_sound: MailUiNotifySound
@@ -2943,7 +2953,7 @@ class MailUiProjectAgentsResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     project_id: int = Field(gt=0)
-    project_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    project_generation: str = Field(pattern=_GENERATION_PATTERN)
     items: list[MailUiAgentDirectoryItem]
     total: int = Field(ge=0)
 
@@ -2995,9 +3005,9 @@ class MailUiReplyTarget(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     agent_id: int = Field(gt=0)
-    agent_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    agent_generation: str = Field(pattern=_GENERATION_PATTERN)
     project_id: int = Field(gt=0)
-    project_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    project_generation: str = Field(pattern=_GENERATION_PATTERN)
     canonical_name: str = Field(min_length=1, max_length=384)
 
 
@@ -3053,7 +3063,7 @@ class MailUiComposeRecipient(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     agent_id: int = Field(gt=0)
-    expected_agent_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_agent_generation: str = Field(pattern=_GENERATION_PATTERN)
 
 
 class MailUiComposeRequest(BaseModel):
@@ -3062,7 +3072,7 @@ class MailUiComposeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     idempotency_key: str = Field(min_length=1, max_length=128)
-    expected_project_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_project_generation: str = Field(pattern=_GENERATION_PATTERN)
     recipients: list[MailUiComposeRecipient] = Field(min_length=1, max_length=100)
     subject: str = Field(min_length=1, max_length=200)
     body_md: str = Field(min_length=1, max_length=50_000)
@@ -3093,9 +3103,9 @@ class MailUiReplyRequest(BaseModel):
 
     idempotency_key: str = Field(min_length=1, max_length=128)
     expected_sender_agent_id: int = Field(gt=0)
-    expected_sender_agent_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_sender_agent_generation: str = Field(pattern=_GENERATION_PATTERN)
     expected_sender_project_id: int = Field(gt=0)
-    expected_sender_project_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_sender_project_generation: str = Field(pattern=_GENERATION_PATTERN)
     body_md: str = Field(min_length=1, max_length=50_000)
 
     @field_validator("idempotency_key", "body_md")
@@ -3209,7 +3219,7 @@ def _mail_ui_datetime(value: Any) -> datetime:
     if isinstance(value, datetime):
         result = value
     elif isinstance(value, str):
-        normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+        normalized = value[:-1] + _UTC_OFFSET if value.endswith("Z") else value
         result = datetime.fromisoformat(normalized)
     else:
         raise ValueError("database timestamp is not a datetime")
@@ -3537,14 +3547,7 @@ def _mail_ui_decode_cursor(cursor: str) -> tuple[str, int]:
             or not 0 < message_id <= 9_223_372_036_854_775_807
         ):
             raise ValueError("invalid message id")
-    except (
-        UnicodeEncodeError,
-        UnicodeDecodeError,
-        binascii.Error,
-        json.JSONDecodeError,
-        TypeError,
-        ValueError,
-    ):
+    except (TypeError, ValueError):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Invalid cursor.",
@@ -3558,6 +3561,23 @@ def _mail_ui_invalid_search_query() -> HTTPException:
         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         detail={"code": "invalid_search_query"},
     )
+
+
+def _mail_ui_search_term(
+    match: re.Match[str], scope: MailUiSearchScope
+) -> tuple[str, tuple[str, str], int]:
+    value = (match.group("phrase") or match.group("word") or "").strip()
+    lexical_tokens = re.findall(r"\w+", value, flags=re.UNICODE)
+    if not value or not lexical_tokens:
+        raise _mail_ui_invalid_search_query()
+    explicit_field = match.group("field")
+    field = explicit_field.casefold() if explicit_field is not None else None
+    selected_field = field if field in {"subject", "body"} else scope
+    escaped = value.replace('"', '""')
+    literal = f'"{escaped}"'
+    if selected_field in {"subject", "body"}:
+        return f"{selected_field}:{literal}", (selected_field, value), len(lexical_tokens)
+    return f"(subject:{literal} OR body:{literal})", ("all", value), len(lexical_tokens)
 
 
 def _mail_ui_compile_search_query(
@@ -3586,35 +3606,16 @@ def _mail_ui_compile_search_query(
         if query[previous_end : match.start()].strip():
             raise _mail_ui_invalid_search_query()
         previous_end = match.end()
-        value = match.group("phrase") or match.group("word") or ""
-        value = value.strip()
-        lexical_tokens = re.findall(r"\w+", value, flags=re.UNICODE)
-        if not value or not lexical_tokens:
-            raise _mail_ui_invalid_search_query()
-        token_count += len(lexical_tokens)
+        expression, ranking_term, lexical_count = _mail_ui_search_term(match, scope)
+        token_count += lexical_count
         if token_count > _MAIL_UI_SEARCH_MAX_TOKENS:
             raise _mail_ui_invalid_search_query()
-
-        explicit_field = match.group("field")
-        field = explicit_field.casefold() if explicit_field is not None else None
-        escaped = value.replace('"', '""')
-        literal = f'"{escaped}"'
-        if field in {"subject", "body"}:
-            expressions.append(f"{field}:{literal}")
-            ranking_terms.append((field, value))
-        elif scope == "subject":
-            expressions.append(f"subject:{literal}")
-            ranking_terms.append(("subject", value))
-        elif scope == "body":
-            expressions.append(f"body:{literal}")
-            ranking_terms.append(("body", value))
-        else:
-            expressions.append(f"(subject:{literal} OR body:{literal})")
-            ranking_terms.append(("all", value))
+        expressions.append(expression)
+        ranking_terms.append(ranking_term)
 
     if query[previous_end:].strip() or not expressions:
         raise _mail_ui_invalid_search_query()
-    return " AND ".join(expressions), tuple(ranking_terms)
+    return _SQL_AND.join(expressions), tuple(ranking_terms)
 
 
 def _mail_ui_local_search_rank(
@@ -3695,6 +3696,16 @@ def _mail_ui_encode_search_cursor(
     return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
 
 
+def _mail_ui_search_cursor_rank(rank: object, order: MailUiSearchOrder) -> float | None:
+    if order == "relevance":
+        if isinstance(rank, bool) or not isinstance(rank, (float, int)) or not math.isfinite(float(rank)):
+            raise ValueError("invalid relevance key")
+        return float(rank)
+    if rank is not None:
+        raise ValueError("unexpected relevance key")
+    return None
+
+
 def _mail_ui_decode_search_cursor(
     cursor: str,
     *,
@@ -3737,26 +3748,8 @@ def _mail_ui_decode_search_cursor(
         _mail_ui_datetime(created_ts)
         if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0:
             raise ValueError("invalid message id")
-        if order == "relevance":
-            if (
-                isinstance(rank, bool)
-                or not isinstance(rank, (float, int))
-                or not math.isfinite(float(rank))
-            ):
-                raise ValueError("invalid relevance key")
-            normalized_rank: float | None = float(rank)
-        elif rank is not None:
-            raise ValueError("unexpected relevance key")
-        else:
-            normalized_rank = None
-    except (
-        UnicodeEncodeError,
-        UnicodeDecodeError,
-        binascii.Error,
-        json.JSONDecodeError,
-        TypeError,
-        ValueError,
-    ):
+        normalized_rank = _mail_ui_search_cursor_rank(rank, order)
+    except (TypeError, ValueError):
         raise _mail_ui_invalid_search_query() from None
     return normalized_rank, created_ts, message_id
 
@@ -3974,177 +3967,149 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
             )
         return None
 
-    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
-        public_entrypoint = self._public_entrypoint(request)
-        if public_entrypoint is not None:
-            return public_entrypoint
-
-        path = request.url.path
-        if not (path == "/mail" or path.startswith("/mail/")):
-            return await call_next(request)
-        raw_legacy_bookmark = _mail_ui_legacy_bookmark(path)
-        legacy_bookmark = _mail_ui_request_legacy_bookmark(request)
-        if raw_legacy_bookmark is not None and legacy_bookmark is None:
-            return JSONResponse(
-                {"detail": "Not Found"},
-                status_code=status.HTTP_404_NOT_FOUND,
-                headers=_MAIL_REACT_INDEX_HEADERS,
-            )
-        if not _mail_ui_active_path(path):
-            return JSONResponse(
-                {"detail": "Not Found"},
-                status_code=status.HTTP_404_NOT_FOUND,
-                headers=_MAIL_REACT_INDEX_HEADERS,
-            )
-        if legacy_bookmark is not None and request.method not in {"GET", "HEAD"}:
-            return JSONResponse(
-                {"detail": "Not Found"},
-                status_code=status.HTTP_404_NOT_FOUND,
-                headers=_MAIL_REACT_INDEX_HEADERS,
-            )
-        if request.method == "OPTIONS":
-            return await call_next(request)
-
-        cfg = self._settings.mail_ui
-        if not cfg.enabled:
-            if self._settings.environment.strip().lower() not in {"development", "test"}:
-                return JSONResponse(
-                    {"detail": "Mail UI authentication may only be disabled in development or test."},
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                )
-            # Auth explicitly switched off: fall through to the bearer middleware,
-            # which is then the only thing standing in front of the UI.
-            token = _mail_ui_template_user.set(None)
-            try:
-                if legacy_bookmark is not None:
-                    return await _mail_ui_legacy_bookmark_redirect(
-                        settings=self._settings,
-                        request=request,
-                        bookmark=legacy_bookmark,
-                    )
-                return await call_next(request)
-            finally:
-                _mail_ui_template_user.reset(token)
-        if not cfg.session_secret:
-            # Fail closed. An unset secret cannot sign cookies, and serving the
-            # destructive UI unauthenticated is never the safer default.
-            return JSONResponse(
-                {"detail": "Mail UI authentication is unconfigured (MAIL_UI_SESSION_SECRET is empty)."},
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            )
-
-        if path in (_MAIL_LOGIN_PATH, _MAIL_LOGOUT_PATH):
-            request.state.mail_ui_authenticated = True  # let the bearer layer stand aside
-            token = _mail_ui_template_user.set(None)
-            try:
-                return await call_next(request)
-            finally:
-                _mail_ui_template_user.reset(token)
-
+    @staticmethod
+    def _session_exempt_path(request: Request) -> bool:
         # The standalone login page needs exactly one locally built stylesheet
         # and its exact self-hosted flag font before a browser can possess a
         # session cookie. Keep this exception deliberately narrower than the
         # asset namespace: the legacy runtime JavaScript and every hashed
         # application asset remain session-gated.
-        if (
+        return request.url.path in (_MAIL_LOGIN_PATH, _MAIL_LOGOUT_PATH) or (
             request.method in {"GET", "HEAD"}
-            and path
+            and request.url.path
             in {
                 _MAIL_LOGIN_STYLESHEET_PATH,
                 _MAIL_LOGIN_FLAG_FONT_PATH,
             }
-        ):
-            request.state.mail_ui_authenticated = True
-            token = _mail_ui_template_user.set(None)
-            try:
-                return await call_next(request)
-            finally:
-                _mail_ui_template_user.reset(token)
+        )
 
+    async def _call_with_ui_context(
+        self,
+        request: Request,
+        call_next: RequestResponseEndpoint,
+        template_user: dict[str, Any] | None = None,
+        bookmark: _MailUiLegacyBookmark | None = None,
+    ) -> Response:
+        token = _mail_ui_template_user.set(template_user)
+        try:
+            if bookmark is not None:
+                return await _mail_ui_legacy_bookmark_redirect(
+                    settings=self._settings, request=request, bookmark=bookmark
+                )
+            return await call_next(request)
+        finally:
+            _mail_ui_template_user.reset(token)
+
+    async def _without_ui_auth(
+        self, request: Request, call_next: RequestResponseEndpoint, bookmark: _MailUiLegacyBookmark | None
+    ) -> Response:
+        if self._settings.environment.strip().lower() not in {"development", "test"}:
+            return JSONResponse(
+                {"detail": "Mail UI authentication may only be disabled in development or test."},
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        # Explicitly disabled UI auth still falls through to the bearer layer.
+        return await self._call_with_ui_context(request, call_next, bookmark=bookmark)
+
+    async def _unauthenticated_response(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        static_bearer = self._settings.http.bearer_token or ""
+        presented_bearer = request.headers.get("Authorization", "")
+        if (
+            request.method == "GET"
+            and request.url.path == _MAIL_FILE_RESERVATIONS_API_PATH
+            and bool(static_bearer)
+            and hmac.compare_digest(presented_bearer, f"Bearer {static_bearer}")
+        ):
+            request.state.mail_ui_service_principal = True
+            return await self._call_with_ui_context(request, call_next)
+        if self._wants_html(request):
+            raw_path = request.scope.get("raw_path")
+            target = raw_path.decode("ascii") if isinstance(raw_path, bytes) and raw_path.isascii() else request.url.path
+            if request.url.query:
+                target = f"{target}?{request.url.query}"
+            return Response(
+                status_code=status.HTTP_303_SEE_OTHER,
+                headers={
+                    **_MAIL_LEGACY_HTML_HEADERS,
+                    "Location": f"{_MAIL_LOGIN_PATH}?next={quote(target, safe='')}",
+                },
+            )
+        return JSONResponse(
+            {"detail": _mail_ui_authorization_detail(request.url.path, "Unauthorized")},
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        )
+
+    @staticmethod
+    def _mutation_refusal(request: Request, user: MailUiSessionPrincipal) -> JSONResponse | None:
+        path = request.url.path
+        if request.method not in _UNSAFE_METHODS:
+            return None
+        if not webauth.same_origin(
+            request.headers.get("origin", ""),
+            request.headers.get("referer", ""),
+            request.headers.get("host", ""),
+            expected_scheme=request.url.scheme,
+        ):
+            return JSONResponse(
+                {"detail": _mail_ui_authorization_detail(path, _CROSS_ORIGIN_DETAIL)},
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+        # These paths allow project-scoped operators; endpoints still enforce assignments.
+        if (
+            user["role"] != webauth.ROLE_ADMIN
+            and path not in _MAIL_ACCOUNT_API_PATHS
+            and not _OVERSEER_REPLY_PATH_RE.fullmatch(path)
+            and not _MAIL_API_REPLY_SHAPE_RE.fullmatch(path)
+            and not _MAIL_API_COMPOSE_SHAPE_RE.fullmatch(path)
+            and not _MAIL_API_AGENT_PROFILE_SHAPE_RE.fullmatch(path)
+            and not (_MAIL_API_DELIVERY_SHAPE_RE.fullmatch(path) and path.endswith("/retry"))
+        ):
+            return JSONResponse(
+                {"detail": _mail_ui_authorization_detail(path, "Forbidden: this action requires the admin role")},
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+        return None
+
+    @staticmethod
+    def _rejects_mail_path(request: Request, bookmark: _MailUiLegacyBookmark | None) -> bool:
+        return (
+            (_mail_ui_legacy_bookmark(request.url.path) is not None and bookmark is None)
+            or not _mail_ui_active_path(request.url.path)
+            or (bookmark is not None and request.method not in {"GET", "HEAD"})
+        )
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
+        public_entrypoint = self._public_entrypoint(request)
+        if public_entrypoint is not None:
+            return public_entrypoint
+        path = request.url.path
+        if not (path == _MAIL_REACT_BASE_PATH or path.startswith(_MAIL_PATH_PREFIX)):
+            return await call_next(request)
+        legacy_bookmark = _mail_ui_request_legacy_bookmark(request)
+        if self._rejects_mail_path(request, legacy_bookmark):
+            return JSONResponse(
+                {"detail": _NOT_FOUND_DETAIL}, status_code=status.HTTP_404_NOT_FOUND, headers=_MAIL_REACT_INDEX_HEADERS
+            )
+        if request.method == "OPTIONS":
+            return await call_next(request)
+        cfg = self._settings.mail_ui
+        if not cfg.enabled:
+            return await self._without_ui_auth(request, call_next, legacy_bookmark)
+        if not cfg.session_secret:
+            return JSONResponse(
+                {"detail": "Mail UI authentication is unconfigured (MAIL_UI_SESSION_SECRET is empty)."},
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        if self._session_exempt_path(request):
+            request.state.mail_ui_authenticated = True
+            return await self._call_with_ui_context(request, call_next)
         token = request.cookies.get(cfg.cookie_name, "")
         user = await _load_session_user(token, settings=self._settings) if token else None
-
         if user is None:
-            static_bearer = self._settings.http.bearer_token or ""
-            presented_bearer = request.headers.get("Authorization", "")
-            if (
-                request.method == "GET"
-                and path == _MAIL_FILE_RESERVATIONS_API_PATH
-                and bool(static_bearer)
-                and hmac.compare_digest(presented_bearer, f"Bearer {static_bearer}")
-            ):
-                request.state.mail_ui_service_principal = True
-                token = _mail_ui_template_user.set(None)
-                try:
-                    return await call_next(request)
-                finally:
-                    _mail_ui_template_user.reset(token)
-            if self._wants_html(request):
-                raw_path = request.scope.get("raw_path")
-                target = (
-                    raw_path.decode("ascii")
-                    if isinstance(raw_path, bytes)
-                    and raw_path.isascii()
-                    else request.url.path
-                )
-                if request.url.query:
-                    target = f"{target}?{request.url.query}"
-
-                return Response(
-                    status_code=status.HTTP_303_SEE_OTHER,
-                    headers={
-                        **_MAIL_LEGACY_HTML_HEADERS,
-                        "Location": f"{_MAIL_LOGIN_PATH}?next={quote(target, safe='')}",
-                    },
-                )
-            return JSONResponse(
-                {"detail": _mail_ui_authorization_detail(path, "Unauthorized")},
-                status_code=status.HTTP_401_UNAUTHORIZED,
-            )
-
-        if request.method in _UNSAFE_METHODS:
-            if not webauth.same_origin(
-                request.headers.get("origin", ""),
-                request.headers.get("referer", ""),
-                request.headers.get("host", ""),
-                expected_scheme=request.url.scheme,
-            ):
-                return JSONResponse(
-                    {
-                        "detail": _mail_ui_authorization_detail(
-                            path,
-                            "Cross-origin request rejected",
-                        )
-                    },
-                    status_code=status.HTTP_403_FORBIDDEN,
-                )
-            # This allowlist decides only whether a path is admin-only BY SHAPE.
-            # Everything listed here still has to pass per-project authorization
-            # inside the endpoint, where the assignment table is read. Compose
-            # is listed for the same reason reply is: an operator may author
-            # into the projects they hold, and the endpoint is what checks which
-            # ones those are.
-            if (
-                user["role"] != webauth.ROLE_ADMIN
-                and path not in _MAIL_ACCOUNT_API_PATHS
-                and not _OVERSEER_REPLY_PATH_RE.fullmatch(path)
-                and not _MAIL_API_REPLY_SHAPE_RE.fullmatch(path)
-                and not _MAIL_API_COMPOSE_SHAPE_RE.fullmatch(path)
-                and not _MAIL_API_AGENT_PROFILE_SHAPE_RE.fullmatch(path)
-                and not (
-                    _MAIL_API_DELIVERY_SHAPE_RE.fullmatch(path)
-                    and path.endswith("/retry")
-                )
-            ):
-                return JSONResponse(
-                    {
-                        "detail": _mail_ui_authorization_detail(
-                            path,
-                            "Forbidden: this action requires the admin role",
-                        )
-                    },
-                    status_code=status.HTTP_403_FORBIDDEN,
-                )
+            return await self._unauthenticated_response(request, call_next)
+        refusal = self._mutation_refusal(request, user)
+        if refusal is not None:
+            return refusal
 
         request.state.mail_ui_authenticated = True
         request.state.mail_ui_user = user
@@ -4154,17 +4119,7 @@ class MailUiAuthMiddleware(BaseHTTPMiddleware):
             "role": user["role"],
             "is_admin": user["role"] == webauth.ROLE_ADMIN,
         }
-        token = _mail_ui_template_user.set(template_user)
-        try:
-            if legacy_bookmark is not None:
-                return await _mail_ui_legacy_bookmark_redirect(
-                    settings=self._settings,
-                    request=request,
-                    bookmark=legacy_bookmark,
-                )
-            return await call_next(request)
-        finally:
-            _mail_ui_template_user.reset(token)
+        return await self._call_with_ui_context(request, call_next, template_user, legacy_bookmark)
 
 
 class MailUiAccountNoStoreMiddleware:
@@ -4473,7 +4428,7 @@ async def _mail_ui_preferences_user(
     if row is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authenticated Mail UI session is no longer current.",
+            detail=_STALE_SESSION_DETAIL,
         )
     return row
 
@@ -4498,7 +4453,7 @@ async def _mail_ui_effective_correspondence_locale(
     if role is None or role != principal["role"]:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authenticated Mail UI session is no longer current.",
+            detail=_STALE_SESSION_DETAIL,
         )
     return _mail_ui_locale_from_db(
         row.preferred_correspondence_locale or row.preferred_ui_locale,
@@ -4563,7 +4518,7 @@ async def _mail_ui_password_user(
     if row is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authenticated Mail UI session is no longer current.",
+            detail=_STALE_SESSION_DETAIL,
         )
     return row
 
@@ -4613,7 +4568,7 @@ def _set_mail_ui_session_cookie(
         httponly=True,
         secure=cfg.cookie_secure,
         samesite="lax",
-        path="/mail",
+        path=_MAIL_REACT_BASE_PATH,
     )
 
 
@@ -4764,6 +4719,54 @@ def _mail_ui_legacy_search_hash(
     )
 
 
+async def _mail_ui_legacy_detail_fragment(
+    session: AsyncSession,
+    project_id: int,
+    bookmark: _MailUiLegacyBookmark,
+    query_items: list[tuple[str, str]],
+) -> str:
+    kind = bookmark["kind"]
+    if kind in {"message", "thread"} and query_items:
+        raise LookupError(f"{kind} bookmark has unsupported query")
+    if kind == "message":
+        message_id = bookmark["message_id"]
+        if message_id is None:
+            raise LookupError("message id missing")
+        message_exists = (
+            await session.execute(
+                text("SELECT 1 FROM messages WHERE project_id = :project_id AND id = :message_id"),
+                {"project_id": project_id, "message_id": message_id},
+            )
+        ).first()
+        if message_exists is None:
+            raise LookupError("message not found")
+        return f"#message/{project_id}/{message_id}"
+    if kind == "thread":
+        thread_id = bookmark["thread_id"]
+        if thread_id is None:
+            raise LookupError("thread id missing")
+        starter_message_id = _mail_ui_thread_starter_message_id(thread_id)
+        thread_exists = (
+            await session.execute(
+                text(
+                    "SELECT 1 FROM messages m "
+                    "WHERE m.project_id = :project_id "
+                    "AND (m.thread_id = :thread_id "
+                    "OR (:starter_message_id IS NOT NULL "
+                    "AND m.id = :starter_message_id)) LIMIT 1"
+                ),
+                {"project_id": project_id, "thread_id": thread_id, "starter_message_id": starter_message_id},
+            )
+        ).first()
+        if thread_exists is None:
+            raise LookupError("thread not found")
+        return f"#thread/{project_id}/{_mail_ui_encode_thread_id(thread_id)}"
+    search_hash = _mail_ui_legacy_search_hash(bookmark=bookmark, project_id=project_id, query_items=query_items)
+    if search_hash is None:
+        raise LookupError("unsupported legacy search query")
+    return search_hash
+
+
 async def _mail_ui_legacy_bookmark_redirect(
     *,
     settings: Settings,
@@ -4776,7 +4779,7 @@ async def _mail_ui_legacy_bookmark_redirect(
     if kind in {"projects", "inbox"}:
         if query_items:
             return JSONResponse(
-                {"detail": "Not Found"},
+                {"detail": _NOT_FOUND_DETAIL},
                 status_code=status.HTTP_404_NOT_FOUND,
                 headers=_MAIL_REACT_INDEX_HEADERS,
             )
@@ -4785,7 +4788,7 @@ async def _mail_ui_legacy_bookmark_redirect(
         project_slug = bookmark["project_slug"]
         if project_slug is None:
             return JSONResponse(
-                {"detail": "Not Found"},
+                {"detail": _NOT_FOUND_DETAIL},
                 status_code=status.HTTP_404_NOT_FOUND,
                 headers=_MAIL_REACT_INDEX_HEADERS,
             )
@@ -4808,66 +4811,10 @@ async def _mail_ui_legacy_bookmark_redirect(
                 project_id = int(project_row[0])
                 if project_id not in visible_roles:
                     raise LookupError("project not visible")
-                if kind == "message":
-                    if query_items:
-                        raise LookupError("message bookmark has unsupported query")
-                    message_id = bookmark["message_id"]
-                    if message_id is None:
-                        raise LookupError("message id missing")
-                    message_exists = (
-                        await session.execute(
-                            text(
-                                "SELECT 1 FROM messages "
-                                "WHERE project_id = :project_id AND id = :message_id"
-                            ),
-                            {
-                                "project_id": project_id,
-                                "message_id": message_id,
-                            },
-                        )
-                    ).first()
-                    if message_exists is None:
-                        raise LookupError("message not found")
-                    fragment = f"#message/{project_id}/{message_id}"
-                elif kind == "thread":
-                    if query_items:
-                        raise LookupError("thread bookmark has unsupported query")
-                    thread_id = bookmark["thread_id"]
-                    if thread_id is None:
-                        raise LookupError("thread id missing")
-                    starter_message_id = _mail_ui_thread_starter_message_id(thread_id)
-                    thread_exists = (
-                        await session.execute(
-                            text(
-                                "SELECT 1 FROM messages m "
-                                "WHERE m.project_id = :project_id "
-                                "AND (m.thread_id = :thread_id "
-                                "OR (:starter_message_id IS NOT NULL "
-                                "AND m.id = :starter_message_id)) "
-                                "LIMIT 1"
-                            ),
-                            {
-                                "project_id": project_id,
-                                "thread_id": thread_id,
-                                "starter_message_id": starter_message_id,
-                            },
-                        )
-                    ).first()
-                    if thread_exists is None:
-                        raise LookupError("thread not found")
-                    fragment = f"#thread/{project_id}/{_mail_ui_encode_thread_id(thread_id)}"
-                else:
-                    search_hash = _mail_ui_legacy_search_hash(
-                        bookmark=bookmark,
-                        project_id=project_id,
-                        query_items=query_items,
-                    )
-                    if search_hash is None:
-                        raise LookupError("unsupported legacy search query")
-                    fragment = search_hash
+                fragment = await _mail_ui_legacy_detail_fragment(session, project_id, bookmark, query_items)
         except Exception:
             return JSONResponse(
-                {"detail": "Not Found"},
+                {"detail": _NOT_FOUND_DETAIL},
                 status_code=status.HTTP_404_NOT_FOUND,
                 headers=_MAIL_REACT_INDEX_HEADERS,
             )
@@ -4910,7 +4857,7 @@ async def _mail_ui_require_project_access(
         session=session,
     )
     if project_id not in visible:
-        raise HTTPException(status_code=404, detail="Project not found")
+        raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND_DETAIL)
     access = _mail_ui_access_context(
         settings=settings,
         request=request,
@@ -5104,6 +5051,20 @@ def _mail_ui_require_admin_read(*, settings: Settings, request: Request) -> None
         raise HTTPException(status_code=403, detail="Forbidden: this action requires the admin role")
 
 
+def _mail_ui_session_principals_match(
+    user: MailUiSessionPrincipal | None, expected: MailUiSessionPrincipal | None
+) -> bool:
+    if user is None or expected is None:
+        return False
+    return (
+        user["id"] == expected["id"]
+        and user["username"] == expected["username"]
+        and user["role"] == expected["role"]
+        and user["session_epoch"] == expected["session_epoch"]
+        and hmac.compare_digest(user["session_generation"], expected["session_generation"])
+    )
+
+
 async def _mail_ui_stream_access_valid(
     *,
     settings: Settings,
@@ -5129,23 +5090,9 @@ async def _mail_ui_stream_access_valid(
         recreated username or project can therefore never inherit an already
         open stream merely by reusing the same human-readable name.
     """
-    if settings.mail_ui.enabled:
-        user = await _load_session_user(session_token, settings=settings)
-        if user is None or expected_principal is None:
-            return False
-        if (
-            user["id"] != expected_principal["id"]
-            or user["username"] != expected_principal["username"]
-            or user["role"] != expected_principal["role"]
-            or user["session_epoch"] != expected_principal["session_epoch"]
-            or not hmac.compare_digest(
-                user["session_generation"],
-                expected_principal["session_generation"],
-            )
-        ):
-            return False
-    else:
-        user = expected_principal
+    user = await _load_session_user(session_token, settings=settings) if settings.mail_ui.enabled else expected_principal
+    if settings.mail_ui.enabled and not _mail_ui_session_principals_match(user, expected_principal):
+        return False
 
     if project_slug is None:
         return True
@@ -5306,8 +5253,7 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
         ):
             try:
                 redis_asyncio = importlib.import_module("redis.asyncio")
-                Redis = redis_asyncio.Redis
-                self._redis = Redis.from_url(settings.http.rate_limit_redis_url)
+                self._redis = redis_asyncio.Redis.from_url(settings.http.rate_limit_redis_url)
             except Exception:
                 self._redis = None
 
@@ -5321,47 +5267,42 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
         for k in to_remove:
             self._buckets.pop(k, None)
 
+    async def _jwt_verification_keys(self, jose_module: Any, header: dict, algorithms: list[str]) -> list:
+        jwks_url = getattr(self.settings.http, "jwt_jwks_url", None) or None
+        secret = getattr(self.settings.http, "jwt_secret", None) or None
+        key = None
+        if jwks_url:
+            with contextlib.suppress(Exception):
+                key_set = await _fetch_jwks(jwks_url)
+                if key_set is None:
+                    return []
+                if not header.get("kid"):
+                    # Try every algorithm-compatible key when the token omits kid.
+                    return _jwks_candidate_keys(key_set, algorithms)
+                key = _select_jwks_key(key_set, header)
+                if key is None:
+                    # Unknown kid: refresh a possibly stale cache once before refusing.
+                    key_set = await _fetch_jwks(jwks_url, force=True)
+                    if key_set is not None:
+                        key = _select_jwks_key(key_set, header)
+        elif secret:
+            with contextlib.suppress(Exception):
+                key = jose_module.JsonWebKey.import_key(secret, {"kty": "oct"})
+        return [key] if key is not None else []
+
     async def _decode_jwt(self, token: str) -> dict | None:
         """Validate and decode JWT, returning claims or None on failure."""
         with contextlib.suppress(Exception):
             jose_mod = importlib.import_module("authlib.jose")
-            JsonWebKey = jose_mod.JsonWebKey
-            JsonWebToken = jose_mod.JsonWebToken
             algs = list(getattr(self.settings.http, "jwt_algorithms", ["HS256"]))
-            jwt = JsonWebToken(algs)
+            jwt = jose_mod.JsonWebToken(algs)
             audience = getattr(self.settings.http, "jwt_audience", None) or None
             issuer = getattr(self.settings.http, "jwt_issuer", None) or None
-            jwks_url = getattr(self.settings.http, "jwt_jwks_url", None) or None
-            secret = getattr(self.settings.http, "jwt_secret", None) or None
 
             header = _decode_jwt_header_segment(token)
             if header is None:
                 return None
-            key = None
-            candidate_keys: list = []
-            if jwks_url:
-                with contextlib.suppress(Exception):
-                    key_set = await _fetch_jwks(jwks_url)
-                    if key_set is None:
-                        return None
-                    if header.get("kid"):
-                        key = _select_jwks_key(key_set, header, algs)
-                        # Unknown kid: the cached JWKS may be stale; force a
-                        # refresh once before giving up (#212).
-                        if key is None:
-                            key_set = await _fetch_jwks(jwks_url, force=True)
-                            if key_set is not None:
-                                key = _select_jwks_key(key_set, header, algs)
-                    else:
-                        # No kid: never blind-pick keys[0]. Try every
-                        # algorithm-compatible key during verification (#211).
-                        candidate_keys = _jwks_candidate_keys(key_set, header, algs)
-            elif secret:
-                with contextlib.suppress(Exception):
-                    key = JsonWebKey.import_key(secret, {"kty": "oct"})
-            keys_to_try = candidate_keys if candidate_keys else ([key] if key is not None else [])
-            if not keys_to_try:
-                return None
+            keys_to_try = await self._jwt_verification_keys(jose_mod, header, algs)
             for candidate in keys_to_try:
                 with contextlib.suppress(Exception):
                     claims = jwt.decode(token, candidate)
@@ -5415,7 +5356,7 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
         return default
 
     def _rate_limits_for(self, kind: str) -> tuple[int, int]:
-        # return (per_minute, burst)
+        # Return the per-minute limit and allowed burst size.
         if kind == "tools":
             rpm = self._coerce_rpm(getattr(self.settings.http, "rate_limit_tools_per_minute", 60), 60)
             burst = int(getattr(self.settings.http, "rate_limit_tools_burst", 0) or 0)
@@ -5486,18 +5427,8 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
         self._buckets[key] = (tokens, now)
         return True
 
-    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
-        # Perform periodic cleanup of in-memory rate limit buckets
-        if self._redis is None:
-            now = self._monotonic()
-            if now - self._last_cleanup > 60.0:
-                self._cleanup_buckets(now)
-                self._last_cleanup = now
-
-        # Allow CORS preflight and health endpoints
-        if request.method == "OPTIONS" or request.url.path.startswith("/health/") or request.url.path == "/api/health":
-            return await call_next(request)
-
+    @staticmethod
+    async def _buffer_request_body(request: Request) -> bytes:
         # Only read/patch body for POST requests. GET (including SSE) must not receive http.request messages.
         body_bytes = b""
         if request.method.upper() == "POST":
@@ -5508,119 +5439,121 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
                 async def _receive() -> dict:
                     nonlocal body_sent
                     if body_sent:
-                        return {"type": "http.request", "body": b"", "more_body": False}
+                        return {"type": _HTTP_REQUEST_EVENT, "body": b"", "more_body": False}
                     body_sent = True
-                    return {"type": "http.request", "body": body_bytes, "more_body": False}
+                    return {"type": _HTTP_REQUEST_EVENT, "body": body_bytes, "more_body": False}
 
                 cast(Any, request)._receive = _receive
             except Exception:
                 body_bytes = b""
 
-        kind, tool_name = self._classify_request(request.url.path, request.method, body_bytes)
+        return body_bytes
 
-        # JWT auth (if enabled)
+    async def _jwt_roles(self, request: Request) -> set[str] | None:
+        auth_header = request.headers.get("Authorization", "")
+        # A valid static bearer remains an alternative to a JWT (#210).
+        static_token = getattr(self.settings.http, "bearer_token", "") or ""
+        if static_token and hmac.compare_digest(auth_header, f"Bearer {static_token}"):
+            return {self._default_role}
+        if not auth_header.startswith(_BEARER_PREFIX):
+            return None
+        token = auth_header.split(" ", 1)[1].strip()
+        claims_dict = await self._decode_jwt(token)
+        if claims_dict is None:
+            return None
+        claims = cast(dict[str, Any], claims_dict)
+        request.state.jwt_claims = claims
+        roles_raw = claims.get(self.settings.http.jwt_role_claim, [])
+        if isinstance(roles_raw, str):
+            roles = {roles_raw}
+        elif isinstance(roles_raw, (list, tuple)):
+            roles = {str(role) for role in roles_raw}
+        else:
+            roles = set()
+        return roles or {self._default_role}
+
+    async def _request_roles(self, request: Request) -> set[str] | None:
         if _oauth_path_is_public(
             request.url.path,
             self._oauth_public_paths,
         ):
-            roles: set[str] = set()
-        elif getattr(request.state, "mail_ui_authenticated", False):
-            roles = {self._default_role}
-        elif getattr(request.state, "oauth_access_token", None) is not None:
-            roles = {self.settings.http.oauth_rbac_role}
-        elif self._jwt_enabled:
-            auth_header = request.headers.get("Authorization", "")
-            # #210: when JWT is enabled, a valid *static* bearer is still accepted
-            # as the OR-alternative to a JWT (the outer BearerAuthMiddleware defers
-            # Bearer requests here without distinguishing the two). Check it first so
-            # static-bearer clients keep working once JWT is turned on; a static
-            # bearer is treated exactly as it is when JWT is disabled (default role).
-            static_token = getattr(self.settings.http, "bearer_token", "") or ""
-            if static_token and hmac.compare_digest(auth_header, f"Bearer {static_token}"):
-                roles = {self._default_role}
-            else:
-                if not auth_header.startswith("Bearer "):
-                    return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
-                token = auth_header.split(" ", 1)[1].strip()
-                claims_dict = await self._decode_jwt(token)
-                if claims_dict is None:
-                    return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
-                claims = cast(dict[str, Any], claims_dict)
-                request.state.jwt_claims = claims
-                roles_raw = claims.get(self.settings.http.jwt_role_claim, [])
-                if isinstance(roles_raw, str):
-                    roles = {roles_raw}
-                elif isinstance(roles_raw, (list, tuple)):
-                    roles = {str(r) for r in roles_raw}
-                else:
-                    roles = set()
-                if not roles:
-                    roles = {self._default_role}
-        else:
-            roles = {self._default_role}
-            # Elevate localhost to writer when unauthenticated localhost is allowed
-            if _localhost_bypass_allowed(
-                request,
-                allow_localhost=bool(getattr(self.settings.http, "allow_localhost_unauthenticated", False)),
-            ):
-                roles.add("writer")
+            return set()
+        if getattr(request.state, "mail_ui_authenticated", False):
+            return {self._default_role}
+        if getattr(request.state, "oauth_access_token", None) is not None:
+            return {self.settings.http.oauth_rbac_role}
+        if self._jwt_enabled:
+            return await self._jwt_roles(request)
+        roles = {self._default_role}
+        # Elevate localhost to writer when unauthenticated localhost is allowed.
+        if _localhost_bypass_allowed(
+            request, allow_localhost=bool(getattr(self.settings.http, "allow_localhost_unauthenticated", False))
+        ):
+            roles.add("writer")
+        return roles
 
+    def _rbac_allows(self, request: Request, roles: set[str], kind: str, tool_name: str | None) -> bool:
         # RBAC enforcement (skip for localhost when allowed)
         is_local_ok = _localhost_bypass_allowed(
             request,
             allow_localhost=bool(getattr(self.settings.http, "allow_localhost_unauthenticated", False)),
         )
-        if self._rbac_enabled and not is_local_ok and kind in {"tools", "resources"}:
-            is_reader = bool(roles & self._reader_roles)
-            is_writer = bool(roles & self._writer_roles) or (not roles)
-            if kind == "resources":
-                pass  # readers allowed
-            elif kind == "tools":
-                if not tool_name:
-                    # Without name, assume write-required to be safe
-                    if not is_writer:
-                        return JSONResponse({"detail": "Forbidden"}, status_code=status.HTTP_403_FORBIDDEN)
-                else:
-                    if tool_name in self._readonly_tools:
-                        if not is_reader and not is_writer:
-                            return JSONResponse({"detail": "Forbidden"}, status_code=status.HTTP_403_FORBIDDEN)
-                    else:
-                        if not is_writer:
-                            return JSONResponse({"detail": "Forbidden"}, status_code=status.HTTP_403_FORBIDDEN)
+        if not self._rbac_enabled or is_local_ok or kind != "tools":
+            return True
+        is_writer = bool(roles & self._writer_roles) or not roles
+        if tool_name and tool_name in self._readonly_tools:
+            return is_writer or bool(roles & self._reader_roles)
+        # Missing or unknown tool names require writer permission.
+        return is_writer
 
+    async def _rate_limit_response(self, request: Request, kind: str, tool_name: str | None) -> JSONResponse | None:
         # DCR remains bounded even in local/development configurations where
         # the general limiter is disabled. It is an anonymous persistent write,
         # unlike ordinary development traffic.
         rate_limit_applies = self.settings.http.rate_limit_enabled or (
             self.settings.http.oauth_enabled and kind == "oauth_register"
         )
-        if rate_limit_applies:
-            rpm, burst = self._rate_limits_for(kind)
-            identity = request.client.host if request.client else "ip-unknown"
-            # Prefer stable subject from JWT if present
-            with contextlib.suppress(Exception):
-                maybe_claims = getattr(request.state, "jwt_claims", None)
-                if isinstance(maybe_claims, dict):
-                    sub = maybe_claims.get("sub")
-                    if isinstance(sub, str) and sub:
-                        identity = f"sub:{sub}"
-            endpoint = tool_name or "*"
-            key = f"{kind}:{endpoint}:{identity}"
-            allowed = await self._consume_bucket(key, rpm, burst)
-            if not allowed:
-                return JSONResponse(
-                    {"detail": "Rate limit exceeded"},
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    headers=(
-                        {"Cache-Control": "no-store", "Pragma": "no-cache"}
-                        if _oauth_path_is_public(
-                            request.url.path,
-                            self._oauth_public_paths,
-                        )
-                        else None
-                    ),
-                )
+        if not rate_limit_applies:
+            return None
+        rpm, burst = self._rate_limits_for(kind)
+        identity = request.client.host if request.client else "ip-unknown"
+        # Prefer stable subject from JWT if present.
+        with contextlib.suppress(Exception):
+            maybe_claims = getattr(request.state, "jwt_claims", None)
+            if isinstance(maybe_claims, dict):
+                sub = maybe_claims.get("sub")
+                if isinstance(sub, str) and sub:
+                    identity = f"sub:{sub}"
+        endpoint = tool_name or "*"
+        key = f"{kind}:{endpoint}:{identity}"
+        if await self._consume_bucket(key, rpm, burst):
+            return None
+        return JSONResponse(
+            {"detail": "Rate limit exceeded"},
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"}
+            if _oauth_path_is_public(request.url.path, self._oauth_public_paths)
+            else None,
+        )
 
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
+        if self._redis is None:
+            now = self._monotonic()
+            if now - self._last_cleanup > 60.0:
+                self._cleanup_buckets(now)
+                self._last_cleanup = now
+        if request.method == "OPTIONS" or request.url.path.startswith("/health/") or request.url.path == "/api/health":
+            return await call_next(request)
+        body_bytes = await self._buffer_request_body(request)
+        kind, tool_name = self._classify_request(request.url.path, request.method, body_bytes)
+        roles = await self._request_roles(request)
+        if roles is None:
+            return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
+        if not self._rbac_allows(request, roles, kind, tool_name):
+            return JSONResponse({"detail": "Forbidden"}, status_code=status.HTTP_403_FORBIDDEN)
+        limited = await self._rate_limit_response(request, kind, tool_name)
+        if limited is not None:
+            return limited
         return await call_next(request)
 
 
@@ -5689,7 +5622,7 @@ def create_app() -> FastAPI:
     return build_http_app(get_settings())
 
 
-def build_http_app(settings: Settings, server=None) -> FastAPI:
+def build_http_app(settings: Settings, server: FastMCP | None = None) -> FastAPI:
     # Configure logging once
     _configure_logging(settings)
     if server is None:
@@ -5738,14 +5671,52 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         json_response=True,
     )
 
-    # no-op wrapper removed; using explicit stateless adapter below
+    from .utils import package_version
 
-    # Background workers lifecycle
-    async def _startup() -> None:  # pragma: no cover - service lifecycle
+    lifecycle = _HttpLifecycle(settings, mcp_http_app, mcp_stateful_http_app, oauth_provider)
+    fastapi_app = FastAPI(
+        title="MCP Agent Mail",
+        version=package_version(),
+        lifespan=lifecycle.lifespan_context,
+    )
+    _install_http_middleware(
+        fastapi_app, settings, oauth_provider, oauth_public_paths, oauth_resource_metadata_url,
+    )
+    _register_health_routes(fastapi_app)
+    _register_agent_event_route(fastapi_app)
+    _install_mcp_routes(
+        fastapi_app, settings, mcp_http_app, mcp_stateful_http_app,
+        oauth_provider, oauth_routes, oauth_metadata_paths,
+    )
+    _register_mail_ui(fastapi_app, settings)
+    _install_http_schema(fastapi_app, settings)
+    return fastapi_app
+
+
+class _HttpLifecycle:
+    """Compose native MCP lifespans and maintenance workers for one app."""
+
+    def __init__(
+        self,
+        settings: Settings,
+        mcp_http_app: FastAPI,
+        mcp_stateful_http_app: FastAPI,
+        oauth_provider: _AllowlistedGitHubOAuthProxy | None,
+    ) -> None:
+        self.workers = self.Workers(settings)
+        self.mcp_http_app = mcp_http_app
+        self.mcp_stateful_http_app = mcp_stateful_http_app
+        self.oauth_provider = oauth_provider
+
+    class Workers:
         # Note: no early return here -- the FD health monitor always runs,
         # even when optional workers are disabled by feature flags.
 
-        async def _worker_cleanup() -> None:
+        def __init__(self, settings: Settings) -> None:
+            self.settings = settings
+
+        async def _worker_cleanup(self) -> None:
+            settings = self.settings
             while True:
                 # Ordinary reservation operations already expire stale rows.
                 # Delay the periodic full scan so startup/shutdown does not race
@@ -5765,12 +5736,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                             stale = await _expire_stale_file_reservations(pid)
                             released_total += len(stale)
                     try:
-                        rich_console = importlib.import_module("rich.console")
-                        rich_panel = importlib.import_module("rich.panel")
-                        Console = rich_console.Console
-                        Panel = rich_panel.Panel
-                        Console().print(
-                            Panel.fit(
+                        rich_console = importlib.import_module(_RICH_CONSOLE_MODULE)
+                        rich_panel = importlib.import_module(_RICH_PANEL_MODULE)
+                        rich_console.Console().print(
+                            rich_panel.Panel.fit(
                                 f"projects_scanned={len(pids)} released={released_total}",
                                 title="File Reservations Cleanup",
                                 border_style="cyan",
@@ -5787,127 +5756,128 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 except Exception:
                     pass
 
-        async def _worker_ack_ttl() -> None:
+        async def _worker_ack_ttl(self) -> None:
+            while True:
+                with contextlib.suppress(Exception):
+                    await self._scan_overdue_acks()
+                await asyncio.sleep(self.settings.ack_ttl_scan_interval_seconds)
+
+        async def _scan_overdue_acks(self) -> None:
             import datetime as _dt
 
-            while True:
-                try:
-                    await ensure_schema()
-                    async with get_session() as session:
-                        result = await session.execute(
-                            text(
-                                """
-                            SELECT m.id, m.project_id, m.created_ts, mr.agent_id
-                            FROM messages m
-                            JOIN message_recipients mr ON mr.message_id = m.id
-                            WHERE m.ack_required = 1 AND mr.ack_ts IS NULL
-                            """
-                            )
-                        )
-                        rows = result.fetchall()
-                    now = _dt.datetime.now(_dt.timezone.utc)
-                    now_naive = now.replace(tzinfo=None)
-                    for mid, project_id, created_ts, agent_id in rows:
-                        # Normalize to timezone-aware UTC before arithmetic; SQLite may yield naive datetimes
-                        ts = created_ts
-                        if getattr(ts, "tzinfo", None) is None or ts.tzinfo.utcoffset(ts) is None:
-                            ts = ts.replace(tzinfo=_dt.timezone.utc)
-                        else:
-                            ts = ts.astimezone(_dt.timezone.utc)
-                        age = (now - ts).total_seconds()
-                        if age >= settings.ack_ttl_seconds:
-                            try:
-                                rich_console = importlib.import_module("rich.console")
-                                rich_panel = importlib.import_module("rich.panel")
-                                rich_text = importlib.import_module("rich.text")
-                                Console = rich_console.Console
-                                Panel = rich_panel.Panel
-                                Text = rich_text.Text
-                                con = Console()
-                                body = Text.assemble(
-                                    ("message_id: ", "cyan"),
-                                    (str(mid), "white"),
-                                    "\n",
-                                    ("agent_id: ", "cyan"),
-                                    (str(agent_id), "white"),
-                                    "\n",
-                                    ("project_id: ", "cyan"),
-                                    (str(project_id), "white"),
-                                    "\n",
-                                    ("age_s: ", "cyan"),
-                                    (str(int(age)), "white"),
-                                    "\n",
-                                    ("ttl_s: ", "cyan"),
-                                    (str(settings.ack_ttl_seconds), "white"),
-                                )
-                                con.print(Panel(body, title="ACK Overdue", border_style="red"))
-                            except Exception:
-                                print(
-                                    f"ack-warning message_id={mid} project_id={project_id} agent_id={agent_id} age_s={int(age)} ttl_s={settings.ack_ttl_seconds}"
-                                )
-                            with contextlib.suppress(Exception):
-                                structlog.get_logger("tasks").warning(
-                                    "ack_overdue",
-                                    message_id=str(mid),
-                                    project_id=str(project_id),
-                                    agent_id=str(agent_id),
-                                    age_s=int(age),
-                                    ttl_s=int(settings.ack_ttl_seconds),
-                                )
-                            if settings.ack_escalation_enabled:
-                                mode = (settings.ack_escalation_mode or "log").lower()
-                                if mode == "file_reservation":
-                                    try:
-                                        y_dir = created_ts.strftime("%Y")
-                                        m_dir = created_ts.strftime("%m")
-                                        # Resolve the exact project/recipient lifetimes.
-                                        async with get_session() as s_lookup:
-                                            project_snapshot = await s_lookup.get(
-                                                Project,
-                                                int(project_id),
-                                            )
-                                            recipient_snapshot = await s_lookup.get(
-                                                Agent,
-                                                int(agent_id),
-                                            )
-                                        if (
-                                            project_snapshot is None
-                                            or recipient_snapshot is None
-                                            or recipient_snapshot.project_id
-                                            != project_snapshot.id
-                                        ):
-                                            raise ValueError(
-                                                "ACK escalation project or recipient lifetime no longer exists."
-                                            )
-                                        recipient_name = recipient_snapshot.name
-                                        pattern = (
-                                            f"agents/{recipient_name}/inbox/{y_dir}/{m_dir}/*.md"
-                                        )
-                                        holder = recipient_snapshot
-                                        if settings.ack_escalation_claim_holder_name:
-                                            claim_name = settings.ack_escalation_claim_holder_name
-                                            holder = await _ensure_ack_escalation_holder(
-                                                settings=settings,
-                                                project=project_snapshot,
-                                                recipient_agent=recipient_snapshot,
-                                                claim_name=claim_name,
-                                                now_naive=now_naive,
-                                            )
-                                        await _create_ack_escalation_reservation(
-                                            project=project_snapshot,
-                                            holder=holder,
-                                            path_pattern=pattern,
-                                            exclusive=settings.ack_escalation_claim_exclusive,
-                                            now_naive=now_naive,
-                                            ttl_seconds=settings.ack_escalation_claim_ttl_seconds,
-                                        )
-                                    except Exception:
-                                        pass
-                except Exception:
-                    pass
-                await asyncio.sleep(settings.ack_ttl_scan_interval_seconds)
+            settings = self.settings
+            await ensure_schema()
+            async with get_session() as session:
+                result = await session.execute(
+                    text(
+                        """
+                    SELECT m.id, m.project_id, m.created_ts, mr.agent_id
+                    FROM messages m
+                    JOIN message_recipients mr ON mr.message_id = m.id
+                    WHERE m.ack_required = 1 AND mr.ack_ts IS NULL
+                    """
+                    )
+                )
+                rows = result.fetchall()
+            now = _dt.datetime.now(_dt.timezone.utc)
+            now_naive = now.replace(tzinfo=None)
+            for mid, project_id, created_ts, agent_id in rows:
+                # SQLite may yield naive datetimes; normalize before arithmetic.
+                ts = created_ts
+                if getattr(ts, "tzinfo", None) is None or ts.tzinfo.utcoffset(ts) is None:
+                    ts = ts.replace(tzinfo=_dt.timezone.utc)
+                else:
+                    ts = ts.astimezone(_dt.timezone.utc)
+                age = (now - ts).total_seconds()
+                if age >= settings.ack_ttl_seconds:
+                    self._report_overdue_ack(mid, project_id, agent_id, age)
+                    await self._escalate_overdue_ack(project_id, agent_id, created_ts, now_naive)
 
-        async def _worker_tool_metrics() -> None:
+        def _report_overdue_ack(self, mid: int, project_id: int, agent_id: int, age: float) -> None:
+            settings = self.settings
+            try:
+                rich_console = importlib.import_module(_RICH_CONSOLE_MODULE)
+                rich_panel = importlib.import_module(_RICH_PANEL_MODULE)
+                rich_text = importlib.import_module("rich.text")
+                con = rich_console.Console()
+                body = rich_text.Text.assemble(
+                    ("message_id: ", "cyan"),
+                    (str(mid), "white"),
+                    "\n",
+                    ("agent_id: ", "cyan"),
+                    (str(agent_id), "white"),
+                    "\n",
+                    ("project_id: ", "cyan"),
+                    (str(project_id), "white"),
+                    "\n",
+                    ("age_s: ", "cyan"),
+                    (str(int(age)), "white"),
+                    "\n",
+                    ("ttl_s: ", "cyan"),
+                    (str(settings.ack_ttl_seconds), "white"),
+                )
+                con.print(rich_panel.Panel(body, title="ACK Overdue", border_style="red"))
+            except Exception:
+                print(
+                    f"ack-warning message_id={mid} project_id={project_id} agent_id={agent_id} age_s={int(age)} ttl_s={settings.ack_ttl_seconds}"
+                )
+            with contextlib.suppress(Exception):
+                structlog.get_logger("tasks").warning(
+                    "ack_overdue",
+                    message_id=str(mid),
+                    project_id=str(project_id),
+                    agent_id=str(agent_id),
+                    age_s=int(age),
+                    ttl_s=int(settings.ack_ttl_seconds),
+                )
+
+        async def _escalate_overdue_ack(
+            self, project_id: int, agent_id: int, created_ts: datetime, now_naive: datetime,
+        ) -> None:
+            settings = self.settings
+            if not settings.ack_escalation_enabled:
+                return
+            mode = (settings.ack_escalation_mode or "log").lower()
+            if mode != "file_reservation":
+                return
+            try:
+                y_dir = created_ts.strftime("%Y")
+                m_dir = created_ts.strftime("%m")
+                # Resolve the exact project/recipient lifetimes.
+                async with get_session() as s_lookup:
+                    project_snapshot = await s_lookup.get(Project, int(project_id))
+                    recipient_snapshot = await s_lookup.get(Agent, int(agent_id))
+                if (
+                    project_snapshot is None
+                    or recipient_snapshot is None
+                    or recipient_snapshot.project_id != project_snapshot.id
+                ):
+                    raise ValueError("ACK escalation project or recipient lifetime no longer exists.")
+                recipient_name = recipient_snapshot.name
+                pattern = f"agents/{recipient_name}/inbox/{y_dir}/{m_dir}/*.md"
+                holder = recipient_snapshot
+                if settings.ack_escalation_claim_holder_name:
+                    claim_name = settings.ack_escalation_claim_holder_name
+                    holder = await _ensure_ack_escalation_holder(
+                        settings=settings,
+                        project=project_snapshot,
+                        recipient_agent=recipient_snapshot,
+                        claim_name=claim_name,
+                        now_naive=now_naive,
+                    )
+                await _create_ack_escalation_reservation(
+                    project=project_snapshot,
+                    holder=holder,
+                    path_pattern=pattern,
+                    exclusive=settings.ack_escalation_claim_exclusive,
+                    now_naive=now_naive,
+                    ttl_seconds=settings.ack_escalation_claim_ttl_seconds,
+                )
+            except Exception:
+                pass
+
+        async def _worker_tool_metrics(self) -> None:
+            settings = self.settings
             log = structlog.get_logger("tool.metrics")
             while True:
                 try:
@@ -5918,7 +5888,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     pass
                 await asyncio.sleep(max(5, settings.tool_metrics_emit_interval_seconds))
 
-        async def _worker_retention_quota() -> None:
+        async def _worker_retention_quota(self) -> None:
+            settings = self.settings
             while True:
                 with contextlib.suppress(Exception):
                     report = await _collect_retention_quota_report(settings)
@@ -5926,24 +5897,26 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         "retention_quota_report",
                         **report,
                     )
-                    # Quota alerts
-                    limit_b = int(settings.quota_attachments_limit_bytes)
-                    inbox_limit = int(settings.quota_inbox_limit_count)
-                    if limit_b > 0:
-                        for proj, used in report["per_project_attach"].items():
-                            if used >= limit_b:
-                                structlog.get_logger("maintenance").warning(
-                                    "quota_attachments_exceeded", project=proj, used_bytes=used, limit_bytes=limit_b
-                                )
-                    if inbox_limit > 0:
-                        for proj, cnt in report["per_project_inbox_counts"].items():
-                            if cnt >= inbox_limit:
-                                structlog.get_logger("maintenance").warning(
-                                    "quota_inbox_exceeded", project=proj, inbox_count=cnt, limit=inbox_limit
-                                )
+                    self._report_quota_limits(report)
                 await asyncio.sleep(max(60, settings.retention_report_interval_seconds))
 
-        async def _worker_fd_health() -> None:
+        def _report_quota_limits(self, report: dict[str, Any]) -> None:
+            limit_b = int(self.settings.quota_attachments_limit_bytes)
+            inbox_limit = int(self.settings.quota_inbox_limit_count)
+            if limit_b > 0:
+                for proj, used in report["per_project_attach"].items():
+                    if used >= limit_b:
+                        structlog.get_logger("maintenance").warning(
+                            "quota_attachments_exceeded", project=proj, used_bytes=used, limit_bytes=limit_b
+                        )
+            if inbox_limit > 0:
+                for proj, cnt in report["per_project_inbox_counts"].items():
+                    if cnt >= inbox_limit:
+                        structlog.get_logger("maintenance").warning(
+                            "quota_inbox_exceeded", project=proj, inbox_count=cnt, limit=inbox_limit
+                        )
+
+        async def _worker_fd_health(self) -> None:
             """Periodic file descriptor health monitor.
 
             Checks FD headroom every 30 seconds and proactively cleans up
@@ -5961,62 +5934,40 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             """
             _fd_logger = structlog.get_logger("fd_health")
             while True:
-                try:
-                    current, limit = get_fd_usage()
-                    if current >= 0 and limit > 0:
-                        headroom_pct = (limit - current) / limit
-                        cache_stats = get_repo_cache_stats()
-                        lock_stats = get_lock_telemetry()
-
-                        if headroom_pct < 0.15:
-                            # Critical: aggressive cleanup
-                            _fd_logger.error(
-                                "fd_health.critical",
-                                current_fds=current,
-                                fd_limit=limit,
-                                headroom_pct=round(headroom_pct * 100, 1),
-                                repo_cache=cache_stats,
-                                lock_telemetry=lock_stats,
-                            )
-                            freed = proactive_fd_cleanup(threshold=limit)
-                            if freed:
-                                _fd_logger.warning(
-                                    "fd_health.emergency_cleanup",
-                                    freed=freed,
-                                    new_headroom=get_fd_headroom(),
-                                )
-                        elif headroom_pct < 0.20:
-                            # Low: proactive cleanup
-                            _fd_logger.warning(
-                                "fd_health.low",
-                                current_fds=current,
-                                fd_limit=limit,
-                                headroom_pct=round(headroom_pct * 100, 1),
-                                repo_cache=cache_stats,
-                                lock_telemetry=lock_stats,
-                            )
-                            freed = proactive_fd_cleanup(threshold=int(limit * 0.25))
-                            if freed:
-                                _fd_logger.info(
-                                    "fd_health.proactive_cleanup",
-                                    freed=freed,
-                                    new_headroom=get_fd_headroom(),
-                                )
-                        elif headroom_pct < 0.30:
-                            # Warning only
-                            _fd_logger.warning(
-                                "fd_health.warning",
-                                current_fds=current,
-                                fd_limit=limit,
-                                headroom_pct=round(headroom_pct * 100, 1),
-                                repo_cache=cache_stats,
-                                lock_telemetry=lock_stats,
-                            )
-                except Exception:
-                    pass
+                with contextlib.suppress(Exception):
+                    self._check_fd_health(_fd_logger)
                 await asyncio.sleep(30)
 
-        async def _worker_auto_retire_stale_agents() -> None:
+        @staticmethod
+        def _check_fd_health(log: Any) -> None:
+            current, limit = get_fd_usage()
+            if current < 0 or limit <= 0:
+                return
+            headroom_pct = (limit - current) / limit
+            cache_stats = get_repo_cache_stats()
+            lock_stats = get_lock_telemetry()
+            fields = {
+                "current_fds": current,
+                "fd_limit": limit,
+                "headroom_pct": round(headroom_pct * 100, 1),
+                "repo_cache": cache_stats,
+                "lock_telemetry": lock_stats,
+            }
+            if headroom_pct < 0.15:
+                log.error("fd_health.critical", **fields)
+                freed = proactive_fd_cleanup(threshold=limit)
+                if freed:
+                    log.warning("fd_health.emergency_cleanup", freed=freed, new_headroom=get_fd_headroom())
+            elif headroom_pct < 0.20:
+                log.warning("fd_health.low", **fields)
+                freed = proactive_fd_cleanup(threshold=int(limit * 0.25))
+                if freed:
+                    log.info("fd_health.proactive_cleanup", freed=freed, new_headroom=get_fd_headroom())
+            elif headroom_pct < 0.30:
+                log.warning("fd_health.warning", **fields)
+
+        async def _worker_auto_retire_stale_agents(self) -> None:
+            settings = self.settings
             log = structlog.get_logger("maintenance.auto_retire")
             interval = max(60, int(settings.auto_retire_stale_agents_interval_seconds))
             threshold = max(60, int(settings.auto_retire_stale_agents_threshold_seconds))
@@ -6039,23 +5990,26 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         )
                 await asyncio.sleep(interval)
 
-        tasks = []
-        # FD health monitor always runs - it's critical for preventing EMFILE cascades
-        tasks.append(asyncio.create_task(_worker_fd_health()))
-        if settings.file_reservations_cleanup_enabled:
-            tasks.append(asyncio.create_task(_worker_cleanup()))
-        if settings.ack_ttl_enabled:
-            tasks.append(asyncio.create_task(_worker_ack_ttl()))
-        if settings.tool_metrics_emit_enabled:
-            tasks.append(asyncio.create_task(_worker_tool_metrics()))
-        if settings.retention_report_enabled or settings.quota_enabled:
-            tasks.append(asyncio.create_task(_worker_retention_quota()))
-        if settings.auto_retire_stale_agents_enabled:
-            tasks.append(asyncio.create_task(_worker_auto_retire_stale_agents()))
-        fastapi_app.state._background_tasks = tasks
+        def start(self, app: FastAPI) -> None:
+            settings = self.settings
+            tasks = []
+            # FD health monitor always runs to prevent EMFILE cascades.
+            tasks.append(asyncio.create_task(self._worker_fd_health()))
+            if settings.file_reservations_cleanup_enabled:
+                tasks.append(asyncio.create_task(self._worker_cleanup()))
+            if settings.ack_ttl_enabled:
+                tasks.append(asyncio.create_task(self._worker_ack_ttl()))
+            if settings.tool_metrics_emit_enabled:
+                tasks.append(asyncio.create_task(self._worker_tool_metrics()))
+            if settings.retention_report_enabled or settings.quota_enabled:
+                tasks.append(asyncio.create_task(self._worker_retention_quota()))
+            if settings.auto_retire_stale_agents_enabled:
+                tasks.append(asyncio.create_task(self._worker_auto_retire_stale_agents()))
+            app.state._background_tasks = tasks
 
-    async def _shutdown() -> None:  # pragma: no cover - service lifecycle
-        tasks = getattr(fastapi_app.state, "_background_tasks", [])
+    @staticmethod
+    async def _shutdown(app: FastAPI) -> None:
+        tasks = getattr(app.state, "_background_tasks", [])
         for task in tasks:
             task.cancel()
         # Await cancelled tasks with a timeout to prevent shutdown hangs
@@ -6064,10 +6018,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             with contextlib.suppress(Exception):
                 await asyncio.wait(tasks, timeout=5.0)
 
-    from contextlib import asynccontextmanager
-
-    @asynccontextmanager
-    async def lifespan_context(app: FastAPI):
+    @contextlib.asynccontextmanager
+    async def lifespan_context(self, app: FastAPI):
+        mcp_http_app = self.mcp_http_app
+        mcp_stateful_http_app = self.mcp_stateful_http_app
+        oauth_provider = self.oauth_provider
         # Ensure both mounted MCP apps initialize their internal task groups
         # (each http_app() call owns an independent StreamableHTTPSessionManager).
         mcp_lifespan_app = cast(_FastAPILifespan, mcp_http_app)
@@ -6080,102 +6035,93 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 mcp_lifespan_app.lifespan(mcp_http_app),
                 mcp_stateful_lifespan_app.lifespan(mcp_stateful_http_app),
             ):
-                await _startup()
+                self.workers.start(app)
                 startup_succeeded = True
                 try:
                     yield
                 finally:
                     if startup_succeeded:
-                        await _shutdown()
+                        await self._shutdown(app)
         finally:
             if oauth_provider is not None:
                 await oauth_provider.aclose()
 
-    # Now construct FastAPI with the composed lifespan so ASGI transports run it.
-    # Give the app a real title/version so the auto-generated /openapi.json has a
-    # proper `info` block. The version comes from utils.package_version, which is
-    # the single source shared with serverInfo, health_check and the CLI.
-    from .utils import package_version
 
-    fastapi_app = FastAPI(
-        title="MCP Agent Mail",
-        version=package_version(),
-        lifespan=lifespan_context,
-    )
-
-    # Simple request logging (configurable)
-    if settings.http.request_log_enabled:
+class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
         import time as _time
 
-        class RequestLoggingMiddleware(BaseHTTPMiddleware):
-            async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
-                start = _time.time()
-                method = request.method
-                path = request.url.path
-                client = request.client.host if request.client else "-"
-                response = None
-                exc: BaseException | None = None
-                try:
-                    response = await call_next(request)
-                    return response
-                except BaseException as err:
-                    exc = err
-                    raise
-                finally:
-                    # Always emit a log line, even when the handler raised (#215).
-                    dur_ms = int((_time.time() - start) * 1000)
-                    status_code = getattr(response, "status_code", 0) if response is not None else 500
-                    with contextlib.suppress(Exception):
-                        log = structlog.get_logger("http")
-                        if exc is not None:
-                            log.error(
-                                "request",
-                                method=method,
-                                path=path,
-                                status=status_code,
-                                duration_ms=dur_ms,
-                                client_ip=client,
-                                error=repr(exc),
-                            )
-                        else:
-                            log.info(
-                                "request",
-                                method=method,
-                                path=path,
-                                status=status_code,
-                                duration_ms=dur_ms,
-                                client_ip=client,
-                            )
-                    try:
-                        rich_console = importlib.import_module("rich.console")
-                        rich_panel = importlib.import_module("rich.panel")
-                        rich_text = importlib.import_module("rich.text")
-                        Console = rich_console.Console
-                        Panel = rich_panel.Panel
-                        Text = rich_text.Text
-                        console = Console(width=100)
-                        title = Text.assemble(
-                            (method, "bold blue"),
-                            ("  "),
-                            (path, "bold white"),
-                            ("  "),
-                            (f"{status_code}", "bold green" if 200 <= status_code < 400 else "bold red"),
-                            ("  "),
-                            (f"{dur_ms}ms", "bold yellow"),
-                        )
-                        body = Text.assemble(
-                            ("client: ", "cyan"),
-                            (client, "white"),
-                        )
-                        if exc is not None:
-                            body = Text.assemble(body, "\n", ("error: ", "cyan"), (repr(exc), "red"))
-                        console.print(Panel(body, title=title, border_style="dim"))
-                    except Exception:
-                        suffix = f" error={exc!r}" if exc is not None else ""
-                        print(
-                            f"http method={method} path={path} status={status_code} ms={dur_ms} client={client}{suffix}"
-                        )
+        start = _time.time()
+        method = request.method
+        path = request.url.path
+        client = request.client.host if request.client else "-"
+        response = None
+        exc: BaseException | None = None
+        try:
+            response = await call_next(request)
+            return response
+        except BaseException as err:
+            exc = err
+            raise
+        finally:
+            # Always emit a log line, even when the handler raised (#215).
+            dur_ms = int((_time.time() - start) * 1000)
+            status_code = getattr(response, "status_code", 0) if response is not None else 500
+            with contextlib.suppress(Exception):
+                log = structlog.get_logger("http")
+                if exc is not None:
+                    log.error(
+                        "request",
+                        method=method,
+                        path=path,
+                        status=status_code,
+                        duration_ms=dur_ms,
+                        client_ip=client,
+                        error=repr(exc),
+                    )
+                else:
+                    log.info(
+                        "request",
+                        method=method,
+                        path=path,
+                        status=status_code,
+                        duration_ms=dur_ms,
+                        client_ip=client,
+                    )
+            try:
+                rich_console = importlib.import_module(_RICH_CONSOLE_MODULE)
+                rich_panel = importlib.import_module(_RICH_PANEL_MODULE)
+                rich_text = importlib.import_module("rich.text")
+                console = rich_console.Console(width=100)
+                title = rich_text.Text.assemble(
+                    (method, "bold blue"),
+                    ("  "),
+                    (path, "bold white"),
+                    ("  "),
+                    (f"{status_code}", "bold green" if 200 <= status_code < 400 else "bold red"),
+                    ("  "),
+                    (f"{dur_ms}ms", "bold yellow"),
+                )
+                body = rich_text.Text.assemble(
+                    ("client: ", "cyan"),
+                    (client, "white"),
+                )
+                if exc is not None:
+                    body = rich_text.Text.assemble(body, "\n", ("error: ", "cyan"), (repr(exc), "red"))
+                console.print(rich_panel.Panel(body, title=title, border_style="dim"))
+            except Exception:
+                suffix = f" error={exc!r}" if exc is not None else ""
+                print(f"http method={method} path={path} status={status_code} ms={dur_ms} client={client}{suffix}")
 
+
+def _install_http_middleware(
+    fastapi_app: FastAPI,
+    settings: Settings,
+    oauth_provider: _AllowlistedGitHubOAuthProxy | None,
+    oauth_public_paths: frozenset[str],
+    oauth_resource_metadata_url: str | None,
+) -> None:
+    if settings.http.request_log_enabled:
         app_any = cast(Any, fastapi_app)
         app_any.add_middleware(RequestLoggingMiddleware)
 
@@ -6238,22 +6184,21 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             allow_headers=settings.cors.allow_headers or ["*"],
         )
 
-    # Health endpoints
+
+def _register_health_routes(fastapi_app: FastAPI) -> None:
     @fastapi_app.get("/health/liveness")
     async def liveness() -> JSONResponse:
         return JSONResponse({"status": "alive"})
 
-    @fastapi_app.get("/health/readiness")
+    @fastapi_app.get("/health/readiness", responses={503: _HTTP_SERVICE_UNAVAILABLE_RESPONSE})
     async def readiness() -> JSONResponse:
         try:
             await readiness_check()
         except Exception as exc:
             try:
-                rich_console = importlib.import_module("rich.console")
-                rich_panel = importlib.import_module("rich.panel")
-                Console = rich_console.Console
-                Panel = rich_panel.Panel
-                Console().print(Panel.fit(str(exc), title="Readiness Error", border_style="red"))
+                rich_console = importlib.import_module(_RICH_CONSOLE_MODULE)
+                rich_panel = importlib.import_module(_RICH_PANEL_MODULE)
+                rich_console.Console().print(rich_panel.Panel.fit(str(exc), title="Readiness Error", border_style="red"))
             except Exception:
                 pass
             with contextlib.suppress(Exception):
@@ -6271,6 +6216,58 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         """
         return JSONResponse({"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()})
 
+
+class _AgentStreamBinding(TypedDict):
+    project_id: int
+    project_slug: str
+    project_generation: str
+    agent_id: int
+    agent_name: str
+    agent_generation: str
+    registration_token: str
+
+
+async def _stream_agent_events(
+    binding: _AgentStreamBinding,
+    queue: asyncio.Queue[dict[str, Any]],
+) -> Any:
+    deadline = asyncio.get_running_loop().time() + MAX_STREAM_SECONDS
+    try:
+        yield b": ready\n\n"
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                yield b": bye\n\n"
+                return
+            try:
+                event = await asyncio.wait_for(
+                    queue.get(), timeout=min(KEEPALIVE_SECONDS, remaining)
+                )
+            except asyncio.TimeoutError:
+                if not await _agent_stream_lifetime_valid(**binding):
+                    return
+                yield b": ping\n\n"
+                continue
+            if not await _agent_stream_lifetime_valid(**binding):
+                return
+            # No `id:` line: that would advertise Last-Event-ID replay
+            # this stream does not have. The mailbox is the log.
+            yield f"data: {json.dumps(event, separators=(',', ':'))}\n\n".encode()
+            return
+    finally:
+        # Must run on client disconnect too, or the hub accumulates
+        # queues for connections that are long gone and publishes into
+        # them forever.
+        hub.unsubscribe(
+            binding["project_slug"],
+            binding["project_generation"],
+            binding["agent_name"],
+            binding["agent_generation"],
+            queue,
+        )
+
+
+def _register_agent_event_route(fastapi_app: FastAPI) -> None:
     @fastapi_app.get("/events")
     async def events_stream(request: Request) -> Any:
         """Wake one agent the moment something lands in its mailbox.
@@ -6341,60 +6338,17 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             agent_generation,
         )
 
-        async def stream() -> Any:
-            deadline = asyncio.get_running_loop().time() + MAX_STREAM_SECONDS
-            try:
-                yield b": ready\n\n"
-                while True:
-                    remaining = deadline - asyncio.get_running_loop().time()
-                    if remaining <= 0:
-                        yield b": bye\n\n"
-                        return
-                    try:
-                        event = await asyncio.wait_for(
-                            queue.get(), timeout=min(KEEPALIVE_SECONDS, remaining)
-                        )
-                    except asyncio.TimeoutError:
-                        if not await _agent_stream_lifetime_valid(
-                            project_id=project_id,
-                            project_slug=project_slug,
-                            project_generation=project_generation,
-                            agent_id=agent_id,
-                            agent_name=canonical_agent,
-                            agent_generation=agent_generation,
-                            registration_token=token,
-                        ):
-                            return
-                        yield b": ping\n\n"
-                        continue
-                    if not await _agent_stream_lifetime_valid(
-                        project_id=project_id,
-                        project_slug=project_slug,
-                        project_generation=project_generation,
-                        agent_id=agent_id,
-                        agent_name=canonical_agent,
-                        agent_generation=agent_generation,
-                        registration_token=token,
-                    ):
-                        return
-                    # No `id:` line: that would advertise Last-Event-ID replay
-                    # this stream does not have. The mailbox is the log.
-                    yield f"data: {json.dumps(event, separators=(',', ':'))}\n\n".encode()
-                    return
-            finally:
-                # Must run on client disconnect too, or the hub accumulates
-                # queues for connections that are long gone and publishes into
-                # them forever.
-                hub.unsubscribe(
-                    project_slug,
-                    project_generation,
-                    canonical_agent,
-                    agent_generation,
-                    queue,
-                )
-
+        binding = _AgentStreamBinding(
+            project_id=project_id,
+            project_slug=project_slug,
+            project_generation=project_generation,
+            agent_id=agent_id,
+            agent_name=canonical_agent,
+            agent_generation=agent_generation,
+            registration_token=token,
+        )
         return StreamingResponse(
-            stream(),
+            _stream_agent_events(binding, queue),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache, no-store",
@@ -6405,15 +6359,21 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             },
         )
 
-    def _oauth_metadata_disabled_response() -> JSONResponse:
-        return JSONResponse({"mcp_oauth": False}, status_code=404)
 
-    def _register_oauth_metadata_disabled(path: str) -> None:
-        async def _oauth_metadata_disabled() -> JSONResponse:
-            return _oauth_metadata_disabled_response()
+def _install_mcp_routes(
+    fastapi_app: FastAPI,
+    settings: Settings,
+    mcp_http_app: FastAPI,
+    mcp_stateful_http_app: FastAPI,
+    oauth_provider: _AllowlistedGitHubOAuthProxy | None,
+    oauth_routes: list[Any],
+    oauth_metadata_paths: frozenset[str],
+) -> None:
+    transports = _McpTransports(settings, mcp_http_app, mcp_stateful_http_app)
+    _register_mcp_mounts(fastapi_app, settings, transports, oauth_provider, oauth_routes, oauth_metadata_paths)
 
-        fastapi_app.add_api_route(path, _oauth_metadata_disabled, methods=["GET"], include_in_schema=False)
 
+class _McpTransports:
     # Thin ASGI wrapper that normalizes Accept / Content-Type headers for
     # MCP clients (some omit Accept entirely) and then delegates to the
     # SDK's native mcp_http_app which properly coordinates server lifecycle,
@@ -6424,13 +6384,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     # ASGITransport) no lifespan events are sent, so the wrapper lazily enters
     # the MCP app's lifespan on first request to avoid "Task group not
     # initialized" errors.
-    lazy_lifespan_lock: asyncio.Lock | None = None
-
-    def _shared_lazy_lifespan_lock() -> asyncio.Lock:
-        nonlocal lazy_lifespan_lock
-        if lazy_lifespan_lock is None:
-            lazy_lifespan_lock = asyncio.Lock()
-        return lazy_lifespan_lock
+    def _shared_lazy_lifespan_lock(self) -> asyncio.Lock:
+        if self.lazy_lifespan_lock is None:
+            self.lazy_lifespan_lock = asyncio.Lock()
+        return self.lazy_lifespan_lock
 
     class _HeaderFixupMCPApp:
         """Normalize headers then delegate to the native MCP HTTP app."""
@@ -6440,11 +6397,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             native_app: FastAPI,
             *,
             allow_lazy_lifespan: bool,
+            lifespan_lock: Callable[[], asyncio.Lock],
         ) -> None:
             self._app = native_app
             self._allow_lazy_lifespan = allow_lazy_lifespan
             self._lifespan_entered = False
             self._lifespan_cm: Any = None
+            self._lifespan_lock = lifespan_lock
 
         async def _ensure_lifespan(self) -> None:
             """Lazily enter the MCP app's lifespan if not already running.
@@ -6460,7 +6419,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             """
             if self._lifespan_entered:
                 return
-            async with _shared_lazy_lifespan_lock():
+            async with self._lifespan_lock():
                 if self._lifespan_entered:
                     return
                 # Check if the session manager is already running (production path)
@@ -6510,19 +6469,20 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
             await self._app(new_scope, receive, send)
 
-    # Mount at both '/base' and '/base/' to tolerate either form from clients/tests.
-    # Also mount compatibility aliases for both '/api' and '/mcp' regardless of configured base.
-    base_no_slash = _normalized_http_base_path(settings.http.path)
-    base_with_slash = base_no_slash if base_no_slash == "/" else base_no_slash + "/"
-    allow_test_lifespan_fallback = settings.environment.casefold() == "test"
-    stateless_app = _HeaderFixupMCPApp(
-        mcp_http_app,
-        allow_lazy_lifespan=allow_test_lifespan_fallback,
-    )
-    stateful_app = _HeaderFixupMCPApp(
-        mcp_stateful_http_app,
-        allow_lazy_lifespan=allow_test_lifespan_fallback,
-    )
+    def __init__(self, settings: Settings, mcp_http_app: FastAPI, mcp_stateful_http_app: FastAPI) -> None:
+        self.lazy_lifespan_lock: asyncio.Lock | None = None
+        self.base_no_slash = _normalized_http_base_path(settings.http.path)
+        allow_test_lifespan_fallback = settings.environment.casefold() == "test"
+        self.stateless_app = self._HeaderFixupMCPApp(
+            mcp_http_app,
+            allow_lazy_lifespan=allow_test_lifespan_fallback,
+            lifespan_lock=self._shared_lazy_lifespan_lock,
+        )
+        self.stateful_app = self._HeaderFixupMCPApp(
+            mcp_stateful_http_app,
+            allow_lazy_lifespan=allow_test_lifespan_fallback,
+            lifespan_lock=self._shared_lazy_lifespan_lock,
+        )
 
     # Path -> app mapping (issue #250): the '/mcp' compat alias is the
     # stateful, Mcp-Session-Id-issuing endpoint; '/api' and the configured
@@ -6530,119 +6490,181 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     # The CONFIGURED base always keeps the legacy stateless behavior, even if
     # an operator points it at '/mcp' — an explicit HTTP_PATH is a promise to
     # existing clients of that deployment, so we never change its semantics.
-    def _app_for_mount(path: str) -> _HeaderFixupMCPApp:
+    def app_for_mount(self, path: str) -> _HeaderFixupMCPApp:
         normalized = path.rstrip("/") or "/"
-        if normalized == "/mcp" and base_no_slash != "/mcp":
-            return stateful_app
-        return stateless_app
+        if normalized == "/mcp" and self.base_no_slash != "/mcp":
+            return self.stateful_app
+        return self.stateless_app
 
-    mount_paths = [base_no_slash, base_with_slash]
+
+def _oauth_metadata_disabled() -> JSONResponse:
+    return JSONResponse({"mcp_oauth": False}, status_code=404)
+
+
+class _MCPResponseCapture:
+    """Collect one direct MCP response using the ASGI send contract."""
+
+    def __init__(self) -> None:
+        self.body: dict[str, Any] = {}
+        self.status_code = 200
+        self.headers: dict[str, str] = {}
+
+    async def send(self, message: MutableMapping[str, Any]) -> None:
+        if message.get("type") == "http.response.start":
+            self.status_code = int(message.get("status", 200))
+            for key, value in message.get("headers") or []:
+                self.headers[key.decode("latin1")] = value.decode("latin1")
+        elif message.get("type") == "http.response.body":
+            body = message.get("body") or b""
+            try:
+                self.body = json.loads(body.decode("utf-8")) if body else {}
+            except Exception:
+                self.body = {}
+
+
+class _MCPBasePassthrough:
+    def __init__(self, settings: Settings, target_app: _McpTransports._HeaderFixupMCPApp) -> None:
+        self.settings = settings
+        self.target_app = target_app
+
+    async def _base_passthrough(self, request: Request) -> JSONResponse:
+        response = _MCPResponseCapture()
+        scope = self._request_scope(request)
+        await self.target_app(
+            {**scope, "path": "/"},  # MCP app expects requests at its root.
+            request.receive,
+            response.send,
+        )
+        return JSONResponse(response.body, status_code=response.status_code, headers=response.headers)
+
+    def _request_scope(self, request: Request) -> dict[str, Any]:
+        settings = self.settings
+        scope = dict(request.scope)
+        if _localhost_bypass_allowed(
+            request,
+            allow_localhost=bool(settings.http.allow_localhost_unauthenticated),
+        ):
+            scope_headers = list(scope.get("headers") or [])
+            has_auth = any(key.lower() == b"authorization" for key, _ in scope_headers)
+            if not has_auth and settings.http.bearer_token:
+                scope_headers.append((b"authorization", f"Bearer {settings.http.bearer_token}".encode("latin1")))
+            scope["headers"] = scope_headers
+        return scope
+
+
+def _mcp_mount_paths(base_no_slash: str) -> list[str]:
+    base_with_slash = base_no_slash if base_no_slash == "/" else base_no_slash + "/"
+    paths = [base_no_slash, base_with_slash]
     for compat_base in ("/api", "/mcp"):
-        compat_no_slash = compat_base.rstrip("/") or "/"
-        compat_with_slash = compat_no_slash if compat_no_slash == "/" else compat_no_slash + "/"
-        if compat_no_slash not in mount_paths:
-            mount_paths.append(compat_no_slash)
-        if compat_with_slash not in mount_paths:
-            mount_paths.append(compat_with_slash)
+        for path in (compat_base, compat_base + "/"):
+            if path not in paths:
+                paths.append(path)
+    return paths
 
+
+def _mcp_passthrough_paths(base_no_slash: str) -> list[str]:
+    paths = [base_no_slash]
+    for compat_base in ("/api", "/mcp"):
+        if compat_base not in paths:
+            paths.append(compat_base)
+    return paths
+
+
+def _register_mcp_mounts(
+    fastapi_app: FastAPI,
+    settings: Settings,
+    transports: _McpTransports,
+    oauth_provider: _AllowlistedGitHubOAuthProxy | None,
+    oauth_routes: list[Any],
+    oauth_metadata_paths: frozenset[str],
+) -> None:
     if oauth_provider is not None:
         fastapi_app.router.routes.extend(oauth_routes)
         fastapi_app.state.oauth_provider = oauth_provider
     else:
         for path in sorted(oauth_metadata_paths):
-            _register_oauth_metadata_disabled(path)
+            fastapi_app.add_api_route(path, _oauth_metadata_disabled, methods=["GET"], include_in_schema=False)
 
-    for mount_path in mount_paths:
+    for mount_path in _mcp_mount_paths(transports.base_no_slash):
         with contextlib.suppress(Exception):
-            fastapi_app.mount(mount_path, _app_for_mount(mount_path))
+            fastapi_app.mount(mount_path, transports.app_for_mount(mount_path))
 
-    # Expose composed lifespan via router
-    fastapi_app.router.lifespan_context = lifespan_context
+    # Match the mounted app at every base when the client omits its trailing slash.
+    for path in _mcp_passthrough_paths(transports.base_no_slash):
+        endpoint = _MCPBasePassthrough(settings, transports.app_for_mount(path))
+        fastapi_app.add_api_route(path, endpoint._base_passthrough, methods=["POST"])
 
-    # Add direct routes at no-slash base paths to tolerate clients omitting trailing slashes.
-    def _register_base_passthrough(base_path_no_slash: str, base_path_with_slash: str) -> None:
-        # Dispatch to the same app that is mounted at this base (issue #250:
-        # '/mcp' is stateful, everything else stateless).
-        target_app = _app_for_mount(base_path_no_slash)
 
-        @fastapi_app.post(base_path_no_slash)
-        async def _base_passthrough(request: Request) -> JSONResponse:
-            # Re-dispatch to the mounted MCP app by calling it directly
-            response_body: dict[str, Any] = {}
-            status_code = 200
-            headers: dict[str, str] = {}
+class _MailRouteSpec(NamedTuple):
+    path: str
+    methods: list[str]
+    options: dict[str, Any]
 
-            async def _send(message: MutableMapping[str, Any]) -> None:
-                nonlocal response_body, status_code, headers
-                if message.get("type") == "http.response.start":
-                    status_code = int(message.get("status", 200))
-                    hdrs = message.get("headers") or []
-                    for k, v in hdrs:
-                        headers[k.decode("latin1")] = v.decode("latin1")
-                elif message.get("type") == "http.response.body":
-                    body = message.get("body") or b""
-                    try:
-                        response_body = json.loads(body.decode("utf-8")) if body else {}
-                    except Exception:
-                        response_body = {}
 
-            # If localhost and allow_localhost_unauthenticated, synthesize Authorization header automatically
-            scope = dict(request.scope)
-            if _localhost_bypass_allowed(
-                request,
-                allow_localhost=bool(settings.http.allow_localhost_unauthenticated),
-            ):
-                scope_headers = list(scope.get("headers") or [])
-                has_auth = any(k.lower() == b"authorization" for k, _ in scope_headers)
-                if not has_auth and settings.http.bearer_token:
-                    scope_headers.append((b"authorization", f"Bearer {settings.http.bearer_token}".encode("latin1")))
-                scope["headers"] = scope_headers
-            await target_app(
-                {**scope, "path": "/"},  # MCP app expects requests at its root
-                request.receive,
-                _send,
-            )
-            return JSONResponse(response_body, status_code=status_code, headers=headers)
+def _mail_route[Handler: Callable[..., Any]](
+    path: str, *, methods: list[str], **options: Any
+) -> Callable[[Handler], Handler]:
+    """Record route metadata until the per-application handler is bound."""
+    def decorate(handler: Handler) -> Handler:
+        specs: list[_MailRouteSpec] = list(getattr(handler, "_mail_route_specs", ()))
+        specs.append(_MailRouteSpec(path, methods, options))
+        cast(Any, handler)._mail_route_specs = specs
+        return handler
+    return decorate
 
-    passthrough_pairs: list[tuple[str, str]] = [(base_no_slash, base_with_slash)]
-    for compat_base in ("/api", "/mcp"):
-        compat_no_slash = compat_base.rstrip("/") or "/"
-        compat_with_slash = compat_no_slash if compat_no_slash == "/" else compat_no_slash + "/"
-        if (compat_no_slash, compat_with_slash) not in passthrough_pairs:
-            passthrough_pairs.append((compat_no_slash, compat_with_slash))
-    for no_slash, with_slash in passthrough_pairs:
-        _register_base_passthrough(no_slash, with_slash)
 
-    # ----- Simple SSR Mail UI -----
-    def _register_mail_ui() -> None:
+_mail_get = functools.partial(_mail_route, methods=["GET"])
+_mail_post = functools.partial(_mail_route, methods=["POST"])
+_mail_patch = functools.partial(_mail_route, methods=["PATCH"])
+_mail_put = functools.partial(_mail_route, methods=["PUT"])
+
+
+class _MailRouteGroup:
+    def __init__(self, context: _MailUiRoutes) -> None:
+        self.context = context
+
+    def register(self, app: FastAPI) -> None:
+        """Preserve definition and stacked-decorator order when adding routes."""
+        for name in vars(type(self)):
+            endpoint = getattr(self, name)
+            for spec in getattr(endpoint, "_mail_route_specs", ()):
+                app.add_api_route(spec.path, endpoint, methods=spec.methods, **spec.options)
+
+
+class _MailUiRoutes:
+    """Own the renderer and route groups for one application instance."""
+
+    def __init__(self, app: FastAPI, settings: Settings) -> None:
+        self.app = app
+        self.settings = settings
         import bleach
         import markdown2
 
         try:
             from bleach.css_sanitizer import CSSSanitizer as _CSSSanitizerImport
         except Exception:  # tinycss2 may be missing; degrade gracefully
-            _CSSSanitizer = None
+            css_sanitizer_type = None
         else:
-            _CSSSanitizer = _CSSSanitizerImport
-        CSSSanitizer = cast(Any, _CSSSanitizer)
+            css_sanitizer_type = _CSSSanitizerImport
+        sanitizer_factory = cast(Any, css_sanitizer_type)
         from jinja2 import Environment, FileSystemLoader, select_autoescape
 
         templates_root = Path(__file__).resolve().parent / "templates"
-        env = Environment(
+        self.env = Environment(
             loader=FileSystemLoader(str(templates_root)),
             autoescape=select_autoescape(["html", "xml"]),
             enable_async=True,
         )
         # HTML sanitizer (allow safe images and limited CSS)
         _css_sanitizer = (
-            CSSSanitizer(
+            sanitizer_factory(
                 allowed_css_properties=["color", "background-color", "text-align", "text-decoration", "font-weight"]
             )
-            if CSSSanitizer
+            if sanitizer_factory
             else None
         )
 
-        _html_cleaner = bleach.Cleaner(
+        self.html_cleaner = bleach.Cleaner(
             tags=[
                 "a",
                 "abbr",
@@ -6696,11 +6718,72 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             strip=True,
             css_sanitizer=_css_sanitizer,
         )
+        self.markdown = markdown2
+        self.rendering = self.Rendering(self)
+        self.operations = self.Operations(self)
+        self.sessions = self.Sessions(self)
+        self.live = self.Live(self)
+        self.projects = self.Projects(self)
+        self.messages = self.Messages(self)
+        self.accounts = self.Accounts(self)
+        self.maintenance = self.Maintenance(self)
+        self.overview = self.Overview(self)
+        self.shell = self.Shell(self)
+        self.legacy = self.Legacy(self)
+        self.overseer = self.Overseer(self)
+        self.archive = self.Archive(self)
 
-        async def _render(name: str, status_code: int = 200, **ctx: Any) -> HTMLResponse:
+    def register(self) -> None:
+        groups = (
+            self.operations, self.sessions, self.live, self.projects, self.messages,
+            self.accounts, self.maintenance, self.overview, self.shell, self.legacy,
+            self.overseer, self.archive,
+        )
+        for group in groups:
+            group.register(self.app)
+
+    class Rendering(_MailRouteGroup):
+        @classmethod
+        def _fts_query_parts(cls, raw: str) -> list[str]:
+            """Split quoted/scoped terms in linear time, including malformed input.
+
+            A quoted alternative wins only when it contains at least one
+            character and closes. Otherwise the next non-whitespace run is
+            one literal term. Indexing successive quotes once avoids rescanning
+            the remaining input for every unmatched opening quote or prefix.
+            """
+            quote_positions = [index for index, char in enumerate(raw) if char == '"']
+            quote_ends = dict(itertools.pairwise(quote_positions))
+            parts: list[str] = []
+            cursor = 0
+            while cursor < len(raw):
+                if raw[cursor].isspace():
+                    cursor += 1
+                    continue
+                start = cursor
+                cursor = cls._fts_token_end(raw, start, quote_ends)
+                parts.append(raw[start:cursor])
+            return parts
+
+        @staticmethod
+        def _fts_token_end(raw: str, start: int, quote_ends: dict[int, int]) -> int:
+            cursor = start
+            while cursor < len(raw) and (raw[cursor].isalnum() or raw[cursor] == "_"):
+                cursor += 1
+            quote_start = start if raw[start] == '"' else -1
+            if cursor > start and raw[cursor:cursor + 2] == ':"':
+                quote_start = cursor + 1
+            quote_end = quote_ends.get(quote_start)
+            if quote_end is not None and quote_end > quote_start + 1:
+                return quote_end + 1
+            while cursor < len(raw) and not raw[cursor].isspace():
+                cursor += 1
+            return cursor
+
+        async def _render(self, name: str, status_code: int = 200, **ctx: Any) -> HTMLResponse:
             ctx.setdefault("mail_ui_user", _mail_ui_template_user.get())
             ctx.setdefault("mail_ui_access", None)
-            tpl = env.get_template(name)
+            tpl = self.context.env.get_template(name)
             html = await tpl.render_async(**ctx)
             return HTMLResponse(
                 html,
@@ -6708,8 +6791,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 headers=_MAIL_LEGACY_HTML_HEADERS,
             )
 
+        @classmethod
         def _parse_fts_query(
-            raw: str, scope_preference: str | None = None
+            cls, raw: str, scope_preference: str | None = None
         ) -> tuple[str, str, str, list[dict[str, str]]]:
             """Return (fts_expression, like_pattern) from a user query.
             Supports subject:foo and body:"multi word" tokens; otherwise defaults to subject/body OR.
@@ -6719,7 +6803,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 return "", "", "both", []
             scope_pref = scope_preference if scope_preference in {"subject", "body"} else "both"
             # tokens: key:"phrase" | "phrase" | key:word | word
-            parts = re.findall(r"\w+:\"[^\"]+\"|\"[^\"]+\"|\w+:[^\s]+|[^\s]+", raw)
+            parts = cls._fts_query_parts(raw)
             exprs: list[str] = []
             like_terms: list[str] = []
             like_scope = scope_pref
@@ -6732,36 +6816,34 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 return term.replace("!", "!!").replace("%", "!%").replace("_", "!_")
 
             for p in parts:
-                key = None
-                val = p
-                if ":" in p and not p.startswith('"'):
-                    maybe_key, maybe_val = p.split(":", 1)
-                    if maybe_key in {"subject", "body"}:
-                        key = maybe_key
-                        val = maybe_val
-                val = val.strip()
-                val_inner = val[1:-1] if val.startswith('"') and val.endswith('"') and len(val) >= 2 else val
-
+                key, val_inner = cls._parse_fts_token(p)
                 # For LIKE pattern, we want literal matching of the user's term
                 like_terms.append(_like_escape(val_inner))
-
-                if key in {"subject", "body"}:
-                    exprs.append(f"{key}:{_quote(val_inner)}")
-                    tokens.append({"field": key, "value": val_inner})
+                field = key or scope_pref
+                if field in {"subject", "body"}:
+                    exprs.append(f"{field}:{_quote(val_inner)}")
                 else:
-                    if scope_pref == "subject":
-                        exprs.append(f"subject:{_quote(val_inner)}")
-                        tokens.append({"field": "subject", "value": val_inner})
-                    elif scope_pref == "body":
-                        exprs.append(f"body:{_quote(val_inner)}")
-                        tokens.append({"field": "body", "value": val_inner})
-                    else:
-                        exprs.append(f"(subject:{_quote(val_inner)} OR body:{_quote(val_inner)})")
-                        tokens.append({"field": "both", "value": val_inner})
-            fts = " AND ".join(exprs) if exprs else ""
+                    exprs.append(f"(subject:{_quote(val_inner)} OR body:{_quote(val_inner)})")
+                tokens.append({"field": field, "value": val_inner})
+            fts = _SQL_AND.join(exprs) if exprs else ""
             like_pat = "%" + "%".join(like_terms) + "%" if like_terms else ""
             return fts, like_pat, like_scope, tokens
 
+        @staticmethod
+        def _parse_fts_token(part: str) -> tuple[str | None, str]:
+            key = None
+            value = part
+            if ":" in part and not part.startswith('"'):
+                maybe_key, maybe_value = part.split(":", 1)
+                if maybe_key in {"subject", "body"}:
+                    key = maybe_key
+                    value = maybe_value
+            value = value.strip()
+            if value.startswith('"') and value.endswith('"') and len(value) >= 2:
+                value = value[1:-1]
+            return key, value
+
+        @staticmethod
         def _safe_fts_snippet(raw_snippet: object) -> tuple[Markup, int]:
             """Escape agent-controlled FTS text while preserving highlights.
 
@@ -6779,7 +6861,24 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             )
             return Markup(highlighted), hits
 
-        @fastapi_app.get("/mail/api/locks", response_class=JSONResponse)
+    class Operations(_MailRouteGroup):
+        @staticmethod
+        def _reservation_still_active(raw: Any, now: datetime) -> bool:
+            if isinstance(raw, datetime):
+                return raw.replace(tzinfo=None) > now
+            try:
+                return datetime.fromisoformat(str(raw).replace(" ", "T")) > now
+            except (TypeError, ValueError):
+                # An unparseable expiry is reported rather than silently
+                # dropped: a warning that turns out to be stale costs a
+                # glance, a reservation that vanishes costs a collision.
+                return True
+
+        @staticmethod
+        @_mail_get(
+            "/mail/api/locks", response_class=JSONResponse,
+            responses={403: _HTTP_FORBIDDEN_RESPONSE},
+        )
         async def mail_lock_status(request: Request) -> JSONResponse:
             """Return metadata about active archive locks for observability."""
 
@@ -6788,8 +6887,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             payload = collect_lock_status(settings_local)
             return JSONResponse(payload)
 
-        @fastapi_app.get("/mail/api/file-reservations", response_class=JSONResponse)
+        @_mail_get(
+            "/mail/api/file-reservations", response_class=JSONResponse,
+            responses={403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE},
+        )
         async def mail_active_file_reservations(
+            self,
             request: Request,
             project: str,
             path: str | None = None,
@@ -6816,12 +6919,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             ALWAYS false — the endpoint would return 200 with an empty list
             forever and look like it worked.
             """
+            settings = self.context.settings
             await ensure_schema()
             now = datetime.now(timezone.utc).replace(tzinfo=None)
             async with get_session() as session:
                 prow = await _resolve_mail_project(session, project)
                 if not prow:
-                    return JSONResponse({"detail": "Project not found"}, status_code=404)
+                    return JSONResponse({"detail": _PROJECT_NOT_FOUND_DETAIL}, status_code=404)
                 if not getattr(request.state, "mail_ui_service_principal", False):
                     await _mail_ui_require_project_access(
                         settings=settings,
@@ -6843,17 +6947,6 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         {"pid": int(prow[0])},
                     )
                 ).fetchall()
-
-            def _still_active(raw: Any) -> bool:
-                if isinstance(raw, datetime):
-                    return raw.replace(tzinfo=None) > now
-                try:
-                    return datetime.fromisoformat(str(raw).replace(" ", "T")) > now
-                except (TypeError, ValueError):
-                    # An unparseable expiry is reported rather than silently
-                    # dropped: a warning that turns out to be stale costs a
-                    # glance, a reservation that vanishes costs a collision.
-                    return True
 
             # Annotated, not inferred: the value type of a dict literal is the
             # union of ALL its values, so the lone `bool(...)` on `exclusive`
@@ -6885,7 +6978,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     "legacy_unscoped": r[7] is None,
                 }
                 for r in rows
-                if _still_active(r[5])
+                if self._reservation_still_active(r[5], now)
             ]
 
             if path:
@@ -6913,10 +7006,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             return JSONResponse({"active": len(items), "reservations": items})
 
         async def _build_unified_inbox_payload(
-            *, request: Request, limit: int = 500, include_projects: bool = True
+            self, *, request: Request, limit: int = 500, include_projects: bool = True
         ) -> dict[str, Any]:
             """Fetch unified inbox data for HTML and JSON consumers."""
-
+            settings = self.context.settings
             safe_limit = max(1, min(int(limit), 1000))
             messages: list[dict[str, Any]] = []
             projects: list[dict[str, Any]] = []
@@ -6926,11 +7019,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             try:
                 await ensure_schema()
 
-                sibling_map: dict[int, dict[str, Any]] = {}
-                if include_projects:
-                    if _mail_ui_request_is_admin(settings=settings, request=request):
-                        await refresh_project_sibling_suggestions()
-                    sibling_map = await get_project_sibling_data()
+                sibling_map = await self._unified_sibling_map(request) if include_projects else {}
 
                 async with get_session() as session:
                     visible_roles = await _mail_ui_visible_project_roles(
@@ -7012,76 +7101,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     rows = await session.execute(query, {**visible_params, "limit": safe_limit})
 
                     for r in rows.mappings().all():
-                        body = r["body_md"] or ""
-                        raw_body_length = r["body_length"]
-                        body_length = int(raw_body_length) if raw_body_length is not None else len(body)
-                        excerpt = body[:150].replace('#', '').replace('*', '').replace('`', '').strip()
-                        if body_length > 150:
-                            excerpt += "..."
-
-                        created_ts = r["created_ts"]
-                        if isinstance(created_ts, str):
-                            created_dt = datetime.fromisoformat(created_ts.replace('Z', '+00:00'))
-                        else:
-                            created_dt = created_ts
-
-                        if created_dt.tzinfo is None:
-                            created_dt = created_dt.replace(tzinfo=timezone.utc)
-                        else:
-                            created_dt = created_dt.astimezone(timezone.utc)
-
-                        now = datetime.now(timezone.utc)
-                        delta = now - created_dt
-
-                        if delta.days < 0 or (delta.days == 0 and delta.seconds < 0):
-                            created_relative = "Just now"
-                        elif delta.days > 365:
-                            created_relative = f"{delta.days // 365}y ago"
-                        elif delta.days > 30:
-                            created_relative = f"{delta.days // 30}mo ago"
-                        elif delta.days > 0:
-                            created_relative = f"{delta.days}d ago"
-                        elif delta.seconds > 3600:
-                            created_relative = f"{delta.seconds // 3600}h ago"
-                        elif delta.seconds > 60:
-                            created_relative = f"{delta.seconds // 60}m ago"
-                        else:
-                            created_relative = "Just now"
-
-                        sender_display, sender_meta = _http_sender_identity(
-                            message_project_id=r["message_project_id"],
-                            sender_name=r["sender_name"],
-                            sender_project_id=r["sender_project_id"],
-                            sender_project_human_key=r["sender_project_name"],
-                            sender_project_slug=r["sender_project_slug"],
-                        )
-                        message_payload = {
-                            "id": r["id"],
-                            "subject": r["subject"] or "(No subject)",
-                            "body_md": body,
-                            "body_length": body_length,
-                            "excerpt": excerpt,
-                            "created_ts": str(r["created_ts"]),
-                            "created_full": created_dt.strftime("%B %d, %Y at %I:%M %p"),
-                            "created_relative": created_relative,
-                            "importance": r["importance"] or "normal",
-                            "thread_id": r["thread_id"],
-                            "sender": sender_display,
-                            "project_slug": r["project_slug"],
-                            "project_name": r["project_name"],
-                            "recipients": ", ".join(
-                                part.strip() for part in (r["recipients"] or "").split(",") if part.strip()
-                            ),
-                            "read": False,
-                            "can_reply": _mail_ui_access_context(
-                                settings=settings,
-                                request=request,
-                                project_id=int(r["message_project_id"]),
-                                project_role=visible_roles[int(r["message_project_id"])],
-                            )["can_reply"],
-                        }
-                        message_payload.update(sender_meta)
-                        messages.append(message_payload)
+                        messages.append(self._unified_message_payload(r, request, visible_roles))
 
                     if include_projects:
                         rows = await session.execute(
@@ -7126,7 +7146,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                             )
 
             except Exception as exc:  # pragma: no cover - defensive logging
-                logging.error("Error fetching unified inbox data", exc_info=True, extra={"error": str(exc)})
+                logging.exception("Error fetching unified inbox data", extra={"error": str(exc)})
 
             # Who sounds like what, for the chime in base.html. Flattened across
             # every project because this page spans all of them and the chime is
@@ -7163,12 +7183,93 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 "has_more": total_messages > len(messages),
             }
 
+        async def _unified_sibling_map(self, request: Request) -> dict[int, dict[str, Any]]:
+            if _mail_ui_request_is_admin(settings=self.context.settings, request=request):
+                await refresh_project_sibling_suggestions()
+            return await get_project_sibling_data()
+
+        def _unified_message_payload(
+            self,
+            row: RowMapping,
+            request: Request,
+            visible_roles: dict[int, str | None],
+        ) -> dict[str, Any]:
+            body = row["body_md"] or ""
+            raw_body_length = row["body_length"]
+            body_length = int(raw_body_length) if raw_body_length is not None else len(body)
+            excerpt = body[:150].replace('#', '').replace('*', '').replace('`', '').strip()
+            if body_length > 150:
+                excerpt += "..."
+
+            created_ts = row["created_ts"]
+            if isinstance(created_ts, str):
+                created_dt = datetime.fromisoformat(created_ts.replace('Z', _UTC_OFFSET))
+            else:
+                created_dt = created_ts
+            if created_dt.tzinfo is None:
+                created_dt = created_dt.replace(tzinfo=timezone.utc)
+            else:
+                created_dt = created_dt.astimezone(timezone.utc)
+            created_relative = self._relative_message_time(datetime.now(timezone.utc) - created_dt)
+            sender_display, sender_meta = _http_sender_identity(
+                message_project_id=row["message_project_id"],
+                sender_name=row["sender_name"],
+                sender_project_id=row["sender_project_id"],
+                sender_project_human_key=row["sender_project_name"],
+                sender_project_slug=row["sender_project_slug"],
+            )
+            payload = {
+                "id": row["id"],
+                "subject": row["subject"] or "(No subject)",
+                "body_md": body,
+                "body_length": body_length,
+                "excerpt": excerpt,
+                "created_ts": str(row["created_ts"]),
+                "created_full": created_dt.strftime("%B %d, %Y at %I:%M %p"),
+                "created_relative": created_relative,
+                "importance": row["importance"] or "normal",
+                "thread_id": row["thread_id"],
+                "sender": sender_display,
+                "project_slug": row["project_slug"],
+                "project_name": row["project_name"],
+                "recipients": ", ".join(
+                    part.strip() for part in (row["recipients"] or "").split(",") if part.strip()
+                ),
+                "read": False,
+                "can_reply": _mail_ui_access_context(
+                    settings=self.context.settings,
+                    request=request,
+                    project_id=int(row["message_project_id"]),
+                    project_role=visible_roles[int(row["message_project_id"])],
+                )["can_reply"],
+            }
+            payload.update(sender_meta)
+            return payload
+
+        @staticmethod
+        def _relative_message_time(delta: timedelta) -> str:
+            if delta.days < 0 or (delta.days == 0 and delta.seconds < 0):
+                return "Just now"
+            if delta.days > 365:
+                return f"{delta.days // 365}y ago"
+            if delta.days > 30:
+                return f"{delta.days // 30}mo ago"
+            if delta.days > 0:
+                return f"{delta.days}d ago"
+            if delta.seconds > 3600:
+                return f"{delta.seconds // 3600}h ago"
+            if delta.seconds > 60:
+                return f"{delta.seconds // 60}m ago"
+            return "Just now"
+
         # ---------------------------------------------------------------
         # Login / logout for the viewer. MailUiAuthMiddleware lets exactly
         # these two paths through without a session; everything else under
         # /mail is gated. See mcp_agent_mail.webauth for the primitives.
         # ---------------------------------------------------------------
 
+    class Sessions(_MailRouteGroup):
+        @staticmethod
         def _safe_next(raw: str) -> str:
             """Redirect sign-in only to the shell or an enumerated bookmark.
 
@@ -7184,23 +7285,23 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 or "\\" in candidate
                 or any(ord(character) < 32 or ord(character) == 127 for character in candidate)
             ):
-                return "/mail"
+                return _MAIL_REACT_BASE_PATH
             parsed = urlsplit(candidate)
             if parsed.scheme or parsed.netloc:
-                return "/mail"
-            if parsed.path in {"/mail", "/mail/"}:
-                return urlunsplit(("", "", "/mail", parsed.query, parsed.fragment))
+                return _MAIL_REACT_BASE_PATH
+            if parsed.path in {_MAIL_REACT_BASE_PATH, _MAIL_PATH_PREFIX}:
+                return urlunsplit(("", "", _MAIL_REACT_BASE_PATH, parsed.query, parsed.fragment))
             if parsed.fragment:
-                return "/mail"
+                return _MAIL_REACT_BASE_PATH
             decoded_path = _mail_ui_decode_raw_path(parsed.path)
             if decoded_path is None:
-                return "/mail"
+                return _MAIL_REACT_BASE_PATH
             bookmark = _mail_ui_canonical_legacy_bookmark(
                 raw_path=parsed.path,
                 decoded_path=decoded_path,
             )
             if bookmark is None:
-                return "/mail"
+                return _MAIL_REACT_BASE_PATH
             try:
                 query_items = parse_qsl(
                     parsed.query,
@@ -7209,7 +7310,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     max_num_fields=4,
                 )
             except ValueError:
-                return "/mail"
+                return _MAIL_REACT_BASE_PATH
             if bookmark["kind"] in {"project", "search"}:
                 if (
                     _mail_ui_legacy_search_hash(
@@ -7219,12 +7320,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     )
                     is None
                 ):
-                    return "/mail"
+                    return _MAIL_REACT_BASE_PATH
             elif query_items:
-                return "/mail"
+                return _MAIL_REACT_BASE_PATH
             return urlunsplit(("", "", parsed.path, parsed.query, ""))
 
         async def _render_mail_login(
+            self,
             request: Request,
             *,
             error: str | None,
@@ -7232,6 +7334,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             requested_locale: str | None,
             status_code: int = status.HTTP_200_OK,
         ) -> HTMLResponse:
+            _render = self.context.rendering._render
             locale = _mail_login_locale(
                 requested_locale,
                 request.headers.get("accept-language", ""),
@@ -7246,8 +7349,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             response.headers.update(_MAIL_LOGIN_HTML_HEADERS)
             return response
 
-        @fastapi_app.get(_MAIL_LOGIN_PATH, response_class=HTMLResponse)
-        async def mail_login_form(request: Request) -> HTMLResponse:
+        @_mail_get(_MAIL_LOGIN_PATH, response_class=HTMLResponse)
+        async def mail_login_form(self, request: Request) -> HTMLResponse:
+            settings = self.context.settings
+            _safe_next = self._safe_next
+            _render_mail_login = self._render_mail_login
             cfg = settings.mail_ui
             # Already signed in? Don't show the form again.
             token = request.cookies.get(cfg.cookie_name, "")
@@ -7256,23 +7362,26 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     "", status_code=status.HTTP_303_SEE_OTHER,
                     headers={
                         **_MAIL_LOGIN_HTML_HEADERS,
-                        "Location": _safe_next(request.query_params.get("next", "/mail")),
+                        "Location": _safe_next(request.query_params.get("next", _MAIL_REACT_BASE_PATH)),
                     },
                 )
             return await _render_mail_login(
                 request,
                 error=None,
-                next_url=_safe_next(request.query_params.get("next", "/mail")),
+                next_url=_safe_next(request.query_params.get("next", _MAIL_REACT_BASE_PATH)),
                 requested_locale=request.query_params.get("lang"),
             )
 
-        @fastapi_app.post(_MAIL_LOGIN_PATH)
-        async def mail_login_submit(request: Request) -> Response:
+        @_mail_post(_MAIL_LOGIN_PATH)
+        async def mail_login_submit(self, request: Request) -> Response:
+            settings = self.context.settings
+            _safe_next = self._safe_next
+            _render_mail_login = self._render_mail_login
             cfg = settings.mail_ui
             form = await request.form()
             username = str(form.get("username", "")).strip()
             password = str(form.get("password", ""))
-            next_url = _safe_next(str(form.get("next", "/mail")))
+            next_url = _safe_next(str(form.get("next", _MAIL_REACT_BASE_PATH)))
             submitted_locale = form.get("lang")
             requested_locale = (
                 str(submitted_locale)
@@ -7292,7 +7401,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 request.headers.get("host", ""),
                 expected_scheme=request.url.scheme,
             ):
-                return JSONResponse({"detail": "Cross-origin request rejected"}, status_code=403)
+                return JSONResponse({"detail": _CROSS_ORIGIN_DETAIL}, status_code=403)
 
             client_ip = request.client.host if request.client else "-"
             throttle_key = f"{client_ip}\0{username.casefold()[:64]}"
@@ -7389,8 +7498,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             structlog.get_logger("mail_ui").info("mail_ui.login_ok", username=username, client=client_ip)
             return response
 
-        @fastapi_app.post(_MAIL_LOGOUT_PATH)
-        async def mail_logout(request: Request) -> Response:
+        @_mail_post(_MAIL_LOGOUT_PATH)
+        async def mail_logout(self, request: Request) -> Response:
+            settings = self.context.settings
             if not webauth.same_origin(
                 request.headers.get("origin", ""),
                 request.headers.get("referer", ""),
@@ -7398,7 +7508,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 expected_scheme=request.url.scheme,
             ):
                 return JSONResponse(
-                    {"detail": "Cross-origin request rejected"},
+                    {"detail": _CROSS_ORIGIN_DETAIL},
                     status_code=status.HTTP_403_FORBIDDEN,
                     headers=_MAIL_LEGACY_HTML_HEADERS,
                 )
@@ -7407,10 +7517,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 status_code=status.HTTP_303_SEE_OTHER,
                 headers={**_MAIL_LEGACY_HTML_HEADERS, "Location": _MAIL_LOGIN_PATH},
             )
-            response.delete_cookie(cfg.cookie_name, path="/mail")
+            response.delete_cookie(cfg.cookie_name, path=_MAIL_REACT_BASE_PATH)
             return response
 
-        @fastapi_app.api_route(
+        @staticmethod
+        @_mail_route(
             _MAIL_LOGOUT_PATH,
             methods=["GET", "HEAD"],
             include_in_schema=False,
@@ -7421,18 +7532,103 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 headers={**_MAIL_LEGACY_HTML_HEADERS, "Allow": "POST"},
             )
 
-        @fastapi_app.api_route(
-            "/mail",
+        @_mail_route(
+            _MAIL_REACT_BASE_PATH,
             methods=["GET", "HEAD"],
             response_class=HTMLResponse,
             include_in_schema=False,
         )
-        async def mail_react_index() -> FileResponse:
+        async def mail_react_index(self) -> FileResponse:
             """Serve the sole authenticated human interface."""
-            return _mail_react_index_response()
+            return self.context.shell._mail_react_index_response()
 
-        @fastapi_app.get("/mail/events")
-        async def mail_events_stream(request: Request) -> Any:
+    class Live(_MailRouteGroup):
+        class Stream:
+            def __init__(
+                self,
+                *,
+                settings: Settings,
+                session_token: str,
+                principal: MailUiSessionPrincipal | None,
+                project_slug: str | None,
+                project_lifetimes: dict[str, tuple[int, str]],
+                queue: asyncio.Queue[dict[str, Any]],
+            ) -> None:
+                self.settings = settings
+                self.session_token = session_token
+                self.principal = principal
+                self.project_slug = project_slug
+                self.project_lifetimes = project_lifetimes
+                self.queue = queue
+
+            async def _access_valid(self, project_slug: str | None) -> bool:
+                lifetime = self.project_lifetimes.get(project_slug) if project_slug is not None else None
+                return await _mail_ui_stream_access_valid(
+                    settings=self.settings,
+                    session_token=self.session_token,
+                    project_slug=project_slug,
+                    expected_principal=self.principal,
+                    expected_project_id=lifetime[0] if lifetime is not None else None,
+                    expected_project_generation=lifetime[1] if lifetime is not None else None,
+                )
+
+            async def _event_visibility(self, event: Any) -> Literal["visible", "skip", "close"]:
+                event_project = event.get("project") if isinstance(event, dict) else None
+                if not isinstance(event_project, str):
+                    return "close"
+                event_scope = event_project if self.project_slug is None else self.project_slug
+                if await self._access_valid(event_scope):
+                    return "visible"
+                if self.project_slug is None and await self._access_valid(None):
+                    return "skip"
+                return "close"
+
+            def _unsubscribe(self) -> None:
+                if self.project_slug is None:
+                    hub.unsubscribe_projects(
+                        (
+                            (slug, generation)
+                            for slug, (_project_id, generation) in self.project_lifetimes.items()
+                        ),
+                        self.queue,
+                    )
+                else:
+                    _project_id, project_generation = self.project_lifetimes[self.project_slug]
+                    hub.unsubscribe_project(self.project_slug, project_generation, self.queue)
+
+            async def stream(self) -> Any:
+                deadline = asyncio.get_running_loop().time() + MAX_STREAM_SECONDS
+                try:
+                    yield b": ready\n\n"
+                    while True:
+                        remaining = deadline - asyncio.get_running_loop().time()
+                        if remaining <= 0:
+                            return
+                        try:
+                            event = await asyncio.wait_for(
+                                self.queue.get(), timeout=min(KEEPALIVE_SECONDS, remaining)
+                            )
+                        except asyncio.TimeoutError:
+                            if not await self._access_valid(self.project_slug):
+                                return
+                            yield b": ping\n\n"
+                            continue
+                        visibility = await self._event_visibility(event)
+                        if visibility == "close":
+                            return
+                        if visibility == "skip":
+                            continue
+                        # Unlike the agent stream this does NOT close after one
+                        # frame: a page stays open and would otherwise have to
+                        # reconnect after every message it displays.
+                        yield f"data: {json.dumps(event, separators=(',', ':'))}\n\n".encode()
+                finally:
+                    self._unsubscribe()
+
+        @_mail_get(
+            "/mail/events", responses={403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE},
+        )
+        async def mail_events_stream(self, request: Request) -> Any:
             """Tell the open viewer when to refetch, so it stops needing F5.
 
             Under `/mail/`, so the session cookie the viewer already holds is
@@ -7455,6 +7651,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             # of them, and those are the pages a person opens first. The frame is
             # the same either way and carries nothing, so the wider scope reveals
             # nothing wider.
+            settings = self.context.settings
             project_key = (request.query_params.get("project") or "").strip()
             session_token = request.cookies.get(settings.mail_ui.cookie_name, "")
             stream_principal = _mail_ui_request_user(request)
@@ -7464,7 +7661,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 async with get_session() as session:
                     row = await _resolve_mail_project(session, project_key)
                     if row is None:
-                        return JSONResponse({"detail": "Project not found"}, status_code=404)
+                        return JSONResponse({"detail": _PROJECT_NOT_FOUND_DETAIL}, status_code=404)
                     await _mail_ui_require_project_access(
                         settings=settings,
                         request=request,
@@ -7503,96 +7700,16 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     for slug, (_project_id, generation) in project_lifetimes.items()
                 )
 
-            async def stream() -> Any:
-                deadline = asyncio.get_running_loop().time() + MAX_STREAM_SECONDS
-                try:
-                    yield b": ready\n\n"
-                    while True:
-                        remaining = deadline - asyncio.get_running_loop().time()
-                        if remaining <= 0:
-                            return
-                        try:
-                            event = await asyncio.wait_for(
-                                queue.get(), timeout=min(KEEPALIVE_SECONDS, remaining)
-                            )
-                        except asyncio.TimeoutError:
-                            keepalive_lifetime = (
-                                project_lifetimes.get(project_slug)
-                                if project_slug is not None
-                                else None
-                            )
-                            if not await _mail_ui_stream_access_valid(
-                                settings=settings,
-                                session_token=session_token,
-                                project_slug=project_slug,
-                                expected_principal=stream_principal,
-                                expected_project_id=(
-                                    keepalive_lifetime[0]
-                                    if keepalive_lifetime is not None
-                                    else None
-                                ),
-                                expected_project_generation=(
-                                    keepalive_lifetime[1]
-                                    if keepalive_lifetime is not None
-                                    else None
-                                ),
-                            ):
-                                return
-                            yield b": ping\n\n"
-                            continue
-                        event_project = event.get("project") if isinstance(event, dict) else None
-                        if not isinstance(event_project, str):
-                            return
-                        event_scope = event_project if project_slug is None else project_slug
-                        expected_lifetime = project_lifetimes.get(event_scope)
-                        event_is_visible = await _mail_ui_stream_access_valid(
-                            settings=settings,
-                            session_token=session_token,
-                            project_slug=event_scope,
-                            expected_principal=stream_principal,
-                            expected_project_id=(
-                                expected_lifetime[0]
-                                if expected_lifetime is not None
-                                else None
-                            ),
-                            expected_project_generation=(
-                                expected_lifetime[1]
-                                if expected_lifetime is not None
-                                else None
-                            ),
-                        )
-                        if not event_is_visible:
-                            if project_slug is None and await _mail_ui_stream_access_valid(
-                                settings=settings,
-                                session_token=session_token,
-                                project_slug=None,
-                                expected_principal=stream_principal,
-                            ):
-                                continue
-                            return
-                        # Unlike the agent stream this does NOT close after one
-                        # frame: a page stays open and would otherwise have to
-                        # reconnect after every message it displays.
-                        yield f"data: {json.dumps(event, separators=(',', ':'))}\n\n".encode()
-                finally:
-                    if project_slug is None:
-                        hub.unsubscribe_projects(
-                            (
-                                (slug, generation)
-                                for slug, (_project_id, generation) in project_lifetimes.items()
-                            ),
-                            queue,
-                        )
-                    else:
-                        _project_id, project_generation = project_lifetimes[project_slug]
-                        hub.unsubscribe_project(
-                            project_slug,
-                            project_generation,
-                            queue,
-                        )
-
+            stream = self.Stream(
+                settings=settings,
+                session_token=session_token,
+                principal=stream_principal,
+                project_slug=project_slug,
+                project_lifetimes=project_lifetimes,
+                queue=queue,
+            )
             return StreamingResponse(
-                stream(),
+                stream.stream(),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache, no-store",
@@ -7601,14 +7718,15 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 },
             )
 
-        @fastapi_app.get("/mail/api/unified-inbox", response_class=JSONResponse)
+        @_mail_get("/mail/api/unified-inbox", response_class=JSONResponse)
         async def mail_unified_inbox_api(
+            self,
             request: Request,
             limit: int = 50000,
             include_projects: bool = False,
         ) -> JSONResponse:
             """Return a bounded message page plus the unbounded inbox total."""
-
+            _build_unified_inbox_payload = self.context.operations._build_unified_inbox_payload
             payload = await _build_unified_inbox_payload(
                 request=request,
                 limit=limit,
@@ -7619,12 +7737,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 payload["projects"] = []
             return JSONResponse(payload)
 
-        @fastapi_app.get(
+    class Projects(_MailRouteGroup):
+        @_mail_get(
             "/mail/api/v1/projects",
-            response_model=MailUiProjectsResponse,
         )
-        async def mail_ui_projects_v1(request: Request) -> MailUiProjectsResponse:
+        async def mail_ui_projects_v1(self, request: Request) -> MailUiProjectsResponse:
             """Return only projects visible to the authenticated human."""
+            settings = self.context.settings
             await ensure_schema()
             async with get_session() as session:
                 visible_roles = await _mail_ui_visible_project_roles(
@@ -7676,17 +7795,18 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     )
             return MailUiProjectsResponse(items=items, total=len(items))
 
-        @fastapi_app.get(
+        @_mail_get(
             "/mail/api/v1/projects/{project_id}/agents",
-            response_model=MailUiProjectAgentsResponse,
             responses=_MAIL_UI_DELIVERY_ERROR_RESPONSES,
         )
         async def mail_ui_project_agents_v1(
+            self,
             project_id: Annotated[int, FastApiPath(gt=0)],
             request: Request,
             purpose: Annotated[MailUiAgentDirectoryPurpose, Query()] = "addressable",
         ) -> MailUiProjectAgentsResponse:
             """Return active Agents for addressing or presentation-profile editing."""
+            settings = self.context.settings
             await ensure_schema()
             async with get_session() as session:
                 # Deliberately NOT `_mail_ui_revalidated_admin_user`: the
@@ -7762,18 +7882,19 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 total=len(items),
             )
 
-        @fastapi_app.patch(
+        @_mail_patch(
             "/mail/api/v1/projects/{project_id}/agents/{agent_id}/profile",
-            response_model=MailUiAgentProfileMutationResponse,
             responses=_MAIL_UI_DOMAIN_MUTATION_ERROR_RESPONSES,
         )
         async def mail_ui_agent_profile_patch_v1(
+            self,
             project_id: Annotated[int, FastApiPath(gt=0)],
             agent_id: Annotated[int, FastApiPath(gt=0)],
             request: Request,
             profile: MailUiAgentProfilePatch,
         ) -> MailUiAgentProfileMutationResponse:
             """CAS-update one active Agent's label and closed-vocabulary tone."""
+            settings = self.context.settings
             await ensure_schema()
             normalized_display_name = _sanitize_display_name_argument(
                 profile.display_name
@@ -7866,51 +7987,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     or agent.notify_sound != profile.notify_sound
                 )
                 if changed:
-                    statement = (
-                        update(Agent)
-                        .where(cast(Any, Agent.id == agent_id))
-                        .where(cast(Any, Agent.project_id == project_id))
-                        .where(
-                            cast(
-                                Any,
-                                Agent.agent_generation
-                                == profile.expected_agent_generation,
-                            )
-                        )
+                    await self._write_agent_profile_cas(
+                        session, project_id, agent_id, profile, normalized_display_name
                     )
-                    if profile.expected_display_name is None:
-                        statement = statement.where(
-                            cast(Any, Agent.display_name).is_(None)
-                        )
-                    else:
-                        statement = statement.where(
-                            cast(
-                                Any,
-                                Agent.display_name == profile.expected_display_name,
-                            )
-                        )
-                    if profile.expected_notify_sound is None:
-                        statement = statement.where(
-                            cast(Any, Agent.notify_sound).is_(None)
-                        )
-                    else:
-                        statement = statement.where(
-                            cast(
-                                Any,
-                                Agent.notify_sound == profile.expected_notify_sound,
-                            )
-                        )
-                    result = await session.execute(
-                        statement.values(
-                            display_name=normalized_display_name,
-                            notify_sound=profile.notify_sound,
-                        )
-                    )
-                    if int(getattr(result, "rowcount", 0) or 0) != 1:
-                        raise _mail_ui_domain_http_exception(
-                            code="compare_and_swap_failed",
-                            status_code=status.HTTP_409_CONFLICT,
-                        )
                 await session.commit()
 
             return MailUiAgentProfileMutationResponse(
@@ -7922,12 +8001,43 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 notify_sound=profile.notify_sound,
             )
 
-        @fastapi_app.get(
+        @staticmethod
+        async def _write_agent_profile_cas(
+            session: AsyncSession,
+            project_id: int,
+            agent_id: int,
+            profile: MailUiAgentProfilePatch,
+            normalized_display_name: str | None,
+        ) -> None:
+            statement = (
+                update(Agent)
+                .where(cast(Any, Agent.id == agent_id))
+                .where(cast(Any, Agent.project_id == project_id))
+                .where(cast(Any, Agent.agent_generation == profile.expected_agent_generation))
+            )
+            if profile.expected_display_name is None:
+                statement = statement.where(cast(Any, Agent.display_name).is_(None))
+            else:
+                statement = statement.where(cast(Any, Agent.display_name == profile.expected_display_name))
+            if profile.expected_notify_sound is None:
+                statement = statement.where(cast(Any, Agent.notify_sound).is_(None))
+            else:
+                statement = statement.where(cast(Any, Agent.notify_sound == profile.expected_notify_sound))
+            result = await session.execute(
+                statement.values(display_name=normalized_display_name, notify_sound=profile.notify_sound)
+            )
+            if int(getattr(result, "rowcount", 0) or 0) != 1:
+                raise _mail_ui_domain_http_exception(
+                    code="compare_and_swap_failed",
+                    status_code=status.HTTP_409_CONFLICT,
+                )
+
+        @_mail_get(
             "/mail/api/v1/reservations",
-            response_model=MailUiReservationsResponse,
             responses=_MAIL_UI_DELIVERY_ERROR_RESPONSES,
         )
         async def mail_ui_reservations_v1(
+            self,
             request: Request,
             project_id: Annotated[int | None, Query(gt=0)] = None,
             limit: Annotated[int, Query(ge=1, le=100)] = 50,
@@ -7944,6 +8054,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             on where. That is repository structure and current activity, which a
             viewer has no need for.
             """
+            settings = self.context.settings
             cursor_key = _mail_ui_decode_cursor(cursor) if cursor is not None else None
             await ensure_schema()
             async with get_session() as session:
@@ -7970,7 +8081,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         # you may see but not operate".
                         raise HTTPException(
                             status_code=status.HTTP_404_NOT_FOUND,
-                            detail="Project not found",
+                            detail=_PROJECT_NOT_FOUND_DETAIL,
                         )
                     visible_ids = [project_id]
                 else:
@@ -8074,21 +8185,51 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             )
             return MailUiReservationsResponse(items=items, next_cursor=next_cursor)
 
-        @fastapi_app.get(
+    class Messages(_MailRouteGroup):
+        @staticmethod
+        def _search_cursor_predicate(
+            cursor_key: tuple[float | None, str, int] | None,
+            order: MailUiSearchOrder,
+            rank_expression: str,
+            page_parameters: dict[str, Any],
+        ) -> str:
+            if cursor_key is None:
+                return ""
+            cursor_rank, cursor_created_ts, cursor_message_id = cursor_key
+            page_parameters.update(
+                {
+                    "cursor_created_ts": cursor_created_ts,
+                    "cursor_message_id": cursor_message_id,
+                }
+            )
+            time_keyset = (
+                f"({_MAIL_UI_CREATED_TS_KEY_SQL} < :cursor_created_ts "
+                f"OR ({_MAIL_UI_CREATED_TS_KEY_SQL} = :cursor_created_ts "
+                "AND m.id < :cursor_message_id))"
+            )
+            if order == "relevance":
+                page_parameters["cursor_rank"] = cursor_rank
+                return (
+                    f" AND ({rank_expression} > :cursor_rank "
+                    f"OR ({rank_expression} = :cursor_rank AND {time_keyset}))"
+                )
+            return f" AND {time_keyset}"
+
+        @_mail_get(
             "/mail/api/v1/inbox",
-            response_model=MailUiInboxResponse,
+            responses={404: {"description": "Project is missing or inaccessible."}},
         )
         async def mail_ui_inbox_v1(
+            self,
             request: Request,
-            project_id: int | None = Query(default=None, gt=0),
-            limit: int = Query(default=50, ge=1, le=100),
-            cursor: str | None = Query(
-                default=None,
-                min_length=1,
-                max_length=_MAIL_UI_CURSOR_MAX_LENGTH,
-            ),
+            project_id: Annotated[int | None, Query(gt=0)] = None,
+            limit: Annotated[int, Query(ge=1, le=100)] = 50,
+            cursor: Annotated[
+                str | None, Query(min_length=1, max_length=_MAIL_UI_CURSOR_MAX_LENGTH)
+            ] = None,
         ) -> MailUiInboxResponse:
             """Return a keyset-paginated inbox without bodies or recipients."""
+            settings = self.context.settings
             cursor_key = _mail_ui_decode_cursor(cursor) if cursor is not None else None
             await ensure_schema()
             async with get_session() as session:
@@ -8099,7 +8240,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 )
                 if project_id is not None:
                     if project_id not in visible_roles:
-                        raise HTTPException(status_code=404, detail="Project not found")
+                        raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND_DETAIL)
                     visible_ids = [project_id]
                 else:
                     visible_ids = sorted(visible_roles)
@@ -8176,12 +8317,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 next_cursor=next_cursor,
             )
 
-        @fastapi_app.get(
+        @_mail_get(
             _MAIL_SEARCH_API_PATH,
-            response_model=MailUiSearchResponse,
             responses=_MAIL_UI_SEARCH_ERROR_RESPONSES,
         )
         async def mail_ui_search_v1(
+            self,
             request: Request,
             q: Annotated[str, Query(min_length=1, max_length=256)],
             project_id: Annotated[int | None, Query(gt=0)] = None,
@@ -8194,6 +8335,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             ] = None,
         ) -> MailUiSearchResponse:
             """Search only visible messages through bounded SQLite FTS5."""
+            settings = self.context.settings
             fts_query, ranking_terms = _mail_ui_compile_search_query(q, scope)
             fingerprint = _mail_ui_search_fingerprint(
                 fts_query=fts_query,
@@ -8236,34 +8378,15 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     rank_expression, rank_parameters = _mail_ui_local_search_rank(
                         ranking_terms
                     )
-                    cursor_predicate = ""
                     page_parameters: dict[str, Any] = {
                         **parameters,
                         **rank_parameters,
                         "fts_query": fts_query,
                         "page_limit": limit + 1,
                     }
-                    if cursor_key is not None:
-                        cursor_rank, cursor_created_ts, cursor_message_id = cursor_key
-                        page_parameters.update(
-                            {
-                                "cursor_created_ts": cursor_created_ts,
-                                "cursor_message_id": cursor_message_id,
-                            }
-                        )
-                        time_keyset = (
-                            f"({_MAIL_UI_CREATED_TS_KEY_SQL} < :cursor_created_ts "
-                            f"OR ({_MAIL_UI_CREATED_TS_KEY_SQL} = :cursor_created_ts "
-                            "AND m.id < :cursor_message_id))"
-                        )
-                        if order == "relevance":
-                            page_parameters["cursor_rank"] = cursor_rank
-                            cursor_predicate = (
-                                f" AND ({rank_expression} > :cursor_rank "
-                                f"OR ({rank_expression} = :cursor_rank AND {time_keyset}))"
-                            )
-                        else:
-                            cursor_predicate = f" AND {time_keyset}"
+                    cursor_predicate = self._search_cursor_predicate(
+                        cursor_key, order, rank_expression, page_parameters
+                    )
 
                     ordering = (
                         f"{rank_expression} ASC, {_MAIL_UI_CREATED_TS_KEY_SQL} DESC, "
@@ -8313,8 +8436,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                 ),
                             )
                         )
-                    next_cursor = (
-                        _mail_ui_encode_search_cursor(
+                    next_cursor = None
+                    if has_more and response_rows:
+                        next_cursor = _mail_ui_encode_search_cursor(
                             fingerprint=fingerprint,
                             created_ts_key=str(
                                 response_rows[-1]["cursor_created_ts"]
@@ -8326,9 +8450,6 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                 else None
                             ),
                         )
-                        if has_more and response_rows
-                        else None
-                    )
             except HTTPException:
                 raise
             except Exception as exc:
@@ -8342,16 +8463,18 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 ) from None
             return MailUiSearchResponse(items=items, next_cursor=next_cursor)
 
-        @fastapi_app.get(
+        @_mail_get(
             "/mail/api/v1/projects/{project_id}/messages/{message_id}",
-            response_model=MailUiMessageDetail,
+            responses={404: {"description": "Project or message is missing or inaccessible."}},
         )
         async def mail_ui_message_v1(
+            self,
             project_id: int,
             message_id: int,
             request: Request,
         ) -> MailUiMessageDetail:
             """Return one visible message with TO/CC but never BCC recipients."""
+            settings = self.context.settings
             await ensure_schema()
             async with get_session() as session:
                 visible_roles = await _mail_ui_visible_project_roles(
@@ -8360,7 +8483,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     session=session,
                 )
                 if project_id not in visible_roles:
-                    raise HTTPException(status_code=404, detail="Project not found")
+                    raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND_DETAIL)
                 row = (
                     await session.execute(
                         text(
@@ -8432,9 +8555,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     visible_roles=visible_roles,
                 )
 
-        @fastapi_app.post(
+        @staticmethod
+        @_mail_post(
             "/mail/api/v1/projects/{project_id}/messages",
-            response_model=MailUiDeliveryResponse,
             responses=_MAIL_UI_DELIVERY_MUTATION_ERROR_RESPONSES,
         )
         @_mail_ui_typed_delivery_endpoint
@@ -8516,9 +8639,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 await emit_published_delivery_notifications(processing.delivery_id)
             return _mail_ui_delivery_response(acceptance, processing)
 
-        @fastapi_app.post(
+        @staticmethod
+        @_mail_post(
             "/mail/api/v1/projects/{project_id}/messages/{message_id}/replies",
-            response_model=MailUiDeliveryResponse,
             responses=_MAIL_UI_DELIVERY_MUTATION_ERROR_RESPONSES,
         )
         @_mail_ui_typed_delivery_endpoint
@@ -8652,9 +8775,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 await emit_published_delivery_notifications(processing.delivery_id)
             return _mail_ui_delivery_response(acceptance, processing)
 
-        @fastapi_app.get(
+        @staticmethod
+        @_mail_get(
             "/mail/api/v1/deliveries/{delivery_id}",
-            response_model=MailUiDeliveryResponse,
             responses=_MAIL_UI_DELIVERY_ERROR_RESPONSES,
         )
         @_mail_ui_typed_delivery_endpoint
@@ -8674,9 +8797,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 raise _mail_ui_delivery_exception(exc) from None
             return _mail_ui_delivery_status_response(processing)
 
-        @fastapi_app.post(
+        @staticmethod
+        @_mail_post(
             "/mail/api/v1/deliveries/{delivery_id}/retry",
-            response_model=MailUiDeliveryResponse,
             responses=_MAIL_UI_DELIVERY_MUTATION_ERROR_RESPONSES,
         )
         @_mail_ui_typed_delivery_endpoint
@@ -8698,22 +8821,22 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 await emit_published_delivery_notifications(processing.delivery_id)
             return _mail_ui_delivery_status_response(processing)
 
-        @fastapi_app.get(
+        @_mail_get(
             "/mail/api/v1/projects/{project_id}/threads",
-            response_model=MailUiThreadResponse,
+            responses={404: {"description": "Project or thread is missing or inaccessible."}},
         )
         async def mail_ui_thread_v1(
+            self,
             project_id: int,
             request: Request,
-            thread_id: str = Query(),
-            limit: int = Query(default=50, ge=1, le=100),
-            cursor: str | None = Query(
-                default=None,
-                min_length=1,
-                max_length=_MAIL_UI_CURSOR_MAX_LENGTH,
-            ),
+            thread_id: Annotated[str, Query()],
+            limit: Annotated[int, Query(ge=1, le=100)] = 50,
+            cursor: Annotated[
+                str | None, Query(min_length=1, max_length=_MAIL_UI_CURSOR_MAX_LENGTH)
+            ] = None,
         ) -> MailUiThreadResponse:
             """Return a bounded, newest-first page from one visible thread."""
+            settings = self.context.settings
             if not _mail_ui_valid_thread_id(thread_id):
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -8730,7 +8853,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     session=session,
                 )
                 if project_id not in visible_roles:
-                    raise HTTPException(status_code=404, detail="Project not found")
+                    raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND_DETAIL)
                 total_result = await session.execute(
                     text(
                         "SELECT COUNT(*) FROM messages m "
@@ -8881,6 +9004,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 next_cursor=next_cursor,
             )
 
+    class Accounts(_MailRouteGroup):
+        @staticmethod
         def _profile_response_for_user(row: Any) -> MailUiProfileResponse:
             """Render one revalidated account without cookie or password material."""
             global_role = webauth.normalize_ui_user_role(row.role)
@@ -8896,21 +9021,21 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 profile_revision=int(row.profile_revision),
             )
 
-        @fastapi_app.get(
+        @_mail_get(
             _MAIL_PROFILE_API_PATH,
-            response_model=MailUiProfileResponse,
             responses=_MAIL_UI_DOMAIN_ERROR_RESPONSES,
         )
-        async def mail_ui_profile_get(request: Request) -> MailUiProfileResponse:
+        async def mail_ui_profile_get(self, request: Request) -> MailUiProfileResponse:
             """Return the signed-in human's non-secret profile and global role."""
+            _profile_response_for_user = self._profile_response_for_user
             await ensure_schema()
             async with get_session() as session:
                 row = await _mail_ui_revalidated_profile_user(request, session)
                 return _profile_response_for_user(row)
 
-        @fastapi_app.patch(
+        @staticmethod
+        @_mail_patch(
             _MAIL_PROFILE_API_PATH,
-            response_model=MailUiProfileMutationResponse,
             responses=_MAIL_UI_DOMAIN_MUTATION_ERROR_RESPONSES,
         )
         async def mail_ui_profile_patch(
@@ -8940,12 +9065,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 profile_revision=result.profile_revision,
             )
 
-        @fastapi_app.get(
+        @_mail_get(
             _MAIL_ADMIN_ACCESS_API_PATH,
-            response_model=MailUiAdminAccessResponse,
             responses=_MAIL_UI_DOMAIN_ERROR_RESPONSES,
         )
-        async def mail_ui_admin_access_get(request: Request) -> MailUiAdminAccessResponse:
+        async def mail_ui_admin_access_get(self, request: Request) -> MailUiAdminAccessResponse:
             """Return one consistent access-management snapshot to an administrator."""
             await ensure_schema()
             async with get_session() as session:
@@ -9003,27 +9127,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
             users: list[MailUiAdminUserSummary] = []
             for row in user_rows:
-                user_id = int(row["id"])
-                global_role = webauth.normalize_ui_user_role(row["role"])
-                generation = str(row["session_generation"] or "")
-                if global_role is None or re.fullmatch(r"[0-9a-f]{64}", generation) is None:
-                    raise RuntimeError("invalid persisted UI user access identity")
-                users.append(
-                    MailUiAdminUserSummary(
-                        id=user_id,
-                        username=str(row["username"]),
-                        display_name=(
-                            str(row["display_name"])
-                            if row["display_name"] is not None
-                            else None
-                        ),
-                        disabled=bool(row["disabled"]),
-                        global_role=global_role,
-                        account_generation=generation,
-                        access_version=int(row["session_epoch"]),
-                        assignments=assignments_by_user[user_id],
-                    )
-                )
+                users.append(self._admin_user_summary(row, assignments_by_user))
 
             projects: list[MailUiAdminProjectSummary] = []
             for row in project_rows:
@@ -9045,9 +9149,30 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 )
             return MailUiAdminAccessResponse(users=users, projects=projects)
 
-        @fastapi_app.put(
+        @staticmethod
+        def _admin_user_summary(
+            row: RowMapping,
+            assignments_by_user: dict[int, list[MailUiAdminAssignmentSummary]],
+        ) -> MailUiAdminUserSummary:
+            user_id = int(row["id"])
+            global_role = webauth.normalize_ui_user_role(row["role"])
+            generation = str(row["session_generation"] or "")
+            if global_role is None or re.fullmatch(r"[0-9a-f]{64}", generation) is None:
+                raise RuntimeError("invalid persisted UI user access identity")
+            return MailUiAdminUserSummary(
+                id=user_id,
+                username=str(row["username"]),
+                display_name=str(row["display_name"]) if row["display_name"] is not None else None,
+                disabled=bool(row["disabled"]),
+                global_role=global_role,
+                account_generation=generation,
+                access_version=int(row["session_epoch"]),
+                assignments=assignments_by_user[user_id],
+            )
+
+        @staticmethod
+        @_mail_put(
             _MAIL_ADMIN_ASSIGNMENT_API_PATH,
-            response_model=MailUiAdminProjectAccessResponse,
             responses=_MAIL_UI_DOMAIN_MUTATION_ERROR_RESPONSES,
         )
         async def mail_ui_admin_assignment_put(
@@ -9084,6 +9209,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 access_version=result.access_version,
             )
 
+        @staticmethod
         def _preferences_response_for_user(row: Any) -> MailUiPreferencesResponse:
             """Render a row whose locale integrity is enforced by the schema."""
             return _mail_ui_preferences_response(
@@ -9095,26 +9221,27 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 ),
             )
 
-        @fastapi_app.get(
+        @_mail_get(
             _MAIL_PREFERENCES_API_PATH,
-            response_model=MailUiPreferencesResponse,
         )
-        async def mail_ui_preferences_get(request: Request) -> MailUiPreferencesResponse:
+        async def mail_ui_preferences_get(self, request: Request) -> MailUiPreferencesResponse:
             """Return stored and effective languages for the signed-in human."""
+            _preferences_response_for_user = self._preferences_response_for_user
             await ensure_schema()
             async with get_session() as session:
                 row = await _mail_ui_preferences_user(request, session)
                 return _preferences_response_for_user(row)
 
-        @fastapi_app.patch(
+        @_mail_patch(
             _MAIL_PREFERENCES_API_PATH,
-            response_model=MailUiPreferencesResponse,
         )
         async def mail_ui_preferences_patch(
+            self,
             request: Request,
             preferences: MailUiPreferencesPatch,
         ) -> MailUiPreferencesResponse:
             """Partially update only the signed-in human's language preferences."""
+            _preferences_response_for_user = self._preferences_response_for_user
             if not webauth.same_origin(
                 request.headers.get("origin", ""),
                 request.headers.get("referer", ""),
@@ -9123,7 +9250,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             ):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Cross-origin request rejected",
+                    detail=_CROSS_ORIGIN_DETAIL,
                 )
 
             await ensure_schema()
@@ -9149,22 +9276,23 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 if not updated:
                     raise HTTPException(
                         status_code=status.HTTP_401_UNAUTHORIZED,
-                        detail="Authenticated Mail UI session is no longer current.",
+                        detail=_STALE_SESSION_DETAIL,
                     )
                 async with get_session() as session:
                     row = await _mail_ui_preferences_user(request, session)
             return _preferences_response_for_user(row)
 
-        @fastapi_app.patch(
+        @_mail_patch(
             _MAIL_PASSWORD_API_PATH,
-            response_model=MailUiPasswordChangeResponse,
         )
         async def mail_ui_password_patch(
+            self,
             request: Request,
             response: Response,
             passwords: MailUiPasswordPatch,
         ) -> MailUiPasswordChangeResponse:
             """Rotate the signed-in human's password and refresh only this session."""
+            settings = self.context.settings
             if not webauth.same_origin(
                 request.headers.get("origin", ""),
                 request.headers.get("referer", ""),
@@ -9173,7 +9301,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             ):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Cross-origin request rejected",
+                    detail=_CROSS_ORIGIN_DETAIL,
                 )
 
             # Do not yield between identifying the limiter key and registering
@@ -9220,7 +9348,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             if not changed:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Authenticated Mail UI session is no longer current.",
+                    detail=_STALE_SESSION_DETAIL,
                 )
 
             import time as _time
@@ -9240,7 +9368,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             )
             return MailUiPasswordChangeResponse()
 
-        @fastapi_app.post("/mail/api/delete-messages", response_class=JSONResponse)
+    class Maintenance(_MailRouteGroup):
+        @staticmethod
+        @_mail_post(
+            "/mail/api/delete-messages", response_class=JSONResponse,
+            responses={400: _HTTP_BAD_REQUEST_RESPONSE, 403: _HTTP_FORBIDDEN_RESPONSE, 500: _HTTP_INTERNAL_ERROR_RESPONSE},
+        )
         async def delete_messages_api(request: Request) -> JSONResponse:
             """Permanently delete messages by ID (cross-project).
 
@@ -9254,7 +9387,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 message_ids: list[int] = request_body.get("message_ids", [])
 
                 if not message_ids:
-                    raise HTTPException(status_code=400, detail="No message IDs provided")
+                    raise HTTPException(status_code=400, detail=_MESSAGE_IDS_REQUIRED_DETAIL)
 
                 if len(message_ids) > 500:
                     raise HTTPException(
@@ -9355,7 +9488,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
         # ---- Agent Retire/Unretire API ----
 
-        @fastapi_app.post("/mail/api/retire-agent", response_class=JSONResponse)
+        @staticmethod
+        @_mail_post(
+            "/mail/api/retire-agent", response_class=JSONResponse,
+            responses={400: _HTTP_BAD_REQUEST_RESPONSE, 403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE, 500: _HTTP_INTERNAL_ERROR_RESPONSE},
+        )
         async def retire_agent_api(request: Request) -> JSONResponse:
             """Retire an agent (soft-delete). Preserves message history but stops new messages."""
             await ensure_schema()
@@ -9369,7 +9506,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     from .models import Agent
                     agent = await session.get(Agent, agent_id)
                     if not agent:
-                        raise HTTPException(status_code=404, detail="Agent not found")
+                        raise HTTPException(status_code=404, detail=_AGENT_NOT_FOUND_DETAIL)
                     agent.retired_at = datetime.now(timezone.utc).replace(tzinfo=None)
                     session.add(agent)
                     await session.commit()
@@ -9380,7 +9517,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             except Exception as exc:
                 raise HTTPException(status_code=500, detail=f"Failed to retire agent: {exc!s}") from exc
 
-        @fastapi_app.post("/mail/api/unretire-agent", response_class=JSONResponse)
+        @staticmethod
+        @_mail_post(
+            "/mail/api/unretire-agent", response_class=JSONResponse,
+            responses={400: _HTTP_BAD_REQUEST_RESPONSE, 403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE, 500: _HTTP_INTERNAL_ERROR_RESPONSE},
+        )
         async def unretire_agent_api(request: Request) -> JSONResponse:
             """Restore a retired agent back to active status."""
             await ensure_schema()
@@ -9394,7 +9535,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     from .models import Agent
                     agent = await session.get(Agent, agent_id)
                     if not agent:
-                        raise HTTPException(status_code=404, detail="Agent not found")
+                        raise HTTPException(status_code=404, detail=_AGENT_NOT_FOUND_DETAIL)
                     agent.retired_at = None
                     session.add(agent)
                     await session.commit()
@@ -9407,7 +9548,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
         # ---- Project Archive/Unarchive API ----
 
-        @fastapi_app.post("/mail/api/archive-project", response_class=JSONResponse)
+        @staticmethod
+        @_mail_post(
+            "/mail/api/archive-project", response_class=JSONResponse,
+            responses={400: _HTTP_BAD_REQUEST_RESPONSE, 403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE, 500: _HTTP_INTERNAL_ERROR_RESPONSE},
+        )
         async def archive_project_api(request: Request) -> JSONResponse:
             """Archive a project (soft-delete). Preserves all messages but hides from active lists."""
             await ensure_schema()
@@ -9421,7 +9566,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     from .models import Project
                     project = await session.get(Project, project_id)
                     if not project:
-                        raise HTTPException(status_code=404, detail="Project not found")
+                        raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND_DETAIL)
                     project.archived_at = datetime.now(timezone.utc).replace(tzinfo=None)
                     session.add(project)
                     await session.commit()
@@ -9432,7 +9577,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             except Exception as exc:
                 raise HTTPException(status_code=500, detail=f"Failed to archive project: {exc!s}") from exc
 
-        @fastapi_app.post("/mail/api/unarchive-project", response_class=JSONResponse)
+        @staticmethod
+        @_mail_post(
+            "/mail/api/unarchive-project", response_class=JSONResponse,
+            responses={400: _HTTP_BAD_REQUEST_RESPONSE, 403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE, 500: _HTTP_INTERNAL_ERROR_RESPONSE},
+        )
         async def unarchive_project_api(request: Request) -> JSONResponse:
             """Restore an archived project back to active status."""
             await ensure_schema()
@@ -9446,7 +9595,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     from .models import Project
                     project = await session.get(Project, project_id)
                     if not project:
-                        raise HTTPException(status_code=404, detail="Project not found")
+                        raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND_DETAIL)
                     project.archived_at = None
                     session.add(project)
                     await session.commit()
@@ -9457,9 +9606,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             except Exception as exc:
                 raise HTTPException(status_code=500, detail=f"Failed to unarchive project: {exc!s}") from exc
 
-        @fastapi_app.get("/mail/projects", response_class=HTMLResponse)
-        async def mail_projects_list(request: Request) -> HTMLResponse:
+    class Overview(_MailRouteGroup):
+        @_mail_get("/mail/projects", response_class=HTMLResponse)
+        async def mail_projects_list(self, request: Request) -> HTMLResponse:
             """Projects list view (moved from /mail)"""
+            settings = self.context.settings
+            _render = self.context.rendering._render
             await ensure_schema()
             if _mail_ui_request_is_admin(settings=settings, request=request):
                 await refresh_project_sibling_suggestions()
@@ -9511,8 +9663,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     )
             return await _render("mail_index.html", projects=projects)
 
-        @fastapi_app.get("/mail/unified-inbox", response_class=HTMLResponse)
+        @_mail_get("/mail/unified-inbox", response_class=HTMLResponse)
         async def unified_inbox_alias(
+            self,
             request: Request,
             limit: int = 10000,
             filter_importance: str | None = None,
@@ -9528,12 +9681,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             Returns:
                 The scoped unified inbox page.
             """
-            return await _render_legacy_unified_inbox(
+            return await self.context.legacy._render_legacy_unified_inbox(
                 request=request,
                 limit=limit,
                 filter_importance=filter_importance,
             )
 
+    class Shell(_MailRouteGroup):
+        @staticmethod
         def _mail_react_index_response() -> FileResponse:
             """Serve the Vite entry point without allowing account data to be cached."""
             index_file = _mail_react_resolve_file(
@@ -9551,8 +9706,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 headers=_MAIL_REACT_INDEX_HEADERS,
             )
 
-        @fastapi_app.api_route(
-            "/mail/",
+        @staticmethod
+        @_mail_route(
+            _MAIL_PATH_PREFIX,
             methods=["GET", "HEAD"],
             include_in_schema=False,
         )
@@ -9566,7 +9722,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 headers={**_MAIL_REACT_INDEX_HEADERS, "Location": location},
             )
 
-        @fastapi_app.api_route(
+        @staticmethod
+        @_mail_route(
             "/mail/assets/{asset_path:path}",
             methods=["GET", "HEAD"],
             include_in_schema=False,
@@ -9620,8 +9777,51 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             )
             return FileResponse(asset_file, headers=asset_headers)
 
-        @fastapi_app.get("/mail/{project}", response_class=HTMLResponse)
+    class Legacy(_MailRouteGroup):
+        @staticmethod
+        def _like_search_sql(scope: str, limit: Literal["10000", ":lim"]) -> str:
+            if scope == "subject":
+                predicate = f"m.subject LIKE :pat ESCAPE '{_LIKE_ESCAPE_CHAR}'"
+            elif scope == "body":
+                predicate = f"m.body_md LIKE :pat ESCAPE '{_LIKE_ESCAPE_CHAR}'"
+            else:
+                predicate = (
+                    f"(m.subject LIKE :pat ESCAPE '{_LIKE_ESCAPE_CHAR}' "
+                    f"OR m.body_md LIKE :pat ESCAPE '{_LIKE_ESCAPE_CHAR}')"
+                )
+            return (
+                "SELECT m.id, m.subject, s.name AS sender_name, s.project_id AS sender_project_id, "
+                "sp.human_key AS sender_project_name, sp.slug AS sender_project_slug, "
+                "m.created_ts, m.importance, m.thread_id "
+                "FROM messages m JOIN agents s ON s.id = m.sender_id "
+                "LEFT JOIN projects sp ON sp.id = s.project_id "
+                f"WHERE m.project_id = :pid AND {predicate} "
+                f"ORDER BY m.created_ts DESC LIMIT {limit}"
+            )
+
+        @staticmethod
+        def _message_attachments(row: RowMapping) -> list[dict[str, Any]]:
+            try:
+                raw = row["attachments"]
+                if isinstance(raw, str):
+                    try:
+                        parsed = json.loads(raw)
+                    except json.JSONDecodeError:
+                        parsed = []
+                else:
+                    parsed = raw
+                if isinstance(parsed, list):
+                    return [attachment for attachment in parsed if isinstance(attachment, dict)]
+            except Exception:
+                pass
+            return []
+
+        @_mail_get(
+            "/mail/{project}", response_class=HTMLResponse,
+            responses={403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE},
+        )
         async def mail_project(
+            self,
             project: str,
             request: Request,
             q: str | None = None,
@@ -9629,13 +9829,15 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             order: str | None = None,
             boost: int | None = None,
         ) -> HTMLResponse:
+            settings = self.context.settings
+            _render = self.context.rendering._render
             if order not in ("relevance", "time", None):
                 order = "relevance"
             await ensure_schema()
             async with get_session() as session:
                 prow = await _resolve_mail_project(session, project)
                 if not prow:
-                    return await _render("error.html", status_code=404, message="Project not found")
+                    return await _render(_ERROR_TEMPLATE, status_code=404, message=_PROJECT_NOT_FOUND_DETAIL)
                 pid = int(prow[0])
                 access = await _mail_ui_require_project_access(
                     settings=settings,
@@ -9662,107 +9864,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 agents = [{"id": r[0], "name": r[1], "program": r[2], "model": r[3], "retired_at": str(r[4]) if r[4] else None, "display_name": r[5], "notify_sound": r[6], "last_active_ts": str(r[7]) if r[7] else None} for r in agents_q.fetchall()]
                 matched_messages: list[dict] = []
                 if q and q.strip():
-                    # Prefer FTS5 when available (fts_messages maintained by triggers)
-                    fts_expr, like_pat, like_scope, tokens = _parse_fts_query(q, scope)
-                    weights = (0.0, 3.0, 1.0) if (boost or 0) else (0.0, 1.0, 1.0)
-                    fts_sql = (
-                        "SELECT m.id, m.subject, s.name AS sender_name, s.project_id AS sender_project_id, "
-                        "sp.human_key AS sender_project_name, sp.slug AS sender_project_slug, "
-                        "m.created_ts, m.importance, m.thread_id, "
-                        "snippet(fts_messages, 2, '<mark>', '</mark>', '…', 18) AS body_snippet "
-                        "FROM fts_messages "
-                        "JOIN messages m ON m.id = fts_messages.rowid "
-                        "JOIN agents s ON s.id = m.sender_id "
-                        "LEFT JOIN projects sp ON sp.id = s.project_id "
-                        "WHERE m.project_id = :pid AND fts_messages MATCH :q "
-                        + (
-                            "ORDER BY m.created_ts DESC "
-                            if (order or "relevance") == "time"
-                            else f"ORDER BY bm25(fts_messages, {weights[0]}, {weights[1]}, {weights[2]}) "
-                        )
-                        + "LIMIT 10000"
-                    )
-                    try:
-                        search = await session.execute(text(fts_sql), {"pid": pid, "q": fts_expr or q})
-                        matched_messages = []
-                        for r in search.mappings().all():
-                            safe_snippet, snippet_hits = _safe_fts_snippet(
-                                r["body_snippet"]
-                            )
-                            sender_display, sender_meta = _http_sender_identity(
-                                message_project_id=pid,
-                                sender_name=r["sender_name"],
-                                sender_project_id=r["sender_project_id"],
-                                sender_project_human_key=r["sender_project_name"],
-                                sender_project_slug=r["sender_project_slug"],
-                            )
-                            item = {
-                                "id": r["id"],
-                                "subject": r["subject"],
-                                "sender": sender_display,
-                                "created": str(r["created_ts"]),
-                                "importance": r["importance"],
-                                "thread_id": r["thread_id"],
-                                "snippet": safe_snippet,
-                                "hits": snippet_hits,
-                            }
-                            item.update(sender_meta)
-                            matched_messages.append(item)
-                    except Exception:
-                        # Fallback to LIKE if FTS not available
-                        if like_scope == "subject":
-                            like_sql = (
-                                "SELECT m.id, m.subject, s.name AS sender_name, s.project_id AS sender_project_id, "
-                                "sp.human_key AS sender_project_name, sp.slug AS sender_project_slug, "
-                                "m.created_ts, m.importance, m.thread_id "
-                                "FROM messages m JOIN agents s ON s.id = m.sender_id "
-                                "LEFT JOIN projects sp ON sp.id = s.project_id "
-                                f"WHERE m.project_id = :pid AND m.subject LIKE :pat ESCAPE '{_LIKE_ESCAPE_CHAR}' "
-                                "ORDER BY m.created_ts DESC LIMIT 10000"
-                            )
-                        elif like_scope == "body":
-                            like_sql = (
-                                "SELECT m.id, m.subject, s.name AS sender_name, s.project_id AS sender_project_id, "
-                                "sp.human_key AS sender_project_name, sp.slug AS sender_project_slug, "
-                                "m.created_ts, m.importance, m.thread_id "
-                                "FROM messages m JOIN agents s ON s.id = m.sender_id "
-                                "LEFT JOIN projects sp ON sp.id = s.project_id "
-                                f"WHERE m.project_id = :pid AND m.body_md LIKE :pat ESCAPE '{_LIKE_ESCAPE_CHAR}' "
-                                "ORDER BY m.created_ts DESC LIMIT 10000"
-                            )
-                        else:
-                            like_sql = (
-                                "SELECT m.id, m.subject, s.name AS sender_name, s.project_id AS sender_project_id, "
-                                "sp.human_key AS sender_project_name, sp.slug AS sender_project_slug, "
-                                "m.created_ts, m.importance, m.thread_id "
-                                "FROM messages m JOIN agents s ON s.id = m.sender_id "
-                                "LEFT JOIN projects sp ON sp.id = s.project_id "
-                                f"WHERE m.project_id = :pid AND (m.subject LIKE :pat ESCAPE '{_LIKE_ESCAPE_CHAR}' "
-                                f"OR m.body_md LIKE :pat ESCAPE '{_LIKE_ESCAPE_CHAR}') "
-                                "ORDER BY m.created_ts DESC LIMIT 10000"
-                            )
-                        search = await session.execute(text(like_sql), {"pid": pid, "pat": like_pat or f"%{_like_escape(q)}%"})
-                        matched_messages = []
-                        for r in search.mappings().all():
-                            sender_display, sender_meta = _http_sender_identity(
-                                message_project_id=pid,
-                                sender_name=r["sender_name"],
-                                sender_project_id=r["sender_project_id"],
-                                sender_project_human_key=r["sender_project_name"],
-                                sender_project_slug=r["sender_project_slug"],
-                            )
-                            item = {
-                                "id": r["id"],
-                                "subject": r["subject"],
-                                "sender": sender_display,
-                                "created": str(r["created_ts"]),
-                                "importance": r["importance"],
-                                "thread_id": r["thread_id"],
-                                "snippet": "",
-                                "hits": 0,
-                            }
-                            item.update(sender_meta)
-                            matched_messages.append(item)
+                    matched_messages, tokens = await self._project_matches(session, pid, q, scope, order, boost)
             render_context: dict[str, Any] = {
                 "project": {
                     "id": pid,
@@ -9785,7 +9887,77 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 render_context["results"] = matched_messages
             return await _render("mail_project.html", **render_context)
 
-        @fastapi_app.post("/mail/api/projects/{project_id}/siblings/{other_id}", response_class=JSONResponse)
+        async def _project_matches(
+            self,
+            session: AsyncSession,
+            project_id: int,
+            query: str,
+            scope: str | None,
+            order: str | None,
+            boost: int | None,
+        ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+            # Prefer FTS5 when available (fts_messages maintained by triggers).
+            fts_expr, like_pat, like_scope, tokens = self.context.rendering._parse_fts_query(query, scope)
+            weights = (0.0, 3.0, 1.0) if (boost or 0) else (0.0, 1.0, 1.0)
+            fts_sql = (
+                "SELECT m.id, m.subject, s.name AS sender_name, s.project_id AS sender_project_id, "
+                "sp.human_key AS sender_project_name, sp.slug AS sender_project_slug, "
+                "m.created_ts, m.importance, m.thread_id, "
+                "snippet(fts_messages, 2, '<mark>', '</mark>', '…', 18) AS body_snippet "
+                "FROM fts_messages "
+                "JOIN messages m ON m.id = fts_messages.rowid "
+                "JOIN agents s ON s.id = m.sender_id "
+                "LEFT JOIN projects sp ON sp.id = s.project_id "
+                "WHERE m.project_id = :pid AND fts_messages MATCH :q "
+                + (
+                    "ORDER BY m.created_ts DESC "
+                    if (order or "relevance") == "time"
+                    else f"ORDER BY bm25(fts_messages, {weights[0]}, {weights[1]}, {weights[2]}) "
+                )
+                + "LIMIT 10000"
+            )
+            try:
+                search = await session.execute(text(fts_sql), {"pid": project_id, "q": fts_expr or query})
+                matches = [
+                    self._project_search_item(row, project_id, snippet=True)
+                    for row in search.mappings().all()
+                ]
+            except Exception:
+                # Fallback to LIKE if FTS not available.
+                like_sql = self._like_search_sql(like_scope, "10000")
+                search = await session.execute(
+                    text(like_sql), {"pid": project_id, "pat": like_pat or f"%{_like_escape(query)}%"}
+                )
+                matches = [
+                    self._project_search_item(row, project_id, snippet=False)
+                    for row in search.mappings().all()
+                ]
+            return matches, tokens
+
+        def _project_search_item(self, row: RowMapping, project_id: int, *, snippet: bool) -> dict[str, Any]:
+            safe_snippet, snippet_hits = self.context.rendering._safe_fts_snippet(row["body_snippet"]) if snippet else ("", 0)
+            sender_display, sender_meta = _http_sender_identity(
+                message_project_id=project_id,
+                sender_name=row["sender_name"],
+                sender_project_id=row["sender_project_id"],
+                sender_project_human_key=row["sender_project_name"],
+                sender_project_slug=row["sender_project_slug"],
+            )
+            item = {
+                "id": row["id"],
+                "subject": row["subject"],
+                "sender": sender_display,
+                "created": str(row["created_ts"]),
+                "importance": row["importance"],
+                "thread_id": row["thread_id"],
+                "snippet": safe_snippet,
+                "hits": snippet_hits,
+            }
+            item.update(sender_meta)
+            return item
+
+        @staticmethod
+        @_mail_post("/mail/api/projects/{project_id}/siblings/{other_id}", response_class=JSONResponse)
         async def update_project_sibling(project_id: int, other_id: int, request: Request) -> JSONResponse:
             try:
                 payload = await request.json()
@@ -9822,11 +9994,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             return JSONResponse({"status": suggestion["status"], "suggestion": suggestion})
 
         async def _render_legacy_unified_inbox(
+            self,
             request: Request,
             limit: int = 10000,
             filter_importance: str | None = None,
         ) -> HTMLResponse:
             """Unified inbox showing messages from all active agents across all projects."""
+            settings = self.context.settings
+            _render = self.context.rendering._render
             limit = min(max(1, limit), 10000)
             await ensure_schema()
             async with get_session() as session:
@@ -9873,38 +10048,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         project_id=proj_id,
                         project_role=visible_roles[proj_id],
                     )
-                    # Get agents for this project
-                    agents_query = await session.execute(
-                        text(
-                            """
-                        SELECT a.id, a.name, a.program, a.model, a.last_active_ts,
-                               a.notify_sound
-                        FROM agents a
-                        WHERE a.project_id = :pid
-                        ORDER BY a.last_active_ts DESC, a.name ASC
-                        """
-                        ),
-                        {"pid": proj_id},
-                    )
-
-                    agents_list = []
-                    for ar in agents_query.fetchall():
-                        agents_list.append(
-                            {
-                                "id": int(ar[0]),
-                                "name": ar[1],
-                                "program": ar[2],
-                                "model": ar[3],
-                                "last_active": str(ar[4]) if ar[4] else None,
-                                # Carried so this page can sound the writer's own
-                                # tone. The project page has done so since the
-                                # feature landed; this is the page a watcher
-                                # actually leaves open, and without the column
-                                # every colleague rang identically here — the
-                                # feature failing exactly where it was for.
-                                "notify_sound": ar[5],
-                            }
-                        )
+                    agents_list = await self._project_agents(session, proj_id)
 
                     if agents_list:  # Only include projects with agents
                         projects_data.append(
@@ -9930,7 +10074,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 if filter_importance and filter_importance.lower() in ["urgent", "high"]:
                     importance_conditions.append("m.importance IN ('urgent', 'high')")
 
-                where_clause = "WHERE " + " AND ".join(importance_conditions) if importance_conditions else "WHERE 1=1"
+                where_clause = "WHERE " + _SQL_AND.join(importance_conditions)
 
                 total_result = await session.execute(
                     text(
@@ -10042,21 +10186,56 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 },
             )
 
-        @fastapi_app.get("/mail/{project}/inbox/{agent}", response_class=HTMLResponse)
+        @staticmethod
+        async def _project_agents(session: AsyncSession, project_id: int) -> list[dict[str, Any]]:
+            agents_query = await session.execute(
+                text(
+                    """
+                    SELECT a.id, a.name, a.program, a.model, a.last_active_ts,
+                           a.notify_sound
+                    FROM agents a
+                    WHERE a.project_id = :pid
+                    ORDER BY a.last_active_ts DESC, a.name ASC
+                    """
+                ),
+                {"pid": project_id},
+            )
+            return [
+                {
+                    "id": int(row[0]),
+                    "name": row[1],
+                    "program": row[2],
+                    "model": row[3],
+                    "last_active": str(row[4]) if row[4] else None,
+                    # Carried so this page can sound the writer's own tone.
+                    # Without it every colleague rings identically in the
+                    # unified inbox, the page a watcher leaves open.
+                    "notify_sound": row[5],
+                }
+                for row in agents_query.fetchall()
+            ]
+
+        @_mail_get(
+            "/mail/{project}/inbox/{agent}", response_class=HTMLResponse,
+            responses={403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE},
+        )
         async def mail_inbox(
+            self,
             project: str,
             agent: str,
             request: Request,
             limit: int = 10000,
             page: int = 1,
         ) -> HTMLResponse:
+            settings = self.context.settings
+            _render = self.context.rendering._render
             limit = min(max(1, limit), 10000)
             page = min(max(1, page), 10000)
             await ensure_schema()
             async with get_session() as session:
                 prow = await _resolve_mail_project(session, project)
                 if not prow:
-                    return await _render("error.html", status_code=404, message="Project not found")
+                    return await _render(_ERROR_TEMPLATE, status_code=404, message=_PROJECT_NOT_FOUND_DETAIL)
                 pid = int(prow[0])
                 access = await _mail_ui_require_project_access(
                     settings=settings,
@@ -10071,7 +10250,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     )
                 ).fetchone()
                 if not arow:
-                    return await _render("error.html", message="Agent not found")
+                    return await _render(_ERROR_TEMPLATE, message=_AGENT_NOT_FOUND_DETAIL)
                 offset = max(0, (max(1, page) - 1) * max(1, limit))
                 inbox_rows = await session.execute(
                     text(
@@ -10141,13 +10320,20 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 mail_ui_access=access,
             )
 
-        @fastapi_app.get("/mail/{project}/message/{mid}", response_class=HTMLResponse)
-        async def mail_message(project: str, mid: int, request: Request) -> HTMLResponse:
+        @_mail_get(
+            "/mail/{project}/message/{mid}", response_class=HTMLResponse,
+            responses={403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE},
+        )
+        async def mail_message(self, project: str, mid: int, request: Request) -> HTMLResponse:
+            settings = self.context.settings
+            _render = self.context.rendering._render
+            markdown2 = self.context.markdown
+            _html_cleaner = self.context.html_cleaner
             await ensure_schema()
             async with get_session() as session:
                 prow = await _resolve_mail_project(session, project)
                 if not prow:
-                    return await _render("error.html", status_code=404, message="Project not found")
+                    return await _render(_ERROR_TEMPLATE, status_code=404, message=_PROJECT_NOT_FOUND_DETAIL)
                 pid = int(prow[0])
                 access = await _mail_ui_require_project_access(
                     settings=settings,
@@ -10190,7 +10376,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     )
                 ).mappings().fetchone()
                 if not mrow:
-                    return await _render("error.html", message="Message not found")
+                    return await _render(_ERROR_TEMPLATE, message="Message not found")
                 recs = await session.execute(
                     text(
                         "SELECT a.name, mr.kind, mr.read_ts, mr.ack_ts "
@@ -10285,20 +10471,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             )
             # Parse persisted attachments so the message view can render/link
             # them (#220). Stored as a JSON array column.
-            message_attachments: list[dict[str, Any]] = []
-            try:
-                raw_attachments = mrow["attachments"]
-                if isinstance(raw_attachments, str):
-                    try:
-                        parsed_attachments = json.loads(raw_attachments)
-                    except json.JSONDecodeError:
-                        parsed_attachments = []
-                else:
-                    parsed_attachments = raw_attachments
-                if isinstance(parsed_attachments, list):
-                    message_attachments = [a for a in parsed_attachments if isinstance(a, dict)]
-            except Exception:
-                message_attachments = []
+            message_attachments = self._message_attachments(mrow)
 
             message_payload = {
                 "id": mrow["id"],
@@ -10330,7 +10503,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 mail_ui_access=access,
             )
 
-        @fastapi_app.post("/mail/{project}/inbox/{agent}/mark-read")
+        @staticmethod
+        @_mail_post(
+            "/mail/{project}/inbox/{agent}/mark-read",
+            responses={400: _HTTP_BAD_REQUEST_RESPONSE, 403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE, 500: _HTTP_INTERNAL_ERROR_RESPONSE},
+        )
         async def mark_selected_messages_read(project: str, agent: str, request: Request) -> JSONResponse:
             """Mark specific messages as read for an agent."""
             await ensure_schema()
@@ -10341,7 +10518,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 message_ids: list[int] = request_body.get("message_ids", [])
 
                 if not message_ids:
-                    raise HTTPException(status_code=400, detail="No message IDs provided")
+                    raise HTTPException(status_code=400, detail=_MESSAGE_IDS_REQUIRED_DETAIL)
 
                 # Limit to prevent SQL parameter overflow (SQLite default limit is 999)
                 # Also prevents abuse - if someone wants to mark 1000+ messages, use "mark all"
@@ -10355,19 +10532,19 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     # Get project
                     prow = await _resolve_mail_project(session, project)
                     if not prow:
-                        raise HTTPException(status_code=404, detail="Project not found")
+                        raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND_DETAIL)
 
                     pid = int(prow[0])
 
                     # Get agent
                     arow = (
                         await session.execute(
-                            text("SELECT id FROM agents WHERE project_id = :pid AND name = :name"),
+                            text(_AGENT_ID_BY_NAME_SQL),
                             {"pid": pid, "name": agent},
                         )
                     ).fetchone()
                     if not arow:
-                        raise HTTPException(status_code=404, detail="Agent not found")
+                        raise HTTPException(status_code=404, detail=_AGENT_NOT_FOUND_DETAIL)
 
                     aid = int(arow[0])
 
@@ -10411,7 +10588,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 traceback.print_exc()
                 raise HTTPException(status_code=500, detail=f"Failed to mark messages as read: {exc!s}") from exc
 
-        @fastapi_app.post("/mail/{project}/inbox/{agent}/mark-all-read")
+        @staticmethod
+        @_mail_post(
+            "/mail/{project}/inbox/{agent}/mark-all-read",
+            responses={403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE, 500: _HTTP_INTERNAL_ERROR_RESPONSE},
+        )
         async def mark_all_messages_read(project: str, agent: str) -> JSONResponse:
             """Mark all messages for an agent as read."""
             await ensure_schema()
@@ -10421,19 +10602,19 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     # Get project
                     prow = await _resolve_mail_project(session, project)
                     if not prow:
-                        raise HTTPException(status_code=404, detail="Project not found")
+                        raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND_DETAIL)
 
                     pid = int(prow[0])
 
                     # Get agent
                     arow = (
                         await session.execute(
-                            text("SELECT id FROM agents WHERE project_id = :pid AND name = :name"),
+                            text(_AGENT_ID_BY_NAME_SQL),
                             {"pid": pid, "name": agent},
                         )
                     ).fetchone()
                     if not arow:
-                        raise HTTPException(status_code=404, detail="Agent not found")
+                        raise HTTPException(status_code=404, detail=_AGENT_NOT_FOUND_DETAIL)
 
                     aid = int(arow[0])
 
@@ -10469,7 +10650,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 traceback.print_exc()
                 raise HTTPException(status_code=500, detail=f"Failed to mark messages as read: {exc!s}") from exc
 
-        @fastapi_app.post("/mail/{project}/inbox/{agent}/delete-messages")
+        @staticmethod
+        @_mail_post(
+            "/mail/{project}/inbox/{agent}/delete-messages",
+            responses={400: _HTTP_BAD_REQUEST_RESPONSE, 403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE, 500: _HTTP_INTERNAL_ERROR_RESPONSE},
+        )
         async def delete_selected_messages(project: str, agent: str, request: Request) -> JSONResponse:
             """Permanently delete specific messages for an agent.
 
@@ -10484,7 +10669,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 message_ids: list[int] = request_body.get("message_ids", [])
 
                 if not message_ids:
-                    raise HTTPException(status_code=400, detail="No message IDs provided")
+                    raise HTTPException(status_code=400, detail=_MESSAGE_IDS_REQUIRED_DETAIL)
 
                 if len(message_ids) > 500:
                     raise HTTPException(
@@ -10499,7 +10684,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     # Resolve project
                     prow = await _resolve_mail_project(session, project)
                     if not prow:
-                        raise HTTPException(status_code=404, detail="Project not found")
+                        raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND_DETAIL)
 
                     pid = int(prow[0])
                     project_slug = prow[1]
@@ -10507,12 +10692,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     # Resolve agent
                     arow = (
                         await session.execute(
-                            text("SELECT id FROM agents WHERE project_id = :pid AND name = :name"),
+                            text(_AGENT_ID_BY_NAME_SQL),
                             {"pid": pid, "name": agent},
                         )
                     ).fetchone()
                     if not arow:
-                        raise HTTPException(status_code=404, detail="Agent not found")
+                        raise HTTPException(status_code=404, detail=_AGENT_NOT_FOUND_DETAIL)
 
                     # Fetch message metadata before deleting so we can locate Git files
                     placeholders = ','.join([f':mid{i}' for i in range(len(message_ids))])
@@ -10601,19 +10786,26 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     detail=f"Failed to delete messages: {exc!s}"
                 ) from exc
 
-        @fastapi_app.get("/mail/{project}/thread/{thread_id}", response_class=HTMLResponse)
-        async def mail_thread(project: str, thread_id: str, request: Request) -> HTMLResponse:
+        @_mail_get(
+            "/mail/{project}/thread/{thread_id}", response_class=HTMLResponse,
+            responses={403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE},
+        )
+        async def mail_thread(self, project: str, thread_id: str, request: Request) -> HTMLResponse:
             """Display all messages in a thread chronologically (Gmail-style conversation view).
 
             NOTE: Currently loads ALL messages in thread without pagination.
             For threads with 1000+ messages, consider adding LIMIT/OFFSET pagination.
             """
+            settings = self.context.settings
+            _render = self.context.rendering._render
+            markdown2 = self.context.markdown
+            _html_cleaner = self.context.html_cleaner
             await ensure_schema()
             async with get_session() as session:
                 # Get project
                 prow = await _resolve_mail_project(session, project)
                 if not prow:
-                    return await _render("error.html", status_code=404, message="Project not found")
+                    return await _render(_ERROR_TEMPLATE, status_code=404, message=_PROJECT_NOT_FOUND_DETAIL)
 
                 pid = int(prow[0])
                 access = await _mail_ui_require_project_access(
@@ -10711,7 +10903,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
                 if not messages:
                     return await _render(
-                        "error.html",
+                        _ERROR_TEMPLATE,
                         message=f"No messages found in thread '{thread_id}'. The thread may not exist or all messages may have been deleted."
                     )
 
@@ -10729,8 +10921,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 )
 
         # Full-text search UI across subject/body using LIKE fallback (SQLite FTS handled elsewhere)
-        @fastapi_app.get("/mail/{project}/search", response_class=HTMLResponse)
+        @_mail_get(
+            "/mail/{project}/search", response_class=HTMLResponse,
+            responses={403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE},
+        )
         async def mail_search(
+            self,
             project: str,
             q: str,
             request: Request,
@@ -10739,6 +10935,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             order: str | None = None,
             boost: int | None = None,
         ) -> HTMLResponse:
+            settings = self.context.settings
+            _render = self.context.rendering._render
+            _parse_fts_query = self.context.rendering._parse_fts_query
+            _safe_fts_snippet = self.context.rendering._safe_fts_snippet
             limit = min(max(1, limit), 10000)
             if order not in ("relevance", "time", None):
                 order = "relevance"
@@ -10746,7 +10946,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             async with get_session() as session:
                 prow = await _resolve_mail_project(session, project)
                 if not prow:
-                    return await _render("error.html", status_code=404, message="Project not found")
+                    return await _render(_ERROR_TEMPLATE, status_code=404, message=_PROJECT_NOT_FOUND_DETAIL)
                 pid = int(prow[0])
                 access = await _mail_ui_require_project_access(
                     settings=settings,
@@ -10800,37 +11000,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         item.update(sender_meta)
                         results.append(item)
                 except Exception:
-                    if like_scope == "subject":
-                        like_sql = (
-                            "SELECT m.id, m.subject, s.name AS sender_name, s.project_id AS sender_project_id, "
-                            "sp.human_key AS sender_project_name, sp.slug AS sender_project_slug, "
-                            "m.created_ts, m.importance, m.thread_id "
-                            "FROM messages m JOIN agents s ON s.id = m.sender_id "
-                            "LEFT JOIN projects sp ON sp.id = s.project_id "
-                            f"WHERE m.project_id = :pid AND m.subject LIKE :pat ESCAPE '{_LIKE_ESCAPE_CHAR}' "
-                            "ORDER BY m.created_ts DESC LIMIT :lim"
-                        )
-                    elif like_scope == "body":
-                        like_sql = (
-                            "SELECT m.id, m.subject, s.name AS sender_name, s.project_id AS sender_project_id, "
-                            "sp.human_key AS sender_project_name, sp.slug AS sender_project_slug, "
-                            "m.created_ts, m.importance, m.thread_id "
-                            "FROM messages m JOIN agents s ON s.id = m.sender_id "
-                            "LEFT JOIN projects sp ON sp.id = s.project_id "
-                            f"WHERE m.project_id = :pid AND m.body_md LIKE :pat ESCAPE '{_LIKE_ESCAPE_CHAR}' "
-                            "ORDER BY m.created_ts DESC LIMIT :lim"
-                        )
-                    else:
-                        like_sql = (
-                            "SELECT m.id, m.subject, s.name AS sender_name, s.project_id AS sender_project_id, "
-                            "sp.human_key AS sender_project_name, sp.slug AS sender_project_slug, "
-                            "m.created_ts, m.importance, m.thread_id "
-                            "FROM messages m JOIN agents s ON s.id = m.sender_id "
-                            "LEFT JOIN projects sp ON sp.id = s.project_id "
-                            f"WHERE m.project_id = :pid AND (m.subject LIKE :pat ESCAPE '{_LIKE_ESCAPE_CHAR}' "
-                            f"OR m.body_md LIKE :pat ESCAPE '{_LIKE_ESCAPE_CHAR}') "
-                            "ORDER BY m.created_ts DESC LIMIT :lim"
-                        )
+                    like_sql = self._like_search_sql(like_scope, ":lim")
                     rows = await session.execute(
                         text(like_sql), {"pid": pid, "pat": like_pat or f"%{_like_escape(q)}%", "lim": limit}
                     )
@@ -10868,13 +11038,18 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             )
 
         # File reservations and attachments views
-        @fastapi_app.get("/mail/{project}/file_reservations", response_class=HTMLResponse)
-        async def mail_file_reservations(project: str, request: Request) -> HTMLResponse:
+        @_mail_get(
+            "/mail/{project}/file_reservations", response_class=HTMLResponse,
+            responses={403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE},
+        )
+        async def mail_file_reservations(self, project: str, request: Request) -> HTMLResponse:
+            settings = self.context.settings
+            _render = self.context.rendering._render
             await ensure_schema()
             async with get_session() as session:
                 prow = await _resolve_mail_project(session, project)
                 if not prow:
-                    return await _render("error.html", status_code=404, message="Project not found")
+                    return await _render(_ERROR_TEMPLATE, status_code=404, message=_PROJECT_NOT_FOUND_DETAIL)
                 pid = int(prow[0])
                 access = await _mail_ui_require_project_access(
                     settings=settings,
@@ -10913,13 +11088,18 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 mail_ui_access=access,
             )
 
-        @fastapi_app.get("/mail/{project}/attachments", response_class=HTMLResponse)
-        async def mail_attachments(project: str, request: Request) -> HTMLResponse:
+        @_mail_get(
+            "/mail/{project}/attachments", response_class=HTMLResponse,
+            responses={403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE},
+        )
+        async def mail_attachments(self, project: str, request: Request) -> HTMLResponse:
+            settings = self.context.settings
+            _render = self.context.rendering._render
             await ensure_schema()
             async with get_session() as session:
                 prow = await _resolve_mail_project(session, project)
                 if not prow:
-                    return await _render("error.html", status_code=404, message="Project not found")
+                    return await _render(_ERROR_TEMPLATE, status_code=404, message=_PROJECT_NOT_FOUND_DETAIL)
                 pid = int(prow[0])
                 access = await _mail_ui_require_project_access(
                     settings=settings,
@@ -10959,102 +11139,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
         # ========== Human Overseer Routes ==========
 
-        async def _resolve_overseer_reply(
-            session: AsyncSession,
-            *,
-            message_id: int,
-            project_id: int,
-        ) -> tuple[list[str], str, str]:
-            """Resolve immutable recipient, subject, and thread fields for a reply.
-
-            Args:
-                session: Open database session containing the message snapshot.
-                message_id: Message being answered or followed up.
-                project_id: Project that owns the message.
-
-            Returns:
-                Recipient names, reply subject, and thread id.
-
-            Raises:
-                HTTPException: If the message is missing, retired, or crosses
-                    a routing boundary the Web UI cannot verify.
-            """
-            original = (
-                await session.execute(
-                    text(
-                        "SELECT m.thread_id, m.subject, a.name, a.project_id, a.retired_at "
-                        "FROM messages m JOIN agents a ON a.id = m.sender_id "
-                        "WHERE m.id = :mid AND m.project_id = :pid"
-                    ),
-                    {"mid": message_id, "pid": project_id},
-                )
-            ).fetchone()
-            if original is None:
-                raise HTTPException(status_code=404, detail="Reply target was not found in this project")
-            if int(original[3]) != project_id:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Cannot reply to a cross-project sender until verified routing is available",
-                )
-
-            sender_name = str(original[2])
-            if sender_name == "HumanOverseer":
-                rows = await session.execute(
-                    text(
-                        "SELECT a.name, a.project_id, a.retired_at "
-                        "FROM message_recipients mr JOIN agents a ON a.id = mr.agent_id "
-                        "WHERE mr.message_id = :mid AND mr.kind IN ('to', 'cc') "
-                        "ORDER BY CASE mr.kind WHEN 'to' THEN 0 ELSE 1 END, a.name"
-                    ),
-                    {"mid": message_id},
-                )
-                recipient_rows = rows.fetchall()
-                if any(int(row[1]) != project_id for row in recipient_rows):
-                    raise HTTPException(
-                        status_code=409,
-                        detail="Cannot follow up to cross-project recipients until verified routing is available",
-                    )
-                retired = sorted(
-                    {
-                        str(row[0])
-                        for row in recipient_rows
-                        if str(row[0]) != "HumanOverseer" and row[2] is not None
-                    }
-                )
-                if retired:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"Cannot follow up to retired recipients: {', '.join(retired)}",
-                    )
-                recipients = list(
-                    dict.fromkeys(
-                        str(row[0])
-                        for row in recipient_rows
-                        if str(row[0]) != "HumanOverseer"
-                    )
-                )
-                if not recipients:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="This Human Overseer message has no addressable recipients to follow up with",
-                    )
-            else:
-                if original[4] is not None:
-                    raise HTTPException(status_code=409, detail="Cannot reply to a retired sender")
-                recipients = [sender_name]
-
-            original_subject = str(original[1] or "")
-            reply_subject = (
-                original_subject
-                if original_subject.lower().startswith("re:")
-                else f"Re: {original_subject}"
-            )
-            subject = reply_subject[:200]
-            thread_id = str(original[0] or message_id)
-            return recipients, subject, thread_id
-
-        @fastapi_app.get("/mail/{project}/overseer/compose", response_class=HTMLResponse)
+    class Overseer(_MailRouteGroup):
+        @_mail_get(
+            "/mail/{project}/overseer/compose", response_class=HTMLResponse,
+            responses={403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE, 409: _HTTP_CONFLICT_RESPONSE, 503: _HTTP_SERVICE_UNAVAILABLE_RESPONSE},
+        )
         async def overseer_compose(
+            self,
             project: str,
             request: Request,
             reply_to: int | None = None,
@@ -11070,11 +11161,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 The composer, or an explicit error page when the requested
                 reply cannot be routed safely.
             """
+            settings = self.context.settings
+            _render = self.context.rendering._render
             async with get_session() as session:
                 # Get project
                 prow = await _resolve_mail_project(session, project)
                 if not prow:
-                    return await _render("error.html", status_code=404, message="Project not found")
+                    return await _render(_ERROR_TEMPLATE, status_code=404, message=_PROJECT_NOT_FOUND_DETAIL)
 
                 # Retired identities remain visible in project history, but they
                 # are not addressable from the human compose surface.
@@ -11089,63 +11182,29 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 if reply_to is None and not access["can_compose"]:
                     raise HTTPException(
                         status_code=403,
-                        detail="Forbidden: new messages require the project operator role",
+                        detail=_PROJECT_OPERATOR_REQUIRED_DETAIL,
                     )
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail=_MAIL_LEGACY_OVERSEER_UNAVAILABLE_DETAIL,
                 )
 
-                agent_rows = await session.execute(
-                    text("SELECT name FROM agents WHERE project_id = :pid AND retired_at IS NULL ORDER BY name"),
-                    {"pid": pid}
-                )
-                agents = [{"name": r[0]} for r in agent_rows.fetchall()]
-
-            prefill: dict[str, Any] = {
-                "reply_to": None,
-                "thread_id": "",
-                "subject": "",
-                "recipients": [],
-            }
-            if reply_to is not None:
-                async with get_session() as session:
-                    try:
-                        reply_recipients, reply_subject, reply_thread_id = await _resolve_overseer_reply(
-                            session,
-                            message_id=reply_to,
-                            project_id=pid,
-                        )
-                    except HTTPException as exc:
-                        return await _render(
-                            "error.html",
-                            status_code=exc.status_code,
-                            message=str(exc.detail),
-                        )
-                prefill = {
-                    "reply_to": reply_to,
-                    "thread_id": reply_thread_id,
-                    "subject": reply_subject,
-                    "recipients": reply_recipients,
-                }
-
-            return await _render(
-                "overseer_compose.html",
-                project={"slug": prow[1], "human_key": prow[2]},
-                agents=agents,
-                prefill=prefill,
-                mail_ui_access=access,
-            )
-
-        @fastapi_app.post("/mail/{project}/overseer/reply")
-        @fastapi_app.post("/mail/{project}/overseer/send")
-        async def overseer_send(project: str, request: Request) -> JSONResponse:
+        @_mail_post(
+            "/mail/{project}/overseer/reply",
+            responses={400: _HTTP_BAD_REQUEST_RESPONSE, 403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE, 409: _HTTP_CONFLICT_RESPONSE, 500: _HTTP_INTERNAL_ERROR_RESPONSE, 503: _HTTP_SERVICE_UNAVAILABLE_RESPONSE},
+        )
+        @_mail_post(
+            "/mail/{project}/overseer/send",
+            responses={400: _HTTP_BAD_REQUEST_RESPONSE, 403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE, 409: _HTTP_CONFLICT_RESPONSE, 500: _HTTP_INTERNAL_ERROR_RESPONSE, 503: _HTTP_SERVICE_UNAVAILABLE_RESPONSE},
+        )
+        async def overseer_send(self, project: str, request: Request) -> JSONResponse:
             """Refuse legacy overseer writes until DB and archive commits are atomic."""
+            settings = self.context.settings
             reply_endpoint = request.url.path.endswith("/overseer/reply")
             async with get_session() as authorization_session:
                 authorization_project = await _resolve_mail_project(authorization_session, project)
                 if authorization_project is None:
-                    raise HTTPException(status_code=404, detail="Project not found")
+                    raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND_DETAIL)
                 access = await _mail_ui_require_project_access(
                     settings=settings,
                     request=request,
@@ -11156,7 +11215,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 if not reply_endpoint and not access["can_compose"]:
                     raise HTTPException(
                         status_code=403,
-                        detail="Forbidden: new messages require the project operator role",
+                        detail=_PROJECT_OPERATOR_REQUIRED_DETAIL,
                     )
 
             raise HTTPException(
@@ -11164,389 +11223,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 detail=_MAIL_LEGACY_OVERSEER_UNAVAILABLE_DETAIL,
             )
 
-            await ensure_schema()
-
-            try:
-                try:
-                    request_body = await request.json()
-                except Exception as exc:
-                    raise HTTPException(status_code=400, detail="Request body must be a valid JSON object") from exc
-                if not isinstance(request_body, dict):
-                    raise HTTPException(status_code=400, detail="Request body must be a JSON object")
-
-                raw_reply_to = request_body.get("reply_to")
-                if raw_reply_to is not None and (
-                    isinstance(raw_reply_to, bool)
-                    or not isinstance(raw_reply_to, int)
-                    or raw_reply_to <= 0
-                ):
-                    raise HTTPException(status_code=400, detail="Reply target must be a positive integer or null")
-                reply_to: int | None = raw_reply_to
-                if reply_endpoint and reply_to is None:
-                    raise HTTPException(status_code=400, detail="Reply target is required")
-                if not reply_endpoint and reply_to is not None:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Replies must use the project reply endpoint",
-                    )
-
-                raw_body_md = request_body.get("body_md", "")
-                if not isinstance(raw_body_md, str):
-                    raise HTTPException(status_code=400, detail="Message body must be a string")
-                body_md = raw_body_md.strip()
-                if not body_md:
-                    raise HTTPException(status_code=400, detail="Message body is required")
-                if len(body_md) > 50000:
-                    raise HTTPException(status_code=400, detail="Message body too long (maximum 50,000 characters)")
-
-                if reply_to is None:
-                    raw_recipients = request_body.get("recipients", [])
-                    if not isinstance(raw_recipients, list) or any(
-                        not isinstance(name, str) or not name.strip()
-                        for name in raw_recipients
-                    ):
-                        raise HTTPException(
-                            status_code=400,
-                            detail="Recipients must be a list of non-empty strings",
-                        )
-                    recipients = list(dict.fromkeys(raw_recipients))
-                    if len(recipients) > 100:
-                        raise HTTPException(status_code=400, detail="Too many recipients (maximum 100 agents)")
-
-                    raw_subject = request_body.get("subject", "")
-                    if not isinstance(raw_subject, str):
-                        raise HTTPException(status_code=400, detail="Subject must be a string")
-                    subject = raw_subject.strip()
-                    if len(subject) > 200:
-                        raise HTTPException(status_code=400, detail="Subject too long (maximum 200 characters)")
-
-                    raw_thread_id = request_body.get("thread_id")
-                    if raw_thread_id is not None and not isinstance(raw_thread_id, str):
-                        raise HTTPException(status_code=400, detail="Thread ID must be a string or null")
-                    thread_id = raw_thread_id.strip() or None if raw_thread_id is not None else None
-
-                    if not recipients:
-                        raise HTTPException(status_code=400, detail="At least one recipient is required")
-                    if not subject:
-                        raise HTTPException(status_code=400, detail="Subject is required")
-                else:
-                    recipients = []
-                    subject = ""
-                    thread_id = None
-
-                # Keep database work and archive work in separate phases so
-                # the request never holds a live DB transaction while doing
-                # archive/Git I/O.
-                from datetime import datetime, timezone
-                message_id: int | None = None
-                valid_recipients: list[str] = []
-                project_slug = ""
-                project_generation = ""
-                project_human_key = ""
-                overseer_name = "HumanOverseer"
-                now = datetime.now(timezone.utc).replace(tzinfo=None)
-                async with get_immediate_session() as session:
-                    # Get project
-                    prow = await _resolve_mail_project(session, project)
-                    if not prow:
-                        raise HTTPException(status_code=404, detail="Project not found")
-
-                    # Extract project info consistently
-                    project_id = int(prow[0])
-                    project_slug = prow[1]
-                    project_human_key = prow[2]
-                    project_generation = str(prow[4])
-
-                    # Revalidate the human and derive the effective locale after
-                    # BEGIN IMMEDIATE. A revoked session or a changed preference
-                    # cannot cross the gap between the early check and this write.
-                    correspondence_locale = await _mail_ui_effective_correspondence_locale(
-                        settings=settings,
-                        request=request,
-                        session=session,
-                    )
-                    access = await _mail_ui_require_project_access(
-                        settings=settings,
-                        request=request,
-                        session=session,
-                        project_id=project_id,
-                        operate=reply_endpoint,
-                    )
-                    if not reply_endpoint and not access["can_compose"]:
-                        raise HTTPException(
-                            status_code=403,
-                            detail="Forbidden: new messages require the project operator role",
-                        )
-                    if reply_endpoint and reply_to is None:
-                        raise HTTPException(status_code=400, detail="Reply target is required")
-
-                    if reply_to is not None:
-                        recipients, subject, thread_id = await _resolve_overseer_reply(
-                            session,
-                            message_id=reply_to,
-                            project_id=project_id,
-                        )
-
-                    correspondence_advisory = _mail_ui_correspondence_advisory(
-                        correspondence_locale
-                    )
-                    preamble = f"""---
-
-        🚨 MESSAGE FROM HUMAN OVERSEER 🚨
-
-        This message is from a human operator overseeing this project. Please prioritize the instructions below over your current tasks.
-
-        You should:
-        1. Temporarily pause your current work
-        2. Complete the request described below
-        3. Resume your original plans afterward (unless modified by these instructions)
-
-        The human's guidance supersedes all other priorities.
-
-        {correspondence_advisory}
-
-        ---
-
-        """
-                    full_body = preamble + body_md
-                    if len(full_body) > 50000:
-                        preamble_length = len(preamble)
-                        max_user_length = 50000 - preamble_length
-                        raise HTTPException(
-                            status_code=400,
-                            detail=(
-                                f"Message body too long ({len(body_md)} characters). "
-                                f"Maximum is {max_user_length} characters to accommodate "
-                                f"the overseer preamble ({preamble_length} characters)."
-                            ),
-                        )
-
-                    placeholders = ", ".join([f":name_{i}" for i in range(len(recipients))])
-                    recipient_params: dict[str, Any] = {"pid": project_id}
-                    recipient_params.update({f"name_{i}": name for i, name in enumerate(recipients)})
-                    recipient_rows = await session.execute(
-                        text(
-                            f"SELECT id, name, retired_at, agent_generation FROM agents "
-                            f"WHERE project_id = :pid AND name IN ({placeholders})"
-                        ),
-                        recipient_params,
-                    )
-                    recipient_records = {
-                        str(row[1]): (int(row[0]), row[2], str(row[3]))
-                        for row in recipient_rows.fetchall()
-                    }
-                    missing_recipients = [name for name in recipients if name not in recipient_records]
-                    retired_recipients = [
-                        name
-                        for name in recipients
-                        if name in recipient_records and recipient_records[name][1] is not None
-                    ]
-                    if retired_recipients:
-                        raise HTTPException(
-                            status_code=409,
-                            detail=(
-                                "Cannot send to retired recipients: "
-                                f"{', '.join(retired_recipients)}. Restore them before sending."
-                            ),
-                        )
-                    if missing_recipients:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"Unknown recipients in this project: {', '.join(missing_recipients)}",
-                        )
-
-                    recipient_map = {
-                        name: record[0]
-                        for name, record in recipient_records.items()
-                    }
-                    valid_recipients = list(recipients)
-
-                    # Get or create "HumanOverseer" agent (with race condition protection)
-                    overseer_row = (
-                        await session.execute(
-                            text("SELECT id, name FROM agents WHERE project_id = :pid AND name = :name"),
-                            {"pid": project_id, "name": overseer_name}
-                        )
-                    ).fetchone()
-
-                    if not overseer_row:
-                        # Create HumanOverseer agent (use INSERT OR IGNORE to handle race conditions)
-                        await session.execute(
-                            text("""
-                                INSERT OR IGNORE INTO agents (
-                                    project_id,
-                                    name,
-                                    program,
-                                    model,
-                                    task_description,
-                                    contact_policy,
-                                    attachments_policy,
-                                    inception_ts,
-                                    last_active_ts
-                                )
-                                VALUES (
-                                    :pid,
-                                    :name,
-                                    :program,
-                                    :model,
-                                    :task,
-                                    :policy,
-                                    :attachments_policy,
-                                    :ts,
-                                    :ts
-                                )
-                            """),
-                            {
-                                "pid": project_id,
-                                "name": overseer_name,
-                                "program": "WebUI",
-                                "model": "Human",
-                                "task": "Human operator providing guidance and oversight to agents",
-                                "policy": "open",
-                                "attachments_policy": "auto",
-                                # Use naive UTC datetime for SQLite compatibility
-                                "ts": datetime.now(timezone.utc).replace(tzinfo=None),
-                            },
-                        )
-                        # Fetch the agent (whether we just created it or another request did)
-                        overseer_row = (
-                            await session.execute(
-                                text("SELECT id, name FROM agents WHERE project_id = :pid AND name = :name"),
-                                {"pid": project_id, "name": overseer_name}
-                            )
-                        ).fetchone()
-
-                        if not overseer_row:
-                            raise HTTPException(status_code=500, detail="Failed to create HumanOverseer agent")
-
-                    # Extract overseer_id for later use
-                    overseer_id = overseer_row[0]
-
-                    result = await session.execute(
-                        text("""
-                            INSERT INTO messages (project_id, sender_id, subject, body_md, importance, thread_id, reply_to, created_ts, ack_required)
-                            VALUES (:pid, :sid, :subj, :body, :imp, :tid, :reply_to, :ts, :ack)
-                            RETURNING id
-                        """),
-                        {
-                            "pid": project_id,
-                            "sid": overseer_id,
-                            "subj": subject,
-                            "body": full_body,
-                            "imp": "high",  # Always high importance for overseer
-                            "tid": thread_id,
-                            "reply_to": reply_to,
-                            "ts": now,
-                            "ack": False
-                        }
-                    )
-                    message_row = result.fetchone()
-                    if not message_row:
-                        raise HTTPException(status_code=500, detail="Failed to create message")
-                    message_id = message_row[0]
-
-                    # Bulk insert all message_recipients (single executemany call)
-                    insert_params = [
-                        {"mid": message_id, "aid": recipient_map[name], "kind": "to"}
-                        for name in valid_recipients
-                    ]
-                    await session.execute(
-                        text("""
-                            INSERT INTO message_recipients (message_id, agent_id, kind)
-                            VALUES (:mid, :aid, :kind)
-                        """),
-                        insert_params
-                    )
-
-                    # Update HumanOverseer activity timestamp before commit.
-                    await session.execute(
-                        text("UPDATE agents SET last_active_ts = :ts WHERE id = :id"),
-                        {"ts": now, "id": overseer_id}
-                    )
-
-                    await session.commit()
-
-                from .storage import ensure_archive, write_message_bundle
-
-                settings_local = get_settings()
-                archive = await ensure_archive(settings_local, project_slug)
-                message_dict = {
-                    "id": message_id,
-                    "thread_id": thread_id,
-                    "reply_to": reply_to,
-                    "project": project_human_key,
-                    "project_slug": project_slug,
-                    "from": overseer_name,
-                    "to": valid_recipients,
-                    "cc": [],
-                    "bcc": [],
-                    "subject": subject,
-                    "importance": "high",
-                    "ack_required": False,
-                    "created": now.isoformat(),
-                    "attachments": [],
-                }
-
-                try:
-                    async with archive_write_lock(archive):
-                        await write_message_bundle(
-                            archive,
-                            message_dict,
-                            full_body,
-                            overseer_name,
-                            valid_recipients,
-                            extra_paths=None,
-                            commit_text=f"Human Overseer message: {subject}",
-                            sender_outbox_name=overseer_name,
-                        )
-                except Exception as git_error:
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"Failed to write message to Git archive: {git_error!s}"
-                    ) from git_error
-
-                # This path builds its rows by hand rather than going through
-                # _deliver_message, so without this the one message type that
-                # most needs to arrive at once — a human telling an agent to
-                # stop — would be the only one that never wakes anybody.
-                # After the archive write, for the same reason as there: a wake
-                # pointing at a message the archive rejected is worse than none.
-                for _recipient in valid_recipients:
-                    with contextlib.suppress(Exception):
-                        hub.publish(
-                            project_slug,
-                            project_generation,
-                            _recipient,
-                            recipient_records[_recipient][2],
-                            {
-                                "kind": "message",
-                                "project": project_slug,
-                                "agent": _recipient,
-                                "id": message_id,
-                            },
-                        )
-                # The viewer too. Without this the one message type composed in
-                # the browser is the one the browser never sees arrive.
-                with contextlib.suppress(Exception):
-                    hub.publish_project(project_slug, project_generation)
-
-                return JSONResponse({
-                    "success": True,
-                    "message_id": message_id,
-                    "recipients": valid_recipients,
-                    "sent_at": now.isoformat()
-                })
-
-            except HTTPException:
-                raise
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                raise HTTPException(status_code=500, detail=f"Failed to send message: {e!s}") from e
-
         # ========== Archive Visualization Routes ==========
 
-        async def _visible_archive_projects(request: Request) -> list[dict[str, Any]]:
+    class Archive(_MailRouteGroup):
+        async def _visible_archive_projects(self, request: Request) -> list[dict[str, Any]]:
             """Return archive project picker rows visible to the current principal.
 
             Args:
@@ -11555,6 +11235,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             Returns:
                 Visible project rows with their template access mappings.
             """
+            settings = self.context.settings
             await ensure_schema()
             async with get_session() as session:
                 visible_roles = await _mail_ui_visible_project_roles(
@@ -11587,6 +11268,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 return projects
 
         async def _require_archive_project(
+            self,
             request: Request,
             project_slug: str,
         ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -11602,6 +11284,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             Raises:
                 HTTPException: With 404 when the project is absent or invisible.
             """
+            settings = self.context.settings
             await ensure_schema()
             async with get_session() as session:
                 row = (
@@ -11622,7 +11305,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                             project_id=-1,
                             project_role=None,
                         )
-                    raise HTTPException(status_code=404, detail="Project not found")
+                    raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND_DETAIL)
                 access = await _mail_ui_require_project_access(
                     settings=settings,
                     request=request,
@@ -11636,6 +11319,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 }, access
 
         async def _scoped_archive_commits(
+            self,
             request: Request,
             *,
             limit: int,
@@ -11649,6 +11333,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             Returns:
                 Reverse-chronological visible commit metadata.
             """
+            _visible_archive_projects = self._visible_archive_projects
+            _filter_archive_commits_to_prefixes = self._filter_archive_commits_to_prefixes
             settings_local = get_settings()
             repo_root = await asyncio.to_thread(_expanduser_resolve_path, Path(settings_local.storage.root))
             if not await asyncio.to_thread(_path_exists, repo_root / ".git"):
@@ -11683,6 +11369,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 if repo is not None:
                     await asyncio.to_thread(repo.close)
 
+        @staticmethod
         async def _filter_archive_commits_to_prefixes(
             repo: Any,
             commits: list[dict[str, Any]],
@@ -11727,6 +11414,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
             return await asyncio.to_thread(filter_commits)
 
+        @staticmethod
         def _archive_graph_from_timeline(
             commits: list[dict[str, Any]],
         ) -> dict[str, list[dict[str, Any]]]:
@@ -11774,6 +11462,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             ]
             return {"nodes": nodes, "edges": edges}
 
+        @staticmethod
         def _validate_project_slug(slug: str) -> bool:
             """Validate project slug format to prevent path traversal."""
 
@@ -11788,9 +11477,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             # Should match safe slug pattern
             return bool(_SLUG_VALIDATOR_RE.match(slug))
 
-        @fastapi_app.get("/mail/archive/guide", response_class=HTMLResponse)
-        async def archive_guide(request: Request) -> HTMLResponse:
+        @_mail_get("/mail/archive/guide", response_class=HTMLResponse)
+        async def archive_guide(self, request: Request) -> HTMLResponse:
             """Display the archive access guide and overview."""
+            _render = self.context.rendering._render
+            _scoped_archive_commits = self._scoped_archive_commits
+            _visible_archive_projects = self._visible_archive_projects
             settings_local = get_settings()
             projects = await _visible_archive_projects(request)
             if _mail_ui_request_is_admin(settings=settings_local, request=request):
@@ -11801,7 +11493,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 if commits:
                     with contextlib.suppress(ValueError, TypeError):
                         last_commit_time = datetime.fromisoformat(
-                            str(commits[0]["date"]).replace("Z", "+00:00")
+                            str(commits[0]["date"]).replace("Z", _UTC_OFFSET)
                         ).strftime("%b %d, %Y")
                 guide_stats = {
                     "storage_root": "Scoped view",
@@ -11821,22 +11513,27 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 projects=projects,
             )
 
-        @fastapi_app.get("/mail/archive/activity", response_class=HTMLResponse)
-        async def archive_activity(request: Request, limit: int = 50) -> HTMLResponse:
+        @_mail_get("/mail/archive/activity", response_class=HTMLResponse)
+        async def archive_activity(self, request: Request, limit: int = 50) -> HTMLResponse:
             """Display recent commits across all projects."""
+            _render = self.context.rendering._render
+            _scoped_archive_commits = self._scoped_archive_commits
             # Validate and cap limit to prevent DoS
             limit = max(1, min(limit, 500))  # Between 1 and 500
 
             commits = await _scoped_archive_commits(request, limit=limit)
             return await _render("archive_activity.html", commits=commits)
 
-        @fastapi_app.get("/mail/archive/commit/{sha}", response_class=HTMLResponse)
-        async def archive_commit(sha: str, request: Request) -> HTMLResponse:
+        @_mail_get("/mail/archive/commit/{sha}", response_class=HTMLResponse)
+        async def archive_commit(self, sha: str, request: Request) -> HTMLResponse:
             """Display detailed commit information with diffs."""
+            _render = self.context.rendering._render
+            _visible_archive_projects = self._visible_archive_projects
+            _filter_archive_commits_to_prefixes = self._filter_archive_commits_to_prefixes
             settings = get_settings()
             repo_root = await asyncio.to_thread(_expanduser_resolve_path, Path(settings.storage.root))
             if not await asyncio.to_thread(_path_exists, repo_root / ".git"):
-                return await _render("error.html", message="Archive repository not found")
+                return await _render(_ERROR_TEMPLATE, message=_ARCHIVE_NOT_FOUND_DETAIL)
 
             repo = None
             try:
@@ -11851,7 +11548,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     )
                     if not scoped:
                         return await _render(
-                            "error.html",
+                            _ERROR_TEMPLATE,
                             status_code=404,
                             message="Commit not found",
                         )
@@ -11859,31 +11556,39 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 return await _render("archive_commit.html", commit=commit)
             except ValueError:
                 # Validation errors (bad SHA, etc.)
-                return await _render("error.html", message="Invalid commit identifier")
+                return await _render(_ERROR_TEMPLATE, message="Invalid commit identifier")
             except Exception:
                 # Don't leak error details
-                return await _render("error.html", message="Commit not found")
+                return await _render(_ERROR_TEMPLATE, message="Commit not found")
             finally:
                 if repo is not None:
                     await asyncio.to_thread(repo.close)
 
-        @fastapi_app.get("/mail/archive/timeline", response_class=HTMLResponse)
-        async def archive_timeline(request: Request, project: str | None = None) -> HTMLResponse:
+        @_mail_get(
+            "/mail/archive/timeline", response_class=HTMLResponse,
+            responses={403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE},
+        )
+        async def archive_timeline(self, request: Request, project: str | None = None) -> HTMLResponse:
             """Display communication timeline with Mermaid.js visualization."""
+            _render = self.context.rendering._render
+            _validate_project_slug = self._validate_project_slug
+            _visible_archive_projects = self._visible_archive_projects
+            _require_archive_project = self._require_archive_project
+            _filter_archive_commits_to_prefixes = self._filter_archive_commits_to_prefixes
             # Validate project slug if provided
             if project and not _validate_project_slug(project):
-                return await _render("error.html", message="Invalid project identifier")
+                return await _render(_ERROR_TEMPLATE, message=_INVALID_PROJECT_DETAIL)
 
             settings = get_settings()
             repo_root = await asyncio.to_thread(_expanduser_resolve_path, Path(settings.storage.root))
             if not await asyncio.to_thread(_path_exists, repo_root / ".git"):
-                return await _render("error.html", message="Archive repository not found")
+                return await _render(_ERROR_TEMPLATE, message=_ARCHIVE_NOT_FOUND_DETAIL)
 
             # Default to first project if not specified
             if not project:
                 projects = await _visible_archive_projects(request)
                 if not projects:
-                    return await _render("error.html", message="No projects found")
+                    return await _render(_ERROR_TEMPLATE, message="No projects found")
                 project = str(projects[0]["slug"])
 
             project_data, access = await _require_archive_project(request, project)
@@ -11912,26 +11617,33 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 if repo is not None:
                     await asyncio.to_thread(repo.close)
 
-        @fastapi_app.get("/mail/archive/browser", response_class=HTMLResponse)
+        @_mail_get(
+            "/mail/archive/browser", response_class=HTMLResponse,
+            responses={403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE},
+        )
         async def archive_browser(
+            self,
             request: Request,
             project: str | None = None,
             path: str = "",
         ) -> HTMLResponse:
             """Browse archive files and directories."""
+            _render = self.context.rendering._render
+            _validate_project_slug = self._validate_project_slug
+            _require_archive_project = self._require_archive_project
             if not project:
                 # Show project selector - requires project parameter
-                return await _render("error.html", message="Please select a project to browse")
+                return await _render(_ERROR_TEMPLATE, message="Please select a project to browse")
 
             # Validate project slug
             if not _validate_project_slug(project):
-                return await _render("error.html", message="Invalid project identifier")
+                return await _render(_ERROR_TEMPLATE, message=_INVALID_PROJECT_DETAIL)
 
             _project_data, access = await _require_archive_project(request, project)
             settings = get_settings()
             archive = await _open_existing_project_archive(settings, project)
             if archive is None:
-                return await _render("error.html", message="Project archive not found")
+                return await _render(_ERROR_TEMPLATE, message=_PROJECT_ARCHIVE_NOT_FOUND_DETAIL)
             try:
                 tree = await get_archive_tree(archive, path)
                 return await _render(
@@ -11942,30 +11654,35 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     mail_ui_access=access,
                 )
             except ValueError:
-                return await _render("error.html", message="Invalid archive path")
+                return await _render(_ERROR_TEMPLATE, message="Invalid archive path")
             finally:
                 await asyncio.to_thread(archive.repo.close)
 
-        @fastapi_app.get("/mail/archive/browser/{project}/file")
-        async def archive_browser_file(project: str, path: str, request: Request) -> JSONResponse:
+        @_mail_get(
+            "/mail/archive/browser/{project}/file",
+            responses={400: _HTTP_BAD_REQUEST_RESPONSE, 403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE},
+        )
+        async def archive_browser_file(self, project: str, path: str, request: Request) -> JSONResponse:
             """Get file content from archive."""
+            _validate_project_slug = self._validate_project_slug
+            _require_archive_project = self._require_archive_project
             # Validate project slug
             if not _validate_project_slug(project):
-                raise HTTPException(status_code=400, detail="Invalid project identifier")
+                raise HTTPException(status_code=400, detail=_INVALID_PROJECT_DETAIL)
 
             await _require_archive_project(request, project)
             try:
                 settings = get_settings()
                 archive = await _open_existing_project_archive(settings, project)
                 if archive is None:
-                    raise HTTPException(status_code=404, detail="Project archive not found")
+                    raise HTTPException(status_code=404, detail=_PROJECT_ARCHIVE_NOT_FOUND_DETAIL)
                 try:
                     content = await get_file_content(archive, path)
                 finally:
                     await asyncio.to_thread(archive.repo.close)
 
                 if content is None:
-                    raise HTTPException(status_code=404, detail="File not found")
+                    raise HTTPException(status_code=404, detail=_FILE_NOT_FOUND_DETAIL)
 
                 return JSONResponse(content=content)
             except ValueError as err:
@@ -11974,28 +11691,33 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             except HTTPException:
                 raise
             except Exception as err:
-                raise HTTPException(status_code=404, detail="File not found") from err
+                raise HTTPException(status_code=404, detail=_FILE_NOT_FOUND_DETAIL) from err
 
-        @fastapi_app.get("/mail/archive/browser/{project}/download")
-        async def archive_browser_download(project: str, path: str, request: Request) -> Response:
+        @_mail_get(
+            "/mail/archive/browser/{project}/download",
+            responses={400: _HTTP_BAD_REQUEST_RESPONSE, 403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE},
+        )
+        async def archive_browser_download(self, project: str, path: str, request: Request) -> Response:
             """Download a file from the archive as an attachment (#221)."""
+            _validate_project_slug = self._validate_project_slug
+            _require_archive_project = self._require_archive_project
             # Validate project slug
             if not _validate_project_slug(project):
-                raise HTTPException(status_code=400, detail="Invalid project identifier")
+                raise HTTPException(status_code=400, detail=_INVALID_PROJECT_DETAIL)
 
             await _require_archive_project(request, project)
             try:
                 settings = get_settings()
                 archive = await _open_existing_project_archive(settings, project)
                 if archive is None:
-                    raise HTTPException(status_code=404, detail="Project archive not found")
+                    raise HTTPException(status_code=404, detail=_PROJECT_ARCHIVE_NOT_FOUND_DETAIL)
                 try:
                     content = await get_file_content(archive, path)
                 finally:
                     await asyncio.to_thread(archive.repo.close)
 
                 if content is None:
-                    raise HTTPException(status_code=404, detail="File not found")
+                    raise HTTPException(status_code=404, detail=_FILE_NOT_FOUND_DETAIL)
 
                 # Derive a safe download filename from the (already validated)
                 # path's basename; strip any directory components and quotes.
@@ -12012,25 +11734,34 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             except HTTPException:
                 raise
             except Exception as err:
-                raise HTTPException(status_code=404, detail="File not found") from err
+                raise HTTPException(status_code=404, detail=_FILE_NOT_FOUND_DETAIL) from err
 
-        @fastapi_app.get("/mail/archive/network", response_class=HTMLResponse)
-        async def archive_network(request: Request, project: str | None = None) -> HTMLResponse:
+        @_mail_get(
+            "/mail/archive/network", response_class=HTMLResponse,
+            responses={403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE},
+        )
+        async def archive_network(self, request: Request, project: str | None = None) -> HTMLResponse:
             """Display agent communication network graph."""
+            _render = self.context.rendering._render
+            _validate_project_slug = self._validate_project_slug
+            _visible_archive_projects = self._visible_archive_projects
+            _require_archive_project = self._require_archive_project
+            _filter_archive_commits_to_prefixes = self._filter_archive_commits_to_prefixes
+            _archive_graph_from_timeline = self._archive_graph_from_timeline
             # Validate project slug if provided
             if project and not _validate_project_slug(project):
-                return await _render("error.html", message="Invalid project identifier")
+                return await _render(_ERROR_TEMPLATE, message=_INVALID_PROJECT_DETAIL)
 
             settings = get_settings()
             repo_root = await asyncio.to_thread(_expanduser_resolve_path, Path(settings.storage.root))
             if not await asyncio.to_thread(_path_exists, repo_root / ".git"):
-                return await _render("error.html", message="Archive repository not found")
+                return await _render(_ERROR_TEMPLATE, message=_ARCHIVE_NOT_FOUND_DETAIL)
 
             # Default to first project
             if not project:
                 projects = await _visible_archive_projects(request)
                 if not projects:
-                    return await _render("error.html", message="No projects found")
+                    return await _render(_ERROR_TEMPLATE, message="No projects found")
                 project = str(projects[0]["slug"])
 
             project_data, access = await _require_archive_project(request, project)
@@ -12062,18 +11793,23 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 if repo is not None:
                     await asyncio.to_thread(repo.close)
 
-        @fastapi_app.get("/mail/api/projects/{project}/agents")
-        async def api_project_agents(project: str, request: Request) -> JSONResponse:
+        @_mail_get(
+            "/mail/api/projects/{project}/agents",
+            responses={400: _HTTP_BAD_REQUEST_RESPONSE, 403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE},
+        )
+        async def api_project_agents(self, project: str, request: Request) -> JSONResponse:
             """Get list of agents for a project."""
+            settings = self.context.settings
+            _validate_project_slug = self._validate_project_slug
             # Validate project slug
             if not _validate_project_slug(project):
-                raise HTTPException(status_code=400, detail="Invalid project identifier")
+                raise HTTPException(status_code=400, detail=_INVALID_PROJECT_DETAIL)
 
             async with get_session() as session:
                 # Get project ID
                 prow = await _resolve_mail_project(session, project)
                 if not prow:
-                    raise HTTPException(status_code=404, detail="Project not found")
+                    raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND_DETAIL)
                 await _mail_ui_require_project_access(
                     settings=settings,
                     request=request,
@@ -12090,25 +11826,33 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
             return JSONResponse({"agents": agents})
 
-        @fastapi_app.get("/mail/archive/time-travel", response_class=HTMLResponse)
-        async def archive_time_travel(request: Request) -> HTMLResponse:
+        @_mail_get("/mail/archive/time-travel", response_class=HTMLResponse)
+        async def archive_time_travel(self, request: Request) -> HTMLResponse:
             """Display time-travel interface."""
+            _render = self.context.rendering._render
+            _visible_archive_projects = self._visible_archive_projects
             project_rows = await _visible_archive_projects(request)
             projects = [row["slug"] for row in project_rows]
 
             return await _render("archive_time_travel.html", projects=projects)
 
-        @fastapi_app.get("/mail/archive/time-travel/snapshot")
+        @_mail_get(
+            "/mail/archive/time-travel/snapshot",
+            responses={400: _HTTP_BAD_REQUEST_RESPONSE, 403: _HTTP_FORBIDDEN_RESPONSE, 404: _HTTP_NOT_FOUND_RESPONSE},
+        )
         async def archive_time_travel_snapshot(
+            self,
             project: str,
             agent: str,
             timestamp: str,
             request: Request,
         ) -> JSONResponse:
             """Get historical inbox snapshot."""
+            _validate_project_slug = self._validate_project_slug
+            _require_archive_project = self._require_archive_project
             # Validate project slug
             if not _validate_project_slug(project):
-                raise HTTPException(status_code=400, detail="Invalid project identifier")
+                raise HTTPException(status_code=400, detail=_INVALID_PROJECT_DETAIL)
 
             # Validate agent name (alphanumeric only)
             if not agent or not _AGENT_NAME_VALIDATOR_RE.match(agent):
@@ -12129,7 +11873,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         "snapshot_time": None,
                         "commit_sha": None,
                         "requested_time": timestamp,
-                        "error": "Project archive not found",
+                        "error": _PROJECT_ARCHIVE_NOT_FOUND_DETAIL,
                     })
 
                 try:
@@ -12157,14 +11901,15 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 })
 
 
+def _register_mail_ui(fastapi_app: FastAPI, settings: Settings) -> None:
     try:
-        _register_mail_ui()
+        _MailUiRoutes(fastapi_app, settings).register()
     except Exception as exc:
         # templates/Jinja may be missing in some environments; UI remains optional
         with contextlib.suppress(Exception):
             structlog.get_logger("ui").error("ui_init_failed", error=str(exc))
-        pass
 
+def _install_http_schema(fastapi_app: FastAPI, settings: Settings) -> None:
     @fastapi_app.exception_handler(RequestValidationError)
     async def _redact_mail_ui_validation(
         request: Request,
@@ -12193,18 +11938,28 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
 
+    # FastAPI's documented extension point for a custom OpenAPI document.
+    cast(Any, fastapi_app).openapi = _HttpSchema(fastapi_app, settings)
+
+
+class _HttpSchema:
     # Keep the auto-generated /openapi.json focused on the real API contract.
     # The browser-facing SSR mail UI and its legacy JSON helpers live under the
     # `/mail` prefix; they are registered for humans, not as part of the typed
     # API contract. The versioned self-service API is the deliberate exception:
     # React clients generate types from it, so its request and response schemas
     # must remain visible while every legacy `/mail` route stays hidden.
-    from fastapi.openapi.utils import get_openapi as _get_openapi
+    def __init__(self, app: FastAPI, settings: Settings) -> None:
+        self.app = app
+        self.settings = settings
 
-    def _custom_openapi() -> dict[str, Any]:
+    def __call__(self) -> dict[str, Any]:
+        from fastapi.openapi.utils import get_openapi
+
+        fastapi_app = self.app
         if fastapi_app.openapi_schema:
             return fastapi_app.openapi_schema
-        schema = _get_openapi(
+        schema = get_openapi(
             title=fastapi_app.title,
             version=fastapi_app.version,
             openapi_version=fastapi_app.openapi_version,
@@ -12217,45 +11972,33 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 path: item
                 for path, item in paths.items()
                 if path in _MAIL_ACCOUNT_API_PATHS
-                or path.startswith("/mail/api/v1/")
-                or not (path == "/mail" or path.startswith("/mail/"))
+                or path.startswith(_MAIL_API_V1_PREFIX)
+                or not (path == _MAIL_REACT_BASE_PATH or path.startswith(_MAIL_PATH_PREFIX))
             }
-            security_scheme_name = "MailUiSession"
-            components = schema.setdefault("components", {})
-            if isinstance(components, dict):
-                security_schemes = components.setdefault("securitySchemes", {})
-                if isinstance(security_schemes, dict):
-                    security_schemes[security_scheme_name] = {
-                        "type": "apiKey",
-                        "in": "cookie",
-                        "name": settings.mail_ui.cookie_name,
-                    }
-            for path, path_item in schema["paths"].items():
-                if not path.startswith("/mail/api/v1/") or not isinstance(
-                    path_item, dict
-                ):
-                    continue
-                for method, operation in path_item.items():
-                    if method not in {
-                        "get",
-                        "post",
-                        "put",
-                        "patch",
-                        "delete",
-                        "options",
-                        "head",
-                    } or not isinstance(operation, dict):
-                        continue
-                    operation["security"] = [{security_scheme_name: []}]
+            self._add_session_security(schema)
         fastapi_app.openapi_schema = schema
         return schema
 
-    # Install the custom generator (FastAPI's documented extension point for
-    # overriding the OpenAPI document); cast keeps the bound-method override
-    # explicit for the type checker.
-    cast(Any, fastapi_app).openapi = _custom_openapi
+    def _add_session_security(self, schema: dict[str, Any]) -> None:
+        security_scheme_name = "MailUiSession"
+        components = schema.setdefault("components", {})
+        if isinstance(components, dict):
+            security_schemes = components.setdefault("securitySchemes", {})
+            if isinstance(security_schemes, dict):
+                security_schemes[security_scheme_name] = {
+                    "type": "apiKey",
+                    "in": "cookie",
+                    "name": self.settings.mail_ui.cookie_name,
+                }
+        for path, path_item in schema["paths"].items():
+            if path.startswith(_MAIL_API_V1_PREFIX) and isinstance(path_item, dict):
+                self._secure_operations(path_item, security_scheme_name)
 
-    return fastapi_app
+    @staticmethod
+    def _secure_operations(path_item: dict[str, Any], scheme_name: str) -> None:
+        for method, operation in path_item.items():
+            if method in {"get", "post", "put", "patch", "delete", "options", "head"} and isinstance(operation, dict):
+                operation["security"] = [{scheme_name: []}]
 
 
 def main() -> None:

@@ -110,4 +110,5 @@ async def test_unknown_recipient_reports_structured_error(isolated_env):
             },
         )
         deliveries = success.data.get("deliveries") or []
-        assert deliveries and deliveries[0].get("message", {}).get("subject") == "Hello again"
+        assert deliveries
+        assert deliveries[0].get("message", {}).get("subject") == "Hello again"

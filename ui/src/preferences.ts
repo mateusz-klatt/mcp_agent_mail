@@ -21,7 +21,7 @@ export class PreferencesHttpError extends Error {
 }
 
 export function isSupportedLocale(value: unknown): value is SupportedLocale {
-  return supportedLocales.some((locale) => locale === value);
+  return (supportedLocales as readonly unknown[]).includes(value);
 }
 
 function exactRecord(

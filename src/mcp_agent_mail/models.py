@@ -12,6 +12,13 @@ from sqlalchemy import CheckConstraint, Column, Index, Integer, String, UniqueCo
 from sqlalchemy.types import JSON
 from sqlmodel import Field, SQLModel
 
+_PROJECT_ID_FOREIGN_KEY = "projects.id"
+_AGENT_ID_FOREIGN_KEY = "agents.id"
+_EXECUTION_ID_FOREIGN_KEY = "agent_executions.id"
+_MESSAGE_ID_FOREIGN_KEY = "messages.id"
+_ON_DELETE_SET_NULL = "SET NULL"
+_ACTIVE_STATUS_SQL = "status = 'active'"
+
 
 class MailUiLocale(StrEnum):
     """Canonical closed set of human interface and correspondence locales."""
@@ -226,7 +233,7 @@ class ProductProjectLink(SQLModel, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
     product_id: int = Field(foreign_key="products.id", index=True)
-    project_id: int = Field(foreign_key="projects.id", index=True)
+    project_id: int = Field(foreign_key=_PROJECT_ID_FOREIGN_KEY, index=True)
     created_at: datetime = Field(default_factory=_utcnow_naive)
 
 
@@ -241,7 +248,7 @@ class Agent(SQLModel, table=True):
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    project_id: int = Field(foreign_key="projects.id", index=True)
+    project_id: int = Field(foreign_key=_PROJECT_ID_FOREIGN_KEY, index=True)
     name: str = Field(index=True, max_length=128)
     agent_generation: str = Field(
         default_factory=_new_agent_generation,
@@ -417,30 +424,30 @@ class AgentExecution(SQLModel, table=True):
             "project_id",
             "agent_id",
             "last_active_ts",
-            sqlite_where=text("status = 'active'"),
+            sqlite_where=text(_ACTIVE_STATUS_SQL),
         ),
         Index(
             "idx_agent_executions_active_stale",
             "last_active_ts",
             "project_id",
             "id",
-            sqlite_where=text("status = 'active'"),
+            sqlite_where=text(_ACTIVE_STATUS_SQL),
         ),
         Index(
             "idx_agent_executions_project_active_stale",
             "project_id",
             "last_active_ts",
             "id",
-            sqlite_where=text("status = 'active'"),
+            sqlite_where=text(_ACTIVE_STATUS_SQL),
         ),
     )
 
     id: str = Field(default_factory=_new_execution_id, primary_key=True, max_length=36)
-    project_id: int = Field(foreign_key="projects.id", index=True)
-    agent_id: int = Field(foreign_key="agents.id", index=True)
+    project_id: int = Field(foreign_key=_PROJECT_ID_FOREIGN_KEY, index=True)
+    agent_id: int = Field(foreign_key=_AGENT_ID_FOREIGN_KEY, index=True)
     parent_execution_id: Optional[str] = Field(
         default=None,
-        foreign_key="agent_executions.id",
+        foreign_key=_EXECUTION_ID_FOREIGN_KEY,
         index=True,
         max_length=36,
     )
@@ -483,11 +490,11 @@ class BuildSlotArtifactProjection(SQLModel, table=True):
     )
 
     execution_id: str = Field(
-        foreign_key="agent_executions.id",
+        foreign_key=_EXECUTION_ID_FOREIGN_KEY,
         primary_key=True,
         max_length=36,
     )
-    project_id: int = Field(foreign_key="projects.id")
+    project_id: int = Field(foreign_key=_PROJECT_ID_FOREIGN_KEY)
     created_ts: datetime = Field(default_factory=_utcnow_naive)
     reconciled_ts: Optional[datetime] = Field(default=None)
 
@@ -518,12 +525,12 @@ class BuildSlotArtifactPath(SQLModel, table=True):
     )
 
     execution_id: str = Field(
-        foreign_key="agent_executions.id",
+        foreign_key=_EXECUTION_ID_FOREIGN_KEY,
         primary_key=True,
         max_length=36,
     )
     slot_path_component: str = Field(primary_key=True, max_length=80)
-    project_id: int = Field(foreign_key="projects.id")
+    project_id: int = Field(foreign_key=_PROJECT_ID_FOREIGN_KEY)
     slot_name: str = Field(max_length=512)
     created_ts: datetime = Field(default_factory=_utcnow_naive)
 
@@ -534,8 +541,8 @@ class MessageRecipient(SQLModel, table=True):
         Index("idx_message_recipients_agent_message", "agent_id", "message_id"),
     )
 
-    message_id: int = Field(foreign_key="messages.id", primary_key=True)
-    agent_id: int = Field(foreign_key="agents.id", primary_key=True)
+    message_id: int = Field(foreign_key=_MESSAGE_ID_FOREIGN_KEY, primary_key=True)
+    agent_id: int = Field(foreign_key=_AGENT_ID_FOREIGN_KEY, primary_key=True)
     kind: str = Field(max_length=8, default="to")
     read_ts: Optional[datetime] = Field(default=None)
     ack_ts: Optional[datetime] = Field(default=None)
@@ -556,13 +563,13 @@ class Message(SQLModel, table=True):
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    project_id: int = Field(foreign_key="projects.id", index=True)
-    sender_id: int = Field(foreign_key="agents.id", index=True)
+    project_id: int = Field(foreign_key=_PROJECT_ID_FOREIGN_KEY, index=True)
+    sender_id: int = Field(foreign_key=_AGENT_ID_FOREIGN_KEY, index=True)
     thread_id: Optional[str] = Field(default=None, index=True, max_length=128)
     # Direct parent→child reply edge (the specific message this one replies to),
     # distinct from `thread_id` which groups a whole conversation. Nullable: a
     # top-level message replies to nothing. (#188)
-    reply_to: Optional[int] = Field(default=None, foreign_key="messages.id", index=True)
+    reply_to: Optional[int] = Field(default=None, foreign_key=_MESSAGE_ID_FOREIGN_KEY, index=True)
     topic: Optional[str] = Field(default=None, max_length=64)
     subject: str = Field(max_length=512)
     body_md: str
@@ -874,18 +881,18 @@ class FileReservation(SQLModel, table=True):
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    project_id: int = Field(foreign_key="projects.id", index=True)
+    project_id: int = Field(foreign_key=_PROJECT_ID_FOREIGN_KEY, index=True)
     # Nullable so a reservation can outlive its owning agent — when the agent
     # row is deleted (manual cleanup, project hygiene, etc.) the reservation
     # becomes "orphaned" and must still be discoverable so it can be
     # auto-released by the staleness sweeper instead of pinning the path
     # forever. (#161)
-    agent_id: Optional[int] = Field(default=None, foreign_key="agents.id", index=True)
+    agent_id: Optional[int] = Field(default=None, foreign_key=_AGENT_ID_FOREIGN_KEY, index=True)
     # Legacy reservations remain nullable. New execution-aware claims bind to
     # the exact run that owns them so sibling runs of one Agent still conflict.
     execution_id: Optional[str] = Field(
         default=None,
-        foreign_key="agent_executions.id",
+        foreign_key=_EXECUTION_ID_FOREIGN_KEY,
         max_length=36,
     )
     origin: str = Field(default="explicit", max_length=16)
@@ -920,10 +927,10 @@ class AgentLink(SQLModel, table=True):
     __table_args__ = (UniqueConstraint("a_project_id", "a_agent_id", "b_project_id", "b_agent_id", name="uq_agentlink_pair"),)
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    a_project_id: int = Field(foreign_key="projects.id", index=True)
-    a_agent_id: int = Field(foreign_key="agents.id", index=True)
-    b_project_id: int = Field(foreign_key="projects.id", index=True)
-    b_agent_id: int = Field(foreign_key="agents.id", index=True)
+    a_project_id: int = Field(foreign_key=_PROJECT_ID_FOREIGN_KEY, index=True)
+    a_agent_id: int = Field(foreign_key=_AGENT_ID_FOREIGN_KEY, index=True)
+    b_project_id: int = Field(foreign_key=_PROJECT_ID_FOREIGN_KEY, index=True)
+    b_agent_id: int = Field(foreign_key=_AGENT_ID_FOREIGN_KEY, index=True)
     status: str = Field(default="pending", max_length=16)  # pending | approved | blocked
     reason: str = Field(default="", max_length=512)
     created_ts: datetime = Field(default_factory=_utcnow_naive)
@@ -946,7 +953,7 @@ class WindowIdentity(SQLModel, table=True):
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    project_id: int = Field(foreign_key="projects.id", index=True)
+    project_id: int = Field(foreign_key=_PROJECT_ID_FOREIGN_KEY, index=True)
     window_uuid: str = Field(max_length=64, index=True)
     display_name: str = Field(max_length=128)
     created_ts: datetime = Field(default_factory=_utcnow_naive)
@@ -963,7 +970,7 @@ class MessageSummary(SQLModel, table=True):
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    project_id: int = Field(foreign_key="projects.id", index=True)
+    project_id: int = Field(foreign_key=_PROJECT_ID_FOREIGN_KEY, index=True)
     summary_text: str
     start_ts: datetime
     end_ts: datetime
@@ -1063,7 +1070,7 @@ class UiProjectAssignment(SQLModel, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: int = Field(foreign_key="ui_users.id", ondelete="CASCADE", index=True)
-    project_id: int = Field(foreign_key="projects.id", ondelete="CASCADE", index=True)
+    project_id: int = Field(foreign_key=_PROJECT_ID_FOREIGN_KEY, ondelete="CASCADE", index=True)
     role: str = Field(default="viewer", max_length=16)
     created_ts: datetime = Field(default_factory=_utcnow_naive)
     updated_ts: datetime = Field(default_factory=_utcnow_naive)
@@ -1150,8 +1157,8 @@ class ProjectSiblingSuggestion(SQLModel, table=True):
     __table_args__ = (UniqueConstraint("project_a_id", "project_b_id", name="uq_project_sibling_pair"),)
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    project_a_id: int = Field(foreign_key="projects.id", index=True)
-    project_b_id: int = Field(foreign_key="projects.id", index=True)
+    project_a_id: int = Field(foreign_key=_PROJECT_ID_FOREIGN_KEY, index=True)
+    project_b_id: int = Field(foreign_key=_PROJECT_ID_FOREIGN_KEY, index=True)
     score: float = Field(default=0.0)
     status: str = Field(default="suggested", max_length=16)  # suggested | confirmed | dismissed
     rationale: str = Field(default="", max_length=4096)
@@ -1213,7 +1220,7 @@ class TicketSequence(SQLModel, table=True):
         CheckConstraint("next_seq >= 1", name="ck_ticket_sequences_next_seq"),
     )
 
-    project_id: int = Field(foreign_key="projects.id", primary_key=True)
+    project_id: int = Field(foreign_key=_PROJECT_ID_FOREIGN_KEY, primary_key=True)
     prefix: str = Field(max_length=12)
     next_seq: int = Field(
         default=1,
@@ -1382,7 +1389,7 @@ class Ticket(SQLModel, table=True):
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    project_id: int = Field(foreign_key="projects.id", index=True)
+    project_id: int = Field(foreign_key=_PROJECT_ID_FOREIGN_KEY, index=True)
     # Stored, never derived. SQLite reuses row ids, so a public identifier can never be a function
     # of the primary key.
     key: str = Field(max_length=64)
@@ -1412,10 +1419,10 @@ class Ticket(SQLModel, table=True):
     # would be REFUSED by the foreign key while ``PRAGMA foreign_keys=ON`` is set on every
     # pooled connection (db.py:449), which is the opposite of "reads as unassigned".
     assignee_agent_id: Optional[int] = Field(
-        default=None, foreign_key="agents.id", ondelete="SET NULL", index=True
+        default=None, foreign_key=_AGENT_ID_FOREIGN_KEY, ondelete=_ON_DELETE_SET_NULL, index=True
     )
     reporter_agent_id: Optional[int] = Field(
-        default=None, foreign_key="agents.id", ondelete="SET NULL"
+        default=None, foreign_key=_AGENT_ID_FOREIGN_KEY, ondelete=_ON_DELETE_SET_NULL
     )
     # Actor snapshot beside the FK, because not every writer is an Agent: ui_access.py:28 answers the
     # same question with the literal "cli". Without it a CLI-created ticket reads as "created by
@@ -1430,8 +1437,8 @@ class Ticket(SQLModel, table=True):
     # models.py:1049-1050.
     origin_message_id: Optional[int] = Field(
         default=None,
-        foreign_key="messages.id",
-        ondelete="SET NULL",
+        foreign_key=_MESSAGE_ID_FOREIGN_KEY,
+        ondelete=_ON_DELETE_SET_NULL,
     )
     # Opaque and IMMUTABLE after creation: changing it would strand every message already
     # committed to the git archive under the old thread. The key stays the readable tag
@@ -1513,7 +1520,7 @@ class TicketLink(SQLModel, table=True):
     target_kind: str = Field(max_length=32)
     target_ref: str = Field(max_length=128)
     created_by_agent_id: Optional[int] = Field(
-        default=None, foreign_key="agents.id", ondelete="SET NULL"
+        default=None, foreign_key=_AGENT_ID_FOREIGN_KEY, ondelete=_ON_DELETE_SET_NULL
     )
     created_by_label: str = Field(default="", max_length=128)
     created_ts: datetime = Field(default_factory=_utcnow_naive)

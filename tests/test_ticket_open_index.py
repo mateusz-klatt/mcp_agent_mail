@@ -147,7 +147,8 @@ def test_an_already_deployed_database_has_the_index_rebuilt(
     dbmod.reset_database_state()
 
     rebuilt = _index_sql(database)
-    assert rebuilt is not None and "DESC" in rebuilt, rebuilt
+    assert rebuilt is not None
+    assert "DESC" in rebuilt, rebuilt
     assert "TEMP B-TREE" not in _plan(database), _plan(database)
 
 

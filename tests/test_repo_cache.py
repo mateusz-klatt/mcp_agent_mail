@@ -292,6 +292,97 @@ class TestLRURepoCacheOpportunisticCleanup:
         assert cleanup_calls == 2
 
 
+class _RepoInitializationControlFlow(BaseException):
+    """Synthetic worker failure outside Exception; never a process exit."""
+
+
+class TestRepoSingleFlightCompletion:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("outcome", ["success", "exception", "control-flow", "cancelled"])
+    async def test_publishes_task_outcome_and_releases_owned_registry_entries(
+        self, monkeypatch: pytest.MonkeyPatch, outcome: str,
+    ) -> None:
+        repo = MagicMock(spec=Repo)
+        errors = {
+            "exception": ValueError("repository initialization failed"),
+            "control-flow": _RepoInitializationControlFlow("worker interrupted"),
+        }
+        original_error = errors.get(outcome)
+
+        async def initialize() -> Repo:
+            if original_error is not None:
+                raise original_error
+            return repo
+
+        task = asyncio.create_task(initialize())
+        if outcome == "cancelled":
+            task.cancel()
+        await asyncio.wait((task,))
+        flight: concurrent.futures.Future[Repo] = concurrent.futures.Future()
+        flights = {"owned": flight}
+        tasks = {task}
+        monkeypatch.setattr(storage_module, "_REPO_SINGLE_FLIGHTS", flights)
+        monkeypatch.setattr(storage_module, "_REPO_CREATION_TASKS", tasks)
+
+        storage_module._complete_repo_single_flight("owned", flight, task)
+
+        assert flight.done()
+        assert not flight.cancelled()
+        if outcome == "success":
+            assert flight.result() is repo
+        elif outcome == "cancelled":
+            with pytest.raises(RuntimeError, match="Repository initialization was cancelled for owned"):
+                flight.result()
+        else:
+            assert original_error is not None
+            with pytest.raises(type(original_error)) as raised:
+                flight.result()
+            assert raised.value is original_error
+        assert tasks == set()
+        assert flights == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("shared_state", ["pending", "completed", "cancelled"])
+    @pytest.mark.parametrize("replaced", [False, True])
+    async def test_completion_preserves_existing_future_and_other_registry_owners(
+        self, monkeypatch: pytest.MonkeyPatch, shared_state: str, replaced: bool,
+    ) -> None:
+        failure = _RepoInitializationControlFlow("late worker failure")
+
+        async def initialize() -> Repo:
+            raise failure
+
+        task = asyncio.create_task(initialize())
+        survivor = asyncio.create_task(asyncio.sleep(0))
+        await asyncio.wait((task, survivor))
+        flight: concurrent.futures.Future[Repo] = concurrent.futures.Future()
+        existing_repo = MagicMock(spec=Repo)
+        if shared_state == "completed":
+            flight.set_result(existing_repo)
+        elif shared_state == "cancelled":
+            flight.cancel()
+        other_flight: concurrent.futures.Future[Repo] = concurrent.futures.Future()
+        flights = {"owned": other_flight if replaced else flight, "unrelated": other_flight}
+        tasks = {task, survivor}
+        monkeypatch.setattr(storage_module, "_REPO_SINGLE_FLIGHTS", flights)
+        monkeypatch.setattr(storage_module, "_REPO_CREATION_TASKS", tasks)
+
+        storage_module._complete_repo_single_flight("owned", flight, task)
+
+        if shared_state == "completed":
+            assert flight.result() is existing_repo
+        elif shared_state == "cancelled":
+            assert flight.cancelled()
+        else:
+            assert flight.exception() is failure
+        assert tasks == {survivor}
+        expected = {"unrelated": other_flight}
+        if replaced:
+            expected["owned"] = other_flight
+        assert flights == expected
+        assert not other_flight.done()
+
+
 class TestModuleLevelFunctions:
     """Test module-level cache functions."""
 

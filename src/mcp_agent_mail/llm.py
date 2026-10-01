@@ -53,13 +53,9 @@ def _setup_callbacks() -> None:
                 # Prefer rich terminal output when enabled; fallback to structlog
                 if settings.log_rich_enabled:
                     try:
-                        import importlib as _imp
-                        _rc = _imp.import_module("rich.console")
-                        _rp = _imp.import_module("rich.panel")
-                        _rt = _imp.import_module("rich.text")
-                        Console = _rc.Console
-                        Panel = _rp.Panel
-                        Text = _rt.Text
+                        from rich.console import Console
+                        from rich.panel import Panel
+                        from rich.text import Text
 
                         body = Text.assemble(
                             ("model: ", "cyan"), (model, "white"), "\n",
@@ -209,6 +205,22 @@ async def complete_system_user(system: str, user: str, *, model: Optional[str] =
     return LlmOutput(content=content or "", model=str(model_used), provider=str(provider) if provider else None)
 
 
+def _provider_key_from_aliases(cfg: DecoupleConfig, keys: tuple[str, ...]) -> str:
+    """Prefer process environment aliases before reading aliases from decouple."""
+    for key in keys:
+        value = os.environ.get(key)
+        if value:
+            return value
+    for key in keys:
+        try:
+            value = cfg(key, default="")
+        except Exception:
+            value = ""
+        if value:
+            return value
+    return ""
+
+
 def _bridge_provider_env() -> None:
     """Populate os.environ with provider API keys from .env via decouple if missing.
 
@@ -223,20 +235,6 @@ def _bridge_provider_env() -> None:
     except FileNotFoundError:
         cfg = DecoupleConfig(RepositoryEmpty())
 
-    def _get_from_any(*keys: str) -> str:
-        for k in keys:
-            v = os.environ.get(k)
-            if v:
-                return v
-        for k in keys:
-            try:
-                v = cfg(k, default="")
-            except Exception:
-                v = ""
-            if v:
-                return v
-        return ""
-
     # Canonical targets with possible synonyms
     mappings: list[tuple[str, tuple[str, ...]]] = [
         ("OPENAI_API_KEY", ("OPENAI_API_KEY",)),
@@ -250,7 +248,6 @@ def _bridge_provider_env() -> None:
 
     for canonical, aliases in mappings:
         if not os.environ.get(canonical):
-            val = _get_from_any(*aliases)
+            val = _provider_key_from_aliases(cfg, aliases)
             if val:
                 os.environ[canonical] = val
-

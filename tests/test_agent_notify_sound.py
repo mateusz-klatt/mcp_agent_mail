@@ -15,6 +15,7 @@ import contextlib
 
 import pytest
 from fastmcp import Client
+from fastmcp.exceptions import ToolError
 
 from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import NOTIFY_SOUND_NAMES, build_mcp_server
@@ -131,7 +132,8 @@ async def test_an_agent_can_choose_and_clear_its_tone(server):
         )
         assert out["notify_sound"] == "high"
         # The whole vocabulary comes back, so a caller never has to guess.
-        assert "chime" in out["available"] and "high" in out["available"]
+        assert "chime" in out["available"]
+        assert "high" in out["available"]
 
         cleared = _data(
             await client.call_tool(
@@ -153,7 +155,7 @@ async def test_an_unknown_tone_is_refused_out_loud(server):
     """
     async with Client(server) as client:
         token = await _register(client)
-        with pytest.raises(Exception) as excinfo:
+        with pytest.raises(ToolError, match="airhorn") as excinfo:
             await client.call_tool(
                 "set_agent_notify_sound",
                 {"project_key": KEY, "agent_name": AGENT_NAME,
@@ -174,7 +176,7 @@ async def test_a_url_is_refused_like_any_other_unknown_value(server):
     """
     async with Client(server) as client:
         token = await _register(client)
-        with pytest.raises(Exception) as excinfo:
+        with pytest.raises(ToolError, match=r"example\.invalid") as excinfo:
             await client.call_tool(
                 "set_agent_notify_sound",
                 {"project_key": KEY, "agent_name": AGENT_NAME,

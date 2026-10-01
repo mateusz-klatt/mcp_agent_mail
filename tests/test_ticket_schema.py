@@ -274,7 +274,6 @@ def test_a_ticket_cannot_be_its_own_parent() -> None:
         row_id = connection.execute("SELECT id FROM tickets WHERE key='AM-1'").fetchone()[0]
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute("UPDATE tickets SET parent_id = id WHERE id = ?", (row_id,))
-            connection.commit()
         connection.rollback()
         # Control: pointing at a different ticket is accepted. The cross-row rule
         # that a parent must itself be an epic spans two rows and lives in
@@ -316,7 +315,6 @@ def test_sequence_prefix_is_uppercase_and_globally_unique() -> None:
                 " VALUES (?, 'am', 1, '2026-08-31 00:00:00', '2026-08-31 00:00:00')",
                 (first,),
             )
-            connection.commit()
         connection.rollback()
 
         connection.execute(
@@ -332,7 +330,6 @@ def test_sequence_prefix_is_uppercase_and_globally_unique() -> None:
                 " VALUES (?, 'AM', 1, '2026-08-31 00:00:00', '2026-08-31 00:00:00')",
                 (second,),
             )
-            connection.commit()
         connection.rollback()
 
         # Control: a different prefix in the second project is accepted.
@@ -494,12 +491,10 @@ def test_ticket_events_are_immutable_in_the_database() -> None:
 
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute("UPDATE ticket_events SET event_type = 'closed'")
-            connection.commit()
         connection.rollback()
 
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute("DELETE FROM ticket_events")
-            connection.commit()
         connection.rollback()
 
         # Control: appending another row is exactly what must still work.

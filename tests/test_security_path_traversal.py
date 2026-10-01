@@ -326,11 +326,12 @@ class TestAttachmentPathTraversal:
             )
             # Try to attach a nonexistent file with traversal path
             # This should raise a ToolError (the system rejects invalid file paths)
+            project_key = pkey("backend")
             with pytest.raises(ToolError) as exc_info:
                 await client.call_tool(
                     "send_message",
                     {
-                        "project_key": pkey("backend"),
+                        "project_key": project_key,
                         "sender_name": SECURITY_ATTACHMENT_AGENT,
                         "to": [SECURITY_ATTACHMENT_AGENT],
                         "subject": "Test missing attachment",
@@ -405,16 +406,18 @@ class TestAttachmentPathTraversal:
                 },
             )
 
+            project_key = pkey("backend")
+            attachment_path = str(secret_file.resolve())
             with pytest.raises(ToolError) as exc_info:
                 await client.call_tool(
                     "send_message",
                     {
-                        "project_key": pkey("backend"),
+                        "project_key": project_key,
                         "sender_name": SECURITY_ABSOLUTE_AGENT,
                         "to": [SECURITY_ABSOLUTE_AGENT],
                         "subject": "Absolute attachment",
                         "body_md": "Should be rejected",
-                        "attachment_paths": [str(secret_file.resolve())],
+                        "attachment_paths": [attachment_path],
                         "convert_images": False,
                         "idempotency_key": "security-absolute-attachment",
                     },

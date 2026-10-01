@@ -25,13 +25,13 @@ import secrets
 import sqlite3
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import wraps
 from pathlib import Path
-from typing import Any, Final, TypeVar, cast
+from typing import Any, Final, cast
 
 from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
@@ -54,8 +54,14 @@ from .models import (
     UiUser,
 )
 
-T = TypeVar("T")
 _logger = logging.getLogger(__name__)
+_SQLITE_FOREIGN_KEYS_ON = "PRAGMA foreign_keys=ON"
+_SQLITE_FOREIGN_KEYS_OFF = "PRAGMA foreign_keys=OFF"
+_SQLITE_FOREIGN_KEYS_STATE = "PRAGMA foreign_keys"
+_SQLITE_FOREIGN_KEY_CHECK = "PRAGMA foreign_key_check"
+_SQLITE_BEGIN_IMMEDIATE = "BEGIN IMMEDIATE"
+_FOREIGN_KEYS_NOT_RESTORED = "SQLite foreign-key enforcement was not restored"
+_FOREIGN_KEY_NO_ACTION = "no action"
 
 # Backoff jitter source; SystemRandom keeps the uniform distribution while
 # avoiding the seedable module-level Mersenne Twister state.
@@ -238,6 +244,85 @@ def _is_pool_exhausted_error(exc: Exception) -> bool:
     return "pool" in error_msg and ("timeout" in error_msg or "exhausted" in error_msg)
 
 
+async def _wait_before_db_retry(
+    error: Exception,
+    attempt: int,
+    func_name: str,
+    max_retries: int,
+    base_delay: float,
+    max_delay: float,
+    use_circuit_breaker: bool,
+) -> bool:
+    """Record a terminal failure or wait for the next transient-error attempt."""
+    error_msg = str(error)
+    is_lock = _is_lock_error(error_msg)
+    is_pool = _is_pool_exhausted_error(error)
+    retryable = is_lock or is_pool
+    if not retryable or attempt >= max_retries:
+        if use_circuit_breaker:
+            await _record_circuit_failure()
+        return False
+
+    delay = min(base_delay * 2**attempt, max_delay)
+    jitter_factor = 2 * _jitter_rng.random() - 1
+    jitter = delay * 0.25 * jitter_factor
+    total_delay = max(0.01, delay + jitter)
+    error_type = "pool_exhausted" if is_pool else "db_locked"
+    _logger.warning(
+        f"db.{error_type}",
+        extra={
+            "function": func_name,
+            "attempt": attempt + 1,
+            "max_retries": max_retries,
+            "delay_seconds": round(total_delay, 3),
+            "error": error_msg[:200],
+        },
+    )
+    await asyncio.sleep(total_delay)
+    return True
+
+
+async def _run_with_db_lock_retries(
+    func: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    max_retries: int,
+    base_delay: float,
+    max_delay: float,
+    use_circuit_breaker: bool,
+) -> Any:
+    """Run the retry loop while preserving the original exception on exhaustion."""
+    last_exception: Exception | None = None
+    func_name = getattr(func, "__name__", getattr(func, "__qualname__", "<callable>"))
+    if use_circuit_breaker and get_circuit_state() == CircuitState.OPEN:
+        raise CircuitBreakerOpenError(
+            f"Circuit breaker is open for database operations. "
+            f"Function {func_name} will not be attempted. "
+            f"This typically indicates sustained database lock contention."
+        )
+
+    for attempt in range(max_retries + 1):
+        try:
+            result = await func(*args, **kwargs)
+            # This includes first-attempt success while the breaker is HALF_OPEN.
+            if use_circuit_breaker and _circuit_breaker_failures > 0:
+                await _record_circuit_success()
+            return result
+        except (OperationalError, SATimeoutError) as error:
+            if not await _wait_before_db_retry(
+                error, attempt, func_name, max_retries,
+                base_delay, max_delay, use_circuit_breaker,
+            ):
+                raise
+            last_exception = error
+
+    if use_circuit_breaker:
+        await _record_circuit_failure()
+    if last_exception:
+        raise last_exception
+    raise RuntimeError("Unexpected retry loop exit")
+
+
 def retry_on_db_lock(
     max_retries: int = 7,
     base_delay: float = 0.05,
@@ -269,71 +354,51 @@ def retry_on_db_lock(
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         @wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
-            last_exception: Exception | None = None
-            func_name = getattr(func, "__name__", getattr(func, "__qualname__", "<callable>"))
-
-            # Check circuit breaker state
-            if use_circuit_breaker:
-                state = get_circuit_state()
-                if state == CircuitState.OPEN:
-                    raise CircuitBreakerOpenError(
-                        f"Circuit breaker is open for database operations. "
-                        f"Function {func_name} will not be attempted. "
-                        f"This typically indicates sustained database lock contention."
-                    )
-
-            for attempt in range(max_retries + 1):
-                try:
-                    result = await func(*args, **kwargs)
-                    # Success - reset circuit breaker if it had any accumulated failures,
-                    # even on the first attempt (allows recovery from HALF_OPEN state).
-                    if use_circuit_breaker and _circuit_breaker_failures > 0:
-                        await _record_circuit_success()
-                    return result
-
-                except (OperationalError, SATimeoutError) as e:
-                    error_msg = str(e)
-                    is_lock = _is_lock_error(error_msg)
-                    is_pool = _is_pool_exhausted_error(e)
-
-                    if not (is_lock or is_pool) or attempt >= max_retries:
-                        # Not a retryable error, or we've exhausted retries
-                        if use_circuit_breaker:
-                            await _record_circuit_failure()
-                        raise
-
-                    last_exception = e
-
-                    # Calculate exponential backoff with jitter
-                    delay = min(base_delay * (2**attempt), max_delay)
-                    # Add ±25% jitter to prevent thundering herd
-                    jitter = delay * 0.25 * (2 * _jitter_rng.random() - 1)
-                    total_delay = max(0.01, delay + jitter)  # Ensure positive delay
-
-                    error_type = "pool_exhausted" if is_pool else "db_locked"
-                    _logger.warning(
-                        f"db.{error_type}",
-                        extra={
-                            "function": func_name,
-                            "attempt": attempt + 1,
-                            "max_retries": max_retries,
-                            "delay_seconds": round(total_delay, 3),
-                            "error": error_msg[:200],
-                        },
-                    )
-
-                    await asyncio.sleep(total_delay)
-
-            # Should never reach here, but just in case
-            if use_circuit_breaker:
-                await _record_circuit_failure()
-            if last_exception:
-                raise last_exception
-            raise RuntimeError("Unexpected retry loop exit")
+            return await _run_with_db_lock_retries(
+                func, args, kwargs, max_retries,
+                base_delay, max_delay, use_circuit_breaker,
+            )
 
         return wrapper
 
     return decorator
+
+
+def _sqlite_connect_args(settings: DatabaseSettings) -> dict[str, Any]:
+    """Prepare the SQLite directory, adapters and DBAPI connection options."""
+    import datetime as dt_module
+
+    from sqlalchemy.engine import make_url
+
+    # SQLite returns "unable to open database file" when the parent is missing.
+    try:
+        parsed = make_url(settings.url)
+        if parsed.database and parsed.database != ":memory:":
+            Path(parsed.database).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    def adapt_datetime_iso(val: Any) -> str:
+        """Adapt datetime.datetime to ISO 8601 date."""
+        return str(val.isoformat())
+
+    def convert_datetime(val: bytes | str) -> dt_module.datetime | None:
+        """Return None for malformed, mistyped or out-of-range timestamps."""
+        try:
+            if isinstance(val, bytes):
+                val = val.decode("utf-8")
+            return dt_module.datetime.fromisoformat(val)
+        except (ValueError, AttributeError, TypeError, OverflowError):
+            # UnicodeDecodeError is a ValueError, so corrupt bytes also return None.
+            return None
+
+    # Global adapter registrations are idempotent; the last registration wins.
+    sqlite3.register_adapter(dt_module.datetime, adapt_datetime_iso)
+    sqlite3.register_converter("timestamp", convert_datetime)
+    return {
+        "timeout": 60.0,
+        "check_same_thread": False,
+    }
 
 
 def _build_engine(settings: DatabaseSettings) -> AsyncEngine:
@@ -352,67 +417,19 @@ def _build_engine(settings: DatabaseSettings) -> AsyncEngine:
     - pool_pre_ping: Detect and recycle stale connections
     """
     from sqlalchemy import event
-    from sqlalchemy.engine import make_url
 
     # For SQLite, enable WAL mode and set timeout for better concurrent access
-    connect_args = {}
     is_sqlite = "sqlite" in settings.url.lower()
-
-    if is_sqlite:
-        # Ensure parent directory exists for file-backed SQLite URLs.
-        # SQLite returns "unable to open database file" when the directory is missing.
-        try:
-            parsed = make_url(settings.url)
-            if parsed.database and parsed.database != ":memory:":
-                Path(parsed.database).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
-
-        # Register datetime adapters ONCE globally for Python 3.12+ compatibility
-        # These are module-level registrations, not per-connection
-        import datetime as dt_module
-        import sqlite3
-
-        def adapt_datetime_iso(val: Any) -> str:
-            """Adapt datetime.datetime to ISO 8601 date."""
-            return str(val.isoformat())
-
-        def convert_datetime(val: bytes | str) -> dt_module.datetime | None:
-            """Convert ISO 8601 datetime to datetime.datetime object.
-
-            Returns None for any conversion errors (invalid format, wrong type,
-            corrupted data, etc.) to allow graceful degradation rather than crashing.
-            """
-            try:
-                # Handle both bytes and str (SQLite can return either)
-                if isinstance(val, bytes):
-                    val = val.decode('utf-8')
-                return dt_module.datetime.fromisoformat(val)
-            except (ValueError, AttributeError, TypeError, UnicodeDecodeError, OverflowError):
-                # Return None for any conversion failure:
-                # - ValueError: invalid ISO format string
-                # - TypeError: unexpected type (shouldn't happen but defensive)
-                # - AttributeError: val has no expected attributes (defensive)
-                # - UnicodeDecodeError: corrupted bytes (extreme edge case)
-                # - OverflowError: datetime value out of valid range (year outside 1-9999)
-                return None
-
-        # Register adapters globally (safe to call multiple times - last registration wins)
-        sqlite3.register_adapter(dt_module.datetime, adapt_datetime_iso)
-        sqlite3.register_converter("timestamp", convert_datetime)
-
-        connect_args = {
-            "timeout": 60.0,  # Extended timeout (60s) to handle checkpoint stalls
-            "check_same_thread": False,  # Required for async SQLite
-        }
+    connect_args = _sqlite_connect_args(settings) if is_sqlite else {}
 
     # SQLite concurrency tuning:
     # - Larger pool to support high-concurrency multi-agent workloads (50 base + 4 overflow = 54 max connections)
     # - Longer timeout to handle WAL checkpoint blocking
     # For non-SQLite (PostgreSQL, etc.), keep existing defaults unless overridden
-    pool_size = settings.pool_size if settings.pool_size is not None else (50 if is_sqlite else 25)
-    max_overflow = settings.max_overflow if settings.max_overflow is not None else (4 if is_sqlite else 25)
-    pool_timeout = settings.pool_timeout if settings.pool_timeout is not None else (45 if is_sqlite else 30)
+    default_pool_size, default_max_overflow, default_pool_timeout = (50, 4, 45) if is_sqlite else (25, 25, 30)
+    pool_size = settings.pool_size if settings.pool_size is not None else default_pool_size
+    max_overflow = settings.max_overflow if settings.max_overflow is not None else default_max_overflow
+    pool_timeout = settings.pool_timeout if settings.pool_timeout is not None else default_pool_timeout
 
     engine = create_async_engine(
         settings.url,
@@ -452,7 +469,7 @@ def _build_engine(settings: DatabaseSettings) -> AsyncEngine:
                 # This must be connection-local: enabling it on the one
                 # connection used by a schema migration does not protect later
                 # pool checkouts.
-                cursor.execute("PRAGMA foreign_keys=ON")
+                cursor.execute(_SQLITE_FOREIGN_KEYS_ON)
 
                 # Enable WAL mode for concurrent reads/writes
                 # This is persistent - only needs to be set once per database file
@@ -633,7 +650,7 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
     return _session_factory
 
 
-async def await_database_cleanup_task(task: asyncio.Task[T]) -> T:
+async def await_database_cleanup_task[T](task: asyncio.Task[T]) -> T:
     """Finish one database cleanup task, then propagate caller cancellation."""
     cancellation: asyncio.CancelledError | None = None
     current_task = asyncio.current_task()
@@ -735,7 +752,7 @@ async def get_immediate_session(*, check_circuit_breaker: bool = False) -> Async
         # Obtain the underlying connection and issue BEGIN IMMEDIATE *before*
         # SQLAlchemy's autobegin can issue a plain BEGIN.
         conn = await session.connection()
-        await conn.exec_driver_sql("BEGIN IMMEDIATE")
+        await conn.exec_driver_sql(_SQLITE_BEGIN_IMMEDIATE)
         yield session
     except BaseException:
         # Roll back on any error so the IMMEDIATE lock is released.
@@ -1176,7 +1193,7 @@ def _rebuild_message_delivery_schema(connection: Any) -> None:
             "MessageDelivery schema migration did not install the canonical columns"
         )
 
-    violations = connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+    violations = connection.exec_driver_sql(_SQLITE_FOREIGN_KEY_CHECK).fetchall()
     if violations:
         raise RuntimeError(
             "MessageDelivery schema migration failed foreign-key validation"
@@ -1188,10 +1205,10 @@ async def _migrate_message_delivery_schema(engine: AsyncEngine) -> None:
     async with engine.connect() as connection:
         if connection.dialect.name != "sqlite":
             return
-        await connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        await connection.exec_driver_sql(_SQLITE_FOREIGN_KEYS_OFF)
         await connection.commit()
         try:
-            await connection.exec_driver_sql("BEGIN IMMEDIATE")
+            await connection.exec_driver_sql(_SQLITE_BEGIN_IMMEDIATE)
             await connection.run_sync(_rebuild_message_delivery_schema)
             await connection.commit()
         except BaseException:
@@ -1199,12 +1216,12 @@ async def _migrate_message_delivery_schema(engine: AsyncEngine) -> None:
                 await connection.rollback()
             raise
         finally:
-            await connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+            await connection.exec_driver_sql(_SQLITE_FOREIGN_KEYS_ON)
             foreign_keys_enabled = int(
-                (await connection.exec_driver_sql("PRAGMA foreign_keys")).scalar_one()
+                (await connection.exec_driver_sql(_SQLITE_FOREIGN_KEYS_STATE)).scalar_one()
             )
             if foreign_keys_enabled != 1:
-                raise RuntimeError("SQLite foreign-key enforcement was not restored")
+                raise RuntimeError(_FOREIGN_KEYS_NOT_RESTORED)
             await connection.commit()
 
 
@@ -1221,6 +1238,30 @@ def _ui_users_locale_schema_needs_rebuild(connection: Any) -> bool:
         or "preferred_correspondence_locale varchar(16)" not in create_sql
         or any(repr(value).casefold() not in create_sql for value in MAIL_UI_LOCALE_VALUES)
     )
+
+
+def _restore_ui_users_schema_objects(
+    connection: Any,
+    ui_users_table: Table,
+    dependent_schema_objects: Sequence[Any],
+) -> None:
+    """Restore dependent objects in order after the UI-account table is replaced."""
+    replaced_locale_triggers = {"ui_users_locale_guard_bi", "ui_users_locale_guard_bu"}
+    for object_type in ("view", "index", "trigger"):
+        for stored_type, name, sql in dependent_schema_objects:
+            if stored_type != object_type or name in replaced_locale_triggers:
+                continue
+            connection.exec_driver_sql(str(sql))
+
+    existing_indexes = {
+        str(row[0])
+        for row in connection.exec_driver_sql(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'ui_users'"
+        )
+    }
+    for index in sorted(ui_users_table.indexes, key=lambda item: item.name or ""):
+        if index.name not in existing_indexes:
+            connection.execute(CreateIndex(index))
 
 
 def _rebuild_ui_users_locale_schema(connection: Any) -> None:
@@ -1296,24 +1337,9 @@ def _rebuild_ui_users_locale_schema(connection: Any) -> None:
     connection.exec_driver_sql("DROP TABLE ui_users")
     connection.exec_driver_sql("ALTER TABLE ui_users_locale_v2 RENAME TO ui_users")
 
-    replaced_locale_triggers = {"ui_users_locale_guard_bi", "ui_users_locale_guard_bu"}
-    for object_type in ("view", "index", "trigger"):
-        for stored_type, name, sql in dependent_schema_objects:
-            if stored_type != object_type or name in replaced_locale_triggers:
-                continue
-            connection.exec_driver_sql(str(sql))
+    _restore_ui_users_schema_objects(connection, ui_users_table, dependent_schema_objects)
 
-    existing_indexes = {
-        str(row[0])
-        for row in connection.exec_driver_sql(
-            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'ui_users'"
-        )
-    }
-    for index in sorted(ui_users_table.indexes, key=lambda item: item.name or ""):
-        if index.name not in existing_indexes:
-            connection.execute(CreateIndex(index))
-
-    violations = connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+    violations = connection.exec_driver_sql(_SQLITE_FOREIGN_KEY_CHECK).fetchall()
     if violations:
         raise RuntimeError("ui_users locale migration failed foreign-key validation")
 
@@ -1323,10 +1349,10 @@ async def _migrate_ui_users_locale_schema(engine: AsyncEngine) -> None:
     async with engine.connect() as connection:
         if connection.dialect.name != "sqlite":
             return
-        await connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        await connection.exec_driver_sql(_SQLITE_FOREIGN_KEYS_OFF)
         await connection.commit()
         try:
-            await connection.exec_driver_sql("BEGIN IMMEDIATE")
+            await connection.exec_driver_sql(_SQLITE_BEGIN_IMMEDIATE)
             await connection.run_sync(_rebuild_ui_users_locale_schema)
             await connection.commit()
         except BaseException:
@@ -1334,12 +1360,12 @@ async def _migrate_ui_users_locale_schema(engine: AsyncEngine) -> None:
                 await connection.rollback()
             raise
         finally:
-            await connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+            await connection.exec_driver_sql(_SQLITE_FOREIGN_KEYS_ON)
             foreign_keys_enabled = int(
-                (await connection.exec_driver_sql("PRAGMA foreign_keys")).scalar_one()
+                (await connection.exec_driver_sql(_SQLITE_FOREIGN_KEYS_STATE)).scalar_one()
             )
             if foreign_keys_enabled != 1:
-                raise RuntimeError("SQLite foreign-key enforcement was not restored")
+                raise RuntimeError(_FOREIGN_KEYS_NOT_RESTORED)
             await connection.commit()
 
 
@@ -1476,6 +1502,8 @@ def dispose_engine_blocking(engine: AsyncEngine, timeout_seconds: float = 5.0) -
     """Dispose an async engine in a helper thread so shutdown survives active event loops/cancellation."""
     # The helper thread hands its failure back through this shared cell;
     # Thread.join() below establishes the happens-before for the read.
+    # BaseException is intentional: cancellation and custom control-flow errors
+    # must also reach the caller, which re-raises the exact object after join().
     dispose_errors: list[BaseException] = []
 
     def _dispose_in_thread() -> None:
@@ -2042,14 +2070,14 @@ def _agent_execution_table_mismatches(connection: Any) -> list[str]:
         ).fetchall()
     }
     expected_foreign_keys = {
-        ("projects", "project_id", "id", "no action", "no action", "none"),
-        ("agents", "agent_id", "id", "no action", "no action", "none"),
+        ("projects", "project_id", "id", _FOREIGN_KEY_NO_ACTION, _FOREIGN_KEY_NO_ACTION, "none"),
+        ("agents", "agent_id", "id", _FOREIGN_KEY_NO_ACTION, _FOREIGN_KEY_NO_ACTION, "none"),
         (
             "agent_executions",
             "parent_execution_id",
             "id",
-            "no action",
-            "no action",
+            _FOREIGN_KEY_NO_ACTION,
+            _FOREIGN_KEY_NO_ACTION,
             "none",
         ),
     }
@@ -2169,10 +2197,10 @@ async def _migrate_agent_executions_schema(engine: AsyncEngine) -> None:
         if not mismatches:
             return
 
-        await connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        await connection.exec_driver_sql(_SQLITE_FOREIGN_KEYS_OFF)
         await connection.commit()
         try:
-            await connection.exec_driver_sql("BEGIN IMMEDIATE")
+            await connection.exec_driver_sql(_SQLITE_BEGIN_IMMEDIATE)
             await connection.run_sync(_rebuild_agent_executions_schema)
             await connection.commit()
         except BaseException:
@@ -2180,14 +2208,14 @@ async def _migrate_agent_executions_schema(engine: AsyncEngine) -> None:
                 await connection.rollback()
             raise
         finally:
-            await connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+            await connection.exec_driver_sql(_SQLITE_FOREIGN_KEYS_ON)
             foreign_keys_enabled = int(
-                (await connection.exec_driver_sql("PRAGMA foreign_keys")).scalar_one()
+                (await connection.exec_driver_sql(_SQLITE_FOREIGN_KEYS_STATE)).scalar_one()
             )
             if foreign_keys_enabled != 1:
-                raise RuntimeError("SQLite foreign-key enforcement was not restored")
+                raise RuntimeError(_FOREIGN_KEYS_NOT_RESTORED)
             violations = (
-                await connection.exec_driver_sql("PRAGMA foreign_key_check")
+                await connection.exec_driver_sql(_SQLITE_FOREIGN_KEY_CHECK)
             ).fetchall()
             if violations:
                 raise RuntimeError(
@@ -2234,8 +2262,8 @@ def _validate_agent_execution_schema(connection: Any) -> None:
         "agent_executions",
         "execution_id",
         "id",
-        "no action",
-        "no action",
+        _FOREIGN_KEY_NO_ACTION,
+        _FOREIGN_KEY_NO_ACTION,
         "none",
     ) not in reservation_foreign_keys:
         raise RuntimeError(

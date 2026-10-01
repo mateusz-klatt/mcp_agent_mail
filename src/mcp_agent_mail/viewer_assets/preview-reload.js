@@ -31,6 +31,4 @@ async function pollStatus() {
 }
 
 const intervalId = window.setInterval(pollStatus, POLL_INTERVAL_MS);
-pollStatus().catch(() => {
-  /* ignore initial error */
-});
+await pollStatus();

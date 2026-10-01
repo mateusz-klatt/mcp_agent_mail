@@ -1149,7 +1149,7 @@ function routeInteger(value: string | undefined): number | null {
 // units, so the browser and Python endpoint enforce the same 128-character cap.
 // eslint-disable-next-line no-control-regex
 const threadControlCharacters = /[\u0000-\u001f\u007f-\u009f]/u;
-const canonicalNumericThreadIdentifier = /^[1-9][0-9]{0,18}$/u;
+const canonicalNumericThreadIdentifier = /^[1-9]\d{0,18}$/u;
 const maximumSqliteInteger = 9_223_372_036_854_775_807n;
 
 function isNumericThreadStarter(
@@ -1196,6 +1196,42 @@ function decodedThreadIdentifier(value: string): string | null {
   }
 }
 
+function parseSearchRoute(query: string): MailRoute {
+  const params = new URLSearchParams(query);
+  const rawQuery = params.get("q") ?? "";
+  const rawScope = params.get("scope");
+  const rawOrder = params.get("order");
+  return {
+    view: "search",
+    query: rawQuery.length <= 256 ? rawQuery : "",
+    projectId: routeInteger(params.get("project") ?? undefined),
+    scope: rawScope === "subject" || rawScope === "body" ? rawScope : "all",
+    order: rawOrder === "newest" ? "newest" : "relevance",
+  };
+}
+
+function parseMessageRoute(parts: string[]): MailRoute | null {
+  const projectId = routeInteger(parts[1]);
+  const messageId = routeInteger(parts[2]);
+  return projectId !== null && messageId !== null
+    ? { view: "message", projectId, messageId }
+    : null;
+}
+
+function parseThreadRoute(parts: string[]): MailRoute | null {
+  const projectId = routeInteger(parts[1]);
+  const threadId = decodedThreadIdentifier(parts[2]!);
+  if (
+    projectId !== null &&
+    parts[1] === String(projectId) &&
+    threadId !== null &&
+    parts[2] === encodeURIComponent(threadId)
+  ) {
+    return { view: "thread", projectId, threadId };
+  }
+  return null;
+}
+
 export function parseMailRoute(hash: string): MailRoute {
   const normalized = hash.startsWith("#") ? hash.slice(1) : hash;
   const hasQueryDelimiter = normalized.includes("?");
@@ -1214,40 +1250,17 @@ export function parseMailRoute(hash: string): MailRoute {
     };
   }
   if (path === "search") {
-    const params = new URLSearchParams(query);
-    const rawQuery = params.get("q") ?? "";
-    const rawScope = params.get("scope");
-    const rawOrder = params.get("order");
-    return {
-      view: "search",
-      query: rawQuery.length <= 256 ? rawQuery : "",
-      projectId: routeInteger(params.get("project") ?? undefined),
-      scope:
-        rawScope === "subject" || rawScope === "body" ? rawScope : "all",
-      order: rawOrder === "newest" ? "newest" : "relevance",
-    };
+    return parseSearchRoute(query);
   }
   const parts = path.split("/");
+  const defaultRoute: MailRoute = { view: "inbox", projectId: null };
   if (parts[0] === "message" && parts.length === 3) {
-    const projectId = routeInteger(parts[1]);
-    const messageId = routeInteger(parts[2]);
-    if (projectId !== null && messageId !== null) {
-      return { view: "message", projectId, messageId };
-    }
+    return parseMessageRoute(parts) ?? defaultRoute;
   }
   if (parts[0] === "thread" && parts.length === 3 && !hasQueryDelimiter) {
-    const projectId = routeInteger(parts[1]);
-    const threadId = decodedThreadIdentifier(parts[2]!);
-    if (
-      projectId !== null &&
-      parts[1] === String(projectId) &&
-      threadId !== null &&
-      parts[2] === encodeURIComponent(threadId)
-    ) {
-      return { view: "thread", projectId, threadId };
-    }
+    return parseThreadRoute(parts) ?? defaultRoute;
   }
-  return { view: "inbox", projectId: null };
+  return defaultRoute;
 }
 
 export function mailThreadRouteHash(

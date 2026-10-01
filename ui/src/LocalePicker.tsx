@@ -28,7 +28,7 @@ export default function LocalePicker({
   disabled,
   locale,
   onSelect,
-}: LocalePickerProps) {
+}: Readonly<LocalePickerProps>) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const [activeLocale, setActiveLocale] = useState(locale);

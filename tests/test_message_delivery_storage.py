@@ -601,12 +601,13 @@ async def test_partial_attempt_is_invisible_and_retryable(
         "mcp_agent_mail.storage._write_message_delivery_attempt_sync",
         partial_write,
     )
+    document_sha256 = _sha256(document)
     with pytest.raises(MessageDeliveryPendingError, match="attempt write failed"):
         await publish_message_delivery(
             archive,
             DELIVERY_ID,
             document,
-            _sha256(document),
+            document_sha256,
             lease_fence=7,
         )
 
@@ -644,12 +645,13 @@ async def test_unsupported_hard_link_leaves_only_retryable_pending_attempt(
         raise OSError("injected hard-link unsupported")
 
     monkeypatch.setattr("mcp_agent_mail.storage.os.link", unsupported_link)
+    document_sha256 = _sha256(document)
     with pytest.raises(MessageDeliveryPendingError, match="hard-link publication is unavailable"):
         await publish_message_delivery(
             archive,
             DELIVERY_ID,
             document,
-            _sha256(document),
+            document_sha256,
             lease_fence=1,
         )
 
@@ -798,13 +800,14 @@ async def test_hash_and_existing_path_mismatches_are_rejected(
     archive = await ensure_archive(get_settings(), "delivery-mismatch")
     document = _document()
     wrong_document = _document(body="Different")
+    wrong_sha256 = _sha256(wrong_document)
 
     with pytest.raises(ValueError, match="document SHA-256 mismatch"):
         await publish_message_delivery(
             archive,
             DELIVERY_ID,
             document,
-            _sha256(wrong_document),
+            wrong_sha256,
             lease_fence=1,
         )
     assert not (archive.root / "message_deliveries").exists()
@@ -821,7 +824,7 @@ async def test_hash_and_existing_path_mismatches_are_rejected(
             archive,
             DELIVERY_ID,
             wrong_document,
-            _sha256(wrong_document),
+            wrong_sha256,
             lease_fence=2,
         )
     assert captured.value.expected_sha256 == _sha256(wrong_document)
@@ -889,12 +892,13 @@ async def test_publisher_revalidates_archive_slug_and_root(isolated_env: Any) ->
     original_root = archive.root
 
     archive.slug = "delivery[meta]"
+    document_sha256 = _sha256(document)
     with pytest.raises(ValueError, match="project slug must be a canonical"):
         await publish_message_delivery(
             archive,
             DELIVERY_ID,
             document,
-            _sha256(document),
+            document_sha256,
             lease_fence=1,
         )
 
@@ -905,7 +909,7 @@ async def test_publisher_revalidates_archive_slug_and_root(isolated_env: Any) ->
             archive,
             DELIVERY_ID,
             document,
-            _sha256(document),
+            document_sha256,
             lease_fence=2,
         )
     assert not (original_root / "message_deliveries").exists()
@@ -1055,12 +1059,13 @@ async def test_failed_delivery_stage_survives_exact_legacy_commit_then_retries(
         "mcp_agent_mail.storage._commit_message_delivery_sync",
         fail_before_commit,
     )
+    document_sha256 = _sha256(document)
     with pytest.raises(MessageDeliveryPendingError, match="Git commit failed"):
         await publish_message_delivery(
             archive,
             DELIVERY_ID,
             document,
-            _sha256(document),
+            document_sha256,
             lease_fence=1,
         )
 

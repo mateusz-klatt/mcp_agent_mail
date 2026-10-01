@@ -270,13 +270,40 @@ def verify_session(token: str, *, now: float, secret: bytes) -> "tuple[str, int,
         username, epoch_s, generation, expiry_s = payload.decode("utf-8").rsplit("|", 3)
         epoch = int(epoch_s)
         expiry = int(expiry_s)
-    except (ValueError, UnicodeDecodeError):
+    except ValueError:
         return None
     if now >= expiry:
         return None
     if not generation:
         return None
     return username, epoch, generation
+
+
+def _url_matches_origin(
+    url: str,
+    expected_scheme: str,
+    expected_hostname: str,
+    expected_port: int,
+    *,
+    origin: bool,
+) -> bool:
+    """Compare an origin or referer against the validated request authority."""
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    except ValueError:
+        return False
+    if (
+        parsed.scheme.lower() != expected_scheme
+        or parsed.scheme.lower() not in {"http", "https"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.hostname is None
+        or parsed.hostname.lower() != expected_hostname
+        or port != expected_port
+    ):
+        return False
+    return not origin or (parsed.path in {"", "/"} and not parsed.query and not parsed.fragment)
 
 
 def same_origin(
@@ -318,28 +345,14 @@ def same_origin(
         return False
     expected_hostname = expected.hostname.lower()
 
-    def _matches(url: str, *, origin: bool) -> bool:
-        try:
-            parsed = urlsplit(url)
-            port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
-        except ValueError:
-            return False
-        if (
-            parsed.scheme.lower() != expected_scheme
-            or parsed.scheme.lower() not in {"http", "https"}
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.hostname is None
-            or parsed.hostname.lower() != expected_hostname
-            or port != expected_port
-        ):
-            return False
-        return not origin or (parsed.path in {"", "/"} and not parsed.query and not parsed.fragment)
-
     if origin_header:
-        return _matches(origin_header, origin=True)
+        return _url_matches_origin(
+            origin_header, expected_scheme, expected_hostname, expected_port, origin=True
+        )
     if referer_header:
-        return _matches(referer_header, origin=False)
+        return _url_matches_origin(
+            referer_header, expected_scheme, expected_hostname, expected_port, origin=False
+        )
     return False
 
 

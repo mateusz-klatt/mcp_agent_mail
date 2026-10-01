@@ -41,7 +41,7 @@ from fastmcp.exceptions import (
 from fastmcp.resources import ResourceContent, ResourceResult
 from fastmcp.server.middleware import Middleware
 from pydantic import ValidationError
-from git import Repo
+from git import Commit, Repo
 from git.exc import InvalidGitRepositoryError, NoSuchPathError
 from sqlalchemy import and_ as _sa_and, asc as _sa_asc, bindparam, delete as _sa_delete, desc as _sa_desc, exists as _sa_exists, func, or_ as _sa_or, select as _sa_select, text, update as _sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -139,6 +139,15 @@ except Exception:  # pragma: no cover - optional dependency fallback
 
 logger = logging.getLogger(__name__)
 
+_PROJECT_AGENT_QUERY_ID_REQUIRED = "Project must have an id before querying agents."
+_PROJECT_AGENT_IDS_REQUIRED = "Project/agent IDs must exist"
+_PROJECT_ADDRESS_PREFIX = "project:"
+_INVALID_PROJECT_LABEL = "(invalid project)"
+_UNKNOWN_PROJECT_LABEL = "(unknown project)"
+_CONTACT_BLOCKED_MESSAGE = "Recipient is not accepting messages."
+_CONTACT_BLOCKED_LOG_MESSAGE = f"CONTACT_BLOCKED: {_CONTACT_BLOCKED_MESSAGE}"
+_PRODUCT_BUS_DISABLED_MESSAGE = "Product Bus is disabled. Enable WORKTREES_ENABLED to use this tool."
+
 _EXECUTION_LIFECYCLE_PROTOCOL_VERSION = 1
 _EXECUTION_TOKEN_PATTERN = re.compile(r"[0-9a-f]{64}")
 _REGISTRATION_TOKEN_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -183,75 +192,85 @@ def _registration_token_fingerprint(token: str | None) -> str | None:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
-def _redact_tool_log_value(value: Any) -> Any:
-    """Return a recursively redacted copy suitable only for diagnostic logs."""
-    sensitive_values: set[str] = set()
+class _ToolLogRedactor:
+    """Collect capabilities before redacting every occurrence in a log value."""
 
+    def __init__(self) -> None:
+        self.sensitive_values: set[str] = set()
+
+    @staticmethod
     def _is_sensitive_key(key: Any) -> bool:
         return any(
             fragment in str(key).casefold()
             for fragment in _SENSITIVE_TOOL_LOG_KEY_FRAGMENTS
         )
 
-    def _collect(item: Any, *, sensitive_context: bool = False) -> None:
+    def collect(self, item: Any, *, sensitive_context: bool = False) -> None:
         if isinstance(item, Mapping):
             for key, nested in item.items():
-                _collect(
+                self.collect(
                     nested,
                     sensitive_context=(
-                        sensitive_context or _is_sensitive_key(key)
+                        sensitive_context or self._is_sensitive_key(key)
                     ),
                 )
             return
         if isinstance(item, (list, tuple, set, frozenset)):
             for nested in item:
-                _collect(nested, sensitive_context=sensitive_context)
+                self.collect(nested, sensitive_context=sensitive_context)
             return
         model_dump = getattr(item, "model_dump", None)
         if callable(model_dump):
             with suppress(Exception):
-                _collect(
+                self.collect(
                     model_dump(),
                     sensitive_context=sensitive_context,
                 )
             return
         if sensitive_context and isinstance(item, str) and item:
-            sensitive_values.add(item)
+            self.sensitive_values.add(item)
 
-    def _redact(item: Any) -> Any:
+    def _contains_sensitive_value(self, item: Any) -> bool:
+        return isinstance(item, str) and any(
+            secret in item for secret in self.sensitive_values
+        )
+
+    def _redact_mapping(self, item: Mapping[Any, Any]) -> dict[Any, Any]:
+        redacted: dict[Any, Any] = {}
+        for key, nested in item.items():
+            safe_key = (
+                _REDACTED_TOOL_ARGUMENT if self._contains_sensitive_value(key) else key
+            )
+            redacted[safe_key] = (
+                _REDACTED_TOOL_ARGUMENT
+                if self._is_sensitive_key(key)
+                else self.redact(nested)
+            )
+        return redacted
+
+    def redact(self, item: Any) -> Any:
         if isinstance(item, Mapping):
-            redacted_mapping: dict[Any, Any] = {}
-            for key, nested in item.items():
-                safe_key = (
-                    _REDACTED_TOOL_ARGUMENT
-                    if isinstance(key, str)
-                    and any(secret in key for secret in sensitive_values)
-                    else key
-                )
-                redacted_mapping[safe_key] = (
-                    _REDACTED_TOOL_ARGUMENT
-                    if _is_sensitive_key(key)
-                    else _redact(nested)
-                )
-            return redacted_mapping
+            return self._redact_mapping(item)
         if isinstance(item, list):
-            return [_redact(nested) for nested in item]
+            return [self.redact(nested) for nested in item]
         if isinstance(item, tuple):
-            return tuple(_redact(nested) for nested in item)
+            return tuple(self.redact(nested) for nested in item)
         if isinstance(item, (set, frozenset)):
-            return [_redact(nested) for nested in item]
+            return [self.redact(nested) for nested in item]
         model_dump = getattr(item, "model_dump", None)
         if callable(model_dump):
             with suppress(Exception):
-                return _redact(model_dump())
-        if isinstance(item, str) and any(
-            secret in item for secret in sensitive_values
-        ):
+                return self.redact(model_dump())
+        if self._contains_sensitive_value(item):
             return _REDACTED_TOOL_ARGUMENT
         return item
 
-    _collect(value)
-    return _redact(value)
+
+def _redact_tool_log_value(value: Any) -> Any:
+    """Return a recursively redacted copy suitable only for diagnostic logs."""
+    redactor = _ToolLogRedactor()
+    redactor.collect(value)
+    return redactor.redact(value)
 
 
 class _FastMCPSensitiveLogFilter(logging.Filter):
@@ -266,7 +285,12 @@ class _FastMCPSensitiveLogFilter(logging.Filter):
 
     _mcp_agent_mail_sensitive_log_filter = True
 
-    def filter(self, record: logging.LogRecord) -> bool:
+    def filter(self, record: logging.LogRecord) -> logging.LogRecord:
+        self._sanitize(record)
+        return record
+
+    @staticmethod
+    def _sanitize(record: logging.LogRecord) -> None:
         if record.name == "fastmcp.server.auth.oauth_proxy.proxy":
             # OAuth transactions, authorization codes, upstream errors, and
             # callback state are all capabilities or untrusted IdP input. Keep
@@ -276,16 +300,16 @@ class _FastMCPSensitiveLogFilter(logging.Filter):
             record.args = ()
             record.exc_info = None
             record.exc_text = None
-            return True
+            return
         message_template = record.msg
         if not isinstance(message_template, str):
-            return True
+            return
         if message_template.endswith(
             "Handler called: call_tool %s with %s"
         ):
             record.msg = "FastMCP tool call received (arguments redacted)"
             record.args = ()
-            return True
+            return
         if message_template == "Invalid arguments for tool %r: %s":
             record_args = record.args
             if isinstance(record_args, tuple) and record_args:
@@ -294,7 +318,6 @@ class _FastMCPSensitiveLogFilter(logging.Filter):
             else:
                 record.msg = "Invalid tool arguments (details redacted)"
                 record.args = ()
-        return True
 
 
 def _install_fastmcp_sensitive_log_filter() -> None:
@@ -518,13 +541,12 @@ def _should_expose_tool(tool_name: str, cluster: str, settings: Settings) -> boo
         if not clusters_list and not tools_list:
             return True
 
-        in_cluster = cluster in clusters_list if clusters_list else False
-        in_tools = tool_name in tools_list if tools_list else False
+        in_cluster = cluster in clusters_list
+        in_tools = tool_name in tools_list
 
         if mode == "include":
             return in_cluster or in_tools
-        else:  # exclude
-            return not (in_cluster or in_tools)
+        return not (in_cluster or in_tools)
 
     # Predefined profile
     if profile == "full":
@@ -538,9 +560,7 @@ def _should_expose_tool(tool_name: str, cluster: str, settings: Settings) -> boo
     profile_tools = profile_def.get("tools", [])
 
     # If profile_clusters is empty for that profile, only check tools
-    if profile_clusters and cluster in profile_clusters:
-        return True
-    if profile_tools and tool_name in profile_tools:
+    if cluster in profile_clusters or tool_name in profile_tools:
         return True
 
     # For profiles with explicit lists, if tool not in any list, don't expose
@@ -667,6 +687,255 @@ def _record_recent(tool_name: str, project: Optional[str], agent: Optional[str])
     RECENT_TOOL_USAGE.append((datetime.now(timezone.utc), tool_name, project, agent))
 
 
+def _tool_type_error(tool_name: str, exc: TypeError) -> ToolExecutionError:
+    message = str(exc)
+    hint = ""
+    if "got an unexpected keyword argument" in message:
+        hint = " Check parameter names for typos."
+    elif "missing" in message and "required" in message:
+        hint = " Ensure all required parameters are provided."
+    elif "NoneType" in message:
+        hint = " A required value was None/null."
+    return ToolExecutionError(
+        "TYPE_ERROR", f"Argument type mismatch: {exc}.{hint}", recoverable=True,
+        data={"tool": tool_name, "error_detail": str(exc)},
+    )
+
+
+def _tool_os_error(tool_name: str, exc: OSError) -> ToolExecutionError:
+    import errno
+
+    if exc.errno == errno.EMFILE:
+        cleared = clear_repo_cache()
+        return ToolExecutionError(
+            "RESOURCE_EXHAUSTED", f"Too many open files. Freed {cleared} cached repos. Retry the operation.",
+            recoverable=True, data={"tool": tool_name, "freed_repos": cleared, "error_detail": str(exc)},
+        )
+    return ToolExecutionError(
+        "OS_ERROR", f"OS error: {exc}", recoverable=False,
+        data={"tool": tool_name, "errno": exc.errno, "error_detail": str(exc)},
+    )
+
+
+def _tool_unexpected_error(tool_name: str, exc: Exception) -> ToolExecutionError:
+    error_type = type(exc).__name__
+    message = str(exc)
+    normalized = message.lower()
+    if "database" in normalized or "sqlite" in normalized:
+        category = "DATABASE_ERROR"
+        friendly = "A database error occurred. This may be a transient issue - try again."
+        recoverable = True
+    elif "lock" in normalized or "busy" in normalized:
+        category = "RESOURCE_BUSY"
+        friendly = "Resource is temporarily busy. Wait a moment and try again."
+        recoverable = True
+    elif "permission" in normalized or "access" in normalized:
+        category = "PERMISSION_ERROR"
+        friendly = f"Access denied: {message}"
+        recoverable = False
+    elif "connection" in normalized or "network" in normalized:
+        category = "CONNECTION_ERROR"
+        friendly = "Connection error occurred. Check network and try again."
+        recoverable = True
+    else:
+        category = "UNHANDLED_EXCEPTION"
+        friendly = f"Unexpected error ({error_type}): {message}"
+        recoverable = False
+    return ToolExecutionError(
+        category, friendly, recoverable=recoverable,
+        data={"tool": tool_name, "original_error": error_type, "error_detail": message},
+    )
+
+
+def _wrap_tool_exception(tool_name: str, settings: Settings, exc: Exception) -> ToolExecutionError:
+    if isinstance(exc, ToolExecutionError):
+        return exc
+    if isinstance(exc, NoResultFound):
+        return ToolExecutionError("NOT_FOUND", str(exc), recoverable=True, data={"tool": tool_name})
+    if isinstance(exc, ValueError):
+        return ToolExecutionError(
+            "INVALID_ARGUMENT", f"Invalid argument value: {exc}. Check that all parameters have valid values.",
+            recoverable=True, data={"tool": tool_name, "error_detail": str(exc)},
+        )
+    if isinstance(exc, TypeError):
+        return _tool_type_error(tool_name, exc)
+    if isinstance(exc, KeyError):
+        return ToolExecutionError(
+            "MISSING_FIELD", f"Missing required field: {exc}. Ensure all required parameters are provided.",
+            recoverable=True, data={"tool": tool_name, "missing_field": str(exc)},
+        )
+    if isinstance(exc, SATimeoutError):
+        database = settings.database
+        return ToolExecutionError(
+            "DATABASE_POOL_EXHAUSTED", "Database connection pool exhausted. Reduce concurrency or increase pool settings.",
+            recoverable=True, data={
+                "tool": tool_name, "pool_size": database.pool_size, "max_overflow": database.max_overflow,
+                "pool_timeout": database.pool_timeout, "error_detail": str(exc),
+            },
+        )
+    if isinstance(exc, TimeoutError):
+        return ToolExecutionError(
+            "TIMEOUT", f"Operation timed out: {exc}. The server may be under heavy load. Try again in a moment.",
+            recoverable=True, data={"tool": tool_name, "error_detail": str(exc)},
+        )
+    if isinstance(exc, GitIndexLockError):
+        return ToolExecutionError(
+            "GIT_INDEX_LOCK",
+            "Git repository is temporarily locked by another operation. "
+            "This is normal in multi-agent environments. "
+            f"Wait a moment and retry. (Attempted {exc.attempts} times before giving up)",
+            recoverable=True, data={"tool": tool_name, "lock_path": str(exc.lock_path), "attempts": exc.attempts},
+        )
+    if isinstance(exc, OSError):
+        return _tool_os_error(tool_name, exc)
+    return _tool_unexpected_error(tool_name, exc)
+
+
+def _validate_instrumented_output_format(tool_name: str, format_value: Any, clean_arguments: dict[str, Any]) -> None:
+    if format_value is None:
+        return
+    _normalized, valid = _normalize_output_format(format_value)
+    if valid:
+        return
+    TOOL_METRICS[tool_name]["errors"] += 1
+    error = ToolExecutionError(
+        "INVALID_ARGUMENT", "Invalid format value. Expected 'json' or 'toon'.", recoverable=True,
+        data={"tool": tool_name, "argument": "format", "provided": clean_arguments.get("format")},
+    )
+    # Reject before any wrapped-tool side effects, outside the main finally.
+    _record_tool_error(tool_name, error)
+    raise error
+
+
+@dataclass(repr=False)
+class _ToolInvocationInstrumentation:
+    tool_name: str
+    settings: Settings
+    project: str | None
+    agent: str | None
+    log_context: rich_logger.ToolCallContext | None
+    query_tracker: Any
+    tracker_token: Any
+
+
+def _start_tool_instrumentation(tool_name: str, safe_context: dict[str, Any], start_time: float) -> _ToolInvocationInstrumentation:
+    settings = get_settings()
+    query_tracker = get_query_tracker()
+    tracker_token = None
+    if query_tracker is None and settings.instrumentation_enabled:
+        query_tracker, tracker_token = start_query_tracking(slow_ms=float(settings.instrumentation_slow_query_ms))
+    log_context = None
+    if settings.tools_log_enabled:
+        try:
+            log_context = rich_logger.ToolCallContext(
+                tool_name=tool_name, args=[], kwargs=safe_context["arguments"],
+                project=safe_context["project"], agent=safe_context["agent"], start_time=start_time,
+            )
+            rich_logger.log_tool_call_start(log_context)
+        except Exception:
+            # Logging failures never break execution.
+            log_context = None
+    return _ToolInvocationInstrumentation(
+        tool_name, settings, safe_context["project"], safe_context["agent"], log_context, query_tracker, tracker_token,
+    )
+
+
+def _finish_tool_instrumentation(state: _ToolInvocationInstrumentation, result: Any, error: Exception | None) -> None:
+    _record_recent(state.tool_name, state.project, state.agent)
+    query_stats = None
+    if state.query_tracker is not None:
+        query_stats = state.query_tracker.to_dict()
+    if query_stats and state.settings.instrumentation_enabled:
+        logger.info("tool_query_stats", extra={
+            "tool": state.tool_name, "project": state.project, "agent": state.agent,
+            "queries": query_stats.get("total", 0), "query_time_ms": query_stats.get("total_time_ms", 0.0),
+            "per_table": query_stats.get("per_table", {}), "slow_query_ms": query_stats.get("slow_query_ms"),
+        })
+    if state.log_context is not None:
+        try:
+            state.log_context.end_time = time.perf_counter()
+            state.log_context.result = _redact_tool_log_value(result)
+            state.log_context.error = error
+            state.log_context.success = error is None
+            if query_stats:
+                state.log_context.query_stats = query_stats
+            rich_logger.log_tool_call_end(state.log_context)
+        except Exception:
+            # Preserve the original execution exception if logging fails.
+            pass
+    if state.tracker_token is not None:
+        stop_query_tracking(state.tracker_token)
+
+
+async def _invoke_tool_with_emfile_retry(func: Any, tool_name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    import errno
+
+    try:
+        return await func(*args, **kwargs)
+    except OSError as exc:
+        if exc.errno != errno.EMFILE or tool_name not in _EMFILE_RETRY_TOOLS:
+            raise
+        with suppress(Exception):
+            clear_repo_cache()
+        with suppress(Exception):
+            import gc
+
+            gc.collect()
+        await asyncio.sleep(0.05)
+        return await func(*args, **kwargs)
+
+
+async def _run_instrumented_tool(
+    func: Any, signature: inspect.Signature, tool_name: str, meta: dict[str, Any],
+    args: tuple[Any, ...], kwargs: dict[str, Any], argument_names: tuple[str | None, str | None],
+) -> Any:
+    start_time = time.perf_counter()
+    metrics = TOOL_METRICS[tool_name]
+    metrics["calls"] += 1
+    bound = _bind_arguments(signature, args, kwargs)
+    ctx = bound.arguments.get("ctx")
+    format_value = bound.arguments.get("format")
+    raw_arguments = {key: value for key, value in bound.arguments.items() if key != "ctx"}
+    safe_context = cast(dict[str, Any], _redact_tool_log_value({
+        "arguments": raw_arguments,
+        "project": _extract_argument(bound, argument_names[1]),
+        "agent": _extract_argument(bound, argument_names[0]),
+    }))
+    _validate_instrumented_output_format(tool_name, format_value, safe_context["arguments"])
+    if isinstance(ctx, Context) and meta["capabilities"]:
+        _enforce_capabilities(ctx, set(cast(list[str], meta["capabilities"])), tool_name)
+    state = _start_tool_instrumentation(tool_name, safe_context, start_time)
+    result = None
+    error = None
+    pending_validation_error: _FastMCPToolError | None = None
+    try:
+        result = await _invoke_tool_with_emfile_retry(func, tool_name, args, kwargs)
+        if format_value is not None or state.settings.output_format_default or state.settings.toon_default_format:
+            result = await _apply_tool_output_format(result, tool_name=tool_name, settings=state.settings, format_value=format_value)
+    except ValidationError as exc:
+        # Never log or raise while credential-bearing Pydantic input is active:
+        # logging.handleError can print the active exception despite redacted LogRecords.
+        metrics["errors"] += 1
+        safe_exc = _FastMCPToolError(_redacted_validation_message(tool_name, exc, raw_arguments))
+        error = safe_exc
+        pending_validation_error = safe_exc
+    except Exception as exc:
+        metrics["errors"] += 1
+        _record_tool_error(tool_name, exc)
+        error = _wrap_tool_exception(tool_name, state.settings, exc)
+        if error is exc:
+            raise
+        raise error from exc
+    finally:
+        _finish_tool_instrumentation(state, result, error)
+
+    # Both except and finally must finish before logging the sanitized validation error.
+    if pending_validation_error is not None:
+        _record_tool_error(tool_name, pending_validation_error)
+        raise pending_validation_error from None
+    return result
+
+
 def _instrument_tool(
     tool_name: str,
     *,
@@ -690,356 +959,7 @@ def _instrument_tool(
 
         @wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
-            start_time = time.perf_counter()
-
-            metrics = TOOL_METRICS[tool_name]
-            metrics["calls"] += 1
-            bound = _bind_arguments(signature, args, kwargs)
-            ctx = bound.arguments.get("ctx")
-            format_value = bound.arguments.get("format")
-            raw_log_arguments = {
-                key: value
-                for key, value in bound.arguments.items()
-                if key != "ctx"
-            }
-            safe_log_context = cast(
-                dict[str, Any],
-                _redact_tool_log_value(
-                    {
-                        "arguments": raw_log_arguments,
-                        "project": _extract_argument(bound, project_arg),
-                        "agent": _extract_argument(bound, agent_arg),
-                    }
-                ),
-            )
-            clean_kwargs = cast(
-                dict[str, Any],
-                safe_log_context["arguments"],
-            )
-            project_value = cast(Optional[str], safe_log_context["project"])
-            agent_value = cast(Optional[str], safe_log_context["agent"])
-            # Pre-validate the output `format` BEFORE running the wrapped tool
-            # (issue #177). Previously an invalid format was only caught while
-            # encoding the result, so the tool's side effects (e.g. sending a
-            # message) had already happened before the request was rejected.
-            if format_value is not None:
-                _normalized_fmt, _fmt_ok = _normalize_output_format(format_value)
-                if not _fmt_ok:
-                    metrics["errors"] += 1
-                    _fmt_exc = ToolExecutionError(
-                        "INVALID_ARGUMENT",
-                        "Invalid format value. Expected 'json' or 'toon'.",
-                        recoverable=True,
-                        data={
-                            "tool": tool_name,
-                            "argument": "format",
-                            "provided": clean_kwargs.get("format"),
-                        },
-                    )
-                    # This validation runs before the try/finally, so emit the
-                    # structured error log here rather than silently skipping the
-                    # instrumentation every other tool-error path goes through (#177).
-                    _record_tool_error(tool_name, _fmt_exc)
-                    raise _fmt_exc
-            if isinstance(ctx, Context) and meta["capabilities"]:
-                required_caps = set(cast(list[str], meta["capabilities"]))
-                _enforce_capabilities(ctx, required_caps, tool_name)
-
-            # Rich logging: Log tool call start if enabled
-            settings = get_settings()
-            log_enabled = settings.tools_log_enabled
-            log_ctx = None
-            query_tracker = get_query_tracker()
-            tracker_token = None
-
-            if query_tracker is None and settings.instrumentation_enabled:
-                query_tracker, tracker_token = start_query_tracking(
-                    slow_ms=float(settings.instrumentation_slow_query_ms),
-                )
-
-            if log_enabled:
-                try:
-                    log_ctx = rich_logger.ToolCallContext(
-                        tool_name=tool_name,
-                        args=[],
-                        kwargs=clean_kwargs,
-                        project=project_value,
-                        agent=agent_value,
-                        start_time=start_time,
-                    )
-                    rich_logger.log_tool_call_start(log_ctx)
-                except Exception:
-                    # Logging errors should not break tool execution
-                    log_ctx = None
-
-            result = None
-            error = None
-            pending_validation_error: _FastMCPToolError | None = None
-            try:
-                try:
-                    result = await func(*args, **kwargs)
-                except OSError as exc:
-                    # Best-effort recovery for EMFILE on safe/idempotent tools.
-                    import errno
-
-                    if exc.errno == errno.EMFILE and tool_name in _EMFILE_RETRY_TOOLS:
-                        with suppress(Exception):
-                            clear_repo_cache()
-                        with suppress(Exception):
-                            import gc
-
-                            gc.collect()
-                        await asyncio.sleep(0.05)
-                        result = await func(*args, **kwargs)
-                    else:
-                        raise
-                if format_value is not None or settings.output_format_default or settings.toon_default_format:
-                    result = await _apply_tool_output_format(
-                        result,
-                        ctx=ctx if isinstance(ctx, Context) else None,
-                        tool_name=tool_name,
-                        settings=settings,
-                        format_value=format_value,
-                    )
-            except ToolExecutionError as exc:
-                metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
-                error = exc
-                raise
-            except NoResultFound as exc:
-                # Handle agent/project not found errors with helpful messages
-                metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
-                wrapped_exc = ToolExecutionError(
-                    "NOT_FOUND",
-                    str(exc),  # Use the original helpful error message
-                    recoverable=True,
-                    data={"tool": tool_name},
-                )
-                error = wrapped_exc
-                raise wrapped_exc from exc
-            except ValidationError as exc:
-                # Pydantic validation raised inside a tool body is a ValueError,
-                # so it must be handled before the generic ValueError branch.
-                # Do not log or re-raise while the raw exception is active. A
-                # broken logging handler calls logging.handleError(), which
-                # prints the active exception context to stderr and would expose
-                # Pydantic's credential-bearing input even when the LogRecord is
-                # sanitized. Defer the safe error until after this except block
-                # and the instrumentation finally block have completed.
-                metrics["errors"] += 1
-                safe_arguments = {
-                    key: value
-                    for key, value in bound.arguments.items()
-                    if key != "ctx"
-                }
-                safe_exc = _FastMCPToolError(
-                    _redacted_validation_message(
-                        tool_name,
-                        exc,
-                        safe_arguments,
-                    )
-                )
-                error = safe_exc
-                pending_validation_error = safe_exc
-            except ValueError as exc:
-                # Invalid argument value
-                metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
-                wrapped_exc = ToolExecutionError(
-                    "INVALID_ARGUMENT",
-                    f"Invalid argument value: {exc}. Check that all parameters have valid values.",
-                    recoverable=True,
-                    data={"tool": tool_name, "error_detail": str(exc)},
-                )
-                error = wrapped_exc
-                raise wrapped_exc from exc
-            except TypeError as exc:
-                # Wrong argument type
-                metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
-                error_msg = str(exc)
-                # Try to extract helpful info from TypeError
-                hint = ""
-                if "got an unexpected keyword argument" in error_msg:
-                    hint = " Check parameter names for typos."
-                elif "missing" in error_msg and "required" in error_msg:
-                    hint = " Ensure all required parameters are provided."
-                elif "NoneType" in error_msg:
-                    hint = " A required value was None/null."
-                wrapped_exc = ToolExecutionError(
-                    "TYPE_ERROR",
-                    f"Argument type mismatch: {exc}.{hint}",
-                    recoverable=True,
-                    data={"tool": tool_name, "error_detail": str(exc)},
-                )
-                error = wrapped_exc
-                raise wrapped_exc from exc
-            except KeyError as exc:
-                # Missing key/field
-                metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
-                wrapped_exc = ToolExecutionError(
-                    "MISSING_FIELD",
-                    f"Missing required field: {exc}. Ensure all required parameters are provided.",
-                    recoverable=True,
-                    data={"tool": tool_name, "missing_field": str(exc)},
-                )
-                error = wrapped_exc
-                raise wrapped_exc from exc
-            except SATimeoutError as exc:
-                # SQLAlchemy pool timeout (QueuePool exhausted)
-                metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
-                db_settings = settings.database
-                wrapped_exc = ToolExecutionError(
-                    "DATABASE_POOL_EXHAUSTED",
-                    "Database connection pool exhausted. Reduce concurrency or increase pool settings.",
-                    recoverable=True,
-                    data={
-                        "tool": tool_name,
-                        "pool_size": db_settings.pool_size,
-                        "max_overflow": db_settings.max_overflow,
-                        "pool_timeout": db_settings.pool_timeout,
-                        "error_detail": str(exc),
-                    },
-                )
-                error = wrapped_exc
-                raise wrapped_exc from exc
-            except TimeoutError as exc:
-                # Timeout (database lock, network, etc.)
-                metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
-                wrapped_exc = ToolExecutionError(
-                    "TIMEOUT",
-                    f"Operation timed out: {exc}. The server may be under heavy load. Try again in a moment.",
-                    recoverable=True,
-                    data={"tool": tool_name, "error_detail": str(exc)},
-                )
-                error = wrapped_exc
-                raise wrapped_exc from exc
-            except GitIndexLockError as exc:
-                # Git index.lock contention (concurrent git operations)
-                # This is an expected error in multi-agent environments
-                metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
-                wrapped_exc = ToolExecutionError(
-                    "GIT_INDEX_LOCK",
-                    f"Git repository is temporarily locked by another operation. "
-                    f"This is normal in multi-agent environments. "
-                    f"Wait a moment and retry. (Attempted {exc.attempts} times before giving up)",
-                    recoverable=True,
-                    data={
-                        "tool": tool_name,
-                        "lock_path": str(exc.lock_path),
-                        "attempts": exc.attempts,
-                    },
-                )
-                error = wrapped_exc
-                raise wrapped_exc from exc
-            except OSError as exc:
-                # Handle file descriptor exhaustion (EMFILE) with cache cleanup
-                import errno
-                metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
-                if exc.errno == errno.EMFILE:
-                    # Clear repo cache to free file handles and allow recovery
-                    cleared = clear_repo_cache()
-                    wrapped_exc = ToolExecutionError(
-                        "RESOURCE_EXHAUSTED",
-                        f"Too many open files. Freed {cleared} cached repos. Retry the operation.",
-                        recoverable=True,
-                        data={"tool": tool_name, "freed_repos": cleared, "error_detail": str(exc)},
-                    )
-                else:
-                    wrapped_exc = ToolExecutionError(
-                        "OS_ERROR",
-                        f"OS error: {exc}",
-                        recoverable=False,
-                        data={"tool": tool_name, "errno": exc.errno, "error_detail": str(exc)},
-                    )
-                error = wrapped_exc
-                raise wrapped_exc from exc
-            except Exception as exc:
-                # Catch-all for unexpected errors - provide helpful categorization
-                metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
-                error_type = type(exc).__name__
-                error_msg = str(exc)
-
-                # Try to categorize common error patterns
-                if "database" in error_msg.lower() or "sqlite" in error_msg.lower():
-                    error_category = "DATABASE_ERROR"
-                    friendly_msg = "A database error occurred. This may be a transient issue - try again."
-                    recoverable = True
-                elif "lock" in error_msg.lower() or "busy" in error_msg.lower():
-                    error_category = "RESOURCE_BUSY"
-                    friendly_msg = "Resource is temporarily busy. Wait a moment and try again."
-                    recoverable = True
-                elif "permission" in error_msg.lower() or "access" in error_msg.lower():
-                    error_category = "PERMISSION_ERROR"
-                    friendly_msg = f"Access denied: {error_msg}"
-                    recoverable = False
-                elif "connection" in error_msg.lower() or "network" in error_msg.lower():
-                    error_category = "CONNECTION_ERROR"
-                    friendly_msg = "Connection error occurred. Check network and try again."
-                    recoverable = True
-                else:
-                    error_category = "UNHANDLED_EXCEPTION"
-                    friendly_msg = f"Unexpected error ({error_type}): {error_msg}"
-                    recoverable = False
-
-                wrapped_exc = ToolExecutionError(
-                    error_category,
-                    friendly_msg,
-                    recoverable=recoverable,
-                    data={"tool": tool_name, "original_error": error_type, "error_detail": error_msg},
-                )
-                error = wrapped_exc
-                raise wrapped_exc from exc
-            finally:
-                _record_recent(tool_name, project_value, agent_value)
-
-                query_stats = None
-                if query_tracker is not None:
-                    query_stats = query_tracker.to_dict()
-
-                if query_stats and settings.instrumentation_enabled:
-                    logger.info(
-                        "tool_query_stats",
-                        extra={
-                            "tool": tool_name,
-                            "project": project_value,
-                            "agent": agent_value,
-                            "queries": query_stats.get("total", 0),
-                            "query_time_ms": query_stats.get("total_time_ms", 0.0),
-                            "per_table": query_stats.get("per_table", {}),
-                            "slow_query_ms": query_stats.get("slow_query_ms"),
-                        },
-                    )
-
-                # Rich logging: Log tool call end if enabled
-                if log_ctx is not None:
-                    try:
-                        log_ctx.end_time = time.perf_counter()
-                        log_ctx.result = _redact_tool_log_value(result)
-                        log_ctx.error = error
-                        log_ctx.success = error is None
-                        if query_stats:
-                            log_ctx.query_stats = query_stats
-                        rich_logger.log_tool_call_end(log_ctx)
-                    except Exception:
-                        # Logging errors should not suppress original exceptions
-                        pass
-
-                if tracker_token is not None:
-                    stop_query_tracking(tracker_token)
-
-            if pending_validation_error is not None:
-                _record_tool_error(tool_name, pending_validation_error)
-                raise pending_validation_error from None
-
-            return result
+            return await _run_instrumented_tool(func, signature, tool_name, meta, args, kwargs, (agent_arg, project_arg))
 
         # Preserve annotations so FastMCP can infer output schema
         with suppress(Exception):
@@ -1225,9 +1145,11 @@ def _coerce_flag_to_bool(value: str, *, default: bool) -> bool:
     return default
 
 
+_JSON_MIME_TYPE = "application/json"
+_TOOLING_METRICS_URI = "resource://tooling/metrics"
 _OUTPUT_FORMAT_AUTO_VALUES: frozenset[str] = frozenset({"", "auto", "default", "none", "null"})
 _OUTPUT_FORMAT_ALIASES: dict[str, str] = {
-    "application/json": "json",
+    _JSON_MIME_TYPE: "json",
     "text/json": "json",
     "application/toon": "toon",
     "text/toon": "toon",
@@ -1348,7 +1270,7 @@ def _looks_like_toon_rust_encoder(exe: str) -> bool:
         return False
 
     ver_text = ((ver_result.stdout or "") + (ver_result.stderr or "")).strip().lower()
-    return ver_text.startswith("tru ") or ver_text.startswith("toon_rust ")
+    return ver_text.startswith(("tru ", "toon_rust "))
 
 
 def _toon_command(settings: Settings) -> list[str]:
@@ -1525,7 +1447,6 @@ def _extract_structured_payload(result: Any) -> tuple[Any, Optional[Callable[[An
 async def _apply_tool_output_format(
     result: Any,
     *,
-    ctx: Optional[Context],
     tool_name: str,
     settings: Settings,
     format_value: Any,
@@ -1605,7 +1526,7 @@ def _apply_resource_output_format(
         if isinstance(payload, list):
             return ResourceResult(
                 contents=[
-                    ResourceContent(payload, mime_type="application/json")
+                    ResourceContent(payload, mime_type=_JSON_MIME_TYPE)
                 ]
             )
         return payload
@@ -1833,7 +1754,6 @@ def _parse_json_safely(text: str) -> dict[str, Any] | None:
     Returns parsed dict on success, otherwise None.
     """
     import json as _json
-    import re as _re
 
     try:
         parsed = _json.loads(text)
@@ -1842,9 +1762,10 @@ def _parse_json_safely(text: str) -> dict[str, Any] | None:
     except Exception:
         pass
     # Code fence block
-    m = _re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", text)
-    if m:
-        inner = m.group(1)
+    _, opening_fence, fenced = text.partition("```")
+    inner, closing_fence, _ = fenced.partition("```")
+    if opening_fence and closing_fence:
+        inner = inner.removeprefix("json").strip()
         try:
             parsed = _json.loads(inner)
             if isinstance(parsed, dict):
@@ -1919,12 +1840,10 @@ def _validate_iso_timestamp(raw_value: Optional[str], param_name: str = "timesta
     except ValueError:
         raise ToolExecutionError(
             error_type="INVALID_TIMESTAMP",
-            message=(
-                f"Invalid {param_name} format: '{raw_value}'. "
+            message=f"Invalid {param_name} format: '{raw_value}'. "
                 f"Expected ISO-8601 format like '2025-01-15T10:30:00+00:00' or '2025-01-15T10:30:00Z'. "
                 f"Common mistakes: missing timezone (add +00:00 or Z), using slashes instead of dashes, "
-                f"or using 12-hour format without AM/PM."
-            ),
+                f"or using 12-hour format without AM/PM.",
             recoverable=True,
             data={"provided": raw_value, "expected_format": "YYYY-MM-DDTHH:MM:SS+HH:MM"},
         ) from None
@@ -2044,10 +1963,17 @@ _FTS5_UNSEARCHABLE_PATTERNS = frozenset({"*", "**", "***", ".", "..", "...", "?"
 _LIKE_FALLBACK_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,63}")
 _LIKE_FALLBACK_STOPWORDS = frozenset({"AND", "OR", "NOT", "NEAR"})
 
-# Regex to detect hyphenated tokens that need quoting for FTS5
-# Matches: POL-358, FEAT-123, foo-bar-baz, A-1
-# Does not match: already-in-quotes, has spaces, etc.
-_FTS5_HYPHENATED_TOKEN_RE = re.compile(r"(?<!\")([A-Za-z0-9]+(?:-[A-Za-z0-9]+)+)(?!\")")
+# Consume complete quoted phrases and alphanumeric tokens in one pass. A plain
+# word must also match, so a long word without hyphens is not retried at every
+# offset. Possessive quantifiers prevent backtracking within each token.
+_FTS5_TOKEN_RE = re.compile(r'"[^"]*"|[A-Za-z0-9]++(?:-[A-Za-z0-9]++)*+')
+
+
+def _quote_fts_token(match: re.Match[str]) -> str:
+    token = match.group()
+    if token.startswith('"') or "-" not in token:
+        return token
+    return f'"{token}"'
 
 
 def _quote_hyphenated_tokens(query: str) -> str:
@@ -2084,7 +2010,7 @@ def _quote_hyphenated_tokens(query: str) -> str:
         return query
 
     # Replace unquoted hyphenated tokens with quoted versions
-    return _FTS5_HYPHENATED_TOKEN_RE.sub(r'"\1"', query)
+    return _FTS5_TOKEN_RE.sub(_quote_fts_token, query)
 
 
 _LIKE_ESCAPE_CHAR = "!"
@@ -2185,11 +2111,8 @@ def _rich_error_panel(title: str, payload: dict[str, Any]) -> None:
     try:
         if not get_settings().tools_log_enabled:
             return
-        import importlib as _imp
-        _rc = _imp.import_module("rich.console")
-        _rj = _imp.import_module("rich.json")
-        Console = _rc.Console
-        JSON = _rj.JSON
+        from rich.console import Console
+        from rich.json import JSON
         Console().print(JSON.from_data({"title": title, **payload}))
     except Exception:
         return
@@ -2444,98 +2367,84 @@ def _normalize_git_remote(url: Optional[str]) -> Optional[str]:
         return None
 
 
+def _short_identity_hash(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8"), usedforsecurity=False).hexdigest()[:10]
+
+
+def _git_remote_url(repo: Repo, remote_name: str) -> str | None:
+    # Prefer get-url so Git's multiple URLs and rewrite rules remain effective.
+    try:
+        return repo.git.remote("get-url", remote_name).strip() or None
+    except Exception:
+        try:
+            remote = next((r for r in repo.remotes if r.name == remote_name), None)
+            if remote and remote.urls:
+                return next(iter(remote.urls), None)
+        except Exception:
+            return None
+    return None
+
+
+def _git_remote_project_slug(human_key: str, settings: Settings) -> str:
+    try:
+        with _git_repo(human_key) as repo:
+            normalized = _normalize_git_remote(
+                _git_remote_url(repo, settings.project_identity_remote or "origin")
+            )
+            if normalized:
+                base = normalized.rsplit("/", 1)[-1] or "repo"
+                return f"{base}-{_short_identity_hash(normalized)}"
+    except Exception:
+        pass
+    return slugify(human_key)
+
+
+def _git_toplevel_project_slug(human_key: str) -> str:
+    try:
+        with _git_repo(human_key) as repo:
+            top = repo.git.rev_parse("--show-toplevel").strip()
+            if top:
+                top_real = str(Path(top).resolve())
+                base = Path(top_real).name or "repo"
+                return f"{base}-{_short_identity_hash(top_real)}"
+    except Exception:
+        return slugify(human_key)
+    return slugify(human_key)
+
+
+def _git_common_dir_project_slug(human_key: str) -> str:
+    try:
+        with _git_repo(human_key) as repo:
+            try:
+                git_dir = getattr(repo, "common_dir", None)
+            except Exception:
+                git_dir = None
+            if not git_dir:
+                git_dir = repo.git.rev_parse("--git-common-dir").strip()
+            if git_dir:
+                # Anchor relative rev-parse paths to the repository, not cwd.
+                git_dir_path = Path(git_dir)
+                if not git_dir_path.is_absolute():
+                    git_dir_path = Path(repo.working_tree_dir or human_key) / git_dir_path
+                return f"repo-{_short_identity_hash(str(git_dir_path.resolve()))}"
+    except Exception:
+        return slugify(human_key)
+    return slugify(human_key)
+
+
 def _compute_project_slug(human_key: str, mode_override: Optional[str] = None) -> str:
-    """
-    Compute the project slug with strict backward compatibility by default.
-    When worktree-friendly behavior is enabled, we still default to 'dir' mode
-    until additional identity modes are implemented.
-    """
+    """Compute a privacy-safe Git slug when enabled, otherwise use the directory slug."""
     settings = get_settings()
-    # Gate: preserve existing behavior unless explicitly enabled
     if not settings.worktrees_enabled:
         return slugify(human_key)
-    # Helpers for identity modes (privacy-safe)
-    def _short_sha1(text: str, n: int = 10) -> str:
-        return hashlib.sha1(text.encode("utf-8"), usedforsecurity=False).hexdigest()[:n]
-
-    # Delegate to the single shared normalizer so slug/uid can never diverge.
-    _norm_remote = _normalize_git_remote
-
-    # A per-call override (e.g. ensure_project(identity_mode=...)) wins over the
-    # process-wide settings default so callers can opt a single project into a
-    # different identity scheme.
+    # A per-call override wins over the process-wide identity mode.
     mode = ((mode_override or settings.project_identity_mode) or "dir").strip().lower()
-    # Mode: git-remote
     if mode == "git-remote":
-        try:
-            # Attempt to use GitPython for robustness across worktrees
-            with _git_repo(human_key) as repo:
-                remote_name = settings.project_identity_remote or "origin"
-                remote_url: str | None = None
-                # Prefer 'git remote get-url' to support multiple urls/rewrite rules
-                try:
-                    remote_url = repo.git.remote("get-url", remote_name).strip() or None
-                except Exception:
-                    # Fallback: use config if available
-                    try:
-                        remote = next((r for r in repo.remotes if r.name == remote_name), None)
-                        if remote and remote.urls:
-                            remote_url = next(iter(remote.urls), None)
-                    except Exception:
-                        remote_url = None
-                normalized = _norm_remote(remote_url)
-                if normalized:
-                    base = normalized.rsplit("/", 1)[-1] or "repo"
-                    canonical = normalized  # privacy-safe canonical string
-                    return f"{base}-{_short_sha1(canonical)}"
-        except (InvalidGitRepositoryError, NoSuchPathError, Exception):
-            # Non-git directory or error; fall through to fallback
-            pass
-        # Fallback to dir behavior if we cannot resolve a normalized remote
-        return slugify(human_key)
-
-    # Mode: git-toplevel
+        return _git_remote_project_slug(human_key, settings)
     if mode == "git-toplevel":
-        try:
-            with _git_repo(human_key) as repo:
-                top = repo.git.rev_parse("--show-toplevel").strip()
-                if top:
-                    from pathlib import Path as _P
-
-                    top_real = str(_P(top).resolve())
-                    base = _P(top_real).name or "repo"
-                    return f"{base}-{_short_sha1(top_real)}"
-        except (InvalidGitRepositoryError, NoSuchPathError, Exception):
-            return slugify(human_key)
-        return slugify(human_key)
-
-    # Mode: git-common-dir
+        return _git_toplevel_project_slug(human_key)
     if mode == "git-common-dir":
-        try:
-            with _git_repo(human_key) as repo:
-                # Prefer GitPython's common_dir which normalizes worktree paths
-                try:
-                    gdir = getattr(repo, "common_dir", None)
-                except Exception:
-                    gdir = None
-                if not gdir:
-                    gdir = repo.git.rev_parse("--git-common-dir").strip()
-                if gdir:
-                    from pathlib import Path as _P
-
-                    # rev-parse may return a relative path (e.g. ".git"); anchor it
-                    # to the repo working tree so the slug does not depend on CWD.
-                    gdir_path = _P(gdir)
-                    if not gdir_path.is_absolute():
-                        gdir_path = _P(repo.working_tree_dir or human_key) / gdir_path
-                    gdir_real = str(gdir_path.resolve())
-                    base = "repo"
-                    return f"{base}-{_short_sha1(gdir_real)}"
-        except (InvalidGitRepositoryError, NoSuchPathError, Exception):
-            return slugify(human_key)
-        return slugify(human_key)
-
-    # Default and 'dir' mode: strict back-compat
+        return _git_common_dir_project_slug(human_key)
     return slugify(human_key)
 
 
@@ -2599,6 +2508,218 @@ def _delete_project_archive_tree(storage_root: str, project_slug: str) -> tuple[
 _VALID_IDENTITY_MODES = ("dir", "git-remote", "git-common-dir", "git-toplevel")
 
 
+@dataclass
+class _ProjectGitIdentity:
+    repo_root: str | None = None
+    git_common_dir: str | None = None
+    git_common_dir_abs: str | None = None
+    branch: str | None = None
+    default_branch: str | None = None
+    worktree_name: str | None = None
+    core_ignorecase: bool | None = None
+    normalized_remote: str | None = None
+
+
+def _project_repo_branch(repo: Repo) -> str | None:
+    try:
+        return repo.active_branch.name
+    except Exception:
+        try:
+            return repo.git.rev_parse("--abbrev-ref", "HEAD").strip()
+        except Exception:
+            return None
+
+
+def _project_repo_worktree_name(repo: Repo) -> str | None:
+    try:
+        return Path(repo.working_tree_dir or "").name or None
+    except Exception:
+        return None
+
+
+def _project_repo_ignorecase(repo: Repo) -> bool | None:
+    try:
+        configured = repo.config_reader().get_value("core", "ignorecase", "false")
+        return str(configured).strip().lower() == "true"
+    except Exception:
+        return None
+
+
+def _project_repo_default_branch(repo: Repo, remote_name: str) -> str | None:
+    try:
+        symbolic = repo.git.symbolic_ref(f"refs/remotes/{remote_name}/HEAD").strip()
+        if symbolic.startswith("refs/remotes/"):
+            return symbolic.rsplit("/", 1)[-1]
+    except Exception:
+        return "main"
+    return None
+
+
+def _absolute_identity_git_dir(git_common_dir: str | None, repo_root: str | None, target_path: str) -> str | None:
+    if not git_common_dir:
+        return None
+    try:
+        git_dir_path = Path(git_common_dir)
+        if not git_dir_path.is_absolute():
+            git_dir_path = Path(repo_root or target_path) / git_dir_path
+        return str(git_dir_path.resolve())
+    except Exception:
+        return None
+
+
+def _read_project_git_identity(target_path: str, settings: Settings) -> _ProjectGitIdentity:
+    identity = _ProjectGitIdentity()
+    try:
+        with _git_repo(target_path) as repo:
+            identity.repo_root = str(Path(repo.working_tree_dir or "").resolve())
+            try:
+                identity.git_common_dir = repo.git.rev_parse("--git-common-dir").strip()
+            except Exception:
+                identity.git_common_dir = None
+            identity.branch = _project_repo_branch(repo)
+            identity.worktree_name = _project_repo_worktree_name(repo)
+            identity.core_ignorecase = _project_repo_ignorecase(repo)
+            remote_name = settings.project_identity_remote or "origin"
+            identity.normalized_remote = _normalize_git_remote(_git_remote_url(repo, remote_name))
+            identity.default_branch = _project_repo_default_branch(repo, remote_name)
+    except Exception:
+        # Non-git directories retain any successfully collected fallback values.
+        pass
+    # Relative common directories belong to the repository, never the caller's cwd.
+    identity.git_common_dir_abs = _absolute_identity_git_dir(identity.git_common_dir, identity.repo_root, target_path)
+    return identity
+
+
+def _minimal_identity_discovery_yaml(path: Path) -> dict[str, Any]:
+    data = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or ":" not in stripped:
+            continue
+        key, value = stripped.split(":", 1)
+        key = key.strip()
+        if key not in {"project_uid", "product_uid"}:
+            continue
+        value = value.split("#", 1)[0].strip().strip("'\"")
+        if value:
+            data[key] = value
+    return data
+
+
+def _read_identity_discovery_yaml(base_dir: str) -> dict[str, Any]:
+    try:
+        path = Path(base_dir) / ".agent-mail.yaml"
+        if not path.exists():
+            return {}
+        try:
+            import yaml
+
+            loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                allowed = {"project_uid", "product_uid"}
+                return {key: str(value) for key, value in loaded.items() if key in allowed and isinstance(value, (str, int))}
+            return {}
+        except Exception:
+            return _minimal_identity_discovery_yaml(path)
+    except Exception:
+        return {}
+
+
+def _read_project_identity_marker(marker: Path | None) -> str | None:
+    try:
+        if marker and marker.exists():
+            return marker.read_text(encoding="utf-8").strip() or None
+    except Exception:
+        return None
+    return None
+
+
+def _private_project_identity_marker(identity: _ProjectGitIdentity, target_path: str) -> Path | None:
+    marker = Path(identity.git_common_dir or "") / "agent-mail" / "project-id" if identity.git_common_dir else None
+    if marker is not None and not marker.is_absolute():
+        with suppress(Exception):
+            marker = (Path(identity.repo_root or target_path) / marker).resolve()
+    return marker
+
+
+def _project_identity_uid_hash(value: str) -> str | None:
+    try:
+        return hashlib.sha1(value.encode("utf-8"), usedforsecurity=False).hexdigest()[:20]
+    except Exception:
+        return None
+
+
+def _project_identity_uid(
+    target_path: str, identity: _ProjectGitIdentity, private_marker: Path | None, discovery: dict[str, Any],
+) -> str:
+    committed_marker = Path(identity.repo_root) / ".agent-mail-project-id" if identity.repo_root else None
+    project_uid = _read_project_identity_marker(committed_marker)
+    if not project_uid:
+        project_uid = str(discovery.get("project_uid", "")).strip() if discovery else ""
+    if not project_uid:
+        project_uid = _read_project_identity_marker(private_marker)
+    if not project_uid and identity.normalized_remote:
+        project_uid = _project_identity_uid_hash(f"{identity.normalized_remote}@{identity.default_branch or 'main'}")
+    if not project_uid and identity.git_common_dir_abs:
+        project_uid = _project_identity_uid_hash(identity.git_common_dir_abs)
+    return project_uid or _project_identity_uid_hash(target_path) or str(uuid.uuid4())
+
+
+def _write_private_project_identity(marker: Path | None, project_uid: str) -> None:
+    if marker and not marker.exists():
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(project_uid + "\n", encoding="utf-8")
+        except Exception:
+            pass
+
+
+def _directory_project_identity(target_path: str) -> dict[str, Any]:
+    slug_value = _compute_project_slug(target_path)
+    return {
+        "slug": slug_value, "identity_mode_used": "dir", "canonical_path": target_path, "human_key": target_path,
+        "repo_root": None, "git_common_dir": None, "branch": None, "worktree_name": None,
+        "core_ignorecase": None, "normalized_remote": None,
+        "project_uid": _project_identity_uid_hash(target_path) or str(uuid.uuid4()), "discovery": None,
+    }
+
+
+def _canonical_identity_path(target_path: str, identity: _ProjectGitIdentity, mode_used: str) -> str:
+    if mode_used == "git-remote" and identity.normalized_remote:
+        return identity.normalized_remote
+    if mode_used == "git-toplevel" and identity.repo_root:
+        return identity.repo_root
+    if mode_used == "git-common-dir" and identity.git_common_dir_abs:
+        return identity.git_common_dir_abs
+    return target_path
+
+
+def _log_project_identity(payload: dict[str, Any]) -> None:
+    try:
+        if get_settings().tools_log_enabled:
+            from rich.console import Console
+            from rich.table import Table
+
+            console = Console()
+            table = Table(title="Identity Resolution", show_header=True, header_style="bold white on blue")
+            table.add_column("Field", style="bold cyan")
+            table.add_column("Value")
+            table.add_row("Mode", str(payload["identity_mode_used"] or "dir"))
+            table.add_row("Slug", str(payload["slug"]))
+            table.add_row("Canonical", str(payload["canonical_path"]))
+            table.add_row("Repo Root", str(payload["repo_root"] or ""))
+            table.add_row("Git Common Dir", str(payload["git_common_dir"] or ""))
+            table.add_row("Branch", str(payload["branch"] or ""))
+            table.add_row("Worktree", str(payload["worktree_name"] or ""))
+            table.add_row("Ignorecase", str(payload["core_ignorecase"]))
+            table.add_row("Normalized Remote", str(payload["normalized_remote"] or ""))
+            table.add_row("Project UID", str(payload["project_uid"] or ""))
+            console.print(table)
+    except Exception:
+        # Never fail identity resolution because of logging.
+        pass
+
+
 def _resolve_project_identity(
     human_key: str, identity_mode: Optional[str] = None
 ) -> dict[str, Any]:
@@ -2627,207 +2748,14 @@ def _resolve_project_identity(
     if not settings_local.worktrees_enabled:
         # Keep default behavior lightweight when worktree features are disabled.
         # (Avoid touching GitPython / spawning git subprocesses unnecessarily.)
-        slug_value = _compute_project_slug(target_path)
-        try:
-            project_uid = hashlib.sha1(
-                target_path.encode("utf-8"), usedforsecurity=False
-            ).hexdigest()[:20]
-        except Exception:
-            project_uid = str(uuid.uuid4())
-        return {
-            "slug": slug_value,
-            "identity_mode_used": "dir",
-            "canonical_path": target_path,
-            "human_key": target_path,
-            "repo_root": None,
-            "git_common_dir": None,
-            "branch": None,
-            "worktree_name": None,
-            "core_ignorecase": None,
-            "normalized_remote": None,
-            "project_uid": project_uid,
-            "discovery": None,
-        }
+        return _directory_project_identity(target_path)
 
-    repo_root: Optional[str] = None
-    git_common_dir: Optional[str] = None
-    branch: Optional[str] = None
-    default_branch: Optional[str] = None
-    worktree_name: Optional[str] = None
-    core_ignorecase: Optional[bool] = None
-    normalized_remote: Optional[str] = None
-    canonical_path: str = target_path
-
-    # Delegate to the single shared normalizer so slug/uid can never diverge.
-    _norm_remote = _normalize_git_remote
-
-    # Discovery YAML: optional override
-    def _read_discovery_yaml(base_dir: str) -> dict[str, Any]:
-        try:
-            ypath = Path(base_dir) / ".agent-mail.yaml"
-            if not ypath.exists():
-                return {}
-            # Prefer PyYAML when available for robust parsing; fallback to minimal parser
-            try:
-                import yaml as _yaml
-                loaded = _yaml.safe_load(ypath.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    # Keep only known keys to avoid surprises
-                    allowed = {"project_uid", "product_uid"}
-                    return {k: str(v) for k, v in loaded.items() if k in allowed and isinstance(v, (str, int))}
-                return {}
-            except Exception:
-                data = {}
-                for line in ypath.read_text(encoding="utf-8").splitlines():
-                    s = line.strip()
-                    if not s or s.startswith("#") or ":" not in s:
-                        continue
-                    key, value = s.split(":", 1)
-                    k = key.strip()
-                    if k not in {"project_uid", "product_uid"}:
-                        continue
-                    # strip inline comments
-                    v = value.split("#", 1)[0].strip().strip("'\"")
-                    if v:
-                        data[k] = v
-                return data
-        except Exception:
-            return {}
-
-    try:
-        with _git_repo(target_path) as repo:
-            repo_root = str(Path(repo.working_tree_dir or "").resolve())
-            try:
-                git_common_dir = repo.git.rev_parse("--git-common-dir").strip()
-            except Exception:
-                git_common_dir = None
-            try:
-                branch = repo.active_branch.name
-            except Exception:
-                try:
-                    branch = repo.git.rev_parse("--abbrev-ref", "HEAD").strip()
-                except Exception:
-                    branch = None
-            try:
-                worktree_name = Path(repo.working_tree_dir or "").name or None
-            except Exception:
-                worktree_name = None
-            try:
-                core_ic = repo.config_reader().get_value("core", "ignorecase", "false")
-                core_ignorecase = str(core_ic).strip().lower() == "true"
-            except Exception:
-                core_ignorecase = None
-            remote_name = settings_local.project_identity_remote or "origin"
-            remote_url_local: Optional[str] = None
-            try:
-                remote_url_local = repo.git.remote("get-url", remote_name).strip() or None
-            except Exception:
-                try:
-                    r = next((r for r in repo.remotes if r.name == remote_name), None)
-                    if r and r.urls:
-                        remote_url_local = next(iter(r.urls), None)
-                except Exception:
-                    remote_url_local = None
-            normalized_remote = _norm_remote(remote_url_local)
-            try:
-                sym = repo.git.symbolic_ref(
-                    f"refs/remotes/{settings_local.project_identity_remote or 'origin'}/HEAD"
-                ).strip()
-                if sym.startswith("refs/remotes/"):
-                    default_branch = sym.rsplit("/", 1)[-1]
-            except Exception:
-                default_branch = "main"
-    except (InvalidGitRepositoryError, NoSuchPathError, Exception):
-        pass  # Non-git directory; continue with fallback values
-
-    # Resolve git_common_dir to an absolute path. `git rev-parse --git-common-dir`
-    # often returns a RELATIVE path (e.g. ".git") which, if resolved against the
-    # process CWD, makes the project identity depend on the caller's CWD. Anchor
-    # it to repo_root (mirrors the marker_private normalization below) so the UID
-    # is stable regardless of CWD.
-    git_common_dir_abs: Optional[str] = None
-    if git_common_dir:
-        try:
-            gcd_path = Path(git_common_dir)
-            if not gcd_path.is_absolute():
-                gcd_path = Path(repo_root or target_path) / gcd_path
-            git_common_dir_abs = str(gcd_path.resolve())
-        except Exception:
-            git_common_dir_abs = None
-
-    if mode_used == "git-remote" and normalized_remote:
-        canonical_path = normalized_remote
-    elif mode_used == "git-toplevel" and repo_root:
-        canonical_path = repo_root
-    elif mode_used == "git-common-dir" and git_common_dir_abs:
-        canonical_path = git_common_dir_abs
-    else:
-        canonical_path = target_path
-
-    # Compute project_uid via precedence:
-    # worktree marker -> discovery yaml -> private marker -> remote fingerprint -> git-common-dir hash -> dir hash
-    marker_committed: Optional[Path] = Path(repo_root or "") / ".agent-mail-project-id" if repo_root else None
-    marker_private: Optional[Path] = Path(git_common_dir or "") / "agent-mail" / "project-id" if git_common_dir else None
-    # Normalize marker_private to absolute if git_common_dir is relative (common for non-linked worktrees)
-    if marker_private is not None and not marker_private.is_absolute():
-        try:
-            base = Path(repo_root or target_path)
-            marker_private = (base / marker_private).resolve()
-        except Exception:
-            pass
-    discovery: dict[str, Any] = _read_discovery_yaml(repo_root or target_path)
-    project_uid: Optional[str] = None
-    try:
-        if marker_committed and marker_committed.exists():
-            project_uid = (marker_committed.read_text(encoding="utf-8").strip() or None)
-    except Exception:
-        project_uid = None
-    if not project_uid:
-        # Discovery yaml override
-        uid = str(discovery.get("project_uid", "")).strip() if discovery else ""
-        if uid:
-            project_uid = uid
-    if not project_uid:
-        try:
-            if marker_private and marker_private.exists():
-                project_uid = (marker_private.read_text(encoding="utf-8").strip() or None)
-        except Exception:
-            project_uid = None
-    if not project_uid:
-        # Remote fingerprint
-        remote_uid: Optional[str] = None
-        try:
-            if normalized_remote:
-                fingerprint = f"{normalized_remote}@{default_branch or 'main'}"
-                remote_uid = hashlib.sha1(
-                    fingerprint.encode("utf-8"), usedforsecurity=False
-                ).hexdigest()[:20]
-        except Exception:
-            remote_uid = None
-        if remote_uid:
-            project_uid = remote_uid
-    if not project_uid and git_common_dir_abs:
-        try:
-            project_uid = hashlib.sha1(
-                git_common_dir_abs.encode("utf-8"), usedforsecurity=False
-            ).hexdigest()[:20]
-        except Exception:
-            project_uid = None
-    if not project_uid:
-        try:
-            project_uid = hashlib.sha1(
-                target_path.encode("utf-8"), usedforsecurity=False
-            ).hexdigest()[:20]
-        except Exception:
-            project_uid = str(uuid.uuid4())
-
-    # Write private marker if gated and we have a git common dir
-    if settings_local.worktrees_enabled and marker_private and not marker_private.exists():
-        try:
-            marker_private.parent.mkdir(parents=True, exist_ok=True)
-            marker_private.write_text(project_uid + "\n", encoding="utf-8")
-        except Exception:
-            pass
+    identity = _read_project_git_identity(target_path, settings_local)
+    canonical_path = _canonical_identity_path(target_path, identity, mode_used)
+    marker_private = _private_project_identity_marker(identity, target_path)
+    discovery = _read_identity_discovery_yaml(identity.repo_root or target_path)
+    project_uid = _project_identity_uid(target_path, identity, marker_private, discovery)
+    _write_private_project_identity(marker_private, project_uid)
 
     slug_value = _compute_project_slug(target_path, mode_override=mode_override)
     payload = {
@@ -2835,38 +2763,16 @@ def _resolve_project_identity(
         "identity_mode_used": mode_used,
         "canonical_path": canonical_path,
         "human_key": target_path,
-        "repo_root": repo_root,
-        "git_common_dir": git_common_dir,
-        "branch": branch,
-        "worktree_name": worktree_name,
-        "core_ignorecase": core_ignorecase,
-        "normalized_remote": normalized_remote,
+        "repo_root": identity.repo_root,
+        "git_common_dir": identity.git_common_dir,
+        "branch": identity.branch,
+        "worktree_name": identity.worktree_name,
+        "core_ignorecase": identity.core_ignorecase,
+        "normalized_remote": identity.normalized_remote,
         "project_uid": project_uid,
         "discovery": discovery or None,
     }
-    # Rich-styled identity decision logging (optional)
-    try:
-        if get_settings().tools_log_enabled:
-            from rich.console import Console as _Console  # local import to avoid global dependency
-            from rich.table import Table as _Table
-            console = _Console()
-            table = _Table(title="Identity Resolution", show_header=True, header_style="bold white on blue")
-            table.add_column("Field", style="bold cyan")
-            table.add_column("Value")
-            table.add_row("Mode", str(payload["identity_mode_used"] or "dir"))
-            table.add_row("Slug", str(payload["slug"]))
-            table.add_row("Canonical", str(payload["canonical_path"]))
-            table.add_row("Repo Root", str(payload["repo_root"] or ""))
-            table.add_row("Git Common Dir", str(payload["git_common_dir"] or ""))
-            table.add_row("Branch", str(payload["branch"] or ""))
-            table.add_row("Worktree", str(payload["worktree_name"] or ""))
-            table.add_row("Ignorecase", str(payload["core_ignorecase"]))
-            table.add_row("Normalized Remote", str(payload["normalized_remote"] or ""))
-            table.add_row("Project UID", str(payload["project_uid"] or ""))
-            console.print(table)
-    except Exception:
-        # Never fail due to logging
-        pass
+    _log_project_identity(payload)
     return payload
 
 
@@ -2924,6 +2830,93 @@ def _project_identity_conflict(
     )
 
 
+def _project_has_matching_uid(project: Project, identity: dict[str, Any], *, reason: str) -> bool:
+    if project.project_uid is None:
+        return False
+    # A concurrent creator may become visible after the earlier UID query.
+    if project.project_uid == identity["project_uid"]:
+        return True
+    raise _project_identity_conflict(identity, [project], reason=reason)
+
+
+def _resolve_project_by_uid(
+    project: Project, human_project: Project | None, slug_project: Project | None,
+    identity: dict[str, Any],
+) -> Project:
+    aliases = [
+        candidate for candidate in (human_project, slug_project)
+        if candidate is not None and candidate.id != project.id
+    ]
+    if aliases:
+        raise _project_identity_conflict(
+            identity, [project, *aliases], reason="durable UID and path/slug resolve to different rows"
+        )
+    return project
+
+
+def _resolve_project_by_human_key(
+    project: Project, slug_project: Project | None, identity: dict[str, Any]
+) -> tuple[Project, bool]:
+    if slug_project is not None and slug_project.id != project.id:
+        raise _project_identity_conflict(
+            identity, [project, slug_project], reason="path and slug resolve to different legacy rows"
+        )
+    if _project_has_matching_uid(
+        project, identity, reason="path is already bound to a different durable UID"
+    ):
+        return project, False
+    # Claim only this exact normalized legacy path; never bulk-merge history.
+    project.project_uid = identity["project_uid"]
+    return project, True
+
+
+async def _resolve_project_by_slug(
+    project: Project, identity: dict[str, Any], identity_mode: str | None
+) -> tuple[Project, bool]:
+    if _project_has_matching_uid(
+        project, identity, reason="slug is already bound to a different durable UID"
+    ):
+        return project, False
+    legacy_identity = await asyncio.to_thread(_resolve_project_identity, project.human_key, identity_mode)
+    if _validated_project_uid(legacy_identity.get("project_uid")) != identity["project_uid"]:
+        raise _project_identity_conflict(
+            identity, [project], reason="legacy slug cannot be proven to represent this durable UID"
+        )
+    project.project_uid = identity["project_uid"]
+    return project, True
+
+
+async def _resolve_project_row(
+    session: AsyncSession, identity: dict[str, Any], identity_mode: str | None
+) -> tuple[Project, bool]:
+    project_uid = identity["project_uid"]
+    human_key = str(identity["human_key"])
+    slug = str(identity["slug"])
+    uid_projects = (
+        await session.execute(select(Project).where(cast(Any, Project.project_uid) == project_uid))
+    ).scalars().all()
+    human_projects = (
+        await session.execute(select(Project).where(cast(Any, Project.human_key) == human_key))
+    ).scalars().all()
+    slug_project = (
+        await session.execute(select(Project).where(cast(Any, Project.slug) == slug))
+    ).scalars().first()
+    if len(uid_projects) > 1 or len(human_projects) > 1:
+        raise _project_identity_conflict(
+            identity, [*uid_projects, *human_projects],
+            reason="multiple database rows match one durable identity",
+        )
+    uid_project = uid_projects[0] if uid_projects else None
+    human_project = human_projects[0] if human_projects else None
+    if uid_project is not None:
+        return _resolve_project_by_uid(uid_project, human_project, slug_project, identity), False
+    if human_project is not None:
+        return _resolve_project_by_human_key(human_project, slug_project, identity)
+    if slug_project is not None:
+        return await _resolve_project_by_slug(slug_project, identity, identity_mode)
+    return Project(slug=slug, human_key=human_key, project_uid=project_uid), True
+
+
 async def _ensure_project(
     human_key: str,
     identity_mode: Optional[str] = None,
@@ -2940,140 +2933,12 @@ async def _ensure_project(
     )
     project_uid = _validated_project_uid(identity.get("project_uid"))
     identity["project_uid"] = project_uid
-    resolved_human_key = str(identity["human_key"])
-    resolved_slug = str(identity["slug"])
-
     for attempt in range(6):
         try:
             async with get_session() as session:
-                uid_projects = (
-                    await session.execute(
-                        select(Project).where(
-                            cast(Any, Project.project_uid) == project_uid
-                        )
-                    )
-                ).scalars().all()
-                human_projects = (
-                    await session.execute(
-                        select(Project).where(
-                            cast(Any, Project.human_key) == resolved_human_key
-                        )
-                    )
-                ).scalars().all()
-                slug_project = (
-                    await session.execute(
-                        select(Project).where(
-                            cast(Any, Project.slug) == resolved_slug
-                        )
-                    )
-                ).scalars().first()
-
-                if len(uid_projects) > 1 or len(human_projects) > 1:
-                    raise _project_identity_conflict(
-                        identity,
-                        [*uid_projects, *human_projects],
-                        reason="multiple database rows match one durable identity",
-                    )
-
-                uid_project = uid_projects[0] if uid_projects else None
-                human_project = human_projects[0] if human_projects else None
-
-                if uid_project is not None:
-                    aliases = [
-                        candidate
-                        for candidate in (human_project, slug_project)
-                        if candidate is not None and candidate.id != uid_project.id
-                    ]
-                    if aliases:
-                        raise _project_identity_conflict(
-                            identity,
-                            [uid_project, *aliases],
-                            reason="durable UID and path/slug resolve to different rows",
-                        )
-                    return uid_project
-
-                if human_project is not None:
-                    if slug_project is not None and slug_project.id != human_project.id:
-                        raise _project_identity_conflict(
-                            identity,
-                            [human_project, slug_project],
-                            reason="path and slug resolve to different legacy rows",
-                        )
-                    if human_project.project_uid is not None:
-                        # The UID, path and slug reads above are separate SQL
-                        # statements.  A concurrent creator can commit after
-                        # the UID read but before the path read, so this branch
-                        # may observe the newly-created canonical row even
-                        # though ``uid_projects`` was empty.  Exact UID equality
-                        # is the idempotent success case; only a different UID
-                        # is an identity conflict.
-                        if human_project.project_uid == project_uid:
-                            return human_project
-                        raise _project_identity_conflict(
-                            identity,
-                            [human_project],
-                            reason="path is already bound to a different durable UID",
-                        )
-                    # Safe lazy migration: only the one exact normalized legacy
-                    # path is claimed.  No historical rows are bulk-merged.
-                    human_project.project_uid = project_uid
-                    session.add(human_project)
-                    try:
-                        await session.commit()
-                    except IntegrityError:
-                        await session.rollback()
-                        if attempt >= 5:
-                            raise
-                        await asyncio.sleep(0)
-                        continue
-                    await session.refresh(human_project)
-                    return human_project
-
-                if slug_project is not None:
-                    if slug_project.project_uid is not None:
-                        # As above, an exact UID can become visible between the
-                        # earlier UID lookup and this slug lookup.  Treat the
-                        # same durable identity as the concurrent winner.
-                        if slug_project.project_uid == project_uid:
-                            return slug_project
-                        raise _project_identity_conflict(
-                            identity,
-                            [slug_project],
-                            reason="slug is already bound to a different durable UID",
-                        )
-                    # A legacy worktree row can be claimed by slug only when its
-                    # own persisted path independently resolves to this exact
-                    # UID.  If that path is no longer inspectable we fail closed.
-                    legacy_identity = await asyncio.to_thread(
-                        _resolve_project_identity,
-                        slug_project.human_key,
-                        identity_mode,
-                    )
-                    legacy_uid = _validated_project_uid(legacy_identity.get("project_uid"))
-                    if legacy_uid != project_uid:
-                        raise _project_identity_conflict(
-                            identity,
-                            [slug_project],
-                            reason="legacy slug cannot be proven to represent this durable UID",
-                        )
-                    slug_project.project_uid = project_uid
-                    session.add(slug_project)
-                    try:
-                        await session.commit()
-                    except IntegrityError:
-                        await session.rollback()
-                        if attempt >= 5:
-                            raise
-                        await asyncio.sleep(0)
-                        continue
-                    await session.refresh(slug_project)
-                    return slug_project
-
-                project = Project(
-                    slug=resolved_slug,
-                    human_key=resolved_human_key,
-                    project_uid=project_uid,
-                )
+                project, needs_commit = await _resolve_project_row(session, identity, identity_mode)
+                if not needs_commit:
+                    return project
                 session.add(project)
                 try:
                     await session.commit()
@@ -3092,7 +2957,7 @@ async def _ensure_project(
             is_lock_error = any(phrase in error_msg for phrase in ("database is locked", "database is busy", "locked"))
             if not is_lock_error or attempt >= 5:
                 raise
-            await asyncio.sleep(min(0.05 * (2**attempt), 0.5))
+            await asyncio.sleep(min(0.05 * 2**attempt, 0.5))
 
     raise RuntimeError("ensure_project retry loop exited unexpectedly")
 
@@ -3158,22 +3023,7 @@ async def _list_project_agents(project: Project, limit: int = 10) -> list[str]:
         return [row[0] for row in result.all()]
 
 
-async def _get_project_by_identifier(identifier: str) -> Project:
-    """Get project by identifier with helpful error messages and suggestions."""
-    await ensure_schema()
-
-    # Validate input
-    if not identifier or not identifier.strip():
-        raise ToolExecutionError(
-            "INVALID_ARGUMENT",
-            "Project identifier cannot be empty. Provide a project path like '/data/projects/myproject' or a slug like 'myproject'.",
-            recoverable=True,
-            data={"parameter": "project_key", "provided": repr(identifier)},
-        )
-
-    raw_identifier = identifier.strip()
-    canonical_identifier = await asyncio.to_thread(_canonicalize_project_identifier, raw_identifier)
-
+def _reject_project_lookup_placeholder(identifier: str, raw_identifier: str) -> None:
     # Detect common placeholder patterns - these indicate unconfigured hooks/settings
     _placeholder_patterns = [
         "YOUR_PROJECT",
@@ -3202,6 +3052,117 @@ async def _get_project_by_identifier(identifier: str) -> Project:
                 },
             )
 
+
+async def _bind_legacy_project_uid(
+    session: AsyncSession, project: Project, identity: dict[str, Any], *, conflict_reason: str
+) -> Project:
+    project.project_uid = str(identity["project_uid"])
+    session.add(project)
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise _project_identity_conflict(identity, [project], reason=conflict_reason) from exc
+    await session.refresh(project)
+    return project
+
+
+async def _lookup_legacy_human_project(
+    session: AsyncSession, project: Project, slug_project: Project | None, identity: dict[str, Any]
+) -> Project:
+    if slug_project is not None and slug_project.id != project.id:
+        raise _project_identity_conflict(
+            identity, [project, slug_project], reason="path and slug resolve to different legacy rows"
+        )
+    if project.project_uid is not None:
+        raise _project_identity_conflict(
+            identity, [project], reason="path is already bound to a different durable UID"
+        )
+    return await _bind_legacy_project_uid(
+        session, project, identity, conflict_reason="legacy path was concurrently bound to another project"
+    )
+
+
+async def _lookup_legacy_slug_project(
+    session: AsyncSession, project: Project, identity: dict[str, Any]
+) -> Project:
+    if project.project_uid is not None:
+        raise _project_identity_conflict(
+            identity, [project], reason="slug is already bound to a different durable UID"
+        )
+    legacy_identity = await asyncio.to_thread(_resolve_project_identity, project.human_key)
+    if _validated_project_uid(legacy_identity.get("project_uid")) != str(identity["project_uid"]):
+        raise _project_identity_conflict(
+            identity, [project], reason="legacy slug cannot be proven to represent this durable UID"
+        )
+    return await _bind_legacy_project_uid(
+        session, project, identity, conflict_reason="legacy slug was concurrently bound to another project"
+    )
+
+
+async def _lookup_identity_project(
+    session: AsyncSession, raw_identifier: str, canonical_identifier: str,
+    identity: dict[str, Any], slug: str,
+) -> Project | None:
+    uid_projects = (
+        await session.execute(select(Project).where(cast(Any, Project.project_uid) == str(identity["project_uid"])))
+    ).scalars().all()
+    human_projects = (
+        await session.execute(select(Project).where(or_(
+            cast(Any, Project.human_key) == canonical_identifier,
+            cast(Any, Project.human_key) == raw_identifier,
+        )))
+    ).scalars().all()
+    slug_project = (
+        await session.execute(select(Project).where(cast(Any, Project.slug) == slug))
+    ).scalars().first()
+    if len(uid_projects) > 1 or len(human_projects) > 1:
+        raise _project_identity_conflict(
+            identity, [*uid_projects, *human_projects],
+            reason="multiple database rows match one durable identity",
+        )
+    uid_project = uid_projects[0] if uid_projects else None
+    human_project = human_projects[0] if human_projects else None
+    if uid_project is not None:
+        return _resolve_project_by_uid(uid_project, human_project, slug_project, identity)
+    if human_project is not None:
+        return await _lookup_legacy_human_project(session, human_project, slug_project, identity)
+    if slug_project is not None:
+        return await _lookup_legacy_slug_project(session, slug_project, identity)
+    return None
+
+
+async def _lookup_project_alias(
+    session: AsyncSession, raw_identifier: str, canonical_identifier: str, slug: str
+) -> Project | None:
+    result = await session.execute(select(Project).where(or_(
+        cast(Any, Project.project_uid) == raw_identifier,
+        cast(Any, Project.slug) == slug,
+        cast(Any, Project.human_key) == canonical_identifier,
+        cast(Any, Project.human_key) == raw_identifier,
+    )))
+    projects = result.scalars().all()
+    if len(projects) > 1:
+        generic_identity = {"project_uid": raw_identifier, "slug": slug, "human_key": raw_identifier}
+        raise _project_identity_conflict(
+            generic_identity, projects, reason="identifier matches multiple project rows"
+        )
+    return projects[0] if projects else None
+
+
+async def _get_project_by_identifier(identifier: str) -> Project:
+    """Get project by identifier with helpful error messages and suggestions."""
+    await ensure_schema()
+    if not identifier or not identifier.strip():
+        raise ToolExecutionError(
+            "INVALID_ARGUMENT",
+            "Project identifier cannot be empty. Provide a project path like '/data/projects/myproject' or a slug like 'myproject'.",
+            recoverable=True,
+            data={"parameter": "project_key", "provided": repr(identifier)},
+        )
+    raw_identifier = identifier.strip()
+    canonical_identifier = await asyncio.to_thread(_canonicalize_project_identifier, raw_identifier)
+    _reject_project_lookup_placeholder(identifier, raw_identifier)
     identity: dict[str, Any] | None = None
     if _is_absolute_project_key(raw_identifier):
         identity = await asyncio.to_thread(
@@ -3215,137 +3176,11 @@ async def _get_project_by_identifier(identifier: str) -> Project:
 
     async with get_session() as session:
         if identity is not None:
-            project_uid = str(identity["project_uid"])
-            uid_projects = (
-                await session.execute(
-                    select(Project).where(
-                        cast(Any, Project.project_uid) == project_uid
-                    )
-                )
-            ).scalars().all()
-            human_projects = (
-                await session.execute(
-                    select(Project).where(
-                        or_(
-                            cast(Any, Project.human_key) == canonical_identifier,
-                            cast(Any, Project.human_key) == raw_identifier,
-                        )
-                    )
-                )
-            ).scalars().all()
-            slug_project = (
-                await session.execute(
-                    select(Project).where(cast(Any, Project.slug) == slug)
-                )
-            ).scalars().first()
-
-            if len(uid_projects) > 1 or len(human_projects) > 1:
-                raise _project_identity_conflict(
-                    identity,
-                    [*uid_projects, *human_projects],
-                    reason="multiple database rows match one durable identity",
-                )
-
-            uid_project = uid_projects[0] if uid_projects else None
-            human_project = human_projects[0] if human_projects else None
-            if uid_project is not None:
-                aliases = [
-                    candidate
-                    for candidate in (human_project, slug_project)
-                    if candidate is not None and candidate.id != uid_project.id
-                ]
-                if aliases:
-                    raise _project_identity_conflict(
-                        identity,
-                        [uid_project, *aliases],
-                        reason="durable UID and path/slug resolve to different rows",
-                    )
-                return uid_project
-
-            if human_project is not None:
-                if slug_project is not None and slug_project.id != human_project.id:
-                    raise _project_identity_conflict(
-                        identity,
-                        [human_project, slug_project],
-                        reason="path and slug resolve to different legacy rows",
-                    )
-                if human_project.project_uid is not None:
-                    raise _project_identity_conflict(
-                        identity,
-                        [human_project],
-                        reason="path is already bound to a different durable UID",
-                    )
-                human_project.project_uid = project_uid
-                session.add(human_project)
-                try:
-                    await session.commit()
-                except IntegrityError as exc:
-                    await session.rollback()
-                    raise _project_identity_conflict(
-                        identity,
-                        [human_project],
-                        reason="legacy path was concurrently bound to another project",
-                    ) from exc
-                await session.refresh(human_project)
-                return human_project
-
-            if slug_project is not None:
-                if slug_project.project_uid is not None:
-                    raise _project_identity_conflict(
-                        identity,
-                        [slug_project],
-                        reason="slug is already bound to a different durable UID",
-                    )
-                legacy_identity = await asyncio.to_thread(
-                    _resolve_project_identity,
-                    slug_project.human_key,
-                )
-                legacy_uid = _validated_project_uid(legacy_identity.get("project_uid"))
-                if legacy_uid != project_uid:
-                    raise _project_identity_conflict(
-                        identity,
-                        [slug_project],
-                        reason="legacy slug cannot be proven to represent this durable UID",
-                    )
-                slug_project.project_uid = project_uid
-                session.add(slug_project)
-                try:
-                    await session.commit()
-                except IntegrityError as exc:
-                    await session.rollback()
-                    raise _project_identity_conflict(
-                        identity,
-                        [slug_project],
-                        reason="legacy slug was concurrently bound to another project",
-                    ) from exc
-                await session.refresh(slug_project)
-                return slug_project
+            project = await _lookup_identity_project(session, raw_identifier, canonical_identifier, identity, slug)
         else:
-            result = await session.execute(
-                select(Project).where(
-                    or_(
-                        cast(Any, Project.project_uid) == raw_identifier,
-                        cast(Any, Project.slug) == slug,
-                        cast(Any, Project.human_key) == canonical_identifier,
-                        cast(Any, Project.human_key) == raw_identifier,
-                    )
-                )
-            )
-            projects = result.scalars().all()
-            if len(projects) > 1:
-                # A slug/UID identifier must never choose an arbitrary row.
-                generic_identity = {
-                    "project_uid": raw_identifier,
-                    "slug": slug,
-                    "human_key": raw_identifier,
-                }
-                raise _project_identity_conflict(
-                    generic_identity,
-                    projects,
-                    reason="identifier matches multiple project rows",
-                )
-            if projects:
-                return projects[0]
+            project = await _lookup_project_alias(session, raw_identifier, canonical_identifier, slug)
+        if project is not None:
+            return project
 
     # Project not found - provide helpful suggestions
     suggestions = await _find_similar_projects(raw_identifier)
@@ -3506,7 +3341,7 @@ def _detect_agent_name_mistake(value: str) -> tuple[str, str] | None:
 def _recipient_agent_fragment(value: str) -> str:
     """Extract the Agent part of either supported qualified recipient syntax."""
     candidate = value.strip()
-    if candidate.startswith("project:") and "#" in candidate:
+    if candidate.startswith(_PROJECT_ADDRESS_PREFIX) and "#" in candidate:
         _project_prefix, _separator, agent_name = candidate.partition("#")
         return agent_name.strip()
     if "@" in candidate:
@@ -3585,11 +3420,9 @@ async def _archive_write_lock(archive: ProjectArchive, *, timeout_seconds: float
     except TimeoutError as exc:
         raise ToolExecutionError(
             "ARCHIVE_LOCK_TIMEOUT",
-            (
-                f"Archive lock busy for project '{archive.slug}' at '{archive.lock_path}'. "
-                f"Timed out after {timeout_seconds:.1f}s. "
-                "Inspect running agents or call collect_lock_status to clear stale locks."
-            ),
+            f"Archive lock busy for project '{archive.slug}' at '{archive.lock_path}'. "
+            f"Timed out after {timeout_seconds:.1f}s. "
+            "Inspect running agents or call collect_lock_status to clear stale locks.",
             recoverable=True,
             data={
                 "project_slug": archive.slug,
@@ -3915,6 +3748,74 @@ async def _score_project_pair(
         return heuristic_score, heuristic_reason + " (LLM fallback)"
 
 
+def _sibling_evaluation_due(suggestion: ProjectSiblingSuggestion, now: datetime) -> bool:
+    evaluated = suggestion.evaluated_ts
+    if evaluated is not None:
+        if evaluated.tzinfo is None or evaluated.tzinfo.utcoffset(evaluated) is None:
+            evaluated = evaluated.replace(tzinfo=timezone.utc)
+        else:
+            evaluated = evaluated.astimezone(timezone.utc)
+        age = now - evaluated
+    else:
+        age = _PROJECT_SIBLING_REFRESH_TTL
+    if suggestion.status == "dismissed" and age < timedelta(days=7):
+        return False
+    return age >= _PROJECT_SIBLING_REFRESH_TTL
+
+
+type _SiblingCandidate = tuple[Project, Project, ProjectSiblingSuggestion | None]
+
+
+def _append_sibling_candidates(
+    project_a: Project,
+    candidates: Sequence[Project],
+    existing: dict[tuple[int, int], ProjectSiblingSuggestion],
+    to_evaluate: list[_SiblingCandidate],
+    now: datetime,
+    max_pairs: int,
+) -> None:
+    for project_b in candidates:
+        # Identical human keys describe the same project, never siblings.
+        if project_b.id is None or project_a.human_key == project_b.human_key:
+            continue
+        pair = _canonical_project_pair(cast(int, project_a.id), project_b.id)
+        suggestion = existing.get(pair)
+        if suggestion is None:
+            to_evaluate.append((project_a, project_b, None))
+        elif _sibling_evaluation_due(suggestion, now) and len(to_evaluate) < max_pairs:
+            to_evaluate.append((project_a, project_b, suggestion))
+        if len(to_evaluate) >= max_pairs:
+            break
+
+
+async def _store_sibling_suggestion(
+    session: AsyncSession,
+    candidate: _SiblingCandidate,
+    agent_map: dict[int, list[str]],
+    existing: dict[tuple[int, int], ProjectSiblingSuggestion],
+    evaluated_at: datetime,
+) -> None:
+    project_a, project_b, suggestion = candidate
+    profile_a = await _build_project_profile(project_a, agent_map.get(project_a.id or -1, []))
+    profile_b = await _build_project_profile(project_b, agent_map.get(project_b.id or -1, []))
+    score, rationale = await _score_project_pair(project_a, profile_a, project_b, profile_b)
+    pair = _canonical_project_pair(project_a.id or 0, project_b.id or 0)
+    record = existing.get(pair) if suggestion is None else suggestion
+    if record is None:
+        record = ProjectSiblingSuggestion(
+            project_a_id=pair[0], project_b_id=pair[1],
+            score=score, rationale=rationale, status="suggested",
+        )
+        session.add(record)
+        existing[pair] = record
+    else:
+        record.score = score
+        record.rationale = rationale
+        if record.status not in {"confirmed", "dismissed"}:
+            record.status = "suggested"
+    record.evaluated_ts = evaluated_at
+
+
 async def refresh_project_sibling_suggestions(*, max_pairs: int = _PROJECT_SIBLING_REFRESH_LIMIT) -> None:
     await ensure_schema()
     async with get_session() as session:
@@ -3939,70 +3840,18 @@ async def refresh_project_sibling_suggestions(*, max_pairs: int = _PROJECT_SIBLI
 
         now = datetime.now(timezone.utc)
         naive_now = _naive_utc(now)
-        to_evaluate: list[tuple[Project, Project, ProjectSiblingSuggestion | None]] = []
+        to_evaluate: list[_SiblingCandidate] = []
         for idx, project_a in enumerate(projects):
             if project_a.id is None:
                 continue
-            for project_b in projects[idx + 1 :]:
-                if project_b.id is None:
-                    continue
-
-                # CRITICAL: Skip projects with identical human_key - they're the SAME project, not siblings
-                # Two agents in /data/projects/smartedgar_mcp are on the SAME project
-                # Siblings would be different directories like /data/projects/smartedgar_mcp_frontend
-                if project_a.human_key == project_b.human_key:
-                    continue
-
-                pair = _canonical_project_pair(project_a.id, project_b.id)
-                suggestion = existing_map.get(pair)
-                if suggestion is None:
-                    to_evaluate.append((project_a, project_b, None))
-                else:
-                    eval_ts = suggestion.evaluated_ts
-                    # Normalize to timezone-aware UTC before arithmetic; SQLite may return naive datetimes
-                    if eval_ts is not None:
-                        if eval_ts.tzinfo is None or eval_ts.tzinfo.utcoffset(eval_ts) is None:
-                            eval_ts = eval_ts.replace(tzinfo=timezone.utc)
-                        else:
-                            eval_ts = eval_ts.astimezone(timezone.utc)
-                        age = now - eval_ts
-                    else:
-                        age = _PROJECT_SIBLING_REFRESH_TTL
-                    if suggestion.status == "dismissed" and age < timedelta(days=7):
-                        continue
-                    if age >= _PROJECT_SIBLING_REFRESH_TTL and len(to_evaluate) < max_pairs:
-                        to_evaluate.append((project_a, project_b, suggestion))
-                if len(to_evaluate) >= max_pairs:
-                    break
+            _append_sibling_candidates(project_a, projects[idx + 1 :], existing_map, to_evaluate, now, max_pairs)
 
         if not to_evaluate:
             return
 
         updated = False
-        for project_a, project_b, suggestion in to_evaluate[:max_pairs]:
-            profile_a = await _build_project_profile(project_a, agent_map.get(project_a.id or -1, []))
-            profile_b = await _build_project_profile(project_b, agent_map.get(project_b.id or -1, []))
-            score, rationale = await _score_project_pair(project_a, profile_a, project_b, profile_b)
-
-            pair = _canonical_project_pair(project_a.id or 0, project_b.id or 0)
-            record = existing_map.get(pair) if suggestion is None else suggestion
-            if record is None:
-                record = ProjectSiblingSuggestion(
-                    project_a_id=pair[0],
-                    project_b_id=pair[1],
-                    score=score,
-                    rationale=rationale,
-                    status="suggested",
-                )
-                session.add(record)
-                existing_map[pair] = record
-            else:
-                record.score = score
-                record.rationale = rationale
-                # Preserve user decisions
-                if record.status not in {"confirmed", "dismissed"}:
-                    record.status = "suggested"
-            record.evaluated_ts = naive_now
+        for candidate in to_evaluate[:max_pairs]:
+            await _store_sibling_suggestion(session, candidate, agent_map, existing_map, naive_now)
             updated = True
 
         if updated:
@@ -4139,7 +3988,7 @@ async def update_project_sibling_status(project_id: int, other_id: int, status: 
 
 async def _agent_name_exists(project: Project, name: str) -> bool:
     if project.id is None:
-        raise ValueError("Project must have an id before querying agents.")
+        raise ValueError(_PROJECT_AGENT_QUERY_ID_REQUIRED)
     async with get_session() as session:
         result = await session.execute(
             select(Agent.id).where(Agent.project_id == project.id, func.lower(Agent.name) == name.lower())
@@ -4421,6 +4270,194 @@ async def _create_agent_record(
         return agent
 
 
+@dataclass(repr=False)
+class _AgentRegistrationRequest:
+    project: Project
+    name: str
+    program: str
+    model: str
+    task_description: str
+    registration_token: str | None
+    attachments_policy: str | None
+    expected_agent_id: int | None
+    expected_agent_generation: str | None
+    expected_project_generation: str | None
+    display_name: str | None
+
+
+async def _reject_renamed_agent_registration(archive: ProjectArchive, requested_name: str) -> None:
+    tombstone = await get_identity_rename_tombstone(archive, requested_name)
+    if tombstone is None:
+        return
+    replacement = str(tombstone["new_name"])
+    raise ToolExecutionError(
+        "IDENTITY_RENAMED",
+        f"IDENTITY_RENAMED: Agent identity '{requested_name}' was permanently renamed "
+        f"to '{replacement}'. Use the new identity and migrate the existing local "
+        "credential key; the old address will never be registered again.",
+        recoverable=True,
+        data={"old_name": str(tombstone["old_name"]), "new_name": replacement, "agent_id": tombstone["agent_id"]},
+    )
+
+
+def _required_agent_registration_name(name: str | None) -> str:
+    if name is None or not name.strip():
+        raise ToolExecutionError(
+            "NAME_REQUIRED",
+            "A durable Agent requires an explicit stable name. Random "
+            "adjective+noun identities are no longer generated; use a "
+            "client-os-host-slot identity such as 'codex-wsl-home-1'.",
+            recoverable=True, data={"field": "name"},
+        )
+    return name.strip()
+
+
+def _validate_agent_registration_name(requested_name: str) -> None:
+    if not validate_thread_id_format(requested_name):
+        raise ToolExecutionError(
+            "INVALID_AGENT_NAME",
+            f"Invalid agent name '{requested_name}'. Use a stable explicit "
+            "identifier containing '-', '_' or '.', such as "
+            "'codex-wsl-home-1'.",
+            recoverable=True,
+            data={"provided_name": requested_name, "valid_examples": ["codex-wsl-home-1", "claude-linux-ci-1"]},
+        )
+
+
+async def _validate_registration_project_lifetime(session: AsyncSession, request: _AgentRegistrationRequest) -> None:
+    project = request.project
+    current = await session.get(Project, project.id)
+    if (
+        current is None or current.slug != project.slug or current.project_generation != project.project_generation
+        or (request.expected_project_generation is not None and current.project_generation != request.expected_project_generation)
+    ):
+        raise ToolExecutionError(
+            "PROJECT_IDENTITY_STALE", "The authenticated project lifetime no longer exists.",
+            recoverable=True, data={"project_key": project.human_key},
+        )
+
+
+def _validate_registration_agent_lifetime(agent: Agent, request: _AgentRegistrationRequest, *, concurrent: bool = False) -> None:
+    id_changed = request.expected_agent_id is not None and agent.id != request.expected_agent_id
+    generation_changed = request.expected_agent_generation is not None and agent.agent_generation != request.expected_agent_generation
+    if id_changed or generation_changed:
+        error = RuntimeError(f"Agent lifetime '{request.name}' changed while registration was authenticated.")
+        if concurrent:
+            raise error from None
+        raise error
+
+
+async def _find_registration_agent(session: AsyncSession, request: _AgentRegistrationRequest) -> Agent | None:
+    result = await session.execute(select(Agent).where(
+        cast(Any, Agent.project_id == request.project.id),
+        cast(Any, func.lower(Agent.name) == request.name.lower()),
+    ))
+    return result.scalars().first()
+
+
+async def _new_registration_agent(session: AsyncSession, request: _AgentRegistrationRequest) -> Agent:
+    if not validate_client_platform_host_agent_id(request.name):
+        raise ToolExecutionError(
+            "INVALID_DURABLE_AGENT_NAME",
+            f"New durable Agent '{request.name}' must match "
+            "client-os-host-slot, for example 'codex-wsl-home-1'. "
+            "Existing legacy identities remain authenticatable.",
+            recoverable=True, data={"provided_name": request.name},
+        )
+    project_id = request.project.id
+    assert project_id is not None
+    alias = await _resolve_new_agent_display_name(session, project_id, request.name, request.display_name)
+    notify_sound = await _resolve_new_agent_notify_sound(session, project_id)
+    return Agent(
+        project_id=project_id, name=request.name, program=request.program, model=request.model,
+        task_description=request.task_description, attachments_policy=request.attachments_policy or "auto",
+        registration_token=request.registration_token, provisioning_state="provisioning",
+        display_name=alias, notify_sound=notify_sound,
+    )
+
+
+async def _find_or_create_registration_agent(request: _AgentRegistrationRequest) -> tuple[Agent, bool]:
+    await ensure_schema()
+    async with get_immediate_session() as session:
+        await _validate_registration_project_lifetime(session, request)
+        agent = await _find_registration_agent(session, request)
+        if agent:
+            _validate_registration_agent_lifetime(agent, request)
+            return agent, False
+        candidate = await _new_registration_agent(session, request)
+        if request.expected_agent_id is not None or request.expected_agent_generation is not None:
+            raise NoResultFound(f"Authenticated agent id '{request.expected_agent_id}' no longer exists.")
+        session.add(candidate)
+        try:
+            await session.commit()
+            return candidate, True
+        except IntegrityError:
+            await session.rollback()
+            with suppress(Exception):
+                session.expunge(candidate)
+            # A concurrent explicit-name registration is an idempotent update.
+            agent = await _find_registration_agent(session, request)
+            if agent is None:
+                raise
+            _validate_registration_agent_lifetime(agent, request, concurrent=True)
+            return agent, False
+
+
+async def _registration_window_identity(project: Project, agent: Agent, window_uuid: str, ttl_days: int) -> WindowIdentity | None:
+    if not window_uuid or not _validate_window_uuid(window_uuid):
+        return None
+    identity = await _get_window_identity(project, window_uuid)
+    if identity is None:
+        return await _create_window_identity(project, window_uuid, agent.name, ttl_days)
+    await _touch_window_identity(identity, ttl_days)
+    return identity
+
+
+def _add_registration_window_profile(profile: dict[str, Any], identity: WindowIdentity | None) -> None:
+    if identity is not None:
+        profile["window_id"] = identity.window_uuid
+        profile["window_display_name"] = identity.display_name
+
+
+async def _publish_updated_registration_profile(
+    archive: ProjectArchive, agent: Agent, request: _AgentRegistrationRequest, identity: WindowIdentity | None,
+) -> Agent:
+    # The caller holds the archive lock. Commit SQLite only after publishing
+    # its corresponding Git projection; restore the previous projection on failure.
+    async with get_immediate_session() as session:
+        _db_project, db_agent, _db_execution = await _revalidate_agent_lifetime_in_session(
+            session, project=request.project, agent=agent, action="authenticated Agent profile update",
+        )
+        previous_profile = _agent_to_dict(db_agent)
+        db_agent.program = request.program
+        db_agent.model = request.model
+        db_agent.task_description = request.task_description
+        if request.attachments_policy is not None:
+            db_agent.attachments_policy = request.attachments_policy
+        db_agent.last_active_ts = _naive_utc()
+        session.add(db_agent)
+        profile = _agent_to_dict(db_agent)
+        _add_registration_window_profile(previous_profile, identity)
+        _add_registration_window_profile(profile, identity)
+        try:
+            await write_agent_profile(archive, profile)
+            await session.commit()
+        except Exception:
+            with suppress(Exception):
+                await write_agent_profile(archive, previous_profile)
+            raise
+        return db_agent
+
+
+async def _publish_new_registration_profile(
+    archive: ProjectArchive, project: Project, agent: Agent, identity: WindowIdentity | None,
+) -> None:
+    profile_agent = await _revalidate_agent_profile_lifetime(project=project, agent=agent)
+    profile = _agent_to_dict(profile_agent)
+    _add_registration_window_profile(profile, identity)
+    await write_agent_profile(archive, profile)
+
+
 async def _get_or_create_agent(
     project: Project,
     name: Optional[str],
@@ -4440,259 +4477,34 @@ async def _get_or_create_agent(
     if project.id is None:
         raise ValueError("Project must have an id before creating agents.")
     archive = await ensure_archive(settings, project.slug)
-
-    async def reject_renamed_identity(requested_name: str) -> None:
-        tombstone = await get_identity_rename_tombstone(archive, requested_name)
-        if tombstone is None:
-            return
-        replacement = str(tombstone["new_name"])
-        raise ToolExecutionError(
-            "IDENTITY_RENAMED",
-            (
-                f"IDENTITY_RENAMED: Agent identity '{requested_name}' was permanently renamed "
-                f"to '{replacement}'. Use the new identity and migrate the existing local "
-                "credential key; the old address will never be registered again."
-            ),
-            recoverable=True,
-            data={
-                "old_name": str(tombstone["old_name"]),
-                "new_name": replacement,
-                "agent_id": tombstone["agent_id"],
-            },
-        )
-
-    if name is None or not name.strip():
-        raise ToolExecutionError(
-            "NAME_REQUIRED",
-            (
-                "A durable Agent requires an explicit stable name. Random "
-                "adjective+noun identities are no longer generated; use a "
-                "client-os-host-slot identity such as 'codex-wsl-home-1'."
-            ),
-            recoverable=True,
-            data={"field": "name"},
-        )
-    requested_name = name.strip()
-    await reject_renamed_identity(requested_name)
-    if not validate_thread_id_format(requested_name):
-        raise ToolExecutionError(
-            "INVALID_AGENT_NAME",
-            (
-                f"Invalid agent name '{requested_name}'. Use a stable explicit "
-                "identifier containing '-', '_' or '.', such as "
-                "'codex-wsl-home-1'."
-            ),
-            recoverable=True,
-            data={
-                "provided_name": requested_name,
-                "valid_examples": ["codex-wsl-home-1", "claude-linux-ci-1"],
-            },
-        )
-
-    desired_name = requested_name
-    explicit_name_used = True
+    desired_name = _required_agent_registration_name(name)
+    await _reject_renamed_agent_registration(archive, desired_name)
+    _validate_agent_registration_name(desired_name)
     window_uuid = getattr(settings, "window_identity_uuid", "") or ""
     ttl_days = getattr(settings, "window_identity_ttl_days", 30)
-    window_identity: Optional[WindowIdentity] = None
-    await reject_renamed_identity(desired_name)
-    await ensure_schema()
-    newly_created = False
-    existing_update_pending = False
-    async with get_immediate_session() as session:
-        current_project = await session.get(Project, project.id)
-        if (
-            current_project is None
-            or current_project.slug != project.slug
-            or current_project.project_generation != project.project_generation
-            or (
-                expected_project_generation is not None
-                and current_project.project_generation
-                != expected_project_generation
-            )
-        ):
-            raise ToolExecutionError(
-                "PROJECT_IDENTITY_STALE",
-                "The authenticated project lifetime no longer exists.",
-                recoverable=True,
-                data={"project_key": project.human_key},
-            )
-        for _attempt in range(5):
-            # Use case-insensitive matching to be consistent with _agent_name_exists() and _get_agent()
-            result = await session.execute(
-                select(Agent).where(
-                    cast(Any, Agent.project_id == project.id),
-                    cast(Any, func.lower(Agent.name) == desired_name.lower()),
-                )
-            )
-            agent = result.scalars().first()
-            if agent:
-                if (
-                    expected_existing_agent_id is not None
-                    and agent.id != expected_existing_agent_id
-                ) or (
-                    expected_existing_agent_generation is not None
-                    and agent.agent_generation
-                    != expected_existing_agent_generation
-                ):
-                    raise RuntimeError(
-                        f"Agent lifetime '{desired_name}' changed while registration was authenticated."
-                    )
-                if not update_existing:
-                    return agent, False
-                existing_update_pending = True
-                break
-
-            if not validate_client_platform_host_agent_id(desired_name):
-                raise ToolExecutionError(
-                    "INVALID_DURABLE_AGENT_NAME",
-                    (
-                        f"New durable Agent '{desired_name}' must match "
-                        "client-os-host-slot, for example 'codex-wsl-home-1'. "
-                        "Existing legacy identities remain authenticatable."
-                    ),
-                    recoverable=True,
-                    data={"provided_name": desired_name},
-                )
-
-            alias = await _resolve_new_agent_display_name(
-                session, project.id, desired_name, display_name
-            )
-            notify_sound = await _resolve_new_agent_notify_sound(
-                session, project.id
-            )
-            candidate = Agent(
-                project_id=project.id,
-                name=desired_name,
-                program=program,
-                model=model,
-                task_description=task_description,
-                attachments_policy=attachments_policy or "auto",
-                registration_token=registration_token_on_create,
-                provisioning_state="provisioning",
-                display_name=alias,
-                notify_sound=notify_sound,
-            )
-            if (
-                expected_existing_agent_id is not None
-                or expected_existing_agent_generation is not None
-            ):
-                raise NoResultFound(
-                    f"Authenticated agent id '{expected_existing_agent_id}' no longer exists."
-                )
-            session.add(candidate)
-            try:
-                await session.commit()
-                agent = candidate
-                newly_created = True
-                break
-            except IntegrityError:
-                await session.rollback()
-                with suppress(Exception):
-                    session.expunge(candidate)
-
-                if explicit_name_used:
-                    # Another concurrent call created this identity; treat as idempotent update.
-                    result = await session.execute(
-                        select(Agent).where(
-                            cast(Any, Agent.project_id == project.id),
-                            cast(Any, func.lower(Agent.name) == desired_name.lower()),
-                        )
-                    )
-                    agent = result.scalars().first()
-                    if agent is None:
-                        raise
-                    if (
-                        expected_existing_agent_id is not None
-                        and agent.id != expected_existing_agent_id
-                    ) or (
-                        expected_existing_agent_generation is not None
-                        and agent.agent_generation
-                        != expected_existing_agent_generation
-                    ):
-                        raise RuntimeError(
-                            f"Agent lifetime '{desired_name}' changed while registration was authenticated."
-                        ) from None
-                    if not update_existing:
-                        return agent, False
-                    existing_update_pending = True
-                    break
-
-                raise
-        else:
-            raise RuntimeError("Failed to create a unique agent after multiple retries.")
+    await _reject_renamed_agent_registration(archive, desired_name)
+    request = _AgentRegistrationRequest(
+        project=project, name=desired_name, program=program, model=model, task_description=task_description,
+        registration_token=registration_token_on_create, attachments_policy=attachments_policy,
+        expected_agent_id=expected_existing_agent_id,
+        expected_agent_generation=expected_existing_agent_generation,
+        expected_project_generation=expected_project_generation, display_name=display_name,
+    )
+    agent, newly_created = await _find_or_create_registration_agent(request)
+    if not newly_created and not update_existing:
+        return agent, False
     try:
         # Associate explicit-name agents with their optional window identity
         # before profile publication and activation.  This belongs inside the
         # provisioning failure boundary: a failed window lookup must not leave
         # an undiscoverable row holding the durable name and its one-time token.
-        if (
-            window_uuid
-            and _validate_window_uuid(window_uuid)
-            and window_identity is None
-            and explicit_name_used
-        ):
-            window_identity = await _get_window_identity(project, window_uuid)
-            if window_identity is None:
-                window_identity = await _create_window_identity(
-                    project,
-                    window_uuid,
-                    agent.name,
-                    ttl_days,
-                )
-            else:
-                await _touch_window_identity(window_identity, ttl_days)
+        window_identity = await _registration_window_identity(project, agent, window_uuid, ttl_days)
 
         async with _archive_write_lock(archive):
-            if existing_update_pending:
-                # Keep an authenticated metadata update and its Git profile in
-                # one failure boundary.  The immediate transaction is not
-                # committed until profile publication succeeds, so a failed
-                # publication leaves both stores on the previous version.
-                async with get_immediate_session() as session:
-                    _db_project, db_agent, _db_execution = (
-                        await _revalidate_agent_lifetime_in_session(
-                            session,
-                            project=project,
-                            agent=agent,
-                            action="authenticated Agent profile update",
-                        )
-                    )
-                    previous_agent_dict = _agent_to_dict(db_agent)
-                    db_agent.program = program
-                    db_agent.model = model
-                    db_agent.task_description = task_description
-                    if attachments_policy is not None:
-                        db_agent.attachments_policy = attachments_policy
-                    db_agent.last_active_ts = _naive_utc()
-                    session.add(db_agent)
-                    agent_dict = _agent_to_dict(db_agent)
-                    if window_identity is not None:
-                        for profile in (previous_agent_dict, agent_dict):
-                            profile["window_id"] = window_identity.window_uuid
-                            profile["window_display_name"] = (
-                                window_identity.display_name
-                            )
-                    try:
-                        await write_agent_profile(archive, agent_dict)
-                        await session.commit()
-                    except Exception:
-                        # write_agent_profile commits independently of SQLite.
-                        # Restore the prior projection if a later DB step fails;
-                        # a pre-write failure makes this an idempotent rewrite.
-                        with suppress(Exception):
-                            await write_agent_profile(archive, previous_agent_dict)
-                        raise
-                    agent = db_agent
+            if not newly_created:
+                agent = await _publish_updated_registration_profile(archive, agent, request, window_identity)
             else:
-                profile_agent = await _revalidate_agent_profile_lifetime(
-                    project=project,
-                    agent=agent,
-                )
-                agent_dict = _agent_to_dict(profile_agent)
-                if window_identity is not None:
-                    agent_dict["window_id"] = window_identity.window_uuid
-                    agent_dict["window_display_name"] = window_identity.display_name
-                await write_agent_profile(archive, agent_dict)
+                await _publish_new_registration_profile(archive, project, agent, window_identity)
         if newly_created:
             agent = await _activate_provisioned_agent_lifetime(
                 project=project,
@@ -4713,10 +4525,8 @@ async def _get_or_create_agent(
     return agent, newly_created
 
 
-async def _get_agent(project: Project, name: str) -> Agent:
-    """Get agent by name with helpful error messages and suggestions."""
-    await ensure_schema()
-
+def _validate_agent_lookup_name(project: Project, name: str) -> None:
+    """Reject empty names and unconfigured integration placeholders."""
     # Validate input
     if not name or not name.strip():
         raise ToolExecutionError(
@@ -4738,7 +4548,7 @@ async def _get_agent(project: Project, name: str) -> Agent:
     ]
     name_upper = name.upper().strip()
     for pattern in _agent_placeholder_patterns:
-        if pattern in name_upper or name_upper == pattern:
+        if pattern in name_upper:
             raise ToolExecutionError(
                 "CONFIGURATION_ERROR",
                 f"Detected placeholder value '{name}' instead of a real agent name. "
@@ -4753,6 +4563,13 @@ async def _get_agent(project: Project, name: str) -> Agent:
                     "fix_hint": "Update AGENT_MAIL_AGENT or agent_name in your configuration",
                 },
             )
+
+
+
+async def _get_agent(project: Project, name: str) -> Agent:
+    """Get agent by name with helpful error messages and suggestions."""
+    await ensure_schema()
+    _validate_agent_lookup_name(project, name)
 
     async with get_session() as session:
         result = await session.execute(
@@ -4772,6 +4589,8 @@ async def _get_agent(project: Project, name: str) -> Agent:
 
     # Check for common mistakes (Unix username, program name, etc.)
     mistake = _detect_agent_name_mistake(name)
+    mistake_type = mistake[0] if mistake else None
+    error_type = mistake_type or "NOT_FOUND"
     mistake_hint = ""
     if mistake:
         mistake_hint = f"\n\nHINT: {mistake[1]}"
@@ -4780,7 +4599,7 @@ async def _get_agent(project: Project, name: str) -> Agent:
         # Found similar names - probably a typo
         suggestion_text = ", ".join([f"'{s[0]}'" for s in suggestions[:3]])
         raise ToolExecutionError(
-            mistake[0] if mistake else "NOT_FOUND",
+            error_type,
             f"Agent '{name}' not found in project '{project.human_key}'. Did you mean: {suggestion_text}? "
             f"Agent names are case-insensitive but must match exactly.{mistake_hint}",
             recoverable=True,
@@ -4789,7 +4608,7 @@ async def _get_agent(project: Project, name: str) -> Agent:
                 "project": project.slug,
                 "suggestions": [{"name": s[0], "score": round(s[1], 2)} for s in suggestions],
                 "available_agents": available_agents,
-                "mistake_type": mistake[0] if mistake else None,
+                "mistake_type": mistake_type,
             },
         )
     elif available_agents:
@@ -4797,7 +4616,7 @@ async def _get_agent(project: Project, name: str) -> Agent:
         agents_list = ", ".join([f"'{a}'" for a in available_agents[:5]])
         more_text = f" and {len(available_agents) - 5} more" if len(available_agents) > 5 else ""
         raise ToolExecutionError(
-            mistake[0] if mistake else "NOT_FOUND",
+            error_type,
             f"Agent '{name}' not found in project '{project.human_key}'. "
             f"Available agents: {agents_list}{more_text}. "
             "Only a durable parent client or operator may provision a missing "
@@ -4807,20 +4626,20 @@ async def _get_agent(project: Project, name: str) -> Agent:
                 "agent_name": name,
                 "project": project.slug,
                 "available_agents": available_agents,
-                "mistake_type": mistake[0] if mistake else None,
+                "mistake_type": mistake_type,
             },
         )
     else:
         # Project has no agents
         raise ToolExecutionError(
-            mistake[0] if mistake else "NOT_FOUND",
+            error_type,
             f"Agent '{name}' not found. Project '{project.human_key}' has no registered agents yet. "
             "A durable parent client or operator must provision an explicit "
             "mailbox first; native subagents report through their parent. "
             f"Example: register_agent(project_key='{project.slug}', program='claude-code', "
             f"model='opus-4', name='claude-linux-ci-1'){mistake_hint}",
             recoverable=True,
-            data={"agent_name": name, "project": project.slug, "available_agents": [], "mistake_type": mistake[0] if mistake else None},
+            data={"agent_name": name, "project": project.slug, "available_agents": [], "mistake_type": mistake_type},
         )
 
 
@@ -5067,7 +4886,7 @@ async def _get_agents_batch(project: Project, names: Sequence[str]) -> dict[str,
     if not names:
         return {}
     if project.id is None:
-        raise ValueError("Project must have an id before querying agents.")
+        raise ValueError(_PROJECT_AGENT_QUERY_ID_REQUIRED)
 
     lowered_names: list[str] = []
     seen: set[str] = set()
@@ -5255,6 +5074,31 @@ def _file_reservation_payload(
     return payload
 
 
+def _reservation_record_payload(
+    project: Project,
+    reservation: FileReservation,
+    agent: Agent | None,
+    execution_by_id: dict[str, AgentExecution],
+    branch_override: str | None,
+    worktree_override: str | None,
+    reason_override: str | None,
+) -> dict[str, Any]:
+    execution = execution_by_id.get(reservation.execution_id) if reservation.execution_id is not None else None
+    return _file_reservation_payload(
+        project,
+        reservation,
+        agent,
+        branch=branch_override or (execution.branch if execution is not None else None),
+        worktree=worktree_override or (execution.worktree_path if execution is not None else None),
+        reason_override=reason_override,
+        execution_status=execution.status if execution is not None else None,
+        ancestor_execution_ids=(
+            _execution_ancestor_ids(list(execution_by_id.values()), execution)
+            if execution is not None else ()
+        ),
+    )
+
+
 async def _write_file_reservation_records(
     project: Project,
     # Optional[Agent] in each tuple: expired-pair records may carry None when
@@ -5294,37 +5138,10 @@ async def _write_file_reservation_records(
     async def _write_all() -> None:
         payloads: list[dict[str, Any]] = []
         for reservation, agent in records:
-            execution = (
-                execution_by_id.get(reservation.execution_id)
-                if reservation.execution_id is not None
-                else None
-            )
             payloads.append(
-                _file_reservation_payload(
-                    project,
-                    reservation,
-                    agent,
-                    branch=(
-                        branch_override
-                        or (execution.branch if execution is not None else None)
-                    ),
-                    worktree=(
-                        worktree_override
-                        or (
-                            execution.worktree_path
-                            if execution is not None
-                            else None
-                        )
-                    ),
-                    reason_override=reason_override,
-                    execution_status=(execution.status if execution is not None else None),
-                    ancestor_execution_ids=(
-                        _execution_ancestor_ids(
-                            list(execution_by_id.values()), execution
-                        )
-                        if execution is not None
-                        else ()
-                    ),
+                _reservation_record_payload(
+                    project, reservation, agent, execution_by_id,
+                    branch_override, worktree_override, reason_override,
                 )
             )
         await write_file_reservation_records(target_archive, payloads)
@@ -5443,6 +5260,138 @@ async def _reconcile_pending_file_reservation_artifacts(
         return await _reconcile_locked()
 
 
+@dataclass(frozen=True)
+class _ReservationStatusContext:
+    moment: datetime
+    inactivity_seconds: int
+    activity_grace: int
+    workspace: Path | None
+    repo: Repo | None
+    executions: list[AgentExecution]
+    send_map: dict[int, datetime | None]
+    ack_map: dict[int, datetime | None]
+    read_map: dict[int, datetime | None]
+
+
+class _ReservationStatusBuilder:
+    def __init__(
+        self, context: _ReservationStatusContext, reservation: FileReservation,
+        agent: Agent | None, execution: AgentExecution | None,
+    ) -> None:
+        self.context = context
+        self.reservation = reservation
+        self.agent = agent
+        self.execution = execution
+        self.agent_orphaned = agent is None
+        self.agent_last_active = None
+        self.last_mail = None
+        if agent is not None:
+            agent_id = agent.id or -1
+            self.agent_last_active = _ensure_utc(agent.last_active_ts)
+            self.last_mail = _max_datetime(
+                context.send_map.get(agent_id), context.ack_map.get(agent_id), context.read_map.get(agent_id)
+            )
+        self.execution_scoped = reservation.execution_id is not None
+        self.execution_missing = self.execution_scoped and execution is None
+        self.execution_status = execution.status if execution is not None else None
+        self.execution_parent_id = execution.parent_execution_id if execution is not None else None
+        self.ancestor_ids = _execution_ancestor_ids(context.executions, execution) if execution is not None else []
+        self.execution_last_active = _ensure_utc(execution.last_active_ts) if execution is not None else None
+
+    def _inactive(self, activity: datetime | None) -> bool:
+        return activity is None or (self.context.moment - activity).total_seconds() > self.context.inactivity_seconds
+
+    def _recent(self, activity: datetime | None) -> bool:
+        return activity is not None and (self.context.moment - activity).total_seconds() <= self.context.activity_grace
+
+    def _stale(self, recent_mail: bool, recent_fs: bool, recent_git: bool) -> bool:
+        if self.execution_scoped:
+            return bool(self.reservation.released_ts is None and (
+                self.execution_missing
+                or self.execution_status != "active"
+                or (self.execution_inactive and not (recent_fs or recent_git))
+            ))
+        return bool(self.reservation.released_ts is None and (
+            self.agent_orphaned
+            or (self.agent_inactive and not (recent_mail or recent_fs or recent_git))
+        ))
+
+    def _execution_reason(self) -> str:
+        if self.execution_missing:
+            return "execution_unresolved"
+        if self.execution_status != "active":
+            return f"execution_{self.execution_status}"
+        if self.execution_inactive:
+            return f"execution_inactive>{self.context.inactivity_seconds}s"
+        return "execution_recently_active"
+
+    def _owner_reasons(self) -> list[str]:
+        if self.execution_scoped:
+            return [self._execution_reason(), "mail_activity_not_execution_signal"]
+        if self.agent_orphaned:
+            return ["agent_missing" if self.reservation.agent_id is None else "agent_unresolved"]
+        if self.agent_inactive:
+            return [f"agent_inactive>{self.context.inactivity_seconds}s"]
+        return ["agent_recently_active"]
+
+    def _mail_reasons(self, recent_mail: bool) -> list[str]:
+        if self.execution_scoped:
+            return []
+        if self.agent_orphaned:
+            return ["no_mail_activity_possible"]
+        if recent_mail:
+            return ["mail_activity_recent"]
+        return [f"no_recent_mail_activity>{self.context.activity_grace}s"]
+
+    def _path_reasons(self, matched: bool, recent_fs: bool, recent_git: bool) -> list[str]:
+        if not matched:
+            return ["path_pattern_unmatched"]
+        return [
+            "filesystem_activity_recent" if recent_fs else f"no_recent_filesystem_activity>{self.context.activity_grace}s",
+            "git_activity_recent" if recent_git else f"no_recent_git_activity>{self.context.activity_grace}s",
+        ]
+
+    async def build(self) -> FileReservationStatus:
+        matched = False
+        fs_activity: datetime | None = None
+        git_activity: datetime | None = None
+        if self.context.workspace is not None:
+            # One threaded glob probe avoids blocking the event loop or
+            # spawning one Git process per matched file.
+            matched, fs_activity, git_activity = await asyncio.to_thread(
+                _compute_reservation_activity,
+                self.context.workspace,
+                self.context.repo,
+                self.reservation.path_pattern,
+                recent_after=self.context.moment - timedelta(seconds=self.context.activity_grace),
+            )
+        self.agent_inactive = self._inactive(self.agent_last_active)
+        self.execution_inactive = self._inactive(self.execution_last_active)
+        recent_mail = self._recent(self.last_mail)
+        recent_fs = self._recent(fs_activity)
+        recent_git = self._recent(git_activity)
+        stale = self._stale(recent_mail, recent_fs, recent_git)
+        reasons = self._owner_reasons() + self._mail_reasons(recent_mail)
+        reasons.extend(self._path_reasons(matched, recent_fs, recent_git))
+        return FileReservationStatus(
+            reservation=self.reservation,
+            agent=self.agent,
+            stale=stale,
+            stale_reasons=reasons,
+            last_agent_activity=self.agent_last_active,
+            execution_id=self.reservation.execution_id,
+            execution_status=self.execution_status,
+            execution_parent_id=self.execution_parent_id,
+            ancestor_execution_ids=self.ancestor_ids,
+            orphaned=self.agent_orphaned or (self.execution_scoped and self.execution_status != "active"),
+            legacy_unscoped=not self.execution_scoped,
+            last_execution_activity=self.execution_last_active,
+            last_mail_activity=self.last_mail,
+            last_fs_activity=fs_activity,
+            last_git_activity=git_activity,
+        )
+
+
 async def _collect_file_reservation_statuses(
     project: Project,
     *,
@@ -5530,159 +5479,15 @@ async def _collect_file_reservation_statuses(
 
     workspace = _project_workspace_path(project)
     repo = _open_repo_if_available(workspace) if workspace is not None else None
-
+    context = _ReservationStatusContext(
+        moment, inactivity_seconds, activity_grace, workspace, repo,
+        project_executions, send_map, ack_map, read_map,
+    )
     statuses: list[FileReservationStatus] = []
     try:
         for reservation, agent, execution in rows:
-            # Orphaned reservation: agent row is gone (or never existed).
-            # Treat as perpetually inactive with no mail signal so the sweeper
-            # auto-releases it; tag the reasons so callers can distinguish
-            # `agent_missing` (NULL agent_id, never resolvable) from
-            # `agent_unresolved` (had an id but row was deleted). (#161)
-            agent_orphaned = agent is None
-            if agent_orphaned:
-                agent_id = None
-                agent_last_active = None
-                last_mail = None
-            else:
-                agent_id = agent.id or -1
-                agent_last_active = _ensure_utc(agent.last_active_ts)
-                last_mail = _max_datetime(
-                    send_map.get(agent_id), ack_map.get(agent_id), read_map.get(agent_id)
-                )
-            execution_scoped = reservation.execution_id is not None
-            execution_missing = execution_scoped and execution is None
-            execution_status = execution.status if execution is not None else None
-            execution_parent_id = (
-                execution.parent_execution_id if execution is not None else None
-            )
-            execution_ancestor_ids = (
-                _execution_ancestor_ids(
-                    project_executions,
-                    execution,
-                )
-                if execution is not None
-                else []
-            )
-            execution_last_active = (
-                _ensure_utc(execution.last_active_ts)
-                if execution is not None
-                else None
-            )
-
-            matched = False
-            fs_activity: Optional[datetime] = None
-            git_activity: Optional[datetime] = None
-
-            if workspace is not None:
-                # Offload the blocking filesystem+git probe to a thread so a
-                # broad glob reservation can never starve the event loop, and
-                # use a single glob-pathspec rev walk instead of one git fork
-                # per matched file (#240).
-                recent_after = moment - timedelta(seconds=activity_grace)
-                matched, fs_activity, git_activity = await asyncio.to_thread(
-                    _compute_reservation_activity,
-                    workspace,
-                    repo,
-                    reservation.path_pattern,
-                    recent_after=recent_after,
-                )
-
-            agent_inactive = (
-                agent_last_active is None or (moment - agent_last_active).total_seconds() > inactivity_seconds
-            )
-            execution_inactive = (
-                execution_last_active is None
-                or (moment - execution_last_active).total_seconds()
-                > inactivity_seconds
-            )
-            recent_mail = last_mail is not None and (moment - last_mail).total_seconds() <= activity_grace
-            recent_fs = fs_activity is not None and (moment - fs_activity).total_seconds() <= activity_grace
-            recent_git = git_activity is not None and (moment - git_activity).total_seconds() <= activity_grace
-
-            if execution_scoped:
-                stale = bool(
-                    reservation.released_ts is None
-                    and (
-                        execution_missing
-                        or execution_status != "active"
-                        or (execution_inactive and not (recent_fs or recent_git))
-                    )
-                )
-            else:
-                stale = bool(
-                    reservation.released_ts is None
-                    and (
-                        agent_orphaned
-                        or (
-                            agent_inactive
-                            and not (recent_mail or recent_fs or recent_git)
-                        )
-                    )
-                )
-            reasons: list[str] = []
-            if execution_scoped:
-                if execution_missing:
-                    reasons.append("execution_unresolved")
-                elif execution_status != "active":
-                    reasons.append(f"execution_{execution_status}")
-                elif execution_inactive:
-                    reasons.append(f"execution_inactive>{inactivity_seconds}s")
-                else:
-                    reasons.append("execution_recently_active")
-                reasons.append("mail_activity_not_execution_signal")
-            elif agent_orphaned:
-                # Distinguish never-had-owner from owner-was-deleted; both are
-                # terminal for the reservation but each tells a different
-                # operational story (config bug vs cleanup hygiene).
-                if reservation.agent_id is None:
-                    reasons.append("agent_missing")
-                else:
-                    reasons.append("agent_unresolved")
-            elif agent_inactive:
-                reasons.append(f"agent_inactive>{inactivity_seconds}s")
-            else:
-                reasons.append("agent_recently_active")
-            if execution_scoped:
-                pass
-            elif agent_orphaned:
-                reasons.append("no_mail_activity_possible")
-            elif recent_mail:
-                reasons.append("mail_activity_recent")
-            else:
-                reasons.append(f"no_recent_mail_activity>{activity_grace}s")
-            if matched:
-                if recent_fs:
-                    reasons.append("filesystem_activity_recent")
-                else:
-                    reasons.append(f"no_recent_filesystem_activity>{activity_grace}s")
-                if recent_git:
-                    reasons.append("git_activity_recent")
-                else:
-                    reasons.append(f"no_recent_git_activity>{activity_grace}s")
-            else:
-                reasons.append("path_pattern_unmatched")
-
-            statuses.append(
-                FileReservationStatus(
-                    reservation=reservation,
-                    agent=agent,
-                    stale=stale,
-                    stale_reasons=reasons,
-                    last_agent_activity=agent_last_active,
-                    execution_id=reservation.execution_id,
-                    execution_status=execution_status,
-                    execution_parent_id=execution_parent_id,
-                    ancestor_execution_ids=execution_ancestor_ids,
-                    orphaned=agent_orphaned
-                    or (execution_scoped and execution_status != "active"),
-                    legacy_unscoped=not execution_scoped,
-                    last_execution_activity=execution_last_active,
-                    last_mail_activity=last_mail,
-                    last_fs_activity=fs_activity,
-                    last_git_activity=git_activity,
-                )
-            )
+            builder = _ReservationStatusBuilder(context, reservation, agent, execution)
+            statuses.append(await builder.build())
     finally:
         # Cleanup: close repo if we opened one
         if repo is not None:
@@ -5867,9 +5672,8 @@ async def _expire_stale_file_reservations(
     return stale_statuses
 
 
-def _file_reservations_conflict(
+def _reservation_can_conflict(
     existing: FileReservation,
-    candidate_path: str,
     candidate_exclusive: bool,
     candidate_execution_id: str | None,
     candidate_agent_id: int,
@@ -5889,7 +5693,24 @@ def _file_reservations_conflict(
         and existing.agent_id == candidate_agent_id
     ):
         return False
-    if not existing.exclusive and not candidate_exclusive:
+    return existing.exclusive or candidate_exclusive
+
+
+def _file_reservations_conflict(
+    existing: FileReservation,
+    candidate_path: str,
+    candidate_exclusive: bool,
+    candidate_execution_id: str | None,
+    candidate_agent_id: int,
+    compatible_execution_ids: set[str] | None = None,
+) -> bool:
+    if not _reservation_can_conflict(
+        existing,
+        candidate_exclusive,
+        candidate_execution_id,
+        candidate_agent_id,
+        compatible_execution_ids,
+    ):
         return False
     # Virtual namespace reservations use exact-match only (bd-14z)
     candidate_virtual = _is_virtual_namespace(candidate_path)
@@ -5900,10 +5721,8 @@ def _file_reservations_conflict(
             return False
         return candidate_path.strip() == existing.path_pattern.strip()
     # Git wildmatch semantics; treat inputs as repo-root relative forward-slash paths
-    def _normalize(p: str) -> str:
-        return p.replace("\\", "/").lstrip("/")
-    candidate_norm = _normalize(candidate_path)
-    existing_norm = _normalize(existing.path_pattern)
+    candidate_norm = _normalize_pathspec_pattern(candidate_path)
+    existing_norm = _normalize_pathspec_pattern(existing.path_pattern)
     # If either side is a glob, treat both as patterns and check for overlap conservatively
     if _contains_glob(candidate_norm) or _contains_glob(existing_norm):
         return _patterns_overlap(existing_norm, candidate_norm)
@@ -6014,26 +5833,16 @@ def _build_reservation_union_spec(
         return None
 
     patterns: list[str] = []
-    compatible_ids = compatible_execution_ids or set()
     for record, _ in existing_reservations:
-        # Skip released reservations
-        if record.released_ts is not None:
-            continue
-        # Skip only this execution's own reservations. Sibling executions of
-        # the same durable Agent must still observe one another's conflicts.
-        if (
-            exclude_execution_id is not None
-            and record.execution_id in {exclude_execution_id, *compatible_ids}
+        # Use the same ownership and exclusivity rules as the exact conflict
+        # check. Sibling executions of one durable Agent can still conflict.
+        if not _reservation_can_conflict(
+            record,
+            candidate_exclusive,
+            exclude_execution_id,
+            exclude_legacy_agent_id,
+            compatible_execution_ids,
         ):
-            continue
-        if (
-            exclude_execution_id is None
-            and record.execution_id is None
-            and record.agent_id == exclude_legacy_agent_id
-        ):
-            continue
-        # Skip non-exclusive if candidate is also non-exclusive
-        if not record.exclusive and not candidate_exclusive:
             continue
         # Skip virtual namespace patterns (they use exact-match, not pathspec) (bd-14z)
         if _is_virtual_namespace(record.path_pattern):
@@ -6185,6 +5994,60 @@ async def _list_outbox(
     return messages
 
 
+def _commit_diff_excerpt(commit: Commit, relpath: str) -> dict[str, Any]:
+    parent = commit.parents[0] if commit.parents else None
+    hunks = 0
+    excerpt: list[str] = []
+    if parent is not None:
+        for diff in parent.diff(commit, paths=[relpath], create_patch=True):
+            try:
+                raw_diff = diff.diff
+                patch = raw_diff.decode("utf-8", "ignore") if isinstance(raw_diff, bytes) else str(raw_diff or "")
+            except Exception:
+                patch = ""
+            added_hunks = _append_diff_excerpt(patch, excerpt)
+            hunks += added_hunks
+            if len(excerpt) >= 12:
+                break
+    return {"hunks": hunks, "excerpt": excerpt}
+
+
+def _append_diff_excerpt(patch: str, excerpt: list[str]) -> int:
+    hunks = 0
+    for line in patch.splitlines():
+        if line.startswith("@@"):
+            hunks += 1
+        if line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
+            excerpt.append(line[:200])
+            if len(excerpt) >= 12:
+                break
+    return hunks
+
+
+def _lookup_message_commit(archive: ProjectArchive, delivery: MessageDelivery) -> dict[str, Any] | None:
+    try:
+        commit = archive.repo.commit(delivery.archive_commit_sha)
+    except Exception:
+        return None
+    data: dict[str, Any] = {
+        "delivery_id": delivery.id,
+        "hexsha": commit.hexsha[:12],
+        "summary": commit.summary,
+        "authored_ts": _iso(datetime.fromtimestamp(commit.authored_date, tz=timezone.utc)),
+    }
+    try:
+        stats = commit.stats.files.get(delivery.archive_relative_path, None)
+        if stats:
+            data["insertions"] = int(stats.get("insertions", 0))
+            data["deletions"] = int(stats.get("deletions", 0))
+    except Exception:
+        pass
+    # Attach concise diff summary (hunks count + first N +/- lines).
+    with suppress(Exception):
+        data["diff_summary"] = _commit_diff_excerpt(commit, cast(str, delivery.archive_relative_path))
+    return data
+
+
 async def _commit_info_for_message(settings: Settings, project: Project, message: Message) -> dict[str, Any] | None:
     """Fetch commit metadata from the message's immutable delivery receipt."""
     if message.id is None or message.delivery_id is None:
@@ -6203,79 +6066,31 @@ async def _commit_info_for_message(settings: Settings, project: Project, message
         return None
 
     archive = await ensure_archive(settings, project.slug)
-    relpath = delivery.archive_relative_path
-    commit_sha = delivery.archive_commit_sha
-
-    def _lookup() -> dict[str, Any] | None:
-        try:
-            commit = archive.repo.commit(commit_sha)
-        except Exception:
-            return None
-        data: dict[str, Any] = {
-            "delivery_id": delivery.id,
-            "hexsha": commit.hexsha[:12],
-            "summary": commit.summary,
-            "authored_ts": _iso(datetime.fromtimestamp(commit.authored_date, tz=timezone.utc)),
-        }
-        try:
-            stats = commit.stats.files.get(relpath, None)
-            if stats:
-                data["insertions"] = int(stats.get("insertions", 0))
-                data["deletions"] = int(stats.get("deletions", 0))
-        except Exception:
-            pass
-        # Attach concise diff summary (hunks count + first N +/- lines)
-        try:
-            parent = commit.parents[0] if commit.parents else None
-            hunks = 0
-            excerpt: list[str] = []
-            if parent is not None:
-                diffs = parent.diff(commit, paths=[relpath], create_patch=True)
-                for d in diffs:
-                    try:
-                        raw_diff = d.diff
-                        patch = raw_diff.decode("utf-8", "ignore") if isinstance(raw_diff, bytes) else str(raw_diff or "")
-                    except Exception:
-                        patch = ""
-                    for line in patch.splitlines():
-                        if line.startswith("@@"):
-                            hunks += 1
-                        if line.startswith("+") or line.startswith("-"):
-                            # skip file header lines like +++/---
-                            if line.startswith("+++") or line.startswith("---"):
-                                continue
-                            excerpt.append(line[:200])
-                            if len(excerpt) >= 12:
-                                break
-                    if len(excerpt) >= 12:
-                        break
-            data["diff_summary"] = {"hunks": hunks, "excerpt": excerpt}
-        except Exception:
-            pass
-        return data
-
-    return await asyncio.to_thread(_lookup)
+    return await asyncio.to_thread(_lookup_message_commit, archive, delivery)
 
 
-def _summarize_messages(messages: Sequence[tuple[Message, str]]) -> dict[str, Any]:
-    participants: set[str] = set()
-    key_points: list[str] = []
-    action_items: list[str] = []
-    open_actions = 0
-    done_actions = 0
-    mentions: dict[str, int] = {}
-    code_references: set[str] = set()
-    keywords = ("TODO", "ACTION", "FIXME", "NEXT", "BLOCKED")
+_ACTION_KEYWORDS = ("TODO", "ACTION", "FIXME", "NEXT", "BLOCKED")
 
-    def _record_mentions(text: str) -> None:
+
+class _MessageSummary:
+    def __init__(self) -> None:
+        self.participants: set[str] = set()
+        self.key_points: list[str] = []
+        self.action_items: list[str] = []
+        self.open_actions = 0
+        self.done_actions = 0
+        self.mentions: dict[str, int] = {}
+        self.code_references: set[str] = set()
+
+    def _record_mentions(self, text: str) -> None:
         # very lightweight @mention parser
         for token in text.split():
             if token.startswith("@") and len(token) > 1:
                 name = token[1:].strip(".,:;()[]{}")
                 if name:
-                    mentions[name] = mentions.get(name, 0) + 1
+                    self.mentions[name] = self.mentions.get(name, 0) + 1
 
-    def _maybe_code_ref(text: str) -> None:
+    def _maybe_code_ref(self, text: str) -> None:
         # capture backtick-enclosed references that look like files/paths
         start = 0
         while True:
@@ -6287,52 +6102,56 @@ def _summarize_messages(messages: Sequence[tuple[Message, str]]) -> dict[str, An
                 break
             snippet = text[i + 1 : j].strip()
             if ("/" in snippet or ".py" in snippet or ".ts" in snippet or ".md" in snippet) and (1 <= len(snippet) <= 120):
-                code_references.add(snippet)
+                self.code_references.add(snippet)
             start = j + 1
 
-    for message, sender_name in messages:
-        participants.add(sender_name)
-        for line in message.body_md.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            _record_mentions(stripped)
-            _maybe_code_ref(stripped)
-            # bullet points and ordered lists → key points
-            if stripped.startswith(('-', '*', '+')) or stripped[:2] in {"1.", "2.", "3.", "4.", "5."}:
-                # normalize checkbox bullets to plain text for key points
-                normalized = stripped
-                if normalized.startswith(('- [ ]', '- [x]', '- [X]')):
-                    normalized = normalized.split(']', 1)[-1].strip()
-                key_points.append(normalized.lstrip("-+* "))
-            # checkbox TODOs
-            if stripped.startswith(('- [ ]', '* [ ]', '+ [ ]')):
-                open_actions += 1
-                action_items.append(stripped)
-                continue
-            if stripped.startswith(('- [x]', '- [X]', '* [x]', '* [X]', '+ [x]', '+ [X]')):
-                done_actions += 1
-                action_items.append(stripped)
-                continue
-            # keyword-based action detection
-            upper = stripped.upper()
-            if any(token in upper for token in keywords):
-                action_items.append(stripped)
+    def add_line(self, line: str) -> None:
+        stripped = line.strip()
+        if not stripped:
+            return
+        self._record_mentions(stripped)
+        self._maybe_code_ref(stripped)
+        # Bullet points and ordered lists become key points.
+        if stripped.startswith(('-', '*', '+')) or stripped[:2] in {"1.", "2.", "3.", "4.", "5."}:
+            normalized = stripped
+            if normalized.startswith(('- [ ]', '- [x]', '- [X]')):
+                normalized = normalized.split(']', 1)[-1].strip()
+            self.key_points.append(normalized.lstrip("-+* "))
+        if stripped.startswith(('- [ ]', '* [ ]', '+ [ ]')):
+            self.open_actions += 1
+            self.action_items.append(stripped)
+            return
+        if stripped.startswith(('- [x]', '- [X]', '* [x]', '* [X]', '+ [x]', '+ [X]')):
+            self.done_actions += 1
+            self.action_items.append(stripped)
+            return
+        upper = stripped.upper()
+        if any(token in upper for token in _ACTION_KEYWORDS):
+            self.action_items.append(stripped)
 
-    # Sort mentions by frequency desc
-    sorted_mentions = sorted(mentions.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
-    summary: dict[str, Any] = {
-        "participants": sorted(participants),
-        "key_points": key_points[:10],
-        "action_items": action_items[:10],
-        "total_messages": len(messages),
-        "open_actions": open_actions,
-        "done_actions": done_actions,
-        "mentions": [{"name": name, "count": count} for name, count in sorted_mentions],
-    }
-    if code_references:
-        summary["code_references"] = sorted(code_references)[:10]
-    return summary
+    def as_dict(self, total_messages: int) -> dict[str, Any]:
+        sorted_mentions = sorted(self.mentions.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
+        summary: dict[str, Any] = {
+            "participants": sorted(self.participants),
+            "key_points": self.key_points[:10],
+            "action_items": self.action_items[:10],
+            "total_messages": total_messages,
+            "open_actions": self.open_actions,
+            "done_actions": self.done_actions,
+            "mentions": [{"name": name, "count": count} for name, count in sorted_mentions],
+        }
+        if self.code_references:
+            summary["code_references"] = sorted(self.code_references)[:10]
+        return summary
+
+
+def _summarize_messages(messages: Sequence[tuple[Message, str]]) -> dict[str, Any]:
+    summary = _MessageSummary()
+    for message, sender_name in messages:
+        summary.participants.add(sender_name)
+        for line in message.body_md.splitlines():
+            summary.add_line(line)
+    return summary.as_dict(len(messages))
 
 
 async def _get_thread_external_participants(
@@ -6395,6 +6214,53 @@ async def _get_thread_external_participants(
     return participants
 
 
+def _merge_thread_summary(
+    summary: dict[str, Any], parsed: dict[str, Any], heuristic_key_points: list[Any]
+) -> None:
+    for key in (
+        "participants", "key_points", "action_items", "mentions", "code_references",
+        "total_messages", "open_actions", "done_actions",
+    ):
+        value = parsed.get(key)
+        if value:
+            summary[key] = value
+    if not heuristic_key_points or not isinstance(summary.get("key_points"), list):
+        return
+    extra = [
+        point for point in heuristic_key_points
+        if any(token in str(point).upper() for token in _ACTION_KEYWORDS)
+    ]
+    if extra:
+        merged: list[str] = []
+        for item in summary["key_points"] + extra:
+            if item not in merged:
+                merged.append(item)
+        summary["key_points"] = merged[:10]
+
+
+async def _enhance_thread_summary(
+    summary: dict[str, Any],
+    rows: Sequence[tuple[Message, str]],
+    heuristic_key_points: list[Any],
+    llm_model: str | None,
+) -> None:
+    excerpts = [
+        f"- {sender_name}: {message.subject}\n{message.body_md[:800]}"
+        for message, sender_name in rows[:15]
+    ]
+    if not excerpts:
+        return
+    system = (
+        "You are a senior engineer. Produce a concise JSON summary with keys: "
+        "participants[], key_points[], action_items[], mentions[{name,count}], code_references[], "
+        "total_messages, open_actions, done_actions. Derive from the given thread excerpts."
+    )
+    response = await complete_system_user(system, "\n\n".join(excerpts), model=llm_model)
+    parsed = _parse_json_safely(response.content)
+    if parsed:
+        _merge_thread_summary(summary, parsed, heuristic_key_points)
+
+
 async def _compute_thread_summary(
     project: Project,
     thread_id: str,
@@ -6450,44 +6316,7 @@ async def _compute_thread_summary(
 
     if llm_mode and get_settings().llm.enabled:
         try:
-            excerpts: list[str] = []
-            for message, sender_name in rows[:15]:
-                excerpts.append(f"- {sender_name}: {message.subject}\n{message.body_md[:800]}")
-            if excerpts:
-                system = (
-                    "You are a senior engineer. Produce a concise JSON summary with keys: "
-                    "participants[], key_points[], action_items[], mentions[{name,count}], code_references[], "
-                    "total_messages, open_actions, done_actions. Derive from the given thread excerpts."
-                )
-                user = "\n\n".join(excerpts)
-                llm_resp = await complete_system_user(system, user, model=llm_model)
-                parsed = _parse_json_safely(llm_resp.content)
-                if parsed:
-                    for key in (
-                        "participants",
-                        "key_points",
-                        "action_items",
-                        "mentions",
-                        "code_references",
-                        "total_messages",
-                        "open_actions",
-                        "done_actions",
-                    ):
-                        value = parsed.get(key)
-                        if value:
-                            summary[key] = value
-                    if heuristic_key_points and isinstance(summary.get("key_points"), list):
-                        keywords = ("TODO", "ACTION", "FIXME", "NEXT", "BLOCKED")
-                        extra = [
-                            kp for kp in heuristic_key_points
-                            if any(token in str(kp).upper() for token in keywords)
-                        ]
-                        if extra:
-                            merged: list[str] = []
-                            for item in summary["key_points"] + extra:
-                                if item not in merged:
-                                    merged.append(item)
-                            summary["key_points"] = merged[:10]
+            await _enhance_thread_summary(summary, rows, heuristic_key_points, llm_model)
         except Exception as e:
             logger.debug("thread_summary.llm_skipped", extra={"thread_id": thread_id, "error": str(e)})
 
@@ -6543,7 +6372,7 @@ async def _get_visible_message(project: Project, agent: Agent, message_id: int) 
 
 async def _get_agent_by_id(project: Project, agent_id: int) -> Agent:
     if project.id is None:
-        raise ValueError("Project must have an id before querying agents.")
+        raise ValueError(_PROJECT_AGENT_QUERY_ID_REQUIRED)
     await ensure_schema()
     async with get_session() as session:
         result = await session.execute(
@@ -6886,6 +6715,49 @@ async def _register_execution_build_slot_artifact_path(
         await session.commit()
 
 
+def _release_execution_artifact(
+    lease_path: Path, artifact_path: BuildSlotArtifactPath, released_iso: str | None
+) -> bool:
+    data = json.loads(lease_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("build-slot lease is not a JSON object")
+    if data.get("execution_id") != artifact_path.execution_id:
+        raise ValueError("build-slot filename does not match execution_id")
+    if data.get("slot") != artifact_path.slot_name:
+        raise ValueError("build-slot path does not match slot name")
+    if data.get("released_ts"):
+        return False
+    data["released_ts"] = released_iso
+    data["expires_ts"] = released_iso
+    _write_json_atomic_sync(lease_path, data)
+    return True
+
+
+def _release_build_slot_files(
+    build_slots_root: Path, artifact_paths: Sequence[BuildSlotArtifactPath], released_at: datetime
+) -> int:
+    if not artifact_paths or not build_slots_root.is_dir():
+        return 0
+    released = 0
+    failures: list[str] = []
+    released_iso = _iso(released_at)
+    for artifact_path in artifact_paths:
+        holder_file = f"{safe_build_path_component(artifact_path.execution_id)}.json"
+        lease_path = build_slots_root / artifact_path.slot_path_component / holder_file
+        if not lease_path.is_file():
+            continue
+        try:
+            released += _release_execution_artifact(lease_path, artifact_path, released_iso)
+        except (OSError, ValueError, TypeError) as exc:
+            failures.append(f"{lease_path}: {exc}")
+            logger.exception(
+                "build_slot.execution_release_failed", extra={"lease_path": str(lease_path)}
+            )
+    if failures:
+        raise RuntimeError("Failed to reconcile build-slot artifact(s): " + "; ".join(failures[:5]))
+    return released
+
+
 async def _release_build_slot_artifacts_for_executions(
     project: Project,
     execution_ids: set[str],
@@ -6916,56 +6788,10 @@ async def _release_build_slot_artifacts_for_executions(
             ).scalars().all()
         )
 
-    def update_files() -> int:
-        if not artifact_paths or not build_slots_root.is_dir():
-            return 0
-        released = 0
-        failures: list[str] = []
-        released_iso = _iso(released_at)
-        for artifact_path in artifact_paths:
-            holder_file = (
-                f"{safe_build_path_component(artifact_path.execution_id)}.json"
-            )
-            lease_path = (
-                build_slots_root
-                / artifact_path.slot_path_component
-                / holder_file
-            )
-            if not lease_path.is_file():
-                continue
-            try:
-                data = json.loads(lease_path.read_text(encoding="utf-8"))
-                if not isinstance(data, dict):
-                    raise ValueError("build-slot lease is not a JSON object")
-                if data.get("execution_id") != artifact_path.execution_id:
-                    raise ValueError(
-                        "build-slot filename does not match execution_id"
-                    )
-                if data.get("slot") != artifact_path.slot_name:
-                    raise ValueError("build-slot path does not match slot name")
-                if data.get("released_ts"):
-                    continue
-                data["released_ts"] = released_iso
-                data["expires_ts"] = released_iso
-                _write_json_atomic_sync(lease_path, data)
-                released += 1
-            except (OSError, ValueError, TypeError) as exc:
-                failures.append(f"{lease_path}: {exc}")
-                logger.exception(
-                    "build_slot.execution_release_failed",
-                    extra={"lease_path": str(lease_path)},
-                )
-        if failures:
-            raise RuntimeError(
-                "Failed to reconcile build-slot artifact(s): "
-                + "; ".join(failures[:5])
-            )
-        return released
-
     if archive_locked:
-        return await asyncio.to_thread(update_files)
+        return await asyncio.to_thread(_release_build_slot_files, build_slots_root, artifact_paths, released_at)
     async with _archive_write_lock(resolved_archive):
-        return await asyncio.to_thread(update_files)
+        return await asyncio.to_thread(_release_build_slot_files, build_slots_root, artifact_paths, released_at)
 
 
 async def _ack_execution_build_slot_reconciliation(
@@ -7059,6 +6885,105 @@ async def _reconcile_terminal_execution_build_slots(
     return released, warnings
 
 
+async def _stale_execution_candidates(
+    session: AsyncSession,
+    cutoff: datetime,
+    project_id: int | None,
+    cursor: tuple[datetime, int, str] | None,
+) -> list[AgentExecution]:
+    stmt = select(AgentExecution).where(
+        cast(Any, AgentExecution.status) == "active",
+        cast(Any, AgentExecution.last_active_ts) <= cutoff,
+    )
+    if project_id is not None:
+        stmt = stmt.where(cast(Any, AgentExecution.project_id) == project_id)
+    if cursor is not None:
+        cursor_ts, cursor_project_id, cursor_id = cursor
+        stmt = stmt.where(or_(
+            cast(Any, AgentExecution.last_active_ts) > cursor_ts,
+            and_(
+                cast(Any, AgentExecution.last_active_ts) == cursor_ts,
+                cast(Any, AgentExecution.project_id) > cursor_project_id,
+            ),
+            and_(
+                cast(Any, AgentExecution.last_active_ts) == cursor_ts,
+                cast(Any, AgentExecution.project_id) == cursor_project_id,
+                cast(Any, AgentExecution.id) > cursor_id,
+            ),
+        ))
+    stmt = stmt.order_by(
+        asc(cast(Any, AgentExecution.last_active_ts)),
+        asc(cast(Any, AgentExecution.project_id)),
+        asc(cast(Any, AgentExecution.id)),
+    ).limit(_EXECUTION_REAPER_BATCH_SIZE)
+    return list((await session.execute(stmt)).scalars().all())
+
+
+class _ExecutionExpirySweep:
+    """Track one serialized expiry sweep across its bounded project batches."""
+
+    def __init__(self, session: AsyncSession, now: datetime, cutoff: datetime) -> None:
+        self.session = session
+        self.now = now
+        self.cutoff = cutoff
+        self.closed: set[str] = set()
+        self.expired_ids: list[str] = []
+        self.expired_by_project: defaultdict[int, set[str]] = defaultdict(set)
+        self.released_count = 0
+
+    async def expire_project(self, project_id: int, candidates: list[AgentExecution]) -> None:
+        rows = await _load_execution_descendant_rows(
+            self.session, [candidate.id for candidate in candidates],
+            project_id=project_id, active_only=True,
+        )
+        by_id = {execution.id: execution for execution in rows}
+        children = _execution_children_by_parent(rows)
+        latest_activity: dict[str, datetime] = {}
+        visiting: set[str] = set()
+        for root in candidates:
+            if root.id in self.closed or root.status != "active":
+                continue
+            latest = _execution_subtree_latest_activity(
+                root.id, by_id=by_id, children=children, memo=latest_activity,
+                visiting=visiting, cycle_sentinel=self.now,
+            )
+            if latest > self.cutoff:
+                continue
+            tree = [
+                *_execution_descendants_from_children(children, root.id, active_only=True),
+                root,
+            ]
+            await self._expire_tree(tree)
+
+    async def _expire_tree(self, tree: list[AgentExecution]) -> None:
+        tree_ids = [
+            execution.id for execution in tree
+            if execution.id not in self.closed and execution.status == "active"
+        ]
+        if tree_ids:
+            released = await self.session.execute(
+                update(FileReservation).where(
+                    cast(Any, FileReservation.execution_id).in_(tree_ids),
+                    cast(Any, FileReservation.origin) == "auto",
+                    cast(Any, FileReservation.released_ts).is_(None),
+                ).values(released_ts=self.now)
+            )
+            self.released_count += int(getattr(released, "rowcount", 0) or 0)
+            await self.session.flush()
+        for execution in tree:
+            if execution.id in self.closed or execution.status != "active":
+                continue
+            execution.status = "expired"
+            execution.last_active_ts = self.now
+            execution.ended_ts = self.now
+            self.session.add(execution)
+            # The storage trigger enforces child-first terminalization.
+            await self.session.flush()
+            self.closed.add(execution.id)
+            self.expired_ids.append(execution.id)
+            self.expired_by_project[execution.project_id].add(execution.id)
+
+
 async def expire_stale_agent_executions(
     threshold_seconds: int,
     *,
@@ -7070,48 +6995,12 @@ async def expire_stale_agent_executions(
         raise ValueError("threshold_seconds must be positive.")
     effective_now = _naive_utc(now or datetime.now(timezone.utc))
     cutoff = effective_now - timedelta(seconds=threshold_seconds)
-    expired_ids: list[str] = []
-    expired_by_project: defaultdict[int, set[str]] = defaultdict(set)
-    released_count = 0
     await ensure_schema()
     async with get_immediate_session() as session:
-        closed: set[str] = set()
+        sweep = _ExecutionExpirySweep(session, effective_now, cutoff)
         cursor: tuple[datetime, int, str] | None = None
         while True:
-            stmt = select(AgentExecution).where(
-                cast(Any, AgentExecution.status) == "active",
-                cast(Any, AgentExecution.last_active_ts) <= cutoff,
-            )
-            if project_id is not None:
-                stmt = stmt.where(
-                    cast(Any, AgentExecution.project_id) == project_id
-                )
-            if cursor is not None:
-                cursor_ts, cursor_project_id, cursor_id = cursor
-                stmt = stmt.where(
-                    or_(
-                        cast(Any, AgentExecution.last_active_ts) > cursor_ts,
-                        and_(
-                            cast(Any, AgentExecution.last_active_ts)
-                            == cursor_ts,
-                            cast(Any, AgentExecution.project_id)
-                            > cursor_project_id,
-                        ),
-                        and_(
-                            cast(Any, AgentExecution.last_active_ts)
-                            == cursor_ts,
-                            cast(Any, AgentExecution.project_id)
-                            == cursor_project_id,
-                            cast(Any, AgentExecution.id) > cursor_id,
-                        ),
-                    )
-                )
-            stmt = stmt.order_by(
-                asc(cast(Any, AgentExecution.last_active_ts)),
-                asc(cast(Any, AgentExecution.project_id)),
-                asc(cast(Any, AgentExecution.id)),
-            ).limit(_EXECUTION_REAPER_BATCH_SIZE)
-            candidates = list((await session.execute(stmt)).scalars().all())
+            candidates = await _stale_execution_candidates(session, cutoff, project_id, cursor)
             if not candidates:
                 break
             last_candidate = candidates[-1]
@@ -7129,80 +7018,7 @@ async def expire_stale_agent_executions(
             for candidate_project_id, project_candidates in (
                 candidates_by_project.items()
             ):
-                rows = await _load_execution_descendant_rows(
-                    session,
-                    [candidate.id for candidate in project_candidates],
-                    project_id=candidate_project_id,
-                    active_only=True,
-                )
-                by_id = {execution.id: execution for execution in rows}
-                children = _execution_children_by_parent(rows)
-                latest_activity: dict[str, datetime] = {}
-                visiting: set[str] = set()
-
-                for root in project_candidates:
-                    if (
-                        root.id in closed
-                        or root.status != "active"
-                        or _execution_subtree_latest_activity(
-                            root.id,
-                            by_id=by_id,
-                            children=children,
-                            memo=latest_activity,
-                            visiting=visiting,
-                            cycle_sentinel=effective_now,
-                        )
-                        > cutoff
-                    ):
-                        continue
-                    tree = [
-                        *_execution_descendants_from_children(
-                            children,
-                            root.id,
-                            active_only=True,
-                        ),
-                        root,
-                    ]
-                    tree_ids = [
-                        execution.id
-                        for execution in tree
-                        if execution.id not in closed
-                        and execution.status == "active"
-                    ]
-                    if tree_ids:
-                        released = await session.execute(
-                            update(FileReservation)
-                            .where(
-                                cast(Any, FileReservation.execution_id).in_(
-                                    tree_ids
-                                ),
-                                cast(Any, FileReservation.origin) == "auto",
-                                cast(Any, FileReservation.released_ts).is_(None),
-                            )
-                            .values(released_ts=effective_now)
-                        )
-                        released_count += int(
-                            getattr(released, "rowcount", 0) or 0
-                        )
-                        await session.flush()
-                    for execution in tree:
-                        if (
-                            execution.id in closed
-                            or execution.status != "active"
-                        ):
-                            continue
-                        execution.status = "expired"
-                        execution.last_active_ts = effective_now
-                        execution.ended_ts = effective_now
-                        session.add(execution)
-                        # The storage trigger enforces child-first
-                        # terminalization.
-                        await session.flush()
-                        closed.add(execution.id)
-                        expired_ids.append(execution.id)
-                        expired_by_project[execution.project_id].add(
-                            execution.id
-                        )
+                await sweep.expire_project(candidate_project_id, project_candidates)
         await session.commit()
     released_build_slots = 0
     archive_warnings: list[str] = []
@@ -7227,7 +7043,7 @@ async def expire_stale_agent_executions(
                 )
             ).scalars().all()
         }
-    projects_to_reconcile = pending_project_ids | set(expired_by_project)
+    projects_to_reconcile = pending_project_ids | set(sweep.expired_by_project)
     for expired_project_id in sorted(projects_to_reconcile):
         async with get_session() as session:
             project = await session.get(Project, expired_project_id)
@@ -7256,9 +7072,9 @@ async def expire_stale_agent_executions(
     released_build_slots += reconciled_build_slots
     archive_warnings.extend(build_slot_warnings)
     return {
-        "expired": len(expired_ids),
-        "execution_ids": expired_ids,
-        "released_reservations": released_count,
+        "expired": len(sweep.expired_ids),
+        "execution_ids": sweep.expired_ids,
+        "released_reservations": sweep.released_count,
         "released_build_slots": released_build_slots,
         "expired_at": _iso(effective_now),
         "archive_warnings": archive_warnings,
@@ -7303,6 +7119,68 @@ async def _agent_execution_reaper_worker(settings: Settings) -> None:
 _CREDENTIAL_ARGUMENT_PATTERN = re.compile(
     r"token|secret|credential|password|bearer", re.IGNORECASE
 )
+_REDACTED_VALIDATION_VALUE = "<redacted>"
+
+
+class _ValidationErrorRedactor:
+    """Render error locations, values, and messages using one credential set."""
+
+    def __init__(self, arguments: Mapping[str, Any]) -> None:
+        self.secrets_in_call: set[str] = set()
+        self._collect_credential_values(arguments)
+
+    def _collect_credential_values(
+        self,
+        value: Any,
+        *,
+        credential_context: bool = False,
+    ) -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                self._collect_credential_values(
+                    item,
+                    credential_context=(
+                        credential_context
+                        or bool(
+                            _CREDENTIAL_ARGUMENT_PATTERN.search(str(key))
+                        )
+                    ),
+                )
+            return
+        if isinstance(value, (list, tuple, set, frozenset)):
+            for item in value:
+                self._collect_credential_values(
+                    item,
+                    credential_context=credential_context,
+                )
+            return
+        if credential_context and isinstance(value, str) and value:
+            self.secrets_in_call.add(value)
+
+    def safe_input(self, location: tuple[Any, ...], value: Any) -> str:
+        if any(_CREDENTIAL_ARGUMENT_PATTERN.search(str(part)) for part in location):
+            return _REDACTED_VALIDATION_VALUE
+        rendered = repr(_redact_tool_log_value(value))
+        if any(secret in rendered for secret in self.secrets_in_call):
+            return _REDACTED_VALIDATION_VALUE
+        return rendered if len(rendered) <= 120 else f"{rendered[:117]}..."
+
+    def _replace_secrets(self, rendered: str) -> str:
+        for secret in sorted(self.secrets_in_call, key=len, reverse=True):
+            rendered = rendered.replace(secret, _REDACTED_VALIDATION_VALUE)
+        return rendered
+
+    def safe_message(self, location: tuple[Any, ...], value: Any) -> str:
+        if any(
+            _CREDENTIAL_ARGUMENT_PATTERN.search(str(part))
+            for part in location
+        ):
+            return "Invalid credential value"
+        return self._replace_secrets(str(value or "invalid"))
+
+    def safe_location_part(self, value: Any) -> str:
+        rendered = self._replace_secrets(str(value))
+        return rendered if len(rendered) <= 120 else f"{rendered[:117]}..."
 
 
 def _redacted_validation_message(
@@ -7324,62 +7202,7 @@ def _redacted_validation_message(
     only when neither its own name nor any credential-named argument's value
     could be hiding in it.
     """
-    secrets_in_call: set[str] = set()
-
-    def _collect_credential_values(
-        value: Any,
-        *,
-        credential_context: bool = False,
-    ) -> None:
-        if isinstance(value, Mapping):
-            for key, item in value.items():
-                _collect_credential_values(
-                    item,
-                    credential_context=(
-                        credential_context
-                        or bool(
-                            _CREDENTIAL_ARGUMENT_PATTERN.search(str(key))
-                        )
-                    ),
-                )
-            return
-        if isinstance(value, (list, tuple, set, frozenset)):
-            for item in value:
-                _collect_credential_values(
-                    item,
-                    credential_context=credential_context,
-                )
-            return
-        if credential_context and isinstance(value, str) and value:
-            secrets_in_call.add(value)
-
-    _collect_credential_values(arguments)
-
-    def _safe_input(location: tuple[Any, ...], value: Any) -> str:
-        if any(_CREDENTIAL_ARGUMENT_PATTERN.search(str(part)) for part in location):
-            return "<redacted>"
-        rendered = repr(_redact_tool_log_value(value))
-        if any(secret in rendered for secret in secrets_in_call):
-            return "<redacted>"
-        return rendered if len(rendered) <= 120 else f"{rendered[:117]}..."
-
-    def _safe_message(location: tuple[Any, ...], value: Any) -> str:
-        if any(
-            _CREDENTIAL_ARGUMENT_PATTERN.search(str(part))
-            for part in location
-        ):
-            return "Invalid credential value"
-        rendered = str(value or "invalid")
-        for secret in sorted(secrets_in_call, key=len, reverse=True):
-            rendered = rendered.replace(secret, "<redacted>")
-        return rendered
-
-    def _safe_location_part(value: Any) -> str:
-        rendered = str(value)
-        for secret in sorted(secrets_in_call, key=len, reverse=True):
-            rendered = rendered.replace(secret, "<redacted>")
-        return rendered if len(rendered) <= 120 else f"{rendered[:117]}..."
-
+    redactor = _ValidationErrorRedactor(arguments)
     # Pydantic's own layout is kept -- location on its own line, message
     # indented beneath it -- because callers and tests read these errors and
     # only the VALUE needed to change here.
@@ -7387,14 +7210,1503 @@ def _redacted_validation_message(
     for entry in error.errors():
         location = tuple(entry.get("loc", ()))
         lines.append(
-            ".".join(_safe_location_part(part) for part in location)
+            ".".join(redactor.safe_location_part(part) for part in location)
             or "<call>"
         )
         lines.append(
-            f"  {_safe_message(location, entry.get('msg'))} "
-            f"[type={entry.get('type', 'unknown')}, input={_safe_input(location, entry.get('input'))}]"
+            f"  {redactor.safe_message(location, entry.get('msg'))} "
+            f"[type={entry.get('type', 'unknown')}, input={redactor.safe_input(location, entry.get('input'))}]"
         )
     return "\n".join(lines)
+
+
+async def _contact_target_project(
+    project: Project, to_agent: str, to_project: str | None,
+) -> tuple[Project, str]:
+    if to_project:
+        return await _get_project_by_identifier(to_project), to_agent
+    if to_agent.startswith(_PROJECT_ADDRESS_PREFIX) and "#" in to_agent:
+        try:
+            _, rest = to_agent.split(":", 1)
+            slug_part, agent_part = rest.split("#", 1)
+            return await _get_project_by_identifier(slug_part), agent_part.strip()
+        except Exception:
+            pass
+    return project, to_agent
+
+
+async def _get_contact_target(project: Project, name: str) -> Agent:
+    try:
+        return await _get_agent(project, name)
+    except (NoResultFound, ToolExecutionError) as exc:
+        if isinstance(exc, NoResultFound) or exc.error_type == "NOT_FOUND":
+            raise _target_registration_required_error(project, name) from exc
+        raise
+
+
+def _message_idempotency_key(value: str) -> str:
+    value = value.strip()
+    if not value or len(value) > 128:
+        raise ToolExecutionError(
+            "INVALID_IDEMPOTENCY_KEY",
+            "idempotency_key must contain 1-128 non-whitespace characters.",
+            recoverable=True,
+            data={"argument": "idempotency_key"},
+        )
+    return value
+
+
+def _message_recipient_keys(value: str) -> set[str]:
+    # Sanitization supplies aliases only; SQL lookups keep the exact durable
+    # spelling, including the hyphens in client-os-host-slot identities.
+    trimmed = (value or "").strip()
+    sanitized = sanitize_agent_name(trimmed)
+    return {key.lower() for key in (trimmed, sanitized) if key}
+
+
+class _MessageContactBlocked(Exception):
+    pass
+
+
+class _MessageRecipientRouter:
+    """Resolve one call's recipients without changing delivery acceptance boundaries."""
+
+    def __init__(
+        self, ctx: Context, project: Project, sender: Agent,
+        thread_participants: dict[tuple[int, str], tuple[Project, str]],
+        *, prefer_cross_project: bool,
+    ) -> None:
+        self.ctx = ctx
+        self.project = project
+        self.sender = sender
+        self.thread_participants = thread_participants
+        self.prefer_cross_project = prefer_cross_project
+        self.local: dict[str, list[str]] = {"to": [], "cc": [], "bcc": []}
+        self.external: dict[int, dict[str, Any]] = {}
+        self.unknown_local: dict[str, set[str]] = defaultdict(set)
+        self.unknown_external: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+        self.local_lookup: dict[str, str] = {}
+        self.link_lookup: dict[str, tuple[Project, Agent]] = {}
+        self.sender_keys = _message_recipient_keys(sender.name)
+
+    async def preload(self, session: AsyncSession) -> None:
+        existing = await session.execute(
+            select(Agent.name).where(
+                Agent.project_id == self.project.id,
+                Agent.provisioning_state == "active",
+            )
+        )
+        for row in existing.fetchall():
+            canonical = (row[0] or "").strip()
+            for key in _message_recipient_keys(canonical):
+                self.local_lookup.setdefault(key, canonical)
+        if self.prefer_cross_project:
+            await self._preload_links(session)
+
+    async def _preload_links(self, session: AsyncSession) -> None:
+        if self.sender.id is None or self.project.id is None:
+            return
+        rows = await session.execute(
+            select(AgentLink, Project, Agent)
+            .join(Project, Project.id == AgentLink.b_project_id)
+            .join(Agent, cast(Any, Agent.id == AgentLink.b_agent_id))
+            .where(
+                cast(Any, AgentLink.a_project_id) == self.project.id,
+                cast(Any, AgentLink.a_agent_id) == self.sender.id,
+                cast(Any, AgentLink.b_project_id) != self.project.id,
+                _active_approved_agent_link_clause(),
+            )
+        )
+        for _link, project, agent in rows.all():
+            for key in _message_recipient_keys(agent.name):
+                self.link_lookup.setdefault(key, (project, agent))
+
+    def _unknown(self, value: str, kind: str, label: str | None) -> None:
+        if label is None:
+            self.unknown_local[value].add(kind)
+        else:
+            self.unknown_external[label][value].add(kind)
+
+    async def _parse_address(self, candidate: str) -> tuple[str, Project | None, str | None]:
+        if candidate.startswith(_PROJECT_ADDRESS_PREFIX) and "#" in candidate:
+            _, rest = candidate.split(":", 1)
+            project_part, agent_part = rest.split("#", 1)
+            label = project_part.strip()
+        elif "@" in candidate:
+            agent_part, project_part = candidate.split("@", 1)
+            if not agent_part.strip() or not project_part.strip():
+                return candidate, None, None
+            label = project_part.strip()
+        else:
+            return candidate, None, None
+        try:
+            project = await _get_project_by_identifier(label)
+        except Exception:
+            if self.prefer_cross_project:
+                logger.debug("Failed to resolve external address %r", candidate, exc_info=True)
+            return candidate, None, label or _INVALID_PROJECT_LABEL
+        return agent_part, project, project.human_key or project.slug
+
+    async def _external_agent(self, project: Project, agent: Agent, kind: str) -> None:
+        policy = (getattr(agent, "contact_policy", "auto") or "auto").lower()
+        if policy == "block_all":
+            await self.ctx.error(_CONTACT_BLOCKED_LOG_MESSAGE)
+            raise _MessageContactBlocked()
+        self._external_name(project, agent.name, kind)
+
+    def _external_name(self, project: Project, name: str, kind: str) -> None:
+        bucket = self.external.setdefault(
+            project.id or 0, {"project": project, "to": [], "cc": [], "bcc": []},
+        )
+        bucket[kind].append(name)
+
+    async def _implicit_route(self, keys: set[str], kind: str) -> bool:
+        if self.sender_keys.intersection(keys):
+            self.local[kind].append(self.sender.name)
+            return True
+        # send_message preloads approved cross-project links to prefer explicit
+        # contact intent over stale local shadows. Replies retain local priority.
+        cross_link = next((self.link_lookup[key] for key in keys if key in self.link_lookup), None)
+        if cross_link is not None:
+            await self._external_agent(*cross_link, kind)
+            return True
+        local = next((self.local_lookup[key] for key in keys if key in self.local_lookup), None)
+        if local:
+            self.local[kind].append(local)
+            return True
+        return False
+
+    async def approved_link(
+        self, session: AsyncSession, name: str, target_project: Project | None,
+    ) -> Any:
+        criteria = [
+            cast(Any, AgentLink.a_project_id) == self.project.id,
+            cast(Any, AgentLink.a_agent_id) == self.sender.id,
+            _active_approved_agent_link_clause(),
+            cast(Any, func.lower(Agent.name) == name),
+        ]
+        if target_project is not None:
+            criteria.append(cast(Any, Project.id == target_project.id))
+        rows = await session.execute(
+            select(AgentLink, Project, Agent)
+            .join(Project, Project.id == AgentLink.b_project_id)
+            .join(Agent, cast(Any, Agent.id == AgentLink.b_agent_id))
+            .where(*criteria).limit(1)
+        )
+        return rows.first()
+
+    async def route(self, session: AsyncSession, names: list[str], kind: str) -> None:
+        for raw in names:
+            await self._route_one(session, raw or "", kind)
+
+    async def _route_one(self, session: AsyncSession, candidate: str, kind: str) -> None:
+        fragment, target_project, label = await self._parse_address(candidate)
+        if label is not None and target_project is None:
+            self._unknown(candidate.strip() or candidate, kind, label)
+            return
+        canonical = (fragment or "").strip()
+        keys = _message_recipient_keys(fragment)
+        if not keys or not canonical:
+            self._unknown(candidate.strip() or candidate, kind, label)
+            return
+        if label is None and await self._implicit_route(keys, kind):
+            return
+        record = await self.approved_link(session, canonical.lower(), target_project)
+        if record:
+            _link, project, agent = record
+            await self._external_agent(project, agent, kind)
+            return
+        if self._thread_route(target_project, canonical.lower(), kind):
+            return
+        self._unknown(canonical or fragment or candidate.strip() or candidate, kind, label)
+
+    def _thread_route(self, target: Project | None, name: str, kind: str) -> bool:
+        if target is None:
+            return False
+        participant = self.thread_participants.get((target.id or 0, name))
+        if participant is None:
+            return False
+        self._external_name(*participant, kind)
+        return True
+
+
+async def _message_thread_contacts(project: Project, sender: Agent, thread: str, *, reply: bool) -> set[str]:
+    try:
+        return await _query_message_thread_contacts(project, sender, thread)
+    except Exception:
+        action = "reply contact" if reply else "contact"
+        logger.exception("Failed to fetch thread participants for %s auto-allow (thread_id=%s)", action, thread)
+        return set()
+
+
+async def _query_message_thread_contacts(project: Project, sender: Agent, thread: str) -> set[str]:
+    sender_alias = aliased(Agent)
+    criteria: list[Any] = [cast(Any, Message.thread_id) == thread]
+    with suppress(ValueError, TypeError):
+        criteria.append(cast(Any, Message.id) == int(thread))
+    async with get_session() as session:
+        rows = await session.execute(
+            select(Message, sender_alias.name, sender_alias.project_id)
+            .join(sender_alias, cast(Any, Message.sender_id == sender_alias.id))
+            .where(
+                cast(Any, Message.project_id) == project.id, or_(*criteria),
+                _message_visible_to_agent_clause(sender.id or 0),
+            ).limit(500)
+        )
+        thread_rows = [(row[0], row[1], row[2]) for row in rows.all()]
+        participants = {name for _m, name, pid in thread_rows if name and pid == project.id}
+        message_ids = [m.id for m, _name, _pid in thread_rows if m.id is not None]
+        if message_ids:
+            recipients = await session.execute(
+                select(Agent.name)
+                .join(MessageRecipient, cast(Any, MessageRecipient.agent_id) == Agent.id)
+                .where(cast(Any, MessageRecipient.message_id).in_(message_ids))
+            )
+            participants.update(row[0] for row in recipients.all() if row[0])
+    return participants
+
+
+async def _message_recent_contacts(
+    session: AsyncSession, project: Project, sender: Agent, names: list[str], since: datetime,
+) -> set[str]:
+    if not names:
+        return set()
+    try:
+        sent = await session.execute(
+            select(Agent.name)
+            .join(MessageRecipient, cast(Any, MessageRecipient.agent_id) == Agent.id)
+            .join(Message, cast(Any, MessageRecipient.message_id) == Message.id)
+            .where(
+                cast(Any, Message.project_id) == project.id,
+                cast(Any, Message.sender_id) == sender.id,
+                cast(Any, Message.created_ts) > _naive_utc(since),
+                cast(Any, Agent.name).in_(names),
+            )
+        )
+        sender_alias = aliased(Agent)
+        received = await session.execute(
+            select(sender_alias.name)
+            .join(Message, cast(Any, Message.sender_id) == sender_alias.id)
+            .join(MessageRecipient, cast(Any, MessageRecipient.message_id) == Message.id)
+            .where(
+                cast(Any, Message.project_id) == project.id,
+                cast(Any, MessageRecipient.agent_id) == sender.id,
+                cast(Any, Message.created_ts) > _naive_utc(since),
+                cast(Any, sender_alias.name).in_(names),
+            )
+        )
+        return {row[0] for row in sent.all() if row[0]} | {row[0] for row in received.all() if row[0]}
+    except Exception:
+        logger.exception("Failed to batch fetch recent contacts for auto-allow heuristics")
+        return set()
+
+
+async def _message_approved_contact_ids(
+    session: AsyncSession, project: Project, sender: Agent, recipients: Mapping[str, Agent | None], now: datetime,
+) -> set[int]:
+    try:
+        ids = [rec.id for rec in recipients.values() if rec is not None and rec.id is not None]
+        if not ids:
+            return set()
+        rows = await session.execute(
+            select(AgentLink.b_agent_id).where(
+                cast(Any, AgentLink.a_project_id) == project.id,
+                cast(Any, AgentLink.a_agent_id) == sender.id,
+                cast(Any, AgentLink.b_project_id) == project.id,
+                _active_approved_agent_link_clause(now),
+                cast(Any, AgentLink.b_agent_id).in_(ids),
+            )
+        )
+        return {row[0] for row in rows.all() if row and row[0] is not None}
+    except Exception:
+        logger.exception("Failed to batch fetch approved agent links")
+        return set()
+
+
+def _message_check_retired(recipient: Agent, name: str) -> None:
+    if getattr(recipient, "retired_at", None) is not None:
+        raise ToolExecutionError(
+            "AGENT_RETIRED",
+            f"Agent '{name}' is retired and no longer accepts new messages. "
+            "Use unretire_agent to restore it first.",
+            recoverable=True,
+            data={"agent_name": name, "retired_at": _iso(recipient.retired_at)},
+        )
+
+
+async def _reply_default_recipients(
+    project: Project, sender: Agent, original: Message, original_sender: Agent,
+    original_sender_project: Project, to: list[str] | None,
+) -> list[str]:
+    if to is not None:
+        return to
+    if original.sender_id != sender.id:
+        if original_sender.project_id == project.id:
+            return [original_sender.name]
+        return [_format_cross_project_agent_address(original_sender_project.slug, original_sender.name)]
+    async with get_session() as session:
+        result = await session.execute(
+            select(Agent.name, Agent.project_id, MessageRecipient.kind)
+            .join(Agent, MessageRecipient.agent_id == Agent.id)
+            .where(
+                cast(Any, MessageRecipient.message_id) == original.id,
+                cast(Any, MessageRecipient.kind) == "to",
+            )
+        )
+        rows = result.all()
+    targets: list[str] = []
+    for name, pid, _kind in rows:
+        if pid == project.id:
+            targets.append(name)
+        else:
+            target_project = await _get_project_by_id(pid)
+            targets.append(_format_cross_project_agent_address(target_project.slug, name))
+    return targets if rows else [original_sender.name]
+
+
+def _message_unknown_details(router: _MessageRecipientRouter) -> tuple[list[str], dict[str, Any]]:
+    parts: list[str] = []
+    data: dict[str, Any] = {}
+    if router.unknown_local:
+        missing = sorted(name for name in router.unknown_local if name)
+        parts.append(f"local recipients {', '.join(missing)} are not registered in project '{router.project.human_key}'")
+        data["unknown_local"] = missing
+    if router.unknown_external:
+        formatted = {label: sorted(name for name in names if name) for label, names in router.unknown_external.items()}
+        external_parts = [f"{', '.join(names)} @ {label}" for label, names in sorted(formatted.items()) if names]
+        if external_parts:
+            parts.append("external recipients missing approved contact links: " + "; ".join(external_parts))
+        data["unknown_external"] = formatted
+    return parts, data
+
+
+def _reply_check_unknown(router: _MessageRecipientRouter) -> None:
+    if not router.unknown_local and not router.unknown_external:
+        return
+    parts, data = _message_unknown_details(router)
+    hint = f"Use resource://agents/{router.project.slug} to list registered agents, or request_contact(...) to create a cross-project link first."
+    parts.append(hint)
+    data["hint"] = hint
+    raise ToolExecutionError("RECIPIENT_NOT_FOUND", "Unable to send reply — " + "; ".join(parts), recoverable=True, data=data)
+
+
+def _reply_contact_blocked(
+    recipient: Agent, name: str, recent: set[str], approved: set[int],
+) -> bool:
+    _message_check_retired(recipient, name)
+    policy = getattr(recipient, "contact_policy", "auto").lower()
+    if policy == "open":
+        return False
+    if policy == "block_all":
+        raise ToolExecutionError("CONTACT_BLOCKED", _CONTACT_BLOCKED_MESSAGE, recoverable=True)
+    if policy == "auto" and recipient.name in recent:
+        return False
+    return recipient.id is None or recipient.id not in approved
+
+
+def _reply_require_contacts(project: Project, sender: Agent, blocked: list[str]) -> None:
+    if not blocked:
+        return
+    names = sorted(set(blocked))
+    message = (
+        f"Contact approval required for recipients: {', '.join(names)}. "
+        f"Before retrying, create a pending request with "
+        f"`request_contact(project_key={project.human_key!r}, from_agent={sender.name!r}, to_agent={names[0]!r})`, "
+        f"then have the recipient approve it with "
+        f"`respond_contact(project_key={project.human_key!r}, to_agent={names[0]!r}, from_agent={sender.name!r}, accept=True)`."
+    )
+    raise ToolExecutionError("CONTACT_REQUIRED", message, recoverable=True, data={"recipients_blocked": names})
+
+
+async def _reply_enforce_contacts(router: _MessageRecipientRouter, thread: str, settings: Settings) -> None:
+    if not settings.contact_enforcement_enabled:
+        return
+    project, sender = router.project, router.sender
+    auto_ok = await _message_thread_contacts(project, sender, thread, reply=True)
+    all_names = router.local["to"] + router.local["cc"] + router.local["bcc"]
+    names = list(dict.fromkeys(all_names))
+    recipients = await _get_agents_batch_lenient(project, names)
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(seconds=int(settings.contact_auto_ttl_seconds))
+    blocked: list[str] = []
+    async with get_session() as session:
+        recent = await _message_recent_contacts(session, project, sender, names, since)
+        approved = await _message_approved_contact_ids(session, project, sender, recipients, now)
+        for name in all_names:
+            if name in auto_ok:
+                continue
+            recipient = recipients.get(name)
+            if recipient is None or recipient.name == sender.name:
+                continue
+            if _reply_contact_blocked(recipient, name, recent, approved):
+                blocked.append(recipient.name)
+    _reply_require_contacts(project, sender, blocked)
+
+
+@dataclass
+class _MessageDeliveryDispatch:
+    router: _MessageRecipientRouter
+    action: str
+    subject: str
+    body: str
+    deliver: Callable[..., Awaitable[dict[str, Any]]]
+    collect: Callable[..., None]
+    failure: Callable[..., dict[str, Any]]
+
+    async def run(
+        self, local_options: _MessageDeliveryOptions, external_options: _MessageDeliveryOptions,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        deliveries: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        if any(self.router.local.values()):
+            payload = await self._deliver(self.router.project, self.router.local, local_options)
+            self.collect(deliveries, errors, self.router.project, payload)
+        for group in self.router.external.values():
+            project = group["project"]
+            try:
+                payload = await self._deliver(project, group, external_options)
+                self.collect(deliveries, errors, project, payload)
+            except Exception as exc:
+                logger.exception("Failed to deliver %s to external project %r", self.action, project.human_key)
+                errors.append(self.failure(project, exc))
+        return deliveries, errors
+
+    async def _deliver(
+        self, project: Project, group: dict[str, Any], options: _MessageDeliveryOptions,
+    ) -> dict[str, Any]:
+        return await self.deliver(
+            self.router.ctx, self.action, project, self.router.sender,
+            group.get("to", []), group.get("cc", []), group.get("bcc", []),
+            self.subject, self.body, options,
+        )
+
+
+@dataclass
+class _SendExternalContacts:
+    router: _MessageRecipientRouter
+    settings: Settings
+    auto_contact: bool | None
+    is_bound: Callable[[Context, Project, Agent], bool]
+    handshake: Callable[..., Awaitable[dict[str, Any]]]
+    request: Callable[..., Awaitable[dict[str, Any]]]
+
+    async def resolve(self, session: AsyncSession) -> None:
+        if not self.router.unknown_local and not self.router.unknown_external:
+            return
+        approved: list[tuple[str, str]] = []
+        attempted: list[str] = []
+        requested: list[str] = []
+        try:
+            effective = (
+                bool(getattr(self.settings, "messaging_auto_handshake_on_block", True))
+                if self.auto_contact is None else self.auto_contact
+            )
+            if effective and self.router.unknown_external:
+                # Collect every approved route before reconciling unknowns; this
+                # preserves recipient kinds and the original retry boundary.
+                await self._handshakes(approved, attempted, requested)
+                if approved:
+                    await self._reroute(session, approved)
+                    await self._purge_resolved()
+        except Exception:
+            logger.exception("Failed to auto-resolve contact for unknown external recipients")
+        await self._require_known(attempted, requested)
+
+    async def _handshakes(
+        self, approved: list[tuple[str, str]], attempted: list[str], requested: list[str],
+    ) -> None:
+        for label, pending in self.router.unknown_external.items():
+            try:
+                project = await _get_project_by_identifier(label)
+            except Exception:
+                logger.debug("Failed to resolve external project %r for handshake", label, exc_info=True)
+                continue
+            for name, kinds in pending.items():
+                try:
+                    display = f"{name}@{project.human_key or project.slug or label}"
+                    if await self._contact(project, name):
+                        attempted.append(display)
+                        approved.extend((display, kind) for kind in sorted(kinds))
+                    else:
+                        requested.append(display)
+                except Exception:
+                    logger.exception("Failed to auto-resolve contact for external recipient %r@%r", name, label)
+
+    async def _contact(self, project: Project, name: str) -> bool:
+        agent = await _find_agent_optional(project, name)
+        if agent is not None and self.is_bound(self.router.ctx, project, agent):
+            await self.handshake(
+                ctx=self.router.ctx, project_key=self.router.project.human_key,
+                requester=self.router.sender.name, target=name,
+                to_project=project.human_key or project.slug,
+                reason="in-session auto-approval by send_message", auto_accept=True,
+                ttl_seconds=int(self.settings.contact_auto_ttl_seconds), format="json",
+            )
+            return True
+        await self.request(
+            ctx=self.router.ctx, project_key=self.router.project.human_key,
+            from_agent=self.router.sender.name, to_agent=name,
+            to_project=project.human_key or project.slug,
+            reason="auto contact request created by send_message",
+            ttl_seconds=int(self.settings.contact_pending_ttl_seconds), format="json",
+        )
+        return False
+
+    async def _reroute(self, session: AsyncSession, approved: list[tuple[str, str]]) -> None:
+        try:
+            for item, kind in approved:
+                await self.router.route(session, [item], kind)
+        except _MessageContactBlocked:
+            pass  # Preserve the original best-effort reroute boundary.
+
+    async def _purge_resolved(self) -> None:
+        try:
+            async with get_session() as session:
+                for label, pending in self.router.unknown_external.copy().items():
+                    await self._purge_project(session, label, pending)
+        except Exception:
+            logger.exception("Failed to purge resolved unknown_external entries after in-session approvals")
+
+    async def _purge_project(self, session: AsyncSession, label: str, pending: dict[str, set[str]]) -> None:
+        try:
+            project = await _get_project_by_identifier(label)
+        except Exception:
+            logger.debug("Failed to verify approved links for project %r", label, exc_info=True)
+            return
+        remaining: dict[str, set[str]] = {}
+        for name, kinds in pending.items():
+            if await self.router.approved_link(session, (name or "").strip().lower(), project) is None:
+                remaining[name] = kinds
+        if remaining:
+            self.router.unknown_external[label] = remaining
+        else:
+            self.router.unknown_external.pop(label, None)
+
+    def _unknown_hint(self) -> tuple[str, list[str]]:
+        parts = [f"Use resource://agents/{self.router.project.slug} to list registered agents."]
+        actions: list[str] = []
+        if self.router.unknown_local:
+            parts.append(
+                "A missing local recipient must self-register, or an "
+                "operator must explicitly provision its durable mailbox, before delivery."
+            )
+            actions.append("target_self_register_or_operator_provision")
+        if self.router.unknown_external:
+            parts.append(
+                "Verify each external target is already registered in its "
+                "own project, then request contact; request_contact never provisions the target mailbox."
+            )
+            actions.append("verify_target_registration_then_request_contact")
+        return " ".join(parts), actions
+
+    async def _require_known(self, attempted: list[str], requested: list[str]) -> None:
+        if not self.router.unknown_local and not any(self.router.unknown_external.values()):
+            return
+        parts, data = _message_unknown_details(self.router)
+        if attempted:
+            data["auto_contact_attempted_external"] = attempted
+        if requested:
+            data["auto_contact_requested_external"] = requested
+            parts.append("pending external contact requests were created for " + ", ".join(sorted(set(requested))))
+        hint, actions = self._unknown_hint()
+        parts.append(hint)
+        data["hint"] = hint
+        data["required_actions"] = actions
+        message = "Unable to send message — " + "; ".join(parts)
+        await self.router.ctx.error(f"RECIPIENT_NOT_FOUND: {message}")
+        raise ToolExecutionError("RECIPIENT_NOT_FOUND", message, recoverable=True, data=data)
+
+
+def _send_check_attachments(paths: list[str] | None, convert_images: bool | None) -> None:
+    if paths is not None or convert_images is not None:
+        raise ToolExecutionError(
+            "ATTACHMENTS_NOT_SUPPORTED",
+            "attachment_paths and convert_images are disabled until attachments "
+            "have a bounded canonical inline representation.",
+            recoverable=True,
+            data={"attachment_paths_provided": paths is not None, "convert_images_provided": convert_images is not None},
+        )
+
+
+def _send_topic(topic: str | None) -> str | None:
+    if topic is None:
+        return None
+    import re as _re
+    topic = topic.strip()
+    # Dots support hierarchical issue IDs. The leading alphanumeric rejects
+    # traversal-shaped values; topics remain DB metadata, never path components.
+    if not topic or len(topic) > 64 or not _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", topic):
+        raise ToolExecutionError(
+            "INVALID_TOPIC",
+            "Topic must be 1-64 characters, start with a letter or digit, and "
+            f"contain only alphanumerics, '.', '_', or '-'. Got: {topic!r}",
+            recoverable=True, data={"argument": "topic", "provided": topic},
+        )
+    return topic
+
+
+def _send_validate_recipient(recipient: str) -> None:
+    if not isinstance(recipient, str):
+        raise ToolExecutionError(
+            "INVALID_ARGUMENT",
+            f"Each recipient in 'to' must be a string (agent name). Got: {type(recipient).__name__}",
+            recoverable=True, data={"argument": "to", "invalid_item": repr(recipient)},
+        )
+    mistake = _detect_agent_name_mistake(_recipient_agent_fragment(recipient))
+    if mistake:
+        raise ToolExecutionError(
+            mistake[0], f"Invalid recipient '{recipient}': {mistake[1]}", recoverable=True,
+            data={
+                "recipient": recipient,
+                "hint": "Use a durable client-os-host-slot Agent name, not a program or model name.",
+            },
+        )
+
+
+async def _send_validate_copies(ctx: Context, names: list[str] | None, kind: str, *, items: bool) -> None:
+    if names is None:
+        return
+    if not items and not isinstance(names, list):
+        message = f"{kind} must be a list of strings or a single string."
+    elif items and any(not isinstance(name, str) for name in names):
+        message = f"{kind} items must be strings (agent names)."
+    else:
+        return
+    await ctx.error(f"INVALID_ARGUMENT: {message}")
+    raise ToolExecutionError("INVALID_ARGUMENT", message, recoverable=True, data={"argument": kind})
+
+
+@dataclass
+class _SendMessageInputs:
+    ctx: Context
+    project: Project
+    sender_name: str
+    to: list[str]
+    cc: list[str] | None
+    bcc: list[str] | None
+    broadcast: bool
+    subject: str
+
+    async def prepare(self, project_key: str) -> None:
+        if self.broadcast:
+            await self._broadcast()
+        self._normalize_to()
+        self.cc = [self.cc] if isinstance(self.cc, str) else self.cc
+        self.bcc = [self.bcc] if isinstance(self.bcc, str) else self.bcc
+        # Preserve validation precedence: both container checks precede item checks.
+        for items in (False, True):
+            await _send_validate_copies(self.ctx, self.cc, "cc", items=items)
+            await _send_validate_copies(self.ctx, self.bcc, "bcc", items=items)
+        all_recipients = (self.to or []) + (self.cc or []) + (self.bcc or [])
+        self._require_recipients(all_recipients)
+        await self._warn_self(all_recipients, project_key)
+        if len(self.subject) > 200:
+            await self.ctx.info(
+                f"[warn] Subject is {len(self.subject)} characters (max recommended: 80, truncated at 200). "
+                "Long subjects may be truncated in search results. Consider moving details to the message body."
+            )
+            self.subject = self.subject[:200]
+
+    async def _broadcast(self) -> None:
+        if self.to and any(t.strip() for t in self.to):
+            raise ToolExecutionError(
+                "INVALID_ARGUMENT",
+                "broadcast=true and explicit 'to' recipients are mutually exclusive. "
+                "Set broadcast=true with an empty 'to' list, or provide explicit recipients without broadcast.",
+                recoverable=True, data={"argument": "broadcast"},
+            )
+        await ensure_schema()
+        async with get_session() as session:
+            cutoff = _naive_utc() - timedelta(days=30)
+            result = await session.execute(
+                select(Agent.name, Agent.contact_policy, Agent.retired_at).where(
+                    cast(Any, Agent.project_id == self.project.id),
+                    cast(Any, Agent.provisioning_state == "active"),
+                    cast(Any, Agent.last_active_ts > cutoff),
+                )
+            )
+            rows = result.all()
+        sender_lower = self.sender_name.lower().strip()
+        self.to = [
+            row[0] for row in rows
+            if row[0].lower() != sender_lower
+            and (row[1] or "auto").lower() != "block_all" and row[2] is None
+        ]
+        if not self.to:
+            await self.ctx.info("[warn] Broadcast: no eligible recipients found (sender is the only active agent).")
+
+    def _normalize_to(self) -> None:
+        if isinstance(self.to, str):
+            self.to = [self.to]
+        if not isinstance(self.to, list):
+            raise ToolExecutionError(
+                "INVALID_ARGUMENT",
+                "'to' must be a list of durable Agent names (for example, "
+                "['claude-linux-ci-1']) or a single Agent name string. "
+                f"Received: {type(self.to).__name__}",
+                recoverable=True, data={"argument": "to", "received_type": type(self.to).__name__},
+            )
+        for recipient in self.to:
+            _send_validate_recipient(recipient)
+
+    def _require_recipients(self, names: list[str]) -> None:
+        if not self.broadcast and not any((name or "").strip() for name in names):
+            raise ToolExecutionError(
+                "INVALID_ARGUMENT",
+                "send_message requires at least one recipient in to/cc/bcc (or broadcast=true).",
+                recoverable=True, data={"argument": "to"},
+            )
+
+    async def _warn_self(self, names: list[str], project_key: str) -> None:
+        sender_lower = self.sender_name.lower().strip()
+        if any(name.lower().strip() == sender_lower for name in names):
+            await self.ctx.info(
+                f"[note] You ({self.sender_name}) are sending a message to yourself. "
+                "This is allowed but usually not intended. To communicate with other agents, "
+                "use their durable Agent names (for example, 'claude-linux-ci-1'). To discover agents, "
+                f"use resource://agents/{project_key}."
+            )
+
+    def log(self) -> None:
+        if not get_settings().tools_log_enabled:
+            return
+        try:
+            from rich.console import Console
+            from rich.panel import Panel
+            from rich.text import Text
+            title = f"tool: send_message — to={len(self.to)} cc={len(self.cc or [])} bcc={len(self.bcc or [])}"
+            body = Text.assemble(
+                ("project: ", "cyan"), (self.project.human_key, "white"), "\n",
+                ("sender: ", "cyan"), (self.sender_name, "white"), "\n",
+                ("subject: ", "cyan"), (self.subject[:120], "white"),
+            )
+            Console().print(Panel(body, title=title, border_style="green"))
+        except Exception:
+            logger.debug("Failed to log send_message call with rich console", exc_info=True)
+
+
+class _SendContactPolicy:
+    def __init__(
+        self, ctx: Context, project: Project, sender: Agent, names: list[str],
+        settings: Settings, runtime: _MCPServerRuntime,
+    ) -> None:
+        self.ctx = ctx
+        self.project = project
+        self.sender = sender
+        self.names = names
+        self.settings = settings
+        self.runtime = runtime
+        self.unique_names = list(set(names))
+        self.recipients: Mapping[str, Agent | None] = {}
+        self.auto_ok: set[str] = set()
+        self.recent: set[str] = set()
+        self.approved: set[int] = set()
+        self.cross_project: set[str] = set()
+        self.blocked: list[str] = []
+        self.auto_requested: list[str] = []
+        self.auto_approved: list[str] = []
+
+    async def enforce(
+        self, thread: str | None, auto_contact: bool | None,
+        handshake: Callable[..., Awaitable[dict[str, Any]]],
+        request: Callable[..., Awaitable[dict[str, Any]]],
+    ) -> None:
+        if thread:
+            self.auto_ok = await _message_thread_contacts(self.project, self.sender, thread, reply=False)
+        now = datetime.now(timezone.utc)
+        await self._overlapping_reservations(now)
+        await self._find_blocked(now)
+        if not self.blocked:
+            return
+        effective_auto = (
+            bool(getattr(self.settings, "messaging_auto_handshake_on_block", True))
+            if auto_contact is None else auto_contact
+        )
+        if effective_auto:
+            await self._resolve_blocked(handshake, request)
+        if self.blocked:
+            await self._raise_required()
+
+    async def _overlapping_reservations(self, now: datetime) -> None:
+        try:
+            async with get_session() as session:
+                rows = await session.execute(
+                    select(FileReservation, Agent.name)
+                    .join(Agent, cast(Any, FileReservation.agent_id) == Agent.id)
+                    .where(
+                        FileReservation.project_id == self.project.id,
+                        cast(Any, FileReservation.released_ts).is_(None),
+                        cast(Any, FileReservation.expires_ts) > _naive_utc(now),
+                    )
+                )
+                patterns: dict[str, list[str]] = {}
+                for reservation, name in rows.all():
+                    patterns.setdefault(name, []).append(reservation.path_pattern)
+            self._allow_overlapping_names(patterns)
+        except Exception:
+            logger.exception("Failed to check file reservation overlap for contact auto-allow")
+
+    def _allow_overlapping_names(self, patterns: dict[str, list[str]]) -> None:
+        ours = patterns.get(self.sender.name, [])
+        for name in self.names:
+            if name == self.sender.name:
+                continue
+            theirs = patterns.get(name, [])
+            if ours and theirs and _file_reservations_patterns_overlap(ours, theirs):
+                self.auto_ok.add(name)
+
+    async def _find_blocked(self, now: datetime) -> None:
+        self.recipients = await _get_agents_batch_lenient(self.project, self.unique_names)
+        async with get_session() as session:
+            since = now - timedelta(seconds=int(self.settings.contact_auto_ttl_seconds))
+            self.recent = await _message_recent_contacts(
+                session, self.project, self.sender, self.unique_names, since,
+            )
+            self.approved = await _message_approved_contact_ids(
+                session, self.project, self.sender, self.recipients, now,
+            )
+            self.cross_project = await self._cross_project_names(session, now)
+            for name in self.names:
+                if await self._requires_contact(name):
+                    recipient = self.recipients[name]
+                    assert recipient is not None
+                    self.blocked.append(recipient.name)
+
+    async def _cross_project_names(self, session: AsyncSession, now: datetime) -> set[str]:
+        names: set[str] = set()
+        try:
+            rows = await session.execute(
+                select(Agent.name)
+                .join(AgentLink, cast(Any, AgentLink.b_agent_id) == Agent.id)
+                .where(
+                    cast(Any, AgentLink.a_project_id) == self.project.id,
+                    cast(Any, AgentLink.a_agent_id) == self.sender.id,
+                    cast(Any, AgentLink.b_project_id) != self.project.id,
+                    _active_approved_agent_link_clause(now),
+                )
+            )
+            for (name,) in rows.all():
+                normalized = (name or "").strip()
+                if normalized:
+                    names.add(normalized.lower())
+                    names.add((sanitize_agent_name(normalized) or normalized).lower())
+        except Exception:
+            logger.exception("Failed to batch fetch cross-project agent links for policy bypass")
+            return set()
+        return names
+
+    async def _requires_contact(self, name: str) -> bool:
+        if name in self.auto_ok:
+            return False
+        keys = {(name or "").strip().lower()}
+        sanitized = sanitize_agent_name(name or "") or ""
+        if sanitized:
+            keys.add(sanitized.lower())
+        if keys & self.cross_project:
+            return False
+        recipient = self.recipients.get(name)
+        if recipient is None:
+            return False
+        _message_check_retired(recipient, name)
+        policy = getattr(recipient, "contact_policy", "auto").lower()
+        if recipient.name == self.sender.name or policy == "open":
+            return False
+        if policy == "block_all":
+            await self.ctx.error(_CONTACT_BLOCKED_LOG_MESSAGE)
+            raise ToolExecutionError("CONTACT_BLOCKED", _CONTACT_BLOCKED_MESSAGE, recoverable=True)
+        if policy == "auto" and recipient.name in self.recent:
+            return False
+        return recipient.id is None or recipient.id not in self.approved
+
+    async def _resolve_blocked(
+        self, handshake: Callable[..., Awaitable[dict[str, Any]]],
+        request: Callable[..., Awaitable[dict[str, Any]]],
+    ) -> None:
+        try:
+            for name in dict.fromkeys(self.blocked):
+                recipient = self.recipients.get(name)
+                if recipient is not None:
+                    await self._resolve_one(name, recipient, handshake, request)
+            if self.settings.contact_auto_retry_enabled and self.auto_approved:
+                await self._reevaluate()
+        except Exception:
+            logger.exception("Failed to auto-resolve contacts or re-evaluate recipients after in-session approvals")
+
+    async def _resolve_one(
+        self, name: str, recipient: Agent,
+        handshake: Callable[..., Awaitable[dict[str, Any]]],
+        request: Callable[..., Awaitable[dict[str, Any]]],
+    ) -> None:
+        try:
+            if self.runtime._session_is_bound_to_agent(self.ctx, self.project, recipient):
+                await handshake(
+                    ctx=self.ctx, project_key=self.project.human_key,
+                    requester=self.sender.name, target=name,
+                    reason="in-session auto-approval by send_message", auto_accept=True,
+                    ttl_seconds=int(self.settings.contact_auto_ttl_seconds), format="json",
+                )
+                self.auto_approved.append(name)
+            else:
+                await request(
+                    ctx=self.ctx, project_key=self.project.human_key,
+                    from_agent=self.sender.name, to_agent=name,
+                    reason="auto contact request created by send_message",
+                    ttl_seconds=int(self.settings.contact_pending_ttl_seconds), format="json",
+                )
+                self.auto_requested.append(name)
+        except Exception:
+            logger.exception("Failed to auto-resolve contact for recipient %r", name)
+
+    async def _reevaluate(self) -> None:
+        self.blocked = []
+        recipients = await _get_agents_batch_lenient(self.project, self.unique_names)
+        async with get_session() as session:
+            for name in self.names:
+                recipient = recipients.get(name)
+                if recipient is None or recipient.name == self.sender.name:
+                    continue
+                if getattr(recipient, "contact_policy", "auto").lower() == "open":
+                    continue
+                if not await self._has_approval(session, recipient):
+                    self.blocked.append(recipient.name)
+
+    async def _has_approval(self, session: AsyncSession, recipient: Agent) -> bool:
+        result = await session.execute(
+            select(AgentLink).where(
+                cast(Any, AgentLink.a_project_id) == self.project.id,
+                cast(Any, AgentLink.a_agent_id) == self.sender.id,
+                cast(Any, AgentLink.b_project_id) == self.project.id,
+                cast(Any, AgentLink.b_agent_id) == recipient.id,
+                _active_approved_agent_link_clause(),
+            ).limit(1)
+        )
+        return result.first() is not None
+
+    def _required_message(self) -> str:
+        blocked = sorted(set(self.blocked))
+        project = repr(self.project.human_key)
+        sender = repr(self.sender.name)
+        target = repr(blocked[0])
+        parts = [
+            f"Contact approval required for recipients: {', '.join(blocked)}.",
+            (
+                "Before retrying, create a pending request with "
+                f"`request_contact(project_key={project}, from_agent={sender}, "
+                f"to_agent={target})`, then have the recipient approve it with "
+                f"`respond_contact(project_key={project}, to_agent={target}, "
+                f"from_agent={sender}, accept=True)`."
+            ),
+            "Alternatively, send your message inside a recent thread that already includes them by reusing its thread_id.",
+        ]
+        if self.auto_requested:
+            parts.append(
+                "Pending contact requests were created for: "
+                + ", ".join(sorted(set(self.auto_requested)))
+                + ". Wait for approval before retrying."
+            )
+        if self.auto_approved:
+            parts.append(
+                "In-session auto-approvals already ran for: "
+                + ", ".join(sorted(set(self.auto_approved)))
+                + ". Any remaining blocked recipients still need explicit approval."
+            )
+        return " ".join(parts)
+
+    def _suggestions(self, data: dict[str, Any]) -> None:
+        try:
+            data["suggested_tool_calls"] = [
+                {
+                    "tool": "request_contact",
+                    "arguments": {
+                        "project_key": self.project.human_key,
+                        "from_agent": self.sender.name,
+                        "to_agent": name,
+                        "ttl_seconds": int(self.settings.contact_pending_ttl_seconds),
+                    },
+                }
+                for name in self.blocked[:3]
+            ]
+        except Exception:
+            logger.exception("Failed to build suggestion examples for blocked recipients")
+
+    async def _raise_required(self) -> None:
+        message = self._required_message()
+        data: dict[str, Any] = {
+            "recipients_blocked": sorted(set(self.blocked)),
+            "remedies": [
+                "Call request_contact(project_key, from_agent, to_agent, registration_token=...) to create a pending approval request",
+                "Have the recipient approve it with respond_contact(project_key, to_agent, from_agent, accept=True, registration_token=...)",
+                "Use macro_contact_handshake(..., auto_accept=True, requester_registration_token=..., target_registration_token=...) only when both agents can authenticate in the same MCP session",
+            ],
+            "auto_contact_requested": sorted(set(self.auto_requested)),
+            "auto_contact_auto_approved": sorted(set(self.auto_approved)),
+        }
+        self._suggestions(data)
+        error_type = "CONTACT_REQUIRED"
+        await self.ctx.error(f"{error_type}: {message}")
+        raise ToolExecutionError(error_type, message, recoverable=True, data=data)
+
+
+@dataclass
+class _ContactLinkUpdate:
+    project: Project
+    sender: Agent
+    target_project: Project
+    target: Agent
+    reason: str
+    now: datetime
+    expires: datetime
+
+    async def _existing(self, session: AsyncSession) -> AgentLink | None:
+        result = await session.execute(
+            select(AgentLink).where(
+                cast(Any, AgentLink.a_project_id) == self.project.id,
+                cast(Any, AgentLink.a_agent_id) == self.sender.id,
+                cast(Any, AgentLink.b_project_id) == self.target_project.id,
+                cast(Any, AgentLink.b_agent_id) == self.target.id,
+            )
+        )
+        return result.scalars().first()
+
+    def _new_link(self, approved: bool) -> AgentLink:
+        return AgentLink(
+            a_project_id=self.project.id or 0,
+            a_agent_id=self.sender.id or 0,
+            b_project_id=self.target_project.id or 0,
+            b_agent_id=self.target.id or 0,
+            status="approved" if approved else "pending",
+            reason=self.reason,
+            created_ts=self.now,
+            updated_ts=self.now,
+            expires_ts=self.expires,
+        )
+
+    def _active(self, link: AgentLink, status: str) -> bool:
+        return link.status == status and (
+            link.expires_ts is None or link.expires_ts > self.now
+        )
+
+    def _refresh_pending(self, link: AgentLink) -> bool:
+        if self._active(link, "approved"):
+            link.reason = self.reason
+            link.updated_ts = self.now
+            if link.expires_ts is not None:
+                link.expires_ts = max(link.expires_ts, self.expires)
+            return False
+        if self._active(link, "pending"):
+            # The pending event's content and timestamp are its immutable
+            # notification identity. A retry only extends its lifetime.
+            link.expires_ts = max(link.expires_ts or self.expires, self.expires)
+            return False
+        link.status = "pending"
+        link.reason = self.reason
+        link.updated_ts = self.now
+        link.expires_ts = self.expires
+        return True
+
+    def _refresh_approved(self, link: AgentLink) -> None:
+        link.reason = self.reason
+        link.updated_ts = self.now
+        active = self._active(link, "approved")
+        link.status = "approved"
+        if not active:
+            link.expires_ts = self.expires
+        elif link.expires_ts is not None:
+            link.expires_ts = max(link.expires_ts, self.expires)
+
+    def _refresh(self, link: AgentLink, approved: bool) -> bool:
+        if approved:
+            self._refresh_approved(link)
+            return False
+        return self._refresh_pending(link)
+
+    async def persist(self, *, approved: bool = False) -> tuple[AgentLink, bool]:
+        async with get_session() as session:
+            link = await self._existing(session)
+            if link is None:
+                link = self._new_link(approved)
+                should_notify = not approved
+            else:
+                should_notify = self._refresh(link, approved)
+            session.add(link)
+            try:
+                await session.commit()
+            except IntegrityError:
+                # A concurrent request created the link: refresh the winner
+                # using the same timestamp and expiry as the first attempt.
+                await session.rollback()
+                link = await self._existing(session)
+                if link is None:
+                    raise
+                should_notify = self._refresh(link, approved)
+                session.add(link)
+                await session.commit()
+        return link, should_notify
+
+
+def _validate_contact_welcome(
+    subject: str | None, body: str | None, auto_accept: bool,
+) -> str | None:
+    if subject is not None:
+        subject = subject.strip()
+        if not subject:
+            raise ToolExecutionError(
+                "INVALID_ARGUMENT", "welcome_subject cannot be blank when provided.",
+                recoverable=True, data={"argument": "welcome_subject"},
+            )
+    if body is not None and not body.strip():
+        raise ToolExecutionError(
+            "INVALID_ARGUMENT", "welcome_body cannot be blank when provided.",
+            recoverable=True, data={"argument": "welcome_body"},
+        )
+    if (subject is None) != (body is None):
+        raise ToolExecutionError(
+            "INVALID_ARGUMENT", "welcome_subject and welcome_body must be provided together.",
+            recoverable=True,
+            data={"welcome_subject_provided": subject is not None, "welcome_body_provided": body is not None},
+        )
+    if subject is not None and not auto_accept:
+        raise ToolExecutionError(
+            "INVALID_ARGUMENT",
+            "welcome_subject and welcome_body require auto_accept=True because the macro cannot defer a welcome until manual approval completes.",
+            recoverable=True, data={"auto_accept": auto_accept},
+        )
+    return subject
+
+
+async def _active_contact_names(project: Project) -> list[str]:
+    async with get_session() as session:
+        rows = await session.execute(
+            select(Agent.name).where(
+                cast(Any, Agent.project_id) == project.id,
+                cast(Any, Agent.provisioning_state == "active"),
+            )
+        )
+        return [str(row[0]).strip() for row in rows.fetchall() if row and row[0]]
+
+
+async def _infer_contact_requester(project: Project) -> str:
+    names = await _active_contact_names(project)
+    return names[0] if len(names) == 1 else ""
+
+
+async def _infer_contact_target(project: Project, requester: str) -> str:
+    names = await _active_contact_names(project)
+    if requester and len(names) == 2 and requester in names:
+        return next((name for name in names if name != requester), "")
+    return ""
+
+
+async def _infer_contact_names(project_key: str, requester: str, target: str) -> tuple[str, str]:
+    if requester and target:
+        return requester, target
+    try:
+        project = await _get_project_by_identifier(project_key)
+        if project.id is not None:
+            if not requester:
+                requester = await _infer_contact_requester(project)
+            if not target:
+                target = await _infer_contact_target(project, requester)
+    except Exception:
+        pass
+    return requester, target
+
+
+async def _contact_expiry(ctx: Context, ttl_seconds: int) -> tuple[datetime, datetime]:
+    if ttl_seconds < 60:
+        await ctx.info(
+            f"[warn] ttl_seconds={ttl_seconds} is below minimum (60s); auto-correcting to 60 seconds."
+        )
+    now = _naive_utc(datetime.now(timezone.utc))
+    return now, now + timedelta(seconds=max(60, ttl_seconds))
+
+
+async def _approve_contact_handshake(
+    ctx: Context,
+    project: Project,
+    requester: str,
+    target: str,
+    reason: str,
+    ttl_seconds: int,
+    requester_token: str | None,
+    target_token: str | None,
+    authenticate: Callable[..., Awaitable[Agent]],
+    reject_self_contact: Callable[..., None],
+) -> dict[str, Any]:
+    sender = await authenticate(
+        ctx, project, requester, requester_token,
+        token_param="requester_registration_token",
+        action="macro_contact_handshake requester approval",
+    )
+    try:
+        recipient = await authenticate(
+            ctx, project, target, target_token,
+            token_param="target_registration_token",
+            action="macro_contact_handshake target approval",
+        )
+    except (NoResultFound, ToolExecutionError) as exc:
+        if isinstance(exc, NoResultFound) or exc.error_type == "NOT_FOUND":
+            raise _target_registration_required_error(project, target) from exc
+        raise
+    reject_self_contact(project, sender, project, recipient, action="macro_contact_handshake")
+    now, expires = await _contact_expiry(ctx, ttl_seconds)
+    link, _ = await _ContactLinkUpdate(
+        project, sender, project, recipient, reason, now, expires,
+    ).persist(approved=True)
+    payload = {
+        "from": sender.name,
+        "from_project": project.human_key,
+        "to": recipient.name,
+        "to_project": project.human_key,
+        "status": "approved",
+        "expires_ts": _iso(link.expires_ts) if link.expires_ts is not None else None,
+    }
+    return {"request": payload, "response": payload, "welcome_message": None}
+
+
+@dataclass
+class _ContactHandshakeFollowup:
+    ctx: Context
+    project: Project
+    project_key: str
+    requester: str
+    target: str
+    target_project_key: str
+    ttl_seconds: int
+    requester_token: str | None
+    target_token: str | None
+    thread_id: str | None
+    runtime: _MCPServerRuntime
+
+    async def response(
+        self,
+        request_result: dict[str, Any],
+        auto_accept: bool,
+        respond: Callable[..., Awaitable[dict[str, Any]]],
+        session_is_bound: Callable[..., bool],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        request_status = str(request_result.get("status") or "").lower()
+        if not auto_accept:
+            return None, None
+        if request_status == "approved":
+            return request_result, None
+        project = await _get_project_by_identifier(self.target_project_key or self.project_key)
+        agent = await _get_agent(project, self.target)
+        if self.target_token is None and not session_is_bound(self.ctx, project, agent):
+            return None, {
+                "type": "AUTHENTICATION_REQUIRED",
+                "message": (
+                    "auto_accept requires target_registration_token unless this MCP session "
+                    "has already authenticated as the target agent."
+                ),
+                "project_key": project.human_key,
+                "agent_name": agent.name,
+                "token_param": "target_registration_token",
+            }
+        result = await respond(
+            ctx=self.ctx,
+            project_key=self.target_project_key or self.project_key,
+            to_agent=self.target,
+            from_agent=self.requester,
+            accept=True,
+            ttl_seconds=self.ttl_seconds,
+            from_project=self.project_key if self.target_project_key else None,
+            registration_token=self.target_token,
+            format="json",
+        )
+        return result, None
+
+    async def welcome(
+        self,
+        subject: str | None,
+        body: str | None,
+        response_error: dict[str, Any] | None,
+        send: Callable[..., Awaitable[dict[str, Any]]],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        if not subject or not body:
+            return None, None
+        project = await _get_project_by_identifier(self.target_project_key or self.project_key)
+        if response_error is not None:
+            return None, {
+                "type": "CONTACT_APPROVAL_REQUIRED",
+                "message": "welcome skipped because auto_accept did not complete; the contact request remains pending.",
+                "project_key": project.human_key,
+                "agent_name": self.target,
+            }
+        try:
+            payload = await self._send_welcome(project, subject, body, send)
+            error = self.runtime._extract_delivery_error_payload(payload)
+            if error is not None:
+                return None, self.runtime._with_delivery_project(error, project)
+            return payload, None
+        except Exception as exc:
+            # Surface delivery failure without aborting the completed handshake.
+            await self.ctx.debug(f"macro_contact_handshake failed to send welcome: {exc}")
+            return None, self.runtime._delivery_failure_from_exception(project, exc)
+
+    async def _send_welcome(
+        self, project: Project, subject: str, body: str,
+        send: Callable[..., Awaitable[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        recipients = [f"{self.target}@{self.target_project_key}"] if self.target_project_key else [self.target]
+        key = self.runtime._internal_delivery_idempotency_key(
+            "contact-welcome",
+            {
+                "source_project": self.project.human_key,
+                "source_agent": self.requester,
+                "target_project": project.human_key,
+                "target_agent": self.target,
+                "subject": subject,
+                "body_md": body,
+                "thread_id": self.thread_id,
+            },
+        )
+        return await send(
+            ctx=self.ctx,
+            project_key=self.project_key,
+            sender_name=self.requester,
+            to=recipients,
+            subject=subject,
+            body_md=body,
+            thread_id=self.thread_id,
+            idempotency_key=key,
+            registration_token=self.requester_token,
+            format="json",
+        )
+
+
+def _reservation_owner_criteria(project: Project, agent: Agent, execution: AgentExecution | None) -> list[Any]:
+    return [
+        cast(Any, FileReservation.project_id) == project.id,
+        cast(Any, FileReservation.agent_id) == agent.id,
+        (
+            cast(Any, FileReservation.execution_id) == execution.id
+            if execution is not None else cast(Any, FileReservation.execution_id).is_(None)
+        ),
+        cast(Any, FileReservation.released_ts).is_(None),
+    ]
+
+
+def _filter_reservation_statement(statement: Any, paths: list[str] | None, ids: list[int] | None) -> Any:
+    if ids:
+        statement = statement.where(cast(Any, FileReservation.id).in_(ids))
+    if paths:
+        statement = statement.where(cast(Any, FileReservation.path_pattern).in_(paths))
+    return statement
+
+
+async def _release_active_reservation_rows(
+    session: AsyncSession, project: Project, agent: Agent, execution: AgentExecution | None,
+    now: datetime, paths: list[str] | None, ids: list[int] | None,
+) -> list[FileReservation]:
+    statement = select(FileReservation).where(
+        *_reservation_owner_criteria(project, agent, execution),
+        or_(cast(Any, FileReservation.expires_ts).is_(None), cast(Any, FileReservation.expires_ts) > now),
+    )
+    result = await session.execute(_filter_reservation_statement(statement, paths, ids))
+    reservations = list(result.scalars().all())
+    durable_ids = [reservation.id for reservation in reservations if reservation.id is not None]
+    if durable_ids:
+        await session.execute(
+            update(FileReservation).where(
+                *_reservation_owner_criteria(project, agent, execution),
+                cast(Any, FileReservation.id).in_(durable_ids),
+            ).values(released_ts=now)
+        )
+    return reservations
+
+
+def _reservation_mutation_warnings(
+    response: dict[str, Any], execution: AgentExecution | None, protocol_warning: str | None, action: str,
+) -> None:
+    warnings: list[str] = []
+    if execution is None:
+        warnings.append(f"execution_required_after_rollout: only legacy unscoped reservations were {action}.")
+    if protocol_warning is not None:
+        warnings.append(protocol_warning)
+    if warnings:
+        response["warnings"] = warnings
+
+
+def _reservation_renewal_response(
+    updated: list[dict[str, Any]], execution: AgentExecution | None, protocol_warning: str | None,
+) -> dict[str, Any]:
+    response: dict[str, Any] = {
+        "renewed": len(updated),
+        "execution_id": execution.id if execution is not None else None,
+        "file_reservations": updated,
+    }
+    _reservation_mutation_warnings(response, execution, protocol_warning, "renewed")
+    return response
+
+
+def _renew_reservation_rows(
+    session: AsyncSession, reservations: list[FileReservation], now: datetime, bump: int,
+) -> list[dict[str, Any]]:
+    updated: list[dict[str, Any]] = []
+    for reservation in reservations:
+        previous = reservation.expires_ts
+        if getattr(previous, "tzinfo", None) is None:
+            previous = previous.replace(tzinfo=timezone.utc)
+        base = previous if previous > now else now
+        reservation.expires_ts = _naive_utc(base + timedelta(seconds=bump))
+        session.add(reservation)
+        updated.append({
+            "id": reservation.id,
+            "execution_id": reservation.execution_id,
+            "path_pattern": reservation.path_pattern,
+            "old_expires_ts": _iso(previous),
+            "new_expires_ts": _iso(reservation.expires_ts),
+        })
+    return updated
+
+
+def _log_reservation_mutation(
+    action: str, project: str, agent: str, paths: list[str] | None,
+    ids: list[int] | None, extend_seconds: int | None = None,
+) -> None:
+    if get_settings().tools_log_enabled:
+        with suppress(Exception):
+            from rich.console import Console
+            from rich.panel import Panel
+
+            details = [f"project={project}", f"agent={agent}"]
+            if extend_seconds is not None:
+                details.append(f"extend={extend_seconds}s")
+            details.extend([f"paths={len(paths or [])}", f"ids={len(ids or [])}"])
+            Console().print(Panel.fit("\n".join(details), title=f"tool: {action}", border_style="green"))
+
+
+def _log_reservation_mutation_error(exc: Exception) -> None:
+    if get_settings().tools_log_enabled:
+        with suppress(Exception):
+            from rich.console import Console
+            from rich.json import JSON
+
+            Console().print(JSON.from_data({"error": str(exc)}))
+
+
+async def _report_stale_reservation_releases(ctx: Context, releases: list[FileReservationStatus]) -> None:
+    if releases:
+        summary = ", ".join(
+            f"{status.agent.name if status.agent is not None else '<orphaned>'}:{status.reservation.path_pattern}"
+            for status in releases[:5]
+        )
+        extra = f" ({summary})" if summary else ""
+        await ctx.info(f"Auto-released {len(releases)} stale file_reservation(s){extra}.")
+
+
+def _conflicting_build_slot_holders(
+    active: list[dict[str, Any]], exclusive: bool,
+    matches_lifetime: Callable[[dict[str, Any]], bool],
+) -> list[dict[str, Any]]:
+    conflicts: list[dict[str, Any]] = []
+    for entry in active:
+        if matches_lifetime(entry):
+            continue
+        if exclusive or entry.get("exclusive", True):
+            conflicts.append(entry)
+    return conflicts
 
 
 class _CredentialSafeValidationErrors(Middleware):
@@ -7426,29 +8738,8 @@ class _CredentialSafeValidationErrors(Middleware):
             ) from None
 
 
-def build_mcp_server() -> FastMCP:
-    """Create and configure the FastMCP server instance."""
-    _install_fastmcp_sensitive_log_filter()
-    settings: Settings = get_settings()
-    lifespan = _lifespan_factory(settings)
-
-    instructions = (
-        "You are the MCP Agent Mail coordination server. "
-        "Provide message routing, coordination tooling, and project context to cooperating agents. "
-        "Outputs are JSON by default; pass format='toon' (or set MCP_AGENT_MAIL_OUTPUT_FORMAT=toon) to receive "
-        "{format:'toon', data:'<TOON>'}."
-    )
-
-    mcp = FastMCP(
-        name="mcp-agent-mail",
-        version=package_version(),
-        instructions=instructions,
-        lifespan=lifespan,
-    )
-    mcp.add_middleware(_CredentialSafeValidationErrors())
-    file_reservation_paths_direct: (
-        Callable[..., Awaitable[dict[str, Any]]] | None
-    ) = None
+class _MCPSessionBindings:
+    """Own one server's session authority, with exact row/token generations."""
 
     # Session bindings are keyed by `ctx.session_id` (the FastMCP-assigned
     # ID derived from the `mcp-session-id` header for HTTP transport, or a
@@ -7464,21 +8755,21 @@ def build_mcp_server() -> FastMCP:
     # Switch to `dict[str, ...]` keyed by the stable session ID, with a
     # last-access timestamp and an expiry sweep on each lookup so an
     # unbounded HTTP server can't accumulate session bindings forever.
-    session_binding_ttl_seconds: float = max(
-        60.0, float(getattr(settings, "session_binding_ttl_seconds", 24 * 3600))
-    )
     # Numeric SQLite ids are recyclable after hard deletion. Every in-memory
     # binding therefore carries the immutable project/Agent row generations.
     # It also carries a one-way fingerprint of the current registration token:
     # a rotation in another worker changes the DB-derived key immediately, so
     # worker-local session state cannot keep the retired credential authorized.
-    session_agent_bindings: dict[str, set[_SessionAgentBinding]] = {}
-    session_current_agents: dict[str, dict[int, _SessionAgentBinding]] = {}
-    session_current_executions: dict[
-        str, dict[int, _SessionExecutionBinding]
-    ] = {}
-    session_binding_last_access: dict[str, float] = {}
+    def __init__(self, settings: Settings) -> None:
+        self.session_binding_ttl_seconds = max(
+            60.0, float(getattr(settings, "session_binding_ttl_seconds", 24 * 3600))
+        )
+        self.session_agent_bindings: dict[str, set[_SessionAgentBinding]] = {}
+        self.session_current_agents: dict[str, dict[int, _SessionAgentBinding]] = {}
+        self.session_current_executions: dict[str, dict[int, _SessionExecutionBinding]] = {}
+        self.session_binding_last_access: dict[str, float] = {}
 
+    @staticmethod
     async def _ctx_info_safe(ctx: Context, message: str) -> None:
         try:
             await ctx.info(message)
@@ -7486,6 +8777,7 @@ def build_mcp_server() -> FastMCP:
             # Context may not be available outside of a request; ignore logging
             return
 
+    @staticmethod
     def _session_agent_binding(
         project: Project,
         agent: Agent,
@@ -7502,6 +8794,7 @@ def build_mcp_server() -> FastMCP:
             ),
         )
 
+    @staticmethod
     def _session_binding_key(ctx: Context) -> str:
         # `ctx.session_id` is a stable identifier across requests for both
         # HTTP (mcp-session-id header) and stdio (uuid stored on the
@@ -7546,62 +8839,65 @@ def build_mcp_server() -> FastMCP:
             setattr(ctx, "_mcp_agent_mail_orphan_key", orphan_key)  # noqa: B010
         return orphan_key
 
-    def _prune_expired_session_bindings(now: float) -> None:
-        if not session_binding_last_access:
+    def _prune_expired_session_bindings(self, now: float) -> None:
+        if not self.session_binding_last_access:
             return
         expired = [
             key
-            for key, last in session_binding_last_access.items()
-            if now - last > session_binding_ttl_seconds
+            for key, last in self.session_binding_last_access.items()
+            if now - last > self.session_binding_ttl_seconds
         ]
         for key in expired:
-            session_binding_last_access.pop(key, None)
-            session_agent_bindings.pop(key, None)
-            session_current_agents.pop(key, None)
-            session_current_executions.pop(key, None)
+            self.session_binding_last_access.pop(key, None)
+            self.session_agent_bindings.pop(key, None)
+            self.session_current_agents.pop(key, None)
+            self.session_current_executions.pop(key, None)
 
-    def _touch_session_binding(key: str) -> None:
+    def _touch_session_binding(self, key: str) -> None:
         now = time.monotonic()
-        _prune_expired_session_bindings(now)
-        session_binding_last_access[key] = now
+        self._prune_expired_session_bindings(now)
+        self.session_binding_last_access[key] = now
 
     def _session_bindings_for(
+        self,
         ctx: Context,
     ) -> set[_SessionAgentBinding]:
-        key = _session_binding_key(ctx)
-        _touch_session_binding(key)
-        bindings = session_agent_bindings.get(key)
+        key = self._session_binding_key(ctx)
+        self._touch_session_binding(key)
+        bindings = self.session_agent_bindings.get(key)
         if bindings is None:
             bindings = set()
-            session_agent_bindings[key] = bindings
+            self.session_agent_bindings[key] = bindings
         return bindings
 
     def _session_current_agents_for(
+        self,
         ctx: Context,
     ) -> dict[int, _SessionAgentBinding]:
-        key = _session_binding_key(ctx)
-        _touch_session_binding(key)
-        current_agents = session_current_agents.get(key)
+        key = self._session_binding_key(ctx)
+        self._touch_session_binding(key)
+        current_agents = self.session_current_agents.get(key)
         if current_agents is None:
             current_agents = {}
-            session_current_agents[key] = current_agents
+            self.session_current_agents[key] = current_agents
         return current_agents
 
     def _session_current_executions_for(
+        self,
         ctx: Context,
     ) -> dict[int, _SessionExecutionBinding]:
-        key = _session_binding_key(ctx)
-        _touch_session_binding(key)
-        current_executions = session_current_executions.get(key)
+        key = self._session_binding_key(ctx)
+        self._touch_session_binding(key)
+        current_executions = self.session_current_executions.get(key)
         if current_executions is None:
             current_executions = {}
-            session_current_executions[key] = current_executions
+            self.session_current_executions[key] = current_executions
         return current_executions
 
-    def _bind_session_agent(ctx: Context, project: Project, agent: Agent) -> None:
-        binding = _session_agent_binding(project, agent)
-        bindings = _session_bindings_for(ctx)
-        current_agents = _session_current_agents_for(ctx)
+    def _bind_session_agent(self, ctx: Context, project: Project, agent: Agent) -> None:
+        binding = self._session_agent_binding(project, agent)
+        bindings = self._session_bindings_for(ctx)
+        current_agents = self._session_current_agents_for(ctx)
         # Keep at most one credential version for an exact Agent lifetime in a
         # session. This bounds stale entries after reauthentication following a
         # rotation and makes the set itself describe current authority only.
@@ -7619,23 +8915,24 @@ def build_mcp_server() -> FastMCP:
         current_agents[binding.project_id] = binding
 
     def _bind_session_execution(
+        self,
         ctx: Context,
         project: Project,
         agent: Agent,
         execution: AgentExecution,
     ) -> None:
-        binding = _session_agent_binding(project, agent)
+        binding = self._session_agent_binding(project, agent)
         if (
             execution.project_id != binding.project_id
             or execution.agent_id != binding.agent_id
         ):
             raise ValueError("Agent execution does not belong to the authenticated project and agent.")
-        _bind_session_agent(ctx, project, agent)
+        self._bind_session_agent(ctx, project, agent)
         # One MCP session may host a root execution and explicit subagent
         # lifetimes. Only the root is eligible for implicit resolution; a
         # child must always pass execution_id and must not steal the root slot.
         if execution.kind == "session":
-            _session_current_executions_for(ctx)[binding.project_id] = (
+            self._session_current_executions_for(ctx)[binding.project_id] = (
                 _SessionExecutionBinding(
                     project_generation=binding.project_generation,
                     agent_id=binding.agent_id,
@@ -7648,17 +8945,18 @@ def build_mcp_server() -> FastMCP:
             )
 
     def _session_execution_id(
+        self,
         ctx: Context,
         project: Project,
         agent: Agent,
     ) -> str | None:
         if project.id is None:
             return None
-        current = _session_current_executions_for(ctx)
+        current = self._session_current_executions_for(ctx)
         binding = current.get(project.id)
         if binding is None:
             return None
-        expected = _session_agent_binding(project, agent)
+        expected = self._session_agent_binding(project, agent)
         if (
             binding.project_generation != expected.project_generation
             or binding.agent_id != expected.agent_id
@@ -7671,27 +8969,29 @@ def build_mcp_server() -> FastMCP:
         return binding.execution_id
 
     def _clear_session_execution(
+        self,
         ctx: Context,
         project: Project,
         execution_id: str,
     ) -> None:
         if project.id is None:
             return
-        current = _session_current_executions_for(ctx)
+        current = self._session_current_executions_for(ctx)
         binding = current.get(project.id)
         if binding is not None and binding.execution_id == execution_id:
             current.pop(project.id, None)
 
-    def _clear_execution_bindings(execution_ids: set[str]) -> None:
+    def _clear_execution_bindings(self, execution_ids: set[str]) -> None:
         if not execution_ids:
             return
-        for current in session_current_executions.values():
-            for project_id, binding in list(current.items()):
+        for current in self.session_current_executions.values():
+            for project_id, binding in current.copy().items():
                 execution_id = binding.execution_id
                 if execution_id in execution_ids:
                     current.pop(project_id, None)
 
     def _invalidate_session_bindings(
+        self,
         project: Project,
         agent: Agent | None = None,
     ) -> None:
@@ -7704,59 +9004,44 @@ def build_mcp_server() -> FastMCP:
                 return
             exact_agent_key = (agent.id, agent.agent_generation)
 
-        for session_key, bindings in session_agent_bindings.items():
+        for session_key, bindings in self.session_agent_bindings.items():
             removed_bindings = {
                 binding
                 for binding in bindings
                 if binding.project_id == project.id
-                and binding.project_generation == project.project_generation
-                and (
-                    exact_agent_key is None
-                    or (binding.agent_id, binding.agent_generation)
-                    == exact_agent_key
-                )
+                and self._matches_lifetime(binding, project, exact_agent_key)
             }
             bindings.difference_update(removed_bindings)
-            current_agents = session_current_agents.get(session_key)
-            if current_agents is not None:
-                current_agent = current_agents.get(project.id)
-                if (
-                    current_agent is not None
-                    and current_agent.project_generation
-                    == project.project_generation
-                    and (
-                        exact_agent_key is None
-                        or (
-                            current_agent.agent_id,
-                            current_agent.agent_generation,
-                        )
-                        == exact_agent_key
-                    )
-                ):
-                    current_agents.pop(project.id, None)
-            current_executions = session_current_executions.get(session_key)
-            if current_executions is not None:
-                current_execution = current_executions.get(project.id)
-                if (
-                    current_execution is not None
-                    and current_execution.project_generation
-                    == project.project_generation
-                    and (
-                        exact_agent_key is None
-                        or (
-                            current_execution.agent_id,
-                            current_execution.agent_generation,
-                        )
-                        == exact_agent_key
-                    )
-                ):
-                    current_executions.pop(project.id, None)
+            self._remove_current_binding(self.session_current_agents.get(session_key), project, exact_agent_key)
+            self._remove_current_binding(self.session_current_executions.get(session_key), project, exact_agent_key)
 
-    def _session_is_bound_to_agent(ctx: Context, project: Project, agent: Agent) -> bool:
+    @staticmethod
+    def _matches_lifetime(
+        binding: _SessionAgentBinding | _SessionExecutionBinding,
+        project: Project,
+        exact_agent_key: tuple[int, str] | None,
+    ) -> bool:
+        return binding.project_generation == project.project_generation and (
+            exact_agent_key is None or (binding.agent_id, binding.agent_generation) == exact_agent_key
+        )
+
+    def _remove_current_binding(
+        self,
+        current: dict[int, _SessionAgentBinding] | dict[int, _SessionExecutionBinding] | None,
+        project: Project,
+        exact_agent_key: tuple[int, str] | None,
+    ) -> None:
+        if current is None or project.id is None:
+            return
+        binding = current.get(project.id)
+        if binding is not None and self._matches_lifetime(binding, project, exact_agent_key):
+            current.pop(project.id, None)
+
+    def _session_is_bound_to_agent(self, ctx: Context, project: Project, agent: Agent) -> bool:
         if project.id is None or agent.id is None:
             return False
-        expected = _session_agent_binding(project, agent)
-        bindings = _session_bindings_for(ctx)
+        expected = self._session_agent_binding(project, agent)
+        bindings = self._session_bindings_for(ctx)
         bindings.difference_update(
             {
                 binding
@@ -7771,10 +9056,339 @@ def build_mcp_server() -> FastMCP:
         )
         return expected in bindings
 
+
+@dataclass(frozen=True, slots=True)
+class _MCPToolRegistration:
+    """Keep wire metadata with a method until its server instance is created."""
+
+    tool_options: dict[str, Any]
+    instrumentation: dict[str, Any]
+
+    def __call__[F: Callable[..., Any]](self, method: F) -> F:
+        cast(Any, method)._mcp_tool_registration = self
+        return method
+
+
+@dataclass(frozen=True, slots=True)
+class _MessageDeliveryOptions:
+    attachment_paths: Sequence[str] | None
+    convert_images_override: bool | None
+    importance: str
+    ack_required: bool
+    thread_id: str | None
+    idempotency_key: str
+    topic: str | None = None
+    reply_to: int | None = None
+    purpose: DeliveryPurpose = "message"
+
+
+@dataclass(slots=True)
+class _FileReservationBatch:
+    project: Project
+    agent: Agent
+    execution: AgentExecution | None
+    ancestor_execution_ids: list[str]
+    paths: list[str]
+    exclusive: bool
+    ttl_seconds: int
+    origin: str
+    reason: str
+
+    @staticmethod
+    def repository_context(project: Project) -> tuple[str | None, str | None]:
+        branch: str | None = None
+        worktree: str | None = None
+        try:
+            with _git_repo(project.human_key) as repo:
+                try:
+                    branch = repo.active_branch.name
+                except Exception:
+                    try:
+                        branch = repo.git.rev_parse("--abbrev-ref", "HEAD").strip()
+                    except Exception:
+                        branch = None
+                try:
+                    worktree = Path(repo.working_tree_dir or "").name or None
+                except Exception:
+                    worktree = None
+        except Exception:
+            pass
+        return branch, worktree
+
+    @staticmethod
+    async def warn_paths(ctx: Context, paths: list[str]) -> None:
+        for pattern in paths:
+            warning = _detect_suspicious_file_reservation(pattern)
+            if warning:
+                await ctx.info(f"[warn] {warning}")
+
+    @staticmethod
+    async def report_stale(ctx: Context, statuses: list[FileReservationStatus]) -> None:
+        if not statuses:
+            return
+        summary = ", ".join(
+            f"{status.agent.name if status.agent is not None else '<orphaned>'}:{status.reservation.path_pattern}"
+            for status in statuses[:5]
+        )
+        extra = f" ({summary})" if summary else ""
+        await ctx.info(f"Auto-released {len(statuses)} stale file_reservation(s){extra}.")
+
+    @staticmethod
+    def warnings(paths: list[str], execution: AgentExecution | None, protocol_warning: str | None) -> list[str]:
+        warnings: list[str] = []
+        if execution is None:
+            warnings.append(
+                "execution_required_after_rollout: reservation was accepted as a legacy "
+                "unscoped claim because AGENT_EXECUTION_ENFORCEMENT_MODE=observe; "
+                "start_agent_execution and pass execution_id before enforce mode is enabled."
+            )
+        if protocol_warning is not None:
+            warnings.append(protocol_warning)
+        advisory_only_paths = [path for path in paths if not _looks_like_archive_path(path)]
+        if advisory_only_paths:
+            warnings.append(
+                "enforcement_off_for_code_paths: "
+                f"{len(advisory_only_paths)} of {len(paths)} reserved paths are "
+                "code-repo paths; server-side exclusivity is advisory only. "
+                "Install the pre-commit guard via `install_precommit_guard` for "
+                "the authoritative reservation gate."
+            )
+        return warnings
+
+    @staticmethod
+    async def publish(
+        project: Project, archive: ProjectArchive, granted: list[dict[str, Any]],
+        branch: str | None, worktree: str | None,
+    ) -> None:
+        if not granted:
+            return
+        reservation_ids = [int(item["id"]) for item in granted if item.get("id") is not None]
+        async with get_session() as session:
+            current_rows = (
+                await session.execute(
+                    select(FileReservation, Agent)
+                    .outerjoin(Agent, cast(Any, FileReservation.agent_id) == Agent.id)
+                    .where(cast(Any, FileReservation.id).in_(reservation_ids))
+                    .order_by(asc(cast(Any, FileReservation.id)))
+                )
+            ).all()
+        records = [cast(tuple[FileReservation, Optional[Agent]], row) for row in current_rows]
+        revisions = [
+            (reservation.id, reservation.archive_revision)
+            for reservation, _agent in records if reservation.id is not None
+        ]
+        # Keep exact revisions pending on failed/partial publication: the DB is
+        # authoritative, even when an artifact has already reached disk or Git.
+        await _write_file_reservation_records(
+            project, records, archive=archive, archive_locked=True,
+            branch_override=branch, worktree_override=worktree,
+        )
+        acknowledged = await _ack_file_reservation_archive_revisions(revisions)
+        if acknowledged != len(revisions):
+            await _reconcile_pending_file_reservation_artifacts(
+                project, archive=archive, archive_locked=True,
+            )
+
+    @property
+    def execution_id(self) -> str | None:
+        return self.execution.id if self.execution is not None else None
+
+    def _potential_conflicts(self, existing: list[tuple[FileReservation, str]]) -> set[str]:
+        union_spec = _build_reservation_union_spec(
+            existing, self.execution_id, cast(int, self.agent.id), self.exclusive,
+            set(self.ancestor_execution_ids),
+        )
+        if union_spec is None:
+            return set(self.paths)
+        normalized = [_normalize_pathspec_pattern(path) for path in self.paths]
+        matching = set(union_spec.match_files(normalized))
+        # Candidate globs require the symmetric detailed check, including when
+        # the union only sees a literal file enclosed by the candidate (#193).
+        return {
+            path for path, pattern in zip(self.paths, normalized, strict=True)
+            if pattern in matching or _contains_glob(pattern)
+        }
+
+    def _owns(self, reservation: FileReservation) -> bool:
+        if self.execution is not None:
+            return reservation.execution_id == self.execution.id
+        return reservation.execution_id is None and reservation.agent_id == self.agent.id
+
+    def _conflicting_holders(
+        self, path: str, existing: list[tuple[FileReservation, str]]
+    ) -> list[dict[str, Any]]:
+        holders: list[dict[str, Any]] = []
+        for reservation, holder_name in existing:
+            if _file_reservations_conflict(
+                reservation, path, self.exclusive, self.execution_id,
+                cast(int, self.agent.id), set(self.ancestor_execution_ids),
+            ):
+                holders.append({
+                    "agent": holder_name,
+                    "execution_id": reservation.execution_id,
+                    "origin": reservation.origin,
+                    "path_pattern": reservation.path_pattern,
+                    "exclusive": reservation.exclusive,
+                    "expires_ts": _iso(reservation.expires_ts),
+                })
+        return holders
+
+    async def _grant(
+        self, session: AsyncSession, path: str, existing: FileReservation | None
+    ) -> FileReservation:
+        requested_exp = _naive_utc() + timedelta(seconds=self.ttl_seconds)
+        if existing is not None:
+            current_exp = existing.expires_ts
+            if getattr(current_exp, "tzinfo", None) is not None:
+                current_exp = _naive_utc(current_exp)
+            existing.exclusive = self.exclusive
+            if self.origin == "explicit":
+                existing.origin = "explicit"
+            if self.reason or not existing.reason:
+                existing.reason = self.reason
+            existing.expires_ts = max(requested_exp, current_exp)
+            session.add(existing)
+            return existing
+        reservation = FileReservation(
+            project_id=self.project.id,
+            agent_id=self.agent.id,
+            execution_id=self.execution_id,
+            origin=self.origin,
+            path_pattern=path,
+            exclusive=self.exclusive,
+            reason=self.reason,
+            expires_ts=requested_exp,
+        )
+        session.add(reservation)
+        await session.flush()  # Assign the id within the caller's IMMEDIATE transaction.
+        return reservation
+
+    def _payload(self, reservation: FileReservation, reused: bool) -> dict[str, Any]:
+        return {
+            "id": reservation.id,
+            "execution_id": reservation.execution_id,
+            "ancestor_execution_ids": self.ancestor_execution_ids,
+            "origin": reservation.origin,
+            "legacy_unscoped": self.execution is None,
+            "orphaned": False,
+            "path_pattern": reservation.path_pattern,
+            "exclusive": reservation.exclusive,
+            "reason": reservation.reason,
+            "expires_ts": _iso(reservation.expires_ts),
+            "reused": reused,
+        }
+
+    async def grant(
+        self, session: AsyncSession, existing: list[tuple[FileReservation, str]]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        possible = self._potential_conflicts(existing)
+        granted: list[dict[str, Any]] = []
+        conflicts: list[dict[str, Any]] = []
+        for path in self.paths:
+            owned = next(
+                (reservation for reservation, _ in existing
+                 if self._owns(reservation) and reservation.path_pattern == path),
+                None,
+            )
+            holders = self._conflicting_holders(path, existing) if path in possible else []
+            if holders:
+                # Conflicts remain advisory: grant the reservation and report them.
+                conflicts.append({"path": path, "holders": holders})
+            reservation = await self._grant(session, path, owned)
+            granted.append(self._payload(reservation, owned is not None))
+            existing.append((reservation, self.agent.name))
+        return granted, conflicts
+
+
+@dataclass(slots=True)
+class _ForceReleaseNotification:
+    ctx: Context
+    project: Project
+    actor: Agent
+    holder: Agent
+    reservation: FileReservation
+    status: FileReservationStatus
+    now: datetime
+    note: str
+    project_key: str
+    agent_name: str
+    registration_token: str | None
+    inactivity_seconds: int
+    grace_seconds: int
+
+    def _details(self) -> str:
+        extras: list[str] = []
+        activities = (
+            (self.status.last_agent_activity, "last agent activity"),
+            (self.status.last_mail_activity, "last mail activity"),
+            (self.status.last_fs_activity, "last filesystem touch"),
+            (self.status.last_git_activity, "last git commit"),
+        )
+        for activity, label in activities:
+            if activity:
+                delta = self.now - activity
+                extras.append(f"{label} ≈ {int(delta.total_seconds() // 60)} minutes ago")
+        extras.append(f"inactivity threshold={self.inactivity_seconds}s grace={self.grace_seconds}s")
+        return "\n".join(f"- {line}" for line in extras if line)
+
+    def _body(self) -> str:
+        reasons_md = "\n".join(f"- {reason}" for reason in self.status.stale_reasons)
+        extra_md = self._details()
+        lines = [
+            f"Hi {self.holder.name},", "",
+            f"I released your file reservation on `{self.reservation.path_pattern}` because it looked abandoned.",
+            "", "Observed signals:", reasons_md or "- (none)",
+        ]
+        if extra_md:
+            lines.extend(["", "Details:", extra_md])
+        if self.note:
+            lines.extend(["", f"Additional note from {self.actor.name}:", self.note.strip()])
+        lines.extend(["", "If you still need this reservation, please re-acquire it via `file_reservation_paths`."])
+        return "\n".join(lines)
+
+    async def send(self, runtime: _MCPServerTools) -> tuple[bool, dict[str, Any] | None]:
+        body = self._body()
+        try:
+            key = runtime._internal_delivery_idempotency_key(
+                "file-reservation-release",
+                {
+                    "project": self.project.human_key,
+                    "reservation_id": self.reservation.id,
+                    "released_ts": _iso(self.reservation.released_ts),
+                    "actor": self.actor.name,
+                    "holder": self.holder.name,
+                },
+            )
+            payload = await runtime.send_message(
+                ctx=self.ctx, project_key=self.project_key,
+                sender_name=self.agent_name, registration_token=self.registration_token,
+                to=[self.holder.name],
+                subject=f"[file-reservations] Released stale lock on {self.reservation.path_pattern}",
+                body_md=body, idempotency_key=key, format="json",
+            )
+            error = runtime._extract_delivery_error_payload(payload)
+            if error is not None:
+                return False, runtime._with_delivery_project(error, self.project)
+            return True, None
+        except Exception as exc:
+            return False, runtime._delivery_failure_from_exception(self.project, exc)
+
+
+class _MCPServerRuntime(_MCPSessionBindings):
+    """Per-server authentication and immutable-delivery operations."""
+
+    def __init__(self, settings: Settings) -> None:
+        super().__init__(settings)
+        self.settings = settings
+
     async def _resolve_session_agent_for_project(
+        self,
         ctx: Context,
         project: Project,
     ) -> Agent | None:
+        _session_current_agents_for = self._session_current_agents_for
+        _session_current_executions_for = self._session_current_executions_for
+        _session_agent_binding = self._session_agent_binding
         if project.id is None:
             return None
         current_agents = _session_current_agents_for(ctx)
@@ -7793,9 +9407,17 @@ def build_mcp_server() -> FastMCP:
             current_agents.pop(project.id, None)
             _session_current_executions_for(ctx).pop(project.id, None)
 
-        bindings = _session_bindings_for(ctx)
+        bindings = self._session_bindings_for(ctx)
+        resolved_agents = await self._resolve_bound_agents_for_project(bindings, project)
+        if len(resolved_agents) == 1:
+            return resolved_agents[0]
+        return None
+
+    async def _resolve_bound_agents_for_project(
+        self, bindings: set[_SessionAgentBinding], project: Project
+    ) -> list[Agent]:
         resolved_agents: list[Agent] = []
-        for binding in list(bindings):
+        for binding in bindings.copy():
             if binding.project_id != project.id:
                 continue
             if binding.project_generation != project.project_generation:
@@ -7806,15 +9428,14 @@ def build_mcp_server() -> FastMCP:
             except NoResultFound:
                 bindings.discard(binding)
                 continue
-            if _session_agent_binding(project, resolved) != binding:
+            if self._session_agent_binding(project, resolved) != binding:
                 bindings.discard(binding)
                 continue
             resolved_agents.append(resolved)
-        if len(resolved_agents) == 1:
-            return resolved_agents[0]
-        return None
+        return resolved_agents
 
     async def _resolve_agent_execution(
+        self,
         ctx: Context,
         project: Project,
         agent: Agent,
@@ -7829,6 +9450,9 @@ def build_mcp_server() -> FastMCP:
         touch_activity: bool = True,
     ) -> AgentExecution | None:
         """Resolve an explicit or session-bound execution and enforce ownership."""
+        _session_execution_id = self._session_execution_id
+        _clear_session_execution = self._clear_session_execution
+        _bind_session_execution = self._bind_session_execution
         if project.id is None or agent.id is None:
             raise ValueError("Project and agent must have ids before resolving an execution.")
         resolved_id = execution_id.strip() if execution_id else None
@@ -7873,32 +9497,10 @@ def build_mcp_server() -> FastMCP:
         is_exact_session_binding = (
             _session_execution_id(ctx, project, agent) == execution.id
         )
-        token_matches = bool(
-            execution_token
-            and hmac.compare_digest(
-                hashlib.sha256(execution_token.encode("utf-8")).hexdigest(),
-                execution.execution_token_hash,
-            )
+        self._validate_execution_capability(
+            execution, execution_token, is_exact_session_binding, explicit_resolution,
+            allow_authenticated_owner_recovery, require_active_capability, action,
         )
-        owner_recovery_allowed = (
-            allow_authenticated_owner_recovery and execution.status != "active"
-        )
-        if (
-            execution.status == "active"
-            and require_active_capability
-            and not token_matches
-        ) or (
-            explicit_resolution
-            and not is_exact_session_binding
-            and not owner_recovery_allowed
-            and not token_matches
-        ):
-            raise ToolExecutionError(
-                "EXECUTION_CAPABILITY_MISMATCH",
-                f"Invalid execution_token for execution '{execution.id}'.",
-                recoverable=False,
-                data={"execution_id": execution.id, "action": action},
-            )
         if require_active and execution.status != "active":
             _clear_session_execution(ctx, project, execution.id)
             raise ToolExecutionError(
@@ -7927,6 +9529,36 @@ def build_mcp_server() -> FastMCP:
             _bind_session_execution(ctx, project, agent, execution)
         return execution
 
+    @staticmethod
+    def _validate_execution_capability(
+        execution: AgentExecution,
+        execution_token: str | None,
+        is_exact_session_binding: bool,
+        explicit_resolution: bool,
+        allow_authenticated_owner_recovery: bool,
+        require_active_capability: bool,
+        action: str,
+    ) -> None:
+        token_matches = bool(
+            execution_token
+            and hmac.compare_digest(
+                hashlib.sha256(execution_token.encode("utf-8")).hexdigest(),
+                execution.execution_token_hash,
+            )
+        )
+        owner_recovery_allowed = allow_authenticated_owner_recovery and execution.status != "active"
+        if (
+            execution.status == "active" and require_active_capability and not token_matches
+        ) or (
+            explicit_resolution and not is_exact_session_binding and not owner_recovery_allowed and not token_matches
+        ):
+            raise ToolExecutionError(
+                "EXECUTION_CAPABILITY_MISMATCH",
+                f"Invalid execution_token for execution '{execution.id}'.",
+                recoverable=False,
+                data={"execution_id": execution.id, "action": action},
+            )
+
     # Authenticating IS activity, and until now it did not count as any.
     #
     # last_active_ts was refreshed when an agent registered or sent a message,
@@ -7943,7 +9575,7 @@ def build_mcp_server() -> FastMCP:
     # 1800s the sweeper compares against.
     _ACTIVITY_TOUCH_SECONDS = 60
 
-    async def _touch_agent_activity(agent: Agent) -> None:
+    async def _touch_agent_activity(self, agent: Agent) -> None:
         if agent.id is None:
             return
         # Never let bookkeeping fail a call that already succeeded. The guard
@@ -7968,7 +9600,7 @@ def build_mcp_server() -> FastMCP:
             if previous is not None:
                 # The file's own idiom, and the reason it exists.
                 previous = _naive_utc(previous)
-                if (now - previous).total_seconds() < _ACTIVITY_TOUCH_SECONDS:
+                if (now - previous).total_seconds() < self._ACTIVITY_TOUCH_SECONDS:
                     return
             async with get_immediate_session() as session:
                 db_agent = await session.get(Agent, agent.id)
@@ -7994,6 +9626,7 @@ def build_mcp_server() -> FastMCP:
             )
 
     async def _authenticate_agent(
+        self,
         ctx: Context,
         project: Project,
         agent_name: str,
@@ -8002,6 +9635,10 @@ def build_mcp_server() -> FastMCP:
         token_param: str,
         action: str,
     ) -> Agent:
+        _session_is_bound_to_agent = self._session_is_bound_to_agent
+        _bind_session_agent = self._bind_session_agent
+        _touch_agent_activity = self._touch_agent_activity
+        _resolve_session_agent_for_project = self._resolve_session_agent_for_project
         agent = await _get_agent(project, agent_name)
         if _session_is_bound_to_agent(ctx, project, agent):
             _bind_session_agent(ctx, project, agent)
@@ -8062,6 +9699,7 @@ def build_mcp_server() -> FastMCP:
         return agent
 
     async def _register_or_authenticate_agent(
+        self,
         ctx: Context,
         project: Project,
         name: str | None,
@@ -8081,6 +9719,8 @@ def build_mcp_server() -> FastMCP:
         concurrent loser can identify the database winner but can neither
         receive its token nor update its profile without authenticating first.
         """
+        _authenticate_agent = self._authenticate_agent
+        settings = self.settings
         if not allow_create:
             existing = await _find_agent_optional(project, name or "")
             if existing is None:
@@ -8173,6 +9813,7 @@ def build_mcp_server() -> FastMCP:
         return updated, False
 
     async def _resolve_authenticated_agent(
+        self,
         ctx: Context,
         project: Project,
         *,
@@ -8181,6 +9822,8 @@ def build_mcp_server() -> FastMCP:
         token_param: str,
         action: str,
     ) -> Agent:
+        _authenticate_agent = self._authenticate_agent
+        _resolve_session_agent_for_project = self._resolve_session_agent_for_project
         if agent_name:
             return await _authenticate_agent(
                 ctx,
@@ -8206,12 +9849,15 @@ def build_mcp_server() -> FastMCP:
         )
 
     async def _authenticate_project_admin(
+        self,
         ctx: Context,
         project: Project,
         provided_token: Optional[str],
         *,
         action: str,
     ) -> Agent:
+        _resolve_session_agent_for_project = self._resolve_session_agent_for_project
+        _bind_session_agent = self._bind_session_agent
         agent = await _resolve_session_agent_for_project(ctx, project)
         if agent is not None:
             return agent
@@ -8260,6 +9906,7 @@ def build_mcp_server() -> FastMCP:
         )
 
     async def _authenticate_product_agents(
+        self,
         ctx: Context,
         product_key: str,
         *,
@@ -8268,6 +9915,7 @@ def build_mcp_server() -> FastMCP:
         token_param: str,
         action: str,
     ) -> tuple[Product, list[Project], list[tuple[Project, Agent]]]:
+        _get_product_by_key = self._get_product_by_key
         await ensure_schema()
         async with get_session() as session:
             product = await _get_product_by_key(session, product_key.strip())
@@ -8282,23 +9930,9 @@ def build_mcp_server() -> FastMCP:
 
         authorized: list[tuple[Project, Agent]] = []
         for project in projects:
-            if agent_name:
-                agent = await _find_agent_optional(project, agent_name)
-                if agent is None:
-                    continue
-                if _session_is_bound_to_agent(ctx, project, agent):
-                    _bind_session_agent(ctx, project, agent)
-                    authorized.append((project, agent))
-                    continue
-                stored_token = (agent.registration_token or "").strip()
-                if stored_token and provided_token and hmac.compare_digest(provided_token, stored_token):
-                    _bind_session_agent(ctx, project, agent)
-                    authorized.append((project, agent))
-                    continue
-            else:
-                session_agent = await _resolve_session_agent_for_project(ctx, project)
-                if session_agent is not None:
-                    authorized.append((project, session_agent))
+            agent = await self._product_agent_for_project(ctx, project, agent_name, provided_token)
+            if agent is not None:
+                authorized.append((project, agent))
 
         if authorized:
             return product, projects, authorized
@@ -8313,6 +9947,24 @@ def build_mcp_server() -> FastMCP:
             data={"product_key": product_key, "agent_name": agent_name, "token_param": token_param},
         )
 
+    async def _product_agent_for_project(
+        self, ctx: Context, project: Project, agent_name: str | None, provided_token: str | None
+    ) -> Agent | None:
+        if not agent_name:
+            return await self._resolve_session_agent_for_project(ctx, project)
+        agent = await _find_agent_optional(project, agent_name)
+        if agent is None:
+            return None
+        if self._session_is_bound_to_agent(ctx, project, agent):
+            self._bind_session_agent(ctx, project, agent)
+            return agent
+        stored_token = (agent.registration_token or "").strip()
+        if stored_token and provided_token and hmac.compare_digest(provided_token, stored_token):
+            self._bind_session_agent(ctx, project, agent)
+            return agent
+        return None
+
+    @staticmethod
     def _project_delivery_snapshot(project: Project) -> DeliveryProjectSnapshot:
         if project.id is None or not project.project_generation:
             raise RuntimeError("Project lifetime is incomplete.")
@@ -8323,6 +9975,7 @@ def build_mcp_server() -> FastMCP:
         )
 
     def _agent_delivery_snapshot(
+        self,
         agent: Agent,
         source_project: Project,
     ) -> DeliveryAgentSnapshot:
@@ -8332,9 +9985,10 @@ def build_mcp_server() -> FastMCP:
             agent_id=agent.id,
             name=agent.name,
             generation=agent.agent_generation,
-            project=_project_delivery_snapshot(source_project),
+            project=self._project_delivery_snapshot(source_project),
         )
 
+    @staticmethod
     def _delivery_status_payload(
         result: MessageDeliveryProcessingResult,
         *,
@@ -8360,6 +10014,7 @@ def build_mcp_server() -> FastMCP:
             payload["reused"] = reused
         return payload
 
+    @staticmethod
     def _internal_delivery_idempotency_key(
         event_name: str,
         payload: dict[str, Any],
@@ -8374,6 +10029,7 @@ def build_mcp_server() -> FastMCP:
         return f"internal:{event_name}:{hashlib.sha256(canonical).hexdigest()}"
 
     async def _deliver_message(
+        self,
         ctx: Context,
         tool_name: str,
         project: Project,
@@ -8383,17 +10039,21 @@ def build_mcp_server() -> FastMCP:
         bcc_names: Sequence[str],
         subject: str,
         body_md: str,
-        attachment_paths: Sequence[str] | None,
-        convert_images_override: Optional[bool],
-        importance: str,
-        ack_required: bool,
-        thread_id: Optional[str],
-        idempotency_key: str,
-        topic: Optional[str] = None,
-        reply_to: Optional[int] = None,
-        purpose: DeliveryPurpose = "message",
+        options: _MessageDeliveryOptions,
     ) -> dict[str, Any]:
         """Accept, publish, and finalize one immutable message delivery."""
+        _project_delivery_snapshot = self._project_delivery_snapshot
+        _agent_delivery_snapshot = self._agent_delivery_snapshot
+        _delivery_status_payload = self._delivery_status_payload
+        attachment_paths = options.attachment_paths
+        convert_images_override = options.convert_images_override
+        importance = options.importance
+        ack_required = options.ack_required
+        thread_id = options.thread_id
+        idempotency_key = options.idempotency_key
+        topic = options.topic
+        reply_to = options.reply_to
+        purpose = options.purpose
         if attachment_paths is not None or convert_images_override is not None:
             raise ToolExecutionError(
                 "ATTACHMENTS_NOT_SUPPORTED",
@@ -8416,24 +10076,7 @@ def build_mcp_server() -> FastMCP:
         # Resolve canonical identities first, then deduplicate by immutable row
         # id. Name-only deduplication is insufficient because lookups are case
         # insensitive and ``BlueLake``/``bluelake`` name the same agent.
-        combined_names = [*to_names, *cc_names, *bcc_names]
-        agent_map = await _get_agents_batch(project, combined_names)
-        recipient_groups: dict[str, list[Agent]] = {"to": [], "cc": [], "bcc": []}
-        claimed_ids: set[int] = set()
-        for kind, names in (
-            ("to", to_names),
-            ("cc", cc_names),
-            ("bcc", bcc_names),
-        ):
-            for name in names:
-                agent = agent_map[name]
-                if agent.id is None:
-                    raise RuntimeError("Recipient lifetime is incomplete.")
-                if agent.id in claimed_ids:
-                    continue
-                claimed_ids.add(agent.id)
-                recipient_groups[kind].append(agent)
-
+        recipient_groups = await self._resolve_delivery_recipients(project, to_names, cc_names, bcc_names)
         to_agents = recipient_groups["to"]
         cc_agents = recipient_groups["cc"]
         bcc_agents = recipient_groups["bcc"]
@@ -8533,13 +10176,7 @@ def build_mcp_server() -> FastMCP:
             sender_project_slug=sender_project.slug,
         )
 
-        resolved_settings = get_settings()
-        window_uuid = getattr(resolved_settings, "window_identity_uuid", "") or ""
-        if window_uuid and _validate_window_uuid(window_uuid):
-            window_identity = await _get_window_identity(project, window_uuid)
-            if window_identity is not None:
-                message_payload["window_id"] = window_identity.window_uuid
-                message_payload["window_display_name"] = window_identity.display_name
+        await self._add_delivery_window_identity(project, message_payload)
 
         if processing.published_now:
             await emit_published_delivery_notifications(processing.delivery_id)
@@ -8550,6 +10187,35 @@ def build_mcp_server() -> FastMCP:
         )
         return {"delivery": delivery_payload, "message": message_payload}
 
+    @staticmethod
+    async def _resolve_delivery_recipients(
+        project: Project, to_names: Sequence[str], cc_names: Sequence[str], bcc_names: Sequence[str]
+    ) -> dict[str, list[Agent]]:
+        agent_map = await _get_agents_batch(project, [*to_names, *cc_names, *bcc_names])
+        recipient_groups: dict[str, list[Agent]] = {"to": [], "cc": [], "bcc": []}
+        claimed_ids: set[int] = set()
+        for kind, names in (("to", to_names), ("cc", cc_names), ("bcc", bcc_names)):
+            for name in names:
+                agent = agent_map[name]
+                if agent.id is None:
+                    raise RuntimeError("Recipient lifetime is incomplete.")
+                if agent.id in claimed_ids:
+                    continue
+                claimed_ids.add(agent.id)
+                recipient_groups[kind].append(agent)
+        return recipient_groups
+
+    @staticmethod
+    async def _add_delivery_window_identity(project: Project, message_payload: dict[str, Any]) -> None:
+        resolved_settings = get_settings()
+        window_uuid = getattr(resolved_settings, "window_identity_uuid", "") or ""
+        if window_uuid and _validate_window_uuid(window_uuid):
+            window_identity = await _get_window_identity(project, window_uuid)
+            if window_identity is not None:
+                message_payload["window_id"] = window_identity.window_uuid
+                message_payload["window_display_name"] = window_identity.display_name
+
+    @staticmethod
     def _extract_delivery_error_payload(payload: Any) -> dict[str, Any] | None:
         if not isinstance(payload, dict):
             return None
@@ -8558,17 +10224,20 @@ def build_mcp_server() -> FastMCP:
             return None
         return dict(error_payload)
 
+    @staticmethod
     def _with_delivery_project(error_payload: dict[str, Any], project: Project) -> dict[str, Any]:
         payload = dict(error_payload)
         payload.setdefault("project", project.human_key)
         return payload
 
-    def _delivery_failure_from_exception(project: Project, exc: Exception) -> dict[str, Any]:
+    def _delivery_failure_from_exception(self, project: Project, exc: Exception) -> dict[str, Any]:
+        _with_delivery_project = self._with_delivery_project
         if isinstance(exc, ToolExecutionError):
             return _with_delivery_project(exc.to_payload()["error"], project)
         message = str(exc).strip() or f"Failed to deliver message to project '{project.human_key}'."
         return _with_delivery_project({"type": "DELIVERY_FAILED", "message": message}, project)
 
+    @staticmethod
     def _contact_targets_same_identity(
         source_project: Project,
         source_agent: Agent,
@@ -8588,6 +10257,7 @@ def build_mcp_server() -> FastMCP:
         )
 
     def _raise_if_self_contact(
+        self,
         source_project: Project,
         source_agent: Agent,
         target_project: Project,
@@ -8595,7 +10265,7 @@ def build_mcp_server() -> FastMCP:
         *,
         action: str,
     ) -> None:
-        if not _contact_targets_same_identity(source_project, source_agent, target_project, target_agent):
+        if not self._contact_targets_same_identity(source_project, source_agent, target_project, target_agent):
             return
         raise ToolExecutionError(
             "INVALID_ARGUMENT",
@@ -8605,17 +10275,19 @@ def build_mcp_server() -> FastMCP:
         )
 
     def _collect_delivery_result(
+        self,
         deliveries: list[dict[str, Any]],
         delivery_errors: list[dict[str, Any]],
         project: Project,
         payload: dict[str, Any],
     ) -> None:
-        error_payload = _extract_delivery_error_payload(payload)
+        error_payload = self._extract_delivery_error_payload(payload)
         if error_payload is not None:
-            delivery_errors.append(_with_delivery_project(error_payload, project))
+            delivery_errors.append(self._with_delivery_project(error_payload, project))
             return
         deliveries.append({"project": project.human_key, **payload})
 
+    @staticmethod
     def _summarize_delivery_failures(
         delivery_errors: Sequence[dict[str, Any]],
         *,
@@ -8629,6 +10301,7 @@ def build_mcp_server() -> FastMCP:
             "errors": [dict(error) for error in delivery_errors],
         }
 
+    @staticmethod
     async def _contact_request_notification_exists(
         project: Project,
         sender: Agent,
@@ -8651,9 +10324,51 @@ def build_mcp_server() -> FastMCP:
             )
             return existing.first() is not None
 
-    @mcp.tool(name="health_check", description="Return basic readiness information for the Agent Mail server.")
-    @_instrument_tool("health_check", cluster=CLUSTER_SETUP, capabilities={"infrastructure"}, complexity="low")
-    async def health_check(ctx: Context, format: Optional[str] = None) -> dict[str, Any]:
+    @staticmethod
+    async def _get_product_by_key(session: AsyncSession, key: str) -> Optional[Product]:
+        # Key may match product_uid or name (case-sensitive by default).
+        stmt = select(Product).where(cast(Any, (Product.product_uid == key) | (Product.name == key)))
+        res = await session.execute(stmt)
+        return res.scalars().first()
+
+
+    def _register_bound_tool(
+        self,
+        mcp: FastMCP,
+        method_name: str,
+        tool_options: dict[str, Any],
+        instrumentation: dict[str, Any],
+    ) -> None:
+        """Apply request instrumentation and registration to this instance only."""
+        method = getattr(self, method_name)
+        instrumented = _instrument_tool(tool_options["name"], **instrumentation)(method)
+        registered = mcp.tool(**tool_options)(instrumented)
+        # Cross-tool calls use the same instrumented callable as the wire tool.
+        setattr(self, method_name, registered)
+
+    def _register_declared_tools(self, mcp: FastMCP, owner: type) -> None:
+        """Register this group's declarations in source order on one server."""
+        for method_name, method in vars(owner).items():
+            declaration = getattr(method, "_mcp_tool_registration", None)
+            if isinstance(declaration, _MCPToolRegistration):
+                self._register_bound_tool(
+                    mcp, method_name, declaration.tool_options, declaration.instrumentation
+                )
+
+    def _register_declared_tool(self, mcp: FastMCP, method_name: str) -> None:
+        """Register one declaration where tools and resources are interleaved."""
+        declaration = getattr(type(self), method_name)._mcp_tool_registration
+        self._register_bound_tool(
+            mcp, method_name, declaration.tool_options, declaration.instrumentation
+        )
+
+
+class _MCPServerTools(_MCPServerRuntime):
+    @_MCPToolRegistration(
+        {"name": "health_check", "description": "Return basic readiness information for the Agent Mail server."},
+        {"cluster": CLUSTER_SETUP, "capabilities": {"infrastructure"}, "complexity": "low"},
+    )
+    async def health_check(self, ctx: Context, format: Optional[str] = None) -> dict[str, Any]:
         """
         Quick readiness probe for agents and orchestrators.
 
@@ -8706,6 +10421,7 @@ def build_mcp_server() -> FastMCP:
         - Call `health_check`.
         - If status != ok, sleep/retry with backoff and log `environment`/`http_host`/`http_port`.
         """
+        settings = self.settings
         await ctx.info("Running health check.")
         database_status: str | None = None
         try:
@@ -8729,9 +10445,12 @@ def build_mcp_server() -> FastMCP:
             **_public_runtime_descriptor(settings),
         }
 
-    @mcp.tool(name="ensure_project")
-    @_instrument_tool("ensure_project", cluster=CLUSTER_SETUP, capabilities={"infrastructure", "storage"}, complexity="low", project_arg="human_key")
+    @_MCPToolRegistration(
+        {"name": "ensure_project"},
+        {"cluster": CLUSTER_SETUP, "capabilities": {"infrastructure", "storage"}, "complexity": "low", "project_arg": "human_key"},
+    )
     async def ensure_project(
+        self,
         ctx: Context,
         human_key: str,
         identity_mode: Optional[str] = None,
@@ -8810,6 +10529,8 @@ def build_mcp_server() -> FastMCP:
         - Safe to call multiple times. If the project already exists, the existing
           record is returned and the archive is ensured on disk (no destructive changes).
         """
+        settings = self.settings
+        _ctx_info_safe = self._ctx_info_safe
         # Validate that human_key is an absolute path-like project key (cross-platform).
         # It need not exist on disk - it is an opaque project KEY, not a filesystem probe.
         if not _is_absolute_project_key(human_key):
@@ -8845,9 +10566,12 @@ def build_mcp_server() -> FastMCP:
                 payload[key] = identity_payload.get(key)
         return payload
 
-    @mcp.tool(name="register_agent")
-    @_instrument_tool("register_agent", cluster=CLUSTER_IDENTITY, capabilities={"identity"}, agent_arg="name", project_arg="project_key")
+    @_MCPToolRegistration(
+        {"name": "register_agent"},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity"}, "agent_arg": "name", "project_arg": "project_key"},
+    )
     async def register_agent(
+        self,
         ctx: Context,
         project_key: str,
         program: str,
@@ -8923,6 +10647,9 @@ def build_mcp_server() -> FastMCP:
           its registration token instead of creating a replacement Agent.
         - Use the same `project_key` consistently across cooperating agents.
         """
+        _register_or_authenticate_agent = self._register_or_authenticate_agent
+        _bind_session_agent = self._bind_session_agent
+        _ctx_info_safe = self._ctx_info_safe
         _validate_program_model(program, model)
         if name is None or not name.strip():
             raise ToolExecutionError(
@@ -8932,17 +10659,7 @@ def build_mcp_server() -> FastMCP:
                 data={"field": "name"},
             )
         project = await _get_project_by_identifier(project_key)
-        if settings.tools_log_enabled:
-            try:
-                import importlib as _imp
-                _rc = _imp.import_module("rich.console")
-                _rp = _imp.import_module("rich.panel")
-                Console = _rc.Console
-                Panel = _rp.Panel
-                c = Console()
-                c.print(Panel(f"project=[bold]{project.human_key}[/]\nname=[bold]{name or '(required)'}[/]\nprogram={program}\nmodel={model}", title="tool: register_agent", border_style="green"))
-            except Exception:
-                pass
+        self._log_agent_registration(project, name, program, model)
         # sanitize attachments policy
         ap = (attachments_policy or "auto").lower()
         if ap not in {"auto", "inline", "file"}:
@@ -8984,10 +10701,24 @@ def build_mcp_server() -> FastMCP:
             result["registration_token"] = token
         else:
             result["registration_token_issued"] = False
+        await self._enrich_registration_window(project, result)
+        return result
+
+    def _log_agent_registration(self, project: Project, name: str, program: str, model: str) -> None:
+        if self.settings.tools_log_enabled:
+            try:
+                from rich.console import Console
+                from rich.panel import Panel
+                c = Console()
+                c.print(Panel(f"project=[bold]{project.human_key}[/]\nname=[bold]{name or '(required)'}[/]\nprogram={program}\nmodel={model}", title="tool: register_agent", border_style="green"))
+            except Exception:
+                pass
+
+    async def _enrich_registration_window(self, project: Project, result: dict[str, Any]) -> None:
         # Enrich with window identity info if MCP_AGENT_MAIL_WINDOW_ID is set.
         # NOTE: _get_or_create_agent already resolved this for the archive profile,
         # but propagating it via return type would churn 8+ callers for a cold-path query.
-        window_uuid = getattr(settings, "window_identity_uuid", "") or ""
+        window_uuid = getattr(self.settings, "window_identity_uuid", "") or ""
         if window_uuid and _validate_window_uuid(window_uuid):
             try:
                 wi = await _get_window_identity(project, window_uuid)
@@ -8999,17 +10730,13 @@ def build_mcp_server() -> FastMCP:
             if wi is not None:
                 result["window_id"] = wi.window_uuid
                 result["window_display_name"] = wi.display_name
-        return result
 
-    @mcp.tool(name="start_agent_execution")
-    @_instrument_tool(
-        "start_agent_execution",
-        cluster=CLUSTER_IDENTITY,
-        capabilities={"identity", "repository"},
-        project_arg="project_key",
-        agent_arg="agent_name",
+    @_MCPToolRegistration(
+        {"name": "start_agent_execution"},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity", "repository"}, "project_arg": "project_key", "agent_arg": "agent_name"},
     )
     async def start_agent_execution(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -9035,6 +10762,8 @@ def build_mcp_server() -> FastMCP:
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """Start and bind one session/subagent lifetime to a durable Agent."""
+        _authenticate_agent = self._authenticate_agent
+        _bind_session_execution = self._bind_session_execution
         project = await _get_project_by_identifier(project_key)
         agent = await _authenticate_agent(
             ctx,
@@ -9106,18 +10835,7 @@ def build_mcp_server() -> FastMCP:
         )
         normalized_branch = _bounded_execution_text("branch", branch, 512)
         normalized_head = _bounded_execution_text("head_sha", head_sha, 40)
-        if normalized_kind == "session" and normalized_parent_id is not None:
-            raise ToolExecutionError(
-                "INVALID_PARENT_EXECUTION",
-                "A session execution cannot have a parent_execution_id.",
-                data={"parent_execution_id": normalized_parent_id},
-            )
-        if normalized_kind == "subagent" and normalized_parent_id is None:
-            raise ToolExecutionError(
-                "PARENT_EXECUTION_REQUIRED",
-                "A subagent execution requires an active parent_execution_id.",
-                data={"kind": normalized_kind},
-            )
+        self._validate_execution_parent_kind(normalized_kind, normalized_parent_id)
         if normalized_head is not None:
             normalized_head = normalized_head.lower()
             if not re.fullmatch(r"[0-9a-f]{40}", normalized_head):
@@ -9130,129 +10848,20 @@ def build_mcp_server() -> FastMCP:
         now = _naive_utc()
         reused = False
         async with get_immediate_session() as session:
-            db_project = await session.get(Project, project.id)
-            db_agent = await session.get(Agent, agent.id)
-            if (
-                db_project is None
-                or db_project.project_generation != project.project_generation
-                or db_agent is None
-                or db_agent.project_id != project.id
-                or db_agent.agent_generation != agent.agent_generation
-                or db_agent.provisioning_state != "active"
-            ):
-                raise ToolExecutionError(
-                    "AGENT_IDENTITY_STALE",
-                    "The authenticated project or Agent lifetime no longer exists.",
-                    recoverable=True,
-                    data={"project_key": project.human_key, "agent_name": agent.name},
-                )
-            if db_agent.retired_at is not None:
-                raise ToolExecutionError(
-                    "AGENT_RETIRED",
-                    f"Agent '{agent.name}' is retired and cannot start an execution.",
-                    recoverable=False,
-                    data={"project_key": project.human_key, "agent_name": agent.name},
-                )
-            parent: AgentExecution | None = None
-            if normalized_parent_id is not None:
-                parent = await session.get(AgentExecution, normalized_parent_id)
-                if (
-                    parent is None
-                    or parent.project_id != project.id
-                    or parent.agent_id != agent.id
-                ):
-                    raise ToolExecutionError(
-                        "INVALID_PARENT_EXECUTION",
-                        "Parent execution must belong to the same project and Agent.",
-                        data={"parent_execution_id": normalized_parent_id},
-                    )
-                if parent.status != "active":
-                    raise ToolExecutionError(
-                        "PARENT_EXECUTION_NOT_ACTIVE",
-                        f"Parent execution '{parent.id}' is '{parent.status}', not active.",
-                        data={"parent_execution_id": parent.id, "status": parent.status},
-                    )
-                parent_is_bound = (
-                    _session_execution_id(ctx, project, agent) == parent.id
-                )
-                if not parent_is_bound and (
-                    not parent_execution_token
-                    or not hmac.compare_digest(
-                        hashlib.sha256(
-                            parent_execution_token.encode("utf-8")
-                        ).hexdigest(),
-                        parent.execution_token_hash,
-                    )
-                ):
-                    raise ToolExecutionError(
-                        "EXECUTION_CAPABILITY_MISMATCH",
-                        f"Invalid parent_execution_token for execution '{parent.id}'.",
-                        recoverable=False,
-                        data={"parent_execution_id": parent.id},
-                    )
-
-            existing_stmt = select(AgentExecution).where(
-                cast(Any, AgentExecution.client_name) == normalized_client_name,
-                cast(Any, AgentExecution.external_id) == normalized_external_id,
-                cast(Any, AgentExecution.kind) == normalized_kind,
+            await self._validate_execution_start_lifetime(session, project, agent)
+            await self._validate_start_execution_parent(
+                session, ctx, project, agent, normalized_parent_id, parent_execution_token
             )
-            if normalized_kind == "session":
-                existing_stmt = existing_stmt.where(
-                    cast(Any, AgentExecution.agent_id) == agent.id,
-                    cast(Any, AgentExecution.parent_execution_id).is_(None),
-                )
-            else:
-                existing_stmt = existing_stmt.where(
-                    cast(Any, AgentExecution.parent_execution_id)
-                    == normalized_parent_id
-                )
-            existing_result = await session.execute(existing_stmt)
-            execution = existing_result.scalars().first()
+            execution = await self._find_start_execution(
+                session, agent.id, normalized_client_name, normalized_external_id,
+                normalized_kind, normalized_parent_id,
+            )
             if execution is not None:
-                if not hmac.compare_digest(
-                    execution_token_hash, execution.execution_token_hash
-                ):
-                    raise ToolExecutionError(
-                        "EXECUTION_CAPABILITY_MISMATCH",
-                        "Idempotent start requires the original execution_token.",
-                        recoverable=False,
-                        data={"execution_id": execution.id},
-                    )
-                if execution.status != "active":
-                    raise ToolExecutionError(
-                        "EXECUTION_ALREADY_ENDED",
-                        (
-                            f"Execution external_id '{normalized_external_id}' already ended "
-                            f"as '{execution.status}' and cannot be reactivated."
-                        ),
-                        recoverable=False,
-                        data=_agent_execution_to_dict(execution),
-                    )
-                immutable_existing = (
-                    execution.project_id,
-                    execution.agent_id,
-                    execution.kind,
-                    execution.parent_execution_id,
-                    execution.client_name,
-                    execution.turn_id if execution.kind == "subagent" else None,
-                    execution.agent_type if execution.kind == "subagent" else None,
+                self._validate_reused_start_execution(
+                    execution, execution_token_hash, normalized_external_id, project, agent,
+                    normalized_kind, normalized_parent_id, normalized_client_name,
+                    normalized_turn_id, normalized_agent_type,
                 )
-                immutable_requested = (
-                    project.id,
-                    agent.id,
-                    normalized_kind,
-                    normalized_parent_id,
-                    normalized_client_name,
-                    normalized_turn_id if normalized_kind == "subagent" else None,
-                    normalized_agent_type if normalized_kind == "subagent" else None,
-                )
-                if immutable_existing != immutable_requested:
-                    raise ToolExecutionError(
-                        "EXECUTION_CONFLICT",
-                        "An active execution with this external_id has different immutable identity metadata.",
-                        recoverable=False,
-                        data={"execution_id": execution.id, "external_id": normalized_external_id},
-                    )
                 reused = True
                 execution.task_description = normalized_task
                 execution.lifecycle_protocol_version = max(
@@ -9325,15 +10934,166 @@ def build_mcp_server() -> FastMCP:
             response["warnings"] = [protocol_warning]
         return response
 
-    @mcp.tool(name="heartbeat_agent_execution")
-    @_instrument_tool(
-        "heartbeat_agent_execution",
-        cluster=CLUSTER_IDENTITY,
-        capabilities={"identity", "repository"},
-        project_arg="project_key",
-        agent_arg="agent_name",
+    @staticmethod
+    def _validate_execution_parent_kind(kind: str, parent_id: str | None) -> None:
+        if kind == "session" and parent_id is not None:
+            raise ToolExecutionError(
+                "INVALID_PARENT_EXECUTION",
+                "A session execution cannot have a parent_execution_id.",
+                data={"parent_execution_id": parent_id},
+            )
+        if kind == "subagent" and parent_id is None:
+            raise ToolExecutionError(
+                "PARENT_EXECUTION_REQUIRED",
+                "A subagent execution requires an active parent_execution_id.",
+                data={"kind": kind},
+            )
+
+    @staticmethod
+    async def _validate_execution_start_lifetime(
+        session: AsyncSession, project: Project, agent: Agent
+    ) -> None:
+        db_project = await session.get(Project, project.id)
+        db_agent = await session.get(Agent, agent.id)
+        if (
+            db_project is None
+            or db_project.project_generation != project.project_generation
+            or db_agent is None
+            or db_agent.project_id != project.id
+            or db_agent.agent_generation != agent.agent_generation
+            or db_agent.provisioning_state != "active"
+        ):
+            raise ToolExecutionError(
+                "AGENT_IDENTITY_STALE",
+                "The authenticated project or Agent lifetime no longer exists.",
+                recoverable=True,
+                data={"project_key": project.human_key, "agent_name": agent.name},
+            )
+        if db_agent.retired_at is not None:
+            raise ToolExecutionError(
+                "AGENT_RETIRED",
+                f"Agent '{agent.name}' is retired and cannot start an execution.",
+                recoverable=False,
+                data={"project_key": project.human_key, "agent_name": agent.name},
+            )
+
+    async def _validate_start_execution_parent(
+        self,
+        session: AsyncSession,
+        ctx: Context,
+        project: Project,
+        agent: Agent,
+        parent_id: str | None,
+        parent_token: str | None,
+    ) -> None:
+        if parent_id is None:
+            return
+        parent = await session.get(AgentExecution, parent_id)
+        if parent is None or parent.project_id != project.id or parent.agent_id != agent.id:
+            raise ToolExecutionError(
+                "INVALID_PARENT_EXECUTION",
+                "Parent execution must belong to the same project and Agent.",
+                data={"parent_execution_id": parent_id},
+            )
+        if parent.status != "active":
+            raise ToolExecutionError(
+                "PARENT_EXECUTION_NOT_ACTIVE",
+                f"Parent execution '{parent.id}' is '{parent.status}', not active.",
+                data={"parent_execution_id": parent.id, "status": parent.status},
+            )
+        parent_is_bound = self._session_execution_id(ctx, project, agent) == parent.id
+        if not parent_is_bound and (
+            not parent_token
+            or not hmac.compare_digest(
+                hashlib.sha256(parent_token.encode("utf-8")).hexdigest(),
+                parent.execution_token_hash,
+            )
+        ):
+            raise ToolExecutionError(
+                "EXECUTION_CAPABILITY_MISMATCH",
+                f"Invalid parent_execution_token for execution '{parent.id}'.",
+                recoverable=False,
+                data={"parent_execution_id": parent.id},
+            )
+
+    @staticmethod
+    async def _find_start_execution(
+        session: AsyncSession,
+        agent_id: int,
+        client_name: str,
+        external_id: str,
+        kind: str,
+        parent_id: str | None,
+    ) -> AgentExecution | None:
+        existing_stmt = select(AgentExecution).where(
+            cast(Any, AgentExecution.client_name) == client_name,
+            cast(Any, AgentExecution.external_id) == external_id,
+            cast(Any, AgentExecution.kind) == kind,
+        )
+        if kind == "session":
+            existing_stmt = existing_stmt.where(
+                cast(Any, AgentExecution.agent_id) == agent_id,
+                cast(Any, AgentExecution.parent_execution_id).is_(None),
+            )
+        else:
+            existing_stmt = existing_stmt.where(
+                cast(Any, AgentExecution.parent_execution_id) == parent_id
+            )
+        existing_result = await session.execute(existing_stmt)
+        return existing_result.scalars().first()
+
+    @staticmethod
+    def _validate_reused_start_execution(
+        execution: AgentExecution,
+        token_hash: str,
+        external_id: str,
+        project: Project,
+        agent: Agent,
+        kind: str,
+        parent_id: str | None,
+        client_name: str,
+        turn_id: str | None,
+        agent_type: str | None,
+    ) -> None:
+        if not hmac.compare_digest(token_hash, execution.execution_token_hash):
+            raise ToolExecutionError(
+                "EXECUTION_CAPABILITY_MISMATCH",
+                "Idempotent start requires the original execution_token.",
+                recoverable=False,
+                data={"execution_id": execution.id},
+            )
+        if execution.status != "active":
+            raise ToolExecutionError(
+                "EXECUTION_ALREADY_ENDED",
+                f"Execution external_id '{external_id}' already ended as '{execution.status}' and cannot be reactivated.",
+                recoverable=False,
+                data=_agent_execution_to_dict(execution),
+            )
+        immutable_existing = (
+            execution.project_id, execution.agent_id, execution.kind,
+            execution.parent_execution_id, execution.client_name,
+            execution.turn_id if execution.kind == "subagent" else None,
+            execution.agent_type if execution.kind == "subagent" else None,
+        )
+        immutable_requested = (
+            project.id, agent.id, kind, parent_id, client_name,
+            turn_id if kind == "subagent" else None,
+            agent_type if kind == "subagent" else None,
+        )
+        if immutable_existing != immutable_requested:
+            raise ToolExecutionError(
+                "EXECUTION_CONFLICT",
+                "An active execution with this external_id has different immutable identity metadata.",
+                recoverable=False,
+                data={"execution_id": execution.id, "external_id": external_id},
+            )
+
+    @_MCPToolRegistration(
+        {"name": "heartbeat_agent_execution"},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity", "repository"}, "project_arg": "project_key", "agent_arg": "agent_name"},
     )
     async def heartbeat_agent_execution(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -9353,6 +11113,9 @@ def build_mcp_server() -> FastMCP:
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """Heartbeat an active execution and optionally refresh observed metadata."""
+        _authenticate_agent = self._authenticate_agent
+        _resolve_agent_execution = self._resolve_agent_execution
+        _bind_session_execution = self._bind_session_execution
         project = await _get_project_by_identifier(project_key)
         agent = await _authenticate_agent(
             ctx,
@@ -9437,15 +11200,12 @@ def build_mcp_server() -> FastMCP:
             response["warnings"] = [protocol_warning]
         return response
 
-    @mcp.tool(name="end_agent_execution")
-    @_instrument_tool(
-        "end_agent_execution",
-        cluster=CLUSTER_IDENTITY,
-        capabilities={"identity", "file_reservations"},
-        project_arg="project_key",
-        agent_arg="agent_name",
+    @_MCPToolRegistration(
+        {"name": "end_agent_execution"},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity", "file_reservations"}, "project_arg": "project_key", "agent_arg": "agent_name"},
     )
     async def end_agent_execution(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -9457,6 +11217,9 @@ def build_mcp_server() -> FastMCP:
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """End an execution tree and atomically release only its claims."""
+        _authenticate_agent = self._authenticate_agent
+        _resolve_agent_execution = self._resolve_agent_execution
+        _clear_execution_bindings = self._clear_execution_bindings
         terminal_status = status.strip().lower()
         requested_protocol_version, protocol_warning = _validate_execution_protocol(
             lifecycle_protocol_version,
@@ -9491,97 +11254,6 @@ def build_mcp_server() -> FastMCP:
         )
         assert execution is not None
 
-        async def _reconcile_terminal_retry(
-            terminal_execution: AgentExecution,
-        ) -> dict[str, Any]:
-            """Repair post-commit archive artifacts on an idempotent end retry."""
-            async with get_session() as session:
-                execution_rows = await _load_execution_descendant_rows(
-                    session,
-                    [terminal_execution.id],
-                    project_id=cast(int, project.id),
-                    active_only=False,
-                )
-                lineage_rows = await _load_execution_lineage_rows(
-                    session,
-                    [terminal_execution.id],
-                    project_id=cast(int, project.id),
-                )
-                terminal_descendants = [
-                    descendant
-                    for descendant in _execution_descendants_all_child_first(
-                        execution_rows,
-                        terminal_execution.id,
-                    )
-                    if descendant.status != "active"
-                ]
-                descendant_ids = [
-                    descendant.id for descendant in terminal_descendants
-                ]
-                terminal_ids = {terminal_execution.id, *descendant_ids}
-
-            _clear_execution_bindings(terminal_ids)
-            archive_warnings: list[str] = []
-            reconciled_reservation_artifacts = 0
-            try:
-                reconciled_reservation_artifacts = (
-                    await _reconcile_pending_file_reservation_artifacts(project)
-                )
-            except Exception as exc:
-                archive_warnings.append(f"reservations: {exc}")
-                logger.exception(
-                    "execution_end.retry_reservation_archive_failed",
-                    extra={"execution_id": terminal_execution.id},
-                )
-
-            released_at = (
-                _ensure_utc(terminal_execution.ended_ts)
-                or datetime.now(timezone.utc)
-            )
-            released_build_slots = 0
-            try:
-                released_build_slots = (
-                    await _release_build_slot_artifacts_for_executions(
-                        project,
-                        terminal_ids,
-                        released_at,
-                    )
-                )
-                await _ack_execution_build_slot_reconciliation(
-                    terminal_ids,
-                    released_at,
-                )
-            except Exception as exc:
-                archive_warnings.append(f"build slots: {exc}")
-                logger.exception(
-                    "execution_end.retry_build_slot_archive_failed",
-                    extra={"execution_id": terminal_execution.id},
-                )
-
-            ancestor_ids = _execution_ancestor_ids(
-                lineage_rows,
-                terminal_execution,
-            )
-            retry_payload: dict[str, Any] = {
-                "execution": _agent_execution_to_dict(
-                    terminal_execution,
-                    ancestor_execution_ids=ancestor_ids,
-                ),
-                "already_ended": True,
-                "descendants_ended": 0,
-                "descendant_execution_ids": descendant_ids,
-                "released_reservations": 0,
-                "reconciled_reservation_artifacts": (
-                    reconciled_reservation_artifacts
-                ),
-                "released_build_slots": released_build_slots,
-            }
-            if archive_warnings:
-                retry_payload["archive_warning"] = "; ".join(archive_warnings)
-            if protocol_warning is not None:
-                retry_payload["warnings"] = [protocol_warning]
-            return retry_payload
-
         if execution.status != "active":
             if execution.status != terminal_status:
                 raise ToolExecutionError(
@@ -9593,7 +11265,7 @@ def build_mcp_server() -> FastMCP:
                     recoverable=False,
                     data=_agent_execution_to_dict(execution),
                 )
-            return await _reconcile_terminal_retry(execution)
+            return await self._reconcile_terminal_retry(project, execution, protocol_warning)
 
         now = _naive_utc()
         released_reservations: list[FileReservation] = []
@@ -9613,57 +11285,43 @@ def build_mcp_server() -> FastMCP:
                 execution = db_execution
                 already_ended_after_lock = True
             else:
-                db_execution.lifecycle_protocol_version = max(
-                    db_execution.lifecycle_protocol_version,
-                    requested_protocol_version,
+                descendant_ids, released_reservations = await self._end_execution_tree(
+                    session, project, db_execution, terminal_status, requested_protocol_version, now
                 )
-                execution_rows = await _load_execution_descendant_rows(
-                    session,
-                    [db_execution.id],
-                    project_id=cast(int, project.id),
-                    active_only=True,
-                )
-                descendants = _execution_descendants_child_first(
-                    execution_rows, db_execution.id
-                )
-                descendant_ids = [item.id for item in descendants]
-                ending_ids = [*descendant_ids, db_execution.id]
-                reservation_result = await session.execute(
-                    select(FileReservation).where(
-                        cast(Any, FileReservation.execution_id).in_(ending_ids),
-                        cast(Any, FileReservation.origin) == "auto",
-                        cast(Any, FileReservation.released_ts).is_(None),
-                    )
-                )
-                released_reservations = list(reservation_result.scalars().all())
-                for reservation in released_reservations:
-                    reservation.released_ts = now
-                    session.add(reservation)
-                # Storage refuses to terminalize an execution while any of its
-                # active claims remain. Flush claims before the first child.
-                await session.flush()
-                for descendant in descendants:
-                    descendant.status = "cancelled"
-                    descendant.last_active_ts = now
-                    descendant.ended_ts = now
-                    session.add(descendant)
-                    # The parent trigger requires strict child-first order; do
-                    # not leave ORM statement ordering to chance.
-                    await session.flush()
-                db_execution.status = terminal_status
-                db_execution.last_active_ts = now
-                db_execution.ended_ts = now
-                session.add(db_execution)
-                await session.flush()
                 await session.commit()
                 await session.refresh(db_execution)
                 execution = db_execution
 
         if already_ended_after_lock:
-            return await _reconcile_terminal_retry(execution)
+            return await self._reconcile_terminal_retry(project, execution, protocol_warning)
 
         ending_id_set = {execution.id, *descendant_ids}
         _clear_execution_bindings(ending_id_set)
+        archive_warning, released_build_slots = await self._reconcile_ended_execution(
+            project, execution.id, ending_id_set, now
+        )
+        ancestor_ids = await _load_execution_ancestor_ids(execution)
+        payload: dict[str, Any] = {
+            "execution": _agent_execution_to_dict(
+                execution,
+                ancestor_execution_ids=ancestor_ids,
+            ),
+            "already_ended": False,
+            "descendants_ended": len(descendant_ids),
+            "descendant_execution_ids": descendant_ids,
+            "released_reservations": len(released_reservations),
+            "released_build_slots": released_build_slots,
+        }
+        if archive_warning is not None:
+            payload["archive_warning"] = archive_warning
+        if protocol_warning is not None:
+            payload["warnings"] = [protocol_warning]
+        return payload
+
+    @staticmethod
+    async def _reconcile_ended_execution(
+        project: Project, execution_id: str, ending_id_set: set[str], now: datetime
+    ) -> tuple[str | None, int]:
         archive_warning: str | None = None
         try:
             await _reconcile_pending_file_reservation_artifacts(project)
@@ -9671,7 +11329,7 @@ def build_mcp_server() -> FastMCP:
             archive_warning = str(exc)
             logger.exception(
                 "execution_end.reservation_archive_failed",
-                extra={"execution_id": execution.id},
+                extra={"execution_id": execution_id},
             )
         released_build_slots = 0
         try:
@@ -9693,35 +11351,138 @@ def build_mcp_server() -> FastMCP:
             )
             logger.exception(
                 "execution_end.build_slot_archive_failed",
-                extra={"execution_id": execution.id},
+                extra={"execution_id": execution_id},
             )
-        ancestor_ids = await _load_execution_ancestor_ids(execution)
-        payload: dict[str, Any] = {
+        return archive_warning, released_build_slots
+
+    @staticmethod
+    async def _end_execution_tree(
+        session: AsyncSession,
+        project: Project,
+        execution: AgentExecution,
+        terminal_status: str,
+        protocol_version: int,
+        now: datetime,
+    ) -> tuple[list[str], list[FileReservation]]:
+        execution.lifecycle_protocol_version = max(
+            execution.lifecycle_protocol_version, protocol_version
+        )
+        execution_rows = await _load_execution_descendant_rows(
+            session, [execution.id], project_id=cast(int, project.id), active_only=True
+        )
+        descendants = _execution_descendants_child_first(execution_rows, execution.id)
+        descendant_ids = [item.id for item in descendants]
+        ending_ids = [*descendant_ids, execution.id]
+        reservation_result = await session.execute(
+            select(FileReservation).where(
+                cast(Any, FileReservation.execution_id).in_(ending_ids),
+                cast(Any, FileReservation.origin) == "auto",
+                cast(Any, FileReservation.released_ts).is_(None),
+            )
+        )
+        released_reservations = list(reservation_result.scalars().all())
+        for reservation in released_reservations:
+            reservation.released_ts = now
+            session.add(reservation)
+        # Storage refuses to terminalize an execution while any of its
+        # active claims remain. Flush claims before the first child.
+        await session.flush()
+        for descendant in descendants:
+            descendant.status = "cancelled"
+            descendant.last_active_ts = now
+            descendant.ended_ts = now
+            session.add(descendant)
+            # The parent trigger requires strict child-first order; do
+            # not leave ORM statement ordering to chance.
+            await session.flush()
+        execution.status = terminal_status
+        execution.last_active_ts = now
+        execution.ended_ts = now
+        session.add(execution)
+        await session.flush()
+        return descendant_ids, released_reservations
+
+    async def _reconcile_terminal_retry(
+        self,
+        project: Project,
+        terminal_execution: AgentExecution,
+        protocol_warning: str | None,
+    ) -> dict[str, Any]:
+        """Repair post-commit archive artifacts on an idempotent end retry."""
+        async with get_session() as session:
+            execution_rows = await _load_execution_descendant_rows(
+                session,
+                [terminal_execution.id],
+                project_id=cast(int, project.id),
+                active_only=False,
+            )
+            lineage_rows = await _load_execution_lineage_rows(
+                session,
+                [terminal_execution.id],
+                project_id=cast(int, project.id),
+            )
+            terminal_descendants = [
+                descendant
+                for descendant in _execution_descendants_all_child_first(
+                    execution_rows, terminal_execution.id
+                )
+                if descendant.status != "active"
+            ]
+            descendant_ids = [descendant.id for descendant in terminal_descendants]
+            terminal_ids = {terminal_execution.id, *descendant_ids}
+
+        self._clear_execution_bindings(terminal_ids)
+        archive_warnings: list[str] = []
+        reconciled_reservation_artifacts = 0
+        try:
+            reconciled_reservation_artifacts = (
+                await _reconcile_pending_file_reservation_artifacts(project)
+            )
+        except Exception as exc:
+            archive_warnings.append(f"reservations: {exc}")
+            logger.exception(
+                "execution_end.retry_reservation_archive_failed",
+                extra={"execution_id": terminal_execution.id},
+            )
+
+        released_at = _ensure_utc(terminal_execution.ended_ts) or datetime.now(timezone.utc)
+        released_build_slots = 0
+        try:
+            released_build_slots = await _release_build_slot_artifacts_for_executions(
+                project, terminal_ids, released_at
+            )
+            await _ack_execution_build_slot_reconciliation(terminal_ids, released_at)
+        except Exception as exc:
+            archive_warnings.append(f"build slots: {exc}")
+            logger.exception(
+                "execution_end.retry_build_slot_archive_failed",
+                extra={"execution_id": terminal_execution.id},
+            )
+
+        ancestor_ids = _execution_ancestor_ids(lineage_rows, terminal_execution)
+        retry_payload: dict[str, Any] = {
             "execution": _agent_execution_to_dict(
-                execution,
-                ancestor_execution_ids=ancestor_ids,
+                terminal_execution, ancestor_execution_ids=ancestor_ids
             ),
-            "already_ended": False,
-            "descendants_ended": len(descendant_ids),
+            "already_ended": True,
+            "descendants_ended": 0,
             "descendant_execution_ids": descendant_ids,
-            "released_reservations": len(released_reservations),
+            "released_reservations": 0,
+            "reconciled_reservation_artifacts": reconciled_reservation_artifacts,
             "released_build_slots": released_build_slots,
         }
-        if archive_warning is not None:
-            payload["archive_warning"] = archive_warning
+        if archive_warnings:
+            retry_payload["archive_warning"] = "; ".join(archive_warnings)
         if protocol_warning is not None:
-            payload["warnings"] = [protocol_warning]
-        return payload
+            retry_payload["warnings"] = [protocol_warning]
+        return retry_payload
 
-    @mcp.tool(name="list_agent_executions")
-    @_instrument_tool(
-        "list_agent_executions",
-        cluster=CLUSTER_IDENTITY,
-        capabilities={"identity"},
-        project_arg="project_key",
-        agent_arg="agent_name",
+    @_MCPToolRegistration(
+        {"name": "list_agent_executions"},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity"}, "project_arg": "project_key", "agent_arg": "agent_name"},
     )
     async def list_agent_executions(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -9732,6 +11493,7 @@ def build_mcp_server() -> FastMCP:
         format: Optional[str] = None,
     ) -> ToonableList:
         """List execution audit rows for one authenticated durable Agent."""
+        _authenticate_agent = self._authenticate_agent
         project = await _get_project_by_identifier(project_key)
         agent = await _authenticate_agent(
             ctx,
@@ -9773,19 +11535,22 @@ def build_mcp_server() -> FastMCP:
             for item in rows
         ]
 
-    @mcp.tool(
-        name="retire_agent",
-        description="Soft-delete an agent: mark it as retired so it stops accepting new messages while preserving message history. "
-        "Retired agents are hidden from active agent lists but visible in 'all agents' views.",
+
+    @_MCPToolRegistration(
+        {"name": "retire_agent", "description":
+         "Soft-delete an agent: mark it as retired so it stops accepting new messages while preserving message history. "
+         "Retired agents are hidden from active agent lists but visible in 'all agents' views."},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity"}, "agent_arg": "agent_name", "project_arg": "project_key"},
     )
-    @_instrument_tool("retire_agent", cluster=CLUSTER_IDENTITY, capabilities={"identity"}, agent_arg="agent_name", project_arg="project_key")
     async def retire_agent(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
         registration_token: Optional[str] = None,
     ) -> dict[str, Any]:
         """Retire an agent (soft-delete). The agent stops accepting new messages but message history is preserved."""
+        _authenticate_agent = self._authenticate_agent
         project = await _get_project_by_identifier(project_key)
         if not project:
             raise ValueError(f"Project '{project_key}' not found")
@@ -9819,22 +11584,15 @@ def build_mcp_server() -> FastMCP:
             "project_key": project_key,
         }
 
-    @mcp.tool(
-        name="sweep_stale_agents",
-        description=(
-            "Retire abandoned agents in the caller's project using the server's conservative inactivity heuristic. "
-            "The caller is never retired, the threshold has a 60-second floor, and active file reservations block "
-            "retirement by default."
-        ),
-    )
-    @_instrument_tool(
-        "sweep_stale_agents",
-        cluster=CLUSTER_IDENTITY,
-        capabilities={"identity", "file_reservations"},
-        agent_arg="agent_name",
-        project_arg="project_key",
+    @_MCPToolRegistration(
+        {"name": "sweep_stale_agents", "description":
+         "Retire abandoned agents in the caller's project using the server's conservative inactivity heuristic. "
+         "The caller is never retired, the threshold has a 60-second floor, and active file reservations block "
+         "retirement by default."},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity", "file_reservations"}, "agent_arg": "agent_name", "project_arg": "project_key"},
     )
     async def sweep_stale_agents_tool(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -9843,6 +11601,7 @@ def build_mcp_server() -> FastMCP:
         registration_token: Optional[str] = None,
     ) -> dict[str, Any]:
         """Retire stale project agents on demand without target-token custody."""
+        _authenticate_agent = self._authenticate_agent
         project = await _get_project_by_identifier(project_key)
         actor = await _authenticate_agent(
             ctx,
@@ -9874,18 +11633,20 @@ def build_mcp_server() -> FastMCP:
             "count": len(retired_names),
         }
 
-    @mcp.tool(
-        name="unretire_agent",
-        description="Restore a retired agent back to active status. The agent will resume accepting new messages.",
+    @_MCPToolRegistration(
+        {"name": "unretire_agent", "description":
+         "Restore a retired agent back to active status. The agent will resume accepting new messages."},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity"}, "agent_arg": "agent_name", "project_arg": "project_key"},
     )
-    @_instrument_tool("unretire_agent", cluster=CLUSTER_IDENTITY, capabilities={"identity"}, agent_arg="agent_name", project_arg="project_key")
     async def unretire_agent(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
         registration_token: Optional[str] = None,
     ) -> dict[str, Any]:
         """Restore a retired agent back to active status."""
+        _authenticate_agent = self._authenticate_agent
         project = await _get_project_by_identifier(project_key)
         if not project:
             raise ValueError(f"Project '{project_key}' not found")
@@ -9919,18 +11680,20 @@ def build_mcp_server() -> FastMCP:
             "project_key": project_key,
         }
 
-    @mcp.tool(
-        name="archive_project",
-        description="Soft-delete a project: mark it as archived so it is hidden from active project lists. "
-        "All messages are preserved and the project can be restored with unarchive_project.",
+    @_MCPToolRegistration(
+        {"name": "archive_project", "description":
+         "Soft-delete a project: mark it as archived so it is hidden from active project lists. "
+         "All messages are preserved and the project can be restored with unarchive_project."},
+        {"cluster": CLUSTER_SETUP, "capabilities": {"infrastructure"}, "project_arg": "project_key"},
     )
-    @_instrument_tool("archive_project", cluster=CLUSTER_SETUP, capabilities={"infrastructure"}, project_arg="project_key")
     async def archive_project(
+        self,
         ctx: Context,
         project_key: str,
         registration_token: Optional[str] = None,
     ) -> dict[str, Any]:
         """Archive a project (soft-delete). Hides from active lists, preserves all messages."""
+        _authenticate_project_admin = self._authenticate_project_admin
         project = await _get_project_by_identifier(project_key)
         if not project:
             raise ValueError(f"Project '{project_key}' not found")
@@ -9959,17 +11722,18 @@ def build_mcp_server() -> FastMCP:
             "slug": project.slug,
         }
 
-    @mcp.tool(
-        name="unarchive_project",
-        description="Restore an archived project back to active status.",
+    @_MCPToolRegistration(
+        {"name": "unarchive_project", "description": "Restore an archived project back to active status."},
+        {"cluster": CLUSTER_SETUP, "capabilities": {"infrastructure"}, "project_arg": "project_key"},
     )
-    @_instrument_tool("unarchive_project", cluster=CLUSTER_SETUP, capabilities={"infrastructure"}, project_arg="project_key")
     async def unarchive_project(
+        self,
         ctx: Context,
         project_key: str,
         registration_token: Optional[str] = None,
     ) -> dict[str, Any]:
         """Restore an archived project back to active status."""
+        _authenticate_project_admin = self._authenticate_project_admin
         project = await _get_project_by_identifier(project_key)
         if not project:
             raise ValueError(f"Project '{project_key}' not found")
@@ -9998,9 +11762,12 @@ def build_mcp_server() -> FastMCP:
             "slug": project.slug,
         }
 
-    @mcp.tool(name="whois")
-    @_instrument_tool("whois", cluster=CLUSTER_IDENTITY, capabilities={"identity", "audit"}, project_arg="project_key", agent_arg="agent_name")
+    @_MCPToolRegistration(
+        {"name": "whois"},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity", "audit"}, "agent_arg": "agent_name", "project_arg": "project_key"},
+    )
     async def whois(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -10033,6 +11800,8 @@ def build_mcp_server() -> FastMCP:
         dict
             Agent profile augmented with { recent_commits: [{hexsha, summary, authored_ts}] } when requested.
         """
+        _authenticate_agent = self._authenticate_agent
+        settings = self.settings
         project = await _get_project_by_identifier(project_key)
         agent = await _authenticate_agent(
             ctx,
@@ -10064,9 +11833,12 @@ def build_mcp_server() -> FastMCP:
         await ctx.info(f"whois for '{agent_name}' in '{project.human_key}' returned {len(recent)} commits")
         return profile
 
-    @mcp.tool(name="rotate_registration_token")
-    @_instrument_tool("rotate_registration_token", cluster=CLUSTER_IDENTITY, capabilities={"identity"}, agent_arg="agent_name", project_arg="project_key")
+    @_MCPToolRegistration(
+        {"name": "rotate_registration_token"},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity"}, "agent_arg": "agent_name", "project_arg": "project_key"},
+    )
     async def rotate_registration_token(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -10103,6 +11875,8 @@ def build_mcp_server() -> FastMCP:
             { "agent": str, "project": str, "rotated": bool,
               "already_current": bool }
         """
+        _invalidate_session_bindings = self._invalidate_session_bindings
+        _touch_agent_activity = self._touch_agent_activity
         project = await _get_project_by_identifier(project_key)
         agent = await _get_agent(project, agent_name)
         rotated_agent, already_current = await _rotate_agent_registration_token(
@@ -10127,9 +11901,12 @@ def build_mcp_server() -> FastMCP:
             "already_current": already_current,
         }
 
-    @mcp.tool(name="create_agent_identity")
-    @_instrument_tool("create_agent_identity", cluster=CLUSTER_IDENTITY, capabilities={"identity"}, agent_arg="name_hint", project_arg="project_key")
+    @_MCPToolRegistration(
+        {"name": "create_agent_identity"},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity"}, "agent_arg": "name_hint", "project_arg": "project_key"},
+    )
     async def create_agent_identity(
+        self,
         ctx: Context,
         project_key: str,
         program: str,
@@ -10183,6 +11960,9 @@ def build_mcp_server() -> FastMCP:
         }}}
         ```
         """
+        settings = self.settings
+        _bind_session_agent = self._bind_session_agent
+        _ctx_info_safe = self._ctx_info_safe
         _validate_program_model(program, model)
         if not name_hint.strip():
             raise ToolExecutionError(
@@ -10241,15 +12021,13 @@ def build_mcp_server() -> FastMCP:
         result["registration_token"] = token
         return result
 
-    @mcp.tool(name="list_window_identities")
-    @_instrument_tool(
-        "list_window_identities",
-        cluster=CLUSTER_IDENTITY,
-        capabilities={"identity"},
-        project_arg="project_key",
-        complexity="low",
+
+    @_MCPToolRegistration(
+        {"name": "list_window_identities"},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity"}, "project_arg": "project_key", "complexity": "low"},
     )
     async def list_window_identities(
+        self,
         ctx: Context,
         project_key: str,
         format: Optional[str] = None,
@@ -10294,14 +12072,12 @@ def build_mcp_server() -> FastMCP:
             })
         return {"identities": items, "count": len(items)}
 
-    @mcp.tool(name="rename_window")
-    @_instrument_tool(
-        "rename_window",
-        cluster=CLUSTER_IDENTITY,
-        capabilities={"identity", "write"},
-        project_arg="project_key",
+    @_MCPToolRegistration(
+        {"name": "rename_window"},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity", "write"}, "project_arg": "project_key"},
     )
     async def rename_window(
+        self,
         ctx: Context,
         project_key: str,
         window_uuid: str,
@@ -10371,14 +12147,12 @@ def build_mcp_server() -> FastMCP:
             "last_active_ts": _iso(wi.last_active_ts),
         }
 
-    @mcp.tool(name="expire_window")
-    @_instrument_tool(
-        "expire_window",
-        cluster=CLUSTER_IDENTITY,
-        capabilities={"identity", "write"},
-        project_arg="project_key",
+    @_MCPToolRegistration(
+        {"name": "expire_window"},
+        {"cluster": CLUSTER_IDENTITY, "capabilities": {"identity", "write"}, "project_arg": "project_key"},
     )
     async def expire_window(
+        self,
         ctx: Context,
         project_key: str,
         window_uuid: str,
@@ -10435,16 +12209,304 @@ def build_mcp_server() -> FastMCP:
             "expired_at": _iso(now),
         }
 
-    @mcp.tool(name="send_message")
-    @_instrument_tool(
-        "send_message",
-        cluster=CLUSTER_MESSAGING,
-        capabilities={"messaging", "write"},
-        project_arg="project_key",
-        agent_arg="sender_name",
+
+    @staticmethod
+    async def _delivery_recipient_is_authorized(
+        session: AsyncSession,
+        delivery: MessageDelivery | None,
+        project: Project,
+        agent: Agent,
+    ) -> bool:
+        if (
+            delivery is None
+            or delivery.project_id != project.id
+            or delivery.project_generation_snapshot != project.project_generation
+        ):
+            return False
+        recipient_result = await session.execute(
+            select(MessageDeliveryRecipient.delivery_id).where(
+                cast(Any, MessageDeliveryRecipient.delivery_id == delivery.id),
+                cast(Any, MessageDeliveryRecipient.agent_id == agent.id),
+                cast(
+                    Any,
+                    MessageDeliveryRecipient.agent_generation_snapshot == agent.agent_generation,
+                ),
+                cast(Any, MessageDeliveryRecipient.project_id_snapshot == project.id),
+            )
+        )
+        return recipient_result.first() is not None
+
+    @staticmethod
+    def _respond_to_existing_link(
+        link: AgentLink, accept: bool, now: datetime, approved_exp: datetime
+    ) -> datetime | None:
+        link.updated_ts = now
+        if not accept:
+            link.status = "blocked"
+            link.expires_ts = None
+            return None
+        is_active_approved = link.status == "approved" and (
+            link.expires_ts is None or link.expires_ts > now
+        )
+        link.status = "approved"
+        if not is_active_approved:
+            link.expires_ts = approved_exp
+            return approved_exp
+        if link.expires_ts is None:
+            return None
+        link.expires_ts = max(link.expires_ts, approved_exp)
+        return link.expires_ts
+
+
+    @staticmethod
+    async def _read_delivery_processing(
+        delivery_id: str, retry_pending: bool, sender_authorized: bool
+    ) -> MessageDeliveryProcessingResult:
+        if not retry_pending:
+            return await get_message_delivery_status(delivery_id)
+        if not sender_authorized:
+            raise ToolExecutionError(
+                "FORBIDDEN",
+                "Only the authenticated sender may retry a pending delivery.",
+                recoverable=False,
+            )
+        processing = await process_message_delivery(delivery_id)
+        if processing.published_now:
+            await emit_published_delivery_notifications(delivery_id)
+        return processing
+
+    @staticmethod
+    async def _search_messages_like(
+        ctx: Context, project: Project, viewer: Agent, query: str, limit: int
+    ) -> list[Any]:
+        fallback_terms = _extract_like_terms(query)
+        if not fallback_terms:
+            await ctx.info(f"Search query '{query}' could not be executed (FTS syntax issue), returning empty results.")
+            return []
+        clauses = []
+        params: dict[str, Any] = {"project_id": project.id, "agent_id": viewer.id, "limit": limit}
+        for idx, term in enumerate(fallback_terms):
+            key = f"t{idx}"
+            params[key] = f"%{_like_escape(term)}%"
+            clauses.append(
+                f"(m.subject LIKE :{key} ESCAPE '{_LIKE_ESCAPE_CHAR}' OR m.body_md LIKE :{key} ESCAPE '{_LIKE_ESCAPE_CHAR}')"
+            )
+        where_clause = " AND ".join(clauses)
+        async with get_session() as session:
+            result = await session.execute(
+                text(
+                    f"""
+                    SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts,
+                           m.thread_id, a.name AS sender_name,
+                           sp.id AS sender_project_id, sp.human_key AS sender_project, sp.slug AS sender_project_slug
+                    FROM messages m
+                    JOIN agents a ON m.sender_id = a.id
+                    JOIN projects sp ON a.project_id = sp.id
+                    WHERE m.project_id = :project_id
+                      AND (
+                            m.sender_id = :agent_id
+                            OR EXISTS (
+                                SELECT 1
+                                FROM message_recipients mr
+                                WHERE mr.message_id = m.id
+                                  AND mr.agent_id = :agent_id
+                            )
+                      )
+                      AND {where_clause}
+                    ORDER BY m.created_ts DESC
+                    LIMIT :limit
+                    """
+                ),
+                params,
+            )
+            rows = list(result.mappings().all())
+        await ctx.info(
+            f"FTS query failed; used LIKE fallback with {len(fallback_terms)} term(s), returned {len(rows)} result(s)."
+        )
+        return rows
+
+
+    @staticmethod
+    async def _thread_summary_rows(
+        session: AsyncSession,
+        project_id: int,
+        viewer_id: int,
+        thread_id: str,
+        limit: int,
+        sender_alias: Any,
+        sender_project_alias: Any,
+    ) -> list[tuple[Message, str]]:
+        try:
+            seed_id = int(thread_id)
+        except ValueError:
+            seed_id = None
+        criteria = [cast(Any, Message.thread_id) == thread_id]
+        if seed_id is not None:
+            criteria.append(cast(Any, Message.id) == seed_id)
+        stmt = (
+            select(Message, sender_alias.name, sender_project_alias.id, sender_project_alias.slug)
+            .join(sender_alias, cast(Any, Message.sender_id == sender_alias.id))
+            .join(sender_project_alias, sender_alias.project_id == sender_project_alias.id)
+            .where(
+                cast(Any, Message.project_id) == project_id,
+                or_(*criteria),
+                _message_visible_to_agent_clause(viewer_id),
+            )
+            .order_by(asc(cast(Any, Message.created_ts)))
+            .limit(limit)
+        )
+        raw_rows = (await session.execute(stmt)).all()
+        return [
+            (
+                row[0],
+                _sender_display_name(
+                    message_project_id=row[0].project_id,
+                    sender_name=row[1],
+                    sender_project_id=row[2],
+                    sender_project_slug=row[3],
+                ),
+            )
+            for row in raw_rows
+        ]
+
+    @staticmethod
+    def _accumulate_thread_mentions(summary: dict[str, Any], mentions: dict[str, int]) -> None:
+        for mention in summary.get("mentions", []):
+            name = str(mention.get("name", "")).strip()
+            if not name:
+                continue
+            mentions[name] = mentions.get(name, 0) + int(mention.get("count", 0) or 0)
+
+    @staticmethod
+    def _thread_digest_prompt(thread_summaries: list[dict[str, Any]]) -> str:
+        parts: list[str] = []
+        for item in thread_summaries[:8]:
+            summary = item["summary"]
+            parts.append(
+                "\n".join(
+                    [
+                        f"# Thread {item['thread_id']}",
+                        "## Key Points",
+                        *[f"- {point}" for point in summary.get("key_points", [])[:6]],
+                        "## Actions",
+                        *[f"- {action}" for action in summary.get("action_items", [])[:6]],
+                    ]
+                )
+            )
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _revise_thread_summaries(
+        thread_summaries: list[dict[str, Any]], threads_payload: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        mapping = {str(thread.get("thread_id")): thread for thread in threads_payload}
+        revised_threads = []
+        for item in thread_summaries:
+            thread_id = str(item["thread_id"])
+            if thread_id not in mapping:
+                revised_threads.append(item)
+                continue
+            summary = item["summary"].copy()
+            thread_data = mapping[thread_id]
+            if thread_data.get("key_points"):
+                summary["key_points"] = thread_data["key_points"]
+            if thread_data.get("actions"):
+                summary["action_items"] = thread_data["actions"]
+            revised_threads.append({"thread_id": item["thread_id"], "summary": summary})
+        return revised_threads
+
+    @staticmethod
+    def _apply_thread_digest(
+        parsed: dict[str, Any] | None,
+        aggregate: dict[str, Any],
+        thread_summaries: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not parsed:
+            return thread_summaries
+        refined_aggregate = parsed.get("aggregate") or {}
+        if refined_aggregate:
+            for key in ("top_mentions", "key_points", "action_items"):
+                value = refined_aggregate.get(key)
+                if value:
+                    aggregate[key] = value
+        threads_payload = parsed.get("threads") or []
+        if not threads_payload:
+            return thread_summaries
+        return _MCPServerTools._revise_thread_summaries(thread_summaries, threads_payload)
+
+    @staticmethod
+    async def _refine_thread_digest(
+        ctx: Context,
+        thread_summaries: list[dict[str, Any]],
+        aggregate: dict[str, Any],
+        llm_model: str | None,
+    ) -> list[dict[str, Any]]:
+        try:
+            # Compose compact context combining per-thread key points & actions only.
+            user = _MCPServerTools._thread_digest_prompt(thread_summaries)
+            system = (
+                "You are a senior engineer producing a crisp digest across threads. "
+                "Return JSON: { threads: [{thread_id, key_points[], actions[]}], aggregate: {top_mentions[], key_points[], action_items[]} }."
+            )
+            llm_resp = await complete_system_user(system, user, model=llm_model)
+            parsed = _parse_json_safely(llm_resp.content)
+            return _MCPServerTools._apply_thread_digest(parsed, aggregate, thread_summaries)
+        except Exception as exc:
+            await ctx.debug(f"summarize_thread.llm_skipped: {exc}")
+            return thread_summaries
+
+
+    @staticmethod
+    async def _refine_recent_summary(
+        ctx: Context,
+        rows: list[tuple[Message, str]],
+        summary_text: str,
+        thread_count: int,
+        since_hours: float,
+        llm_model: str | None,
+        truncated: bool,
+    ) -> tuple[str, str | None, float | None]:
+        import json as _json
+
+        used_model: str | None = None
+        cost_usd: float | None = None
+        try:
+            excerpts: list[str] = []
+            for msg, sender in rows[:30]:
+                tid = msg.thread_id or f"msg-{msg.id}"
+                excerpts.append(f"[{tid}] {sender}: {msg.subject}\n{msg.body_md[:400]}")
+            system = (
+                "You are a senior engineering lead. Summarize the following project messages "
+                "from the given time window into a concise JSON with keys: "
+                "key_decisions[], blockers_resolved[], work_completed[], open_questions[], "
+                "participants[], total_messages (int), total_threads (int). "
+                "Be specific and actionable."
+            )
+            user = f"Time window: last {since_hours}h\n\n" + "\n\n".join(excerpts)
+            llm_resp = await complete_system_user(system, user, model=llm_model)
+            used_model = llm_resp.model
+            cost_usd = getattr(llm_resp, "estimated_cost_usd", None)
+            parsed = _parse_json_safely(llm_resp.content)
+            if parsed:
+                # Preserve heuristic counts but use LLM text.
+                parsed["total_messages"] = len(rows)
+                parsed["total_threads"] = thread_count
+                if truncated:
+                    parsed["truncated"] = True
+                summary_text = _json.dumps(parsed)
+        except Exception as exc:
+            await ctx.debug(f"summarize_recent.llm_skipped: {exc}")
+        return summary_text, used_model, cost_usd
+
+
+    @_MCPToolRegistration(
+        {"name": "send_message"},
+        {"cluster": CLUSTER_MESSAGING, "capabilities": {"messaging", "write"},
+         "project_arg": "project_key", "agent_arg": "sender_name"},
     )
     @retry_on_db_lock(max_retries=3, base_delay=0.05, max_delay=0.5)
     async def send_message(
+        self,
         ctx: Context,
         project_key: str,
         sender_name: str,
@@ -10578,220 +12640,24 @@ def build_mcp_server() -> FastMCP:
         }}}
         ```
         """
-        idempotency_key = idempotency_key.strip()
-        if not idempotency_key or len(idempotency_key) > 128:
-            raise ToolExecutionError(
-                "INVALID_IDEMPOTENCY_KEY",
-                "idempotency_key must contain 1-128 non-whitespace characters.",
-                recoverable=True,
-                data={"argument": "idempotency_key"},
-            )
-        if attachment_paths is not None or convert_images is not None:
-            raise ToolExecutionError(
-                "ATTACHMENTS_NOT_SUPPORTED",
-                "attachment_paths and convert_images are disabled until attachments "
-                "have a bounded canonical inline representation.",
-                recoverable=True,
-                data={
-                    "attachment_paths_provided": attachment_paths is not None,
-                    "convert_images_provided": convert_images is not None,
-                },
-            )
-
+        runtime = self
+        _authenticate_agent = self._authenticate_agent
+        _session_is_bound_to_agent = self._session_is_bound_to_agent
+        macro_contact_handshake = self.macro_contact_handshake
+        request_contact = self.request_contact
+        _deliver_message = self._deliver_message
+        _collect_delivery_result = self._collect_delivery_result
+        _delivery_failure_from_exception = self._delivery_failure_from_exception
+        _summarize_delivery_failures = self._summarize_delivery_failures
+        idempotency_key = _message_idempotency_key(idempotency_key)
+        _send_check_attachments(attachment_paths, convert_images)
         project = await _get_project_by_identifier(project_key)
-
-        # Validate topic format if provided.
-        #
-        # Topics must start with an alphanumeric character and may then contain
-        # alphanumerics plus '.', '_', '-'. Allowing dots lets agents use
-        # beads_rust hierarchical IDs (e.g. ``br-abc.1``) verbatim as topics
-        # without mangling. The leading-alphanumeric anchor rejects traversal
-        # shapes like ``.``, ``..``, ``../foo`` and dotfiles. Topics are only
-        # ever stored as a DB column value, used in an index, and displayed —
-        # they are NEVER used to build filesystem paths (thread_id/message_id
-        # are the path components) — so dots are safe here, but the anchor is
-        # kept as defense-in-depth regardless.
-        if topic is not None:
-            import re as _re
-            topic = topic.strip()
-            if not topic or len(topic) > 64 or not _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", topic):
-                raise ToolExecutionError(
-                    "INVALID_TOPIC",
-                    "Topic must be 1-64 characters, start with a letter or digit, and "
-                    f"contain only alphanumerics, '.', '_', or '-'. Got: {topic!r}",
-                    recoverable=True,
-                    data={"argument": "topic", "provided": topic},
-                )
-
-        # Broadcast expansion: expand to = all agents in project (excluding sender)
-        if broadcast:
-            if to and any(t.strip() for t in to):
-                raise ToolExecutionError(
-                    "INVALID_ARGUMENT",
-                    "broadcast=true and explicit 'to' recipients are mutually exclusive. "
-                    "Set broadcast=true with an empty 'to' list, or provide explicit recipients without broadcast.",
-                    recoverable=True,
-                    data={"argument": "broadcast"},
-                )
-            await ensure_schema()
-            async with get_session() as _bcast_session:
-                _bcast_cutoff = _naive_utc() - timedelta(days=30)
-                _bcast_result = await _bcast_session.execute(
-                    select(Agent.name, Agent.contact_policy, Agent.retired_at).where(
-                        cast(Any, Agent.project_id == project.id),
-                        cast(Any, Agent.provisioning_state == "active"),
-                        cast(Any, Agent.last_active_ts > _bcast_cutoff),
-                    )
-                )
-                _bcast_rows = _bcast_result.all()
-            sender_lower = sender_name.lower().strip()
-            to = [
-                row[0] for row in _bcast_rows
-                if row[0].lower() != sender_lower
-                and (row[1] or "auto").lower() != "block_all"
-                and row[2] is None  # skip retired agents
-            ]
-            if not to:
-                await ctx.info("[warn] Broadcast: no eligible recipients found (sender is the only active agent).")
-
-        # Normalize 'to' parameter - accept single string and convert to list
-        if isinstance(to, str):
-            to = [to]
-        if not isinstance(to, list):
-            raise ToolExecutionError(
-                "INVALID_ARGUMENT",
-                "'to' must be a list of durable Agent names (for example, "
-                "['claude-linux-ci-1']) or a single Agent name string. "
-                f"Received: {type(to).__name__}",
-                recoverable=True,
-                data={"argument": "to", "received_type": type(to).__name__},
-            )
-
-        # Check for common recipient mistakes and provide helpful guidance
-        for recipient in to:
-            if not isinstance(recipient, str):
-                raise ToolExecutionError(
-                    "INVALID_ARGUMENT",
-                    f"Each recipient in 'to' must be a string (agent name). Got: {type(recipient).__name__}",
-                    recoverable=True,
-                    data={"argument": "to", "invalid_item": repr(recipient)},
-                )
-            mistake = _detect_agent_name_mistake(
-                _recipient_agent_fragment(recipient)
-            )
-            if mistake:
-                raise ToolExecutionError(
-                    mistake[0],
-                    f"Invalid recipient '{recipient}': {mistake[1]}",
-                    recoverable=True,
-                    data={
-                        "recipient": recipient,
-                        "hint": (
-                            "Use a durable client-os-host-slot Agent name, "
-                            "not a program or model name."
-                        ),
-                    },
-                )
-
-        # Normalize cc/bcc inputs and validate types for friendlier UX
-        if isinstance(cc, str):
-            cc = [cc]
-        if isinstance(bcc, str):
-            bcc = [bcc]
-        if cc is not None and not isinstance(cc, list):
-            await ctx.error("INVALID_ARGUMENT: cc must be a list of strings or a single string.")
-            raise ToolExecutionError(
-                "INVALID_ARGUMENT",
-                "cc must be a list of strings or a single string.",
-                recoverable=True,
-                data={"argument": "cc"},
-            )
-        if bcc is not None and not isinstance(bcc, list):
-            await ctx.error("INVALID_ARGUMENT: bcc must be a list of strings or a single string.")
-            raise ToolExecutionError(
-                "INVALID_ARGUMENT",
-                "bcc must be a list of strings or a single string.",
-                recoverable=True,
-                data={"argument": "bcc"},
-            )
-        if cc is not None and any(not isinstance(x, str) for x in cc):
-            await ctx.error("INVALID_ARGUMENT: cc items must be strings (agent names).")
-            raise ToolExecutionError(
-                "INVALID_ARGUMENT",
-                "cc items must be strings (agent names).",
-                recoverable=True,
-                data={"argument": "cc"},
-            )
-        if bcc is not None and any(not isinstance(x, str) for x in bcc):
-            await ctx.error("INVALID_ARGUMENT: bcc items must be strings (agent names).")
-            raise ToolExecutionError(
-                "INVALID_ARGUMENT",
-                "bcc items must be strings (agent names).",
-                recoverable=True,
-                data={"argument": "bcc"},
-            )
-
-        # Reject empty-recipient sends for non-broadcast messages.
-        #
-        # Without this guard a non-broadcast send with empty to/cc/bcc falls
-        # through every downstream step and returns ``count: 0`` while
-        # reporting success — silently dropping the message and contradicting
-        # the docstring ("If no recipients are given, the call fails."). The
-        # broadcast path is intentionally exempt: ``broadcast=true`` with no
-        # eligible recipients is a legitimately-empty result (sender is the
-        # only active agent) and is already surfaced via ctx.info above. (#189)
-        if not broadcast and not any(
-            (r or "").strip() for r in ((to or []) + (cc or []) + (bcc or []))
-        ):
-            raise ToolExecutionError(
-                "INVALID_ARGUMENT",
-                "send_message requires at least one recipient in to/cc/bcc "
-                "(or broadcast=true).",
-                recoverable=True,
-                data={"argument": "to"},
-            )
-
-        # Self-send detection: warn if sender is sending to themselves
-        sender_lower = sender_name.lower().strip()
-        all_recipients = (to or []) + (cc or []) + (bcc or [])
-        self_send_matches = [r for r in all_recipients if r.lower().strip() == sender_lower]
-        if self_send_matches:
-            await ctx.info(
-                f"[note] You ({sender_name}) are sending a message to yourself. "
-                f"This is allowed but usually not intended. To communicate with other agents, "
-                "use their durable Agent names (for example, 'claude-linux-ci-1'). To discover agents, "
-                f"use resource://agents/{project_key}."
-            )
-
-        # Subject length warning: warn if subject is too long (will be truncated in DB)
-        if len(subject) > 200:
-            await ctx.info(
-                f"[warn] Subject is {len(subject)} characters (max recommended: 80, truncated at 200). "
-                f"Long subjects may be truncated in search results. Consider moving details to the message body."
-            )
-            subject = subject[:200]
-
+        topic = _send_topic(topic)
+        inputs = _SendMessageInputs(ctx, project, sender_name, to, cc, bcc, broadcast, subject)
+        await inputs.prepare(project_key)
+        to, cc, bcc, subject = inputs.to, inputs.cc, inputs.bcc, inputs.subject
         thread_id = _validate_thread_id(thread_id)
-
-        if get_settings().tools_log_enabled:
-            try:
-                import importlib as _imp
-                _rc = _imp.import_module("rich.console")
-                _rp = _imp.import_module("rich.panel")
-                _rt = _imp.import_module("rich.text")
-                Console = _rc.Console
-                Panel = _rp.Panel
-                Text = _rt.Text
-                c = Console()
-                title = f"tool: send_message — to={len(to)} cc={len(cc or [])} bcc={len(bcc or [])}"
-                body = Text.assemble(
-                    ("project: ", "cyan"), (project.human_key, "white"), "\n",
-                    ("sender: ", "cyan"), (sender_name, "white"), "\n",
-                    ("subject: ", "cyan"), (subject[:120], "white"),
-                )
-                c.print(Panel(body, title=title, border_style="green"))
-            except Exception:
-                logger.debug("Failed to log send_message call with rich console", exc_info=True)
+        inputs.log()
         sender = await _authenticate_agent(
             ctx,
             project,
@@ -10804,843 +12670,45 @@ def build_mcp_server() -> FastMCP:
         # Enforce contact policies (per-recipient) with auto-allow heuristics
         settings_local = get_settings()
         if settings_local.contact_enforcement_enabled:
-            # allow replies always; if thread present and recipient already on thread, allow
-            auto_ok_names: set[str] = set()
-            if thread_id:
-                try:
-                    thread_rows: list[tuple[Message, str, int]]
-                    sender_alias = aliased(Agent)
-                    # Build criteria: thread_id match or numeric id seed
-                    criteria: list[Any] = [cast(Any, Message.thread_id) == thread_id]
-                    try:
-                        seed_id = int(thread_id)
-                        criteria.append(cast(Any, Message.id) == seed_id)
-                    except (ValueError, TypeError):
-                        pass  # thread_id is not numeric — expected for UUID-style IDs
-                    async with get_session() as s:
-                        stmt = (
-                            select(Message, sender_alias.name, sender_alias.project_id)
-                            .join(sender_alias, cast(Any, Message.sender_id == sender_alias.id))
-                            .where(
-                                cast(Any, Message.project_id) == project.id,
-                                or_(*criteria),
-                                _message_visible_to_agent_clause(sender.id or 0),
-                            )
-                            .limit(500)
-                        )
-                        thread_rows = [(row[0], row[1], row[2]) for row in (await s.execute(stmt)).all()]
-                        # Keep every thread-participant query inside the managed session.
-                        participants: set[str] = {
-                            n for _m, n, sender_project_id in thread_rows if n and sender_project_id == project.id
-                        }
-                        message_ids = [m.id for m, _n, _sender_project_id in thread_rows if m.id is not None]
-                        if message_ids:
-                            recipient_rows = await s.execute(
-                                select(Agent.name)
-                                .join(MessageRecipient, cast(Any, MessageRecipient.agent_id) == Agent.id)
-                                .where(cast(Any, MessageRecipient.message_id).in_(message_ids))
-                            )
-                            participants.update({row[0] for row in recipient_rows.all() if row[0]})
-                    auto_ok_names.update(participants)
-                except Exception:
-                    logger.exception("Failed to fetch thread participants for contact auto-allow (thread_id=%s)", thread_id)
-            # allow recent overlapping file_reservations contact (shared surfaces) by default
-            # best-effort: if both agents hold any file_reservation currently active, auto allow
-            now_utc = datetime.now(timezone.utc)
-            try:
-                async with get_session() as s2:
-                    file_reservation_rows = await s2.execute(
-                        select(FileReservation, Agent.name)
-                        .join(Agent, cast(Any, FileReservation.agent_id) == Agent.id)
-                        .where(FileReservation.project_id == project.id, cast(Any, FileReservation.released_ts).is_(None), cast(Any, FileReservation.expires_ts) > _naive_utc(now_utc))
-                    )
-                    name_to_file_reservations: dict[str, list[str]] = {}
-                    for c, nm in file_reservation_rows.all():
-                        name_to_file_reservations.setdefault(nm, []).append(c.path_pattern)
-                sender_file_reservations = name_to_file_reservations.get(sender.name, [])
-                for nm in to + (cc or []) + (bcc or []):
-                    # Always allow self-messages
-                    if nm == sender.name:
-                        continue
-                    their = name_to_file_reservations.get(nm, [])
-                    if sender_file_reservations and their and _file_reservations_patterns_overlap(sender_file_reservations, their):
-                        auto_ok_names.add(nm)
-            except Exception:
-                logger.exception("Failed to check file reservation overlap for contact auto-allow")
-            # For each recipient, require link unless policy/open or in auto_ok
-            blocked_recipients: list[str] = []
-            # Batch-fetch all recipient agents in a single query (eliminates N+1)
-            all_recipient_names = list(set(to + (cc or []) + (bcc or [])))
-            recipient_agents = await _get_agents_batch_lenient(project, all_recipient_names)
-            async with get_session() as s3:
-                recent_ok_names: set[str] = set()
-                ttl = timedelta(seconds=int(settings_local.contact_auto_ttl_seconds))
-                since_dt = now_utc - ttl
-                # Batch fetch recent contacts (sender -> recipients and recipients -> sender)
-                try:
-                    recipient_name_filter = list(all_recipient_names)
-                    if recipient_name_filter:
-                        sent_stmt = (
-                            select(Agent.name)
-                            .join(MessageRecipient, cast(Any, MessageRecipient.agent_id) == Agent.id)
-                            .join(Message, cast(Any, MessageRecipient.message_id) == Message.id)
-                            .where(
-                                cast(Any, Message.project_id) == project.id,
-                                cast(Any, Message.sender_id) == sender.id,
-                                cast(Any, Message.created_ts) > _naive_utc(since_dt),
-                                cast(Any, Agent.name).in_(recipient_name_filter),
-                            )
-                        )
-                        sent_rows = await s3.execute(sent_stmt)
-                        recent_ok_names.update({row[0] for row in sent_rows.all() if row[0]})
-
-                        sender_alias2 = aliased(Agent)
-                        recv_stmt = (
-                            select(sender_alias2.name)
-                            .join(Message, cast(Any, Message.sender_id) == sender_alias2.id)
-                            .join(MessageRecipient, cast(Any, MessageRecipient.message_id) == Message.id)
-                            .where(
-                                cast(Any, Message.project_id) == project.id,
-                                cast(Any, MessageRecipient.agent_id) == sender.id,
-                                cast(Any, Message.created_ts) > _naive_utc(since_dt),
-                                cast(Any, sender_alias2.name).in_(recipient_name_filter),
-                            )
-                        )
-                        recv_rows = await s3.execute(recv_stmt)
-                        recent_ok_names.update({row[0] for row in recv_rows.all() if row[0]})
-                except Exception:
-                    logger.exception("Failed to batch fetch recent contacts for auto-allow heuristics")
-                    recent_ok_names = set()
-                # Batch fetch approved agent links for these recipients
-                approved_link_ids: set[int] = set()
-                try:
-                    recipient_ids = [rec.id for rec in recipient_agents.values() if rec is not None and rec.id is not None]
-                    if recipient_ids:
-                        link_rows = await s3.execute(
-                            select(AgentLink.b_agent_id)
-                            .where(
-                                cast(Any, AgentLink.a_project_id) == project.id,
-                                cast(Any, AgentLink.a_agent_id) == sender.id,
-                                cast(Any, AgentLink.b_project_id) == project.id,
-                                _active_approved_agent_link_clause(now_utc),
-                                cast(Any, AgentLink.b_agent_id).in_(recipient_ids),
-                            )
-                        )
-                        approved_link_ids.update({row[0] for row in link_rows.all() if row and row[0] is not None})
-                except Exception:
-                    logger.exception("Failed to batch fetch approved agent links")
-                    approved_link_ids = set()
-
-                # PR #138 Bug 1: also gather names for which this sender has any
-                # approved cross-project AgentLink. When a bare name routes to
-                # another project (handled later in _route), the local-side
-                # contact-policy enforcement must not loud-fail on a same-named
-                # local shadow — the cross-project link is the explicit approval.
-                cross_project_approved_names: set[str] = set()
-                try:
-                    xp_link_rows = await s3.execute(
-                        select(Agent.name)
-                        .join(AgentLink, cast(Any, AgentLink.b_agent_id) == Agent.id)
-                        .where(
-                            cast(Any, AgentLink.a_project_id) == project.id,
-                            cast(Any, AgentLink.a_agent_id) == sender.id,
-                            cast(Any, AgentLink.b_project_id) != project.id,
-                            _active_approved_agent_link_clause(now_utc),
-                        )
-                    )
-                    for (xp_name,) in xp_link_rows.all():
-                        nm_str = (xp_name or "").strip()
-                        if not nm_str:
-                            continue
-                        cross_project_approved_names.add(nm_str.lower())
-                        sanitized_xp = sanitize_agent_name(nm_str) or nm_str
-                        cross_project_approved_names.add(sanitized_xp.lower())
-                except Exception:
-                    logger.exception("Failed to batch fetch cross-project agent links for policy bypass")
-                    cross_project_approved_names = set()
-
-                for nm in to + (cc or []) + (bcc or []):
-                    if nm in auto_ok_names:
-                        continue
-                    # PR #138 Bug 1: name resolves cross-project via approved link;
-                    # the local contact policy is irrelevant since delivery routes
-                    # to the other project's recipient (handled in _route below).
-                    nm_keys = {(nm or "").strip().lower()}
-                    sanitized_nm = sanitize_agent_name(nm or "") or ""
-                    if sanitized_nm:
-                        nm_keys.add(sanitized_nm.lower())
-                    if nm_keys & cross_project_approved_names:
-                        continue
-                    # recipient lookup (from batch-fetched dict)
-                    rec = recipient_agents.get(nm)
-                    if rec is None:
-                        continue
-                    # Reject messages to retired agents
-                    if getattr(rec, "retired_at", None) is not None:
-                        raise ToolExecutionError(
-                            "AGENT_RETIRED",
-                            f"Agent '{nm}' is retired and no longer accepts new messages. "
-                            "Use unretire_agent to restore it first.",
-                            recoverable=True,
-                            data={"agent_name": nm, "retired_at": _iso(rec.retired_at)},
-                        )
-                    rec_policy = getattr(rec, "contact_policy", "auto").lower()
-                    # allow self always
-                    if rec.name == sender.name:
-                        continue
-                    if rec_policy == "open":
-                        continue
-                    if rec_policy == "block_all":
-                        await ctx.error("CONTACT_BLOCKED: Recipient is not accepting messages.")
-                        raise ToolExecutionError(
-                            "CONTACT_BLOCKED",
-                            "Recipient is not accepting messages.",
-                            recoverable=True,
-                        )
-                    # contacts_only or auto -> must have approved link or prior contact within TTL
-                    recent_ok = rec.name in recent_ok_names
-                    if rec_policy == "auto" and recent_ok:
-                        continue
-                    # check approved AgentLink (local project)
-                    if rec.id is not None and rec.id in approved_link_ids:
-                        continue
-                    # Contact policy must be enforced regardless of ack_required flag.
-                    blocked_recipients.append(rec.name)
-
-            if blocked_recipients:
-                remedies = [
-                    "Call request_contact(project_key, from_agent, to_agent, registration_token=...) to create a pending approval request",
-                    "Have the recipient approve it with respond_contact(project_key, to_agent, from_agent, accept=True, registration_token=...)",
-                    "Use macro_contact_handshake(..., auto_accept=True, requester_registration_token=..., target_registration_token=...) only when both agents can authenticate in the same MCP session",
-                ]
-                auto_requested: list[str] = []
-                auto_approved: list[str] = []
-                # Respect explicit flag or server default ergonomics
-                effective_auto_contact = (
-                    bool(getattr(settings_local, "messaging_auto_handshake_on_block", True))
-                    if auto_contact_if_blocked is None
-                    else auto_contact_if_blocked
-                )
-                if effective_auto_contact:
-                    try:
-                        for nm in list(dict.fromkeys(blocked_recipients)):
-                            rec = recipient_agents.get(nm)
-                            if rec is None:
-                                continue
-                            try:
-                                if _session_is_bound_to_agent(ctx, project, rec):
-                                    await macro_contact_handshake(
-                                        ctx=ctx,
-                                        project_key=project.human_key,
-                                        requester=sender.name,
-                                        target=nm,
-                                        reason="in-session auto-approval by send_message",
-                                        auto_accept=True,
-                                        ttl_seconds=int(settings_local.contact_auto_ttl_seconds),
-                                        format="json",
-                                    )
-                                    auto_approved.append(nm)
-                                else:
-                                    # Pending fallback path — async human may take days to approve,
-                                    # so use the longer pending TTL (default 7 days) rather than
-                                    # the in-session auto-approval TTL (default 24h).
-                                    await request_contact(
-                                        ctx=ctx,
-                                        project_key=project.human_key,
-                                        from_agent=sender.name,
-                                        to_agent=nm,
-                                        reason="auto contact request created by send_message",
-                                        ttl_seconds=int(settings_local.contact_pending_ttl_seconds),
-                                        format="json",
-                                    )
-                                    auto_requested.append(nm)
-                            except Exception:
-                                logger.exception("Failed to auto-resolve contact for recipient %r", nm)
-
-                        if settings_local.contact_auto_retry_enabled and auto_approved:
-                            blocked_recipients = []
-                            # Re-fetch recipient agents in batch for re-evaluation
-                            recipient_agents_retry = await _get_agents_batch_lenient(project, all_recipient_names)
-                            async with get_session() as s3b:
-                                for nm in to + (cc or []) + (bcc or []):
-                                    rec = recipient_agents_retry.get(nm)
-                                    if rec is None:
-                                        continue
-                                    if rec.name == sender.name:
-                                        continue
-                                    rec_policy = getattr(rec, "contact_policy", "auto").lower()
-                                    if rec_policy == "open":
-                                        continue
-                                    # After auto-approval, link should exist; double-check
-                                    link = await s3b.execute(
-                                        select(AgentLink)
-                                        .where(
-                                            cast(Any, AgentLink.a_project_id) == project.id,
-                                            cast(Any, AgentLink.a_agent_id) == sender.id,
-                                            cast(Any, AgentLink.b_project_id) == project.id,
-                                            cast(Any, AgentLink.b_agent_id) == rec.id,
-                                            _active_approved_agent_link_clause(),
-                                        )
-                                        .limit(1)
-                                    )
-                                    if link.first() is None:
-                                        blocked_recipients.append(rec.name)
-                    except Exception:
-                        logger.exception("Failed to auto-resolve contacts or re-evaluate recipients after in-session approvals")
-                if blocked_recipients:
-                    err_type: str = "CONTACT_REQUIRED"
-                    blocked_sorted = sorted(set(blocked_recipients))
-                    recipient_list = ", ".join(blocked_sorted)
-                    sample_target = blocked_sorted[0]
-                    project_expr = repr(project.human_key)
-                    sender_expr = repr(sender.name)
-                    target_expr = repr(sample_target)
-                    err_msg_parts = [
-                        f"Contact approval required for recipients: {recipient_list}.",
-                        (
-                            "Before retrying, create a pending request with "
-                            f"`request_contact(project_key={project_expr}, from_agent={sender_expr}, "
-                            f"to_agent={target_expr})`, then have the recipient approve it with "
-                            f"`respond_contact(project_key={project_expr}, to_agent={target_expr}, "
-                            f"from_agent={sender_expr}, accept=True)`."
-                        ),
-                        "Alternatively, send your message inside a recent thread that already includes them by reusing its thread_id.",
-                    ]
-                    if auto_requested:
-                        err_msg_parts.append(
-                            "Pending contact requests were created for: "
-                            + ", ".join(sorted(set(auto_requested)))
-                            + ". Wait for approval before retrying."
-                        )
-                    if auto_approved:
-                        err_msg_parts.append(
-                            "In-session auto-approvals already ran for: "
-                            + ", ".join(sorted(set(auto_approved)))
-                            + ". Any remaining blocked recipients still need explicit approval."
-                        )
-                    err_msg: str = " ".join(err_msg_parts)
-                    err_data: dict[str, Any] = {
-                        "recipients_blocked": sorted(set(blocked_recipients)),
-                        "remedies": remedies,
-                        "auto_contact_requested": sorted(set(auto_requested)),
-                        "auto_contact_auto_approved": sorted(set(auto_approved)),
-                    }
-                    # Provide actionable sample calls
-                    try:
-                        if blocked_recipients:
-                            examples: list[dict[str, Any]] = []
-                            for nm in blocked_recipients[:3]:
-                                examples.append(
-                                    {
-                                        "tool": "request_contact",
-                                        "arguments": {
-                                            "project_key": project.human_key,
-                                            "from_agent": sender.name,
-                                            "to_agent": nm,
-                                            "ttl_seconds": int(settings_local.contact_pending_ttl_seconds),
-                                        },
-                                    }
-                                )
-                            err_data["suggested_tool_calls"] = examples
-                    except Exception:
-                        logger.exception("Failed to build suggestion examples for blocked recipients")
-                    await ctx.error(f"{err_type}: {err_msg}")
-                    raise ToolExecutionError(
-                        err_type,
-                        err_msg,
-                        recoverable=True,
-                        data=err_data,
-                    )
+            policy = _SendContactPolicy(
+                ctx, project, sender, to + (cc or []) + (bcc or []), settings_local, runtime,
+            )
+            await policy.enforce(thread_id, auto_contact_if_blocked, macro_contact_handshake, request_contact)
         # Split recipients into local vs external (approved links)
-        local_to: list[str] = []
-        local_cc: list[str] = []
-        local_bcc: list[str] = []
-        external: dict[int, dict[str, Any]] = {}
         thread_external_participants = (
             await _get_thread_external_participants(project, sender, thread_id)
             if thread_id
             else {}
         )
-
+        router = _MessageRecipientRouter(
+            ctx, project, sender, thread_external_participants, prefer_cross_project=True,
+        )
         async with get_session() as sx:
-            # Preload local agent names (normalized -> canonical stored name)
-            existing = await sx.execute(
-                select(Agent.name).where(
-                    Agent.project_id == project.id,
-                    Agent.provisioning_state == "active",
-                )
-            )
-            local_lookup: dict[str, str] = {}
-            for row in existing.fetchall():
-                canonical_name = (row[0] or "").strip()
-                if not canonical_name:
-                    continue
-                sanitized_canonical = sanitize_agent_name(canonical_name) or canonical_name
-                for key in {canonical_name.lower(), sanitized_canonical.lower()}:
-                    local_lookup.setdefault(key, canonical_name)
-
-            # PR #138 Bug 1 fix: pre-fetch approved CROSS-project AgentLinks for
-            # this sender. When a bare recipient name has BOTH a local agent and
-            # an approved cross-project link (e.g. a stale shadow agent left
-            # over from a prior auto_contact_if_blocked + handshake cycle), we
-            # prefer the cross-project route — the explicit prior approval is
-            # the load-bearing signal of intent, and silently delivering to a
-            # local shadow has caused message loss in production.
-            #
-            # Only cross-project links go in this lookup. Same-project links
-            # are handled by the existing local-resolution path (and the
-            # existing AgentLink-based fallback further down) — including them
-            # here would cause messages to land in the `external` bucket keyed
-            # by the sender's own project, which downstream code does not
-            # expect.
-            agent_link_lookup: dict[str, tuple[Project, Agent]] = {}
-            if sender.id is not None and project.id is not None:
-                link_rows = await sx.execute(
-                    select(AgentLink, Project, Agent)
-                    .join(Project, Project.id == AgentLink.b_project_id)
-                    .join(Agent, cast(Any, Agent.id == AgentLink.b_agent_id))
-                    .where(
-                        cast(Any, AgentLink.a_project_id) == project.id,
-                        cast(Any, AgentLink.a_agent_id) == sender.id,
-                        cast(Any, AgentLink.b_project_id) != project.id,
-                        _active_approved_agent_link_clause(),
-                    )
-                )
-                for _link, b_project, b_agent in link_rows.all():
-                    canonical = (b_agent.name or "").strip()
-                    if not canonical:
-                        continue
-                    sanitized_b = sanitize_agent_name(canonical) or canonical
-                    for key in {canonical.lower(), sanitized_b.lower()}:
-                        agent_link_lookup.setdefault(key, (b_project, b_agent))
-
-            sender_candidate_keys = {
-                key.lower()
-                for key in (
-                    (sender.name or "").strip(),
-                    sanitize_agent_name(sender.name or "") or "",
-                )
-                if key
-            }
-
-            def _normalize(value: str) -> tuple[str, set[str], Optional[str]]:
-                """Trim input, derive comparable lowercase keys, and canonical lookup token."""
-                trimmed = (value or "").strip()
-                sanitized = sanitize_agent_name(trimmed)
-                keys: set[str] = set()
-                if trimmed:
-                    keys.add(trimmed.lower())
-                if sanitized:
-                    keys.add(sanitized.lower())
-                # Preserve the exact durable identity for DB lookup.  The
-                # sanitized spelling is only an alias candidate; notably,
-                # sanitize_agent_name() removes hyphens from canonical
-                # client-os-host-slot names.
-                canonical = trimmed if trimmed else None
-                return trimmed or value, keys, canonical
-
-            unknown_local: dict[str, set[str]] = defaultdict(set)
-            unknown_external: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
-
-            class _ContactBlocked(Exception):
-                pass
-
-            async def _route(name_list: list[str], kind: str) -> None:
-                for raw in name_list:
-                    candidate = raw or ""
-                    explicit_override = False
-                    target_project_override: Project | None = None
-                    target_project_label: str | None = None
-                    agent_fragment = candidate
-
-                    # Explicit external addressing: project:<slug-or-key>#<AgentName>
-                    if candidate.startswith("project:") and "#" in candidate:
-                        explicit_override = True
-                        parsed_project_label: str | None = None
-                        try:
-                            _, rest = candidate.split(":", 1)
-                            slug_part, agent_part = rest.split("#", 1)
-                            parsed_project_label = slug_part.strip() or None
-                            target_project_override = await _get_project_by_identifier(parsed_project_label or "")
-                            target_project_label = target_project_override.human_key or target_project_override.slug
-                            agent_fragment = agent_part
-                        except Exception:
-                            logger.debug("Failed to parse explicit external address: %s", candidate, exc_info=True)
-                            label = parsed_project_label or "(invalid project)"
-                            unknown_external[label][candidate.strip() or candidate].add(kind)
-                            continue
-
-                    # Alternate explicit format: <AgentName>@<project-identifier>
-                    if not explicit_override and "@" in candidate:
-                        name_part, project_part = candidate.split("@", 1)
-                        if name_part.strip() and project_part.strip():
-                            try:
-                                target_project_override = await _get_project_by_identifier(project_part.strip())
-                                target_project_label = target_project_override.human_key or target_project_override.slug
-                                agent_fragment = name_part
-                                explicit_override = True
-                            except Exception:
-                                logger.debug("Failed to resolve external project %r for %r", project_part.strip(), name_part, exc_info=True)
-                                label = project_part.strip() or "(invalid project)"
-                                unknown_external[label][candidate.strip() or candidate].add(kind)
-                                continue
-
-                    display_value, key_candidates, canonical = _normalize(agent_fragment)
-                    if not key_candidates or not canonical:
-                        if explicit_override:
-                            label = target_project_label or "(unknown project)"
-                            unknown_external[label][candidate.strip() or candidate].add(kind)
-                        else:
-                            unknown_local[candidate.strip() or candidate].add(kind)
-                        continue
-
-                    # Always allow self-send (local context only)
-                    if not explicit_override and sender_candidate_keys.intersection(key_candidates):
-                        if kind == "to":
-                            local_to.append(sender.name)
-                        elif kind == "cc":
-                            local_cc.append(sender.name)
-                        else:
-                            local_bcc.append(sender.name)
-                        continue
-
-                    if not explicit_override:
-                        resolved_local = None
-                        for key in key_candidates:
-                            resolved_local = local_lookup.get(key)
-                            if resolved_local:
-                                break
-                        cross_link_match: tuple[Project, Agent] | None = None
-                        for key in key_candidates:
-                            cross_link_match = agent_link_lookup.get(key)
-                            if cross_link_match:
-                                break
-                        if cross_link_match is not None:
-                            # PR #138 Bug 1: an approved cross-project AgentLink
-                            # is the load-bearing signal of intent. Prefer it
-                            # over both a (possibly stale-shadow) local agent
-                            # and the DB-side AgentLink fallback below — that
-                            # fallback only matches `func.lower(Agent.name) ==
-                            # canonical.lower()` and would miss legacy / non-
-                            # sanitized agent names that the pre-fetch finds
-                            # via the alternate sanitized-form key.
-                            target_project_xp, target_agent_xp = cross_link_match
-                            pol = (getattr(target_agent_xp, "contact_policy", "auto") or "auto").lower()
-                            if pol == "block_all":
-                                await ctx.error("CONTACT_BLOCKED: Recipient is not accepting messages.")
-                                raise _ContactBlocked()
-                            bucket = external.setdefault(
-                                target_project_xp.id or 0,
-                                {"project": target_project_xp, "to": [], "cc": [], "bcc": []},
-                            )
-                            bucket[kind].append(target_agent_xp.name)
-                            continue
-                        if resolved_local:
-                            # Local-only (no cross-project link): route locally as before.
-                            if kind == "to":
-                                local_to.append(resolved_local)
-                            elif kind == "cc":
-                                local_cc.append(resolved_local)
-                            else:
-                                local_bcc.append(resolved_local)
-                            continue
-
-                    lookup_value = canonical.lower()
-                    rows = None
-                    if explicit_override and target_project_override is not None:
-                        rows = await sx.execute(
-                            select(AgentLink, Project, Agent)
-                            .join(Project, Project.id == AgentLink.b_project_id)
-                            .join(Agent, cast(Any, Agent.id == AgentLink.b_agent_id))
-                            .where(
-                                cast(Any, AgentLink.a_project_id) == project.id,
-                                cast(Any, AgentLink.a_agent_id) == sender.id,
-                                _active_approved_agent_link_clause(),
-                                cast(Any, Project.id == target_project_override.id),
-                                cast(Any, func.lower(Agent.name) == lookup_value),
-                            )
-                            .limit(1)
-                        )
-                    else:
-                        rows = await sx.execute(
-                            select(AgentLink, Project, Agent)
-                            .join(Project, Project.id == AgentLink.b_project_id)
-                            .join(Agent, cast(Any, Agent.id == AgentLink.b_agent_id))
-                            .where(
-                                cast(Any, AgentLink.a_project_id) == project.id,
-                                cast(Any, AgentLink.a_agent_id) == sender.id,
-                                _active_approved_agent_link_clause(),
-                                cast(Any, func.lower(Agent.name) == lookup_value),
-                            )
-                            .limit(1)
-                        )
-
-                    rec = rows.first() if rows else None
-                    if rec:
-                        _link, target_project, target_agent = rec
-                        pol = (getattr(target_agent, "contact_policy", "auto") or "auto").lower()
-                        if pol == "block_all":
-                            await ctx.error("CONTACT_BLOCKED: Recipient is not accepting messages.")
-                            raise _ContactBlocked()
-                        bucket = external.setdefault(
-                            target_project.id or 0,
-                            {"project": target_project, "to": [], "cc": [], "bcc": []},
-                        )
-                        bucket[kind].append(target_agent.name)
-                        continue
-
-                    if explicit_override and target_project_override is not None:
-                        thread_participant = thread_external_participants.get(
-                            (target_project_override.id or 0, lookup_value)
-                        )
-                        if thread_participant is not None:
-                            target_project, participant_name = thread_participant
-                            bucket = external.setdefault(
-                                target_project.id or 0,
-                                {"project": target_project, "to": [], "cc": [], "bcc": []},
-                            )
-                            bucket[kind].append(participant_name)
-                            continue
-
-                    if explicit_override:
-                        label = target_project_label or "(unknown project)"
-                        unknown_external[label][display_value or candidate.strip() or candidate].add(kind)
-                    else:
-                        unknown_local[display_value or candidate.strip() or candidate].add(kind)
-
+            await router.preload(sx)
             try:
-                await _route(to, "to")
-                await _route(cc or [], "cc")
-                await _route(bcc or [], "bcc")
-            except _ContactBlocked as err:
+                await router.route(sx, to, "to")
+                await router.route(sx, cc or [], "cc")
+                await router.route(sx, bcc or [], "bcc")
+            except _MessageContactBlocked as err:
                 raise ToolExecutionError(
                     "CONTACT_BLOCKED",
-                    "Recipient is not accepting messages.",
+                    _CONTACT_BLOCKED_MESSAGE,
                     recoverable=True,
                 ) from err
+            await _SendExternalContacts(
+                router, settings_local, auto_contact_if_blocked, _session_is_bound_to_agent,
+                macro_contact_handshake, request_contact,
+            ).resolve(sx)
 
-            if unknown_local or unknown_external:
-                # Attempt cross-project handshakes for unknown external recipients if allowed
-                approved_external_routes: list[tuple[str, str]] = []
-                attempted_external: list[str] = []
-                requested_external: list[str] = []
-                try:
-                    effective_auto_contact = (
-                        bool(getattr(settings_local, "messaging_auto_handshake_on_block", True))
-                        if auto_contact_if_blocked is None
-                        else auto_contact_if_blocked
-                    )
-                    if effective_auto_contact and unknown_external:
-                        # Iterate over a copy since we may mutate/resolve entries
-                        for label, pending_names in list(unknown_external.items()):
-                            try:
-                                target_proj = await _get_project_by_identifier(label)
-                            except Exception:
-                                logger.debug("Failed to resolve external project %r for handshake", label, exc_info=True)
-                                continue
-                            target_project_ref = target_proj.human_key or target_proj.slug or label
-                            for nm, route_kinds in list(pending_names.items()):
-                                display_target = f"{nm}@{target_project_ref}"
-                                try:
-                                    target_agent = await _find_agent_optional(target_proj, nm)
-                                    if target_agent is not None and _session_is_bound_to_agent(ctx, target_proj, target_agent):
-                                        await macro_contact_handshake(
-                                            ctx=ctx,
-                                            project_key=project.human_key,
-                                            requester=sender.name,
-                                            target=nm,
-                                            to_project=target_proj.human_key or target_proj.slug,
-                                            reason="in-session auto-approval by send_message",
-                                            auto_accept=True,
-                                            ttl_seconds=int(settings_local.contact_auto_ttl_seconds),
-                                            format="json",
-                                        )
-                                        attempted_external.append(display_target)
-                                        for route_kind in sorted(route_kinds):
-                                            approved_external_routes.append((display_target, route_kind))
-                                    else:
-                                        # Pending fallback path — async human may take days to approve,
-                                        # so use the longer pending TTL (default 7 days) rather than
-                                        # the in-session auto-approval TTL (default 24h).
-                                        await request_contact(
-                                            ctx=ctx,
-                                            project_key=project.human_key,
-                                            from_agent=sender.name,
-                                            to_agent=nm,
-                                            to_project=target_proj.human_key or target_proj.slug,
-                                            reason="auto contact request created by send_message",
-                                            ttl_seconds=int(settings_local.contact_pending_ttl_seconds),
-                                            format="json",
-                                        )
-                                        requested_external.append(display_target)
-                                except Exception:
-                                    logger.exception("Failed to auto-resolve contact for external recipient %r@%r", nm, label)
-                        # Re-route any that were approved in-session
-                        if approved_external_routes:
-                            from contextlib import suppress
-                            with suppress(_ContactBlocked):
-                                for item, route_kind in approved_external_routes:
-                                    await _route([item], route_kind)
-                            # Purge unknown_external entries that now have approved links
-                            try:
-                                async with get_session() as scheck:
-                                    for label, pending_names in list(unknown_external.items()):
-                                        try:
-                                            tproj = await _get_project_by_identifier(label)
-                                        except Exception:
-                                            logger.debug("Failed to verify approved links for project %r", label, exc_info=True)
-                                            continue
-                                        remaining: dict[str, set[str]] = {}
-                                        for nm, route_kinds in list(pending_names.items()):
-                                            lookup_value = (nm or "").strip().lower()
-                                            rows = await scheck.execute(
-                                                select(AgentLink, Project, Agent)
-                                                .join(Project, Project.id == AgentLink.b_project_id)
-                                                .join(Agent, cast(Any, Agent.id == AgentLink.b_agent_id))
-                                                .where(
-                                                    cast(Any, AgentLink.a_project_id) == project.id,
-                                                    cast(Any, AgentLink.a_agent_id) == sender.id,
-                                                    _active_approved_agent_link_clause(),
-                                                    cast(Any, Project.id == tproj.id),
-                                                    cast(Any, func.lower(Agent.name) == lookup_value),
-                                                )
-                                                .limit(1)
-                                            )
-                                            if rows.first() is None:
-                                                remaining[nm] = route_kinds
-                                        if remaining:
-                                            unknown_external[label] = remaining
-                                        else:
-                                            unknown_external.pop(label, None)
-                            except Exception:
-                                logger.exception("Failed to purge resolved unknown_external entries after in-session approvals")
-                except Exception:
-                    logger.exception("Failed to auto-resolve contact for unknown external recipients")
-                # If everything resolved after auto-actions, skip error path
-                still_unknown = bool(unknown_local) or any(v for v in unknown_external.values())
-                if not still_unknown:
-                    # All unknowns were resolved; continue to delivery
-                    pass
-                else:
-                    parts: list[str] = []
-                data_payload: dict[str, Any] = {}
-                if still_unknown and unknown_local:
-                    missing_local = sorted({name for name in unknown_local if name})
-                    parts.append(
-                        f"local recipients {', '.join(missing_local)} are not registered in project '{project.human_key}'"
-                    )
-                    data_payload["unknown_local"] = missing_local
-                if still_unknown and unknown_external:
-                    formatted_external = {
-                        label: sorted({name for name in names if name})
-                        for label, names in unknown_external.items()
-                    }
-                    ext_parts = [
-                        f"{', '.join(names)} @ {label}"
-                        for label, names in sorted(formatted_external.items())
-                        if names
-                    ]
-                    if ext_parts:
-                        parts.append(
-                            "external recipients missing approved contact links: " + "; ".join(ext_parts)
-                        )
-                    data_payload["unknown_external"] = formatted_external
-                # Include auto actions we tried
-                if still_unknown and attempted_external:
-                    data_payload["auto_contact_attempted_external"] = attempted_external
-                if still_unknown and requested_external:
-                    data_payload["auto_contact_requested_external"] = requested_external
-                if still_unknown:
-                    hint_parts = [
-                        f"Use resource://agents/{project.slug} to list registered agents."
-                    ]
-                    required_actions: list[str] = []
-                    if unknown_local:
-                        hint_parts.append(
-                            "A missing local recipient must self-register, or an "
-                            "operator must explicitly provision its durable mailbox, "
-                            "before delivery."
-                        )
-                        required_actions.append(
-                            "target_self_register_or_operator_provision"
-                        )
-                    if unknown_external:
-                        hint_parts.append(
-                            "Verify each external target is already registered in its "
-                            "own project, then request contact; request_contact never "
-                            "provisions the target mailbox."
-                        )
-                        required_actions.append(
-                            "verify_target_registration_then_request_contact"
-                        )
-                    hint = " ".join(hint_parts)
-                    if requested_external:
-                        parts.append(
-                            "pending external contact requests were created for "
-                            + ", ".join(sorted(set(requested_external)))
-                        )
-                    parts.append(hint)
-                    message = "Unable to send message — " + "; ".join(parts)
-                    data_payload["hint"] = hint
-                    data_payload["required_actions"] = required_actions
-                    await ctx.error(f"RECIPIENT_NOT_FOUND: {message}")
-                    raise ToolExecutionError(
-                        "RECIPIENT_NOT_FOUND",
-                        message,
-                        recoverable=True,
-                        data=data_payload,
-                    )
-
-        deliveries: list[dict[str, Any]] = []
-        delivery_errors: list[dict[str, Any]] = []
-        # Local deliver if any
-        if local_to or local_cc or local_bcc:
-            payload_local = await _deliver_message(
-                ctx,
-                "send_message",
-                project,
-                sender,
-                local_to,
-                local_cc,
-                local_bcc,
-                subject,
-                body_md,
-                attachment_paths,
-                convert_images,
-                importance,
-                ack_required,
-                thread_id,
-                idempotency_key,
-                topic=topic,
-            )
-            _collect_delivery_result(deliveries, delivery_errors, project, payload_local)
-        # External per-target project deliver using the original sender identity.
-        for _pid, group in external.items():
-            p: Project = group["project"]
-            try:
-                payload_ext = await _deliver_message(
-                    ctx,
-                    "send_message",
-                    p,
-                    sender,
-                    group.get("to", []),
-                    group.get("cc", []),
-                    group.get("bcc", []),
-                    subject,
-                    body_md,
-                    attachment_paths,
-                    convert_images,
-                    importance,
-                    ack_required,
-                    thread_id,
-                    idempotency_key,
-                    topic=topic,
-                )
-                _collect_delivery_result(deliveries, delivery_errors, p, payload_ext)
-            except Exception as exc:
-                logger.exception("Failed to deliver message to external project %r", p.human_key)
-                delivery_errors.append(_delivery_failure_from_exception(p, exc))
-                continue
+        options = _MessageDeliveryOptions(
+            attachment_paths, convert_images, importance, ack_required,
+            thread_id, idempotency_key, topic=topic,
+        )
+        dispatch = _MessageDeliveryDispatch(
+            router, "send_message", subject, body_md,
+            _deliver_message, _collect_delivery_result, _delivery_failure_from_exception,
+        )
+        deliveries, delivery_errors = await dispatch.run(options, options)
 
         if not deliveries and delivery_errors:
             return {
@@ -11654,15 +12722,13 @@ def build_mcp_server() -> FastMCP:
             result["delivery_errors"] = delivery_errors
         return result
 
-    @mcp.tool(name="get_message_delivery")
-    @_instrument_tool(
-        "get_message_delivery",
-        cluster=CLUSTER_MESSAGING,
-        capabilities={"messaging", "read"},
-        project_arg="project_key",
-        agent_arg="agent_name",
+    @_MCPToolRegistration(
+        {"name": "get_message_delivery"},
+        {"cluster": CLUSTER_MESSAGING, "capabilities": {"messaging", "read"},
+         "project_arg": "project_key", "agent_arg": "agent_name"},
     )
     async def get_message_delivery(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -11677,6 +12743,8 @@ def build_mcp_server() -> FastMCP:
         recipient lifetimes. ``retry_pending`` is restricted to the sender; it
         never creates a new intent and is safe after an ambiguous disconnect.
         """
+        _authenticate_agent = self._authenticate_agent
+        _delivery_status_payload = self._delivery_status_payload
         project = await _get_project_by_identifier(project_key)
         agent = await _authenticate_agent(
             ctx,
@@ -11699,28 +12767,9 @@ def build_mcp_server() -> FastMCP:
                 and delivery.sender_project_generation_snapshot
                 == project.project_generation
             )
-            recipient_authorized = False
-            if (
-                delivery is not None
-                and delivery.project_id == project.id
-                and delivery.project_generation_snapshot == project.project_generation
-            ):
-                recipient_result = await session.execute(
-                    select(MessageDeliveryRecipient.delivery_id).where(
-                        cast(Any, MessageDeliveryRecipient.delivery_id == delivery.id),
-                        cast(Any, MessageDeliveryRecipient.agent_id == agent.id),
-                        cast(
-                            Any,
-                            MessageDeliveryRecipient.agent_generation_snapshot
-                            == agent.agent_generation,
-                        ),
-                        cast(
-                            Any,
-                            MessageDeliveryRecipient.project_id_snapshot == project.id,
-                        ),
-                    )
-                )
-                recipient_authorized = recipient_result.first() is not None
+            recipient_authorized = await _MCPServerTools._delivery_recipient_is_authorized(
+                session, delivery, project, agent
+            )
 
             if delivery is None or not (sender_authorized or recipient_authorized):
                 raise ToolExecutionError(
@@ -11740,18 +12789,9 @@ def build_mcp_server() -> FastMCP:
                 raise RuntimeError("Delivery target project lifetime is unavailable.")
             target_project_key = target_project.human_key
 
-        if retry_pending:
-            if not sender_authorized:
-                raise ToolExecutionError(
-                    "FORBIDDEN",
-                    "Only the authenticated sender may retry a pending delivery.",
-                    recoverable=False,
-                )
-            processing = await process_message_delivery(delivery_id)
-            if processing.published_now:
-                await emit_published_delivery_notifications(delivery_id)
-        else:
-            processing = await get_message_delivery_status(delivery_id)
+        processing = await _MCPServerTools._read_delivery_processing(
+            delivery_id, retry_pending, sender_authorized
+        )
 
         message_payload: dict[str, Any] | None = None
         if processing.status == "published" and processing.message_id is not None:
@@ -11771,25 +12811,23 @@ def build_mcp_server() -> FastMCP:
             "message": message_payload,
         }
 
-    @mcp.tool(
-        name="purge_old_messages",
-        description="Delete messages older than the configured retention period. "
+    @_MCPToolRegistration(
+        {"name": "purge_old_messages",
+         "description": "Delete messages older than the configured retention period. "
         "Defaults to retention_max_age_days from config (180 days). "
-        "Returns count of messages purged.",
-    )
-    @_instrument_tool(
-        "purge_old_messages",
-        cluster=CLUSTER_MESSAGING,
-        capabilities={"messaging", "write"},
-        project_arg="project_key",
+        "Returns count of messages purged."},
+        {"cluster": CLUSTER_MESSAGING, "capabilities": {"messaging", "write"},
+         "project_arg": "project_key"},
     )
     async def purge_old_messages(
+        self,
         ctx: Context,
         project_key: str,
         max_age_days: Optional[int] = None,
         dry_run: bool = True,
     ) -> dict[str, Any]:
         """Purge messages older than max_age_days."""
+        settings = self.settings
         project = await _get_project_by_identifier(project_key)
         if not project:
             raise ValueError(f"Project '{project_key}' not found")
@@ -11849,15 +12887,13 @@ def build_mcp_server() -> FastMCP:
             "max_age_days": age_limit,
         }
 
-    @mcp.tool(name="reply_message")
-    @_instrument_tool(
-        "reply_message",
-        cluster=CLUSTER_MESSAGING,
-        capabilities={"messaging", "write"},
-        project_arg="project_key",
-        agent_arg="sender_name",
+    @_MCPToolRegistration(
+        {"name": "reply_message"},
+        {"cluster": CLUSTER_MESSAGING, "capabilities": {"messaging", "write"},
+         "project_arg": "project_key", "agent_arg": "sender_name"},
     )
     async def reply_message(
+        self,
         ctx: Context,
         project_key: str,
         message_id: int,
@@ -11946,14 +12982,12 @@ def build_mcp_server() -> FastMCP:
         }}}
         ```
         """
-        idempotency_key = idempotency_key.strip()
-        if not idempotency_key or len(idempotency_key) > 128:
-            raise ToolExecutionError(
-                "INVALID_IDEMPOTENCY_KEY",
-                "idempotency_key must contain 1-128 non-whitespace characters.",
-                recoverable=True,
-                data={"argument": "idempotency_key"},
-            )
+        _authenticate_agent = self._authenticate_agent
+        _deliver_message = self._deliver_message
+        _collect_delivery_result = self._collect_delivery_result
+        _delivery_failure_from_exception = self._delivery_failure_from_exception
+        _summarize_delivery_failures = self._summarize_delivery_failures
+        idempotency_key = _message_idempotency_key(idempotency_key)
 
         project = await _get_project_by_identifier(project_key)
         sender = await _authenticate_agent(
@@ -11975,456 +13009,39 @@ def build_mcp_server() -> FastMCP:
             reply_subject = base_subject
         else:
             reply_subject = f"{subject_prefix_clean} {base_subject}".strip()
-        # When replying to your own outbound message, default `to` to the
-        # original recipients instead of yourself (avoids self-reply loop).
-        if to is None and original.sender_id == sender.id:
-            async with get_session() as _rsl_sx:
-                _rsl_result = await _rsl_sx.execute(
-                    # Use the local ``select`` wrapper (not ``_sa_select``) so ty
-                    # doesn't trip over SQLAlchemy's multi-entity overloads on
-                    # SQLModel-mapped columns. See the wrapper definition above.
-                    select(Agent.name, Agent.project_id, MessageRecipient.kind)
-                    .join(Agent, MessageRecipient.agent_id == Agent.id)
-                    .where(
-                        cast(Any, MessageRecipient.message_id) == original.id,
-                        cast(Any, MessageRecipient.kind) == "to",
-                    )
-                )
-                _rsl_rows = _rsl_result.all()
-            if _rsl_rows:
-                _rsl_targets: list[str] = []
-                for _rsl_name, _rsl_proj_id, _ in _rsl_rows:
-                    if _rsl_proj_id == project.id:
-                        _rsl_targets.append(_rsl_name)
-                    else:
-                        _rsl_proj = await _get_project_by_id(_rsl_proj_id)
-                        _rsl_targets.append(_format_cross_project_agent_address(_rsl_proj.slug, _rsl_name))
-                to_names = _rsl_targets
-            else:
-                # Fallback: no "to" recipients found (shouldn't happen), use original sender
-                to_names = [original_sender.name]
-        else:
-            default_reply_target = (
-                original_sender.name
-                if original_sender.project_id == project.id
-                else _format_cross_project_agent_address(original_sender_project.slug, original_sender.name)
-            )
-            to_names = [default_reply_target] if to is None else to
-        cc_list = cc or []
-        bcc_list = bcc or []
-
-        local_to: list[str] = []
-        local_cc: list[str] = []
-        local_bcc: list[str] = []
-        external: dict[int, dict[str, Any]] = {}
-        unknown_local: set[str] = set()
-        unknown_external: dict[str, set[str]] = defaultdict(set)
+        to_names = await _reply_default_recipients(
+            project, sender, original, original_sender, original_sender_project, to,
+        )
         thread_external_participants = await _get_thread_external_participants(project, sender, thread_key)
-
+        router = _MessageRecipientRouter(
+            ctx, project, sender, thread_external_participants, prefer_cross_project=False,
+        )
         async with get_session() as sx:
-            existing = await sx.execute(
-                select(Agent.name).where(
-                    Agent.project_id == project.id,
-                    Agent.provisioning_state == "active",
-                )
-            )
-            local_lookup: dict[str, str] = {}
-            for row in existing.fetchall():
-                canonical_name = (row[0] or "").strip()
-                if not canonical_name:
-                    continue
-                sanitized_canonical = sanitize_agent_name(canonical_name) or canonical_name
-                for key in {canonical_name.lower(), sanitized_canonical.lower()}:
-                    local_lookup.setdefault(key, canonical_name)
-
-            sender_candidate_keys = {
-                key.lower()
-                for key in (
-                    (sender.name or "").strip(),
-                    sanitize_agent_name(sender.name or "") or "",
-                )
-                if key
-            }
-
-            class _ContactBlocked(Exception):
-                pass
-
-            def _normalize(value: str) -> tuple[str, set[str], Optional[str]]:
-                trimmed = (value or "").strip()
-                sanitized = sanitize_agent_name(trimmed)
-                keys: set[str] = set()
-                if trimmed:
-                    keys.add(trimmed.lower())
-                if sanitized:
-                    keys.add(sanitized.lower())
-                # Preserve the exact durable identity for DB lookup.  The
-                # sanitized spelling is only an alias candidate; notably,
-                # sanitize_agent_name() removes hyphens from canonical
-                # client-os-host-slot names.
-                canonical = trimmed if trimmed else None
-                return trimmed or value, keys, canonical
-
-            async def _route(name_list: list[str], kind: str) -> None:
-                for raw in name_list:
-                    candidate = raw or ""
-                    explicit_override = False
-                    target_project_override: Project | None = None
-                    target_project_label: str | None = None
-                    agent_fragment = candidate
-
-                    if candidate.startswith("project:") and "#" in candidate:
-                        parsed_project_label: str | None = None
-                        try:
-                            explicit_override = True
-                            _, rest = candidate.split(":", 1)
-                            slug_part, agent_part = rest.split("#", 1)
-                            parsed_project_label = slug_part.strip() or None
-                            target_project_override = await _get_project_by_identifier(parsed_project_label or "")
-                            target_project_label = target_project_override.human_key or target_project_override.slug
-                            agent_fragment = agent_part
-                        except Exception:
-                            label = parsed_project_label or "(invalid project)"
-                            unknown_external[label].add(candidate.strip() or candidate)
-                            continue
-
-                    if not explicit_override and "@" in candidate:
-                        name_part, project_part = candidate.split("@", 1)
-                        if name_part.strip() and project_part.strip():
-                            try:
-                                target_project_override = await _get_project_by_identifier(project_part.strip())
-                                target_project_label = target_project_override.human_key or target_project_override.slug
-                                agent_fragment = name_part
-                                explicit_override = True
-                            except Exception:
-                                label = project_part.strip() or "(invalid project)"
-                                unknown_external[label].add(candidate.strip() or candidate)
-                                continue
-
-                    display_value, key_candidates, canonical = _normalize(agent_fragment)
-                    if not key_candidates or not canonical:
-                        if explicit_override:
-                            label = target_project_label or "(unknown project)"
-                            unknown_external[label].add(candidate.strip() or candidate)
-                        else:
-                            unknown_local.add(candidate.strip() or candidate)
-                        continue
-
-                    if not explicit_override and sender_candidate_keys.intersection(key_candidates):
-                        if kind == "to":
-                            local_to.append(sender.name)
-                        elif kind == "cc":
-                            local_cc.append(sender.name)
-                        else:
-                            local_bcc.append(sender.name)
-                        continue
-
-                    if not explicit_override:
-                        resolved_local = None
-                        for key in key_candidates:
-                            resolved_local = local_lookup.get(key)
-                            if resolved_local:
-                                break
-                        if resolved_local:
-                            if kind == "to":
-                                local_to.append(resolved_local)
-                            elif kind == "cc":
-                                local_cc.append(resolved_local)
-                            else:
-                                local_bcc.append(resolved_local)
-                            continue
-
-                    lookup_value = canonical.lower()
-                    rows = None
-                    if explicit_override and target_project_override is not None:
-                        rows = await sx.execute(
-                            select(AgentLink, Project, Agent)
-                            .join(Project, Project.id == AgentLink.b_project_id)
-                            .join(Agent, cast(Any, Agent.id == AgentLink.b_agent_id))
-                            .where(
-                                cast(Any, AgentLink.a_project_id) == project.id,
-                                cast(Any, AgentLink.a_agent_id) == sender.id,
-                                _active_approved_agent_link_clause(),
-                                cast(Any, Project.id == target_project_override.id),
-                                cast(Any, func.lower(Agent.name) == lookup_value),
-                            )
-                            .limit(1)
-                        )
-                    else:
-                        rows = await sx.execute(
-                            select(AgentLink, Project, Agent)
-                            .join(Project, Project.id == AgentLink.b_project_id)
-                            .join(Agent, cast(Any, Agent.id == AgentLink.b_agent_id))
-                            .where(
-                                cast(Any, AgentLink.a_project_id) == project.id,
-                                cast(Any, AgentLink.a_agent_id) == sender.id,
-                                _active_approved_agent_link_clause(),
-                                cast(Any, func.lower(Agent.name) == lookup_value),
-                            )
-                            .limit(1)
-                        )
-                    rec = rows.first()
-                    if rec:
-                        _link, target_project, target_agent = rec
-                        recipient_policy = (getattr(target_agent, "contact_policy", "auto") or "auto").lower()
-                        if recipient_policy == "block_all":
-                            await ctx.error("CONTACT_BLOCKED: Recipient is not accepting messages.")
-                            raise _ContactBlocked()
-                        bucket = external.setdefault(target_project.id or 0, {"project": target_project, "to": [], "cc": [], "bcc": []})
-                        bucket[kind].append(target_agent.name)
-                    else:
-                        if explicit_override and target_project_override is not None:
-                            thread_participant = thread_external_participants.get(
-                                (target_project_override.id or 0, lookup_value)
-                            )
-                            if thread_participant is not None:
-                                target_project, participant_name = thread_participant
-                                bucket = external.setdefault(
-                                    target_project.id or 0,
-                                    {"project": target_project, "to": [], "cc": [], "bcc": []},
-                                )
-                                bucket[kind].append(participant_name)
-                                continue
-                        if explicit_override:
-                            label = target_project_label or "(unknown project)"
-                            unknown_external[label].add(display_value or candidate.strip() or candidate)
-                        else:
-                            unknown_local.add(display_value or candidate.strip() or candidate)
-
+            await router.preload(sx)
             try:
-                await _route(to_names, "to")
-                await _route(cc_list, "cc")
-                await _route(bcc_list, "bcc")
-            except _ContactBlocked:
-                return {"error": {"type": "CONTACT_BLOCKED", "message": "Recipient is not accepting messages."}}
-
-        if unknown_local or unknown_external:
-            parts: list[str] = []
-            err_data: dict[str, Any] = {}
-            if unknown_local:
-                missing_local = sorted({name for name in unknown_local if name})
-                parts.append(
-                    f"local recipients {', '.join(missing_local)} are not registered in project '{project.human_key}'"
-                )
-                err_data["unknown_local"] = missing_local
-            if unknown_external:
-                formatted_external = {
-                    label: sorted({name for name in names if name})
-                    for label, names in unknown_external.items()
-                }
-                ext_parts = [
-                    f"{', '.join(names)} @ {label}"
-                    for label, names in sorted(formatted_external.items())
-                    if names
-                ]
-                if ext_parts:
-                    parts.append("external recipients missing approved contact links: " + "; ".join(ext_parts))
-                err_data["unknown_external"] = formatted_external
-            hint = f"Use resource://agents/{project.slug} to list registered agents, or request_contact(...) to create a cross-project link first."
-            parts.append(hint)
-            message = "Unable to send reply — " + "; ".join(parts)
-            err_data["hint"] = hint
-            raise ToolExecutionError("RECIPIENT_NOT_FOUND", message, recoverable=True, data=err_data)
-
-        if settings_local.contact_enforcement_enabled:
-            auto_ok_names: set[str] = set()
-            try:
-                sender_alias = aliased(Agent)
-                criteria: list[Any] = [cast(Any, Message.thread_id) == thread_key]
-                try:
-                    seed_id = int(thread_key)
-                    criteria.append(cast(Any, Message.id) == seed_id)
-                except (ValueError, TypeError):
-                    pass
-                async with get_session() as s_contact:
-                    stmt = (
-                        select(Message, sender_alias.name, sender_alias.project_id)
-                        .join(sender_alias, cast(Any, Message.sender_id == sender_alias.id))
-                        .where(
-                            cast(Any, Message.project_id) == project.id,
-                            or_(*criteria),
-                            _message_visible_to_agent_clause(sender.id or 0),
-                        )
-                        .limit(500)
-                    )
-                    thread_rows = [(row[0], row[1], row[2]) for row in (await s_contact.execute(stmt)).all()]
-                    participants: set[str] = {
-                        n for _m, n, sender_project_id in thread_rows if n and sender_project_id == project.id
-                    }
-                    message_ids = [m.id for m, _n, _sender_project_id in thread_rows if m.id is not None]
-                    if message_ids:
-                        recipient_rows = await s_contact.execute(
-                            select(Agent.name)
-                            .join(MessageRecipient, cast(Any, MessageRecipient.agent_id) == Agent.id)
-                            .where(cast(Any, MessageRecipient.message_id).in_(message_ids))
-                        )
-                        participants.update({row[0] for row in recipient_rows.all() if row[0]})
-                    auto_ok_names.update(participants)
-            except Exception:
-                logger.exception("Failed to fetch thread participants for reply contact auto-allow (thread_id=%s)", thread_key)
-
-            blocked_recipients: list[str] = []
-            all_local_names = list(dict.fromkeys(local_to + local_cc + local_bcc))
-            recipient_agents = await _get_agents_batch_lenient(project, all_local_names)
-            now_utc = datetime.now(timezone.utc)
-            ttl = timedelta(seconds=int(settings_local.contact_auto_ttl_seconds))
-            since_dt = now_utc - ttl
-            async with get_session() as s_contact:
-                recent_ok_names: set[str] = set()
-                try:
-                    if all_local_names:
-                        sent_stmt = (
-                            select(Agent.name)
-                            .join(MessageRecipient, cast(Any, MessageRecipient.agent_id) == Agent.id)
-                            .join(Message, cast(Any, MessageRecipient.message_id) == Message.id)
-                            .where(
-                                cast(Any, Message.project_id) == project.id,
-                                cast(Any, Message.sender_id) == sender.id,
-                                cast(Any, Message.created_ts) > _naive_utc(since_dt),
-                                cast(Any, Agent.name).in_(all_local_names),
-                            )
-                        )
-                        sent_rows = await s_contact.execute(sent_stmt)
-                        recent_ok_names.update({row[0] for row in sent_rows.all() if row[0]})
-
-                        sender_alias2 = aliased(Agent)
-                        recv_stmt = (
-                            select(sender_alias2.name)
-                            .join(Message, cast(Any, Message.sender_id) == sender_alias2.id)
-                            .join(MessageRecipient, cast(Any, MessageRecipient.message_id) == Message.id)
-                            .where(
-                                cast(Any, Message.project_id) == project.id,
-                                cast(Any, MessageRecipient.agent_id) == sender.id,
-                                cast(Any, Message.created_ts) > _naive_utc(since_dt),
-                                cast(Any, sender_alias2.name).in_(all_local_names),
-                            )
-                        )
-                        recv_rows = await s_contact.execute(recv_stmt)
-                        recent_ok_names.update({row[0] for row in recv_rows.all() if row[0]})
-                except Exception:
-                    logger.exception("Failed to batch fetch recent contacts for reply auto-allow heuristics")
-                    recent_ok_names = set()
-
-                approved_link_ids: set[int] = set()
-                try:
-                    recipient_ids = [rec.id for rec in recipient_agents.values() if rec is not None and rec.id is not None]
-                    if recipient_ids:
-                        link_rows = await s_contact.execute(
-                            select(AgentLink.b_agent_id)
-                            .where(
-                                cast(Any, AgentLink.a_project_id) == project.id,
-                                cast(Any, AgentLink.a_agent_id) == sender.id,
-                                cast(Any, AgentLink.b_project_id) == project.id,
-                                _active_approved_agent_link_clause(now_utc),
-                                cast(Any, AgentLink.b_agent_id).in_(recipient_ids),
-                            )
-                        )
-                        approved_link_ids.update({row[0] for row in link_rows.all() if row and row[0] is not None})
-                except Exception:
-                    logger.exception("Failed to batch fetch approved agent links for reply_message")
-
-                for nm in local_to + local_cc + local_bcc:
-                    if nm in auto_ok_names:
-                        continue
-                    rec = recipient_agents.get(nm)
-                    if rec is None or rec.name == sender.name:
-                        continue
-                    if getattr(rec, "retired_at", None) is not None:
-                        raise ToolExecutionError(
-                            "AGENT_RETIRED",
-                            f"Agent '{nm}' is retired and no longer accepts new messages. "
-                            "Use unretire_agent to restore it first.",
-                            recoverable=True,
-                            data={"agent_name": nm, "retired_at": _iso(rec.retired_at)},
-                        )
-                    rec_policy = getattr(rec, "contact_policy", "auto").lower()
-                    if rec_policy == "open":
-                        continue
-                    if rec_policy == "block_all":
-                        raise ToolExecutionError(
-                            "CONTACT_BLOCKED",
-                            "Recipient is not accepting messages.",
-                            recoverable=True,
-                        )
-                    if rec_policy == "auto" and rec.name in recent_ok_names:
-                        continue
-                    if rec.id is not None and rec.id in approved_link_ids:
-                        continue
-                    blocked_recipients.append(rec.name)
-
-            if blocked_recipients:
-                blocked_sorted = sorted(set(blocked_recipients))
-                recipient_list = ", ".join(blocked_sorted)
-                sample_target = blocked_sorted[0]
-                project_expr = repr(project.human_key)
-                sender_expr = repr(sender.name)
-                target_expr = repr(sample_target)
-                err_msg = (
-                    f"Contact approval required for recipients: {recipient_list}. "
-                    f"Before retrying, create a pending request with "
-                    f"`request_contact(project_key={project_expr}, from_agent={sender_expr}, to_agent={target_expr})`, "
-                    f"then have the recipient approve it with "
-                    f"`respond_contact(project_key={project_expr}, to_agent={target_expr}, from_agent={sender_expr}, accept=True)`."
-                )
-                raise ToolExecutionError(
-                    "CONTACT_REQUIRED",
-                    err_msg,
-                    recoverable=True,
-                    data={"recipients_blocked": blocked_sorted},
-                )
-
-        deliveries: list[dict[str, Any]] = []
-        delivery_errors: list[dict[str, Any]] = []
-        if local_to or local_cc or local_bcc:
-            payload_local = await _deliver_message(
-                ctx,
-                "reply_message",
-                project,
-                sender,
-                local_to,
-                local_cc,
-                local_bcc,
-                reply_subject,
-                body_md,
-                None,
-                None,
-                importance=original.importance,
-                ack_required=original.ack_required,
-                thread_id=thread_key,
-                idempotency_key=idempotency_key,
-                topic=original.topic,
-                reply_to=original.id,
-                purpose="reply",
-            )
-            _collect_delivery_result(deliveries, delivery_errors, project, payload_local)
-
-        for _pid, group in external.items():
-            target_project: Project = group["project"]
-            try:
-                payload_ext = await _deliver_message(
-                    ctx,
-                    "reply_message",
-                    target_project,
-                    sender,
-                    group.get("to", []),
-                    group.get("cc", []),
-                    group.get("bcc", []),
-                    reply_subject,
-                    body_md,
-                    None,
-                    None,
-                    importance=original.importance,
-                    ack_required=original.ack_required,
-                    thread_id=thread_key,
-                    idempotency_key=idempotency_key,
-                    topic=original.topic,
-                    reply_to=None,
-                    purpose="reply",
-                )
-                _collect_delivery_result(deliveries, delivery_errors, target_project, payload_ext)
-            except Exception as exc:
-                logger.exception("Failed to deliver reply to external project %r", target_project.human_key)
-                delivery_errors.append(_delivery_failure_from_exception(target_project, exc))
-                continue
+                await router.route(sx, to_names, "to")
+                await router.route(sx, cc or [], "cc")
+                await router.route(sx, bcc or [], "bcc")
+            except _MessageContactBlocked:
+                return {"error": {"type": "CONTACT_BLOCKED", "message": _CONTACT_BLOCKED_MESSAGE}}
+        _reply_check_unknown(router)
+        await _reply_enforce_contacts(router, thread_key, settings_local)
+        dispatch = _MessageDeliveryDispatch(
+            router, "reply_message", reply_subject, body_md,
+            _deliver_message, _collect_delivery_result, _delivery_failure_from_exception,
+        )
+        deliveries, delivery_errors = await dispatch.run(
+            _MessageDeliveryOptions(
+                None, None, importance=original.importance, ack_required=original.ack_required,
+                thread_id=thread_key, idempotency_key=idempotency_key, topic=original.topic,
+                reply_to=original.id, purpose="reply",
+            ),
+            _MessageDeliveryOptions(
+                None, None, importance=original.importance, ack_required=original.ack_required,
+                thread_id=thread_key, idempotency_key=idempotency_key, topic=original.topic,
+                reply_to=None, purpose="reply",
+            ),
+        )
 
         if not deliveries:
             payload: dict[str, Any] = {
@@ -12450,16 +13067,14 @@ def build_mcp_server() -> FastMCP:
             primary_payload["delivery_errors"] = delivery_errors
         return primary_payload
 
-    @mcp.tool(name="request_contact")
-    @_instrument_tool(
-        "request_contact",
-        cluster=CLUSTER_CONTACT,
-        capabilities={"contact"},
-        project_arg="project_key",
-        agent_arg="from_agent",
+    @_MCPToolRegistration(
+        {"name": "request_contact"},
+        {"cluster": CLUSTER_CONTACT, "capabilities": {"contact"},
+         "project_arg": "project_key", "agent_arg": "from_agent"},
     )
     @retry_on_db_lock(max_retries=3, base_delay=0.05, max_delay=0.5)
     async def request_contact(
+        self,
         ctx: Context,
         project_key: str,
         from_agent: str,
@@ -12496,6 +13111,12 @@ def build_mcp_server() -> FastMCP:
         ttl_seconds : int
             Time to live for the contact approval request (default: 7 days).
         """
+        _authenticate_agent = self._authenticate_agent
+        _raise_if_self_contact = self._raise_if_self_contact
+        _contact_request_notification_exists = self._contact_request_notification_exists
+        _deliver_message = self._deliver_message
+        _extract_delivery_error_payload = self._extract_delivery_error_payload
+        _with_delivery_project = self._with_delivery_project
         project = await _get_project_by_identifier(project_key)
         a = await _authenticate_agent(
             ctx,
@@ -12505,32 +13126,8 @@ def build_mcp_server() -> FastMCP:
             token_param="registration_token",
             action="request_contact",
         )
-        # Allow explicit external addressing in to_agent as project:<slug>#<Name>
-        target_project = project
-        target_name = to_agent
-        if to_project:
-            target_project = await _get_project_by_identifier(to_project)
-        elif to_agent.startswith("project:") and "#" in to_agent:
-            try:
-                _, rest = to_agent.split(":", 1)
-                slug_part, agent_part = rest.split("#", 1)
-                target_project = await _get_project_by_identifier(slug_part)
-                target_name = agent_part.strip()
-            except Exception:
-                target_project = project
-                target_name = to_agent
-        try:
-            b = await _get_agent(target_project, target_name)
-        except (NoResultFound, ToolExecutionError) as exc:
-            is_not_found = isinstance(exc, NoResultFound) or (
-                isinstance(exc, ToolExecutionError) and exc.error_type == "NOT_FOUND"
-            )
-            if is_not_found:
-                raise _target_registration_required_error(
-                    target_project,
-                    target_name,
-                ) from exc
-            raise
+        target_project, target_name = await _contact_target_project(project, to_agent, to_project)
+        b = await _get_contact_target(target_project, target_name)
         _raise_if_self_contact(
             project,
             a,
@@ -12546,121 +13143,11 @@ def build_mcp_server() -> FastMCP:
         now = datetime.now(timezone.utc)
         naive_now = _naive_utc(now)
         exp = naive_now + timedelta(seconds=max(60, ttl_seconds))
-        result_expires: datetime | None = exp
-        should_notify = False
-        result_status = "pending"
-        async with get_session() as s:
-            # upsert link
-            existing = await s.execute(
-                select(AgentLink).where(
-                    cast(Any, AgentLink.a_project_id) == project.id,
-                    cast(Any, AgentLink.a_agent_id) == a.id,
-                    cast(Any, AgentLink.b_project_id) == target_project.id,
-                    cast(Any, AgentLink.b_agent_id) == b.id,
-                )
-            )
-            link = existing.scalars().first()
-            if link:
-                previous_status = link.status
-                is_active_approved = previous_status == "approved" and (
-                    link.expires_ts is None or link.expires_ts > naive_now
-                )
-                is_active_pending = previous_status == "pending" and (
-                    link.expires_ts is None or link.expires_ts > naive_now
-                )
-                if is_active_approved:
-                    link.reason = reason
-                    link.updated_ts = naive_now
-                    result_status = "approved"
-                    should_notify = False
-                    if link.expires_ts is None:
-                        result_expires = None
-                    else:
-                        link.expires_ts = max(link.expires_ts, exp)
-                        result_expires = link.expires_ts
-                elif is_active_pending:
-                    # Keep the pending event's content and timestamp immutable.
-                    # Its timestamp is the deterministic delivery idempotency
-                    # component, so a retry cannot create a second intro intent.
-                    result_status = "pending"
-                    should_notify = False
-                    if link.expires_ts is None:
-                        link.expires_ts = exp
-                    else:
-                        link.expires_ts = max(link.expires_ts, exp)
-                    result_expires = link.expires_ts
-                else:
-                    link.status = "pending"
-                    link.reason = reason
-                    link.updated_ts = naive_now
-                    link.expires_ts = exp
-                    result_expires = exp
-                    should_notify = previous_status != "pending" or not is_active_pending
-                s.add(link)
-            else:
-                link = AgentLink(
-                    a_project_id=project.id or 0,
-                    a_agent_id=a.id or 0,
-                    b_project_id=target_project.id or 0,
-                    b_agent_id=b.id or 0,
-                    status="pending",
-                    reason=reason,
-                    created_ts=naive_now,
-                    updated_ts=naive_now,
-                    expires_ts=exp,
-                )
-                s.add(link)
-                should_notify = True
-            try:
-                await s.commit()
-            except IntegrityError:
-                # Another concurrent request created the link. Treat this as an idempotent refresh.
-                await s.rollback()
-                existing = await s.execute(
-                    select(AgentLink).where(
-                        cast(Any, AgentLink.a_project_id) == project.id,
-                        cast(Any, AgentLink.a_agent_id) == a.id,
-                        cast(Any, AgentLink.b_project_id) == target_project.id,
-                        cast(Any, AgentLink.b_agent_id) == b.id,
-                    )
-                )
-                link = existing.scalars().first()
-                if link is None:
-                    raise
-                previous_status = link.status
-                is_active_approved = previous_status == "approved" and (
-                    link.expires_ts is None or link.expires_ts > naive_now
-                )
-                is_active_pending = previous_status == "pending" and (
-                    link.expires_ts is None or link.expires_ts > naive_now
-                )
-                if is_active_approved:
-                    link.reason = reason
-                    link.updated_ts = naive_now
-                    result_status = "approved"
-                    should_notify = False
-                    if link.expires_ts is None:
-                        result_expires = None
-                    else:
-                        link.expires_ts = max(link.expires_ts, exp)
-                        result_expires = link.expires_ts
-                elif is_active_pending:
-                    result_status = "pending"
-                    should_notify = False
-                    if link.expires_ts is None:
-                        link.expires_ts = exp
-                    else:
-                        link.expires_ts = max(link.expires_ts, exp)
-                    result_expires = link.expires_ts
-                else:
-                    link.status = "pending"
-                    link.reason = reason
-                    link.updated_ts = naive_now
-                    link.expires_ts = exp
-                    result_expires = exp
-                    should_notify = previous_status != "pending" or not is_active_pending
-                s.add(link)
-                await s.commit()
+        link, should_notify = await _ContactLinkUpdate(
+            project, a, target_project, b, reason, naive_now, exp,
+        ).persist()
+        result_status = link.status
+        result_expires = link.expires_ts
 
         subject = f"Contact request from {a.name}"
         body = link.reason or f"{a.name} requests permission to contact {b.name}."
@@ -12687,13 +13174,14 @@ def build_mcp_server() -> FastMCP:
                 [],
                 subject,
                 body,
-                None,
-                None,
-                importance="normal",
-                ack_required=True,
-                thread_id=None,
-                idempotency_key=contact_event_key,
-                purpose="contact_request",
+                _MessageDeliveryOptions(
+                    None, None,
+                    importance="normal",
+                    ack_required=True,
+                    thread_id=None,
+                    idempotency_key=contact_event_key,
+                    purpose="contact_request",
+                ),
             )
             error_payload = _extract_delivery_error_payload(notification_payload)
             if error_payload is not None:
@@ -12715,16 +13203,14 @@ def build_mcp_server() -> FastMCP:
             result["notification_error"] = notification_error
         return result
 
-    @mcp.tool(name="respond_contact")
-    @_instrument_tool(
-        "respond_contact",
-        cluster=CLUSTER_CONTACT,
-        capabilities={"contact"},
-        project_arg="project_key",
-        agent_arg="to_agent",
+    @_MCPToolRegistration(
+        {"name": "respond_contact"},
+        {"cluster": CLUSTER_CONTACT, "capabilities": {"contact"},
+         "project_arg": "project_key", "agent_arg": "to_agent"},
     )
     @retry_on_db_lock(max_retries=3, base_delay=0.05, max_delay=0.5)
     async def respond_contact(
+        self,
         ctx: Context,
         project_key: str,
         to_agent: str,
@@ -12736,6 +13222,8 @@ def build_mcp_server() -> FastMCP:
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """Approve or deny a contact request."""
+        _authenticate_agent = self._authenticate_agent
+        _raise_if_self_contact = self._raise_if_self_contact
         project = await _get_project_by_identifier(project_key)
         # Resolve remote requestor project if provided
         a_project = project if not from_project else await _get_project_by_identifier(from_project)
@@ -12777,25 +13265,9 @@ def build_mcp_server() -> FastMCP:
             )
             link = existing.scalars().first()
             if link:
-                link.updated_ts = naive_now
-                if accept:
-                    is_active_approved = link.status == "approved" and (
-                        link.expires_ts is None or link.expires_ts > naive_now
-                    )
-                    link.status = "approved"
-                    if is_active_approved:
-                        if link.expires_ts is None:
-                            result_expires = None
-                        else:
-                            link.expires_ts = max(link.expires_ts, approved_exp)
-                            result_expires = link.expires_ts
-                    else:
-                        link.expires_ts = exp
-                        result_expires = exp
-                else:
-                    link.status = "blocked"
-                    link.expires_ts = None
-                    result_expires = None
+                result_expires = _MCPServerTools._respond_to_existing_link(
+                    link, accept, naive_now, approved_exp
+                )
                 s.add(link)
                 updated = 1
             else:
@@ -12824,15 +13296,13 @@ def build_mcp_server() -> FastMCP:
             "updated": updated,
         }
 
-    @mcp.tool(name="list_contacts")
-    @_instrument_tool(
-        "list_contacts",
-        cluster=CLUSTER_CONTACT,
-        capabilities={"contact", "audit"},
-        project_arg="project_key",
-        agent_arg="agent_name",
+    @_MCPToolRegistration(
+        {"name": "list_contacts"},
+        {"cluster": CLUSTER_CONTACT, "capabilities": {"contact", "audit"},
+         "project_arg": "project_key", "agent_arg": "agent_name"},
     )
     async def list_contacts(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -12840,6 +13310,7 @@ def build_mcp_server() -> FastMCP:
         format: Optional[str] = None,
     ) -> ToonableList:
         """List contact links for an agent in a project."""
+        _authenticate_agent = self._authenticate_agent
         project = await _get_project_by_identifier(project_key)
         agent = await _authenticate_agent(
             ctx,
@@ -12873,15 +13344,13 @@ def build_mcp_server() -> FastMCP:
                 })
         return out
 
-    @mcp.tool(name="set_agent_display_name")
-    @_instrument_tool(
-        "set_agent_display_name",
-        cluster=CLUSTER_CONTACT,
-        capabilities={"configure"},
-        project_arg="project_key",
-        agent_arg="agent_name",
+    @_MCPToolRegistration(
+        {"name": "set_agent_display_name"},
+        {"cluster": CLUSTER_CONTACT, "capabilities": {"configure"},
+         "project_arg": "project_key", "agent_arg": "agent_name"},
     )
     async def set_agent_display_name(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -12912,6 +13381,7 @@ def build_mcp_server() -> FastMCP:
         dict
             `{agent, display_name}` — the canonical name and the label now set.
         """
+        _authenticate_agent = self._authenticate_agent
         project = await _get_project_by_identifier(project_key)
         agent = await _authenticate_agent(
             ctx,
@@ -12966,15 +13436,13 @@ def build_mcp_server() -> FastMCP:
                 await s.commit()
         return {"agent": agent.name, "display_name": label or None}
 
-    @mcp.tool(name="set_agent_notify_sound")
-    @_instrument_tool(
-        "set_agent_notify_sound",
-        cluster=CLUSTER_CONTACT,
-        capabilities={"configure"},
-        project_arg="project_key",
-        agent_arg="agent_name",
+    @_MCPToolRegistration(
+        {"name": "set_agent_notify_sound"},
+        {"cluster": CLUSTER_CONTACT, "capabilities": {"configure"},
+         "project_arg": "project_key", "agent_arg": "agent_name"},
     )
     async def set_agent_notify_sound(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -13012,6 +13480,7 @@ def build_mcp_server() -> FastMCP:
             vocabulary, so a caller never has to guess the valid values or read
             this docstring twice.
         """
+        _authenticate_agent = self._authenticate_agent
         project = await _get_project_by_identifier(project_key)
         agent = await _authenticate_agent(
             ctx,
@@ -13047,15 +13516,13 @@ def build_mcp_server() -> FastMCP:
             "available": list(NOTIFY_SOUND_NAMES),
         }
 
-    @mcp.tool(name="set_contact_policy")
-    @_instrument_tool(
-        "set_contact_policy",
-        cluster=CLUSTER_CONTACT,
-        capabilities={"contact", "configure"},
-        project_arg="project_key",
-        agent_arg="agent_name",
+    @_MCPToolRegistration(
+        {"name": "set_contact_policy"},
+        {"cluster": CLUSTER_CONTACT, "capabilities": {"contact", "configure"},
+         "project_arg": "project_key", "agent_arg": "agent_name"},
     )
     async def set_contact_policy(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -13064,6 +13531,7 @@ def build_mcp_server() -> FastMCP:
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """Set contact policy for an agent: open | auto | contacts_only | block_all."""
+        _authenticate_agent = self._authenticate_agent
         project = await _get_project_by_identifier(project_key)
         agent = await _authenticate_agent(
             ctx,
@@ -13099,15 +13567,13 @@ def build_mcp_server() -> FastMCP:
                 await s.commit()
         return {"agent": agent.name, "policy": pol}
 
-    @mcp.tool(name="fetch_inbox")
-    @_instrument_tool(
-        "fetch_inbox",
-        cluster=CLUSTER_MESSAGING,
-        capabilities={"messaging", "read"},
-        project_arg="project_key",
-        agent_arg="agent_name",
+    @_MCPToolRegistration(
+        {"name": "fetch_inbox"},
+        {"cluster": CLUSTER_MESSAGING, "capabilities": {"messaging", "read"},
+         "project_arg": "project_key", "agent_arg": "agent_name"},
     )
     async def fetch_inbox(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -13161,6 +13627,7 @@ def build_mcp_server() -> FastMCP:
         """
         # Validate limit parameter bounds (shared with search_messages, the
         # product tools, and the resource handlers via _validate_limit).
+        _authenticate_agent = self._authenticate_agent
         if isinstance(limit, int) and not isinstance(limit, bool) and limit > 1000:
             await ctx.info(f"[warn] limit={limit} is very large; capping at 1000 to prevent performance issues.")
         limit = _validate_limit(limit)
@@ -13171,11 +13638,8 @@ def build_mcp_server() -> FastMCP:
         settings = get_settings()
         if settings.tools_log_enabled:
             try:
-                import importlib as _imp
-                _rc = _imp.import_module("rich.console")
-                _rp = _imp.import_module("rich.panel")
-                Console = _rc.Console
-                Panel = _rp.Panel
+                from rich.console import Console
+                from rich.panel import Panel
                 Console().print(Panel.fit(f"project={project_key}\nagent={agent_name}\nlimit={limit}\nurgent_only={urgent_only}", title="tool: fetch_inbox", border_style="green"))
             except Exception:
                 pass
@@ -13211,14 +13675,13 @@ def build_mcp_server() -> FastMCP:
             _rich_error_panel("fetch_inbox", {"error": str(exc)})
             raise
 
-    @mcp.tool(name="fetch_topic")
-    @_instrument_tool(
-        "fetch_topic",
-        cluster=CLUSTER_MESSAGING,
-        capabilities={"messaging", "read"},
-        project_arg="project_key",
+    @_MCPToolRegistration(
+        {"name": "fetch_topic"},
+        {"cluster": CLUSTER_MESSAGING, "capabilities": {"messaging", "read"},
+         "project_arg": "project_key"},
     )
     async def fetch_topic(
+        self,
         ctx: Context,
         project_key: str,
         topic_name: str,
@@ -13260,6 +13723,7 @@ def build_mcp_server() -> FastMCP:
         list[dict]
             Each message includes: { id, subject, from, created_ts, importance, topic, [body_md] }
         """
+        _resolve_authenticated_agent = self._resolve_authenticated_agent
         _validate_iso_timestamp(since_ts, "since_ts")
         project = await _get_project_by_identifier(project_key)
         # Authentication is only required when unread_only=True (which needs a
@@ -13356,15 +13820,13 @@ def build_mcp_server() -> FastMCP:
         )
         return messages
 
-    @mcp.tool(name="mark_message_read")
-    @_instrument_tool(
-        "mark_message_read",
-        cluster=CLUSTER_MESSAGING,
-        capabilities={"messaging", "read"},
-        project_arg="project_key",
-        agent_arg="agent_name",
+    @_MCPToolRegistration(
+        {"name": "mark_message_read"},
+        {"cluster": CLUSTER_MESSAGING, "capabilities": {"messaging", "read"},
+         "project_arg": "project_key", "agent_arg": "agent_name"},
     )
     async def mark_message_read(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -13399,13 +13861,11 @@ def build_mcp_server() -> FastMCP:
         }}}
         ```
         """
+        _authenticate_agent = self._authenticate_agent
         if get_settings().tools_log_enabled:
             try:
-                import importlib as _imp
-                _rc = _imp.import_module("rich.console")
-                _rp = _imp.import_module("rich.panel")
-                Console = _rc.Console
-                Panel = _rp.Panel
+                from rich.console import Console
+                from rich.panel import Panel
                 Console().print(Panel.fit(f"project={project_key}\nagent={agent_name}\nmessage_id={message_id}", title="tool: mark_message_read", border_style="green"))
             except Exception:
                 pass
@@ -13434,15 +13894,13 @@ def build_mcp_server() -> FastMCP:
                     pass
             raise
 
-    @mcp.tool(name="acknowledge_message")
-    @_instrument_tool(
-        "acknowledge_message",
-        cluster=CLUSTER_MESSAGING,
-        capabilities={"messaging", "ack"},
-        project_arg="project_key",
-        agent_arg="agent_name",
+    @_MCPToolRegistration(
+        {"name": "acknowledge_message"},
+        {"cluster": CLUSTER_MESSAGING, "capabilities": {"messaging", "ack"},
+         "project_arg": "project_key", "agent_arg": "agent_name"},
     )
     async def acknowledge_message(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -13480,13 +13938,11 @@ def build_mcp_server() -> FastMCP:
         }}}
         ```
         """
+        _authenticate_agent = self._authenticate_agent
         if get_settings().tools_log_enabled:
             try:
-                import importlib as _imp
-                _rc = _imp.import_module("rich.console")
-                _rp = _imp.import_module("rich.panel")
-                Console = _rc.Console
-                Panel = _rp.Panel
+                from rich.console import Console
+                from rich.panel import Panel
                 Console().print(Panel.fit(f"project={project_key}\nagent={agent_name}\nmessage_id={message_id}", title="tool: acknowledge_message", border_style="green"))
             except Exception:
                 pass
@@ -13513,25 +13969,20 @@ def build_mcp_server() -> FastMCP:
         except Exception as exc:
             if get_settings().tools_log_enabled:
                 try:
-                    import importlib as _imp
-                    _rc = _imp.import_module("rich.console")
-                    _rj = _imp.import_module("rich.json")
-                    Console = _rc.Console
-                    JSON = _rj.JSON
+                    from rich.console import Console
+                    from rich.json import JSON
                     Console().print(JSON.from_data({"error": str(exc)}))
                 except Exception:
                     pass
             raise
 
-    @mcp.tool(name="macro_start_session")
-    @_instrument_tool(
-        "macro_start_session",
-        cluster=CLUSTER_MACROS,
-        capabilities={"workflow", "messaging", "file_reservations", "identity"},
-        project_arg="human_key",
-        agent_arg="agent_name",
+    @_MCPToolRegistration(
+        {"name": "macro_start_session"},
+        {"cluster": CLUSTER_MACROS, "capabilities": {"workflow", "messaging", "file_reservations", "identity"},
+         "project_arg": "human_key", "agent_arg": "agent_name"},
     )
     async def macro_start_session(
+        self,
         ctx: Context,
         human_key: str,
         program: str,
@@ -13552,6 +14003,10 @@ def build_mcp_server() -> FastMCP:
         Macro helper that boots a project session: ensure project, register agent,
         optionally file_reservation paths, and fetch the latest inbox snapshot.
         """
+        _register_or_authenticate_agent = self._register_or_authenticate_agent
+        _bind_session_agent = self._bind_session_agent
+        start_agent_execution = self.start_agent_execution
+        file_reservation_paths_direct = self.file_reservation_paths
         _validate_program_model(program, model)
         if not agent_name.strip():
             raise ToolExecutionError(
@@ -13629,15 +14084,13 @@ def build_mcp_server() -> FastMCP:
             "inbox": inbox_items,
         }
 
-    @mcp.tool(name="macro_prepare_thread")
-    @_instrument_tool(
-        "macro_prepare_thread",
-        cluster=CLUSTER_MACROS,
-        capabilities={"workflow", "messaging", "summarization"},
-        project_arg="project_key",
-        agent_arg="agent_name",
+    @_MCPToolRegistration(
+        {"name": "macro_prepare_thread"},
+        {"cluster": CLUSTER_MACROS, "capabilities": {"workflow", "messaging", "summarization"},
+         "project_arg": "project_key", "agent_arg": "agent_name"},
     )
     async def macro_prepare_thread(
+        self,
         ctx: Context,
         project_key: str,
         thread_id: str,
@@ -13660,6 +14113,9 @@ def build_mcp_server() -> FastMCP:
         Macro helper that aligns an already provisioned agent with an existing thread,
         summarising the thread, and fetching recent inbox context.
         """
+        _register_or_authenticate_agent = self._register_or_authenticate_agent
+        _bind_session_agent = self._bind_session_agent
+        start_agent_execution = self.start_agent_execution
         if not agent_name.strip():
             raise ToolExecutionError(
                 "NAME_REQUIRED",
@@ -13728,15 +14184,13 @@ def build_mcp_server() -> FastMCP:
             "inbox": inbox_items,
         }
 
-    @mcp.tool(name="macro_file_reservation_cycle")
-    @_instrument_tool(
-        "macro_file_reservation_cycle",
-        cluster=CLUSTER_MACROS,
-        capabilities={"workflow", "file_reservations", "repository"},
-        project_arg="project_key",
-        agent_arg="agent_name",
+    @_MCPToolRegistration(
+        {"name": "macro_file_reservation_cycle"},
+        {"cluster": CLUSTER_MACROS, "capabilities": {"workflow", "file_reservations", "repository"},
+         "project_arg": "project_key", "agent_arg": "agent_name"},
     )
     async def macro_file_reservation_cycle(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -13752,6 +14206,8 @@ def build_mcp_server() -> FastMCP:
     ) -> dict[str, Any]:
         """Reserve a set of file paths and optionally release them at the end of the workflow."""
 
+        file_reservation_paths = self.file_reservation_paths
+        release_file_reservations_tool = self.release_file_reservations_tool
         file_reservations_result = await file_reservation_paths(
             ctx=ctx,
             project_key=project_key,
@@ -13803,16 +14259,14 @@ def build_mcp_server() -> FastMCP:
             "released": release_result,
         }
 
-    @mcp.tool(name="macro_contact_handshake")
-    @_instrument_tool(
-        "macro_contact_handshake",
-        cluster=CLUSTER_MACROS,
-        capabilities={"workflow", "contact", "messaging"},
-        project_arg="project_key",
-        agent_arg="requester",
+    @_MCPToolRegistration(
+        {"name": "macro_contact_handshake"},
+        {"cluster": CLUSTER_MACROS, "capabilities": {"workflow", "contact", "messaging"},
+         "project_arg": "project_key", "agent_arg": "requester"},
     )
     @retry_on_db_lock(max_retries=3, base_delay=0.05, max_delay=0.5)
     async def macro_contact_handshake(
+        self,
         ctx: Context,
         project_key: str,
         requester: Optional[str] = None,
@@ -13839,72 +14293,18 @@ def build_mcp_server() -> FastMCP:
         """
 
         # Resolve aliases
+        _authenticate_agent = self._authenticate_agent
+        _raise_if_self_contact = self._raise_if_self_contact
+        request_contact = self.request_contact
+        runtime = self
+        respond_contact = self.respond_contact
+        _session_is_bound_to_agent = self._session_is_bound_to_agent
+        send_message = self.send_message
         real_requester = (requester or agent_name or "").strip()
         real_target = (target or to_agent or "").strip()
         target_project_key = (to_project or "").strip()
-        if welcome_subject is not None:
-            welcome_subject = welcome_subject.strip()
-            if not welcome_subject:
-                raise ToolExecutionError(
-                    "INVALID_ARGUMENT",
-                    "welcome_subject cannot be blank when provided.",
-                    recoverable=True,
-                    data={"argument": "welcome_subject"},
-                )
-        if welcome_body is not None and not welcome_body.strip():
-            raise ToolExecutionError(
-                "INVALID_ARGUMENT",
-                "welcome_body cannot be blank when provided.",
-                recoverable=True,
-                data={"argument": "welcome_body"},
-            )
-        if (welcome_subject is None) != (welcome_body is None):
-            raise ToolExecutionError(
-                "INVALID_ARGUMENT",
-                "welcome_subject and welcome_body must be provided together.",
-                recoverable=True,
-                data={
-                    "welcome_subject_provided": welcome_subject is not None,
-                    "welcome_body_provided": welcome_body is not None,
-                },
-            )
-        if welcome_subject is not None and not auto_accept:
-            raise ToolExecutionError(
-                "INVALID_ARGUMENT",
-                "welcome_subject and welcome_body require auto_accept=True because the macro cannot defer a welcome until manual approval completes.",
-                recoverable=True,
-                data={"auto_accept": auto_accept},
-            )
-        if not real_requester or not real_target:
-            # Best-effort inference to honor "obvious intent"
-            try:
-                project = await _get_project_by_identifier(project_key)
-                # If requester missing and exactly one agent exists in project, assume that one
-                if not real_requester and project.id is not None:
-                    async with get_session() as s:
-                        rows = await s.execute(
-                            select(Agent.name).where(
-                                cast(Any, Agent.project_id) == project.id,
-                                cast(Any, Agent.provisioning_state == "active"),
-                            )
-                        )
-                        names = [str(row[0]).strip() for row in rows.fetchall() if (row and row[0])]
-                    if len(names) == 1:
-                        real_requester = names[0]
-                # If target missing and exactly two agents exist, infer the other
-                if not real_target and project.id is not None:
-                    async with get_session() as s2:
-                        rows2 = await s2.execute(
-                            select(Agent.name).where(
-                                cast(Any, Agent.project_id) == project.id,
-                                cast(Any, Agent.provisioning_state == "active"),
-                            )
-                        )
-                        names2 = [str(row[0]).strip() for row in rows2.fetchall() if (row and row[0])]
-                    if real_requester and len(names2) == 2 and real_requester in names2:
-                        real_target = next((n for n in names2 if n != real_requester), real_target)
-            except Exception:
-                pass
+        welcome_subject = _validate_contact_welcome(welcome_subject, welcome_body, auto_accept)
+        real_requester, real_target = await _infer_contact_names(project_key, real_requester, real_target)
         if not real_requester or not real_target:
             raise ToolExecutionError(
                 "INVALID_ARGUMENT",
@@ -13939,133 +14339,11 @@ def build_mcp_server() -> FastMCP:
         # Fast path: for same-project auto-accept handshakes (used heavily by send_message),
         # approve the AgentLink directly without generating extra "intro" messages.
         if auto_accept and not target_project_key and not (welcome_subject and welcome_body):
-            a = await _authenticate_agent(
-                ctx,
-                project,
-                real_requester,
-                requester_registration_token,
-                token_param="requester_registration_token",
-                action="macro_contact_handshake requester approval",
+            return await _approve_contact_handshake(
+                ctx, project, real_requester, real_target, reason, ttl_seconds,
+                requester_registration_token, target_registration_token,
+                _authenticate_agent, _raise_if_self_contact,
             )
-            try:
-                b = await _authenticate_agent(
-                    ctx,
-                    project,
-                    real_target,
-                    target_registration_token,
-                    token_param="target_registration_token",
-                    action="macro_contact_handshake target approval",
-                )
-            except (NoResultFound, ToolExecutionError) as exc:
-                is_not_found = isinstance(exc, NoResultFound) or (
-                    isinstance(exc, ToolExecutionError) and exc.error_type == "NOT_FOUND"
-                )
-                if is_not_found:
-                    raise _target_registration_required_error(
-                        project,
-                        real_target,
-                    ) from exc
-                raise
-            _raise_if_self_contact(
-                project,
-                a,
-                project,
-                b,
-                action="macro_contact_handshake",
-            )
-
-            if ttl_seconds < 60:
-                await ctx.info(
-                    f"[warn] ttl_seconds={ttl_seconds} is below minimum (60s); auto-correcting to 60 seconds."
-                )
-            now = datetime.now(timezone.utc)
-            naive_now = _naive_utc(now)
-            exp = naive_now + timedelta(seconds=max(60, ttl_seconds))
-            result_expires: datetime | None = exp
-
-            async with get_session() as s:
-                existing = await s.execute(
-                    select(AgentLink).where(
-                        cast(Any, AgentLink.a_project_id) == project.id,
-                        cast(Any, AgentLink.a_agent_id) == a.id,
-                        cast(Any, AgentLink.b_project_id) == project.id,
-                        cast(Any, AgentLink.b_agent_id) == b.id,
-                    )
-                )
-                link = existing.scalars().first()
-                if link:
-                    link.reason = reason
-                    link.updated_ts = naive_now
-                    is_active_approved = link.status == "approved" and (
-                        link.expires_ts is None or link.expires_ts > naive_now
-                    )
-                    link.status = "approved"
-                    if is_active_approved:
-                        if link.expires_ts is None:
-                            result_expires = None
-                        else:
-                            link.expires_ts = max(link.expires_ts, exp)
-                            result_expires = link.expires_ts
-                    else:
-                        link.expires_ts = exp
-                        result_expires = exp
-                    s.add(link)
-                else:
-                    link = AgentLink(
-                        a_project_id=project.id or 0,
-                        a_agent_id=a.id or 0,
-                        b_project_id=project.id or 0,
-                        b_agent_id=b.id or 0,
-                        status="approved",
-                        reason=reason,
-                        created_ts=naive_now,
-                        updated_ts=naive_now,
-                        expires_ts=exp,
-                    )
-                    s.add(link)
-                try:
-                    await s.commit()
-                except IntegrityError:
-                    # Another concurrent handshake created the link; treat as idempotent approval.
-                    await s.rollback()
-                    existing = await s.execute(
-                        select(AgentLink).where(
-                            cast(Any, AgentLink.a_project_id) == project.id,
-                            cast(Any, AgentLink.a_agent_id) == a.id,
-                            cast(Any, AgentLink.b_project_id) == project.id,
-                            cast(Any, AgentLink.b_agent_id) == b.id,
-                        )
-                    )
-                    link = existing.scalars().first()
-                    if link is None:
-                        raise
-                    link.reason = reason
-                    link.updated_ts = naive_now
-                    is_active_approved = link.status == "approved" and (
-                        link.expires_ts is None or link.expires_ts > naive_now
-                    )
-                    link.status = "approved"
-                    if is_active_approved:
-                        if link.expires_ts is None:
-                            result_expires = None
-                        else:
-                            link.expires_ts = max(link.expires_ts, exp)
-                            result_expires = link.expires_ts
-                    else:
-                        link.expires_ts = exp
-                        result_expires = exp
-                    s.add(link)
-                    await s.commit()
-
-            approved_payload = {
-                "from": a.name,
-                "from_project": project.human_key,
-                "to": b.name,
-                "to_project": project.human_key,
-                "status": "approved",
-                "expires_ts": _iso(result_expires) if result_expires is not None else None,
-            }
-            return {"request": approved_payload, "response": approved_payload, "welcome_message": None}
 
         request_result = await request_contact(
             ctx=ctx,
@@ -14078,88 +14356,17 @@ def build_mcp_server() -> FastMCP:
             registration_token=requester_registration_token,
             format="json",
         )
-        request_status = str(request_result.get("status") or "").lower()
-
-        response_result = None
-        response_error: dict[str, Any] | None = None
-        if auto_accept:
-            if request_status == "approved":
-                response_result = request_result
-            else:
-                response_project = await _get_project_by_identifier(target_project_key or project_key)
-                response_agent = await _get_agent(response_project, real_target)
-                target_auth_token = target_registration_token
-                if target_auth_token is None and not _session_is_bound_to_agent(ctx, response_project, response_agent):
-                    response_error = {
-                        "type": "AUTHENTICATION_REQUIRED",
-                        "message": (
-                            "auto_accept requires target_registration_token unless this MCP session "
-                            "has already authenticated as the target agent."
-                        ),
-                        "project_key": response_project.human_key,
-                        "agent_name": response_agent.name,
-                        "token_param": "target_registration_token",
-                    }
-                else:
-                    response_result = await respond_contact(
-                        ctx=ctx,
-                        project_key=target_project_key or project_key,
-                        to_agent=real_target,
-                        from_agent=real_requester,
-                        accept=True,
-                        ttl_seconds=ttl_seconds,
-                        from_project=project_key if target_project_key else None,
-                        registration_token=target_auth_token,
-                        format="json",
-                    )
-
-        welcome_message = None
-        welcome_error: dict[str, Any] | None = None
-        if welcome_subject and welcome_body:
-            welcome_project = await _get_project_by_identifier(target_project_key or project_key)
-            if response_error is not None:
-                welcome_error = {
-                    "type": "CONTACT_APPROVAL_REQUIRED",
-                    "message": "welcome skipped because auto_accept did not complete; the contact request remains pending.",
-                    "project_key": welcome_project.human_key,
-                    "agent_name": real_target,
-                }
-            else:
-                try:
-                    welcome_recipients = [real_target] if not target_project_key else [f"{real_target}@{target_project_key}"]
-                    welcome_idempotency_key = _internal_delivery_idempotency_key(
-                        "contact-welcome",
-                        {
-                            "source_project": project.human_key,
-                            "source_agent": real_requester,
-                            "target_project": welcome_project.human_key,
-                            "target_agent": real_target,
-                            "subject": welcome_subject,
-                            "body_md": welcome_body,
-                            "thread_id": thread_id,
-                        },
-                    )
-                    welcome_payload = await send_message(
-                        ctx=ctx,
-                        project_key=project_key,
-                        sender_name=real_requester,
-                        to=welcome_recipients,
-                        subject=welcome_subject,
-                        body_md=welcome_body,
-                        thread_id=thread_id,
-                        idempotency_key=welcome_idempotency_key,
-                        registration_token=requester_registration_token,
-                        format="json",
-                    )
-                    error_payload = _extract_delivery_error_payload(welcome_payload)
-                    if error_payload is not None:
-                        welcome_error = _with_delivery_project(error_payload, welcome_project)
-                    else:
-                        welcome_message = welcome_payload
-                except Exception as exc:
-                    # surface but do not abort handshake
-                    await ctx.debug(f"macro_contact_handshake failed to send welcome: {exc}")
-                    welcome_error = _delivery_failure_from_exception(welcome_project, exc)
+        followup = _ContactHandshakeFollowup(
+            ctx, project, project_key, real_requester, real_target,
+            target_project_key, ttl_seconds, requester_registration_token,
+            target_registration_token, thread_id, runtime,
+        )
+        response_result, response_error = await followup.response(
+            request_result, auto_accept, respond_contact, _session_is_bound_to_agent,
+        )
+        welcome_message, welcome_error = await followup.welcome(
+            welcome_subject, welcome_body, response_error, send_message,
+        )
 
         result = {
             "request": request_result,
@@ -14172,9 +14379,12 @@ def build_mcp_server() -> FastMCP:
             result["welcome_error"] = welcome_error
         return result
 
-    @mcp.tool(name="search_messages")
-    @_instrument_tool("search_messages", cluster=CLUSTER_SEARCH, capabilities={"search"}, project_arg="project_key")
+    @_MCPToolRegistration(
+        {"name": "search_messages"},
+        {"cluster": CLUSTER_SEARCH, "capabilities": {"search"}, "project_arg": "project_key"},
+    )
     async def search_messages(
+        self,
         ctx: Context,
         project_key: str,
         query: str,
@@ -14223,6 +14433,7 @@ def build_mcp_server() -> FastMCP:
         """
         # Apply the shared limit bounds (issue #191) so search_messages matches
         # fetch_inbox: reject limit<1, clamp >1000.
+        _resolve_authenticated_agent = self._resolve_authenticated_agent
         limit = _validate_limit(limit)
         project = await _get_project_by_identifier(project_key)
         viewer = await _resolve_authenticated_agent(
@@ -14235,13 +14446,9 @@ def build_mcp_server() -> FastMCP:
         )
         if get_settings().tools_log_enabled:
             try:
-                import importlib as _imp
-                _rc = _imp.import_module("rich.console")
-                _rp = _imp.import_module("rich.panel")
-                _rt = _imp.import_module("rich.text")
-                Console = _rc.Console
-                Panel = _rp.Panel
-                Text = _rt.Text
+                from rich.console import Console
+                from rich.panel import Panel
+                from rich.text import Text
                 cons = Console()
                 body = Text.assemble(
                     ("project: ", "cyan"), (project.human_key, "white"), "\n",
@@ -14306,60 +14513,13 @@ def build_mcp_server() -> FastMCP:
 
         # Handle FTS failure with LIKE fallback (using a fresh session)
         if fts_failed:
-            fallback_terms = _extract_like_terms(query)
-            if not fallback_terms:
-                await ctx.info(f"Search query '{query}' could not be executed (FTS syntax issue), returning empty results.")
-                rows = []
-            else:
-                clauses = []
-                params: dict[str, Any] = {"project_id": project.id, "agent_id": viewer.id, "limit": limit}
-                for idx, term in enumerate(fallback_terms):
-                    key = f"t{idx}"
-                    params[key] = f"%{_like_escape(term)}%"
-                    clauses.append(
-                        f"(m.subject LIKE :{key} ESCAPE '{_LIKE_ESCAPE_CHAR}' OR m.body_md LIKE :{key} ESCAPE '{_LIKE_ESCAPE_CHAR}')"
-                    )
-                where_clause = " AND ".join(clauses)
-                async with get_session() as session:
-                    result = await session.execute(
-                        text(
-                            f"""
-                            SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts,
-                                   m.thread_id, a.name AS sender_name,
-                                   sp.id AS sender_project_id, sp.human_key AS sender_project, sp.slug AS sender_project_slug
-                            FROM messages m
-                            JOIN agents a ON m.sender_id = a.id
-                            JOIN projects sp ON a.project_id = sp.id
-                            WHERE m.project_id = :project_id
-                              AND (
-                                    m.sender_id = :agent_id
-                                    OR EXISTS (
-                                        SELECT 1
-                                        FROM message_recipients mr
-                                        WHERE mr.message_id = m.id
-                                          AND mr.agent_id = :agent_id
-                                    )
-                              )
-                              AND {where_clause}
-                            ORDER BY m.created_ts DESC
-                            LIMIT :limit
-                            """
-                        ),
-                        params,
-                    )
-                    rows = list(result.mappings().all())
-                await ctx.info(
-                    f"FTS query failed; used LIKE fallback with {len(fallback_terms)} term(s), returned {len(rows)} result(s)."
-                )
+            rows = await _MCPServerTools._search_messages_like(ctx, project, viewer, query, limit)
 
         await ctx.info(f"Search '{query}' returned {len(rows)} messages for project '{project.human_key}'.")
         if get_settings().tools_log_enabled:
             try:
-                import importlib as _imp
-                _rc = _imp.import_module("rich.console")
-                _rp = _imp.import_module("rich.panel")
-                Console = _rc.Console
-                Panel = _rp.Panel
+                from rich.console import Console
+                from rich.panel import Panel
                 Console().print(Panel(f"results={len(rows)}", title="tool: search_messages — done", border_style="green"))
             except Exception:
                 pass
@@ -14388,9 +14548,12 @@ def build_mcp_server() -> FastMCP:
         except Exception:
             return items
 
-    @mcp.tool(name="summarize_thread")
-    @_instrument_tool("summarize_thread", cluster=CLUSTER_SEARCH, capabilities={"summarization", "search"}, project_arg="project_key")
+    @_MCPToolRegistration(
+        {"name": "summarize_thread"},
+        {"cluster": CLUSTER_SEARCH, "capabilities": {"summarization", "search"}, "project_arg": "project_key"},
+    )
     async def summarize_thread(
+        self,
         ctx: Context,
         project_key: str,
         thread_id: str,
@@ -14440,6 +14603,7 @@ def build_mcp_server() -> FastMCP:
         {"thread_id": "TKT-1,TKT-2,TKT-3"}
         ```
         """
+        _resolve_authenticated_agent = self._resolve_authenticated_agent
         # Detect multi-thread mode by checking for comma-separated IDs
         thread_ids = [t.strip() for t in thread_id.split(",") if t.strip()]
         project = await _get_project_by_identifier(project_key)
@@ -14481,45 +14645,13 @@ def build_mcp_server() -> FastMCP:
 
         async with get_session() as session:
             for tid in thread_ids:
-                try:
-                    seed_id = int(tid)
-                except ValueError:
-                    seed_id = None
-                criteria = [cast(Any, Message.thread_id) == tid]
-                if seed_id is not None:
-                    criteria.append(cast(Any, Message.id) == seed_id)
-                stmt = (
-                    select(Message, sender_alias.name, sender_project_alias.id, sender_project_alias.slug)
-                    .join(sender_alias, cast(Any, Message.sender_id == sender_alias.id))
-                    .join(sender_project_alias, cast(Any, sender_alias.project_id == sender_project_alias.id))
-                    .where(
-                        cast(Any, Message.project_id) == project.id,
-                        or_(*criteria),
-                        _message_visible_to_agent_clause(viewer.id or 0),
-                    )
-                    .order_by(asc(cast(Any, Message.created_ts)))
-                    .limit(per_thread_limit)
+                rows = await _MCPServerTools._thread_summary_rows(
+                    session, project.id, viewer.id or 0, tid, per_thread_limit,
+                    sender_alias, sender_project_alias,
                 )
-                raw_rows = (await session.execute(stmt)).all()
-                rows = [
-                    (
-                        row[0],
-                        _sender_display_name(
-                            message_project_id=row[0].project_id,
-                            sender_name=row[1],
-                            sender_project_id=row[2],
-                            sender_project_slug=row[3],
-                        ),
-                    )
-                    for row in raw_rows
-                ]
                 summary = _summarize_messages(rows)
                 # accumulate
-                for m in summary.get("mentions", []):
-                    name = str(m.get("name", "")).strip()
-                    if not name:
-                        continue
-                    all_mentions[name] = all_mentions.get(name, 0) + int(m.get("count", 0) or 0)
+                _MCPServerTools._accumulate_thread_mentions(summary, all_mentions)
                 all_actions.extend(summary.get("action_items", []))
                 all_points.extend(summary.get("key_points", []))
                 thread_summaries.append({"thread_id": tid, "summary": summary})
@@ -14534,70 +14666,21 @@ def build_mcp_server() -> FastMCP:
 
         # Optional LLM refinement
         if llm_mode and get_settings().llm.enabled and thread_summaries:
-            try:
-                # Compose compact context combining per-thread key points & actions only
-                parts: list[str] = []
-                for item in thread_summaries[:8]:
-                    s = item["summary"]
-                    parts.append(
-                        "\n".join(
-                            [
-                                f"# Thread {item['thread_id']}",
-                                "## Key Points",
-                                *[f"- {p}" for p in s.get("key_points", [])[:6]],
-                                "## Actions",
-                                *[f"- {a}" for a in s.get("action_items", [])[:6]],
-                            ]
-                        )
-                    )
-                system = (
-                    "You are a senior engineer producing a crisp digest across threads. "
-                    "Return JSON: { threads: [{thread_id, key_points[], actions[]}], aggregate: {top_mentions[], key_points[], action_items[]} }."
-                )
-                user = "\n\n".join(parts)
-                llm_resp = await complete_system_user(system, user, model=llm_model)
-                parsed = _parse_json_safely(llm_resp.content)
-                if parsed:
-                    agg = parsed.get("aggregate") or {}
-                    if agg:
-                        for k in ("top_mentions", "key_points", "action_items"):
-                            v = agg.get(k)
-                            if v:
-                                aggregate[k] = v
-                    # Replace per-thread summaries' key aggregates if returned
-                    revised_threads = []
-                    threads_payload = parsed.get("threads") or []
-                    if threads_payload:
-                        mapping = {str(t.get("thread_id")): t for t in threads_payload}
-                        for item in thread_summaries:
-                            tid = str(item["thread_id"])
-                            if tid in mapping:
-                                s = item["summary"].copy()
-                                tdata = mapping[tid]
-                                if tdata.get("key_points"):
-                                    s["key_points"] = tdata["key_points"]
-                                if tdata.get("actions"):
-                                    s["action_items"] = tdata["actions"]
-                                revised_threads.append({"thread_id": item["thread_id"], "summary": s})
-                            else:
-                                revised_threads.append(item)
-                        thread_summaries = revised_threads
-            except Exception as e:
-                await ctx.debug(f"summarize_thread.llm_skipped: {e}")
+            thread_summaries = await _MCPServerTools._refine_thread_digest(
+                ctx, thread_summaries, aggregate, llm_model
+            )
 
         await ctx.info(f"Summarized {len(thread_ids)} thread(s) for project '{project.human_key}'.")
         return {"threads": thread_summaries, "aggregate": aggregate}
 
     # ── On-demand project-wide summarization (bd-1ia) ────────────────────
 
-    @mcp.tool(name="summarize_recent")
-    @_instrument_tool(
-        "summarize_recent",
-        cluster=CLUSTER_SEARCH,
-        capabilities={"summarization", "search"},
-        project_arg="project_key",
+    @_MCPToolRegistration(
+        {"name": "summarize_recent"},
+        {"cluster": CLUSTER_SEARCH, "capabilities": {"summarization", "search"}, "project_arg": "project_key"},
     )
     async def summarize_recent(
+        self,
         ctx: Context,
         project_key: str,
         since_hours: float = 1.0,
@@ -14769,32 +14852,9 @@ def build_mcp_server() -> FastMCP:
 
         # ── LLM refinement ──
         if llm_mode and get_settings().llm.enabled and rows:
-            try:
-                excerpts: list[str] = []
-                for msg, sender in rows[:30]:
-                    tid = msg.thread_id or f"msg-{msg.id}"
-                    excerpts.append(f"[{tid}] {sender}: {msg.subject}\n{msg.body_md[:400]}")
-                system = (
-                    "You are a senior engineering lead. Summarize the following project messages "
-                    "from the given time window into a concise JSON with keys: "
-                    "key_decisions[], blockers_resolved[], work_completed[], open_questions[], "
-                    "participants[], total_messages (int), total_threads (int). "
-                    "Be specific and actionable."
-                )
-                user = f"Time window: last {since_hours}h\n\n" + "\n\n".join(excerpts)
-                llm_resp = await complete_system_user(system, user, model=llm_model)
-                used_model = llm_resp.model
-                cost_usd = getattr(llm_resp, "estimated_cost_usd", None)
-                parsed = _parse_json_safely(llm_resp.content)
-                if parsed:
-                    # Preserve heuristic counts but use LLM text
-                    parsed["total_messages"] = len(rows)
-                    parsed["total_threads"] = len(threads)
-                    if truncated:
-                        parsed["truncated"] = True
-                    summary_text = _json.dumps(parsed)
-            except Exception as e:
-                await ctx.debug(f"summarize_recent.llm_skipped: {e}")
+            summary_text, used_model, cost_usd = await _MCPServerTools._refine_recent_summary(
+                ctx, rows, summary_text, len(threads), since_hours, llm_model, truncated
+            )
 
         # ── Store summary ──
         async with get_session() as session:
@@ -14829,14 +14889,12 @@ def build_mcp_server() -> FastMCP:
             "created_ts": _iso(summary_row.created_ts),
         }
 
-    @mcp.tool(name="fetch_summary")
-    @_instrument_tool(
-        "fetch_summary",
-        cluster=CLUSTER_SEARCH,
-        capabilities={"summarization", "read"},
-        project_arg="project_key",
+    @_MCPToolRegistration(
+        {"name": "fetch_summary"},
+        {"cluster": CLUSTER_SEARCH, "capabilities": {"summarization", "read"}, "project_arg": "project_key"},
     )
     async def fetch_summary(
+        self,
         ctx: Context,
         project_key: str,
         since_hours: float = 24.0,
@@ -14894,27 +14952,31 @@ def build_mcp_server() -> FastMCP:
         await ctx.info(f"Fetched {len(items)} stored summaries for project '{project.human_key}'.")
         return items
 
+    @staticmethod
     def _resolve_code_repo_path(code_repo_path: str) -> Path:
         return Path(code_repo_path).expanduser().resolve()
 
-    @mcp.tool(name="install_precommit_guard")
-    @_instrument_tool("install_precommit_guard", cluster=CLUSTER_SETUP, capabilities={"infrastructure", "repository"}, project_arg="project_key")
+    @_MCPToolRegistration(
+        {"name": "install_precommit_guard"},
+        {"cluster": CLUSTER_SETUP, "capabilities": {"infrastructure", "repository"}, "project_arg": "project_key"},
+    )
     async def install_precommit_guard(
+        self,
         ctx: Context,
         project_key: str,
         code_repo_path: str,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
+        settings = self.settings
+        _resolve_code_repo_path = self._resolve_code_repo_path
+        _ctx_info_safe = self._ctx_info_safe
         if not settings.worktrees_enabled:
             await ctx.info("Worktree-friendly features are disabled (WORKTREES_ENABLED=0). Skipping guard install.")
             return {"hook": ""}
         if get_settings().tools_log_enabled:
             try:
-                import importlib as _imp
-                _rc = _imp.import_module("rich.console")
-                _rp = _imp.import_module("rich.panel")
-                Console = _rc.Console
-                Panel = _rp.Panel
+                from rich.console import Console
+                from rich.panel import Panel
                 Console().print(Panel.fit(f"project={project_key}\nrepo={code_repo_path}", title="tool: install_precommit_guard", border_style="green"))
             except Exception:
                 pass
@@ -14924,20 +14986,22 @@ def build_mcp_server() -> FastMCP:
         await _ctx_info_safe(ctx, f"Installed pre-commit guard for project '{project.human_key}' at {hook_path}.")
         return {"hook": str(hook_path)}
 
-    @mcp.tool(name="uninstall_precommit_guard")
-    @_instrument_tool("uninstall_precommit_guard", cluster=CLUSTER_SETUP, capabilities={"infrastructure", "repository"})
+    @_MCPToolRegistration(
+        {"name": "uninstall_precommit_guard"},
+        {"cluster": CLUSTER_SETUP, "capabilities": {"infrastructure", "repository"}},
+    )
     async def uninstall_precommit_guard(
+        self,
         ctx: Context,
         code_repo_path: str,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
+        _resolve_code_repo_path = self._resolve_code_repo_path
+        _ctx_info_safe = self._ctx_info_safe
         if get_settings().tools_log_enabled:
             try:
-                import importlib as _imp
-                _rc = _imp.import_module("rich.console")
-                _rp = _imp.import_module("rich.panel")
-                Console = _rc.Console
-                Panel = _rp.Panel
+                from rich.console import Console
+                from rich.panel import Panel
                 Console().print(Panel.fit(f"repo={code_repo_path}", title="tool: uninstall_precommit_guard", border_style="green"))
             except Exception:
                 pass
@@ -14949,9 +15013,13 @@ def build_mcp_server() -> FastMCP:
             await _ctx_info_safe(ctx, f"No pre-commit guard to remove at {repo_path / '.git/hooks/pre-commit'}.")
         return {"removed": removed}
 
-    @mcp.tool(name="file_reservation_paths")
-    @_instrument_tool("file_reservation_paths", cluster=CLUSTER_FILE_RESERVATIONS, capabilities={"file_reservations", "repository"}, project_arg="project_key", agent_arg="agent_name")
+    @_MCPToolRegistration(
+        {"name": "file_reservation_paths"},
+        {"cluster": CLUSTER_FILE_RESERVATIONS, "capabilities": {"file_reservations", "repository"},
+         "project_arg": "project_key", "agent_arg": "agent_name"},
+    )
     async def file_reservation_paths(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -15017,6 +15085,8 @@ def build_mcp_server() -> FastMCP:
         }}}
         ```
         """
+        _authenticate_agent = self._authenticate_agent
+        _resolve_agent_execution = self._resolve_agent_execution
         # Validate paths is not empty
         if not paths:
             raise ToolExecutionError(
@@ -15040,11 +15110,8 @@ def build_mcp_server() -> FastMCP:
         settings = get_settings()
         if settings.tools_log_enabled:
             try:
-                import importlib as _imp
-                _rc = _imp.import_module("rich.console")
-                _rp = _imp.import_module("rich.panel")
-                Console = _rc.Console
-                Panel = _rp.Panel
+                from rich.console import Console
+                from rich.panel import Panel
                 c = Console()
                 c.print(Panel("\n".join(paths), title=f"tool: file_reservation_paths — agent={agent_name} ttl={ttl_seconds}s", border_style="green"))
             except Exception:
@@ -15086,42 +15153,16 @@ def build_mcp_server() -> FastMCP:
             if execution is not None
             else []
         )
-        compatible_execution_ids = set(ancestor_execution_ids)
         stale_auto_releases = await _expire_stale_file_reservations(project.id)
-        if stale_auto_releases:
-            summary = ", ".join(
-                f"{status.agent.name if status.agent is not None else '<orphaned>'}:{status.reservation.path_pattern}"
-                for status in stale_auto_releases[:5]
-            )
-            extra = f" ({summary})" if summary else ""
-            await ctx.info(f"Auto-released {len(stale_auto_releases)} stale file_reservation(s){extra}.")
+        await _FileReservationBatch.report_stale(ctx, stale_auto_releases)
         project_id = project.id
         # Validate path patterns and warn on suspicious patterns
-        for pattern in paths:
-            warning = _detect_suspicious_file_reservation(pattern)
-            if warning:
-                await ctx.info(f"[warn] {warning}")
+        await _FileReservationBatch.warn_paths(ctx, paths)
 
         granted: list[dict[str, Any]] = []
         conflicts: list[dict[str, Any]] = []
         archive = await ensure_archive(settings, project.slug)
-        ctx_branch: Optional[str] = None
-        ctx_worktree: Optional[str] = None
-        try:
-            with _git_repo(project.human_key) as repo:
-                try:
-                    ctx_branch = repo.active_branch.name
-                except Exception:
-                    try:
-                        ctx_branch = repo.git.rev_parse("--abbrev-ref", "HEAD").strip()
-                    except Exception:
-                        ctx_branch = None
-                try:
-                    ctx_worktree = Path(repo.working_tree_dir or "").name or None
-                except Exception:
-                    ctx_worktree = None
-        except Exception:
-            pass
+        ctx_branch, ctx_worktree = _FileReservationBatch.repository_context(project)
         async with _archive_write_lock(archive):
             # Use BEGIN IMMEDIATE to acquire a fresh WAL snapshot, preventing
             # stale reads that cause duplicate exclusive holders (#129) and
@@ -15151,186 +15192,16 @@ def build_mcp_server() -> FastMCP:
                 )
                 existing_reservations = [(row[0], row[1]) for row in existing_rows.all()]
 
-                # Build union PathSpec for fast conflict pre-filtering (O(n+m) instead of O(n*m))
-                union_spec = _build_reservation_union_spec(
-                    existing_reservations,
-                    execution.id if execution is not None else None,
-                    cast(int, agent.id),
-                    exclusive,
-                    compatible_execution_ids,
+                batch = _FileReservationBatch(
+                    project=project, agent=agent, execution=execution,
+                    ancestor_execution_ids=ancestor_execution_ids, paths=paths,
+                    exclusive=exclusive, ttl_seconds=ttl_seconds,
+                    origin=normalized_origin, reason=reason,
                 )
-
-                # Pre-compute which paths might conflict using the union spec
-                potentially_conflicting_paths: set[str] = set()
-                if union_spec is not None:
-                    # Normalize paths for matching (same normalization as pattern matching)
-                    normalized_paths = [_normalize_pathspec_pattern(p) for p in paths]
-                    # Match all normalized paths against union in a single pass
-                    matching_normalized = set(union_spec.match_files(normalized_paths))
-                    # Build set of original paths that might conflict
-                    for orig_path, norm_path in zip(paths, normalized_paths, strict=True):
-                        # `match_files` only treats the candidate as a concrete FILE matched
-                        # against existing patterns, so it cannot detect reverse-glob conflicts
-                        # (a candidate glob like "app/**" enclosing an existing literal like
-                        # "app/models/user.py"). Always defer globbed candidates to the detailed
-                        # _file_reservations_conflict check, which is symmetric. (#193)
-                        if norm_path in matching_normalized or _contains_glob(norm_path):
-                            potentially_conflicting_paths.add(orig_path)
-                else:
-                    # Fallback: all paths potentially conflict (PathSpec unavailable)
-                    potentially_conflicting_paths = set(paths)
-
-                for path in paths:
-                    conflicting_holders: list[dict[str, Any]] = []
-                    existing_self_reservation = next(
-                        (
-                            file_reservation_record
-                            for file_reservation_record, _holder_name in existing_reservations
-                            if (
-                                (
-                                    execution is not None
-                                    and file_reservation_record.execution_id
-                                    == execution.id
-                                )
-                                or (
-                                    execution is None
-                                    and file_reservation_record.execution_id is None
-                                    and file_reservation_record.agent_id == agent.id
-                                )
-                            )
-                            and file_reservation_record.path_pattern == path
-                        ),
-                        None,
-                    )
-
-                    # Fast path: skip detailed check if path cannot conflict with any reservation
-                    if path in potentially_conflicting_paths:
-                        # Slow path: detailed attribution for potentially conflicting paths only
-                        for file_reservation_record, holder_name in existing_reservations:
-                            if _file_reservations_conflict(
-                                file_reservation_record,
-                                path,
-                                exclusive,
-                                execution.id if execution is not None else None,
-                                cast(int, agent.id),
-                                compatible_execution_ids,
-                            ):
-                                conflicting_holders.append(
-                                    {
-                                        "agent": holder_name,
-                                        "execution_id": file_reservation_record.execution_id,
-                                        "origin": file_reservation_record.origin,
-                                        "path_pattern": file_reservation_record.path_pattern,
-                                        "exclusive": file_reservation_record.exclusive,
-                                        "expires_ts": _iso(file_reservation_record.expires_ts),
-                                    }
-                                )
-
-                    if conflicting_holders:
-                        # Advisory model: still grant the file_reservation but surface conflicts
-                        conflicts.append({"path": path, "holders": conflicting_holders})
-                    requested_exp = _naive_utc() + timedelta(seconds=ttl_seconds)
-                    # Track whether this reservation already existed for this agent so
-                    # callers (e.g. macro auto-release) can avoid releasing a reservation
-                    # the agent held before this call. (#196)
-                    reused_existing = existing_self_reservation is not None
-                    if existing_self_reservation is not None:
-                        current_exp = existing_self_reservation.expires_ts
-                        if getattr(current_exp, "tzinfo", None) is not None:
-                            current_exp = _naive_utc(current_exp)
-                        existing_self_reservation.exclusive = exclusive
-                        if normalized_origin == "explicit":
-                            existing_self_reservation.origin = "explicit"
-                        if reason or not existing_self_reservation.reason:
-                            existing_self_reservation.reason = reason
-                        existing_self_reservation.expires_ts = max(requested_exp, current_exp)
-                        file_reservation = existing_self_reservation
-                        session.add(file_reservation)
-                    else:
-                        # Create reservation inline within the IMMEDIATE transaction
-                        # (instead of _create_file_reservation which opens its own session)
-                        file_reservation = FileReservation(
-                            project_id=project.id,
-                            agent_id=agent.id,
-                            execution_id=execution.id if execution is not None else None,
-                            origin=normalized_origin,
-                            path_pattern=path,
-                            exclusive=exclusive,
-                            reason=reason,
-                            expires_ts=requested_exp,
-                        )
-                        session.add(file_reservation)
-                        await session.flush()  # Assigns id without committing
-                    granted.append(
-                        {
-                            "id": file_reservation.id,
-                            "execution_id": file_reservation.execution_id,
-                            "ancestor_execution_ids": ancestor_execution_ids,
-                            "origin": file_reservation.origin,
-                            "legacy_unscoped": execution is None,
-                            "orphaned": False,
-                            "path_pattern": file_reservation.path_pattern,
-                            "exclusive": file_reservation.exclusive,
-                            "reason": file_reservation.reason,
-                            "expires_ts": _iso(file_reservation.expires_ts),
-                            "reused": reused_existing,
-                        }
-                    )
-                    existing_reservations.append((file_reservation, agent.name))
+                granted, conflicts = await batch.grant(session, existing_reservations)
                 # Commit all reservations atomically within the IMMEDIATE tx
                 await session.commit()
-            if granted:
-                reservation_ids = [
-                    int(item["id"])
-                    for item in granted
-                    if item.get("id") is not None
-                ]
-                async with get_session() as version_session:
-                    current_rows = (
-                        await version_session.execute(
-                            select(FileReservation, Agent)
-                            .outerjoin(
-                                Agent,
-                                cast(Any, FileReservation.agent_id) == Agent.id,
-                            )
-                            .where(
-                                cast(Any, FileReservation.id).in_(
-                                    reservation_ids
-                                )
-                            )
-                            .order_by(asc(cast(Any, FileReservation.id)))
-                        )
-                    ).all()
-                records = [
-                    cast(tuple[FileReservation, Optional[Agent]], row)
-                    for row in current_rows
-                ]
-                revisions = [
-                    (reservation.id, reservation.archive_revision)
-                    for reservation, _agent in records
-                    if reservation.id is not None
-                ]
-                # DB is authoritative. A failed or partial archive publication
-                # leaves these exact revisions pending for the next ordinary
-                # operation/reaper instead of deleting ownership state while a
-                # guard artifact may already have reached disk or Git.
-                await _write_file_reservation_records(
-                    project,
-                    records,
-                    archive=archive,
-                    archive_locked=True,
-                    branch_override=ctx_branch,
-                    worktree_override=ctx_worktree,
-                )
-                acknowledged = await _ack_file_reservation_archive_revisions(
-                    revisions
-                )
-                if acknowledged != len(revisions):
-                    await _reconcile_pending_file_reservation_artifacts(
-                        project,
-                        archive=archive,
-                        archive_locked=True,
-                    )
+            await _FileReservationBatch.publish(project, archive, granted, ctx_branch, ctx_worktree)
         await ctx.info(f"Issued {len(granted)} file_reservations for '{agent.name}'. Conflicts: {len(conflicts)}")
         # Surface per-call enforcement mode so wrappers (e.g. ntm's `lock`
         # subcommand) can warn the operator that code-repo paths are
@@ -15340,24 +15211,7 @@ def build_mcp_server() -> FastMCP:
         # authoritative gate. Without an explicit signal in the JSON
         # response, downstream tools have no programmatic way to detect
         # the advisory-only mode short of parsing the docstring. (#162)
-        warnings_list: list[str] = []
-        if execution is None:
-            warnings_list.append(
-                "execution_required_after_rollout: reservation was accepted as a legacy "
-                "unscoped claim because AGENT_EXECUTION_ENFORCEMENT_MODE=observe; "
-                "start_agent_execution and pass execution_id before enforce mode is enabled."
-            )
-        if protocol_warning is not None:
-            warnings_list.append(protocol_warning)
-        advisory_only_paths = [p for p in paths if not _looks_like_archive_path(p)]
-        if advisory_only_paths:
-            warnings_list.append(
-                "enforcement_off_for_code_paths: "
-                f"{len(advisory_only_paths)} of {len(paths)} reserved paths are "
-                "code-repo paths; server-side exclusivity is advisory only. "
-                "Install the pre-commit guard via `install_precommit_guard` for "
-                "the authoritative reservation gate."
-            )
+        warnings_list = _FileReservationBatch.warnings(paths, execution, protocol_warning)
         return {
             "granted": granted,
             "conflicts": conflicts,
@@ -15367,14 +15221,13 @@ def build_mcp_server() -> FastMCP:
             "legacy_unscoped": execution is None,
         }
 
-    # FastMCP 3 decorators return the original function for safe composition.
-    # Keep a non-shadowed reference so the macro continues to work even when
-    # the public helper is hidden by an instance-scoped tool filter.
-    file_reservation_paths_direct = file_reservation_paths
-
-    @mcp.tool(name="release_file_reservations")
-    @_instrument_tool("release_file_reservations", cluster=CLUSTER_FILE_RESERVATIONS, capabilities={"file_reservations"}, project_arg="project_key", agent_arg="agent_name")
+    @_MCPToolRegistration(
+        {"name": "release_file_reservations"},
+        {"cluster": CLUSTER_FILE_RESERVATIONS, "capabilities": {"file_reservations"},
+         "project_arg": "project_key", "agent_arg": "agent_name"},
+    )
     async def release_file_reservations_tool(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -15420,6 +15273,8 @@ def build_mcp_server() -> FastMCP:
         }}}
         ```
         """
+        _authenticate_agent = self._authenticate_agent
+        _resolve_agent_execution = self._resolve_agent_execution
         if paths == []:
             raise ToolExecutionError(
                 error_type="EMPTY_PATHS",
@@ -15434,20 +15289,7 @@ def build_mcp_server() -> FastMCP:
                 recoverable=True,
                 data={"provided": file_reservation_ids},
             )
-        if get_settings().tools_log_enabled:
-            try:
-                from rich.console import Console
-                from rich.panel import Panel
-
-                details = [
-                    f"project={project_key}",
-                    f"agent={agent_name}",
-                    f"paths={len(paths or [])}",
-                    f"ids={len(file_reservation_ids or [])}",
-                ]
-                Console().print(Panel.fit("\n".join(details), title="tool: release_file_reservations", border_style="green"))
-            except Exception:
-                pass
+        _log_reservation_mutation("release_file_reservations", project_key, agent_name, paths, file_reservation_ids)
         try:
             project = await _get_project_by_identifier(project_key)
             legacy_observe = _legacy_execution_rollout_allowed(get_settings())
@@ -15494,48 +15336,9 @@ def build_mcp_server() -> FastMCP:
                     ),
                     action="release_file_reservations",
                 )
-                select_stmt = (
-                    select(FileReservation)
-                    .where(
-                        cast(Any, FileReservation.project_id) == project.id,
-                        cast(Any, FileReservation.agent_id) == agent.id,
-                        (
-                            cast(Any, FileReservation.execution_id) == execution.id
-                            if execution is not None
-                            else cast(Any, FileReservation.execution_id).is_(None)
-                        ),
-                        cast(Any, FileReservation.released_ts).is_(None),
-                        or_(
-                            cast(Any, FileReservation.expires_ts).is_(None),
-                            cast(Any, FileReservation.expires_ts) > naive_now,
-                        ),
-                    )
+                reservations = await _release_active_reservation_rows(
+                    session, project, agent, execution, naive_now, paths, file_reservation_ids,
                 )
-                if file_reservation_ids:
-                    select_stmt = select_stmt.where(cast(Any, FileReservation.id).in_(file_reservation_ids))
-                if paths:
-                    select_stmt = select_stmt.where(cast(Any, FileReservation.path_pattern).in_(paths))
-                result = await session.execute(select_stmt)
-                reservations = list(result.scalars().all())
-                if reservations:
-                    ids = [res.id for res in reservations if res.id is not None]
-                    if ids:
-                        await session.execute(
-                            update(FileReservation)
-                            .where(
-                                cast(Any, FileReservation.project_id) == project.id,
-                                cast(Any, FileReservation.agent_id) == agent.id,
-                                (
-                                    cast(Any, FileReservation.execution_id)
-                                    == execution.id
-                                    if execution is not None
-                                    else cast(Any, FileReservation.execution_id).is_(None)
-                                ),
-                                cast(Any, FileReservation.released_ts).is_(None),
-                                cast(Any, FileReservation.id).in_(ids),
-                            )
-                            .values(released_ts=naive_now)  # Use naive UTC for SQLite compatibility
-                        )
                 await session.commit()
             affected = len(reservations)
             for reservation in reservations:
@@ -15547,38 +15350,46 @@ def build_mcp_server() -> FastMCP:
                 "released_at": _iso(now),
                 "execution_id": execution.id if execution is not None else None,
             }
-            response_warnings: list[str] = []
-            if execution is None:
-                response_warnings.append(
-                    "execution_required_after_rollout: only legacy unscoped reservations were released."
-                )
-            if protocol_warning is not None:
-                response_warnings.append(protocol_warning)
-            if response_warnings:
-                response["warnings"] = response_warnings
+            _reservation_mutation_warnings(response, execution, protocol_warning, "released")
             return response
         except Exception as exc:
-            if get_settings().tools_log_enabled:
-                try:
-                    import importlib as _imp
-                    _rc = _imp.import_module("rich.console")
-                    _rj = _imp.import_module("rich.json")
-                    Console = _rc.Console
-                    JSON = _rj.JSON
-                    Console().print(JSON.from_data({"error": str(exc)}))
-                except Exception:
-                    pass
+            _log_reservation_mutation_error(exc)
             raise
 
-    @mcp.tool(name="force_release_file_reservation")
-    @_instrument_tool(
-        "force_release_file_reservation",
-        cluster=CLUSTER_FILE_RESERVATIONS,
-        capabilities={"file_reservations", "repository"},
-        project_arg="project_key",
-        agent_arg="agent_name",
+    @staticmethod
+    def _forced_release_summary(
+        reservation: FileReservation, holder: Agent, target_status: FileReservationStatus,
+    ) -> dict[str, Any]:
+        return {
+            "id": reservation.id,
+            "agent": holder.name,
+            "execution_id": target_status.execution_id,
+            "execution_status": target_status.execution_status,
+            "ancestor_execution_ids": target_status.ancestor_execution_ids,
+            "origin": reservation.origin,
+            "orphaned": target_status.orphaned,
+            "legacy_unscoped": target_status.legacy_unscoped,
+            "path_pattern": reservation.path_pattern,
+            "exclusive": reservation.exclusive,
+            "reason": reservation.reason,
+            "created_ts": _iso(reservation.created_ts),
+            "expires_ts": _iso(reservation.expires_ts),
+            "released_ts": _iso(reservation.released_ts),
+            "stale_reasons": target_status.stale_reasons,
+            "last_agent_activity_ts": _iso(target_status.last_agent_activity) if target_status.last_agent_activity else None,
+            "last_execution_activity_ts": _iso(target_status.last_execution_activity) if target_status.last_execution_activity else None,
+            "last_mail_activity_ts": _iso(target_status.last_mail_activity) if target_status.last_mail_activity else None,
+            "last_filesystem_activity_ts": _iso(target_status.last_fs_activity) if target_status.last_fs_activity else None,
+            "last_git_activity_ts": _iso(target_status.last_git_activity) if target_status.last_git_activity else None,
+        }
+
+    @_MCPToolRegistration(
+        {"name": "force_release_file_reservation"},
+        {"cluster": CLUSTER_FILE_RESERVATIONS, "capabilities": {"file_reservations", "repository"},
+         "project_arg": "project_key", "agent_arg": "agent_name"},
     )
     async def force_release_file_reservation(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -15589,6 +15400,7 @@ def build_mcp_server() -> FastMCP:
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """Recover one stale claim owned by this authenticated durable Agent."""
+        _authenticate_agent = self._authenticate_agent
         project = await _get_project_by_identifier(project_key)
         actor = await _authenticate_agent(
             ctx,
@@ -15724,28 +15536,7 @@ def build_mcp_server() -> FastMCP:
         grace_seconds = int(settings.file_reservation_activity_grace_seconds)
         inactivity_seconds = int(settings.file_reservation_inactivity_seconds)
 
-        summary = {
-            "id": reservation.id,
-            "agent": holder.name,
-            "execution_id": target_status.execution_id,
-            "execution_status": target_status.execution_status,
-            "ancestor_execution_ids": target_status.ancestor_execution_ids,
-            "origin": reservation.origin,
-            "orphaned": target_status.orphaned,
-            "legacy_unscoped": target_status.legacy_unscoped,
-            "path_pattern": reservation.path_pattern,
-            "exclusive": reservation.exclusive,
-            "reason": reservation.reason,
-            "created_ts": _iso(reservation.created_ts),
-            "expires_ts": _iso(reservation.expires_ts),
-            "released_ts": _iso(reservation.released_ts),
-            "stale_reasons": target_status.stale_reasons,
-            "last_agent_activity_ts": _iso(target_status.last_agent_activity) if target_status.last_agent_activity else None,
-            "last_execution_activity_ts": _iso(target_status.last_execution_activity) if target_status.last_execution_activity else None,
-            "last_mail_activity_ts": _iso(target_status.last_mail_activity) if target_status.last_mail_activity else None,
-            "last_filesystem_activity_ts": _iso(target_status.last_fs_activity) if target_status.last_fs_activity else None,
-            "last_git_activity_ts": _iso(target_status.last_git_activity) if target_status.last_git_activity else None,
-        }
+        summary = self._forced_release_summary(reservation, holder, target_status)
 
         await ctx.info(
             f"Force released reservation {file_reservation_id} held by '{holder.name}' on '{reservation.path_pattern}'."
@@ -15754,78 +15545,26 @@ def build_mcp_server() -> FastMCP:
         notified = False
         notification_error: dict[str, Any] | None = None
         if notify_previous and holder.name != actor.name:
-            reasons_md = "\n".join(f"- {reason}" for reason in target_status.stale_reasons)
-            extras: list[str] = []
-            if target_status.last_agent_activity:
-                delta = now - target_status.last_agent_activity
-                extras.append(f"last agent activity ≈ {int(delta.total_seconds() // 60)} minutes ago")
-            if target_status.last_mail_activity:
-                delta = now - target_status.last_mail_activity
-                extras.append(f"last mail activity ≈ {int(delta.total_seconds() // 60)} minutes ago")
-            if target_status.last_fs_activity:
-                delta = now - target_status.last_fs_activity
-                extras.append(f"last filesystem touch ≈ {int(delta.total_seconds() // 60)} minutes ago")
-            if target_status.last_git_activity:
-                delta = now - target_status.last_git_activity
-                extras.append(f"last git commit ≈ {int(delta.total_seconds() // 60)} minutes ago")
-            extras.append(f"inactivity threshold={inactivity_seconds}s grace={grace_seconds}s")
-            extra_md = "\n".join(f"- {line}" for line in extras if line)
-            body_lines = [
-                f"Hi {holder.name},",
-                "",
-                f"I released your file reservation on `{reservation.path_pattern}` because it looked abandoned.",
-                "",
-                "Observed signals:",
-                reasons_md or "- (none)",
-            ]
-            if extra_md:
-                body_lines.extend(["", "Details:", extra_md])
-            if note:
-                body_lines.extend(["", f"Additional note from {actor.name}:", note.strip()])
-            body_lines.extend(
-                [
-                    "",
-                    "If you still need this reservation, please re-acquire it via `file_reservation_paths`.",
-                ]
+            notification = _ForceReleaseNotification(
+                ctx=ctx, project=project, actor=actor, holder=holder,
+                reservation=reservation, status=target_status, now=now, note=note,
+                project_key=project_key, agent_name=agent_name,
+                registration_token=registration_token,
+                inactivity_seconds=inactivity_seconds, grace_seconds=grace_seconds,
             )
-            try:
-                release_idempotency_key = _internal_delivery_idempotency_key(
-                    "file-reservation-release",
-                    {
-                        "project": project.human_key,
-                        "reservation_id": file_reservation_id,
-                        "released_ts": _iso(reservation.released_ts),
-                        "actor": actor.name,
-                        "holder": holder.name,
-                    },
-                )
-                notification_payload = await send_message(
-                    ctx=ctx,
-                    project_key=project_key,
-                    sender_name=agent_name,
-                    registration_token=registration_token,
-                    to=[holder.name],
-                    subject=f"[file-reservations] Released stale lock on {reservation.path_pattern}",
-                    body_md="\n".join(body_lines),
-                    idempotency_key=release_idempotency_key,
-                    format="json",
-                )
-                error_payload = _extract_delivery_error_payload(notification_payload)
-                if error_payload is not None:
-                    notification_error = _with_delivery_project(error_payload, project)
-                else:
-                    notified = True
-            except Exception as exc:
-                notified = False
-                notification_error = _delivery_failure_from_exception(project, exc)
+            notified, notification_error = await notification.send(self)
 
         summary["notified"] = notified
         if notification_error is not None:
             summary["notification_error"] = notification_error
         return {"released": 1, "released_at": _iso(now), "reservation": summary}
-    @mcp.tool(name="renew_file_reservations")
-    @_instrument_tool("renew_file_reservations", cluster=CLUSTER_FILE_RESERVATIONS, capabilities={"file_reservations"}, project_arg="project_key", agent_arg="agent_name")
+    @_MCPToolRegistration(
+        {"name": "renew_file_reservations"},
+        {"cluster": CLUSTER_FILE_RESERVATIONS, "capabilities": {"file_reservations"},
+         "project_arg": "project_key", "agent_arg": "agent_name"},
+    )
     async def renew_file_reservations(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -15859,6 +15598,8 @@ def build_mcp_server() -> FastMCP:
         dict
             { renewed: int, file_reservations: [{id, path_pattern, old_expires_ts, new_expires_ts}] }
         """
+        _authenticate_agent = self._authenticate_agent
+        _resolve_agent_execution = self._resolve_agent_execution
         if paths == []:
             raise ToolExecutionError(
                 error_type="EMPTY_PATHS",
@@ -15873,21 +15614,9 @@ def build_mcp_server() -> FastMCP:
                 recoverable=True,
                 data={"provided": file_reservation_ids},
             )
-        if get_settings().tools_log_enabled:
-            try:
-                from rich.console import Console
-                from rich.panel import Panel
-
-                meta = [
-                    f"project={project_key}",
-                    f"agent={agent_name}",
-                    f"extend={extend_seconds}s",
-                    f"paths={len(paths or [])}",
-                    f"ids={len(file_reservation_ids or [])}",
-                ]
-                Console().print(Panel.fit("\n".join(meta), title="tool: renew_file_reservations", border_style="green"))
-            except Exception:
-                pass
+        _log_reservation_mutation(
+            "renew_file_reservations", project_key, agent_name, paths, file_reservation_ids, extend_seconds,
+        )
         project = await _get_project_by_identifier(project_key)
         legacy_observe = _legacy_execution_rollout_allowed(get_settings())
         agent = await _authenticate_agent(
@@ -15918,13 +15647,7 @@ def build_mcp_server() -> FastMCP:
         now = datetime.now(timezone.utc)
         bump = max(60, int(extend_seconds))
         stale_auto_releases = await _expire_stale_file_reservations(project.id)
-        if stale_auto_releases:
-            summary = ", ".join(
-                f"{status.agent.name if status.agent is not None else '<orphaned>'}:{status.reservation.path_pattern}"
-                for status in stale_auto_releases[:5]
-            )
-            extra = f" ({summary})" if summary else ""
-            await ctx.info(f"Auto-released {len(stale_auto_releases)} stale file_reservation(s){extra}.")
+        await _report_stale_reservation_releases(ctx, stale_auto_releases)
 
         # Use a single IMMEDIATE session for the read + write so the
         # renewal is atomic and immediately visible to other connections.
@@ -15943,84 +15666,27 @@ def build_mcp_server() -> FastMCP:
             stmt = (
                 select(FileReservation)
                 .where(
-                    cast(Any, FileReservation.project_id) == project.id,
-                    cast(Any, FileReservation.agent_id) == agent.id,
-                    (
-                        cast(Any, FileReservation.execution_id) == execution.id
-                        if execution is not None
-                        else cast(Any, FileReservation.execution_id).is_(None)
-                    ),
-                    cast(Any, FileReservation.released_ts).is_(None),
+                    *_reservation_owner_criteria(project, agent, execution),
                     cast(Any, FileReservation.expires_ts) > _naive_utc(now),
                 )
                 .order_by(asc(cast(Any, FileReservation.expires_ts)))
             )
-            if file_reservation_ids:
-                stmt = stmt.where(cast(Any, FileReservation.id).in_(file_reservation_ids))
-            if paths:
-                stmt = stmt.where(cast(Any, FileReservation.path_pattern).in_(paths))
-            result = await session.execute(stmt)
+            result = await session.execute(_filter_reservation_statement(stmt, paths, file_reservation_ids))
             file_reservations: list[FileReservation] = list(result.scalars().all())
 
             if not file_reservations:
                 await session.commit()
                 await ctx.info(f"No active file_reservations to renew for '{agent.name}'.")
-                empty_response: dict[str, Any] = {
-                    "renewed": 0,
-                    "execution_id": execution.id if execution is not None else None,
-                    "file_reservations": [],
-                }
-                empty_warnings: list[str] = []
-                if execution is None:
-                    empty_warnings.append(
-                        "execution_required_after_rollout: only legacy unscoped reservations were renewed."
-                    )
-                if protocol_warning is not None:
-                    empty_warnings.append(protocol_warning)
-                if empty_warnings:
-                    empty_response["warnings"] = empty_warnings
-                return empty_response
+                return _reservation_renewal_response([], execution, protocol_warning)
 
-            updated: list[dict[str, Any]] = []
-            for file_reservation in file_reservations:
-                old_exp = file_reservation.expires_ts
-                if getattr(old_exp, "tzinfo", None) is None:
-                    from datetime import timezone as _tz
-                    old_exp = old_exp.replace(tzinfo=_tz.utc)
-                base = old_exp if old_exp > now else now
-                # Convert to naive UTC for SQLite compatibility
-                file_reservation.expires_ts = _naive_utc(base + timedelta(seconds=bump))
-                session.add(file_reservation)
-                updated.append(
-                    {
-                        "id": file_reservation.id,
-                        "execution_id": file_reservation.execution_id,
-                        "path_pattern": file_reservation.path_pattern,
-                        "old_expires_ts": _iso(old_exp),
-                        "new_expires_ts": _iso(file_reservation.expires_ts),
-                    }
-                )
+            updated = _renew_reservation_rows(session, file_reservations, now, bump)
             await session.commit()
 
         # Publish the exact committed revisions. A failed write leaves each
         # renewal pending in DB for the next ordinary sweep or operation.
         await _reconcile_pending_file_reservation_artifacts(project)
         await ctx.info(f"Renewed {len(updated)} file_reservation(s) for '{agent.name}'.")
-        response: dict[str, Any] = {
-            "renewed": len(updated),
-            "execution_id": execution.id if execution is not None else None,
-            "file_reservations": updated,
-        }
-        response_warnings: list[str] = []
-        if execution is None:
-            response_warnings.append(
-                "execution_required_after_rollout: only legacy unscoped reservations were renewed."
-            )
-        if protocol_warning is not None:
-            response_warnings.append(protocol_warning)
-        if response_warnings:
-            response["warnings"] = response_warnings
-        return response
+        return _reservation_renewal_response(updated, execution, protocol_warning)
 
     # --- Ticketing (epics and tickets) -------------------------------------------------------
     #
@@ -16038,6 +15704,7 @@ def build_mcp_server() -> FastMCP:
     # annotation, format="toon" puts a dict envelope where the list belongs and breaks the
     # declared output schema.
 
+    @staticmethod
     def _ticket_refusal(error: ticketing.TicketError) -> ToolExecutionError:
         """Map a domain refusal onto the tool error contract, preserving its code."""
         not_found = {"ticket_not_found", "parent_not_found", "link_target_not_found"}
@@ -16055,19 +15722,13 @@ def build_mcp_server() -> FastMCP:
             data={"code": error.code, "detail": error.detail},
         )
 
-    async def _ticket_actor(agent: Agent) -> ticketing.TicketActor:
-        """Build the audit actor for an authenticated agent."""
-        return ticketing.TicketActor.from_agent(agent)
-
-    @mcp.tool(name="create_ticket")
-    @_instrument_tool(
-        "create_ticket",
-        cluster=CLUSTER_TICKETING,
-        capabilities={"ticketing", "write"},
-        project_arg="project_key",
-        agent_arg="agent_name",
+    @_MCPToolRegistration(
+        {"name": "create_ticket"},
+        {"cluster": CLUSTER_TICKETING, "capabilities": {"ticketing", "write"},
+         "project_arg": "project_key", "agent_arg": "agent_name"},
     )
     async def create_ticket(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -16124,6 +15785,8 @@ def build_mcp_server() -> FastMCP:
         }}}
         ```
         """
+        _resolve_authenticated_agent = self._resolve_authenticated_agent
+        _ticket_refusal = self._ticket_refusal
         project = await _get_project_by_identifier(project_key)
         agent = await _resolve_authenticated_agent(
             ctx,
@@ -16154,7 +15817,7 @@ def build_mcp_server() -> FastMCP:
                 ticket = await ticketing.create_ticket(
                     session,
                     project=db_project,
-                    actor=await _ticket_actor(agent),
+                    actor=ticketing.TicketActor.from_agent(agent),
                     title=title,
                     kind_key=kind,
                     description_md=description_md,
@@ -16172,15 +15835,13 @@ def build_mcp_server() -> FastMCP:
                 raise _ticket_refusal(error) from error
         return payload
 
-    @mcp.tool(name="get_ticket")
-    @_instrument_tool(
-        "get_ticket",
-        cluster=CLUSTER_TICKETING,
-        capabilities={"ticketing", "read"},
-        project_arg="project_key",
-        agent_arg="agent_name",
+    @_MCPToolRegistration(
+        {"name": "get_ticket"},
+        {"cluster": CLUSTER_TICKETING, "capabilities": {"ticketing", "read"},
+         "project_arg": "project_key", "agent_arg": "agent_name"},
     )
     async def get_ticket(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -16211,6 +15872,8 @@ def build_mcp_server() -> FastMCP:
         dict
             { ticket: {...}, links: [...], [events: [...]], [discussion: [...]] }
         """
+        _resolve_authenticated_agent = self._resolve_authenticated_agent
+        _ticket_refusal = self._ticket_refusal
         project = await _get_project_by_identifier(project_key)
         await _resolve_authenticated_agent(
             ctx,
@@ -16316,15 +15979,13 @@ def build_mcp_server() -> FastMCP:
                 ]
         return payload
 
-    @mcp.tool(name="list_tickets")
-    @_instrument_tool(
-        "list_tickets",
-        cluster=CLUSTER_TICKETING,
-        capabilities={"ticketing", "read"},
-        project_arg="project_key",
-        agent_arg="agent_name",
+    @_MCPToolRegistration(
+        {"name": "list_tickets"},
+        {"cluster": CLUSTER_TICKETING, "capabilities": {"ticketing", "read"},
+         "project_arg": "project_key", "agent_arg": "agent_name"},
     )
     async def list_tickets(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -16362,6 +16023,8 @@ def build_mcp_server() -> FastMCP:
         list[dict]
             Ticket payloads in canonical order.
         """
+        _resolve_authenticated_agent = self._resolve_authenticated_agent
+        _ticket_refusal = self._ticket_refusal
         project = await _get_project_by_identifier(project_key)
         await _resolve_authenticated_agent(
             ctx,
@@ -16397,15 +16060,13 @@ def build_mcp_server() -> FastMCP:
                 raise _ticket_refusal(error) from error
         return [ticketing.ticket_to_dict(row) for row in rows]
 
-    @mcp.tool(name="update_ticket")
-    @_instrument_tool(
-        "update_ticket",
-        cluster=CLUSTER_TICKETING,
-        capabilities={"ticketing", "write"},
-        project_arg="project_key",
-        agent_arg="agent_name",
+    @_MCPToolRegistration(
+        {"name": "update_ticket"},
+        {"cluster": CLUSTER_TICKETING, "capabilities": {"ticketing", "write"},
+         "project_arg": "project_key", "agent_arg": "agent_name"},
     )
     async def update_ticket(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -16445,6 +16106,12 @@ def build_mcp_server() -> FastMCP:
         dict
             { ticket: {...}, changed_fields: [...], revision: int }
         """
+        _resolve_authenticated_agent = self._resolve_authenticated_agent
+        _ticket_refusal = self._ticket_refusal
+        send_message = self.send_message
+        _internal_delivery_idempotency_key = self._internal_delivery_idempotency_key
+        _extract_delivery_error_payload = self._extract_delivery_error_payload
+        _delivery_failure_from_exception = self._delivery_failure_from_exception
         project = await _get_project_by_identifier(project_key)
         agent = await _resolve_authenticated_agent(
             ctx,
@@ -16483,7 +16150,7 @@ def build_mcp_server() -> FastMCP:
                     session,
                     ticket=ticket,
                     project=db_project,
-                    actor=await _ticket_actor(agent),
+                    actor=ticketing.TicketActor.from_agent(agent),
                     update=ticketing.TicketUpdate(
                         title=title,
                         description_md=description_md,
@@ -16565,15 +16232,13 @@ def build_mcp_server() -> FastMCP:
                 }
         return payload
 
-    @mcp.tool(name="link_ticket")
-    @_instrument_tool(
-        "link_ticket",
-        cluster=CLUSTER_TICKETING,
-        capabilities={"ticketing", "write"},
-        project_arg="project_key",
-        agent_arg="agent_name",
+    @_MCPToolRegistration(
+        {"name": "link_ticket"},
+        {"cluster": CLUSTER_TICKETING, "capabilities": {"ticketing", "write"},
+         "project_arg": "project_key", "agent_arg": "agent_name"},
     )
     async def link_ticket(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -16615,6 +16280,8 @@ def build_mcp_server() -> FastMCP:
         dict
             { created: bool, link: {...} }
         """
+        _resolve_authenticated_agent = self._resolve_authenticated_agent
+        _ticket_refusal = self._ticket_refusal
         project = await _get_project_by_identifier(project_key)
         agent = await _resolve_authenticated_agent(
             ctx,
@@ -16647,7 +16314,7 @@ def build_mcp_server() -> FastMCP:
                     session,
                     ticket=ticket,
                     project=db_project,
-                    actor=await _ticket_actor(agent),
+                    actor=ticketing.TicketActor.from_agent(agent),
                     relation=relation,
                     target_kind=target_kind,
                     target_ref=target_ref,
@@ -16668,6 +16335,7 @@ def build_mcp_server() -> FastMCP:
                 raise _ticket_refusal(error) from error
         return payload
 
+    @staticmethod
     async def _ticket_correspondents(
         session: Any, ticket: Any, exclude_agent_id: Optional[int]
     ) -> list[str]:
@@ -16691,15 +16359,28 @@ def build_mcp_server() -> FastMCP:
         )
         return sorted({row[0] for row in found.all()})
 
-    @mcp.tool(name="comment_ticket")
-    @_instrument_tool(
-        "comment_ticket",
-        cluster=CLUSTER_TICKETING,
-        capabilities={"ticketing", "messaging", "write"},
-        project_arg="project_key",
-        agent_arg="agent_name",
+    @staticmethod
+    def _comment_delivery_id(delivery: Any) -> Any:
+        if not isinstance(delivery, dict):
+            return None
+        entries = delivery.get("deliveries")
+        if not isinstance(entries, list) or not entries:
+            return None
+        first = entries[0]
+        if not isinstance(first, dict):
+            return None
+        message_payload = first.get("message")
+        if not isinstance(message_payload, dict):
+            return None
+        return message_payload.get("delivery_id") or message_payload.get("id")
+
+    @_MCPToolRegistration(
+        {"name": "comment_ticket"},
+        {"cluster": CLUSTER_TICKETING, "capabilities": {"ticketing", "messaging", "write"},
+         "project_arg": "project_key", "agent_arg": "agent_name"},
     )
     async def comment_ticket(
+        self,
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -16742,6 +16423,12 @@ def build_mcp_server() -> FastMCP:
         dict
             { ticket_key, thread_id, recipients, delivery, [notification_error] }
         """
+        _resolve_authenticated_agent = self._resolve_authenticated_agent
+        _ticket_refusal = self._ticket_refusal
+        _ticket_correspondents = self._ticket_correspondents
+        send_message = self.send_message
+        _extract_delivery_error_payload = self._extract_delivery_error_payload
+        _with_delivery_project = self._with_delivery_project
         project = await _get_project_by_identifier(project_key)
         agent = await _resolve_authenticated_agent(
             ctx,
@@ -16813,17 +16500,7 @@ def build_mcp_server() -> FastMCP:
         # `send_message` returns {"deliveries": [...], "count": n, ...} -- one entry per
         # target project -- not a bare message. Reading `delivery["message"]` here would
         # silently record `None` for every comment.
-        delivery_id = None
-        if isinstance(delivery, dict):
-            entries = delivery.get("deliveries")
-            if isinstance(entries, list) and entries:
-                first = entries[0]
-                if isinstance(first, dict):
-                    message_payload = first.get("message")
-                    if isinstance(message_payload, dict):
-                        delivery_id = message_payload.get("delivery_id") or message_payload.get(
-                            "id"
-                        )
+        delivery_id = self._comment_delivery_id(delivery)
         async with get_immediate_session() as session:
             db_project = await session.get(Project, project.id)
             db_ticket = await session.get(Ticket, ticket_id)
@@ -16832,21 +16509,54 @@ def build_mcp_server() -> FastMCP:
                     session,
                     ticket=db_ticket,
                     project=db_project,
-                    actor=await _ticket_actor(agent),
+                    actor=ticketing.TicketActor.from_agent(agent),
                     event_type="commented",
                     new_value=str(delivery_id) if delivery_id is not None else None,
                 )
                 await session.commit()
         return payload
 
-    # --- Build slots (coarse concurrency control) --------------------------------------------
-    # Only registered when WORKTREES_ENABLED=1 to reduce token overhead for single-worktree setups
+def build_mcp_server() -> FastMCP:
+    """Create and configure the FastMCP server instance."""
+    _install_fastmcp_sensitive_log_filter()
+    settings: Settings = get_settings()
+    lifespan = _lifespan_factory(settings)
+    instructions = (
+        "You are the MCP Agent Mail coordination server. "
+        "Provide message routing, coordination tooling, and project context to cooperating agents. "
+        "Outputs are JSON by default; pass format='toon' (or set MCP_AGENT_MAIL_OUTPUT_FORMAT=toon) to receive "
+        "{format:'toon', data:'<TOON>'}."
+    )
+    mcp = FastMCP(
+        name="mcp-agent-mail",
+        version=package_version(),
+        instructions=instructions,
+        lifespan=lifespan,
+    )
+    mcp.add_middleware(_CredentialSafeValidationErrors())
+    runtime = _MCPServer(settings)
+    runtime._register_declared_tools(mcp, _MCPServerTools)
 
-    if settings.worktrees_enabled:
+    runtime.register_build_slots(mcp)
+    runtime.register_product_bus(mcp)
+    runtime.register_resources(mcp)
+    if settings.tool_filter.enabled:
+        _apply_tool_filter(mcp, settings)
+    return mcp
+
+
+class _MCPBuildSlots(_MCPServerRuntime):
+        def register_build_slots(self, mcp: FastMCP) -> None:
+            # Reduce token overhead for single-worktree setups.
+            if self.settings.worktrees_enabled:
+                self._register_declared_tools(mcp, _MCPBuildSlots)
+
+        @staticmethod
         def _slot_dir(archive: ProjectArchive, slot: str) -> Path:
             safe = safe_build_path_component(slot)
             return archive.root / "build_slots" / safe
 
+        @staticmethod
         def _compute_branch(path: str) -> Optional[str]:
             try:
                 with _git_repo(path) as repo:
@@ -16857,6 +16567,7 @@ def build_mcp_server() -> FastMCP:
             except Exception:
                 return None
 
+        @staticmethod
         def _is_active_build_slot_lease(data: dict[str, Any], now: datetime) -> bool:
             if data.get("released_ts"):
                 return False
@@ -16869,14 +16580,14 @@ def build_mcp_server() -> FastMCP:
                     pass
             return True
 
-        def _read_active_slots(slot_path: Path, now: datetime) -> list[dict[str, Any]]:
+        def _read_active_slots(self, slot_path: Path, now: datetime) -> list[dict[str, Any]]:
             results: list[dict[str, Any]] = []
             if not slot_path.exists():
                 return results
             for f in slot_path.glob("*.json"):
                 try:
                     data = json.loads(f.read_text(encoding="utf-8"))
-                    if isinstance(data, dict) and _is_active_build_slot_lease(cast(dict[str, Any], data), now):
+                    if isinstance(data, dict) and self._is_active_build_slot_lease(cast(dict[str, Any], data), now):
                         results.append(cast(dict[str, Any], data))
                 except Exception:
                     results.append(
@@ -16890,12 +16601,7 @@ def build_mcp_server() -> FastMCP:
                     )
             return results
 
-        def _read_build_slot_lease(lease_path: Path) -> dict[str, Any]:
-            try:
-                return cast(dict[str, Any], json.loads(lease_path.read_text(encoding="utf-8")))
-            except Exception:
-                return {}
-
+        @staticmethod
         def _read_existing_build_slot_lease(lease_path: Path) -> dict[str, Any] | None:
             try:
                 if not lease_path.is_file():
@@ -16907,6 +16613,7 @@ def build_mcp_server() -> FastMCP:
                 return None
             return cast(dict[str, Any], data)
 
+        @staticmethod
         def _build_slot_holder_id(
             agent: Agent,
             branch: str | None,
@@ -16919,6 +16626,7 @@ def build_mcp_server() -> FastMCP:
                 f"{agent.name}__{branch or 'unknown'}__{agent.agent_generation}"
             )
 
+        @staticmethod
         def _build_slot_lease_matches_lifetime(
             data: dict[str, Any],
             *,
@@ -16942,6 +16650,7 @@ def build_mcp_server() -> FastMCP:
                 and data.get("branch") == branch
             )
 
+        @staticmethod
         def _build_slot_rollout_response(
             payload: dict[str, Any],
             *,
@@ -16966,6 +16675,7 @@ def build_mcp_server() -> FastMCP:
                 payload["warnings"] = warnings
             return payload
 
+        @staticmethod
         async def _revalidate_build_slot_lifetime(
             execution: AgentExecution | None,
             project: Project,
@@ -16997,9 +16707,12 @@ def build_mcp_server() -> FastMCP:
                 )
                 await session.commit()
 
-        @mcp.tool(name="acquire_build_slot")
-        @_instrument_tool("acquire_build_slot", cluster=CLUSTER_BUILD_SLOTS, capabilities={"build"}, project_arg="project_key", agent_arg="agent_name")
+        @_MCPToolRegistration(
+            {"name": "acquire_build_slot"},
+            {"cluster": CLUSTER_BUILD_SLOTS, "capabilities": {"build"}, "project_arg": "project_key", "agent_arg": "agent_name"},
+        )
         async def acquire_build_slot(
+            self,
             ctx: Context,
             project_key: str,
             agent_name: str,
@@ -17016,6 +16729,18 @@ def build_mcp_server() -> FastMCP:
             """
             Acquire a build slot (advisory), optionally exclusive. Returns conflicts when another holder is active.
             """
+            settings = self.settings
+            _authenticate_agent = self._authenticate_agent
+            _resolve_agent_execution = self._resolve_agent_execution
+            _compute_branch = self._compute_branch
+            _build_slot_holder_id = self._build_slot_holder_id
+            _revalidate_build_slot_lifetime = self._revalidate_build_slot_lifetime
+            _slot_dir = self._slot_dir
+            _read_active_slots = self._read_active_slots
+            _read_existing_build_slot_lease = self._read_existing_build_slot_lease
+            _build_slot_lease_matches_lifetime = self._build_slot_lease_matches_lifetime
+            _is_active_build_slot_lease = self._is_active_build_slot_lease
+            _build_slot_rollout_response = self._build_slot_rollout_response
             project = await _get_project_by_identifier(project_key)
             agent = await _authenticate_agent(
                 ctx,
@@ -17063,18 +16788,13 @@ def build_mcp_server() -> FastMCP:
                 lease_path = slot_path / f"{holder_id}.json"
                 current = await asyncio.to_thread(_read_existing_build_slot_lease, lease_path)
 
-                for entry in active:
-                    same_holder = _build_slot_lease_matches_lifetime(
-                        entry,
-                        project=project,
-                        agent=agent,
-                        execution=execution,
-                        branch=holder_branch,
-                    )
-                    if same_holder:
-                        continue
-                    if exclusive or entry.get("exclusive", True):
-                        conflicts.append(entry)
+                conflicts = _conflicting_build_slot_holders(
+                    active, exclusive,
+                    lambda entry: _build_slot_lease_matches_lifetime(
+                        entry, project=project, agent=agent,
+                        execution=execution, branch=holder_branch,
+                    ),
+                )
                 active_current = (
                     current
                     if current is not None
@@ -17129,9 +16849,12 @@ def build_mcp_server() -> FastMCP:
                 protocol_warning=protocol_warning,
             )
 
-        @mcp.tool(name="renew_build_slot")
-        @_instrument_tool("renew_build_slot", cluster=CLUSTER_BUILD_SLOTS, capabilities={"build"}, project_arg="project_key", agent_arg="agent_name")
+        @_MCPToolRegistration(
+            {"name": "renew_build_slot"},
+            {"cluster": CLUSTER_BUILD_SLOTS, "capabilities": {"build"}, "project_arg": "project_key", "agent_arg": "agent_name"},
+        )
         async def renew_build_slot(
+            self,
             ctx: Context,
             project_key: str,
             agent_name: str,
@@ -17147,6 +16870,17 @@ def build_mcp_server() -> FastMCP:
             """
             Extend expiry for an existing build slot lease. No-op if missing.
             """
+            settings = self.settings
+            _authenticate_agent = self._authenticate_agent
+            _resolve_agent_execution = self._resolve_agent_execution
+            _compute_branch = self._compute_branch
+            _build_slot_holder_id = self._build_slot_holder_id
+            _revalidate_build_slot_lifetime = self._revalidate_build_slot_lifetime
+            _slot_dir = self._slot_dir
+            _read_existing_build_slot_lease = self._read_existing_build_slot_lease
+            _build_slot_lease_matches_lifetime = self._build_slot_lease_matches_lifetime
+            _is_active_build_slot_lease = self._is_active_build_slot_lease
+            _build_slot_rollout_response = self._build_slot_rollout_response
             project = await _get_project_by_identifier(project_key)
             agent = await _authenticate_agent(
                 ctx,
@@ -17242,9 +16976,12 @@ def build_mcp_server() -> FastMCP:
                 protocol_warning=protocol_warning,
             )
 
-        @mcp.tool(name="release_build_slot")
-        @_instrument_tool("release_build_slot", cluster=CLUSTER_BUILD_SLOTS, capabilities={"build"}, project_arg="project_key", agent_arg="agent_name")
+        @_MCPToolRegistration(
+            {"name": "release_build_slot"},
+            {"cluster": CLUSTER_BUILD_SLOTS, "capabilities": {"build"}, "project_arg": "project_key", "agent_arg": "agent_name"},
+        )
         async def release_build_slot(
+            self,
             ctx: Context,
             project_key: str,
             agent_name: str,
@@ -17259,6 +16996,17 @@ def build_mcp_server() -> FastMCP:
             """
             Mark an active slot lease as released (non-destructive; keeps JSON with released_ts).
             """
+            settings = self.settings
+            _authenticate_agent = self._authenticate_agent
+            _resolve_agent_execution = self._resolve_agent_execution
+            _compute_branch = self._compute_branch
+            _build_slot_holder_id = self._build_slot_holder_id
+            _revalidate_build_slot_lifetime = self._revalidate_build_slot_lifetime
+            _slot_dir = self._slot_dir
+            _read_existing_build_slot_lease = self._read_existing_build_slot_lease
+            _build_slot_lease_matches_lifetime = self._build_slot_lease_matches_lifetime
+            _is_active_build_slot_lease = self._is_active_build_slot_lease
+            _build_slot_rollout_response = self._build_slot_rollout_response
             project = await _get_project_by_identifier(project_key)
             agent = await _authenticate_agent(
                 ctx,
@@ -17340,7 +17088,21 @@ def build_mcp_server() -> FastMCP:
                 protocol_warning=protocol_warning,
             )
 
-    def _read_environment_resource(format: Optional[str] = None) -> dict[str, Any]:
+class _MCPProductBus(_MCPServerRuntime):
+    def register_product_bus(self, mcp: FastMCP) -> None:
+        mcp.resource("resource://config/environment", mime_type=_JSON_MIME_TYPE)(self.environment_resource_exact)
+        mcp.resource("resource://config/environment{?format}", mime_type=_JSON_MIME_TYPE)(self.environment_resource)
+        if not self.settings.worktrees_enabled:
+            return
+        self._register_declared_tool(mcp, "ensure_product_tool")
+        self._register_declared_tool(mcp, "products_link_tool")
+        mcp.resource("resource://product/{key}{?format}", mime_type=_JSON_MIME_TYPE)(self.product_resource)
+        self._register_declared_tool(mcp, "search_messages_product")
+        self._register_declared_tool(mcp, "fetch_inbox_product")
+        self._register_declared_tool(mcp, "summarize_thread_product")
+        mcp.resource("resource://identity/{project}{?format}", mime_type=_JSON_MIME_TYPE)(self.identity_resource)
+
+    def _read_environment_resource(self, format: Optional[str] = None) -> dict[str, Any]:
         """
         Inspect the server's current environment and HTTP settings.
 
@@ -17367,7 +17129,7 @@ def build_mcp_server() -> FastMCP:
         {"jsonrpc":"2.0","id":"r1","method":"resources/read","params":{"uri":"resource://config/environment"}}
         ```
         """
-        public_runtime = _public_runtime_descriptor(settings)
+        public_runtime = _public_runtime_descriptor(self.settings)
         payload = {
             "environment": public_runtime["environment"],
             "http": {
@@ -17378,564 +17140,594 @@ def build_mcp_server() -> FastMCP:
         }
         return _apply_resource_output_format(
             payload,
-            settings=settings,
+            settings=self.settings,
             resource_name="resource://config/environment",
             format_value=format,
         )
 
-    @mcp.resource("resource://config/environment", mime_type="application/json")
-    def environment_resource_exact() -> dict[str, Any]:
-        return _read_environment_resource()
+    def environment_resource_exact(self) -> dict[str, Any]:
+        return self._read_environment_resource()
 
-    @mcp.resource("resource://config/environment{?format}", mime_type="application/json")
-    def environment_resource(format: Optional[str] = None) -> dict[str, Any]:
-        return _read_environment_resource(format)
+    def environment_resource(self, format: Optional[str] = None) -> dict[str, Any]:
+        return self._read_environment_resource(format)
 
     # --- Product Bus (Phase 2): ensure/link/search/resources ---------------------------------
 
-    async def _get_product_by_key(session, key: str) -> Optional[Product]:
-        # Key may match product_uid or name (case-sensitive by default)
-        stmt = select(Product).where(cast(Any, (Product.product_uid == key) | (Product.name == key)))
-        res = await session.execute(stmt)
-        return res.scalars().first()
+    @_MCPToolRegistration(
+        {"name": "ensure_product"},
+        {"cluster": CLUSTER_PRODUCT, "capabilities": {"product"}},
+    )
+    async def ensure_product_tool(
+        self,
+        ctx: Context,
+        product_key: Optional[str] = None,
+        name: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Ensure a Product exists. If not, create one.
 
-    if settings.worktrees_enabled:
-        @mcp.tool(name="ensure_product")
-        @_instrument_tool("ensure_product", cluster=CLUSTER_PRODUCT, capabilities={"product"})
-        async def ensure_product_tool(
-            ctx: Context,
-            product_key: Optional[str] = None,
-            name: Optional[str] = None,
-            format: Optional[str] = None,
-        ) -> dict[str, Any]:
-            """
-            Ensure a Product exists. If not, create one.
+        - product_key may be a product_uid or a name
+        - If both are absent, error
+        """
+        self._require_product_bus()
+        await ensure_schema()
+        key_raw = (product_key or name or "").strip()
+        if not key_raw:
+            raise ToolExecutionError("INVALID_ARGUMENT", "Provide product_key or name.")
+        async with get_session() as session:
+            prod = await self._get_product_by_key(session, key_raw)
+            if prod is None:
+                # Create with strict uid pattern; otherwise generate uid and normalize name
+                import uuid as _uuid
+                import re as _re
+                uid_pattern = _re.compile(r"^[A-Fa-f0-9]{8,64}$")
+                if product_key and uid_pattern.fullmatch(product_key.strip()):
+                    uid = product_key.strip().lower()
+                else:
+                    uid = _uuid.uuid4().hex[:20]
+                display_name = (name or key_raw).strip()
+                # Collapse internal whitespace and cap length
+                display_name = " ".join(display_name.split())[:255] or uid
+                prod = Product(product_uid=uid, name=display_name)
+                session.add(prod)
+                await session.commit()
+                await session.refresh(prod)
+        return {"id": prod.id, "product_uid": prod.product_uid, "name": prod.name, "created_at": _iso(prod.created_at)}
 
-            - product_key may be a product_uid or a name
-            - If both are absent, error
-            """
-            await ensure_schema()
-            key_raw = (product_key or name or "").strip()
-            if not key_raw:
-                raise ToolExecutionError("INVALID_ARGUMENT", "Provide product_key or name.")
-            async with get_session() as session:
-                prod = await _get_product_by_key(session, key_raw)
-                if prod is None:
-                    # Create with strict uid pattern; otherwise generate uid and normalize name
-                    import uuid as _uuid
-                    import re as _re
-                    uid_pattern = _re.compile(r"^[A-Fa-f0-9]{8,64}$")
-                    if product_key and uid_pattern.fullmatch(product_key.strip()):
-                        uid = product_key.strip().lower()
-                    else:
-                        uid = _uuid.uuid4().hex[:20]
-                    display_name = (name or key_raw).strip()
-                    # Collapse internal whitespace and cap length
-                    display_name = " ".join(display_name.split())[:255] or uid
-                    prod = Product(product_uid=uid, name=display_name)
-                    session.add(prod)
-                    await session.commit()
-                    await session.refresh(prod)
-            return {"id": prod.id, "product_uid": prod.product_uid, "name": prod.name, "created_at": _iso(prod.created_at)}
-    else:
-        async def ensure_product_tool(
-            ctx: Context,
-            product_key: Optional[str] = None,
-            name: Optional[str] = None,
-            format: Optional[str] = None,
-        ) -> dict[str, Any]:
-            raise ToolExecutionError("FEATURE_DISABLED", "Product Bus is disabled. Enable WORKTREES_ENABLED to use this tool.")
-
-    if settings.worktrees_enabled:
-        @mcp.tool(name="products_link")
-        @_instrument_tool("products_link", cluster=CLUSTER_PRODUCT, capabilities={"product"}, project_arg="project_key")
-        async def products_link_tool(
-            ctx: Context,
-            product_key: str,
-            project_key: str,
-            format: Optional[str] = None,
-        ) -> dict[str, Any]:
-            """
-            Link a project into a product (idempotent).
-            """
-            await ensure_schema()
-            async with get_session() as session:
-                prod = await _get_product_by_key(session, product_key.strip())
-                if prod is None:
-                    raise ToolExecutionError("NOT_FOUND", f"Product '{product_key}' not found.", recoverable=True)
-                # Resolve project
-                project = await _get_project_by_identifier(project_key)
-                if project.id is None:
-                    raise ToolExecutionError("NOT_FOUND", f"Project '{project_key}' not found.", recoverable=True)
-                # Link if missing
-                existing = await session.execute(
-                    select(ProductProjectLink).where(
-                        cast(Any, ProductProjectLink.product_id) == cast(Any, prod.id),
-                        cast(Any, ProductProjectLink.project_id) == cast(Any, project.id),
-                    )
+    @_MCPToolRegistration(
+        {"name": "products_link"},
+        {"cluster": CLUSTER_PRODUCT, "capabilities": {"product"}, "project_arg": "project_key"},
+    )
+    async def products_link_tool(
+        self,
+        ctx: Context,
+        product_key: str,
+        project_key: str,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Link a project into a product (idempotent).
+        """
+        self._require_product_bus()
+        await ensure_schema()
+        async with get_session() as session:
+            prod = await self._get_product_by_key(session, product_key.strip())
+            if prod is None:
+                raise ToolExecutionError("NOT_FOUND", f"Product '{product_key}' not found.", recoverable=True)
+            # Resolve project
+            project = await _get_project_by_identifier(project_key)
+            if project.id is None:
+                raise ToolExecutionError("NOT_FOUND", f"Project '{project_key}' not found.", recoverable=True)
+            # Link if missing
+            existing = await session.execute(
+                select(ProductProjectLink).where(
+                    cast(Any, ProductProjectLink.product_id) == cast(Any, prod.id),
+                    cast(Any, ProductProjectLink.project_id) == cast(Any, project.id),
                 )
-                link = existing.scalars().first()
-                if link is None:
-                    link = ProductProjectLink(product_id=int(cast(int, prod.id)), project_id=int(project.id))
-                    session.add(link)
-                    await session.commit()
-                    await session.refresh(link)
-                return {
-                    "product": {"id": prod.id, "product_uid": prod.product_uid, "name": prod.name},
-                    "project": {"id": project.id, "slug": project.slug, "human_key": project.human_key},
-                    "linked": True,
-                }
-    else:
-        async def products_link_tool(
-            ctx: Context,
-            product_key: str,
-            project_key: str,
-            format: Optional[str] = None,
-        ) -> dict[str, Any]:
-            raise ToolExecutionError("FEATURE_DISABLED", "Product Bus is disabled. Enable WORKTREES_ENABLED to use this tool.")
-
-    if settings.worktrees_enabled:
-        @mcp.resource("resource://product/{key}{?format}", mime_type="application/json")
-        async def product_resource(key: str, format: Optional[str] = None) -> dict[str, Any]:
-            """
-            Inspect product and list linked projects.
-            """
-            # Async like every other DB-backed resource. The previous sync
-            # variant bridged into a worker thread's private event loop while
-            # blocking the serving loop's thread on a queue; the cached engine
-            # is bound to the serving loop, so the worker could deadlock the
-            # whole process (observed as multi-hour CI unit-suite hangs).
-            key, query_params = _split_slug_and_query(key)
-            format_value = format or query_params.get("format")
-            await ensure_schema()
-            async with get_session() as session:
-                prod = await _get_product_by_key(session, key.strip())
-                if prod is None:
-                    raise ToolExecutionError("NOT_FOUND", f"Product '{key}' not found.", recoverable=True)
-                proj_rows = await session.execute(
-                    select(Project).join(ProductProjectLink, cast(Any, ProductProjectLink.project_id) == Project.id).where(
-                        cast(Any, ProductProjectLink.product_id) == cast(Any, prod.id)
-                    )
-                )
-                projects = [
-                    {"id": p.id, "slug": p.slug, "human_key": p.human_key, "created_at": _iso(p.created_at)}
-                    for p in proj_rows.scalars().all()
-                ]
-                payload = {
-                    "id": prod.id,
-                    "product_uid": prod.product_uid,
-                    "name": prod.name,
-                    "created_at": _iso(prod.created_at),
-                    "projects": projects,
-                }
-            return _apply_resource_output_format(
-                payload,
-                settings=settings,
-                resource_name="resource://product/{key}",
-                format_value=format_value,
             )
-
-    if settings.worktrees_enabled:
-        @mcp.tool(name="search_messages_product")
-        @_instrument_tool("search_messages_product", cluster=CLUSTER_PRODUCT, capabilities={"search"})
-        async def search_messages_product(
-            ctx: Context,
-            product_key: str,
-            query: str,
-            limit: int = 20,
-            agent_name: Optional[str] = None,
-            registration_token: Optional[str] = None,
-            format: Optional[str] = None,
-        ) -> Any:
-            """
-            Full-text search across all projects linked to a product.
-            """
-            # Shared limit bounds (issue #202): reject limit<1, clamp >1000.
-            limit = _validate_limit(limit)
-            # Sanitize the FTS query first
-            sanitized_query = _sanitize_fts_query(query)
-            if sanitized_query is None:
-                await ctx.info(f"Search query '{query}' is not searchable, returning empty results.")
-                try:
-                    from fastmcp.tools import ToolResult
-                    return ToolResult(structured_content={"result": []})
-                except Exception:
-                    return []
-
-            await ensure_schema()
-            _product, _projects, authorized = await _authenticate_product_agents(
-                ctx,
-                product_key,
-                agent_name=agent_name,
-                provided_token=registration_token,
-                token_param="registration_token",
-                action="search_messages_product",
-            )
-            proj_ids = [project.id for project, _agent in authorized if project.id is not None]
-            if not proj_ids:
-                return []
-            authorized_map = {
-                project.id: agent.id
-                for project, agent in authorized
-                if project.id is not None and agent.id is not None
+            link = existing.scalars().first()
+            if link is None:
+                link = ProductProjectLink(product_id=int(cast(int, prod.id)), project_id=int(project.id))
+                session.add(link)
+                await session.commit()
+                await session.refresh(link)
+            return {
+                "product": {"id": prod.id, "product_uid": prod.product_uid, "name": prod.name},
+                "project": {"id": project.id, "slug": project.slug, "human_key": project.human_key},
+                "linked": True,
             }
-            rows: list[Any] = []
-            async with get_session() as session:
-                # FTS search limited to projects in proj_ids
-                try:
-                    result = await session.execute(
-                        text(
-                            """
-                            SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts,
-                                   m.sender_id,
-                                   m.thread_id, a.name AS sender_name, m.project_id,
-                                   sp.id AS sender_project_id, sp.human_key AS sender_project, sp.slug AS sender_project_slug
-                            FROM fts_messages
-                            JOIN messages m ON fts_messages.rowid = m.id
-                            JOIN agents a ON m.sender_id = a.id
-                            JOIN projects sp ON a.project_id = sp.id
-                            WHERE m.project_id IN :proj_ids AND fts_messages MATCH :query
-                            ORDER BY bm25(fts_messages) ASC
-                            LIMIT :limit
-                            """
-                        ).bindparams(bindparam("proj_ids", expanding=True)),
-                        {"proj_ids": proj_ids, "query": sanitized_query, "limit": limit},
-                    )
-                    rows = list(result.mappings().all())
-                except Exception as fts_err:
-                    logger.warning("FTS product query failed, returning empty results", extra={"query": sanitized_query, "error": str(fts_err)})
-                    fallback_terms = _extract_like_terms(query)
-                    if not fallback_terms:
-                        rows = []
-                    else:
-                        clauses = []
-                        params: dict[str, Any] = {"proj_ids": proj_ids, "limit": limit}
-                        for idx, term in enumerate(fallback_terms):
-                            key = f"t{idx}"
-                            params[key] = f"%{_like_escape(term)}%"
-                            clauses.append(
-                                f"(m.subject LIKE :{key} ESCAPE '{_LIKE_ESCAPE_CHAR}' OR m.body_md LIKE :{key} ESCAPE '{_LIKE_ESCAPE_CHAR}')"
-                            )
-                        where_clause = " AND ".join(clauses)
-                        result = await session.execute(
-                            text(
-                                f"""
-                                SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts,
-                                       m.sender_id,
-                                       m.thread_id, a.name AS sender_name, m.project_id,
-                                       sp.id AS sender_project_id, sp.human_key AS sender_project, sp.slug AS sender_project_slug
-                                FROM messages m
-                                JOIN agents a ON m.sender_id = a.id
-                                JOIN projects sp ON a.project_id = sp.id
-                                WHERE m.project_id IN :proj_ids AND {where_clause}
-                                ORDER BY m.created_ts DESC
-                                LIMIT :limit
-                                """
-                            ).bindparams(bindparam("proj_ids", expanding=True)),
-                            params,
-                        )
-                        rows = list(result.mappings().all())
-            visible_rows = rows
-            if rows:
-                message_ids = [int(row["id"]) for row in rows]
-                recipients_by_message: dict[int, set[int]] = {}
-                async with get_session() as session:
-                    recipient_rows = await session.execute(
-                        select(MessageRecipient.message_id, MessageRecipient.agent_id).where(
-                            cast(Any, MessageRecipient.message_id).in_(message_ids)
-                        )
-                    )
-                    for message_id, recipient_agent_id in recipient_rows.all():
-                        recipients_by_message.setdefault(int(message_id), set()).add(int(recipient_agent_id))
-                visible_rows = []
-                for row in rows:
-                    project_agent_id = authorized_map.get(int(row["project_id"]))
-                    if project_agent_id is None:
-                        continue
-                    if int(row["sender_id"]) == project_agent_id or project_agent_id in recipients_by_message.get(int(row["id"]), set()):
-                        visible_rows.append(row)
-            items: list[dict[str, Any]] = []
-            for row in visible_rows:
-                item = {
-                    "id": row["id"],
-                    "subject": row["subject"],
-                    "importance": row["importance"],
-                    "ack_required": row["ack_required"],
-                    "created_ts": _iso(row["created_ts"]),
-                    "thread_id": row["thread_id"],
-                    "project_id": row["project_id"],
-                }
-                _apply_sender_identity(
-                    item,
-                    message_project_id=row["project_id"],
-                    sender_name=row["sender_name"],
-                    sender_project_id=row["sender_project_id"],
-                    sender_project_human_key=row["sender_project"],
-                    sender_project_slug=row["sender_project_slug"],
+
+    async def product_resource(self, key: str, format: Optional[str] = None) -> dict[str, Any]:
+        """
+        Inspect product and list linked projects.
+        """
+        # Async like every other DB-backed resource. The previous sync
+        # variant bridged into a worker thread's private event loop while
+        # blocking the serving loop's thread on a queue; the cached engine
+        # is bound to the serving loop, so the worker could deadlock the
+        # whole process (observed as multi-hour CI unit-suite hangs).
+        key, query_params = _split_slug_and_query(key)
+        format_value = format or query_params.get("format")
+        await ensure_schema()
+        async with get_session() as session:
+            prod = await self._get_product_by_key(session, key.strip())
+            if prod is None:
+                raise ToolExecutionError("NOT_FOUND", f"Product '{key}' not found.", recoverable=True)
+            proj_rows = await session.execute(
+                select(Project).join(ProductProjectLink, cast(Any, ProductProjectLink.project_id) == Project.id).where(
+                    cast(Any, ProductProjectLink.product_id) == cast(Any, prod.id)
                 )
-                items.append(item)
+            )
+            projects = [
+                {"id": p.id, "slug": p.slug, "human_key": p.human_key, "created_at": _iso(p.created_at)}
+                for p in proj_rows.scalars().all()
+            ]
+            payload = {
+                "id": prod.id,
+                "product_uid": prod.product_uid,
+                "name": prod.name,
+                "created_at": _iso(prod.created_at),
+                "projects": projects,
+            }
+        return _apply_resource_output_format(
+            payload,
+            settings=self.settings,
+            resource_name="resource://product/{key}",
+            format_value=format_value,
+        )
+
+    @_MCPToolRegistration(
+        {"name": "search_messages_product"},
+        {"cluster": CLUSTER_PRODUCT, "capabilities": {"search"}},
+    )
+    async def search_messages_product(
+        self,
+        ctx: Context,
+        product_key: str,
+        query: str,
+        limit: int = 20,
+        agent_name: Optional[str] = None,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> Any:
+        """
+        Full-text search across all projects linked to a product.
+        """
+        self._require_product_bus()
+        # Shared limit bounds (issue #202): reject limit<1, clamp >1000.
+        limit = _validate_limit(limit)
+        # Sanitize the FTS query first
+        sanitized_query = _sanitize_fts_query(query)
+        if sanitized_query is None:
+            await ctx.info(f"Search query '{query}' is not searchable, returning empty results.")
             try:
                 from fastmcp.tools import ToolResult
-                return ToolResult(structured_content={"result": items})
+                return ToolResult(structured_content={"result": []})
             except Exception:
-                return items
-    else:
-        async def search_messages_product(
-            ctx: Context,
-            product_key: str,
-            query: str,
-            limit: int = 20,
-            agent_name: Optional[str] = None,
-            registration_token: Optional[str] = None,
-            format: Optional[str] = None,
-        ) -> Any:
-            raise ToolExecutionError("FEATURE_DISABLED", "Product Bus is disabled. Enable WORKTREES_ENABLED to use this tool.")
+                return []
 
-    if settings.worktrees_enabled:
-        @mcp.tool(name="fetch_inbox_product")
-        @_instrument_tool("fetch_inbox_product", cluster=CLUSTER_PRODUCT, capabilities={"messaging", "read"})
-        async def fetch_inbox_product(
-            ctx: Context,
-            product_key: str,
-            agent_name: str,
-            limit: int = 20,
-            urgent_only: bool = False,
-            include_bodies: bool = False,
-            since_ts: Optional[str] = None,
-            unread_only: bool = False,
-            registration_token: Optional[str] = None,
-            format: Optional[str] = None,
-        ) -> ToonableList:
-            """
-            Retrieve recent messages for an agent across all projects linked to a product (non-mutating).
-
-            `unread_only=True` filters each per-project fetch to recipient rows the agent
-            has not explicitly marked read; especially load-bearing for product-wide
-            polling where the cross-project token cost compounds.
-            """
-            # Shared limit bounds (issue #202): reject limit<1, clamp >1000.
-            limit = _validate_limit(limit)
-            _product, _projects, authorized = await _authenticate_product_agents(
-                ctx,
-                product_key,
-                agent_name=agent_name,
-                provided_token=registration_token,
-                token_param="registration_token",
-                action="fetch_inbox_product",
+        await ensure_schema()
+        _product, _projects, authorized = await self._authenticate_product_agents(
+            ctx,
+            product_key,
+            agent_name=agent_name,
+            provided_token=registration_token,
+            token_param="registration_token",
+            action="search_messages_product",
+        )
+        proj_ids = [project.id for project, _agent in authorized if project.id is not None]
+        if not proj_ids:
+            return []
+        authorized_map = {
+            project.id: agent.id
+            for project, agent in authorized
+            if project.id is not None and agent.id is not None
+        }
+        rows = await self._search_product_rows(proj_ids, query, sanitized_query, limit)
+        visible_rows = await self._visible_product_rows(rows, authorized_map)
+        items: list[dict[str, Any]] = []
+        for row in visible_rows:
+            item = {
+                "id": row["id"],
+                "subject": row["subject"],
+                "importance": row["importance"],
+                "ack_required": row["ack_required"],
+                "created_ts": _iso(row["created_ts"]),
+                "thread_id": row["thread_id"],
+                "project_id": row["project_id"],
+            }
+            _apply_sender_identity(
+                item,
+                message_project_id=row["project_id"],
+                sender_name=row["sender_name"],
+                sender_project_id=row["sender_project_id"],
+                sender_project_human_key=row["sender_project"],
+                sender_project_slug=row["sender_project_slug"],
             )
-            messages: list[dict[str, Any]] = []
-            for project, ag in authorized:
-                proj_items = await _list_inbox(
-                    project,
-                    ag,
-                    limit,
-                    urgent_only,
-                    include_bodies,
-                    since_ts,
-                    unread_only=unread_only,
-                )
-                for item in proj_items:
-                    item["project_id"] = item.get("project_id") or project.id
-                    messages.append(item)
-            # Sort by created_ts desc and trim to limit
-            def _dt_key(it: dict[str, Any]) -> float:
-                ts = _parse_iso(str(it.get("created_ts") or ""))
-                return ts.timestamp() if ts else 0.0
-            messages.sort(key=_dt_key, reverse=True)
-            return messages[: max(0, int(limit))]
-    else:
-        async def fetch_inbox_product(
-            ctx: Context,
-            product_key: str,
-            agent_name: str,
-            limit: int = 20,
-            urgent_only: bool = False,
-            include_bodies: bool = False,
-            since_ts: Optional[str] = None,
-            unread_only: bool = False,
-            registration_token: Optional[str] = None,
-            format: Optional[str] = None,
-        ) -> ToonableList:
-            raise ToolExecutionError("FEATURE_DISABLED", "Product Bus is disabled. Enable WORKTREES_ENABLED to use this tool.")
+            items.append(item)
+        try:
+            from fastmcp.tools import ToolResult
+            return ToolResult(structured_content={"result": items})
+        except Exception:
+            return items
 
-    if settings.worktrees_enabled:
-        @mcp.tool(name="summarize_thread_product")
-        @_instrument_tool("summarize_thread_product", cluster=CLUSTER_PRODUCT, capabilities={"summarization", "search"})
-        async def summarize_thread_product(
-            ctx: Context,
-            product_key: str,
-            thread_id: str,
-            include_examples: bool = False,
-            llm_mode: bool = True,
-            llm_model: Optional[str] = None,
-            per_thread_limit: Optional[int] = None,
-            agent_name: Optional[str] = None,
-            registration_token: Optional[str] = None,
-            format: Optional[str] = None,
-        ) -> dict[str, Any]:
-            """
-            Summarize a thread (by id or thread key) across all projects linked to a product.
-            """
-            await ensure_schema()
-            sender_alias = aliased(Agent)
-            sender_project_alias = aliased(Project)
+    @_MCPToolRegistration(
+        {"name": "fetch_inbox_product"},
+        {"cluster": CLUSTER_PRODUCT, "capabilities": {"messaging", "read"}},
+    )
+    async def fetch_inbox_product(
+        self,
+        ctx: Context,
+        product_key: str,
+        agent_name: str,
+        limit: int = 20,
+        urgent_only: bool = False,
+        include_bodies: bool = False,
+        since_ts: Optional[str] = None,
+        unread_only: bool = False,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> ToonableList:
+        """
+        Retrieve recent messages for an agent across all projects linked to a product (non-mutating).
+
+        `unread_only=True` filters each per-project fetch to recipient rows the agent
+        has not explicitly marked read; especially load-bearing for product-wide
+        polling where the cross-project token cost compounds.
+        """
+        self._require_product_bus()
+        # Shared limit bounds (issue #202): reject limit<1, clamp >1000.
+        limit = _validate_limit(limit)
+        _product, _projects, authorized = await self._authenticate_product_agents(
+            ctx,
+            product_key,
+            agent_name=agent_name,
+            provided_token=registration_token,
+            token_param="registration_token",
+            action="fetch_inbox_product",
+        )
+        messages: list[dict[str, Any]] = []
+        for project, ag in authorized:
+            proj_items = await _list_inbox(
+                project,
+                ag,
+                limit,
+                urgent_only,
+                include_bodies,
+                since_ts,
+                unread_only=unread_only,
+            )
+            for item in proj_items:
+                item["project_id"] = item.get("project_id") or project.id
+                messages.append(item)
+        # Sort by created_ts desc and trim to limit
+        def _dt_key(it: dict[str, Any]) -> float:
+            ts = _parse_iso(str(it.get("created_ts") or ""))
+            return ts.timestamp() if ts else 0.0
+        messages.sort(key=_dt_key, reverse=True)
+        return messages[: max(0, int(limit))]
+
+    @_MCPToolRegistration(
+        {"name": "summarize_thread_product"},
+        {"cluster": CLUSTER_PRODUCT, "capabilities": {"summarization", "search"}},
+    )
+    async def summarize_thread_product(
+        self,
+        ctx: Context,
+        product_key: str,
+        thread_id: str,
+        include_examples: bool = False,
+        llm_mode: bool = True,
+        llm_model: Optional[str] = None,
+        per_thread_limit: Optional[int] = None,
+        agent_name: Optional[str] = None,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Summarize a thread (by id or thread key) across all projects linked to a product.
+        """
+        self._require_product_bus()
+        await ensure_schema()
+        sender_alias = aliased(Agent)
+        sender_project_alias = aliased(Project)
+        try:
+            seed_id = int(thread_id)
+        except ValueError:
+            seed_id = None
+        criteria: list[Any] = [cast(Any, Message.thread_id) == thread_id]
+        if seed_id is not None:
+            criteria.append(cast(Any, Message.id) == seed_id)
+
+        _product, _projects, authorized = await self._authenticate_product_agents(
+            ctx,
+            product_key,
+            agent_name=agent_name,
+            provided_token=registration_token,
+            token_param="registration_token",
+            action="summarize_thread_product",
+        )
+        visibility_clauses = [
+            and_(
+                cast(Any, Message.project_id) == project.id,
+                _message_visible_to_agent_clause(agent.id or 0),
+            )
+            for project, agent in authorized
+            if project.id is not None and agent.id is not None
+        ]
+        if not visibility_clauses:
+            return {"thread_id": thread_id, "summary": {"participants": [], "key_points": [], "action_items": [], "total_messages": 0}, "examples": []}
+
+        async with get_session() as session:
+            stmt = (
+                select(Message, sender_alias.name, sender_project_alias.id, sender_project_alias.slug)
+                .join(sender_alias, cast(Any, Message.sender_id == sender_alias.id))
+                .join(sender_project_alias, cast(Any, sender_alias.project_id == sender_project_alias.id))
+                .where(or_(*cast(Any, criteria)), or_(*visibility_clauses))
+                .order_by(asc(cast(Any, Message.created_ts)))
+            )
+            if per_thread_limit:
+                stmt = stmt.limit(per_thread_limit)
+            raw_rows = (await session.execute(stmt)).all()
+        rows = [
+            (
+                row[0],
+                _sender_display_name(
+                    message_project_id=row[0].project_id,
+                    sender_name=row[1],
+                    sender_project_id=row[2],
+                    sender_project_slug=row[3],
+                ),
+            )
+            for row in raw_rows
+        ]
+        summary = _summarize_messages(rows)
+        heuristic_key_points = list(summary.get("key_points", []))
+
+        # Optional LLM refinement (same as project-level)
+        if llm_mode and get_settings().llm.enabled:
+            await self._refine_product_summary(ctx, rows, summary, heuristic_key_points, llm_model)
+
+        examples: list[dict[str, Any]] = []
+        if include_examples:
+            for message, sender_name in rows[:3]:
+                examples.append(
+                    {
+                        "id": message.id,
+                        "subject": message.subject,
+                        "from": sender_name,
+                        "created_ts": _iso(message.created_ts),
+                    }
+                )
+        await ctx.info(f"Summarized thread '{thread_id}' across product '{product_key}' with {len(rows)} messages")
+        return {"thread_id": thread_id, "summary": summary, "examples": examples}
+
+    def _require_product_bus(self) -> None:
+        if not self.settings.worktrees_enabled:
+            raise ToolExecutionError("FEATURE_DISABLED", _PRODUCT_BUS_DISABLED_MESSAGE)
+
+    def _render_identity_resource_payload(
+        self,
+        project_identifier: Optional[str],
+        *,
+        format_value: Optional[str],
+        resource_name: str,
+    ) -> dict[str, Any]:
+        if not project_identifier:
+            raise ValueError("project parameter is required for identity resource")
+        target_path = _canonicalize_project_identifier(project_identifier)
+        payload = _resolve_project_identity(target_path)
+        return _apply_resource_output_format(
+            payload,
+            settings=self.settings,
+            resource_name=resource_name,
+            format_value=format_value,
+        )
+
+    def identity_resource(self, project: str, format: Optional[str] = None) -> dict[str, Any]:
+        """
+        Inspect identity resolution for a given project path. Returns the slug actually used,
+        the identity mode in effect, canonical path for the selected mode, and git repo facts.
+        """
+        raw_path, query_params = _split_slug_and_query(project)
+        format_value = format or query_params.get("format")
+        return self._render_identity_resource_payload(
+            raw_path,
+            format_value=format_value,
+            resource_name="resource://identity/{project}",
+        )
+
+    @staticmethod
+    async def _refine_product_summary(
+        ctx: Context,
+        rows: list[tuple[Message, str]],
+        summary: dict[str, Any],
+        heuristic_key_points: list[Any],
+        llm_model: str | None,
+    ) -> None:
+        try:
+            excerpts: list[str] = []
+            for message, sender_name in rows[:15]:
+                excerpts.append(f"- {sender_name}: {message.subject}\n{message.body_md[:800]}")
+            if excerpts:
+                system = (
+                    "You are a senior engineer. Produce a concise JSON summary with keys: "
+                    "participants[], key_points[], action_items[], mentions[{name,count}], code_references[], "
+                    "total_messages, open_actions, done_actions. Derive from the given thread excerpts."
+                )
+                user = "\n\n".join(excerpts)
+                llm_resp = await complete_system_user(system, user, model=llm_model)
+                parsed = _parse_json_safely(llm_resp.content)
+                if parsed:
+                    _MCPProductBus._apply_product_summary(summary, parsed, heuristic_key_points)
+        except Exception as e:
+            await ctx.debug(f"summarize_thread_product.llm_skipped: {e}")
+
+    @staticmethod
+    def _apply_product_summary(
+        summary: dict[str, Any],
+        parsed: dict[str, Any],
+        heuristic_key_points: list[Any],
+    ) -> None:
+        for key in (
+            "participants",
+            "key_points",
+            "action_items",
+            "mentions",
+            "code_references",
+            "total_messages",
+            "open_actions",
+            "done_actions",
+        ):
+            value = parsed.get(key)
+            if value:
+                summary[key] = value
+        if heuristic_key_points and isinstance(summary.get("key_points"), list):
+            keywords = ("TODO", "ACTION", "FIXME", "NEXT", "BLOCKED")
+            extra = [
+                kp for kp in heuristic_key_points
+                if any(token in str(kp).upper() for token in keywords)
+            ]
+            if extra:
+                summary["key_points"] = _MCPProductBus._merge_product_key_points(summary["key_points"], extra)
+
+    @staticmethod
+    def _merge_product_key_points(key_points: list[Any], extra: list[Any]) -> list[Any]:
+        merged: list[Any] = []
+        for item in key_points + extra:
+            if item not in merged:
+                merged.append(item)
+        return merged[:10]
+
+    @staticmethod
+    async def _search_product_rows(
+        proj_ids: list[int],
+        query: str,
+        sanitized_query: str,
+        limit: int,
+    ) -> list[Any]:
+        async with get_session() as session:
+            # FTS search limited to projects in proj_ids
             try:
-                seed_id = int(thread_id)
-            except ValueError:
-                seed_id = None
-            criteria: list[Any] = [cast(Any, Message.thread_id) == thread_id]
-            if seed_id is not None:
-                criteria.append(cast(Any, Message.id) == seed_id)
-
-            _product, _projects, authorized = await _authenticate_product_agents(
-                ctx,
-                product_key,
-                agent_name=agent_name,
-                provided_token=registration_token,
-                token_param="registration_token",
-                action="summarize_thread_product",
-            )
-            visibility_clauses = [
-                and_(
-                    cast(Any, Message.project_id) == project.id,
-                    _message_visible_to_agent_clause(agent.id or 0),
+                result = await session.execute(
+                    text(
+                        """
+                        SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts,
+                               m.sender_id,
+                               m.thread_id, a.name AS sender_name, m.project_id,
+                               sp.id AS sender_project_id, sp.human_key AS sender_project, sp.slug AS sender_project_slug
+                        FROM fts_messages
+                        JOIN messages m ON fts_messages.rowid = m.id
+                        JOIN agents a ON m.sender_id = a.id
+                        JOIN projects sp ON a.project_id = sp.id
+                        WHERE m.project_id IN :proj_ids AND fts_messages MATCH :query
+                        ORDER BY bm25(fts_messages) ASC
+                        LIMIT :limit
+                        """
+                    ).bindparams(bindparam("proj_ids", expanding=True)),
+                    {"proj_ids": proj_ids, "query": sanitized_query, "limit": limit},
                 )
-                for project, agent in authorized
-                if project.id is not None and agent.id is not None
-            ]
-            if not visibility_clauses:
-                return {"thread_id": thread_id, "summary": {"participants": [], "key_points": [], "action_items": [], "total_messages": 0}, "examples": []}
+                return list(result.mappings().all())
+            except Exception as fts_err:
+                logger.warning("FTS product query failed, returning empty results", extra={"query": sanitized_query, "error": str(fts_err)})
+                return await _MCPProductBus._search_product_rows_like(session, proj_ids, query, limit)
 
-            async with get_session() as session:
-                stmt = (
-                    select(Message, sender_alias.name, sender_project_alias.id, sender_project_alias.slug)
-                    .join(sender_alias, cast(Any, Message.sender_id == sender_alias.id))
-                    .join(sender_project_alias, cast(Any, sender_alias.project_id == sender_project_alias.id))
-                    .where(or_(*cast(Any, criteria)), or_(*visibility_clauses))
-                    .order_by(asc(cast(Any, Message.created_ts)))
-                )
-                if per_thread_limit:
-                    stmt = stmt.limit(per_thread_limit)
-                raw_rows = (await session.execute(stmt)).all()
-            rows = [
-                (
-                    row[0],
-                    _sender_display_name(
-                        message_project_id=row[0].project_id,
-                        sender_name=row[1],
-                        sender_project_id=row[2],
-                        sender_project_slug=row[3],
-                    ),
-                )
-                for row in raw_rows
-            ]
-            summary = _summarize_messages(rows)
-            heuristic_key_points = list(summary.get("key_points", []))
-
-            # Optional LLM refinement (same as project-level)
-            if llm_mode and get_settings().llm.enabled:
-                try:
-                    excerpts: list[str] = []
-                    for message, sender_name in rows[:15]:
-                        excerpts.append(f"- {sender_name}: {message.subject}\n{message.body_md[:800]}")
-                    if excerpts:
-                        system = (
-                            "You are a senior engineer. Produce a concise JSON summary with keys: "
-                            "participants[], key_points[], action_items[], mentions[{name,count}], code_references[], "
-                            "total_messages, open_actions, done_actions. Derive from the given thread excerpts."
-                        )
-                        user = "\n\n".join(excerpts)
-                        llm_resp = await complete_system_user(system, user, model=llm_model)
-                        parsed = _parse_json_safely(llm_resp.content)
-                        if parsed:
-                            for key in (
-                                "participants",
-                                "key_points",
-                                "action_items",
-                                "mentions",
-                                "code_references",
-                                "total_messages",
-                                "open_actions",
-                                "done_actions",
-                            ):
-                                value = parsed.get(key)
-                                if value:
-                                    summary[key] = value
-                            if heuristic_key_points and isinstance(summary.get("key_points"), list):
-                                keywords = ("TODO", "ACTION", "FIXME", "NEXT", "BLOCKED")
-                                extra = [
-                                    kp for kp in heuristic_key_points
-                                    if any(token in str(kp).upper() for token in keywords)
-                                ]
-                                if extra:
-                                    merged: list[str] = []
-                                    for item in summary["key_points"] + extra:
-                                        if item not in merged:
-                                            merged.append(item)
-                                    summary["key_points"] = merged[:10]
-                except Exception as e:
-                    await ctx.debug(f"summarize_thread_product.llm_skipped: {e}")
-
-            examples: list[dict[str, Any]] = []
-            if include_examples:
-                for message, sender_name in rows[:3]:
-                    examples.append(
-                        {
-                            "id": message.id,
-                            "subject": message.subject,
-                            "from": sender_name,
-                            "created_ts": _iso(message.created_ts),
-                        }
-                    )
-            await ctx.info(f"Summarized thread '{thread_id}' across product '{product_key}' with {len(rows)} messages")
-            return {"thread_id": thread_id, "summary": summary, "examples": examples}
-    else:
-        async def summarize_thread_product(
-            ctx: Context,
-            product_key: str,
-            thread_id: str,
-            include_examples: bool = False,
-            llm_mode: bool = True,
-            llm_model: Optional[str] = None,
-            per_thread_limit: Optional[int] = None,
-            agent_name: Optional[str] = None,
-            registration_token: Optional[str] = None,
-            format: Optional[str] = None,
-        ) -> dict[str, Any]:
-            raise ToolExecutionError("FEATURE_DISABLED", "Product Bus is disabled. Enable WORKTREES_ENABLED to use this tool.")
-    if settings.worktrees_enabled:
-        def _render_identity_resource_payload(
-            project_identifier: Optional[str],
-            *,
-            format_value: Optional[str],
-            resource_name: str,
-        ) -> dict[str, Any]:
-            if not project_identifier:
-                raise ValueError("project parameter is required for identity resource")
-            target_path = _canonicalize_project_identifier(project_identifier)
-            payload = _resolve_project_identity(target_path)
-            return _apply_resource_output_format(
-                payload,
-                settings=settings,
-                resource_name=resource_name,
-                format_value=format_value,
+    @staticmethod
+    async def _search_product_rows_like(
+        session: AsyncSession,
+        proj_ids: list[int],
+        query: str,
+        limit: int,
+    ) -> list[Any]:
+        fallback_terms = _extract_like_terms(query)
+        if not fallback_terms:
+            return []
+        clauses = []
+        params: dict[str, Any] = {"proj_ids": proj_ids, "limit": limit}
+        for idx, term in enumerate(fallback_terms):
+            key = f"t{idx}"
+            params[key] = f"%{_like_escape(term)}%"
+            clauses.append(
+                f"(m.subject LIKE :{key} ESCAPE '{_LIKE_ESCAPE_CHAR}' OR m.body_md LIKE :{key} ESCAPE '{_LIKE_ESCAPE_CHAR}')"
             )
+        where_clause = " AND ".join(clauses)
+        result = await session.execute(
+            text(
+                f"""
+                SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts,
+                       m.sender_id,
+                       m.thread_id, a.name AS sender_name, m.project_id,
+                       sp.id AS sender_project_id, sp.human_key AS sender_project, sp.slug AS sender_project_slug
+                FROM messages m
+                JOIN agents a ON m.sender_id = a.id
+                JOIN projects sp ON a.project_id = sp.id
+                WHERE m.project_id IN :proj_ids AND {where_clause}
+                ORDER BY m.created_ts DESC
+                LIMIT :limit
+                """
+            ).bindparams(bindparam("proj_ids", expanding=True)),
+            params,
+        )
+        return list(result.mappings().all())
 
-        @mcp.resource("resource://identity/{project}{?format}", mime_type="application/json")
-        def identity_resource(project: str, format: Optional[str] = None) -> dict[str, Any]:
-            """
-            Inspect identity resolution for a given project path. Returns the slug actually used,
-            the identity mode in effect, canonical path for the selected mode, and git repo facts.
-            """
-            raw_path, query_params = _split_slug_and_query(project)
-            format_value = format or query_params.get("format")
-            return _render_identity_resource_payload(
-                raw_path,
-                format_value=format_value,
-                resource_name="resource://identity/{project}",
+    @staticmethod
+    async def _visible_product_rows(rows: list[Any], authorized_map: dict[int, int]) -> list[Any]:
+        if not rows:
+            return rows
+        message_ids = [int(row["id"]) for row in rows]
+        recipients_by_message: dict[int, set[int]] = {}
+        async with get_session() as session:
+            recipient_rows = await session.execute(
+                select(MessageRecipient.message_id, MessageRecipient.agent_id).where(
+                    cast(Any, MessageRecipient.message_id).in_(message_ids)
+                )
             )
+            for message_id, recipient_agent_id in recipient_rows.all():
+                recipients_by_message.setdefault(int(message_id), set()).add(int(recipient_agent_id))
+        visible_rows = []
+        for row in rows:
+            project_agent_id = authorized_map.get(int(row["project_id"]))
+            if project_agent_id is None:
+                continue
+            if int(row["sender_id"]) == project_agent_id or project_agent_id in recipients_by_message.get(int(row["id"]), set()):
+                visible_rows.append(row)
+        return visible_rows
 
-    def _read_tooling_directory_resource(format: Optional[str] = None) -> dict[str, Any]:
+
+class _MCPServerResources(_MCPServerRuntime):
+    def register_resources(self, mcp: FastMCP) -> None:
+        definitions = [
+            ("resource://tooling/directory", self.tooling_directory_resource_exact),
+            ("resource://tooling/directory{?format}", self.tooling_directory_resource),
+            ("resource://tooling/schemas", self.tooling_schemas_resource_exact),
+            ("resource://tooling/schemas{?format}", self.tooling_schemas_resource),
+            (_TOOLING_METRICS_URI, self.tooling_metrics_resource_exact),
+            ("resource://tooling/metrics{?format}", self.tooling_metrics_resource),
+            ("resource://tooling/locks", self.tooling_locks_resource_exact),
+            ("resource://tooling/locks{?format}", self.tooling_locks_resource),
+            ("resource://tooling/capabilities/{agent}{?project,format}", self.tooling_capabilities_resource),
+            ("resource://tooling/recent/{window_seconds}{?agent,project,format}", self.tooling_recent_resource),
+            ("resource://tooling/projects", self.projects_resource_exact),
+            ("resource://tooling/projects{?format}", self.projects_resource),
+            ("resource://project/{slug}{?format}", self.project_detail),
+            ("resource://agents/{project_key}{?format}", self.agents_directory),
+            ("resource://file_reservations/{slug}{?active_only,format}", self.file_reservations_resource),
+            ("resource://message/{message_id}{?project,agent,format}", self.message_resource),
+            ("resource://thread/{thread_id}{?project,agent,include_bodies,format}", self.thread_resource),
+            ("resource://inbox/{agent}{?project,since_ts,urgent_only,include_bodies,limit,format}", self.inbox_resource),
+            ("resource://views/urgent-unread/{agent}{?project,limit,format}", self.urgent_unread_view),
+            ("resource://views/ack-required/{agent}{?project,limit,format}", self.ack_required_view),
+            ("resource://views/acks-stale/{agent}{?project,ttl_seconds,limit,format}", self.acks_stale_view),
+            ("resource://views/ack-overdue/{agent}{?project,ttl_minutes,limit,format}", self.ack_overdue_view),
+            ("resource://mailbox/{agent}{?project,limit,format}", self.mailbox_resource),
+            ("resource://mailbox-with-commits/{agent}{?project,limit,format}", self.mailbox_with_commits_resource),
+            ("resource://outbox/{agent}{?project,limit,include_bodies,since_ts,format}", self.outbox_resource),
+        ]
+        for uri, handler in definitions:
+            mcp.resource(uri, mime_type=_JSON_MIME_TYPE)(handler)
+
+    def _read_tooling_directory_resource(self, format: Optional[str] = None) -> dict[str, Any]:
         """
         Provide a clustered view of exposed MCP tools to combat option overload.
 
@@ -18278,28 +18070,7 @@ def build_mcp_server() -> FastMCP:
 
         visible_clusters: list[dict[str, Any]] = []
         for cluster in clusters:
-            visible_tools: list[dict[str, Any]] = []
-            for tool_entry in cluster["tools"]:
-                tool_dict = cast(dict[str, Any], tool_entry)
-                tool_name = str(tool_dict.get("name", ""))
-                if not _tool_visible_for_settings(tool_name, settings):
-                    continue
-                related = tool_dict.get("related")
-                if isinstance(related, list):
-                    tool_dict["related"] = [
-                        related_name
-                        for related_name in related
-                        if _tool_visible_for_settings(str(related_name), settings)
-                    ]
-                meta = TOOL_METADATA.get(tool_name)
-                if not meta:
-                    visible_tools.append(tool_dict)
-                    continue
-                tool_dict["capabilities"] = meta["capabilities"]
-                tool_dict.setdefault("complexity", meta["complexity"])
-                if "required_capabilities" in tool_dict:
-                    tool_dict["required_capabilities"] = meta["capabilities"]
-                visible_tools.append(tool_dict)
+            visible_tools = self._visible_directory_tools(cluster["tools"])
             if visible_tools:
                 cluster["tools"] = visible_tools
                 visible_clusters.append(cluster)
@@ -18331,15 +18102,15 @@ def build_mcp_server() -> FastMCP:
             playbook
             for playbook in playbooks
             if all(
-                _tool_visible_for_settings(str(tool_name), settings)
+                _tool_visible_for_settings(str(tool_name), self.settings)
                 for tool_name in playbook["sequence"]
             )
         ]
 
-        default_format = settings.output_format_default or settings.toon_default_format or "json"
+        default_format = self.settings.output_format_default or self.settings.toon_default_format or "json"
         payload = {
             "generated_at": _iso(datetime.now(timezone.utc)),
-            "metrics_uri": "resource://tooling/metrics",
+            "metrics_uri": _TOOLING_METRICS_URI,
             "output_formats": {
                 "default": default_format,
                 "tool_param": "format",
@@ -18352,26 +18123,49 @@ def build_mcp_server() -> FastMCP:
         }
         return _apply_resource_output_format(
             payload,
-            settings=settings,
+            settings=self.settings,
             resource_name="resource://tooling/directory",
             format_value=format,
         )
 
-    @mcp.resource("resource://tooling/directory", mime_type="application/json")
-    def tooling_directory_resource_exact() -> dict[str, Any]:
-        return _read_tooling_directory_resource()
+    def _visible_directory_tools(self, tools: Any) -> list[dict[str, Any]]:
+        visible_tools: list[dict[str, Any]] = []
+        for tool_entry in tools:
+            tool_dict = cast(dict[str, Any], tool_entry)
+            tool_name = str(tool_dict.get("name", ""))
+            if not _tool_visible_for_settings(tool_name, self.settings):
+                continue
+            related = tool_dict.get("related")
+            if isinstance(related, list):
+                tool_dict["related"] = [
+                    related_name
+                    for related_name in related
+                    if _tool_visible_for_settings(str(related_name), self.settings)
+                ]
+            meta = TOOL_METADATA.get(tool_name)
+            if not meta:
+                visible_tools.append(tool_dict)
+                continue
+            tool_dict["capabilities"] = meta["capabilities"]
+            tool_dict.setdefault("complexity", meta["complexity"])
+            if "required_capabilities" in tool_dict:
+                tool_dict["required_capabilities"] = meta["capabilities"]
+            visible_tools.append(tool_dict)
+        return visible_tools
 
-    @mcp.resource("resource://tooling/directory{?format}", mime_type="application/json")
-    def tooling_directory_resource(format: Optional[str] = None) -> dict[str, Any]:
-        return _read_tooling_directory_resource(format)
+    def tooling_directory_resource_exact(self) -> dict[str, Any]:
+        return self._read_tooling_directory_resource()
 
-    def _read_tooling_schemas_resource(format: Optional[str] = None) -> dict[str, Any]:
+    def tooling_directory_resource(self, format: Optional[str] = None) -> dict[str, Any]:
+        return self._read_tooling_directory_resource(format)
+
+    def _read_tooling_schemas_resource(self, format: Optional[str] = None) -> dict[str, Any]:
         """Expose JSON-like parameter schemas for tools/macros to prevent drift.
 
         This is a lightweight, hand-maintained view focusing on the most error-prone
         parameters and accepted aliases to guide clients.
         """
-        default_format = settings.output_format_default or settings.toon_default_format or "json"
+        default_format = self.settings.output_format_default or self.settings.toon_default_format or "json"
         payload = {
             "generated_at": _iso(datetime.now(timezone.utc)),
             "global_optional": ["format"],
@@ -18445,24 +18239,22 @@ def build_mcp_server() -> FastMCP:
             payload["tools"] = {
                 tool_name: schema
                 for tool_name, schema in tool_schemas.items()
-                if _tool_visible_for_settings(str(tool_name), settings)
+                if _tool_visible_for_settings(str(tool_name), self.settings)
             }
         return _apply_resource_output_format(
             payload,
-            settings=settings,
+            settings=self.settings,
             resource_name="resource://tooling/schemas",
             format_value=format,
         )
 
-    @mcp.resource("resource://tooling/schemas", mime_type="application/json")
-    def tooling_schemas_resource_exact() -> dict[str, Any]:
-        return _read_tooling_schemas_resource()
+    def tooling_schemas_resource_exact(self) -> dict[str, Any]:
+        return self._read_tooling_schemas_resource()
 
-    @mcp.resource("resource://tooling/schemas{?format}", mime_type="application/json")
-    def tooling_schemas_resource(format: Optional[str] = None) -> dict[str, Any]:
-        return _read_tooling_schemas_resource(format)
+    def tooling_schemas_resource(self, format: Optional[str] = None) -> dict[str, Any]:
+        return self._read_tooling_schemas_resource(format)
 
-    def _read_tooling_metrics_resource(format: Optional[str] = None) -> dict[str, Any]:
+    def _read_tooling_metrics_resource(self, format: Optional[str] = None) -> dict[str, Any]:
         """Expose aggregated tool call/error counts for analysis."""
         payload = {
             "generated_at": _iso(datetime.now(timezone.utc)),
@@ -18470,41 +18262,37 @@ def build_mcp_server() -> FastMCP:
         }
         return _apply_resource_output_format(
             payload,
-            settings=settings,
-            resource_name="resource://tooling/metrics",
+            settings=self.settings,
+            resource_name=_TOOLING_METRICS_URI,
             format_value=format,
         )
 
-    @mcp.resource("resource://tooling/metrics", mime_type="application/json")
-    def tooling_metrics_resource_exact() -> dict[str, Any]:
-        return _read_tooling_metrics_resource()
+    def tooling_metrics_resource_exact(self) -> dict[str, Any]:
+        return self._read_tooling_metrics_resource()
 
-    @mcp.resource("resource://tooling/metrics{?format}", mime_type="application/json")
-    def tooling_metrics_resource(format: Optional[str] = None) -> dict[str, Any]:
-        return _read_tooling_metrics_resource(format)
+    def tooling_metrics_resource(self, format: Optional[str] = None) -> dict[str, Any]:
+        return self._read_tooling_metrics_resource(format)
 
-    def _read_tooling_locks_resource(format: Optional[str] = None) -> dict[str, Any]:
+    def _read_tooling_locks_resource(self, format: Optional[str] = None) -> dict[str, Any]:
         """Return lock metadata from the shared archive storage."""
 
         settings_local = get_settings()
         payload = collect_lock_status(settings_local)
         return _apply_resource_output_format(
             payload,
-            settings=settings,
+            settings=self.settings,
             resource_name="resource://tooling/locks",
             format_value=format,
         )
 
-    @mcp.resource("resource://tooling/locks", mime_type="application/json")
-    def tooling_locks_resource_exact() -> dict[str, Any]:
-        return _read_tooling_locks_resource()
+    def tooling_locks_resource_exact(self) -> dict[str, Any]:
+        return self._read_tooling_locks_resource()
 
-    @mcp.resource("resource://tooling/locks{?format}", mime_type="application/json")
-    def tooling_locks_resource(format: Optional[str] = None) -> dict[str, Any]:
-        return _read_tooling_locks_resource(format)
+    def tooling_locks_resource(self, format: Optional[str] = None) -> dict[str, Any]:
+        return self._read_tooling_locks_resource(format)
 
-    @mcp.resource("resource://tooling/capabilities/{agent}{?project,format}", mime_type="application/json")
     def tooling_capabilities_resource(
+        self,
         agent: str,
         project: Optional[str] = None,
         format: Optional[str] = None,
@@ -18531,13 +18319,13 @@ def build_mcp_server() -> FastMCP:
         }
         return _apply_resource_output_format(
             payload,
-            settings=settings,
+            settings=self.settings,
             resource_name="resource://tooling/capabilities/{agent}",
             format_value=format_value,
         )
 
-    @mcp.resource("resource://tooling/recent/{window_seconds}{?agent,project,format}", mime_type="application/json")
     def tooling_recent_resource(
+        self,
         window_seconds: str,
         agent: Optional[str] = None,
         project: Optional[str] = None,
@@ -18561,8 +18349,28 @@ def build_mcp_server() -> FastMCP:
         except Exception:
             win = 60
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=max(1, win))
+        entries = self._recent_tool_entries(cutoff, project, agent)
+        payload = {
+            "generated_at": _iso(datetime.now(timezone.utc)),
+            "window_seconds": win,
+            "count": len(entries),
+            "entries": entries,
+        }
+        return _apply_resource_output_format(
+            payload,
+            settings=self.settings,
+            resource_name="resource://tooling/recent/{window_seconds}",
+            format_value=format_value,
+        )
+
+    @staticmethod
+    def _recent_tool_entries(
+        cutoff: datetime,
+        project: str | None,
+        agent: str | None,
+    ) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
-        for ts, tool_name, proj, ag in list(RECENT_TOOL_USAGE):
+        for ts, tool_name, proj, ag in RECENT_TOOL_USAGE.copy():
             if ts < cutoff:
                 continue
             if project and proj != project:
@@ -18578,20 +18386,10 @@ def build_mcp_server() -> FastMCP:
                 "cluster": TOOL_CLUSTER_MAP.get(tool_name, "unclassified"),
             }
             entries.append(record)
-        payload = {
-            "generated_at": _iso(datetime.now(timezone.utc)),
-            "window_seconds": win,
-            "count": len(entries),
-            "entries": entries,
-        }
-        return _apply_resource_output_format(
-            payload,
-            settings=settings,
-            resource_name="resource://tooling/recent/{window_seconds}",
-            format_value=format_value,
-        )
+        return entries
 
     async def _read_projects_resource(
+        self,
         format: Optional[str] = None,
     ) -> JsonArrayResource:
         """
@@ -18632,18 +18430,16 @@ def build_mcp_server() -> FastMCP:
                 format_value=format,
             )
 
-    @mcp.resource("resource://tooling/projects", mime_type="application/json")
-    async def projects_resource_exact() -> JsonArrayResource:
-        return await _read_projects_resource()
+    async def projects_resource_exact(self) -> JsonArrayResource:
+        return await self._read_projects_resource()
 
-    @mcp.resource("resource://tooling/projects{?format}", mime_type="application/json")
     async def projects_resource(
+        self,
         format: Optional[str] = None,
     ) -> JsonArrayResource:
-        return await _read_projects_resource(format)
+        return await self._read_projects_resource(format)
 
-    @mcp.resource("resource://project/{slug}{?format}", mime_type="application/json")
-    async def project_detail(slug: str, format: Optional[str] = None) -> dict[str, Any]:
+    async def project_detail(self, slug: str, format: Optional[str] = None) -> dict[str, Any]:
         """
         Fetch a project and its agents by project slug or human key.
 
@@ -18686,13 +18482,12 @@ def build_mcp_server() -> FastMCP:
         }
         return _apply_resource_output_format(
             payload,
-            settings=settings,
+            settings=self.settings,
             resource_name="resource://project/{slug}",
             format_value=format_value,
         )
 
-    @mcp.resource("resource://agents/{project_key}{?format}", mime_type="application/json")
-    async def agents_directory(project_key: str, format: Optional[str] = None) -> dict[str, Any]:
+    async def agents_directory(self, project_key: str, format: Optional[str] = None) -> dict[str, Any]:
         """
         List all registered agents in a project for easy agent discovery.
 
@@ -18793,13 +18588,13 @@ def build_mcp_server() -> FastMCP:
         }
         return _apply_resource_output_format(
             payload,
-            settings=settings,
+            settings=self.settings,
             resource_name="resource://agents/{project_key}",
             format_value=format_value,
         )
 
-    @mcp.resource("resource://file_reservations/{slug}{?active_only,format}", mime_type="application/json")
     async def file_reservations_resource(
+        self,
         slug: str,
         active_only: bool = True,
         format: Optional[str] = None,
@@ -18853,44 +18648,48 @@ def build_mcp_server() -> FastMCP:
             reservation = status.reservation
             if active_only and reservation.released_ts is not None:
                 continue
-            payload.append(
-                {
-                    "id": reservation.id,
-                    # `agent` is None when the reservation is orphaned (owning
-                    # agent row deleted or agent_id NULL). Callers should fall
-                    # back to `agent_id` for debugging. (#161)
-                    "agent": status.agent.name if status.agent is not None else None,
-                    "agent_id": reservation.agent_id,
-                    "execution_id": status.execution_id,
-                    "execution_status": status.execution_status,
-                    "execution_parent_id": status.execution_parent_id,
-                    "ancestor_execution_ids": status.ancestor_execution_ids,
-                    "origin": reservation.origin,
-                    "orphaned": status.orphaned,
-                    "legacy_unscoped": status.legacy_unscoped,
-                    "path_pattern": reservation.path_pattern,
-                    "exclusive": reservation.exclusive,
-                    "reason": reservation.reason,
-                    "created_ts": _iso(reservation.created_ts),
-                    "expires_ts": _iso(reservation.expires_ts),
-                    "released_ts": _iso(reservation.released_ts) if reservation.released_ts else None,
-                    "stale": status.stale,
-                    "stale_reasons": status.stale_reasons,
-                    "last_agent_activity_ts": _iso(status.last_agent_activity) if status.last_agent_activity else None,
-                    "last_execution_activity_ts": _iso(status.last_execution_activity) if status.last_execution_activity else None,
-                    "last_mail_activity_ts": _iso(status.last_mail_activity) if status.last_mail_activity else None,
-                    "last_filesystem_activity_ts": _iso(status.last_fs_activity) if status.last_fs_activity else None,
-                    "last_git_activity_ts": _iso(status.last_git_activity) if status.last_git_activity else None,
-                }
-            )
+            payload.append(self._reservation_resource_entry(status))
         return _apply_resource_output_format(
             payload,
-            settings=settings,
+            settings=self.settings,
             resource_name="resource://file_reservations/{slug}",
             format_value=format_value,
         )
 
+    @staticmethod
+    def _reservation_resource_entry(status: FileReservationStatus) -> dict[str, Any]:
+        reservation = status.reservation
+        return {
+            "id": reservation.id,
+            # `agent` is None when the reservation is orphaned (owning
+            # agent row deleted or agent_id NULL). Callers should fall
+            # back to `agent_id` for debugging. (#161)
+            "agent": status.agent.name if status.agent is not None else None,
+            "agent_id": reservation.agent_id,
+            "execution_id": status.execution_id,
+            "execution_status": status.execution_status,
+            "execution_parent_id": status.execution_parent_id,
+            "ancestor_execution_ids": status.ancestor_execution_ids,
+            "origin": reservation.origin,
+            "orphaned": status.orphaned,
+            "legacy_unscoped": status.legacy_unscoped,
+            "path_pattern": reservation.path_pattern,
+            "exclusive": reservation.exclusive,
+            "reason": reservation.reason,
+            "created_ts": _iso(reservation.created_ts),
+            "expires_ts": _iso(reservation.expires_ts),
+            "released_ts": _iso(reservation.released_ts) if reservation.released_ts else None,
+            "stale": status.stale,
+            "stale_reasons": status.stale_reasons,
+            "last_agent_activity_ts": _iso(status.last_agent_activity) if status.last_agent_activity else None,
+            "last_execution_activity_ts": _iso(status.last_execution_activity) if status.last_execution_activity else None,
+            "last_mail_activity_ts": _iso(status.last_mail_activity) if status.last_mail_activity else None,
+            "last_filesystem_activity_ts": _iso(status.last_fs_activity) if status.last_fs_activity else None,
+            "last_git_activity_ts": _iso(status.last_git_activity) if status.last_git_activity else None,
+        }
+
     async def _resolve_private_resource_agent(
+        self,
         ctx: Context,
         project: Project,
         *,
@@ -18909,7 +18708,7 @@ def build_mcp_server() -> FastMCP:
         """
         if requested_agent is not None:
             viewer = await _get_agent(project, requested_agent)
-            if not _session_is_bound_to_agent(ctx, project, viewer):
+            if not self._session_is_bound_to_agent(ctx, project, viewer):
                 raise ToolExecutionError(
                     "AUTHENTICATION_REQUIRED",
                     (
@@ -18926,7 +18725,7 @@ def build_mcp_server() -> FastMCP:
                     },
                 )
         else:
-            viewer = await _resolve_session_agent_for_project(ctx, project)
+            viewer = await self._resolve_session_agent_for_project(ctx, project)
             if viewer is None:
                 raise ToolExecutionError(
                     "AUTHENTICATION_REQUIRED",
@@ -18942,11 +18741,11 @@ def build_mcp_server() -> FastMCP:
                         "stateless_tool": stateless_tool,
                     },
                 )
-        await _touch_agent_activity(viewer)
+        await self._touch_agent_activity(viewer)
         return viewer
 
-    @mcp.resource("resource://message/{message_id}{?project,agent,format}", mime_type="application/json")
     async def message_resource(
+        self,
         ctx: Context,
         message_id: str,
         project: Optional[str] = None,
@@ -19007,7 +18806,7 @@ def build_mcp_server() -> FastMCP:
         project_obj = await _get_project_by_identifier(
             _require_project_resource_param(project, resource_name="message resource")
         )
-        viewer = await _resolve_private_resource_agent(
+        viewer = await self._resolve_private_resource_agent(
             ctx,
             project_obj,
             requested_agent=agent,
@@ -19028,13 +18827,13 @@ def build_mcp_server() -> FastMCP:
         )
         return _apply_resource_output_format(
             payload,
-            settings=settings,
+            settings=self.settings,
             resource_name="resource://message/{message_id}",
             format_value=format_value,
         )
 
-    @mcp.resource("resource://thread/{thread_id}{?project,agent,include_bodies,format}", mime_type="application/json")
     async def thread_resource(
+        self,
         ctx: Context,
         thread_id: str,
         project: Optional[str] = None,
@@ -19105,14 +18904,29 @@ def build_mcp_server() -> FastMCP:
         project_obj = await _get_project_by_identifier(
             _require_project_resource_param(project, resource_name="thread resource")
         )
-        viewer = await _resolve_private_resource_agent(
+        viewer = await self._resolve_private_resource_agent(
             ctx,
             project_obj,
             requested_agent=agent,
             action="resource://thread/{thread_id}",
             stateless_tool="summarize_thread",
         )
+        messages = await self._thread_resource_messages(project_obj, viewer, thread_id, include_bodies)
+        payload = {"project": project_obj.human_key, "thread_id": thread_id, "messages": messages}
+        return _apply_resource_output_format(
+            payload,
+            settings=self.settings,
+            resource_name="resource://thread/{thread_id}",
+            format_value=format_value,
+        )
 
+    @staticmethod
+    async def _thread_resource_messages(
+        project_obj: Project,
+        viewer: Agent,
+        thread_id: str,
+        include_bodies: bool,
+    ) -> list[dict[str, Any]]:
         if project_obj.id is None:
             raise ValueError("Project must have an id before listing threads.")
         await ensure_schema()
@@ -19157,19 +18971,10 @@ def build_mcp_server() -> FastMCP:
                 sender_project_slug=sender_project_slug,
             )
             messages.append(payload)
-        payload = {"project": project_obj.human_key, "thread_id": thread_id, "messages": messages}
-        return _apply_resource_output_format(
-            payload,
-            settings=settings,
-            resource_name="resource://thread/{thread_id}",
-            format_value=format_value,
-        )
+        return messages
 
-    @mcp.resource(
-        "resource://inbox/{agent}{?project,since_ts,urgent_only,include_bodies,limit,format}",
-        mime_type="application/json",
-    )
     async def inbox_resource(
+        self,
         ctx: Context,
         agent: str,
         project: Optional[str] = None,
@@ -19249,7 +19054,7 @@ def build_mcp_server() -> FastMCP:
         project_obj = await _get_project_by_identifier(
             _require_project_resource_param(project, resource_name="inbox resource")
         )
-        agent_obj = await _resolve_private_resource_agent(
+        agent_obj = await self._resolve_private_resource_agent(
             ctx,
             project_obj,
             requested_agent=agent,
@@ -19258,16 +19063,7 @@ def build_mcp_server() -> FastMCP:
         )
         messages = await _list_inbox(project_obj, agent_obj, limit, urgent_only, include_bodies, since_ts)
         # Enrich with commit info for canonical markdown files (best-effort)
-        enriched: list[dict[str, Any]] = []
-        for item in messages:
-            try:
-                msg_obj = await _get_message(project_obj, int(item["id"]))
-                commit_info = await _commit_info_for_message(settings, project_obj, msg_obj)
-                if commit_info:
-                    item["commit"] = commit_info
-            except Exception:
-                pass
-            enriched.append(item)
+        enriched = await self._enrich_resource_messages(project_obj, messages)
         payload = {
             "project": project_obj.human_key,
             "agent": agent_obj.name,
@@ -19276,13 +19072,30 @@ def build_mcp_server() -> FastMCP:
         }
         return _apply_resource_output_format(
             payload,
-            settings=settings,
+            settings=self.settings,
             resource_name="resource://inbox/{agent}",
             format_value=format_value,
         )
 
-    @mcp.resource("resource://views/urgent-unread/{agent}{?project,limit,format}", mime_type="application/json")
+    async def _enrich_resource_messages(
+        self,
+        project: Project,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        enriched: list[dict[str, Any]] = []
+        for item in messages:
+            try:
+                msg_obj = await _get_message(project, int(item["id"]))
+                commit_info = await _commit_info_for_message(self.settings, project, msg_obj)
+                if commit_info:
+                    item["commit"] = commit_info
+            except Exception:
+                pass
+            enriched.append(item)
+        return enriched
+
     async def urgent_unread_view(
+        self,
         ctx: Context,
         agent: str,
         project: Optional[str] = None,
@@ -19319,7 +19132,7 @@ def build_mcp_server() -> FastMCP:
         project_obj = await _get_project_by_identifier(
             _require_project_resource_param(project, resource_name="urgent view")
         )
-        agent_obj = await _resolve_private_resource_agent(
+        agent_obj = await self._resolve_private_resource_agent(
             ctx,
             project_obj,
             requested_agent=agent,
@@ -19343,13 +19156,13 @@ def build_mcp_server() -> FastMCP:
         payload = {"project": project_obj.human_key, "agent": agent_obj.name, "count": len(unread), "messages": unread}
         return _apply_resource_output_format(
             payload,
-            settings=settings,
+            settings=self.settings,
             resource_name="resource://views/urgent-unread/{agent}",
             format_value=format_value,
         )
 
-    @mcp.resource("resource://views/ack-required/{agent}{?project,limit,format}", mime_type="application/json")
     async def ack_required_view(
+        self,
         ctx: Context,
         agent: str,
         project: Optional[str] = None,
@@ -19386,7 +19199,7 @@ def build_mcp_server() -> FastMCP:
         project_obj = await _get_project_by_identifier(
             _require_project_resource_param(project, resource_name="ack view")
         )
-        agent_obj = await _resolve_private_resource_agent(
+        agent_obj = await self._resolve_private_resource_agent(
             ctx,
             project_obj,
             requested_agent=agent,
@@ -19394,7 +19207,7 @@ def build_mcp_server() -> FastMCP:
             stateless_tool="fetch_inbox",
         )
         if project_obj.id is None or agent_obj.id is None:
-            raise ValueError("Project/agent IDs must exist")
+            raise ValueError(_PROJECT_AGENT_IDS_REQUIRED)
         await ensure_schema()
         out: list[dict[str, Any]] = []
         async with get_session() as session:
@@ -19417,13 +19230,13 @@ def build_mcp_server() -> FastMCP:
         payload = {"project": project_obj.human_key, "agent": agent_obj.name, "count": len(out), "messages": out}
         return _apply_resource_output_format(
             payload,
-            settings=settings,
+            settings=self.settings,
             resource_name="resource://views/ack-required/{agent}",
             format_value=format_value,
         )
 
-    @mcp.resource("resource://views/acks-stale/{agent}{?project,ttl_seconds,limit,format}", mime_type="application/json")
     async def acks_stale_view(
+        self,
         ctx: Context,
         agent: str,
         project: Optional[str] = None,
@@ -19466,7 +19279,7 @@ def build_mcp_server() -> FastMCP:
         project_obj = await _get_project_by_identifier(
             _require_project_resource_param(project, resource_name="stale acks view")
         )
-        agent_obj = await _resolve_private_resource_agent(
+        agent_obj = await self._resolve_private_resource_agent(
             ctx,
             project_obj,
             requested_agent=agent,
@@ -19474,7 +19287,7 @@ def build_mcp_server() -> FastMCP:
             stateless_tool="fetch_inbox",
         )
         if project_obj.id is None or agent_obj.id is None:
-            raise ValueError("Project/agent IDs must exist")
+            raise ValueError(_PROJECT_AGENT_IDS_REQUIRED)
         await ensure_schema()
         ttl = int(ttl_seconds) if ttl_seconds is not None else get_settings().ack_ttl_seconds
         now = datetime.now(timezone.utc)
@@ -19492,20 +19305,7 @@ def build_mcp_server() -> FastMCP:
                 .order_by(asc(cast(Any, Message.created_ts)))
                 .limit(limit * 5)
             )
-            for msg, kind, read_ts in rows.all():
-                # Coerce potential naive datetimes from SQLite to UTC for arithmetic
-                created = msg.created_ts
-                if getattr(created, "tzinfo", None) is None:
-                    created = created.replace(tzinfo=timezone.utc)
-                age_s = int((now - created).total_seconds())
-                if age_s >= ttl:
-                    payload = _message_to_dict(msg, include_body=False)
-                    payload["kind"] = kind
-                    payload["read_at"] = _iso(read_ts) if read_ts else None
-                    payload["age_seconds"] = age_s
-                    out.append(payload)
-                    if len(out) >= limit:
-                        break
+            out = self._stale_ack_messages(rows.all(), now, ttl, limit)
         payload = {
             "project": project_obj.human_key,
             "agent": agent_obj.name,
@@ -19515,13 +19315,37 @@ def build_mcp_server() -> FastMCP:
         }
         return _apply_resource_output_format(
             payload,
-            settings=settings,
+            settings=self.settings,
             resource_name="resource://views/acks-stale/{agent}",
             format_value=format_value,
         )
 
-    @mcp.resource("resource://views/ack-overdue/{agent}{?project,ttl_minutes,limit,format}", mime_type="application/json")
+    @staticmethod
+    def _stale_ack_messages(
+        rows: Sequence[Any],
+        now: datetime,
+        ttl: int,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for msg, kind, read_ts in rows:
+            # Coerce potential naive datetimes from SQLite to UTC for arithmetic
+            created = msg.created_ts
+            if getattr(created, "tzinfo", None) is None:
+                created = created.replace(tzinfo=timezone.utc)
+            age_s = int((now - created).total_seconds())
+            if age_s >= ttl:
+                payload = _message_to_dict(msg, include_body=False)
+                payload["kind"] = kind
+                payload["read_at"] = _iso(read_ts) if read_ts else None
+                payload["age_seconds"] = age_s
+                out.append(payload)
+                if len(out) >= limit:
+                    break
+        return out
+
     async def ack_overdue_view(
+        self,
         ctx: Context,
         agent: str,
         project: Optional[str] = None,
@@ -19551,7 +19375,7 @@ def build_mcp_server() -> FastMCP:
         project_obj = await _get_project_by_identifier(
             _require_project_resource_param(project, resource_name="ack-overdue view")
         )
-        agent_obj = await _resolve_private_resource_agent(
+        agent_obj = await self._resolve_private_resource_agent(
             ctx,
             project_obj,
             requested_agent=agent,
@@ -19559,7 +19383,7 @@ def build_mcp_server() -> FastMCP:
             stateless_tool="fetch_inbox",
         )
         if project_obj.id is None or agent_obj.id is None:
-            raise ValueError("Project/agent IDs must exist")
+            raise ValueError(_PROJECT_AGENT_IDS_REQUIRED)
         await ensure_schema()
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=max(1, ttl_minutes))
         out: list[dict[str, Any]] = []
@@ -19576,26 +19400,36 @@ def build_mcp_server() -> FastMCP:
                 .order_by(asc(cast(Any, Message.created_ts)))
                 .limit(limit * 5)
             )
-            for msg, kind in rows.all():
-                created = msg.created_ts
-                if getattr(created, "tzinfo", None) is None:
-                    created = created.replace(tzinfo=timezone.utc)
-                if created <= cutoff:
-                    payload = _message_to_dict(msg, include_body=False)
-                    payload["kind"] = kind
-                    out.append(payload)
-                    if len(out) >= limit:
-                        break
+            out = self._overdue_ack_messages(rows.all(), cutoff, limit)
         payload = {"project": project_obj.human_key, "agent": agent_obj.name, "count": len(out), "messages": out}
         return _apply_resource_output_format(
             payload,
-            settings=settings,
+            settings=self.settings,
             resource_name="resource://views/ack-overdue/{agent}",
             format_value=format_value,
         )
 
-    @mcp.resource("resource://mailbox/{agent}{?project,limit,format}", mime_type="application/json")
+    @staticmethod
+    def _overdue_ack_messages(
+        rows: Sequence[Any],
+        cutoff: datetime,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for msg, kind in rows:
+            created = msg.created_ts
+            if getattr(created, "tzinfo", None) is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if created <= cutoff:
+                payload = _message_to_dict(msg, include_body=False)
+                payload["kind"] = kind
+                out.append(payload)
+                if len(out) >= limit:
+                    break
+        return out
+
     async def mailbox_resource(
+        self,
         ctx: Context,
         agent: str,
         project: Optional[str] = None,
@@ -19628,7 +19462,7 @@ def build_mcp_server() -> FastMCP:
         project_obj = await _get_project_by_identifier(
             _require_project_resource_param(project, resource_name="mailbox resource")
         )
-        agent_obj = await _resolve_private_resource_agent(
+        agent_obj = await self._resolve_private_resource_agent(
             ctx,
             project_obj,
             requested_agent=agent,
@@ -19642,7 +19476,7 @@ def build_mcp_server() -> FastMCP:
             payload = dict(item)
             try:
                 msg_obj = await _get_message(project_obj, int(item["id"]))
-                commit_info = await _commit_info_for_message(settings, project_obj, msg_obj)
+                commit_info = await _commit_info_for_message(self.settings, project_obj, msg_obj)
                 if commit_info:
                     payload["commit"] = commit_info
             except Exception:
@@ -19651,16 +19485,13 @@ def build_mcp_server() -> FastMCP:
         payload = {"project": project_obj.human_key, "agent": agent_obj.name, "count": len(out), "messages": out}
         return _apply_resource_output_format(
             payload,
-            settings=settings,
+            settings=self.settings,
             resource_name="resource://mailbox/{agent}",
             format_value=format_value,
         )
 
-    @mcp.resource(
-        "resource://mailbox-with-commits/{agent}{?project,limit,format}",
-        mime_type="application/json",
-    )
     async def mailbox_with_commits_resource(
+        self,
         ctx: Context,
         agent: str,
         project: Optional[str] = None,
@@ -19685,7 +19516,7 @@ def build_mcp_server() -> FastMCP:
         project_obj = await _get_project_by_identifier(
             _require_project_resource_param(project, resource_name="mailbox-with-commits resource")
         )
-        agent_obj = await _resolve_private_resource_agent(
+        agent_obj = await self._resolve_private_resource_agent(
             ctx,
             project_obj,
             requested_agent=agent,
@@ -19698,7 +19529,7 @@ def build_mcp_server() -> FastMCP:
         for item in items:
             try:
                 msg_obj = await _get_message(project_obj, int(item["id"]))
-                commit_info = await _commit_info_for_message(settings, project_obj, msg_obj)
+                commit_info = await _commit_info_for_message(self.settings, project_obj, msg_obj)
                 if commit_info:
                     item["commit"] = commit_info
             except Exception:
@@ -19707,13 +19538,13 @@ def build_mcp_server() -> FastMCP:
         payload = {"project": project_obj.human_key, "agent": agent_obj.name, "count": len(enriched), "messages": enriched}
         return _apply_resource_output_format(
             payload,
-            settings=settings,
+            settings=self.settings,
             resource_name="resource://mailbox-with-commits/{agent}",
             format_value=format_value,
         )
 
-    @mcp.resource("resource://outbox/{agent}{?project,limit,include_bodies,since_ts,format}", mime_type="application/json")
     async def outbox_resource(
+        self,
         ctx: Context,
         agent: str,
         project: Optional[str] = None,
@@ -19748,7 +19579,7 @@ def build_mcp_server() -> FastMCP:
         project_obj = await _get_project_by_identifier(
             _require_project_resource_param(project, resource_name="outbox resource")
         )
-        agent_obj = await _resolve_private_resource_agent(
+        agent_obj = await self._resolve_private_resource_agent(
             ctx,
             project_obj,
             requested_agent=agent,
@@ -19756,33 +19587,17 @@ def build_mcp_server() -> FastMCP:
             stateless_tool="search_messages",
         )
         items = await _list_outbox(project_obj, agent_obj, limit, include_bodies, since_ts)
-        enriched: list[dict[str, Any]] = []
-        for item in items:
-            try:
-                msg_obj = await _get_message(project_obj, int(item["id"]))
-                commit_info = await _commit_info_for_message(settings, project_obj, msg_obj)
-                if commit_info:
-                    item["commit"] = commit_info
-            except Exception:
-                pass
-            enriched.append(item)
+        enriched = await self._enrich_resource_messages(project_obj, items)
         payload = {"project": project_obj.human_key, "agent": agent_obj.name, "count": len(enriched), "messages": enriched}
         return _apply_resource_output_format(
             payload,
-            settings=settings,
+            settings=self.settings,
             resource_name="resource://outbox/{agent}",
             format_value=format_value,
         )
 
-    # No explicit output-schema transform; the tool returns ToolResult with {"result": ...}
-
-    # -------------------------------------------------------------------------------------------------
-    # Tool Filtering: Remove tools that shouldn't be exposed based on settings
-    # -------------------------------------------------------------------------------------------------
-    if settings.tool_filter.enabled:
-        _apply_tool_filter(mcp, settings)
-
-    return mcp
+class _MCPServer(_MCPServerTools, _MCPBuildSlots, _MCPProductBus, _MCPServerResources):
+    pass
 
 
 def _apply_tool_filter(mcp: FastMCP, settings: Settings) -> None:

@@ -119,11 +119,12 @@ async def test_broadcast_with_explicit_recipients_errors(isolated_env):
     async with Client(server) as client:
         names = await _setup_project_with_agents(client, pkey("test/bcast-err"), 2)
 
+        project_key = pkey("test/bcast-err")
         with pytest.raises(Exception, match="mutually exclusive"):
             await client.call_tool(
                 "send_message",
                 {
-                    "project_key": pkey("test/bcast-err"),
+                    "project_key": project_key,
                     "sender_name": names[0],
                     "to": [names[1]],
                     "subject": "Should fail",

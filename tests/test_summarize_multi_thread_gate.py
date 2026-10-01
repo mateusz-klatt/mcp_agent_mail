@@ -126,13 +126,15 @@ async def test_batching_threads_does_not_widen_what_a_viewer_may_read(isolated_e
 
     # Positive control first: the thread must be visible to SOMEBODY, or the
     # refusal below is satisfied by an empty database.
-    assert mine["total_messages"] == 1 and OWNER in mine["participants"], (
+    assert mine["total_messages"] == 1, (
         f"positive control failed: the owner must see their own thread; got {mine}"
     )
-    assert theirs["total_messages"] == 0 and theirs["participants"] == [], (
+    assert OWNER in mine["participants"], f"owner missing from their own thread: {mine}"
+    assert theirs["total_messages"] == 0, (
         "asking for a readable thread and an unreadable one in a single call must "
         f"not surface the unreadable one; got {theirs}"
     )
+    assert theirs["participants"] == [], f"unreadable thread leaked participants: {theirs}"
 
 
 @pytest.mark.asyncio
@@ -156,14 +158,16 @@ async def test_a_trailing_comma_is_still_one_thread(isolated_env):
             reader, " OPEN , ", OWNER, owner["registration_token"]
         )
 
-    assert "thread_id" in plain and "threads" not in plain, (
+    assert "thread_id" in plain, (
         f"a single id must answer in single-thread shape; got keys {sorted(plain)}"
     )
+    assert "threads" not in plain, f"single-thread response has multi-thread keys: {sorted(plain)}"
     for label, payload in (("trailing comma", trailing), ("padded", spaced)):
-        assert "thread_id" in payload and "threads" not in payload, (
+        assert "thread_id" in payload, (
             f"{label} still names one thread, so the shape must not change; "
             f"got keys {sorted(payload)}"
         )
+        assert "threads" not in payload, f"{label} has multi-thread keys: {sorted(payload)}"
 
 
 @pytest.mark.asyncio
@@ -181,7 +185,8 @@ async def test_two_ids_answer_in_multi_thread_shape(isolated_env):
             reader, "OPEN,CLOSED", OWNER, owner["registration_token"]
         )
 
-    assert "threads" in both and "aggregate" in both, (
+    assert "threads" in both, (
         f"two ids must answer in multi-thread shape; got keys {sorted(both)}"
     )
+    assert "aggregate" in both, f"multi-thread response has no aggregate: {sorted(both)}"
     assert {t.get("thread_id") for t in both["threads"]} == {"OPEN", "CLOSED"}

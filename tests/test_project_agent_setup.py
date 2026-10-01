@@ -332,11 +332,12 @@ async def test_register_agent_existing_identity_requires_token_across_sessions(i
         registration_token = created.data["registration_token"]
 
     async with Client(server) as attacker_client:
+        project_key = pkey("test/setup/takeover")
         with pytest.raises(ToolError) as exc_info:
             await attacker_client.call_tool(
                 "register_agent",
                 {
-                    "project_key": pkey("test/setup/takeover"),
+                    "project_key": project_key,
                     "program": "attacker-program",
                     "model": "attacker-model",
                     "name": "codex-wsl-takeover-1",
@@ -731,11 +732,12 @@ async def test_register_agent_invalid_name_rejected(isolated_env):
             "ensure_project", {"human_key": pkey("test/setup/invalid")}
         )
 
+        project_key = pkey("test/setup/invalid")
         with pytest.raises(ToolError, match="must match client-os-host-slot"):
             await client.call_tool(
                 "register_agent",
                 {
-                    "project_key": pkey("test/setup/invalid"),
+                    "project_key": project_key,
                     "program": "test",
                     "model": "test",
                     "name": "YourAgentName",
@@ -753,11 +755,12 @@ async def test_whois_nonexistent_agent_error(isolated_env):
         await client.call_tool("ensure_project", {"human_key": pkey("test/setup/noagent")})
 
         # Try to whois non-existent agent
-        with pytest.raises(Exception) as exc_info:
+        project_key = pkey("test/setup/noagent")
+        with pytest.raises(ToolError) as exc_info:
             await client.call_tool(
                 "whois",
                 {
-                    "project_key": pkey("test/setup/noagent"),
+                    "project_key": project_key,
                     "agent_name": "NonExistentAgent",
                 },
             )

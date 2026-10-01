@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import os
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
 from fastmcp import Client, Context
+from sqlalchemy.exc import NoResultFound
 
+from mcp_agent_mail import app as app_module
 from mcp_agent_mail.app import (
     ToolExecutionError,
     _enforce_capabilities,
@@ -19,7 +24,156 @@ from mcp_agent_mail.app import (
     _reservation_repo_pathspec,
     build_mcp_server,
 )
+from mcp_agent_mail.config import get_settings
+from mcp_agent_mail.models import Agent, Project
 from tests.keys import pkey
+
+
+@pytest.mark.asyncio
+async def test_bound_agents_discard_stale_authority_and_keep_other_projects(monkeypatch):
+    runtime = app_module._MCPServerRuntime(get_settings())
+    project = Project(id=1, slug="current", human_key="/current")
+    valid = Agent(id=1, project_id=1, name="valid", program="test", model="test")
+    recycled = Agent(id=2, project_id=1, name="recycled", program="test", model="test")
+    valid_binding = runtime._session_agent_binding(project, valid)
+    stale_agent = replace(runtime._session_agent_binding(project, recycled), agent_generation="old")
+    stale_project = replace(valid_binding, project_generation="old")
+    missing = replace(valid_binding, agent_id=3)
+    other_project = replace(valid_binding, project_id=2)
+    bindings = {valid_binding, stale_agent, stale_project, missing, other_project}
+    looked_up: set[int] = set()
+
+    async def lookup(requested_project, agent_id):
+        assert requested_project is project
+        looked_up.add(agent_id)
+        if agent_id == 3:
+            raise NoResultFound
+        return {1: valid, 2: recycled}[agent_id]
+
+    monkeypatch.setattr(app_module, "_get_agent_by_id", lookup)
+
+    resolved = await runtime._resolve_bound_agents_for_project(bindings, project)
+
+    assert resolved == [valid]
+    assert looked_up == {1, 2, 3}
+    assert bindings == {valid_binding, other_project}
+
+
+@pytest.mark.asyncio
+async def test_bound_agent_resolution_keeps_snapshot_across_await(monkeypatch):
+    runtime = app_module._MCPServerRuntime(get_settings())
+    project = Project(id=1, slug="current", human_key="/current")
+    agents = {
+        number: Agent(id=number, project_id=1, name=f"agent-{number}", program="test", model="test")
+        for number in (1, 2, 3)
+    }
+    bindings = {runtime._session_agent_binding(project, agents[number]) for number in (1, 2)}
+    later_binding = runtime._session_agent_binding(project, agents[3])
+    entered = asyncio.Event()
+    resume = asyncio.Event()
+    looked_up: set[int] = set()
+
+    async def lookup(requested_project, agent_id):
+        assert requested_project is project
+        looked_up.add(agent_id)
+        entered.set()
+        await resume.wait()
+        return agents[agent_id]
+
+    monkeypatch.setattr(app_module, "_get_agent_by_id", lookup)
+
+    async with asyncio.TaskGroup() as group:
+        resolution = group.create_task(runtime._resolve_bound_agents_for_project(bindings, project))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        bindings.clear()
+        bindings.add(later_binding)
+        resume.set()
+
+    assert {agent.id for agent in resolution.result()} == {1, 2}
+    assert looked_up == {1, 2}
+    assert bindings == {later_binding}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("known_agent", "stored_token", "provided_token", "authorized"),
+    [
+        (False, "secret", "secret", False),
+        (True, "secret", "secret", True),
+        (True, "secret", "wrong", False),
+        (True, "secret", None, False),
+        (True, "", "secret", False),
+    ],
+    ids=["unknown-agent", "matching-token", "wrong-token", "missing-token", "empty-stored-token"],
+)
+async def test_product_agent_token_authority(
+    monkeypatch, known_agent, stored_token, provided_token, authorized,
+):
+    runtime = app_module._MCPServerRuntime(get_settings())
+    ctx = cast(Context, SimpleNamespace(session_id="product-auth"))
+    project = Project(id=1, slug="requested", human_key="/requested")
+    agent = Agent(
+        id=1, project_id=1, name="requested-agent", program="test", model="test",
+        registration_token=stored_token,
+    )
+    other_project = Project(id=2, slug="other", human_key="/other")
+    other_agent = Agent(id=2, project_id=2, name="other-agent", program="test", model="test")
+    runtime._bind_session_agent(ctx, other_project, other_agent)
+    other_binding = runtime._session_agent_binding(other_project, other_agent)
+
+    async def lookup(requested_project, requested_name):
+        assert requested_project is project
+        assert requested_name == agent.name
+        return agent if known_agent else None
+
+    monkeypatch.setattr(app_module, "_find_agent_optional", lookup)
+
+    resolved = await runtime._product_agent_for_project(ctx, project, agent.name, provided_token)
+
+    assert runtime._session_current_agents_for(ctx).get(other_project.id) == other_binding
+    if authorized:
+        assert resolved is agent
+        binding = runtime._session_agent_binding(project, agent)
+        assert runtime._session_bindings_for(ctx) == {other_binding, binding}
+        assert runtime._session_current_agents_for(ctx) == {1: binding, 2: other_binding}
+    else:
+        assert resolved is None
+        assert runtime._session_bindings_for(ctx) == {other_binding}
+        assert runtime._session_current_agents_for(ctx) == {2: other_binding}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent_count", [1, 2], ids=["unique", "ambiguous"])
+async def test_session_agent_fallback_requires_unique_project_authority(monkeypatch, agent_count):
+    runtime = app_module._MCPServerRuntime(get_settings())
+    ctx = cast(Context, SimpleNamespace(session_id="fallback-auth"))
+    project = Project(id=1, slug="requested", human_key="/requested")
+    agents = {
+        number: Agent(id=number, project_id=1, name=f"agent-{number}", program="test", model="test")
+        for number in range(1, agent_count + 1)
+    }
+    bindings = runtime._session_bindings_for(ctx)
+    bindings.update(runtime._session_agent_binding(project, agent) for agent in agents.values())
+    other_project = Project(id=2, slug="other", human_key="/other")
+    other_agent = Agent(id=3, project_id=2, name="other-agent", program="test", model="test")
+    runtime._bind_session_agent(ctx, other_project, other_agent)
+    original_bindings = bindings.copy()
+    original_current = runtime._session_current_agents_for(ctx).copy()
+    looked_up: set[int] = set()
+
+    async def lookup(requested_project, agent_id):
+        assert requested_project is project
+        looked_up.add(agent_id)
+        return agents[agent_id]
+
+    monkeypatch.setattr(app_module, "_get_agent_by_id", lookup)
+
+    resolved = await runtime._resolve_session_agent_for_project(ctx, project)
+
+    assert resolved is (agents[1] if agent_count == 1 else None)
+    assert looked_up == set(agents)
+    assert bindings == original_bindings
+    assert runtime._session_current_agents_for(ctx) == original_current
 
 
 def test_iso_and_parse_helpers():

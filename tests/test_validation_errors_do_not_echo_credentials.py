@@ -283,6 +283,58 @@ def test_log_redaction_removes_aliases_and_preserves_safe_container_values():
 def test_sensitive_log_filter_keeps_records_with_sanitized_messages(name, message, args, expected):
     record = logging.LogRecord(name, logging.WARNING, __file__, 1, message, args, None)
 
-    assert _FastMCPSensitiveLogFilter().filter(record) is True
+    assert _FastMCPSensitiveLogFilter().filter(record) is record
     assert record.getMessage() == expected
     assert SECRET not in repr(record.__dict__)
+
+
+@pytest.mark.parametrize("allow_record", [True, False], ids=["emit", "downstream-veto"])
+def test_sensitive_log_filter_preserves_record_through_logging_chain(allow_record: bool) -> None:
+    class MemoryHandler(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.records: list[logging.LogRecord] = []
+            self.messages: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self.records.append(record)
+            self.messages.append(self.format(record))
+
+    logger = logging.Logger("fastmcp.server.server")
+    logger.propagate = False
+    logger.addFilter(_FastMCPSensitiveLogFilter())
+    next_filter_records: list[logging.LogRecord] = []
+    next_filter_messages: list[str] = []
+
+    def next_filter(record: logging.LogRecord) -> bool:
+        next_filter_records.append(record)
+        next_filter_messages.append(record.getMessage())
+        assert SECRET not in repr(record.__dict__)
+        return allow_record
+
+    logger.addFilter(next_filter)
+    handlers = [MemoryHandler(), MemoryHandler()]
+    for handler in handlers:
+        logger.addHandler(handler)
+    record = logging.LogRecord(
+        logger.name, logging.DEBUG, __file__, 1,
+        "Handler called: call_tool %s with %s", ("probe", {"token": SECRET}), None,
+    )
+    try:
+        logger.handle(record)
+
+        assert len(next_filter_records) == 1
+        assert next_filter_records[0] is record
+        assert next_filter_messages == ["FastMCP tool call received (arguments redacted)"]
+        for handler in handlers:
+            if allow_record:
+                assert len(handler.records) == 1
+                assert handler.records[0] is record
+                assert handler.messages == next_filter_messages
+            else:
+                assert handler.records == []
+                assert handler.messages == []
+    finally:
+        for handler in handlers:
+            logger.removeHandler(handler)
+            handler.close()

@@ -285,9 +285,9 @@ class _FastMCPSensitiveLogFilter(logging.Filter):
 
     _mcp_agent_mail_sensitive_log_filter = True
 
-    def filter(self, record: logging.LogRecord) -> bool:
+    def filter(self, record: logging.LogRecord) -> logging.LogRecord:
         self._sanitize(record)
-        return True
+        return record
 
     @staticmethod
     def _sanitize(record: logging.LogRecord) -> None:
@@ -9417,7 +9417,7 @@ class _MCPServerRuntime(_MCPSessionBindings):
         self, bindings: set[_SessionAgentBinding], project: Project
     ) -> list[Agent]:
         resolved_agents: list[Agent] = []
-        for binding in list(bindings):
+        for binding in bindings.copy():
             if binding.project_id != project.id:
                 continue
             if binding.project_generation != project.project_generation:

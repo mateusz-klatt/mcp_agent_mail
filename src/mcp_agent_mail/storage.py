@@ -2134,20 +2134,16 @@ def _complete_repo_single_flight(
     task: asyncio.Task[Repo],
 ) -> None:
     """Publish one loop-owned creation task to waiters on every event loop."""
-    try:
-        repo = task.result()
-    except asyncio.CancelledError:
-        error: BaseException = RuntimeError(f"Repository initialization was cancelled for {cache_key}")
-    except BaseException as exc:
-        # Publish the exact worker error to every cross-loop waiter, including
-        # control-flow exceptions outside Exception. The Future re-raises it.
-        error = exc
+    if task.cancelled():
+        error: BaseException | None = RuntimeError(f"Repository initialization was cancelled for {cache_key}")
     else:
-        error = None
+        # Inspect the completed task without raising its stored failure here;
+        # the shared Future delivers the same exception to every waiter.
+        error = task.exception()
 
     if not flight.done():
         if error is None:
-            flight.set_result(repo)
+            flight.set_result(task.result())
         else:
             flight.set_exception(error)
 

@@ -3,14 +3,31 @@ from pathlib import Path
 
 import psutil
 import pytest
+import pytest_asyncio
 
 from mcp_agent_mail.config import clear_settings_cache
 from mcp_agent_mail.db import reset_database_state
-from mcp_agent_mail.http import clear_jwks_cache
+from mcp_agent_mail.http import clear_jwks_cache, close_test_http_lifespans
 from mcp_agent_mail.storage import clear_repo_cache
 
 # CPU overload threshold - skip benchmark tests if ALL cores are at this level
 CPU_OVERLOAD_THRESHOLD = 95.0
+
+
+@pytest_asyncio.fixture
+async def _close_lazy_http_lifespans():
+    yield
+    await close_test_http_lifespans()
+
+
+@pytest.fixture(autouse=True)
+def manage_lazy_http_lifespans(request):
+    if pytest_asyncio.is_async_test(request.node):
+        # Set up an already-requested environment first so owner teardown runs
+        # before that fixture removes storage and before the runner closes.
+        if "isolated_env" in request.fixturenames:
+            request.getfixturevalue("isolated_env")
+        request.getfixturevalue("_close_lazy_http_lifespans")
 
 
 def is_cpu_overloaded() -> bool:

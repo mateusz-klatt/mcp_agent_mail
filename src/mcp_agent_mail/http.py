@@ -590,6 +590,19 @@ def _decode_jwt_header_segment(token: str) -> dict[str, object] | None:
 
 
 _LOGGING_CONFIGURED = False
+_TEST_LIFESPAN_TASKS: set[asyncio.Task[None]] = set()
+
+
+async def close_test_http_lifespans() -> None:
+    """Close lazy test lifespans before their loop cancels all child tasks."""
+    loop = asyncio.get_running_loop()
+    owners = [task for task in _TEST_LIFESPAN_TASKS if task.get_loop() is loop and not task.done()]
+    for task in owners:
+        task.cancel()
+    results = await asyncio.gather(*owners, return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+            raise result
 
 # Pre-compiled regex patterns for HTTP validators
 _SLUG_VALIDATOR_RE = re.compile(r"^[a-z0-9_-]+$", re.IGNORECASE)
@@ -6450,8 +6463,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         async def _run_lazy_lifespan(self, started: asyncio.Future[None]) -> None:
             # AnyIO task groups must enter and exit in the same task. Keeping
             # this context in a request task corrupts its middleware's cancel
-            # scope stack when the request returns. Test loop shutdown cancels
-            # this owner task and unwinds the lifespan in its original context.
+            # scope stack when the request returns. Test cleanup cancels this
+            # owner before loop shutdown and unwinds its original context.
             mcp_lifespan_app = cast(_FastAPILifespan, self._app)
             try:
                 async with mcp_lifespan_app.lifespan(self._app):
@@ -6517,6 +6530,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 started.add_done_callback(lambda future: future.exception() if not future.cancelled() else None)
                 self._lifespan_started = started
                 self._lifespan_task = asyncio.create_task(self._run_lazy_lifespan(started))
+                _TEST_LIFESPAN_TASKS.add(self._lifespan_task)
+                self._lifespan_task.add_done_callback(_TEST_LIFESPAN_TASKS.discard)
                 self._lifespan_task.add_done_callback(
                     lambda task: task.exception() if not task.cancelled() else None
                 )

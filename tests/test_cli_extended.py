@@ -298,7 +298,7 @@ def test_cli_products_search_rejects_registration_token_argv(isolated_env):
 
     assert res.exit_code == 2
     normalized_error = "".join(strip_ansi(res.output).split())
-    assert "Nosuchoption:--registration-token" in normalized_error
+    assert "Nosuchoption'--registration-token'." in normalized_error
     assert argv_secret not in res.output
 
 

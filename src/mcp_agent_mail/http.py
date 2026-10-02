@@ -6444,7 +6444,23 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             self._app = native_app
             self._allow_lazy_lifespan = allow_lazy_lifespan
             self._lifespan_entered = False
-            self._lifespan_cm: Any = None
+            self._lifespan_task: asyncio.Task[None] | None = None
+
+        async def _run_lazy_lifespan(self, started: asyncio.Future[None]) -> None:
+            # AnyIO task groups must enter and exit in the same task. Keeping
+            # this context in a request task corrupts its middleware's cancel
+            # scope stack when the request returns. Test loop shutdown cancels
+            # this owner task and unwinds the lifespan in its original context.
+            mcp_lifespan_app = cast(_FastAPILifespan, self._app)
+            try:
+                async with mcp_lifespan_app.lifespan(self._app):
+                    started.set_result(None)
+                    await asyncio.Future()
+            except BaseException as exc:
+                if not started.done():
+                    started.set_exception(exc)
+                else:
+                    raise
 
         async def _ensure_lifespan(self) -> None:
             """Lazily enter the MCP app's lifespan if not already running.
@@ -6480,10 +6496,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     raise RuntimeError(
                         "The parent ASGI lifespan was not started before an MCP request."
                     )
-                # Enter the MCP app's lifespan (test path)
-                mcp_lifespan_app = cast(_FastAPILifespan, self._app)
-                self._lifespan_cm = mcp_lifespan_app.lifespan(self._app)
-                await self._lifespan_cm.__aenter__()
+                # The test-only fallback owns its lifespan independently of
+                # whichever request first needs the session manager.
+                started: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+                self._lifespan_task = asyncio.create_task(self._run_lazy_lifespan(started))
+                await asyncio.shield(started)
                 self._lifespan_entered = True
 
         async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:

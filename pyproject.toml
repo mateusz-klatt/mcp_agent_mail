@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling==1.32.0"]
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
 [project]
@@ -30,7 +30,7 @@ classifiers = [
 ]
 dependencies = [
   "fastmcp>=3.4.7,<3.5",
-  "mcp>=1.25.0,<1.26",
+  "mcp>=1.28.1,<1.29",
   "uvicorn[standard]>=0.32.0",
   "gunicorn>=26.0.0,<27; sys_platform != 'win32'",
   "uvicorn-worker>=0.4.0,<0.5; sys_platform != 'win32'",
@@ -182,8 +182,8 @@ markers = [
 
 [dependency-groups]
 dev = [
-    "hatchling==1.32.0",
-    "playwright==1.62.0",
+    "hatchling==1.32.4",
+    "playwright==1.63.0",
     "pytest-asyncio>=1.2.0",
     "pytest-cov>=7.0.0",
     "respx>=0.23.1,<0.24",

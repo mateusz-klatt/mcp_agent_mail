@@ -72,7 +72,7 @@ RUN git init -q /build/toon_rust && \
 # manifest, validates every entry-point reference, and embeds that same tree in
 # a wheel. The extraction below copies only the validated ui_dist members.
 # --------------------------------------------------------------------------
-FROM ghcr.io/astral-sh/uv:0.11.2 AS uv-bin
+FROM ghcr.io/astral-sh/uv:0.11.33 AS uv-bin
 # Must match the toolchain hatch_build.py validates (_NODE_VERSION /
 # _NPM_VERSION) and the node-version in ci.yml: the wheel is built here, so a
 # divergence fails the image build rather than any test.

@@ -2155,11 +2155,11 @@ wheels = [
 
 [[package]]
 name = "redis"
-version = "7.4.1"
+version = "7.1.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/51/93/05e7d4a65285066a74f48697f9b9cde5cfce71398033d69ed83c3d98f5c9/redis-7.4.1.tar.gz", hash = "sha256:1a1df5067062cf7cbe677994e391f8ee0840f499d370f1a71266e0dd3aa9308e", size = 4945742, upload-time = "2026-06-05T09:10:06.703Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/43/c8/983d5c6579a411d8a99bc5823cc5712768859b5ce2c8afe1a65b37832c81/redis-7.1.0.tar.gz", hash = "sha256:b1cc3cfa5a2cb9c2ab3ba700864fb0ad75617b41f01352ce5779dabf6d5f9c3c", size = 4796669, upload-time = "2025-11-19T15:54:39.961Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/4a/2e/2677f3f93dae0497e7e33b6637302e7f3744efc553f34231183e32584885/redis-7.4.1-py3-none-any.whl", hash = "sha256:1fa4647af1c5e93a2c685aa248ee44cce092691146d41390518dabe9a99839b0", size = 410171, upload-time = "2026-06-05T09:10:05.128Z" },
+    { url = "https://files.pythonhosted.org/packages/89/f0/8956f8a86b20d7bb9d6ac0187cf4cd54d8065bc9a1a09eb8011d4d326596/redis-7.1.0-py3-none-any.whl", hash = "sha256:23c52b208f92b56103e17c5d06bdc1a6c2c0b3106583985a76a18f83b265de2b", size = 354159, upload-time = "2025-11-19T15:54:38.064Z" },
 ]
 
 [package.optional-dependencies]
@@ -2431,16 +2431,15 @@ asyncio = [
 
 [[package]]
 name = "sqlmodel"
-version = "0.0.47"
+version = "0.0.31"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pydantic" },
     { name = "sqlalchemy" },
-    { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/4f/60/aa4cb68f03fa6bd1ca9e9a9ca89c3bc6c67f50981d0abcd9d6364609516d/sqlmodel-0.0.47.tar.gz", hash = "sha256:3606430ea6db7f00c8ae2157458b9766644ea3ad365c601e26a86cf23f5910d5", size = 98136, upload-time = "2026-09-23T17:31:07.921Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/56/b8/e7cd6def4a773f25d6e29ffce63ccbfd6cf9488b804ab6fb9b80d334b39d/sqlmodel-0.0.31.tar.gz", hash = "sha256:2d41a8a9ee05e40736e2f9db8ea28cbfe9b5d4e5a18dd139e80605025e0c516c", size = 94952, upload-time = "2025-12-28T12:35:01.436Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f7/b3/988928029b0e68de7ac587c2e1ccd379aa18e7c0aa7cc426628145a032fe/sqlmodel-0.0.47-py3-none-any.whl", hash = "sha256:165294386c3e4b25fa02f151ca1abb0cbf5fdb76f6093a38aca33fdc30dfd485", size = 31314, upload-time = "2026-09-23T17:31:06.8Z" },
+    { url = "https://files.pythonhosted.org/packages/6c/72/5aa5be921800f6418a949a73c9bb7054890881143e6bc604a93d228a95a3/sqlmodel-0.0.31-py3-none-any.whl", hash = "sha256:6d946d56cac4c2db296ba1541357cee2e795d68174e2043cd138b916794b1513", size = 27093, upload-time = "2025-12-28T12:35:00.108Z" },
 ]
 
 [[package]]

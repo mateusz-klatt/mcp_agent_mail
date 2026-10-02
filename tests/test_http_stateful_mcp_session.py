@@ -10,13 +10,14 @@ working.
 import asyncio
 import contextlib
 
+import anyio
 import pytest
 from httpx import ASGITransport, AsyncClient
 from starlette.routing import Mount
 
 from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
-from mcp_agent_mail.http import build_http_app
+from mcp_agent_mail.http import build_http_app, close_test_http_lifespans
 
 
 def _initialize_payload() -> dict:
@@ -182,6 +183,34 @@ async def test_failed_lifespan_owner_is_reported_on_next_request(http_app, monke
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         with pytest.raises(RuntimeError, match="owner teardown failed"):
             await client.post("/api/", headers=AUTH, json=_tools_call_payload("health_check"))
+
+
+@pytest.mark.asyncio
+async def test_ordered_lifespan_cleanup_awaits_nested_children(http_app, monkeypatch):
+    wrapper = next(route.app for route in http_app.routes if isinstance(route, Mount) and route.path == "/api")
+    original_lifespan = wrapper._app.router.lifespan_context
+    child_started = asyncio.Event()
+    child_finished = asyncio.Event()
+
+    async def child():
+        try:
+            child_started.set()
+            await asyncio.Future()
+        finally:
+            child_finished.set()
+
+    @contextlib.asynccontextmanager
+    async def nested_lifespan(app):
+        async with original_lifespan(app), anyio.create_task_group() as group:
+            group.start_soon(child)
+            yield
+
+    monkeypatch.setattr(wrapper._app.router, "lifespan_context", nested_lifespan)
+    await wrapper._ensure_lifespan()
+    await asyncio.wait_for(child_started.wait(), timeout=5)
+    await asyncio.wait_for(close_test_http_lifespans(), timeout=5)
+    assert wrapper._lifespan_task.done()
+    assert child_finished.is_set()
 
 
 @pytest.mark.asyncio

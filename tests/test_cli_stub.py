@@ -165,6 +165,19 @@ def test_editable_distribution_exposes_the_canonical_cli_entrypoint() -> None:
     assert console_scripts[0].load() is main
 
 
+def test_typer_modules_have_one_installed_distribution_owner() -> None:
+    owners: dict[str, list[str]] = {}
+    for distribution in importlib.metadata.distributions():
+        owner = f"{distribution.metadata['Name']}=={distribution.version}"
+        for path in distribution.files or ():
+            if str(path).startswith("typer/") and path.suffix == ".py":
+                owners.setdefault(str(path), []).append(owner)
+
+    assert owners, "No installed Typer module files were found"
+    conflicts = {path: names for path, names in owners.items() if len(names) > 1}
+    assert not conflicts, f"Multiple distributions overwrite Typer modules: {conflicts}"
+
+
 def test_native_cli_launcher_runs_real_typer_help() -> None:
     executable_name = "mcp-agent-mail.exe" if os.name == "nt" else "mcp-agent-mail"
     launcher = Path(sysconfig.get_path("scripts")) / executable_name

@@ -7,10 +7,12 @@ STATELESS so handshake-skipping one-shot clients (e.g. ntm's HTTP client) keep
 working.
 """
 
+import asyncio
 import contextlib
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from starlette.routing import Mount
 
 from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
@@ -55,6 +57,60 @@ def http_app(isolated_env, monkeypatch):
 
 
 AUTH = {"Authorization": "Bearer token250"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mount_path", ["/api", "/mcp"])
+async def test_lazy_lifespan_enters_and_exits_in_its_own_task(http_app, monkeypatch, mount_path):
+    wrapper = next(route.app for route in http_app.routes if isinstance(route, Mount) and route.path == mount_path)
+    native_app = wrapper._app
+    original_lifespan = native_app.router.lifespan_context
+    owners = []
+
+    @contextlib.asynccontextmanager
+    async def observed_lifespan(app):
+        owners.append(asyncio.current_task())
+        try:
+            async with original_lifespan(app):
+                yield
+        finally:
+            owners.append(asyncio.current_task())
+
+    monkeypatch.setattr(native_app.router, "lifespan_context", observed_lifespan)
+    transport = ASGITransport(app=http_app)
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            for _ in range(2):
+                payload = _initialize_payload() if mount_path == "/mcp" else _tools_call_payload("health_check")
+                response = await client.post(f"{mount_path}/", headers=AUTH, json=payload)
+                assert response.status_code == 200, response.text
+        assert len(owners) == 1
+        assert owners[0] is not asyncio.current_task()
+        assert owners[0] is wrapper._lifespan_task
+    finally:
+        if wrapper._lifespan_task is not None:
+            wrapper._lifespan_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await wrapper._lifespan_task
+    assert owners == [wrapper._lifespan_task, wrapper._lifespan_task]
+
+
+@pytest.mark.asyncio
+async def test_lazy_lifespan_propagates_startup_failure(http_app, monkeypatch):
+    wrapper = next(route.app for route in http_app.routes if isinstance(route, Mount) and route.path == "/api")
+
+    @contextlib.asynccontextmanager
+    async def failed_lifespan(app):
+        raise RuntimeError("lifespan startup failed")
+        yield
+
+    monkeypatch.setattr(wrapper._app.router, "lifespan_context", failed_lifespan)
+    transport = ASGITransport(app=http_app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        with pytest.raises(RuntimeError, match="lifespan startup failed"):
+            await client.post("/api/", headers=AUTH, json=_tools_call_payload("health_check"))
+    assert wrapper._lifespan_task.done()
+    assert not wrapper._lifespan_entered
 
 
 @pytest.mark.asyncio

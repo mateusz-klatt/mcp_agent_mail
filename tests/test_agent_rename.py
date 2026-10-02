@@ -21,6 +21,7 @@ from git import Git
 from sqlalchemy import func, select as _sa_select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.sql import ColumnElement
+from sqlmodel import col
 from typer.testing import CliRunner
 
 from mcp_agent_mail import cli as cli_module, storage as storage_module, utils as utils_module
@@ -787,7 +788,7 @@ def test_rename_agent_tombstone_blocks_stale_registration(isolated_env) -> None:
             return int(
                 (
                     await session.execute(
-                        select(func.count(Agent.id)).where(
+                        select(func.count(col(Agent.id))).where(
                             cast(ColumnElement[bool], Agent.project_id == seeded.project_id),
                             func.lower(Agent.name) == OLD_NAME.lower(),
                         )
@@ -891,7 +892,7 @@ def test_tombstone_blocks_raw_old_name_before_durable_name_validation(
             return int(
                 (
                     await session.execute(
-                        select(func.count(Agent.id)).where(
+                        select(func.count(col(Agent.id))).where(
                             cast(
                                 ColumnElement[bool],
                                 Agent.project_id == seeded.project_id,

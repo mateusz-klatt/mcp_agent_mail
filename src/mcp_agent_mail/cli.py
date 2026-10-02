@@ -49,6 +49,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.engine import make_url
 from sqlalchemy.sql import ColumnElement
+from sqlmodel import col
 
 from . import tickets
 from .app import (
@@ -5220,7 +5221,7 @@ def list_projects(
             if include_agents:
                 for project in projects:
                     count_result = await session.execute(
-                        select(func.count(Agent.id)).where(Agent.project_id == project.id)
+                        select(func.count(col(Agent.id))).where(Agent.project_id == project.id)
                     )
                     count = int(count_result.scalar_one())
                     rows.append((project, count))

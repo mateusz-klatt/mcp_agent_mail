@@ -8,6 +8,7 @@ from typing import Any, cast
 import pytest
 from fastmcp import Client
 from sqlalchemy import func, select
+from sqlmodel import col
 
 import mcp_agent_mail.delivery as delivery_service
 import mcp_agent_mail.storage as storage
@@ -603,8 +604,8 @@ async def test_cross_project_reply_uses_thread_route_without_reverse_contact_gra
                     select(func.count())
                     .select_from(AgentLink)
                     .where(
-                        AgentLink.a_project_id == target_project.id,
-                        AgentLink.b_project_id == source_project.id,
+                        col(AgentLink.a_project_id) == target_project.id,
+                        col(AgentLink.b_project_id) == source_project.id,
                     )
                 )
             ).scalar_one()

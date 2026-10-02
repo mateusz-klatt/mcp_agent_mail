@@ -114,6 +114,77 @@ async def test_lazy_lifespan_propagates_startup_failure(http_app, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("startup_fails", [False, True])
+async def test_cancelled_first_request_keeps_one_starting_lifespan(http_app, monkeypatch, startup_fails):
+    wrapper = next(route.app for route in http_app.routes if isinstance(route, Mount) and route.path == "/api")
+    original_lifespan = wrapper._app.router.lifespan_context
+    entered = asyncio.Event()
+    resume = asyncio.Event()
+    owners = []
+
+    @contextlib.asynccontextmanager
+    async def blocked_lifespan(app):
+        owners.append(asyncio.current_task())
+        entered.set()
+        await resume.wait()
+        if startup_fails:
+            raise RuntimeError("delayed startup failed")
+        async with original_lifespan(app):
+            yield
+
+    monkeypatch.setattr(wrapper._app.router, "lifespan_context", blocked_lifespan)
+    first = asyncio.create_task(wrapper._ensure_lifespan())
+    follower = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        follower = asyncio.create_task(wrapper._ensure_lifespan())
+        await asyncio.sleep(0)
+        assert len(owners) == 1
+        assert not follower.done()
+        resume.set()
+        if startup_fails:
+            with pytest.raises(RuntimeError, match="delayed startup failed"):
+                await asyncio.wait_for(follower, timeout=5)
+        else:
+            await asyncio.wait_for(follower, timeout=5)
+            assert wrapper._lifespan_entered
+        assert owners == [wrapper._lifespan_task]
+    finally:
+        for task in (first, follower, wrapper._lifespan_task):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, RuntimeError):
+                    await task
+
+
+@pytest.mark.asyncio
+async def test_failed_lifespan_owner_is_reported_on_next_request(http_app, monkeypatch):
+    wrapper = next(route.app for route in http_app.routes if isinstance(route, Mount) and route.path == "/api")
+    original_lifespan = wrapper._app.router.lifespan_context
+
+    @contextlib.asynccontextmanager
+    async def failed_teardown(app):
+        try:
+            async with original_lifespan(app):
+                yield
+        finally:
+            raise RuntimeError("owner teardown failed")
+
+    monkeypatch.setattr(wrapper._app.router, "lifespan_context", failed_teardown)
+    await wrapper._ensure_lifespan()
+    wrapper._lifespan_task.cancel()
+    with pytest.raises(RuntimeError, match="owner teardown failed"):
+        await wrapper._lifespan_task
+    transport = ASGITransport(app=http_app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        with pytest.raises(RuntimeError, match="owner teardown failed"):
+            await client.post("/api/", headers=AUTH, json=_tools_call_payload("health_check"))
+
+
+@pytest.mark.asyncio
 async def test_mcp_mount_issues_session_id_and_session_persists(http_app):
     """'/mcp' initialize returns Mcp-Session-Id, and follow-up calls reusing
     that ID succeed — the transport-level prerequisite for #148 session-bound

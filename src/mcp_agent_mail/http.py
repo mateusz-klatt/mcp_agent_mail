@@ -6445,6 +6445,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             self._allow_lazy_lifespan = allow_lazy_lifespan
             self._lifespan_entered = False
             self._lifespan_task: asyncio.Task[None] | None = None
+            self._lifespan_started: asyncio.Future[None] | None = None
 
         async def _run_lazy_lifespan(self, started: asyncio.Future[None]) -> None:
             # AnyIO task groups must enter and exit in the same task. Keeping
@@ -6459,6 +6460,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             except BaseException as exc:
                 if not started.done():
                     started.set_exception(exc)
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise
                 else:
                     raise
 
@@ -6474,10 +6477,20 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             Uses double-check locking to prevent concurrent requests from
             entering the lifespan context manager twice.
             """
+            if self._lifespan_task is not None and self._lifespan_task.done():
+                if self._lifespan_task.cancelled():
+                    raise RuntimeError("The test MCP lifespan owner was cancelled.")
+                self._lifespan_task.result()
             if self._lifespan_entered:
                 return
             async with _shared_lazy_lifespan_lock():
                 if self._lifespan_entered:
+                    return
+                if self._lifespan_started is not None:
+                    # A cancelled first request must not start a second owner
+                    # while the original lifespan is still initializing.
+                    await asyncio.shield(self._lifespan_started)
+                    self._lifespan_entered = True
                     return
                 # Check if the session manager is already running (production path)
                 session_mgr = getattr(self._app.state, "session_manager", None)
@@ -6499,7 +6512,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 # The test-only fallback owns its lifespan independently of
                 # whichever request first needs the session manager.
                 started: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+                # A request can disappear before startup fails. Observe that
+                # exception even then; awaiting the future still propagates it.
+                started.add_done_callback(lambda future: future.exception() if not future.cancelled() else None)
+                self._lifespan_started = started
                 self._lifespan_task = asyncio.create_task(self._run_lazy_lifespan(started))
+                self._lifespan_task.add_done_callback(
+                    lambda task: task.exception() if not task.cancelled() else None
+                )
                 await asyncio.shield(started)
                 self._lifespan_entered = True
 

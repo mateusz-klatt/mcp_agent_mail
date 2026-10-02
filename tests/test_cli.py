@@ -15,12 +15,11 @@ from typing import Any, cast
 from zipfile import ZipFile
 
 import pytest
-from click.testing import Result
 from git import Repo
 from git.cmd import Git
 from sqlalchemy import select
 from sqlalchemy.sql import ColumnElement
-from typer.testing import CliRunner
+from typer.testing import CliRunner, Result
 
 from mcp_agent_mail import cli as cli_module, share as share_module, storage as storage_module
 from mcp_agent_mail.cli import app

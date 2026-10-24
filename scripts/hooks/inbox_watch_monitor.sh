@@ -126,10 +126,16 @@ FAIL_ANNOUNCE="${AGENT_MAIL_MONITOR_FAIL_SECONDS:-300}"
 CURL_PID=""
 STREAM=""
 slug="$(am_state_component "${PROJECT}|${AGENT}")" || exit 0
+# The announced-mail mark (see `last_id` below) is a statement about one
+# server's id space, so its key names the server too: a host pointed at another
+# server must start from nothing rather than inherit a number that means
+# something else there.
+mark_slug="$(am_state_component "${AM_BASE_URL}|${PROJECT}|${AGENT}")" || exit 0
 WATCH_DIR="${AM_STATE_DIR}/watch"
 MARKER="${WATCH_DIR}/monitor-${slug}.pid"
 METADATA="${WATCH_DIR}/monitor-${slug}.json"
 MONITOR_LOCK="${WATCH_DIR}/monitor-${slug}.lock"
+MARK="${WATCH_DIR}/monitor-${mark_slug}.last"
 mkdir -p "$WATCH_DIR" 2>/dev/null || exit 0
 
 # Exactly one stream per durable mailbox in one project. Different projects
@@ -207,15 +213,36 @@ fi
 rm -f "$metadata_tmp" 2>/dev/null || true
 printf '%s\n' "$$" > "$MARKER" 2>/dev/null || { exit 0; }
 
-# Highest message id already announced on stdout.
+# Highest message id already announced on stdout, persisted per server, project
+# and Agent so that it outlives the run that announced it.
 #
-# Needed only because this script reconnects. After a wake, the mail stays
-# unread until the agent gets to it, so the catch-up query that runs after every
-# reconnect finds the same id again — and without this guard would announce it
-# on every cycle, turning one message into an unbounded stream of wakes. Kept in
-# memory rather than on disk: the value is meaningful only for the life of this
-# process, and a stale file would suppress a real message after a restart.
+# After a wake the mail stays unread until the agent gets to it, so the catch-up
+# query below finds the same id again on every reconnect -- and on every new
+# run. Without this guard the first turns one message into an unbounded stream
+# of wakes; with the guard held only in memory, the second still happened:
+# every `/wake` started from 0 and woke the agent for the newest unread message
+# however old it was. Measured on claude-wsl-home-1: one seven-week-old message
+# announced on four consecutive arms while no new mail had arrived at all.
+#
+# Memory-only was chosen because a stale file could suppress a real message.
+# Ids are issued in increasing order, so a mark hides nothing newer than what
+# it records; what it can hide is mail from an id space that moved backwards --
+# a restored or rebuilt database. The server is part of the key, and the first
+# catch-up of each run checks an inherited mark against the newest message the
+# mailbox holds and drops it if nothing reaches it (`mark_unverified`). Content
+# delivery never depended on this: inbox_check.sh reports unread mail at the
+# start of every session, and this line only ends the waiting.
+#
+# Eighteen digits stays below 2^63. Anything longer cannot be an id, and `[ -gt
+# ]` reports overflow as an error that every comparison below would read as
+# "not newer" -- silencing the monitor for good -- so it counts as no mark.
 last_id=0
+if [ -r "$MARK" ]; then
+    last_id="$(tr -cd '0-9' 2>/dev/null < "$MARK")"
+    [ -n "$last_id" ] && [ "${#last_id}" -le 18 ] || last_id=0
+fi
+mark_unverified=0
+[ "$last_id" -gt 0 ] && mark_unverified=1
 backoff="$BACKOFF_MIN"
 fail_since=0
 fail_announced=0
@@ -228,8 +255,23 @@ migration_announced=0
 # worth one. This line only has to say "there is mail"; inbox_check.sh delivers
 # the content when the agent wakes, and it is the component that owns dedupe and
 # rate limiting for actual delivery.
+#
+# Print, then persist. A crash between the two re-announces one id on the next
+# arm; the opposite order could record as announced an id that never was.
 announce() {
     printf 'Agent Mail: new mail (id %s) for %s\n' "$1" "$2"
+    remember "$1"
+}
+
+# Replaced, never edited in place, so a reader can see only a whole number.
+# `2>/dev/null` comes first because a redirection that fails reports on the
+# stderr in force when it is attempted, and this process must never be noisy.
+remember() {
+    local tmp="${MARK}.${BASHPID:-$$}.tmp"
+    last_id="$1"
+    printf '%s\n' "$1" 2>/dev/null > "$tmp" && mv -f "$tmp" "$MARK" 2>/dev/null
+    rm -f "$tmp" 2>/dev/null
+    return 0
 }
 
 # Sleep in short pieces while checking the actual CLI owner. This is deliberately
@@ -335,6 +377,28 @@ while :; do
     fail_announced=0
     backoff="$BACKOFF_MIN"
 
+    # ── check an inherited mark, once per run ────────────────────────────────
+    #
+    # Only a server that has issued an id at least as high as the mark makes it
+    # meaningful. One that has not -- restored, rebuilt, counting from 1 again --
+    # would have every new message hidden below it, so the mark is dropped.
+    # Asked here, after `: ready`, because this is when an answer is likely. An
+    # unclear answer keeps the mark and asks again next cycle: a failed query is
+    # far likelier to be an outage than a rewound database.
+    if [ "$mark_unverified" -eq 1 ]; then
+        newest="$(am_call fetch_inbox "$(AGENT_MAIL_JQ_REGISTRATION_TOKEN="$token" \
+            jq -nc --arg p "$PROJECT" --arg a "$AGENT" \
+            '{project_key:$p,agent_name:$a,registration_token:env.AGENT_MAIL_JQ_REGISTRATION_TOKEN,unread_only:false,limit:1,include_bodies:false}')" \
+            | jq -r 'if type == "array" then (.[0].id // 0 | tostring) else empty end' 2>/dev/null)"
+        case "$newest" in
+            ''|*[!0-9]*) ;;
+            *) if [ "$newest" -lt "$last_id" ] 2>/dev/null; then
+                   remember 0
+               fi
+               mark_unverified=0 ;;
+        esac
+    fi
+
     # ── catch up, under the protection of a live subscription ────────────────
     #
     # Ordering is the whole reason this is not one curl: subscribe, wait for
@@ -354,7 +418,6 @@ while :; do
         ''|*[!0-9]*) ;;
         *) if [ "$top" -gt "$last_id" ] 2>/dev/null; then
                announce "$top" "$AGENT"
-               last_id="$top"
            fi ;;
     esac
 
@@ -385,7 +448,6 @@ while :; do
         esac
         if [ -n "$id" ] && [ "$id" -gt "$last_id" ] 2>/dev/null; then
             announce "$id" "$AGENT"
-            last_id="$id"
         fi
     fi
     # No frame means the window closed on its own — `: bye`, a cut, or the

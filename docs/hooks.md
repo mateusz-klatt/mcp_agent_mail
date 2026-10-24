@@ -63,7 +63,11 @@ either way — but the two edges around it:
 `data:` frame, then the connection closes — so "never exits" is a reconnect loop
 rather than one held connection. Concurrent subscriptions for the same agent are
 supported server-side, so the catch-up query after each reconnect closes the gap
-between connections without risk of eviction. `session_start.sh` suppresses the
+between connections without risk of eviction. The highest announced id persists
+per server, project and Agent, so a fresh `/wake` does not wake the agent again
+for mail an earlier monitor already announced; a mark the server's own newest
+message does not reach is discarded on the first catch-up.
+`session_start.sh` suppresses the
 manual watcher invitation while a monitor's pid file shows a live process, so the
 two are not armed at once.
 

@@ -36,8 +36,10 @@ from tests.test_agent_hook_identity import (
     ROOT,
     _git_bash_path,
     _hook_env,
+    _hook_names,
     _init_git_repo,
     _install_fake_curl,
+    _put_credential,
     _tree_snapshot,
 )
 
@@ -2420,3 +2422,181 @@ def test_monitor_exits_promptly_on_sigterm(tmp_path: Path) -> None:
         pytest.fail("monitor ignored SIGTERM")
 
     assert time.monotonic() - sent < 15
+
+
+def _install_mailbox_server(fake_bin: Path) -> None:
+    """A fake Iris answering the only two requests the monitor's loop makes.
+
+    `GET /events` says `: ready` and holds for a second, so every cycle runs the
+    catch-up exactly once and then reconnects. `fetch_inbox` answers from two
+    files a test rewrites between runs: one for the unread-only catch-up, one for
+    the newest message the mailbox holds. Every request is logged by kind, which
+    is what lets a test know a cycle has finished instead of guessing.
+    """
+    _install_fake_curl(
+        fake_bin,
+        r'''#!/usr/bin/env bash
+case "$*" in
+  *'/events?'*)
+    cat >/dev/null
+    printf 'events\n' >> "$FAKE_CALL_LOG"
+    printf ': ready\n\n'
+    exec sleep 1
+    ;;
+esac
+body="$(cat)"
+[[ "$(printf '%s' "$body" | jq -r '.params.name')" == fetch_inbox ]] || exit 93
+[[ "$(printf '%s' "$body" | jq -r '.params.arguments.registration_token')" == registration-token ]] || exit 92
+if [[ "$(printf '%s' "$body" | jq -r '.params.arguments.unread_only')" == true ]]; then
+  printf 'unread\n' >> "$FAKE_CALL_LOG"
+  result="$(cat "$FAKE_UNREAD")"
+else
+  printf 'newest\n' >> "$FAKE_CALL_LOG"
+  result="$(cat "$FAKE_NEWEST")"
+fi
+jq -nc --argjson value "$result" '{result:{content:[{type:"text",text:($value|tojson)}],isError:false}}'
+printf '200\n'
+''',
+    )
+
+
+def _mailbox_env(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
+    """A registered Agent in front of a fake Iris holding one mailbox."""
+    env, repo, _ = _monitor_env(tmp_path)
+    _install_mailbox_server(tmp_path / "bin")
+    _put_credential(tmp_path / "state", _hook_names(env)[1])
+    call_log = tmp_path / "calls.log"
+    env["FAKE_CALL_LOG"] = _git_bash_path(call_log)
+    env["FAKE_UNREAD"] = _git_bash_path(tmp_path / "unread.json")
+    env["FAKE_NEWEST"] = _git_bash_path(tmp_path / "newest.json")
+    return env, repo, call_log
+
+
+def _set_mailbox(tmp_path: Path, *, unread: list[int], newest: int) -> None:
+    (tmp_path / "unread.json").write_text(
+        json.dumps([{"id": message_id} for message_id in unread]), encoding="utf-8"
+    )
+    (tmp_path / "newest.json").write_text(
+        json.dumps([{"id": newest}]), encoding="utf-8"
+    )
+
+
+def _announcements_of_one_cycle(
+    env: dict[str, str], repo: Path, tmp_path: Path, tag: str, call_log: Path
+) -> str:
+    """Run a monitor until its first cycle is provably over and return its stdout.
+
+    A cycle makes every announcement decision before it opens the next
+    subscription, so a second `events` line in the call log is a completion
+    signal rather than a guess at how long the catch-up takes. The monitor is
+    then stopped and its singleton released, so the next call is a fresh `/wake`
+    against the same private state.
+    """
+
+    def _subscriptions() -> int:
+        if not call_log.exists():
+            return 0
+        return call_log.read_text(encoding="utf-8").splitlines().count("events")
+
+    before = _subscriptions()
+    record_dir = tmp_path / "state" / "watch"
+    proc, out_path, err_path = _spawn_monitor(env, repo, tmp_path, tag)
+    pid: int | None = None
+    try:
+        assert _wait_until(lambda: _subscriptions() >= before + 2, budget=30), (
+            f"monitor {tag!r} never finished a cycle; stderr: "
+            f"{_read_output(err_path)!r}"
+        )
+        records = list(record_dir.glob("monitor-*.json"))
+        pid = _recorded_monitor_pid(records[0]) if records else None
+    finally:
+        stdout, _stderr = _stop_and_read(proc, out_path, err_path)
+        _sweep_monitors(tmp_path)
+    if pid is not None:
+        assert _wait_until(lambda: not _bash_can_observe_pid(pid)), (
+            f"monitor {pid} outlived its stop, so the next run would be a duplicate"
+        )
+    return stdout
+
+
+def test_a_fresh_wake_does_not_reannounce_mail_an_earlier_monitor_announced(
+    tmp_path: Path,
+) -> None:
+    """Pins the regression that woke an agent for the same old message every arm.
+
+    `last_id` lived only in memory, so every `/wake` started from 0 and the
+    catch-up announced the newest unread message again however long ago it had
+    arrived: claude-wsl-home-1 was woken for one seven-week-old id on four
+    consecutive arms while no new mail existed. Both halves are pinned, because
+    a mark that silenced the repeat by also silencing newer mail would be worse
+    than the bug.
+    """
+    env, repo, call_log = _mailbox_env(tmp_path)
+    _set_mailbox(tmp_path, unread=[4428], newest=4428)
+
+    first = _announcements_of_one_cycle(env, repo, tmp_path, "first", call_log)
+    assert "new mail (id 4428)" in first
+
+    second = _announcements_of_one_cycle(env, repo, tmp_path, "second", call_log)
+    assert second == "", f"the repeat wake is back: {second!r}"
+
+    _set_mailbox(tmp_path, unread=[4429, 4428], newest=4429)
+    third = _announcements_of_one_cycle(env, repo, tmp_path, "third", call_log)
+    assert "new mail (id 4429)" in third
+    assert "id 4428" not in third
+
+
+def test_an_inherited_mark_the_server_never_reached_is_dropped(tmp_path: Path) -> None:
+    """A restored or rebuilt database must not have its new mail hidden.
+
+    Ids are issued in increasing order, so the only way a persisted mark can
+    swallow a real message is an id space that moved backwards. Without the
+    check against the newest message in the mailbox, id 17 below would be
+    compared with 4428 and stay silent all night.
+    """
+    env, repo, call_log = _mailbox_env(tmp_path)
+    _set_mailbox(tmp_path, unread=[4428], newest=4428)
+    before = _announcements_of_one_cycle(env, repo, tmp_path, "before", call_log)
+    assert "new mail (id 4428)" in before
+
+    _set_mailbox(tmp_path, unread=[17], newest=17)
+    after = _announcements_of_one_cycle(env, repo, tmp_path, "after", call_log)
+    assert "new mail (id 17)" in after
+
+
+def test_the_mark_belongs_to_one_server(tmp_path: Path) -> None:
+    """A host pointed at another server must not inherit the first one's mark.
+
+    The newest-message check alone would not catch this one: the other server
+    holds an id as high as the mark, so only the server in the key keeps its
+    unread message from being treated as already announced.
+    """
+    env, repo, call_log = _mailbox_env(tmp_path)
+    _set_mailbox(tmp_path, unread=[4428], newest=4428)
+    first = _announcements_of_one_cycle(env, repo, tmp_path, "hermes", call_log)
+    assert "new mail (id 4428)" in first
+
+    (tmp_path / "home" / ".agent-mail.env").write_text(
+        "AGENT_MAIL_URL=https://elsewhere.example/mcp/\nHTTP_BEARER_TOKEN=test-bearer\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    other = _announcements_of_one_cycle(env, repo, tmp_path, "elsewhere", call_log)
+    assert "new mail (id 4428)" in other
+
+
+def test_an_unreadable_mark_counts_as_no_mark(tmp_path: Path) -> None:
+    """A mark too long to be an id must not silence the monitor for good.
+
+    `[ -gt ]` reports an overflowing operand as an error, and every comparison
+    in the monitor reads an error as "not newer". Trusting such a file would
+    mean never announcing anything again, so it is treated as absent.
+    """
+    env, repo, call_log = _mailbox_env(tmp_path)
+    _set_mailbox(tmp_path, unread=[4428], newest=4428)
+    assert "new mail (id 4428)" in _announcements_of_one_cycle(env, repo, tmp_path, "seed", call_log)
+
+    [mark] = (tmp_path / "state" / "watch").glob("monitor-*.last")
+    mark.write_text("9" * 25 + "\n", encoding="utf-8")
+    after = _announcements_of_one_cycle(env, repo, tmp_path, "corrupt", call_log)
+    assert "new mail (id 4428)" in after

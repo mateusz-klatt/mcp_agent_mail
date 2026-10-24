@@ -2289,5 +2289,9 @@
   "tests/test_tickets_service.py::test_relinking_the_same_edge_is_idempotent": 0.48679024900775403,
   "tests/test_tickets_service.py::test_the_first_ticket_of_a_project_bootstraps_its_sequence": 0.4898348590359092,
   "tests/test_tickets_service.py::test_the_service_normalizes_rather_than_relying_on_the_length_check": 0.5327051860513166,
-  "tests/test_tickets_service.py::test_vocabulary_is_refused_by_the_service_not_by_the_table": 0.4501110860146582
+  "tests/test_tickets_service.py::test_vocabulary_is_refused_by_the_service_not_by_the_table": 0.4501110860146582,
+  "tests/test_inbox_watch_monitor.py::test_a_fresh_wake_does_not_reannounce_mail_an_earlier_monitor_announced": 5.74,
+  "tests/test_inbox_watch_monitor.py::test_an_inherited_mark_the_server_never_reached_is_dropped": 3.76,
+  "tests/test_inbox_watch_monitor.py::test_the_mark_belongs_to_one_server": 3.71,
+  "tests/test_inbox_watch_monitor.py::test_an_unreadable_mark_counts_as_no_mark": 3.71
 }

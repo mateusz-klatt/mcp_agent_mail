@@ -811,7 +811,7 @@ def test_copy_viewer_assets_is_self_contained_and_air_gapped(
     assert "Tailwind CSS 3.4.17" in license_text
     assert "sql.js 1.10.1" in license_text
     assert "Marked 11.0.0" in license_text
-    assert "DOMPurify 3.0.8" in license_text
+    assert "DOMPurify 3.4.17" in license_text
     assert "Clusterize.js 0.18.0 - repository-only historical source" in license_text
     assert "Distribution status: excluded from the standalone viewer" in license_text
     assert "coi-serviceworker 0.1.7" in license_text

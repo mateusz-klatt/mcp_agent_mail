@@ -26,15 +26,15 @@
     }
   },
   "dompurify": {
-    "version": "3.0.8",
+    "version": "3.4.17",
     "license": "Apache-2.0 OR MPL-2.0",
     "license_file": "THIRD_PARTY_LICENSES.txt",
-    "source": "https://cdn.jsdelivr.net/npm/dompurify@3.0.8/dist/purify.min.js",
-    "upstream": "https://github.com/cure53/DOMPurify/tree/3.0.8",
+    "source": "https://cdn.jsdelivr.net/npm/dompurify@3.4.17/dist/purify.min.js",
+    "upstream": "https://github.com/cure53/DOMPurify/tree/3.4.17",
     "transform": "terminal sourceMappingURL comment omitted because source maps are not shipped",
     "files": {
       "dompurify.min.js": {
-        "sha256": "1499a72ba22ab7037f8f23dc9f0a84d8c2c0f8e83b641bef56d90d4831a9a696"
+        "sha256": "1bb973289c6a99e511f9209b4159384a6020ead799eca059f065cf213b28e1f3"
       }
     }
   },
